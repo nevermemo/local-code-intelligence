@@ -1,0 +1,7 @@
+{
+  "servers": {
+    "local-code-intelligence": {
+      "url": "http://127.0.0.1:8768/mcp"
+    }
+  }
+}

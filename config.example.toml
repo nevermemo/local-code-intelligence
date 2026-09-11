@@ -1,0 +1,22 @@
+embedding_url = "http://localhost:8766/v1"
+embedding_model = "qwen3-embedding-8b"
+reranker_url = "http://localhost:8767/rerank"
+reranker_model = "qwen3-reranker-4b"
+default_top_k = 8
+# Defaults to %LOCALAPPDATA%\local-code-intelligence on Windows.
+# Must be outside every workspace you index.
+# data_dir = 'C:\Users\you\AppData\Local\local-code-intelligence'
+embedding_batch_size = 8
+embedding_timeout_seconds = 120
+reranker_timeout_seconds = 120
+ripgrep_path = "rg"
+semantic_candidate_count = 40
+lexical_candidate_count = 40
+rerank_candidate_count = 24
+rrf_k = 60.0
+# Used only after watch_workspace is called for a workspace.
+watch_poll_milliseconds = 2000
+watch_debounce_milliseconds = 750
+rust_analyzer_path = "rust-analyzer"
+lsp_timeout_seconds = 60
+lsp_candidate_count = 40
