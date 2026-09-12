@@ -50,7 +50,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | Setting | Default |
 | --- | --- |
 | `embedding_url` | `http://localhost:8766/v1` |
-| `embedding_model` | `qwen3-embedding-8b` |
+| `embedding_model` | `qwen3-embedding-4b` |
 | `reranker_url` | `http://localhost:8767/rerank` |
 | `reranker_model` | `qwen3-reranker-4b` |
 | `data_dir` | `%LOCALAPPDATA%\local-code-intelligence` on Windows |

@@ -35,7 +35,7 @@ impl Default for Config {
             .unwrap_or_default();
         Self {
             embedding_url: "http://localhost:8766/v1".into(),
-            embedding_model: "qwen3-embedding-8b".into(),
+            embedding_model: "qwen3-embedding-4b".into(),
             reranker_url: "http://localhost:8767/rerank".into(),
             reranker_model: "qwen3-reranker-4b".into(),
             data_dir: base.join("local-code-intelligence"),

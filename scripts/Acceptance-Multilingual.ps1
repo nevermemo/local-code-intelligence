@@ -61,14 +61,14 @@ export const productionPipelineDocumentation = "trim and filter events";
 $normalizedDataDir = $dataDir.Replace('\', '/')
 Write-Utf8 $configPath @"
 embedding_url = "http://localhost:8766/v1"
-embedding_model = "qwen3-embedding-8b"
+embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
 reranker_model = "qwen3-reranker-4b"
 data_dir = "$normalizedDataDir"
 "@
 Write-Utf8 $failureConfigPath @"
 embedding_url = "http://127.0.0.1:1/v1"
-embedding_model = "qwen3-embedding-8b"
+embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
 reranker_model = "qwen3-reranker-4b"
 data_dir = "$normalizedDataDir"
