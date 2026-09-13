@@ -1,0 +1,9 @@
+# Agent control-plane material remains available to coding agents without
+# competing with product source during code retrieval.
+.agents/**
+.github/agents/**
+.github/instructions/**
+.github/skills/**
+.codex/**
+.claude/**
+test-results/**

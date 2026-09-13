@@ -153,13 +153,14 @@ struct SourceFile {
 
 fn sources(root: &Path) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(root)
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker
         .hidden(false)
         .follow_links(false)
         .require_git(false)
-        .filter_entry(|e| e.file_name() != ".git")
-        .build()
-    {
+        .add_custom_ignore_filename(".lciignore")
+        .filter_entry(|e| e.file_name() != ".git");
+    for entry in walker.build() {
         let entry = entry.context("workspace traversal failed; previous index retained")?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -480,6 +481,23 @@ export interface TelemetryLifecycle {
         let chunks = scan(temp.path()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].relative_file_path, "lib.rs");
+    }
+
+    #[test]
+    fn respects_project_local_lciignore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join(".agents/skills/example")).unwrap();
+        std::fs::write(
+            temp.path().join(".agents/skills/example/template.rs"),
+            "fn skill_template() {}\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(".lciignore"), ".agents/skills/**\n").unwrap();
+
+        let chunks = scan(temp.path()).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].relative_file_path, "visible.rs");
     }
 
     #[test]

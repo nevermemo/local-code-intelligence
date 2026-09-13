@@ -15,6 +15,11 @@ Supported source extensions and result language identifiers are exact and case-s
 
 TypeScript, JavaScript, and Python have Tree-sitter syntax indexing and retrieval, but no language-server integration. Rust remains the only language supported by symbol, definition, and reference navigation.
 
+## Documentation
+
+- [Architecture guide](docs/architecture.md): runtime boundaries, data flow, and the agent control-plane exclusion.
+- [Testing guide](docs/development/testing.md): focused suite selection and the full deterministic gate.
+
 ## Build and run
 
 Build prerequisites are Rust stable 1.91 or newer, the MSVC C++ build tools/Windows SDK, CMake, and `protoc`; the setup script downloads the official Windows `protoc` binary into `.tools` inside this project. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. No Python environment or database server is required.
@@ -163,7 +168,7 @@ It verifies all supported language IDs, semantic and lexical retrieval with live
 
 ## Retrieval and persistence behavior
 
-1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.py` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
+1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.py` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. The checked-in `.lciignore` is honored as an additional ignore file and keeps agent control-plane material (`.agents`, `.github/agents`, `.github/instructions`, `.github/skills`, `.codex`, `.claude`) and generated `test-results` out of this repository's searchable corpus while leaving those files available to agents on disk. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
 2. Select a static language adapter and Tree-sitter grammar by extension. Rust retains its original declaration boundaries. TypeScript/JavaScript chunks preserve imports, executable top-level statements, exports, comments/decorators, functions, classes and methods, interfaces and signatures, type aliases, enums, and variable-assigned arrow functions. Python chunks preserve imports, assignments, executable top-level statements, synchronous functions, asynchronous functions, classes, methods, decorators, and associated leading comments. Oversized syntax splits only at named syntax boundaries toward 6,000-byte groups, with declarations preserved up to 24,000 bytes. Large indivisible leaves stay whole rather than being truncated; parser error recovery remains searchable.
 3. Hash each complete source file and persist its parsed chunks, language identifier, and adapter version in the external manifest. A later manual or watched pass reparses only changed/new files or files whose selected adapter version changed, including after restart. Fingerprints include path, content, language, and adapter version. A missing, incompatible, or malformed manifest safely causes a full parse.
 4. Hash each exact source chunk. Reuse vectors from the current workspace snapshot when content hashes and the stored embedding URL/model/document-format identity match. Parser adapter versions are intentionally decoupled from embedding compatibility, so unchanged chunk text keeps its vector. Duplicate new chunks are embedded once. Documents are embedded as source, without a query instruction.
@@ -190,8 +195,11 @@ JSON timing fields measure query embedding, LanceDB search, lexical search, Rust
 - `config` / `workspace`: configuration, canonical identity, external storage boundary.
 - `language` / `chunk` / `manifest`: static language adapters, ignore-aware incremental scan, Tree-sitter chunks, and persistent per-file parse reuse.
 - `models`: embedding and reranking HTTP clients.
+- `lexical`: ripgrep-based lexical candidate channel.
 - `lsp`: persistent rust-analyzer JSON-RPC processes and normalized navigation locations.
 - `store`: embedded LanceDB schema, snapshot writes, cosine candidates.
+- `filter`: retrieval filter validation and deterministic source-role classification.
+- `evaluate`: portable evaluation definitions, execution, and metrics; it observes retrieval without changing ranking.
 - `app`: indexing/cache coordination and retrieval pipeline.
 - `server`: MCP tools and HTTP transport. `main`: CLI/server startup.
 
@@ -203,5 +211,7 @@ cargo fmt --all --check
 $env:PROTOC = Join-Path (Get-Location) '.tools\protoc\bin\protoc.exe'
 cargo clippy --locked --all-targets -j 8 -- -D warnings
 ```
+
+For focused iteration, `scripts/Test.ps1 -Suite <name>` runs the matching test modules: `Unit`, `Chunk`, `Filter`, `Evaluation`, `Indexing`, `Readiness`, `MCP`, `Watching`, `LSP`, or `Full`. The integration suites filter the single `tests/integration.rs` binary by the module names registered there (`evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `watching`); [docs/development/testing.md](docs/development/testing.md) maps each change to its suite.
 
 Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all six language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, and actual Streamable HTTP initialization/tool discovery. Live GUST and multilingual acceptance use the real local Qwen services separately.
