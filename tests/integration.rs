@@ -68,15 +68,13 @@ async fn rerank(
         .enumerate()
         .map(|(i, d)| {
             let document = d.as_str().unwrap();
-            let score = if query == "buildProductionTelemetryPipeline"
+            let preferred_implementation = (query == "buildProductionTelemetryPipeline"
                 && document.contains("src/telemetry.ts\n")
-                && document.contains("function buildProductionTelemetryPipeline")
-            {
-                0.995
-            } else if query == "build_production_feature_pipeline"
-                && document.contains("src/feature_pipeline.py\n")
-                && document.contains("def build_production_feature_pipeline")
-            {
+                && document.contains("function buildProductionTelemetryPipeline"))
+                || (query == "build_production_feature_pipeline"
+                    && document.contains("src/feature_pipeline.py\n")
+                    && document.contains("def build_production_feature_pipeline"));
+            let score = if preferred_implementation {
                 0.995
             } else if document.contains("translator") {
                 0.99
