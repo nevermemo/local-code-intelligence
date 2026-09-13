@@ -1,6 +1,6 @@
 use crate::{
     chunk,
-    config::Config,
+    config::{Config, IndexFreshness},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest},
     language, lexical, lsp,
     manifest::{self, Manifest},
@@ -20,7 +20,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// Per-workspace coordination: the existing read/write lock plus the minimum
-/// state needed to share the outcome of an automatic first-index flight.
+/// state needed to share the outcome of an automatic first-index flight and
+/// to throttle `on-search` staleness checks.
 #[derive(Default)]
 struct WorkspaceCoordination {
     lock: RwLock<()>,
@@ -28,6 +29,10 @@ struct WorkspaceCoordination {
     /// Consulted only by a caller that holds the write lock and finds no
     /// committed snapshot; cleared when a new flight starts.
     flight_error: Mutex<Option<String>>,
+    /// Wall-clock time of the last `on-search` filesystem staleness check,
+    /// so repeated searches within `stale_check_interval_seconds` skip the
+    /// scan and reuse the current snapshot.
+    last_stale_check: Mutex<Option<Instant>>,
 }
 
 pub struct App {
@@ -98,6 +103,9 @@ pub enum IndexAction {
     Reused,
     Created,
     WaitedForExistingJob,
+    /// The previous snapshot was stale (changed files or an embedding
+    /// configuration change) and was incrementally refreshed before search.
+    RefreshedIncrementally,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +279,114 @@ impl App {
             total_ms: ms(start),
         })
     }
+
+    /// Applies the `on-search` freshness policy for a workspace that already
+    /// has a committed snapshot. Returns the action taken and, when the
+    /// previous snapshot had to be reused instead of refreshed, a warning
+    /// describing why. `identity_changed` is precomputed by the caller from
+    /// the snapshot already in hand, so an embedding configuration change is
+    /// always detected even when the filesystem staleness check is throttled.
+    async fn refresh_stale_snapshot(
+        &self,
+        workspace: &Workspace,
+        coordination: &WorkspaceCoordination,
+        identity_changed: bool,
+    ) -> Result<(IndexAction, Option<String>)> {
+        let due = {
+            let mut last = coordination.last_stale_check.lock().await;
+            let interval =
+                std::time::Duration::from_secs(self.config.index.stale_check_interval_seconds);
+            let due = last.is_none_or(|checked_at| checked_at.elapsed() >= interval);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        let current_fingerprint = if due {
+            let root = workspace.path.clone();
+            Some(tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??)
+        } else {
+            None
+        };
+        let file_stale = current_fingerprint.as_ref().is_some_and(|current| {
+            let stored = manifest::load(&self.config.data_dir, workspace);
+            stored.fingerprint.is_empty() || stored.fingerprint != *current
+        });
+        if !file_stale && !identity_changed {
+            return Ok((IndexAction::Reused, None));
+        }
+        match coordination.lock.try_write() {
+            Ok(_write) => match self.index_locked(workspace.clone()).await {
+                Ok(_) => Ok((IndexAction::RefreshedIncrementally, None)),
+                Err(error) => Self::stale_refresh_fallback(identity_changed, error),
+            },
+            Err(_) => {
+                let wait =
+                    std::time::Duration::from_secs(self.config.index.wait_for_existing_job_seconds);
+                match tokio::time::timeout(wait, coordination.lock.write()).await {
+                    Ok(_write) => {
+                        // The previous holder may already have refreshed the
+                        // snapshot; re-check before refreshing again.
+                        let still_stale = self
+                            .store
+                            .snapshot(workspace)
+                            .await?
+                            .is_some_and(|s| s.identity != self.config.embedding_identity())
+                            || current_fingerprint.is_some_and(|current| {
+                                manifest::load(&self.config.data_dir, workspace).fingerprint
+                                    != current
+                            });
+                        if !still_stale {
+                            Ok((IndexAction::WaitedForExistingJob, None))
+                        } else {
+                            match self.index_locked(workspace.clone()).await {
+                                Ok(_) => Ok((IndexAction::RefreshedIncrementally, None)),
+                                Err(error) => Self::stale_refresh_fallback(identity_changed, error),
+                            }
+                        }
+                    }
+                    Err(_elapsed) => {
+                        ensure!(
+                            !identity_changed,
+                            "embedding configuration changed and no compatible index is available; \
+                             an index refresh is already in progress"
+                        );
+                        Ok((
+                            IndexAction::Reused,
+                            Some(format!(
+                                "timed out after {}s waiting for an in-progress index refresh; reusing previous snapshot",
+                                wait.as_secs()
+                            )),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shared handling for a failed refresh attempt: an embedding-identity
+    /// change leaves no searchable snapshot, so it must be a hard failure;
+    /// a plain file-content staleness can safely fall back to the previous
+    /// snapshot with a warning.
+    fn stale_refresh_fallback(
+        identity_changed: bool,
+        error: anyhow::Error,
+    ) -> Result<(IndexAction, Option<String>)> {
+        if identity_changed {
+            Err(error.context(
+                "embedding configuration changed; automatic reindex failed and the previous \
+                 incompatible snapshot cannot be searched",
+            ))
+        } else {
+            Ok((
+                IndexAction::Reused,
+                Some(format!(
+                    "index refresh unavailable; reusing previous snapshot: {error:#}"
+                )),
+            ))
+        }
+    }
+
     pub async fn status(&self, path: &Path) -> Result<Status> {
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let coordination = self.lock(&workspace.id).await;
@@ -490,6 +606,7 @@ impl App {
         let snapshot;
         let index_action;
         let index_wait_ms;
+        let mut index_warning = None;
         if initial_snapshot.is_none() {
             let flight = Instant::now();
             let mut created = false;
@@ -551,22 +668,37 @@ impl App {
             _read_guard = coordination.lock.read().await;
             snapshot = self.store.snapshot(&workspace).await?;
         } else {
+            let flight = Instant::now();
+            let identity_changed = initial_snapshot
+                .as_ref()
+                .is_some_and(|s| s.identity != self.config.embedding_identity());
+            match self.config.index.freshness {
+                IndexFreshness::OnSearch => {
+                    let (action, warning) = self
+                        .refresh_stale_snapshot(&workspace, &coordination, identity_changed)
+                        .await?;
+                    index_action = action;
+                    index_warning = warning;
+                }
+                IndexFreshness::Manual | IndexFreshness::Watch => {
+                    ensure!(
+                        !identity_changed,
+                        "embedding configuration changed; reindex workspace"
+                    );
+                    index_action = IndexAction::Reused;
+                }
+            }
+            index_wait_ms = ms(flight);
             _read_guard = coordination.lock.read().await;
             snapshot = self.store.snapshot(&workspace).await?;
-            index_action = IndexAction::Reused;
-            index_wait_ms = 0.0;
         }
         let snapshot = snapshot.context("workspace is not indexed; call index_workspace first")?;
-        ensure!(
-            snapshot.identity == self.config.embedding_identity(),
-            "embedding configuration changed; reindex workspace"
-        );
         let mut report = SearchReport {
             workspace,
             query: query.into(),
             candidate_count: 0,
             reranked: false,
-            warning: None,
+            warning: index_warning,
             timings: Timings::default(),
             results: vec![],
             index: SearchIndexLifecycle {
@@ -640,14 +772,25 @@ impl App {
             {
                 Ok(hits) => hits,
                 Err(error) => {
-                    report.warning = Some(format!("Semantic retrieval unavailable: {error:#}"));
+                    let message = format!("Semantic retrieval unavailable: {error:#}");
+                    report.warning = Some(
+                        report
+                            .warning
+                            .take()
+                            .map_or(message.clone(), |w| format!("{w}; {message}")),
+                    );
                     vec![]
                 }
             },
             Err(error) => {
-                report.warning = Some(format!(
-                    "Query embedding unavailable; lexical results used: {error:#}"
-                ));
+                let message =
+                    format!("Query embedding unavailable; lexical results used: {error:#}");
+                report.warning = Some(
+                    report
+                        .warning
+                        .take()
+                        .map_or(message.clone(), |w| format!("{w}; {message}")),
+                );
                 vec![]
             }
         };

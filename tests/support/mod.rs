@@ -6,7 +6,7 @@ use axum::{
 };
 use local_code_intelligence::{
     app::App,
-    config::Config,
+    config::{Config, IndexFreshness},
     evaluate::{
         EvalQuery, EvalWorkspace, EvaluationFile, QueryReport, ResultEvidence, aggregate,
         has_failures, load_definition, parse_workspace_mappings, query_metrics,

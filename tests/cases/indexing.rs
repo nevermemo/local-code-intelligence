@@ -116,8 +116,9 @@ async fn failed_initial_search_preserves_no_snapshot_and_can_retry() {
 }
 
 #[tokio::test]
-async fn stale_snapshot_is_reused_without_automatic_refresh() {
-    let (temp, config, fake, task) = fixture().await;
+async fn manual_freshness_reuses_stale_snapshot_without_refresh() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Manual;
     let workspace = temp.path().join("stale");
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = App::open(config).await.unwrap();
@@ -140,8 +141,152 @@ async fn stale_snapshot_is_reused_without_automatic_refresh() {
 }
 
 #[tokio::test]
-async fn persistence_incremental_isolation_deletion_and_fail_open() {
+async fn on_search_freshness_refreshes_a_stale_snapshot_before_searching() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    let workspace = temp.path().join("stale");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    let first = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    let document_requests = fake.document_requests.load(Ordering::SeqCst);
+
+    write(&workspace, "lib.rs", "fn replacement() {}\n");
+    assert!(app.status(&workspace).await.unwrap().stale);
+    let refreshed = app
+        .search(&workspace, "replacement", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&refreshed).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(refreshed.results[0].chunk.code.contains("replacement"));
+    assert!(!app.status(&workspace).await.unwrap().stale);
+    assert!(fake.document_requests.load(Ordering::SeqCst) > document_requests);
+    task.abort();
+}
+
+#[tokio::test]
+async fn on_search_freshness_reuses_snapshot_within_throttle_interval() {
     let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("stale");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    // Perform one more search while the workspace is unchanged, so the first
+    // (always-due) staleness check runs and starts the throttle window.
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    let document_requests = fake.document_requests.load(Ordering::SeqCst);
+
+    // Changed within the default 10s throttle window: the staleness check is
+    // skipped, so the previous snapshot is reused rather than refreshed.
+    write(&workspace, "lib.rs", "fn replacement() {}\n");
+    let reused = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&reused).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        document_requests
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn on_search_freshness_reuses_snapshot_when_refresh_is_unavailable() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    let workspace = temp.path().join("stale");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    let document_requests = fake.document_requests.load(Ordering::SeqCst);
+
+    // Keep the original chunk on disk (so lexical search still finds it in
+    // the retained snapshot) while adding a new chunk that would need
+    // embedding, so the incremental refresh has work to fail on.
+    write(&workspace, "lib.rs", "fn translator() {}\nfn extra() {}\n");
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let unavailable = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&unavailable).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(
+        unavailable
+            .warning
+            .as_ref()
+            .unwrap()
+            .contains("refresh unavailable")
+    );
+    assert!(unavailable.results[0].chunk.code.contains("translator"));
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        document_requests
+    );
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    task.abort();
+}
+
+#[tokio::test]
+async fn on_search_freshness_waits_for_a_concurrent_refresh_job() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    fake.embed_delay_milliseconds.store(200, Ordering::SeqCst);
+    let workspace = temp.path().join("stale");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    fake.embed_delay_milliseconds.store(0, Ordering::SeqCst);
+
+    write(&workspace, "lib.rs", "fn replacement() {}\n");
+    fake.embed_delay_milliseconds.store(200, Ordering::SeqCst);
+    let first_app = app.clone();
+    let first_workspace = workspace.clone();
+    let first = tokio::spawn(async move {
+        first_app
+            .search(&first_workspace, "replacement", Some(1))
+            .await
+            .unwrap()
+    });
+    while fake.document_requests.load(Ordering::SeqCst) == 1 {
+        tokio::task::yield_now().await;
+    }
+    let second_app = app.clone();
+    let second_workspace = workspace.clone();
+    let second = tokio::spawn(async move {
+        second_app
+            .search(&second_workspace, "replacement", Some(1))
+            .await
+            .unwrap()
+    });
+    let (first, second) = tokio::join!(first, second);
+    let actions = [
+        serde_json::to_value(first.unwrap()).unwrap()["index"]["action"].clone(),
+        serde_json::to_value(second.unwrap()).unwrap()["index"]["action"].clone(),
+    ];
+    assert!(
+        actions.contains(&json!("refreshed_incrementally")),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&json!("waited_for_existing_job")),
+        "{actions:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn persistence_incremental_isolation_deletion_and_fail_open() {
+    let (temp, mut config, fake, task) = fixture().await;
+    // This test drives explicit index()/status() calls; automatic on-search
+    // refresh is covered separately by the freshness-policy tests below.
+    config.index.freshness = IndexFreshness::Manual;
     let a = temp.path().join("a");
     let b = temp.path().join("b");
     write(&a, "lib.rs", "fn translator() {}\nfn unrelated() {}\n");

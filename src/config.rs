@@ -2,6 +2,45 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Controls when a search request may trigger an automatic incremental
+/// refresh of a workspace's index. `on-search` is the default for coding
+/// agents: freshness is checked lazily on the first retrieval that needs it,
+/// throttled by `stale_check_interval_seconds`. `watch` defers refresh to the
+/// background watcher started by `watch_workspace` instead of checking on
+/// every search, which suits long-running editor sessions. `manual` never
+/// refreshes automatically; callers must call `index_workspace` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexFreshness {
+    Manual,
+    #[default]
+    OnSearch,
+    Watch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexConfig {
+    pub freshness: IndexFreshness,
+    /// Minimum interval between filesystem staleness checks for a workspace
+    /// under `on-search` freshness, so repeated searches in the same
+    /// unchanged workspace reuse the current snapshot instead of rescanning.
+    pub stale_check_interval_seconds: u64,
+    /// How long a search waits for a concurrently running refresh job before
+    /// falling back to the previous snapshot.
+    pub wait_for_existing_job_seconds: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            freshness: IndexFreshness::OnSearch,
+            stale_check_interval_seconds: 10,
+            wait_for_existing_job_seconds: 120,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -25,6 +64,7 @@ pub struct Config {
     pub rust_analyzer_path: String,
     pub lsp_timeout_seconds: u64,
     pub lsp_candidate_count: usize,
+    pub index: IndexConfig,
 }
 
 impl Default for Config {
@@ -55,6 +95,7 @@ impl Default for Config {
             rust_analyzer_path: "rust-analyzer".into(),
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
+            index: IndexConfig::default(),
         }
     }
 }

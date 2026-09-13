@@ -153,6 +153,7 @@ pub async fn run_evaluation(
                 IndexAction::Reused => IndexLifecycleAction::Reused,
                 IndexAction::Created => IndexLifecycleAction::Created,
                 IndexAction::WaitedForExistingJob => IndexLifecycleAction::WaitedForExistingJob,
+                IndexAction::RefreshedIncrementally => IndexLifecycleAction::RefreshedIncrementally,
             }),
             Some(report.index.wait_ms),
         ));

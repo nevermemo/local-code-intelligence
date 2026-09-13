@@ -148,6 +148,7 @@ pub enum IndexLifecycleAction {
     Reused,
     Created,
     WaitedForExistingJob,
+    RefreshedIncrementally,
 }
 
 // ---------------------------------------------------------------------------

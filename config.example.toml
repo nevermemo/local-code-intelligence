@@ -22,3 +22,15 @@ watch_debounce_milliseconds = 750
 rust_analyzer_path = "rust-analyzer"
 lsp_timeout_seconds = 60
 lsp_candidate_count = 40
+
+[index]
+# manual: never refresh automatically; call index_workspace explicitly.
+# on-search: refresh a stale snapshot on the first search that needs it (default for agents).
+# watch: leave refresh to watch_workspace's background poller instead of checking on every search.
+freshness = "on-search"
+# Throttles filesystem staleness checks under "on-search" so repeated
+# searches in the same unchanged workspace reuse the current snapshot.
+stale_check_interval_seconds = 10
+# How long a search waits for a concurrently running refresh job before
+# falling back to the previous snapshot.
+wait_for_existing_job_seconds = 120
