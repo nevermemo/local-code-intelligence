@@ -17,7 +17,7 @@ TypeScript, JavaScript, and Python have Tree-sitter syntax indexing and retrieva
 
 ## Build and run
 
-Prerequisites: Rust stable 1.91 or newer, ripgrep (`rg`) on `PATH`, the MSVC C++ build tools/Windows SDK, and CMake. Rust navigation additionally needs the `rust-analyzer` and `rust-src` Rustup components. LanceDB also needs `protoc` at build time; the setup script downloads the official Windows binary into `.tools` inside this project. No Python environment or database server is required.
+Build prerequisites are Rust stable 1.91 or newer, the MSVC C++ build tools/Windows SDK, CMake, and `protoc`; the setup script downloads the official Windows `protoc` binary into `.tools` inside this project. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. No Python environment or database server is required.
 
 ```powershell
 cd C:\Users\micro\Desktop\local-code-intelligence
@@ -35,6 +35,7 @@ The executable serves:
 
 - MCP: `http://127.0.0.1:8768/mcp`
 - Health: `http://127.0.0.1:8768/health`
+- Readiness: `http://127.0.0.1:8768/ready`
 
 Smoke test from another PowerShell window:
 
@@ -42,7 +43,7 @@ Smoke test from another PowerShell window:
 Invoke-RestMethod http://127.0.0.1:8768/health
 ```
 
-The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation and supports session-based older clients as well as the SDK's current protocol. `/health` reports process liveness; it does not claim that either model service is ready. Ctrl+C stops the server.
+The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation and supports session-based older clients as well as the SDK's current protocol. `/health` is a cheap process-liveness check and never contacts model services. `/ready` and the MCP `service_status` tool return the same bounded dependency report. They return HTTP 200 when a new semantic index can be created, even if optional channels are degraded, and `/ready` returns HTTP 503 when a required dependency is unavailable. Ctrl+C stops the server.
 
 ## Configuration
 
@@ -59,6 +60,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | `embedding_batch_size` | 8 |
 | `embedding_timeout_seconds` | 120 per batch |
 | `reranker_timeout_seconds` | 120 |
+| `readiness_timeout_seconds` | 5 (allowed: 1–30) |
 | `ripgrep_path` | `rg` (on Windows, also discovers common VS Code-bundled copies) |
 | `semantic_candidate_count` | 40 |
 | `lexical_candidate_count` | 40 |
@@ -72,7 +74,7 @@ Defaults work with the services specified for this project. Copy `config.example
 
 Persistent data lives in `data_dir\lancedb` and `data_dir\manifests`, outside indexed repositories. Canonicalization resolves path aliases and symlinks. A SHA-256 of the canonical workspace path identifies a workspace; each workspace has a separate LanceDB table and parse manifest. Manifest schema v2 records language and adapter compatibility per file, so changing one language parser does not invalidate unaffected languages. Compatible schema-v1 Rust manifests are migrated without reparsing unchanged files. Data directories and indexed workspaces cannot contain one another. Moving a repository creates a new workspace identity. This milestone has no automatic index cleanup command.
 
-The generation service at port 8765 is independent and is never called, proxied, or managed by this application.
+The generation service at port 8765 is independent and is never called, inspected, proxied, or managed by this application.
 
 ## MCP tools
 
@@ -87,7 +89,8 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `search_symbols` | `workspace_path`, `query` | Workspace symbols from rust-analyzer |
 | `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations from rust-analyzer |
 | `find_references` | the definition arguments plus optional `include_declaration` | Reference locations from rust-analyzer |
-| `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks with absolute/relative paths, inclusive one-based lines, semantic/reranker scores, timings and fallback warning |
+| `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, and index lifecycle metadata |
+| `service_status` | none | The same required/optional readiness report as `/ready` |
 
 Example arguments:
 
@@ -103,7 +106,11 @@ Example arguments:
 }
 ```
 
-Indexing is synchronous: its tool call finishes when the new index is persisted. Allow a long client tool timeout for the first indexing pass. Index writes are serialized in the running service, with per-workspace read/write coordination. This version is intended for one running service per data directory; multiple clients should connect to that service.
+`search_code` automatically creates a missing workspace index, waits for its commit, and continues the requested search in the same call. Concurrent first searches for one workspace share that indexing job; different callers receive results from the committed snapshot without duplicate document embeddings. A compatible persisted index is reused immediately after restart. A stale but searchable snapshot is also reused and is not refreshed by ordinary search; use `index_workspace` for an explicit refresh or `watch_workspace` for opted-in updates.
+
+The search result's separate `index` object explains first-search latency. `action: created` means that request performed initial indexing, `waited_for_existing_job` means another concurrent request performed it, and `reused` means a compatible snapshot was already available. `wait_ms` covers index creation or waiting and is zero or near zero for reuse; it does not overload retrieval-stage timing fields. Indexing is synchronous and finishes when the new index is persisted, so allow a long client tool timeout for a first search or explicit indexing pass. Index writes are serialized in the running service, with per-workspace read/write coordination. This version is intended for one running service per data directory; multiple clients should connect to that service.
+
+Readiness requires a writable application data directory, accessible embedded LanceDB storage, a reachable embedding endpoint, and the configured embedding model in its OpenAI-compatible model listing. Reranking and ripgrep are optional fail-open channels. Rust-analyzer is optional and affects only Rust navigation and the Rust LSP candidate channel. Dependency probes use `readiness_timeout_seconds`; readiness never downloads, starts, stops, or manages dependencies, and it never inspects or contacts the independent generation service on port 8765.
 
 Watching is opt-in for each server run. It polls only after `watch_workspace`, debounces a detected source change, and calls the same safe indexing path. Watch registrations are not restored after a process restart; persistent indexes and manifests are. A failed automatic update is logged and retried after another poll while the prior LanceDB snapshot remains searchable.
 

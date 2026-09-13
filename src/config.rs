@@ -14,6 +14,7 @@ pub struct Config {
     pub embedding_batch_size: usize,
     pub embedding_timeout_seconds: u64,
     pub reranker_timeout_seconds: u64,
+    pub readiness_timeout_seconds: u64,
     pub ripgrep_path: String,
     pub semantic_candidate_count: usize,
     pub lexical_candidate_count: usize,
@@ -43,6 +44,7 @@ impl Default for Config {
             embedding_batch_size: 8,
             embedding_timeout_seconds: 120,
             reranker_timeout_seconds: 120,
+            readiness_timeout_seconds: 5,
             ripgrep_path: "rg".into(),
             semantic_candidate_count: 40,
             lexical_candidate_count: 40,
@@ -106,6 +108,10 @@ impl Config {
         ensure!(
             self.embedding_timeout_seconds > 0 && self.reranker_timeout_seconds > 0,
             "timeouts must be positive"
+        );
+        ensure!(
+            (1..=30).contains(&self.readiness_timeout_seconds),
+            "readiness_timeout_seconds must be 1..=30"
         );
         for value in [&self.embedding_url, &self.reranker_url] {
             let url = reqwest::Url::parse(value)?;

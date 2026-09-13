@@ -39,6 +39,9 @@ impl Models {
             config: config.clone(),
         })
     }
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
     pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         ensure!(!inputs.is_empty(), "embedding input is empty");
         let response = self.client.post(format!("{}/embeddings", self.config.embedding_url.trim_end_matches('/')))

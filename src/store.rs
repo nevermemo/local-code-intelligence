@@ -51,6 +51,12 @@ impl Store {
         })
     }
 
+    /// Smallest non-mutating accessibility probe: list table names.
+    pub async fn accessibility_probe(&self, _path: &Path) -> Result<()> {
+        self.db.table_names().execute().await?;
+        Ok(())
+    }
+
     pub async fn snapshot(&self, workspace: &Workspace) -> Result<Option<Snapshot>> {
         let table = match self.db.open_table(workspace.table_name()).execute().await {
             Ok(t) => t,

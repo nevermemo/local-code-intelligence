@@ -1,4 +1,9 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
 use local_code_intelligence::{app::App, config::Config, models::QUERY_INSTRUCTION};
 use serde_json::{Value, json};
 use std::{
@@ -7,12 +12,15 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 #[derive(Default)]
 struct FakeModels {
     documents: AtomicUsize,
+    document_requests: AtomicUsize,
     queries: AtomicUsize,
+    embed_delay_milliseconds: AtomicUsize,
     rerank_fails: AtomicBool,
     embed_fails: AtomicBool,
     malformed_rerank: AtomicBool,
@@ -26,6 +34,16 @@ async fn embed(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let inputs = body["input"].as_array().unwrap();
+    if inputs
+        .iter()
+        .any(|text| !text.as_str().unwrap().starts_with(QUERY_INSTRUCTION))
+    {
+        state.document_requests.fetch_add(1, Ordering::SeqCst);
+        let delay = state.embed_delay_milliseconds.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+    }
     let mut data = Vec::new();
     for (index, text) in inputs.iter().enumerate() {
         let text = text.as_str().unwrap();
@@ -48,6 +66,18 @@ async fn embed(
     data.reverse();
     Ok(Json(json!({"data":data})))
 }
+
+async fn model_endpoint() -> Json<Value> {
+    Json(json!({"status":"ok"}))
+}
+
+async fn models() -> Json<Value> {
+    Json(json!({"data":[
+        {"id":"qwen3-embedding-4b"},
+        {"id":"qwen3-reranker-4b"}
+    ]}))
+}
+
 async fn rerank(
     State(state): State<Arc<FakeModels>>,
     Json(body): Json<Value>,
@@ -96,8 +126,10 @@ async fn fixture() -> (
     let temp = tempfile::tempdir().unwrap();
     let state = Arc::new(FakeModels::default());
     let router = Router::new()
+        .route("/v1", get(model_endpoint))
+        .route("/v1/models", get(models))
         .route("/v1/embeddings", post(embed))
-        .route("/rerank", post(rerank))
+        .route("/rerank", get(model_endpoint).post(rerank))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -121,6 +153,145 @@ fn write(root: &Path, name: &str, content: &str) {
 }
 
 #[tokio::test]
+async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("automatic");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() { println!(\"ready\"); }\n",
+    );
+    let app = App::open(config.clone()).await.unwrap();
+
+    let first = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(first.results[0].chunk.code.contains("translator"));
+    let document_requests = fake.document_requests.load(Ordering::SeqCst);
+    let documents = fake.documents.load(Ordering::SeqCst);
+
+    let second = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&second).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        document_requests
+    );
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents);
+
+    drop(app);
+    let reopened = App::open(config).await.unwrap();
+    let after_restart = reopened
+        .search(&workspace, "translator", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_restart).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        document_requests
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_first_searches_share_one_initial_index_job() {
+    let (temp, config, fake, task) = fixture().await;
+    fake.embed_delay_milliseconds.store(200, Ordering::SeqCst);
+    let workspace = temp.path().join("concurrent");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+
+    let first_app = app.clone();
+    let first_workspace = workspace.clone();
+    let first = tokio::spawn(async move {
+        first_app
+            .search(&first_workspace, "translator", Some(1))
+            .await
+            .unwrap()
+    });
+    while fake.document_requests.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let second_app = app.clone();
+    let second_workspace = workspace.clone();
+    let second = tokio::spawn(async move {
+        second_app
+            .search(&second_workspace, "translator", Some(1))
+            .await
+            .unwrap()
+    });
+    let (first, second) = tokio::join!(first, second);
+    let actions = [
+        serde_json::to_value(first.unwrap()).unwrap()["index"]["action"].clone(),
+        serde_json::to_value(second.unwrap()).unwrap()["index"]["action"].clone(),
+    ];
+    assert!(actions.contains(&json!("created")), "{actions:?}");
+    assert!(
+        actions.contains(&json!("waited_for_existing_job")),
+        "{actions:?}"
+    );
+    assert_eq!(fake.document_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_initial_search_preserves_no_snapshot_and_can_retry() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("retry");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    fake.embed_fails.store(true, Ordering::SeqCst);
+
+    let error = app
+        .search(&workspace, "translator", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("embedding service HTTP error"));
+    assert!(!app.status(&workspace).await.unwrap().indexed);
+
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let retried = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(retried).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(app.status(&workspace).await.unwrap().indexed);
+    task.abort();
+}
+
+#[tokio::test]
+async fn stale_snapshot_is_reused_without_automatic_refresh() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("stale");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    let document_requests = fake.document_requests.load(Ordering::SeqCst);
+    write(&workspace, "lib.rs", "fn replacement() {}\n");
+    assert!(app.status(&workspace).await.unwrap().stale);
+
+    let stale = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&stale).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(stale.results[0].chunk.code.contains("translator"));
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        document_requests
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn persistence_incremental_isolation_deletion_and_fail_open() {
     let (temp, config, fake, task) = fixture().await;
     let a = temp.path().join("a");
@@ -129,12 +300,16 @@ async fn persistence_incremental_isolation_deletion_and_fail_open() {
     write(&b, "lib.rs", "fn repository_b() {}\n");
     let app = App::open(config.clone()).await.unwrap();
     assert!(!app.status(&a).await.unwrap().indexed);
-    assert!(app.search(&a, "translator", None).await.is_err());
+    let automatic = app.search(&a, "translator", None).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&automatic).unwrap()["index"]["action"],
+        "created"
+    );
     let first = app.index(&a).await.unwrap();
     assert_eq!(first.chunks, 2);
-    assert_eq!(first.embedded_chunks, 2);
-    assert_eq!(first.parsed_files, 1);
-    assert_eq!(first.unchanged_files, 0);
+    assert_eq!(first.embedded_chunks, 0);
+    assert_eq!(first.parsed_files, 0);
+    assert_eq!(first.unchanged_files, 1);
     app.index(&b).await.unwrap();
     let unchanged = app.index(&a.join(".")).await.unwrap();
     assert_eq!(unchanged.workspace.id, first.workspace.id);
@@ -153,7 +328,7 @@ async fn persistence_incremental_isolation_deletion_and_fail_open() {
             .iter()
             .all(|h| !h.chunk.code.contains("repository_b"))
     );
-    assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 2);
     fake.embed_fails.store(true, Ordering::SeqCst);
     let direct_lexical = local_code_intelligence::lexical::search("rg", &a, "translator")
         .await
@@ -674,6 +849,7 @@ async fn http_mcp_initialization_tools_and_health() {
         "search_symbols",
         "find_definition",
         "find_references",
+        "service_status",
     ] {
         assert!(tools.contains(name), "{tools}");
     }
@@ -719,4 +895,118 @@ async fn http_mcp_initialization_tools_and_health() {
     token.cancel();
     server.abort();
     models_task.abort();
+}
+
+#[tokio::test]
+async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let unavailable = Config {
+        data_dir: temp.path().join("unavailable-data"),
+        embedding_url: "http://127.0.0.1:1/v1".into(),
+        reranker_url: "http://127.0.0.1:1/rerank".into(),
+        ripgrep_path: "definitely-missing-ripgrep".into(),
+        rust_analyzer_path: "definitely-missing-rust-analyzer".into(),
+        readiness_timeout_seconds: 1,
+        ..Config::default()
+    };
+    let app = Arc::new(App::open(unavailable).await.unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = local_code_intelligence::server::router(app, token.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let failed_ready = client.get(format!("{base}/ready")).send().await.unwrap();
+    assert_eq!(failed_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let failed: Value = failed_ready.json().await.unwrap();
+    assert_eq!(failed["ready"], false);
+    assert!(
+        failed["degraded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "embedding_endpoint_reachable")
+    );
+    token.cancel();
+    server.abort();
+
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.reranker_url = "http://127.0.0.1:1/rerank".into();
+    config.ripgrep_path = "definitely-missing-ripgrep".into();
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    config.readiness_timeout_seconds = 1;
+    let app = Arc::new(App::open(config).await.unwrap());
+    let direct = serde_json::to_value(app.service_status().await).unwrap();
+    assert_eq!(direct["ready"], true);
+    assert_eq!(direct["can_create_semantic_index"], true);
+    for name in [
+        "reranker_endpoint_reachable",
+        "ripgrep_available",
+        "rust_analyzer_available",
+    ] {
+        assert!(
+            direct["degraded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == name)
+        );
+    }
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = local_code_intelligence::server::router(app, token.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let ready = client.get(format!("{base}/ready")).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let ready_json: Value = ready.json().await.unwrap();
+    assert_eq!(ready_json["ready"], direct["ready"]);
+    assert_eq!(
+        ready_json["can_create_semantic_index"],
+        direct["can_create_semantic_index"]
+    );
+    assert_eq!(ready_json["components"], direct["components"]);
+
+    let initialize = client.post(format!("{base}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"readiness-test","version":"1"}}}))
+        .send().await.unwrap();
+    let session = initialize
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!("{base}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .send()
+        .await
+        .unwrap();
+    let mcp = client.post(format!("{base}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"service_status","arguments":{}}}))
+        .send().await.unwrap().text().await.unwrap();
+    assert!(mcp.contains("\"ready\":true"), "{mcp}");
+    assert!(mcp.contains("\"can_create_semantic_index\":true"), "{mcp}");
+    assert!(!mcp.contains("8765"), "{mcp}");
+    assert!(!serde_json::to_string(&ready_json).unwrap().contains("8765"));
+    token.cancel();
+    server.abort();
+    models_task.abort();
+    drop(temp);
 }

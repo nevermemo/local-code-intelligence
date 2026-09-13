@@ -9,6 +9,8 @@ default_top_k = 8
 embedding_batch_size = 8
 embedding_timeout_seconds = 120
 reranker_timeout_seconds = 120
+# Bounded timeout for /ready and service_status dependency probes (1-30 seconds).
+readiness_timeout_seconds = 5
 ripgrep_path = "rg"
 semantic_candidate_count = 40
 lexical_candidate_count = 40
