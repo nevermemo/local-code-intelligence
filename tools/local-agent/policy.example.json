@@ -34,7 +34,18 @@
     "maxTurns": 24,
     "maxReadLines": 400,
     "maxPatchBytes": 24576,
-    "maxToolResultBytes": 16384
+    "maxToolResultBytes": 16384,
+    "modelRequestTimeoutMs": 600000,
+    "mcpRequestTimeoutMs": 60000,
+    "checkTimeoutMs": 600000,
+    "gitTimeoutMs": 60000,
+    "taskDeadlineMs": 1800000,
+    "retryBudget": {
+      "model_failure": 1,
+      "mcp_failure": 1,
+      "patch_rejected": 2,
+      "check_failed": 1
+    }
   },
   "checks": {
     "script": "scripts/Test.ps1",

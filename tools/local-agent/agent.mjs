@@ -30,6 +30,33 @@
 // - Dry-run: policy is resolved and validated, the task is validated, and the
 //   planned tool surface is listed. `apply_patch` and `run_check` are blocked
 //   (they would be refused at execution time anyway).
+//
+// Reliability / recovery notes:
+// - Every outbound request is bounded: a per-model-request timeout, a
+//   per-MCP-request timeout, and a per-child-process timeout. The overall
+//   task deadline additionally bounds the whole run independently of the
+//   turn budget: it is checked before every model turn, every tool call, and
+//   every MCP request, and each in-flight request's timeout is capped at the
+//   remaining deadline, so no single request can outlive the task.
+// - Cancellation is graceful: SIGINT/SIGTERM abort in-flight model, MCP, and
+//   child-process work, the loop stops at the next safe point, and a
+//   checkpoint is written. A cancellation is never reported as a timeout,
+//   and a deadline expiry is never reported as a cancellation.
+// - Every run has a persistent task id and a compact checkpoint file. The
+//   growing conversation is never persisted; only the task contract identity,
+//   tool metadata, the accepted change summary (including a SHA-256 hash per
+//   accepted file), and the accepted patch-chain identity are, so `--resume` stays
+//   small and predictable. `--resume` reconstructs a fresh model
+//   conversation from that compact state (a resume summary), never a replayed
+//   transcript. MCP initialization happens once per run and is never retried.
+// - Checkpoint file-hash validation: `--resume` re-hashes every recorded
+//   accepted file and refuses with `state_drift` when a recorded file is
+//   missing or its content differs from the recorded SHA-256.
+// - Failures are classified (model / MCP / patch rejection / check failure /
+//   coordinator cancellation / deadline expiry / state drift / harness, with
+//   operation-specific timeout codes) and each class has its own narrow retry
+//   budget. A repeated identical failing tool call stops the run and returns
+//   control to the coordinator.
 
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -41,7 +68,43 @@ import { fileURLToPath } from 'node:url';
 
 const SCHEMA = 'local-agent.policy/v1';
 const CONTRACT_SCHEMA = 'local-agent.task/v1';
+const STATE_SCHEMA = 'local-agent.state/v1';
 const CONTRACT_ID_RE = /^[A-Za-z0-9._-]+$/;
+const TASK_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+// Default request bounds (milliseconds). Every one is overridable through the
+// optional policy `limits` fields of the same name.
+export const DEFAULT_LIMITS = Object.freeze({
+  modelRequestTimeoutMs: 600000,
+  mcpRequestTimeoutMs: 60000,
+  checkTimeoutMs: 600000,
+  gitTimeoutMs: 60000,
+  taskDeadlineMs: 1800000,
+});
+
+// Failure classes. The coordinator distinguishes these so a transport problem
+// is never confused with a rejected patch or a failing check.
+export const FAILURE_CLASSES = Object.freeze([
+  'model_failure',
+  'mcp_failure',
+  'patch_rejected',
+  'check_failed',
+  'coordinator_cancelled',
+  'deadline_exceeded',
+  'harness_failure',
+]);
+
+// Narrow per-class retry budgets. `coordinator_cancelled`, `deadline_exceeded`
+// and `harness_failure` are never retried: they return control immediately.
+export const DEFAULT_RETRY_BUDGET = Object.freeze({
+  model_failure: 1,
+  mcp_failure: 1,
+  patch_rejected: 2,
+  check_failed: 1,
+  coordinator_cancelled: 0,
+  deadline_exceeded: 0,
+  harness_failure: 0,
+});
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -72,17 +135,63 @@ Options:
   --contract <path>    Path to a local-agent.task/v1 JSON contract. The
                        contract supplies the task text and the allowed-file /
                        check-suite restrictions enforced by the tools.
+  --task-id <id>       Persistent task id ([A-Za-z0-9._-]+). Defaults to the
+                       contract id, else a stable hash of the task text.
+  --state <path>       Checkpoint file path. Defaults to
+                       <audit dir>/state/<task-id>.json.
+  --resume             Resume from the existing checkpoint instead of starting
+                       a new run. The task id and task text must match.
+  --stop-after-first-patch
+                       Stop as soon as one patch is accepted.
+  --stop-after-first-failed-check
+                       Stop as soon as one check fails.
   --dry-run            Resolve and validate the policy and task, list the
                        planned tool surface, and exit without contacting the
                        model or writing files.
   --help               Show this help.
+
+Exit codes:
+  0 success (awaiting_review, stopped_after_patch, stopped_after_failed_check)
+  1 failed        2 no_changes        3 cancelled or deadline_exceeded
 `;
 
 export function parseArgs(argv) {
-  const out = { policy: null, task: null, taskFile: null, contract: null, dryRun: false, help: false };
+  const out = {
+    policy: null,
+    task: null,
+    taskFile: null,
+    contract: null,
+    taskId: null,
+    state: null,
+    resume: false,
+    stopAfterFirstPatch: false,
+    stopAfterFirstFailedCheck: false,
+    dryRun: false,
+    help: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
+      case '--task-id':
+        if (out.taskId !== null) throw new AgentError('--task-id given more than once');
+        out.taskId = argv[++i];
+        if (out.taskId === undefined) throw new AgentError('--task-id requires a value');
+        if (!TASK_ID_RE.test(out.taskId)) throw new AgentError('--task-id must match [A-Za-z0-9._-]+');
+        break;
+      case '--state':
+        if (out.state !== null) throw new AgentError('--state given more than once');
+        out.state = argv[++i];
+        if (out.state === undefined) throw new AgentError('--state requires a value');
+        break;
+      case '--resume':
+        out.resume = true;
+        break;
+      case '--stop-after-first-patch':
+        out.stopAfterFirstPatch = true;
+        break;
+      case '--stop-after-first-failed-check':
+        out.stopAfterFirstFailedCheck = true;
+        break;
       case '--policy':
         if (out.policy !== null) throw new AgentError('--policy given more than once');
         out.policy = argv[++i];
@@ -265,6 +374,32 @@ export function loadPolicy(policyPath) {
     maxPatchBytes: requirePositiveInt(raw.limits, 'maxPatchBytes', 'limits'),
     maxToolResultBytes: requirePositiveInt(raw.limits, 'maxToolResultBytes', 'limits'),
   };
+  // Optional request bounds. Absent fields fall back to DEFAULT_LIMITS so an
+  // existing policy keeps working unchanged.
+  for (const key of Object.keys(DEFAULT_LIMITS)) {
+    limits[key] = raw.limits[key] === undefined
+      ? DEFAULT_LIMITS[key]
+      : requirePositiveInt(raw.limits, key, 'limits');
+  }
+  // Optional per-failure-class retry budget. Unknown classes are rejected;
+  // absent classes keep the default budget.
+  const retryBudget = { ...DEFAULT_RETRY_BUDGET };
+  if (raw.limits.retryBudget !== undefined) {
+    const rb = raw.limits.retryBudget;
+    if (typeof rb !== 'object' || rb === null || Array.isArray(rb)) {
+      throw new AgentError('limits.retryBudget must be an object of failure class -> count');
+    }
+    for (const [cls, count] of Object.entries(rb)) {
+      if (!FAILURE_CLASSES.includes(cls)) {
+        throw new AgentError(`limits.retryBudget references unknown failure class: ${cls}`);
+      }
+      if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
+        throw new AgentError(`limits.retryBudget.${cls} must be a non-negative integer`);
+      }
+      retryBudget[cls] = count;
+    }
+  }
+  limits.retryBudget = retryBudget;
 
   const checks = {
     script: requireString(raw.checks, 'script', 'checks'),
@@ -654,12 +789,13 @@ export function resolveRepoPath(policy, relPath) {
 // ---------------------------------------------------------------------------
 
 export class AuditLog {
-  constructor(policy, { contractId = null } = {}) {
+  constructor(policy, { contractId = null, taskId = null } = {}) {
     this.path = policy.audit.jsonlPath;
     this.dir = path.dirname(this.path);
     // Contract id only (a short identifier). Never task text, source, patch,
     // or model output.
     this.contractId = contractId;
+    this.taskId = taskId;
     fs.mkdirSync(this.dir, { recursive: true });
   }
   append(entry) {
@@ -681,6 +817,7 @@ export class AuditLog {
       outputBytes,
       durationMs,
       contractId: this.contractId,
+      taskId: this.taskId,
     });
   }
   modelTurn({ turn, ok, error, inputBytes, outputBytes, durationMs }) {
@@ -694,9 +831,289 @@ export class AuditLog {
       outputBytes,
       durationMs,
       contractId: this.contractId,
+      taskId: this.taskId,
+    });
+  }
+  // Run-lifecycle metadata: retries, checkpoints, and terminal status. Like
+  // every other record, this carries identifiers and classes only.
+  lifecycle({ event, turn = null, failureClass = null, error = null, status = null }) {
+    this.append({
+      ts: new Date().toISOString(),
+      kind: 'lifecycle',
+      event,
+      turn,
+      failureClass,
+      error,
+      status,
+      contractId: this.contractId,
+      taskId: this.taskId,
     });
   }
 }
+
+// ---------------------------------------------------------------------------
+// Failure classification
+// ---------------------------------------------------------------------------
+
+// Map an AgentError code to one of FAILURE_CLASSES. The coordinator needs
+// these apart: a model transport problem, an MCP problem, a rejected patch, a
+// failing check, an explicit cancellation, and a blown deadline all call for
+// different recovery.
+export function classifyFailure(err) {
+  switch (err?.code) {
+    case 'model_timeout':
+    case 'model_error':
+    case 'model_bad_json':
+    case 'model_no_choices':
+    case 'model_empty':
+    case 'no_api_key':
+      return 'model_failure';
+    case 'mcp_timeout':
+    case 'mcp_error':
+    case 'mcp_tool_error':
+    case 'mcp_init_failed':
+      return 'mcp_failure';
+    case 'bad_patch':
+    case 'patch_mismatch':
+    case 'patch_too_large':
+    case 'write_error':
+    case 'contract_path_denied':
+      return 'patch_rejected';
+    case 'check_failed':
+    case 'check_timeout':
+      return 'check_failed';
+    case 'git_timeout':
+    case 'output_limit':
+      return 'harness_failure';
+    case 'cancelled':
+      return 'coordinator_cancelled';
+    case 'deadline_exceeded':
+      return 'deadline_exceeded';
+    default:
+      return 'harness_failure';
+  }
+}
+
+// Only transport-shaped failures are worth repeating verbatim. A missing API
+// key or a denied path is a configuration decision, not a transient fault, so
+// it is never retried even though its class has a budget.
+const RETRYABLE_CODES = new Set([
+  'model_timeout',
+  'model_error',
+  'model_bad_json',
+  'model_no_choices',
+  'model_empty',
+  'mcp_timeout',
+  'mcp_error',
+  'mcp_tool_error',
+  'patch_mismatch',
+  'check_failed',
+]);
+
+export function isRetryable(err) {
+  return RETRYABLE_CODES.has(err?.code);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent task state (checkpoint)
+// ---------------------------------------------------------------------------
+
+export function hashText(text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+// Compact, resumable run record. The growing conversation is deliberately not
+// persisted: only the task identity, the tool surface, the accepted change
+// summary (paths plus a SHA-256 hash per accepted file), and the current diff
+// identity are, so resumption stays small and predictable and a resume can
+// detect file drift.
+export class TaskState {
+  constructor({ statePath, taskId, taskHash, contractId = null, contractHash = null, tools = [] }) {
+    if (typeof taskId !== 'string' || !TASK_ID_RE.test(taskId)) {
+      throw new AgentError('task id must match [A-Za-z0-9._-]+', { code: 'bad_task_id' });
+    }
+    this.statePath = statePath;
+    this.record = {
+      schema: STATE_SCHEMA,
+      task_id: taskId,
+      status: 'running',
+      turn: 0,
+      patches_applied: 0,
+      checks_run: [],
+      files_changed: [],
+      file_hashes: {},
+      last_failure: null,
+      task_hash: taskHash,
+      contract_id: contractId,
+      contract_hash: contractHash,
+      tools: [...tools].sort(),
+      diff_id: null,
+      retries_used: {},
+      created_at: new Date().toISOString(),
+      updated_at: null,
+    };
+  }
+
+  // Load an existing checkpoint and verify it describes the same task. A
+  // different task id, task text, or contract must not silently resume.
+  // `repoRoot`, when given, enables the checkpoint file-hash validation
+  // against the current working tree (missing or drifted recorded files are
+  // refused with `state_drift`).
+  static load(statePath, { taskId, taskHash, contractId = null, contractHash = null, repoRoot = null } = {}) {
+    if (!fs.existsSync(statePath)) {
+      throw new AgentError(`state file not found: ${statePath}`, { code: 'state_missing' });
+    }
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    } catch (e) {
+      throw new AgentError(`state file is not valid JSON: ${e.message}`, { code: 'state_corrupt' });
+    }
+    if (raw?.schema !== STATE_SCHEMA) {
+      throw new AgentError(`unsupported state schema: ${String(raw?.schema)} (expected ${STATE_SCHEMA})`, { code: 'state_corrupt' });
+    }
+    if (taskId !== undefined && raw.task_id !== taskId) {
+      throw new AgentError(`state task_id mismatch: ${raw.task_id} != ${taskId}`, { code: 'state_mismatch' });
+    }
+    if (taskHash !== undefined && raw.task_hash !== taskHash) {
+      throw new AgentError('state task_hash mismatch: the task text changed since the checkpoint', { code: 'state_mismatch' });
+    }
+    if (contractId !== null && raw.contract_id !== contractId) {
+      throw new AgentError(`state contract_id mismatch: ${String(raw.contract_id)} != ${contractId}`, { code: 'state_mismatch' });
+    }
+    if (contractHash !== null && raw.contract_hash !== contractHash) {
+      throw new AgentError('state contract_hash mismatch: the contract changed since the checkpoint', { code: 'state_mismatch' });
+    }
+    // Checkpoint file-hash validation: every accepted file recorded in the
+    // checkpoint must still exist with exactly the recorded SHA-256. A
+    // missing or drifted file means the checkpoint no longer describes the
+    // working tree, so the resume is refused with a dedicated state-drift
+    // error instead of continuing on a stale premise.
+    if (repoRoot) {
+      const hashes = raw.file_hashes;
+      if (raw.patches_applied > 0 && (!hashes || typeof hashes !== 'object' || Array.isArray(hashes))) {
+        throw new AgentError('state is missing file hashes for accepted patches', { code: 'state_corrupt' });
+      }
+      if (hashes && typeof hashes === 'object' && Object.keys(hashes).length > 0) {
+        for (const [rel, sha256] of Object.entries(hashes)) {
+          let normalized;
+          try {
+            normalized = normalizeRelPath(rel);
+          } catch (e) {
+            throw new AgentError(`state contains an unsafe recorded path: ${String(rel)}`, { code: 'state_corrupt' });
+          }
+          if (normalized !== rel || typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) {
+            throw new AgentError(`state contains invalid file hash metadata: ${String(rel)}`, { code: 'state_corrupt' });
+          }
+          const abs = path.resolve(repoRoot, normalized);
+          const relativeToRoot = path.relative(path.resolve(repoRoot), abs);
+          if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) {
+            throw new AgentError(`state contains a path outside the repository: ${rel}`, { code: 'state_corrupt' });
+          }
+          if (!fs.existsSync(abs)) {
+            throw new AgentError(
+              `state drift: recorded file is missing: ${rel}`,
+              { code: 'state_drift' },
+            );
+          }
+          const actual = hashText(fs.readFileSync(abs, 'utf8'));
+          if (actual !== sha256) {
+            throw new AgentError(
+              `state drift: file changed since the checkpoint: ${rel}`,
+              { code: 'state_drift' },
+            );
+          }
+        }
+      }
+    }
+    const state = Object.create(TaskState.prototype);
+    state.statePath = statePath;
+    raw.file_hashes ??= {};
+    state.record = raw;
+    return state;
+  }
+
+  // Atomic checkpoint write: temp file in the same directory, then rename.
+  save() {
+    this.record.updated_at = new Date().toISOString();
+    const dir = path.dirname(this.statePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `.${path.basename(this.statePath)}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(this.record, null, 2) + '\n', 'utf8');
+      fs.renameSync(tmp, this.statePath);
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      throw new AgentError(`state write failed: ${e.message}`, { code: 'state_write_failed' });
+    }
+    return this.record;
+  }
+
+  setTurn(turn) {
+    this.record.turn = turn;
+  }
+
+  setStatus(status) {
+    this.record.status = status;
+  }
+
+  // Diff identity without shelling out to Git after every patch: a chained
+  // hash over the accepted patches, so an identical sequence of accepted
+  // changes yields an identical id.
+  // Record an accepted patch and store the current SHA-256 of the file in
+  // the checkpoint so a later `--resume` can detect drift (a missing or
+  // differently-hashed recorded file refuses the resume with `state_drift`).
+  notePatch(relPath, contentHash) {
+    this.record.patches_applied += 1;
+    if (!this.record.files_changed.includes(relPath)) {
+      this.record.files_changed.push(relPath);
+      this.record.files_changed.sort();
+    }
+    this.record.file_hashes[relPath] = contentHash;
+    this.record.diff_id = hashText(`${this.record.diff_id ?? ''}|${relPath}|${contentHash}`);
+    this.record.last_failure = null;
+  }
+
+  noteCheck(suite, result) {
+    this.record.checks_run.push({ suite, result });
+  }
+
+  noteFailure({ failureClass, code, turn }) {
+    this.record.last_failure = {
+      class: failureClass,
+      code: code ?? null,
+      turn: turn ?? this.record.turn,
+      at: new Date().toISOString(),
+    };
+  }
+
+  noteRetry(failureClass) {
+    this.record.retries_used[failureClass] = (this.record.retries_used[failureClass] ?? 0) + 1;
+    return this.record.retries_used[failureClass];
+  }
+
+  retriesUsed(failureClass) {
+    return this.record.retries_used[failureClass] ?? 0;
+  }
+
+  // Compact resume brief. The conversation is not persisted, so a resumed run
+  // is re-seeded with this summary instead of a replayed transcript.
+  resumeSummary() {
+    const r = this.record;
+    const lines = [
+      `Resuming task ${r.task_id} from checkpoint (previous status: ${r.status}).`,
+      `Turns already spent: ${r.turn}. Patches already accepted: ${r.patches_applied}.`,
+      `Files already changed: ${r.files_changed.length ? r.files_changed.join(', ') : '(none)'}`,
+      `Checks already run: ${r.checks_run.length ? r.checks_run.map((c) => `${c.suite}=${c.result}`).join(', ') : '(none)'}`,
+    ];
+    if (r.last_failure) {
+      lines.push(`Last failure: class=${r.last_failure.class} code=${String(r.last_failure.code)} at turn ${r.last_failure.turn}.`);
+    }
+    lines.push('Re-read the current file content before patching: earlier edits are already on disk.');
+    return lines.join('\n');
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Output bounding
@@ -712,11 +1129,120 @@ export function boundOutput(text, maxBytes) {
 }
 
 // ---------------------------------------------------------------------------
+// Cancellation, deadlines, and bounded requests
+// ---------------------------------------------------------------------------
+
+// Combine an optional cancellation signal with a per-request timeout. The
+// timeout signal's timer is unref'd by Node, so it never keeps the process
+// alive on its own.
+export function combineSignals(signal, timeoutMs) {
+  const parts = [];
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) parts.push(AbortSignal.timeout(timeoutMs));
+  if (signal) parts.push(signal);
+  if (parts.length === 0) return undefined;
+  if (parts.length === 1) return parts[0];
+  return AbortSignal.any(parts);
+}
+
+// Overall task deadline, independent of the turn budget. It truly bounds the
+// whole run: it is checked before every model turn, tool call, and MCP
+// request (assertLive), and `boundedTimeout` caps every individual request
+// timeout at the remaining time, so no single model request, MCP request,
+// run_check, or git_diff can outlive the deadline.
+export function createDeadline(totalMs, startedAt = Date.now()) {
+  const at = startedAt + totalMs;
+  const controller = new AbortController();
+  const delay = at - Date.now();
+  if (delay <= 0) controller.abort(new Error('task deadline exceeded'));
+  else setTimeout(() => controller.abort(new Error('task deadline exceeded')), delay).unref?.();
+  return {
+    at,
+    signal: controller.signal,
+    remainingMs: () => at - Date.now(),
+    expired: () => Date.now() >= at,
+    assertLive(where) {
+      if (this.expired()) {
+        throw new AgentError(
+          `task deadline exceeded before ${where} (deadline bound expired)`,
+          { code: 'deadline_exceeded' },
+        );
+      }
+    },
+    // The effective timeout for one request: never longer than what is left,
+    // so even a slow request is aborted the moment the deadline passes.
+    // Once the deadline has expired the value is 0: a request started then
+    // must not run at all (it is refused with `deadline_exceeded`).
+    boundedTimeout(timeoutMs) {
+      const left = this.remainingMs();
+      return left > 0 ? Math.min(timeoutMs, left) : 0;
+    },
+  };
+}
+
+// Overall-deadline abort signal. When the deadline passes, this signal fires,
+// so an in-flight request is aborted by the deadline bound (classified as
+// `deadline_exceeded`) rather than by the per-request timeout bound.
+// A single bounded fetch. Aborts are translated into classified AgentErrors
+// so the three outcomes stay distinct: a coordinator cancellation, an
+// overall deadline expiry, and an operation-specific timeout are never
+// confused with one another. A `timeoutMs` of 0 means the deadline has
+// already passed: the request must not start at all.
+async function boundedFetch(url, init, { signal = null, timeoutMs, label, timeoutCode, errorCode, deadline = null }) {
+  const deadlineSignal = deadline?.signal ?? null;
+  if (Number.isFinite(timeoutMs) && timeoutMs <= 0) {
+    throw new AgentError(`${label} aborted: the overall task deadline has already expired`, {
+      code: deadlineCodeFor(timeoutCode),
+    });
+  }
+  try {
+    const parts = [];
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) parts.push(AbortSignal.timeout(timeoutMs));
+    if (deadlineSignal) parts.push(deadlineSignal);
+    if (signal) parts.push(signal);
+    const combined = parts.length === 1 ? parts[0] : (parts.length > 1 ? AbortSignal.any(parts) : undefined);
+    return await fetch(url, { ...init, signal: combined });
+  } catch (e) {
+    if (signal?.aborted) {
+      throw new AgentError(`${label} cancelled by the coordinator`, { code: 'cancelled' });
+    }
+    if (deadlineSignal?.aborted) {
+      throw new AgentError(`${label} aborted: the overall task deadline expired`, { code: 'deadline_exceeded' });
+    }
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      throw new AgentError(`${label} timed out after ${timeoutMs}ms`, { code: timeoutCode });
+    }
+    throw new AgentError(`${label} transport error: ${e.message}`, { code: errorCode });
+  }
+}
+
+// The deadline-expiry code for a request kind: the deadline is one failure
+// class (`deadline_exceeded`), reported with the same dedicated code.
+function deadlineCodeFor(_timeoutCode) {
+  return 'deadline_exceeded';
+}
+
+// ---------------------------------------------------------------------------
 // Child process helper (shell: false, fixed argv, bounded output, timeout)
 // ---------------------------------------------------------------------------
 
-function runFixedCommand({ argv, cwd, timeoutMs = 120000, maxBytes }) {
+export function runFixedCommand({
+  argv,
+  cwd,
+  timeoutMs = 120000,
+  timeoutCode = 'command_timeout',
+  maxBytes,
+  signal = null,
+  deadline = null,
+}) {
   return new Promise((resolve, reject) => {
+    if (deadline?.expired()) {
+      reject(new AgentError(`task deadline exceeded before running ${argv[0]}`, { code: 'deadline_exceeded' }));
+      return;
+    }
+    if (signal?.aborted) {
+      reject(new AgentError(`cancelled before running ${argv[0]}`, { code: 'cancelled' }));
+      return;
+    }
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
       shell: false,
@@ -726,40 +1252,61 @@ function runFixedCommand({ argv, cwd, timeoutMs = 120000, maxBytes }) {
     let stdout = '';
     let stderr = '';
     let killed = false;
+    let cancelled = false;
+    const effectiveTimeout = deadline ? deadline.boundedTimeout(timeoutMs) : timeoutMs;
     const timer = setTimeout(() => {
       killed = true;
       child.kill('SIGKILL');
-    }, timeoutMs);
+    }, effectiveTimeout);
+    // Graceful cancellation: kill the child and report a cancellation rather
+    // than a timeout, so the coordinator sees the real cause.
+    const onAbort = () => {
+      cancelled = true;
+      child.kill('SIGKILL');
+    };
+    const onDeadline = () => child.kill('SIGKILL');
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    if (deadline?.signal) deadline.signal.addEventListener('abort', onDeadline, { once: true });
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (deadline?.signal) deadline.signal.removeEventListener('abort', onDeadline);
+    };
     child.stdout.on('data', (d) => {
-      stdout += d.toString('utf8');
-      if (maxBytes && Buffer.byteLength(stdout, 'utf8') > maxBytes * 4) {
-        // Hard cap: kill if output is wildly over budget.
-        child.kill('SIGKILL');
-      }
+      if (!maxBytes || Buffer.byteLength(stdout, 'utf8') < maxBytes * 4) stdout += d.toString('utf8');
     });
     child.stderr.on('data', (d) => {
-      stderr += d.toString('utf8');
+      if (!maxBytes || Buffer.byteLength(stderr, 'utf8') < maxBytes * 4) stderr += d.toString('utf8');
     });
     child.on('error', (e) => {
-      clearTimeout(timer);
+      cleanup();
       reject(new AgentError(`failed to spawn ${argv[0]}: ${e.message}`, { code: 'spawn_error' }));
     });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      if (killed) {
-        reject(new AgentError(`command timed out after ${timeoutMs}ms: ${argv.join(' ')}`, { code: 'timeout' }));
+    child.on('close', (code, signalName) => {
+      cleanup();
+      if (cancelled) {
+        reject(new AgentError(`command cancelled: ${argv.join(' ')}`, { code: 'cancelled' }));
         return;
       }
-      resolve({ code, signal, stdout, stderr });
+      if (deadline?.signal?.aborted) {
+        reject(new AgentError(`task deadline exceeded while running ${argv.join(' ')}`, { code: 'deadline_exceeded' }));
+        return;
+      }
+      if (killed) {
+        reject(new AgentError(`command timed out after ${effectiveTimeout}ms: ${argv.join(' ')}`, { code: timeoutCode }));
+        return;
+      }
+      resolve({ code, signal: signalName, stdout, stderr });
     });
   });
 }
+
 
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
-export function buildTools(policy, audit, { dryRun = false, contract = null } = {}) {
+export function buildTools(policy, audit, { dryRun = false, contract = null, signal = null, deadline = null } = {}) {
   const maxResult = policy.limits.maxToolResultBytes;
   // Contract restrictions (null when no contract is active). When active,
   // apply_patch is limited to contract.allowedFiles and run_check to
@@ -896,9 +1443,15 @@ export function buildTools(policy, audit, { dryRun = false, contract = null } = 
     const expected = Math.max(1, Math.floor(expectedReplacements) || 1);
     const count = countOccurrences(current, oldText);
     if (count !== expected) {
+      // Patch precondition mismatch: hand back the current nearby source so
+      // the next attempt can be an exact patch instead of a guess.
+      const context = nearbySourceContext(current, oldText, rel);
       throw new AgentError(
-        `apply_patch failed: expected ${expected} occurrence(s) of oldText, found ${count} in ${rel}`,
-        { code: 'patch_mismatch' },
+        `apply_patch failed: expected ${expected} occurrence(s) of oldText, found ${count} in ${rel}\n` +
+          'The file on disk does not contain your oldText exactly. Current nearby source follows; ' +
+          'copy the exact text from it and send one fresh apply_patch.\n' +
+          boundOutput(context, Math.min(maxResult, 4096)),
+        { code: 'patch_mismatch', fatal: false },
       );
     }
     // Exact-text replacement: replace every occurrence (count === expected)
@@ -921,8 +1474,11 @@ export function buildTools(policy, audit, { dryRun = false, contract = null } = 
     const { stdout, code, stderr } = await runFixedCommand({
       argv: ['git', '-C', policy.repoRoot, 'diff'],
       cwd: policy.repoRoot,
-      timeoutMs: 60000,
+      timeoutMs: policy.limits.gitTimeoutMs ?? DEFAULT_LIMITS.gitTimeoutMs,
+      timeoutCode: 'git_timeout',
       maxBytes: maxResult,
+      signal,
+      deadline,
     });
     if (code !== 0) {
       throw new AgentError(`git diff failed (exit ${code}): ${boundOutput(stderr, 2048)}`, { code: 'git_error' });
@@ -953,12 +1509,17 @@ export function buildTools(policy, audit, { dryRun = false, contract = null } = 
     const { stdout, code, stderr } = await runFixedCommand({
       argv,
       cwd: policy.repoRoot,
-      timeoutMs: 600000,
+      timeoutMs: policy.limits.checkTimeoutMs ?? DEFAULT_LIMITS.checkTimeoutMs,
+      timeoutCode: 'check_timeout',
       maxBytes: maxResult,
+      signal,
+      deadline,
     });
     const out = boundOutput((stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : ''), maxResult);
     if (code !== 0) {
-      throw new AgentError(`run_check ${suite} failed (exit ${code}):\n${out}`, { code: 'check_failed' });
+      // A failing check is a recoverable result, not a harness fault: the
+      // model gets only the failure output and may send one correction.
+      throw new AgentError(`run_check ${suite} failed (exit ${code}):\n${out}`, { code: 'check_failed', fatal: false });
     }
     return out;
   }
@@ -1027,13 +1588,39 @@ function countOccurrences(haystack, needle) {
   return count;
 }
 
+// Current source around the most plausible anchor for a failed patch. The
+// anchor is the first non-blank line of oldText (exact, then trimmed); with no
+// anchor the head of the file is returned. Line numbers are 1-based so the
+// next attempt can quote exact text.
+export function nearbySourceContext(content, oldText, relPath, { radius = 12, maxLines = 60 } = {}) {
+  const lines = content.split('\n');
+  const anchorLine = String(oldText).split('\n').find((l) => l.trim().length > 0) ?? '';
+  const anchor = anchorLine.trim();
+  let index = -1;
+  if (anchor.length > 0) {
+    index = lines.findIndex((l) => l === anchorLine);
+    if (index === -1) index = lines.findIndex((l) => l.includes(anchor));
+  }
+  const start = index === -1 ? 0 : Math.max(0, index - radius);
+  const end = Math.min(lines.length, start + Math.min(maxLines, radius * 2 + 1));
+  const header =
+    index === -1
+      ? `// ${relPath}: no anchor line from oldText was found; showing lines ${start + 1}-${end} of ${lines.length}`
+      : `// ${relPath}: current source lines ${start + 1}-${end} of ${lines.length}`;
+  const body = lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`);
+  return [header, ...body].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // MCP client (JSON-RPC over HTTP; JSON or SSE)
 // ---------------------------------------------------------------------------
 
 export class McpClient {
-  constructor(endpoint) {
+  constructor(endpoint, { timeoutMs = DEFAULT_LIMITS.mcpRequestTimeoutMs, signal = null, deadline = null } = {}) {
     this.endpoint = endpoint;
+    this.timeoutMs = timeoutMs;
+    this.signal = signal;
+    this.deadline = deadline;
     this.sessionId = null;
     this.nextId = 1;
     this.initialized = false;
@@ -1042,11 +1629,18 @@ export class McpClient {
   async _post(body) {
     const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' };
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
-    const res = await fetch(this.endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    const res = await boundedFetch(
+      this.endpoint,
+      { method: 'POST', headers, body: JSON.stringify(body) },
+      {
+        signal: this.signal,
+        timeoutMs: this.timeoutMs,
+        label: `MCP request ${String(body.method)}`,
+        timeoutCode: 'mcp_timeout',
+        errorCode: 'mcp_error',
+        deadline: this.deadline,
+      },
+    );
     const sessionId = res.headers.get('mcp-session-id');
     if (sessionId) this.sessionId = sessionId;
     const text = await res.text();
@@ -1283,24 +1877,35 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
-async function chatCompletion(policy, messages) {
+async function chatCompletion(policy, messages, { signal = null, timeoutMs = null, deadline = null } = {}) {
   const apiKey = process.env[policy.model.apiKeyEnv];
   if (!apiKey) {
     throw new AgentError(`API key environment variable ${policy.model.apiKeyEnv} is not set`, { code: 'no_api_key' });
   }
   const url = policy.model.endpoint.replace(/\/$/, '') + '/chat/completions';
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+  const res = await boundedFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: policy.model.name,
+        messages,
+        tools: TOOL_DEFINITIONS,
+      }),
     },
-    body: JSON.stringify({
-      model: policy.model.name,
-      messages,
-      tools: TOOL_DEFINITIONS,
-    }),
-  });
+    {
+      signal,
+      timeoutMs: timeoutMs ?? policy.limits.modelRequestTimeoutMs ?? DEFAULT_LIMITS.modelRequestTimeoutMs,
+      label: 'model request',
+      timeoutCode: 'model_timeout',
+      errorCode: 'model_error',
+      deadline,
+    },
+  );
   const text = await res.text();
   if (!res.ok) {
     throw new AgentError(`model request failed (HTTP ${res.status}): ${boundOutput(text, 2048)}`, { code: 'model_error' });
@@ -1316,23 +1921,110 @@ async function chatCompletion(policy, messages) {
   return choice;
 }
 
-// Run the model/tool loop. Returns the final assistant text.
-export async function runAgentLoop({ policy, audit, tools, task, systemPrompt }) {
+// A short correction prompt, used when the model produced no response content
+// and no saved change. It is deliberately tiny: the full task is already in
+// the conversation, and a long re-statement makes the next turn worse.
+const NO_CHANGE_CORRECTION =
+  'Your last reply requested no file change. Make the smallest exact-text apply_patch ' +
+  'that satisfies the task, inside the allowed files. Reply with the tool call, not prose.';
+
+// Stable signature of a tool call, used to detect a repeated identical call.
+function toolCallSignature(name, args) {
+  return hashText(`${name}|${JSON.stringify(args ?? {})}`);
+}
+
+// Run the model/tool loop. Returns a recovery-aware outcome:
+// `{ status, finalText, failure, state }`. The caller maps the status to an
+// exit code; `state` is the (already checkpointed) TaskState when one is used.
+export async function runAgentLoop({
+  policy,
+  audit,
+  tools,
+  task,
+  systemPrompt,
+  state = null,
+  signal = null,
+  deadline = null,
+  resumeSummary = null,
+  stopAfterFirstPatch = false,
+  stopAfterFirstFailedCheck = false,
+}) {
   const messages = [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: task },
   ];
+  if (resumeSummary) messages.push({ role: 'user', content: resumeSummary });
   const maxTurns = policy.limits.maxTurns;
-  let failures = 0;
-  for (let turn = 1; turn <= maxTurns; turn++) {
+  const retryBudget = policy.limits.retryBudget ?? DEFAULT_RETRY_BUDGET;
+  const clock = deadline ?? createDeadline(policy.limits.taskDeadlineMs ?? DEFAULT_LIMITS.taskDeadlineMs);
+  const retriesUsed = {};
+  // Signature -> { code, count } for failing tool calls, so the same failing
+  // call is never repeated indefinitely.
+  const failedCalls = new Map();
+  let patchesApplied = state ? state.record.patches_applied : 0;
+  let noChangeCorrectionSent = false;
+
+  const startTurn = state ? state.record.turn : 0;
+
+  // Record a failure on the checkpoint and decide whether the class still has
+  // retry budget left.
+  const consumeRetry = (err, turn) => {
+    const failureClass = classifyFailure(err);
+    state?.noteFailure({ failureClass, code: err.code, turn });
+    const budget = retryBudget[failureClass] ?? 0;
+    const used = state ? state.retriesUsed(failureClass) : (retriesUsed[failureClass] ?? 0);
+    if (!isRetryable(err) || used >= budget) return { failureClass, allowed: false };
+    if (state) state.noteRetry(failureClass);
+    else retriesUsed[failureClass] = used + 1;
+    audit.lifecycle({ event: 'retry', turn, failureClass, error: err.code ?? null });
+    return { failureClass, allowed: true };
+  };
+
+  const finish = (status, failure = null, finalText = '') => {
+    if (state) {
+      state.setStatus(status);
+      state.save();
+    }
+    audit.lifecycle({ event: 'finished', turn: state?.record.turn ?? null, status, failureClass: failure?.class ?? null, error: failure?.code ?? null });
+    return { status, finalText, failure, state };
+  };
+
+  for (let turn = startTurn + 1; turn <= startTurn + maxTurns; turn++) {
+    if (signal?.aborted) {
+      return finish('cancelled', { class: 'coordinator_cancelled', code: 'cancelled', message: 'cancelled before the model turn' });
+    }
+    if (clock.expired()) {
+      return finish('deadline_exceeded', { class: 'deadline_exceeded', code: 'deadline_exceeded', message: 'task deadline exceeded' });
+    }
+    state?.setTurn(turn);
+
     const t0 = Date.now();
     const inputBytes = Buffer.byteLength(JSON.stringify(messages), 'utf8');
-    let choice;
-    try {
-      choice = await chatCompletion(policy, messages);
-    } catch (e) {
-      audit.modelTurn({ turn, ok: false, error: e.code || e.name, inputBytes, outputBytes: 0, durationMs: Date.now() - t0 });
-      throw e;
+    let choice = null;
+    let modelError = null;
+    // Transport timeout: retry the same request once, within the class budget.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        choice = await chatCompletion(policy, messages, {
+          signal,
+          timeoutMs: clock.boundedTimeout(policy.limits.modelRequestTimeoutMs ?? DEFAULT_LIMITS.modelRequestTimeoutMs),
+          deadline: clock,
+        });
+        modelError = null;
+        break;
+      } catch (e) {
+        modelError = e;
+        const { failureClass, allowed } = consumeRetry(e, turn);
+        if (!allowed) {
+          audit.modelTurn({ turn, ok: false, error: e.code || e.name, inputBytes, outputBytes: 0, durationMs: Date.now() - t0 });
+          const status = failureClass === 'coordinator_cancelled'
+            ? 'cancelled'
+            : failureClass === 'deadline_exceeded'
+              ? 'deadline_exceeded'
+              : 'failed';
+          return finish(status, { class: failureClass, code: e.code ?? null, message: e.message });
+        }
+      }
     }
     const message = choice.message || {};
     const outputBytes = Buffer.byteLength(JSON.stringify(message), 'utf8');
@@ -1340,25 +2032,48 @@ export async function runAgentLoop({ policy, audit, tools, task, systemPrompt })
 
     const toolCalls = message.tool_calls;
     if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
-      // Final answer.
-      return message.content ?? '';
+      const finalText = message.content ?? '';
+      // A final response that requested no file change is not an accepted
+      // result. Send one short correction, then stop and report no_changes.
+      if (patchesApplied === 0) {
+        if (!noChangeCorrectionSent) {
+          noChangeCorrectionSent = true;
+          audit.lifecycle({ event: 'no_change_correction', turn });
+          messages.push({ role: 'assistant', content: finalText || null });
+          messages.push({ role: 'user', content: NO_CHANGE_CORRECTION });
+          continue;
+        }
+        return finish('no_changes', null, finalText);
+      }
+      return finish('awaiting_review', null, finalText);
     }
     // Preserve the assistant message with tool_calls verbatim.
     messages.push({ role: 'assistant', content: message.content ?? null, tool_calls: toolCalls });
+
     for (const call of toolCalls) {
+      if (signal?.aborted) {
+        messages.push({ role: 'tool', tool_call_id: call.id, content: 'ERROR: cancelled by the coordinator' });
+        return finish('cancelled', { class: 'coordinator_cancelled', code: 'cancelled', message: 'cancelled before a tool call' });
+      }
+      if (clock.expired()) {
+        messages.push({ role: 'tool', tool_call_id: call.id, content: 'ERROR: task deadline exceeded' });
+        return finish('deadline_exceeded', { class: 'deadline_exceeded', code: 'deadline_exceeded', message: 'task deadline exceeded' });
+      }
       const name = call?.function?.name;
       let args = {};
       try {
         args = call?.function?.arguments ? JSON.parse(call.function.arguments) : {};
-      } catch (e) {
+      } catch {
         args = {};
       }
+      const signature = toolCallSignature(name, args);
       const tool = tools[name];
       const t1 = Date.now();
       const inputBytes2 = Buffer.byteLength(JSON.stringify(args), 'utf8');
       let resultText;
       let ok = true;
       let errorCode = null;
+      let thrown = null;
       try {
         if (!tool) {
           throw new AgentError(`unknown tool: ${name}`, { code: 'unknown_tool' });
@@ -1366,17 +2081,9 @@ export async function runAgentLoop({ policy, audit, tools, task, systemPrompt })
         resultText = await tool.fn(args);
       } catch (e) {
         ok = false;
+        thrown = e;
         errorCode = e.code || e.name;
         resultText = `ERROR: ${e.message}`;
-        if (e.fatal === false) {
-          // Non-fatal tool error: report to model and continue.
-        } else {
-          audit.toolCall({ tool: name, ok: false, error: errorCode, inputBytes: inputBytes2, outputBytes: Buffer.byteLength(resultText, 'utf8'), durationMs: Date.now() - t1 });
-          failures++;
-          // Fatal tool error: stop the loop.
-          messages.push({ role: 'tool', tool_call_id: call.id, content: resultText });
-          throw e;
-        }
       }
       audit.toolCall({
         tool: name,
@@ -1386,11 +2093,79 @@ export async function runAgentLoop({ policy, audit, tools, task, systemPrompt })
         outputBytes: Buffer.byteLength(resultText, 'utf8'),
         durationMs: Date.now() - t1,
       });
-      if (!ok) failures++;
       messages.push({ role: 'tool', tool_call_id: call.id, content: resultText });
+
+      if (ok) {
+        failedCalls.delete(signature);
+        // Checkpoint after every accepted patch.
+        if (name === 'apply_patch' && state) {
+          try {
+            const { rel, abs } = resolveRepoPath(policy, args.path);
+            state.notePatch(rel, hashText(fs.readFileSync(abs, 'utf8')));
+            state.save();
+            audit.lifecycle({ event: 'checkpoint', turn, status: state.record.status });
+          } catch (e) {
+            throw new AgentError(`checkpoint after patch failed: ${e.message}`, { code: 'state_write_failed' });
+          }
+        }
+        if (name === 'apply_patch') {
+          patchesApplied++;
+          if (stopAfterFirstPatch) {
+            return finish('stopped_after_patch', null, 'stopped after the first accepted patch');
+          }
+        }
+        if (name === 'run_check' && state) {
+          state.noteCheck(args.suite ?? '(unknown)', 'passed');
+          state.save();
+        }
+        continue;
+      }
+
+      // A repeated identical failing call means the model is stuck: stop and
+      // return control to the coordinator instead of burning the budget.
+      const previous = failedCalls.get(signature);
+      if (previous && previous.code === errorCode) {
+        previous.count += 1;
+        failedCalls.set(signature, previous);
+        state?.noteFailure({ failureClass: classifyFailure(thrown), code: errorCode, turn });
+        audit.lifecycle({ event: 'repeated_failure', turn, failureClass: classifyFailure(thrown), error: errorCode });
+        return finish('failed', {
+          class: classifyFailure(thrown),
+          code: errorCode,
+          message: `repeated identical failing ${name} call (${errorCode}); returning control to the coordinator`,
+          repeated: true,
+        });
+      }
+      failedCalls.set(signature, { code: errorCode, count: 1 });
+
+      if (name === 'run_check' && errorCode === 'check_failed' && state) {
+        state.noteCheck(args.suite ?? '(unknown)', 'failed');
+        state.save();
+      }
+
+      if (name === 'run_check' && errorCode === 'check_failed' && stopAfterFirstFailedCheck) {
+        return finish('stopped_after_failed_check', { class: 'check_failed', code: errorCode, message: thrown.message });
+      }
+      const { failureClass, allowed } = consumeRetry(thrown, turn);
+      if (allowed) {
+        // Recoverable within budget: the model already has the failure text
+        // (a patch mismatch also carries the current nearby source) and may
+        // send one correction.
+        continue;
+      }
+      const status = failureClass === 'coordinator_cancelled'
+        ? 'cancelled'
+        : failureClass === 'deadline_exceeded'
+          ? 'deadline_exceeded'
+          : 'failed';
+      return finish(status, { class: failureClass, code: errorCode, message: thrown.message });
     }
   }
-  throw new AgentError(`exceeded maxTurns (${maxTurns})`, { code: 'max_turns' });
+  return finish('failed', {
+    class: 'harness_failure',
+    code: 'max_turns',
+    message: `exceeded maxTurns (${maxTurns})`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +2207,8 @@ function buildSystemPrompt(policy, contract = null) {
     suites,
     ...contractLines,
     'Prefer small, exact-text patches and one focused check proportional to the change.',
+    'If apply_patch reports a mismatch, use the current nearby source it returns and send one fresh exact patch; never repeat the same failing call.',
+    'A reply that requests no file change is not an accepted result: make the edit through apply_patch.',
     'After making edits, call plan_verification with the changed repository-relative paths and run at most the returned contract-authorized focused suites.',
     'Do not run the deferred finalSuite (e.g. full) during an ordinary slice; it is run once after all accepted slices by the coordinator final integration.',
   ].join('\n');
@@ -1441,7 +2218,7 @@ function buildSystemPrompt(policy, contract = null) {
 // Dry-run
 // ---------------------------------------------------------------------------
 
-function dryRunReport(policy, task, contract = null) {
+function dryRunReport(policy, task, contract = null, { taskId = null, statePath = null, args = null } = {}) {
   const lines = [
     'Dry-run: policy resolved and task validated. No model contact, no writes.',
     `  policy: ${policy.policyPath}`,
@@ -1451,8 +2228,17 @@ function dryRunReport(policy, task, contract = null) {
     `  lci: ${policy.lci.endpoint}`,
     `  audit: ${policy.audit.jsonlPath}`,
     `  limits: maxTurns=${policy.limits.maxTurns} maxReadLines=${policy.limits.maxReadLines} maxPatchBytes=${policy.limits.maxPatchBytes} maxToolResultBytes=${policy.limits.maxToolResultBytes}`,
+    `  timeouts: model=${policy.limits.modelRequestTimeoutMs}ms mcp=${policy.limits.mcpRequestTimeoutMs}ms check=${policy.limits.checkTimeoutMs}ms git=${policy.limits.gitTimeoutMs}ms deadline=${policy.limits.taskDeadlineMs}ms`,
+    `  retry budget: ${Object.entries(policy.limits.retryBudget).map(([k, v]) => `${k}=${v}`).join(' ')}`,
     `  task bytes: ${Buffer.byteLength(task, 'utf8')}`,
   ];
+  if (taskId) lines.push(`  task id: ${taskId}`);
+  if (statePath) lines.push(`  checkpoint: ${statePath}`);
+  if (args) {
+    lines.push(
+      `  resume: ${args.resume} stopAfterFirstPatch: ${args.stopAfterFirstPatch} stopAfterFirstFailedCheck: ${args.stopAfterFirstFailedCheck}`,
+    );
+  }
   if (contract) {
     // Contract summary only: the id plus the allowed-file/check counts.
     // Never the contract text.
@@ -1503,14 +2289,73 @@ export async function main(argv = process.argv.slice(2)) {
     throw new AgentError('task text is empty');
   }
 
+  // Persistent task identity: the explicit --task-id, else the contract id,
+  // else a stable short hash of the task text.
+  const taskHash = hashText(task);
+  const taskId = args.taskId ?? (contract ? contract.id : `task-${taskHash.slice(0, 12)}`);
+  const contractHash = contract ? hashText(JSON.stringify(contract)) : null;
+  const statePath = args.state
+    ? path.resolve(args.state)
+    : path.join(path.dirname(policy.audit.jsonlPath), 'state', `${taskId}.json`);
+
   if (args.dryRun) {
-    process.stdout.write(dryRunReport(policy, task, contract) + '\n');
+    process.stdout.write(dryRunReport(policy, task, contract, { taskId, statePath, args }) + '\n');
     return 0;
   }
 
-  const audit = new AuditLog(policy, { contractId: contract ? contract.id : null });
-  const tools = buildTools(policy, audit, { dryRun: false, contract });
-  const mcp = new McpClient(policy.lci.endpoint);
+  const audit = new AuditLog(policy, { contractId: contract ? contract.id : null, taskId });
+
+  // Graceful cancellation: SIGINT/SIGTERM abort in-flight model, MCP, and
+  // child-process work; the loop stops at the next safe point and checkpoints.
+  const controller = new AbortController();
+  const onSignal = () => {
+    if (!controller.signal.aborted) {
+      audit.lifecycle({ event: 'cancellation_requested' });
+      controller.abort();
+    }
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  const deadline = createDeadline(policy.limits.taskDeadlineMs ?? DEFAULT_LIMITS.taskDeadlineMs);
+  const tools = buildTools(policy, audit, {
+    dryRun: false,
+    contract,
+    signal: controller.signal,
+    deadline,
+  });
+  const toolNames = Object.keys(tools).filter((k) => !k.startsWith('_'));
+
+  let state;
+  let resumeSummary = null;
+  if (args.resume) {
+    try {
+      state = TaskState.load(statePath, {
+        taskId,
+        taskHash,
+        contractId: contract ? contract.id : null,
+        contractHash,
+        repoRoot: policy.repoRoot,
+      });
+    } catch (e) {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+      throw e;
+    }
+    resumeSummary = state.resumeSummary();
+    state.setStatus('running');
+    audit.lifecycle({ event: 'resumed', turn: state.record.turn, status: state.record.status });
+  } else {
+    state = new TaskState({ statePath, taskId, taskHash, contractId: contract ? contract.id : null, contractHash, tools: toolNames });
+    audit.lifecycle({ event: 'started', status: 'running' });
+  }
+  state.save();
+
+  const mcp = new McpClient(policy.lci.endpoint, {
+    timeoutMs: policy.limits.mcpRequestTimeoutMs ?? DEFAULT_LIMITS.mcpRequestTimeoutMs,
+    signal: controller.signal,
+    deadline,
+  });
   // Initialize the MCP session once, before the model loop can call any LCI
   // tool. This is the live path only: --help, --dry-run, imports, and offline
   // unit tests never reach here. A failure to initialize is fatal and must
@@ -1518,9 +2363,27 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     await mcp.initialize();
   } catch (e) {
+    const failureClass = classifyFailure(e);
+    if (failureClass === 'coordinator_cancelled' || failureClass === 'deadline_exceeded') {
+      const status = failureClass === 'coordinator_cancelled' ? 'cancelled' : 'deadline_exceeded';
+      state.noteFailure({ failureClass, code: e.code, turn: state.record.turn });
+      state.setStatus(status);
+      state.save();
+      audit.lifecycle({ event: 'finished', status, failureClass, error: e.code });
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+      process.stderr.write(`agent failed: ${e.message}\n`);
+      return exitCodeForStatus(status);
+    }
     const msg = e instanceof AgentError ? e.message : `MCP initialize failed: ${e.message}`;
+    const failure = { class: 'mcp_failure', code: 'mcp_init_failed', message: msg };
+    state.noteFailure({ failureClass: 'mcp_failure', code: 'mcp_init_failed', turn: state.record.turn });
+    state.setStatus('failed');
+    state.save();
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
     throw new AgentError(
-      `MCP client failed to initialize against ${policy.lci.endpoint}: ${msg} ` +
+      `MCP client failed to initialize against ${policy.lci.endpoint}: ${failure.message} ` +
         '(is the LCI MCP server running and reachable?)',
       { code: 'mcp_init_failed' },
     );
@@ -1529,13 +2392,40 @@ export async function main(argv = process.argv.slice(2)) {
 
   const systemPrompt = buildSystemPrompt(policy, contract);
   try {
-    const finalText = await runAgentLoop({ policy, audit, tools, task, systemPrompt });
-    process.stdout.write(finalText + '\n');
-    return 0;
+    const outcome = await runAgentLoop({
+      policy,
+      audit,
+      tools,
+      task,
+      systemPrompt,
+      state,
+      signal: controller.signal,
+      deadline,
+      resumeSummary,
+      stopAfterFirstPatch: args.stopAfterFirstPatch,
+      stopAfterFirstFailedCheck: args.stopAfterFirstFailedCheck,
+    });
+    if (outcome.finalText) process.stdout.write(outcome.finalText + '\n');
+    process.stdout.write(runSummary(outcome, statePath) + '\n');
+    const code = exitCodeForStatus(outcome.status);
+    if (code !== 0) {
+      process.stderr.write(
+        outcome.failure
+          ? `agent failed: ${outcome.failure.message}\n`
+          : 'agent finished with no requested file changes\n',
+      );
+    }
+    return code;
   } catch (e) {
+    // Only a harness fault reaches here: the loop classifies everything else.
+    state.noteFailure({ failureClass: classifyFailure(e), code: e.code ?? null, turn: state.record.turn });
+    state.setStatus('failed');
+    state.save();
     process.stderr.write(`agent failed: ${e.message}\n`);
     return 1;
   } finally {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
     // Best-effort cleanup of the MCP session we own.
     try {
       if (typeof mcp.close === 'function') await mcp.close();
@@ -1543,6 +2433,42 @@ export async function main(argv = process.argv.slice(2)) {
       // Cleanup is best-effort; never mask the original outcome.
     }
   }
+}
+
+// Terminal status -> process exit code. Kept in one place so the coordinator
+// can branch on the outcome without parsing text.
+export function exitCodeForStatus(status) {
+  switch (status) {
+    case 'awaiting_review':
+    case 'stopped_after_patch':
+    case 'stopped_after_failed_check':
+      return 0;
+    case 'no_changes':
+      return 2;
+    case 'cancelled':
+    case 'deadline_exceeded':
+      return 3;
+    default:
+      return 1;
+  }
+}
+
+// Compact human-readable summary of the terminal outcome. Metadata only.
+function runSummary(outcome, statePath) {
+  const r = outcome.state?.record;
+  const lines = [
+    `run status: ${outcome.status}`,
+    `  task id: ${r?.task_id ?? '(none)'}`,
+    `  turns: ${r?.turn ?? 0}  patches: ${r?.patches_applied ?? 0}  checks: ${r?.checks_run?.length ?? 0}`,
+    `  files changed: ${r?.files_changed?.length ? r.files_changed.join(', ') : '(none)'}`,
+    `  diff id: ${r?.diff_id ?? '(none)'}`,
+    `  checkpoint: ${statePath}`,
+  ];
+  if (outcome.failure) {
+    lines.push(`  failure: class=${outcome.failure.class} code=${String(outcome.failure.code)}`);
+    lines.push(`  detail: ${outcome.failure.message}`);
+  }
+  return lines.join('\n');
 }
 
 // Run main only when executed directly (not when imported for tests).

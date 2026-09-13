@@ -36,6 +36,18 @@ import {
   McpClient,
   runAgentLoop,
   main,
+  classifyFailure,
+  isRetryable,
+  hashText,
+  nearbySourceContext,
+  combineSignals,
+  createDeadline,
+  runFixedCommand,
+  exitCodeForStatus,
+  TaskState,
+  DEFAULT_LIMITS,
+  DEFAULT_RETRY_BUDGET,
+  FAILURE_CLASSES,
 } from '../agent.mjs';
 
 // ---------------------------------------------------------------------------
@@ -57,7 +69,14 @@ function makePolicy({ repoRoot, read = [], write = [], deny = [] }) {
     denyRe: deny.map(globToRegExp),
     model: { name: 'qwen3.8-27b', endpoint: 'http://127.0.0.1:8765/v1', apiKeyEnv: 'QWEN_API_KEY' },
     lci: { endpoint: 'http://127.0.0.1:8768/mcp' },
-    limits: { maxTurns: 24, maxReadLines: 400, maxPatchBytes: 24576, maxToolResultBytes: 16384 },
+    limits: {
+      maxTurns: 24,
+      maxReadLines: 400,
+      maxPatchBytes: 24576,
+      maxToolResultBytes: 16384,
+      ...DEFAULT_LIMITS,
+      retryBudget: { ...DEFAULT_RETRY_BUDGET },
+    },
     checks: { script: 'scripts/Test.ps1', suites: { chunk: 'Chunk' } },
     audit: { jsonlPath: path.join(repoRoot, 'test-results', 'local-agent', 'audit.jsonl') },
   };
@@ -1372,7 +1391,7 @@ test('AuditLog: never records secret content, only metadata fields', () => {
     const line = JSON.parse(raw.trim());
     assert.deepEqual(
       Object.keys(line).sort(),
-      ['contractId', 'durationMs', 'error', 'inputBytes', 'kind', 'ok', 'outputBytes', 'tool', 'ts'].sort(),
+      ['contractId', 'taskId', 'durationMs', 'error', 'inputBytes', 'kind', 'ok', 'outputBytes', 'tool', 'ts'].sort(),
     );
     assert.equal(line.error, 'patch_mismatch');
     // No contract is active here, so the id is null (never a contract body).
@@ -1437,7 +1456,7 @@ test('AuditLog: a failed audit write is fatal with code audit_failure', () => {
 // state and never invoke git.
 // ---------------------------------------------------------------------------
 
-test('runAgentLoop: returns the final assistant text with no tool calls', async () => {
+test('runAgentLoop: returns the final assistant text and reports no_changes when nothing was patched', async () => {
   const repoRoot = await makeTempDir('lca-loop-final-');
   const realFetch = globalThis.fetch;
   const modelEndpoint = 'http://127.0.0.1:0/v1';
@@ -1450,8 +1469,9 @@ test('runAgentLoop: returns the final assistant text with no tool calls', async 
     process.env.QWEN_API_KEY = 'test-key';
     const audit = new AuditLog(policy);
     const tools = buildTools(policy, audit, { dryRun: false });
-    const finalText = await runAgentLoop({ policy, audit, tools, task: 'hi', systemPrompt: 'test' });
-    assert.equal(finalText, 'all done');
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'hi', systemPrompt: 'test' });
+    assert.equal(outcome.finalText, 'all done');
+    assert.equal(outcome.status, 'no_changes');
   } finally {
     globalThis.fetch = realFetch;
     delete process.env.QWEN_API_KEY;
@@ -1493,9 +1513,11 @@ test('runAgentLoop: executes a harmless fake tool call then returns the final te
     // Inject a harmless fake tool so the loop exercises a real tool call
     // without depending on a Git repository.
     tools.fake_tool = makeFakeTool('fake_tool', 'fake-result');
-    const finalText = await runAgentLoop({ policy, audit, tools, task: 'diff', systemPrompt: 'test' });
-    assert.equal(finalText, 'finished');
-    assert.equal(calls.length, 2);
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'diff', systemPrompt: 'test' });
+    assert.equal(outcome.finalText, 'finished');
+    // Turn 1 tool call, turn 2 final answer, turn 3 after the one no-change
+    // correction prompt.
+    assert.equal(calls.length, 3);
     const lines = readAuditLines(policy);
     const toolLine = lines.find((l) => l.kind === 'tool' && l.tool === 'fake_tool');
     assert.ok(toolLine, 'fake tool call was not audited');
@@ -1507,7 +1529,7 @@ test('runAgentLoop: executes a harmless fake tool call then returns the final te
   }
 });
 
-test('runAgentLoop: a fatal tool error stops the loop and is audited', async () => {
+test('runAgentLoop: a harness tool error stops the loop and is audited', async () => {
   const repoRoot = await makeTempDir('lca-loop-fatal-');
   const realFetch = globalThis.fetch;
   const modelEndpoint = 'http://127.0.0.1:0/v1';
@@ -1531,10 +1553,9 @@ test('runAgentLoop: a fatal tool error stops the loop and is audited', async () 
     process.env.QWEN_API_KEY = 'test-key';
     const audit = new AuditLog(policy);
     const tools = buildTools(policy, audit, { dryRun: false });
-    await assert.rejects(
-      () => runAgentLoop({ policy, audit, tools, task: 'read', systemPrompt: 'test' }),
-      AgentError,
-    );
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'read', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.class, 'harness_failure');
     const lines = readAuditLines(policy);
     const toolLine = lines.find((l) => l.kind === 'tool' && l.tool === 'read_file');
     assert.ok(toolLine, 'tool call was not audited');
@@ -1546,9 +1567,9 @@ test('runAgentLoop: a fatal tool error stops the loop and is audited', async () 
   }
 });
 
-// An unknown tool is fatal (AgentError.fatal defaults to true), so the loop
-// must reject with code unknown_tool rather than recover via the model.
-test('runAgentLoop: an unknown tool name is fatal with code unknown_tool', async () => {
+// An unknown tool is a harness failure with no retry budget, so the loop must
+// stop and report it rather than recover via the model.
+test('runAgentLoop: an unknown tool name stops the run with code unknown_tool', async () => {
   const repoRoot = await makeTempDir('lca-loop-unknown-');
   const realFetch = globalThis.fetch;
   const modelEndpoint = 'http://127.0.0.1:0/v1';
@@ -1572,10 +1593,9 @@ test('runAgentLoop: an unknown tool name is fatal with code unknown_tool', async
     process.env.QWEN_API_KEY = 'test-key';
     const audit = new AuditLog(policy);
     const tools = buildTools(policy, audit, { dryRun: false });
-    await assert.rejects(
-      () => runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' }),
-      (e) => e instanceof AgentError && e.code === 'unknown_tool',
-    );
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.code, 'unknown_tool');
     const lines = readAuditLines(policy);
     const toolLine = lines.find((l) => l.kind === 'tool' && l.tool === 'no_such_tool');
     assert.ok(toolLine, 'unknown tool call was not audited');
@@ -1590,7 +1610,7 @@ test('runAgentLoop: an unknown tool name is fatal with code unknown_tool', async
 
 // maxTurns is exercised with a harmless fake tool (not git_diff) so the loop
 // keeps calling a tool until it exceeds the turn budget.
-test('runAgentLoop: throws when maxTurns is exceeded', async () => {
+test('runAgentLoop: stops when maxTurns is exceeded', async () => {
   const repoRoot = await makeTempDir('lca-loop-maxturns-');
   const realFetch = globalThis.fetch;
   const modelEndpoint = 'http://127.0.0.1:0/v1';
@@ -1616,10 +1636,9 @@ test('runAgentLoop: throws when maxTurns is exceeded', async () => {
     const audit = new AuditLog(policy);
     const tools = buildTools(policy, audit, { dryRun: false });
     tools.fake_tool = makeFakeTool('fake_tool', 'fake-result');
-    await assert.rejects(
-      () => runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' }),
-      (e) => e instanceof AgentError && e.code === 'max_turns',
-    );
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.code, 'max_turns');
   } finally {
     globalThis.fetch = realFetch;
     delete process.env.QWEN_API_KEY;
@@ -1640,10 +1659,10 @@ test('runAgentLoop: fails with no_api_key when the key env var is unset', async 
     delete process.env.QWEN_API_KEY;
     const audit = new AuditLog(policy);
     const tools = buildTools(policy, audit, { dryRun: false });
-    await assert.rejects(
-      () => runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' }),
-      (e) => e instanceof AgentError && e.code === 'no_api_key',
-    );
+    const outcome = await runAgentLoop({ policy, audit, tools, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.class, 'model_failure');
+    assert.equal(outcome.failure.code, 'no_api_key');
   } finally {
     globalThis.fetch = realFetch;
     delete process.env.QWEN_API_KEY;
@@ -1687,7 +1706,7 @@ test('runAgentLoop: audits model turns and tool calls with metadata only', async
     const lines = readAuditLines(policy);
     const modelTurns = lines.filter((l) => l.kind === 'model_turn');
     const toolLines = lines.filter((l) => l.kind === 'tool');
-    assert.equal(modelTurns.length, 2, 'both model turns must be audited');
+    assert.equal(modelTurns.length, 3, 'every model turn must be audited');
     assert.ok(modelTurns.every((l) => l.ok === true));
     assert.equal(toolLines.length, 1);
     assert.equal(toolLines[0].tool, 'fake_tool');
@@ -1900,10 +1919,12 @@ test('main: initializes MCP before any tools/call and audits a successful run', 
     process.env.QW_API_KEY = 'test-key';
     const policyPath = writePolicyFile(repoRoot);
     const code = await main(['--policy', policyPath, '--task', 'do the thing']);
-    assert.equal(code, 0);
+    // The scripted model answers without requesting any file change, so the
+    // run ends in no_changes (exit 2) rather than awaiting_review.
+    assert.equal(code, 2);
     assert.ok(modelContacted, 'the model must be contacted on the live path');
     assert.ok(capturedOut.includes('final answer'));
-    assert.equal(capturedErr, '', 'no stderr output on success');
+    assert.ok(capturedErr.includes('no requested file changes'));
     // The initialize handshake must precede any tools/call request.
     const initIdx = requests.indexOf('initialize');
     const firstCallIdx = requests.findIndex((m) => m === 'tools/call');
@@ -2291,7 +2312,7 @@ test('main live contract path audits contract id', async () => {
     const policyPath = writePolicyFile(repoRoot);
     const contractPath = writeContractFile(repoRoot, { id: 'contract-live-audit-1' });
     const code = await main(['--policy', policyPath, '--contract', contractPath]);
-    assert.equal(code, 0, 'live contract run must return 0');
+    assert.equal(code, 2, 'the scripted model requests no file change');
     assert.ok(modelContacted, 'the model must be contacted on the live path');
     assert.ok(capturedOut.includes('live contract final answer'));
     assert.ok(mcpMethods.includes('initialize'), 'MCP initialize must be mocked and used');
@@ -2390,7 +2411,7 @@ test('main: valid non-dry-run --contract with mocked MCP and model returns 0 and
     const policyPath = writePolicyFile(repoRoot);
     const contractPath = writeContractFile(repoRoot, { id: 'contract-live-1' });
     const code = await main(['--policy', policyPath, '--contract', contractPath]);
-    assert.equal(code, 0);
+    assert.equal(code, 2, 'the scripted model requests no file change');
     assert.ok(modelContacted, 'the model must be contacted on the live path');
     assert.ok(capturedOut.includes('contract final answer'));
     assert.ok(mcpMethods.includes('initialize'), 'MCP initialize must be mocked and used');
@@ -2733,4 +2754,727 @@ test('plan_verification tool: matches the pure planner and performs no fetch or 
     globalThis.fetch = realFetch;
     await fsp.rm(repoRoot, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Reliability: timeouts, deadlines, cancellation, checkpoints, recovery
+// ---------------------------------------------------------------------------
+// Every test below is offline. Model and MCP transports are scripted through
+// globalThis.fetch, cancellation uses an in-process AbortController, and no
+// test spawns a process or contacts 127.0.0.1:8765 / 127.0.0.1:8768.
+
+// Script a model that returns the queued responses in order. Each entry is
+// either a final-content string or an array of tool calls.
+function scriptModel(steps) {
+  let i = 0;
+  const calls = [];
+  const handler = async (url) => {
+    if (!String(url).includes('/chat/completions')) {
+      throw new Error(`unexpected non-model request: ${url}`);
+    }
+    const step = steps[Math.min(i, steps.length - 1)];
+    i += 1;
+    calls.push(1);
+    if (typeof step === 'function') return step();
+    if (typeof step === 'string') return Response.json({ choices: [{ message: { content: step } }] });
+    return Response.json({
+      choices: [{ message: { content: null, tool_calls: step } }],
+    });
+  };
+  return { handler, calls };
+}
+
+function toolCall(name, args, id = `call_${Math.random().toString(16).slice(2)}`) {
+  return { id, type: 'function', function: { name, arguments: JSON.stringify(args) } };
+}
+
+// A temp repo with one source file, a policy, and an initialized harness.
+async function makeLoopFixture(prefix, { limits = {} } = {}) {
+  const repoRoot = await makeTempDir(prefix);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  const target = path.join(repoRoot, 'src', 'a.rs');
+  fs.writeFileSync(target, 'fn one() {}\nfn two() {}\nfn three() {}\n', 'utf8');
+  const policyPath = writePolicyFile(repoRoot, {
+    model: { name: 'qwen3.8-27b', endpoint: 'http://127.0.0.1:0/v1', apiKeyEnv: 'QWEN_API_KEY' },
+    limits: { maxTurns: 8, maxReadLines: 400, maxPatchBytes: 24576, maxToolResultBytes: 16384, ...limits },
+  });
+  const policy = loadPolicy(policyPath);
+  const audit = new AuditLog(policy);
+  const tools = buildTools(policy, audit, { dryRun: false });
+  return { repoRoot, target, policy, audit, tools };
+}
+
+test('parseArgs: recovery flags parse and --task-id is validated', () => {
+  const out = parseArgs([
+    '--policy', 'p.json', '--task', 'x',
+    '--task-id', 'python-decorators-01',
+    '--state', 's.json',
+    '--resume',
+    '--stop-after-first-patch',
+    '--stop-after-first-failed-check',
+  ]);
+  assert.equal(out.taskId, 'python-decorators-01');
+  assert.equal(out.state, 's.json');
+  assert.equal(out.resume, true);
+  assert.equal(out.stopAfterFirstPatch, true);
+  assert.equal(out.stopAfterFirstFailedCheck, true);
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--task', 'x', '--task-id', 'bad id']), AgentError);
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--task', 'x', '--task-id']), AgentError);
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--task', 'x', '--task-id', 'a', '--task-id', 'b']), AgentError);
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--task', 'x', '--state']), AgentError);
+});
+
+test('loadPolicy: request bounds default and the retry budget is validated', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    // Absent fields keep the documented defaults.
+    const defaults = loadPolicy(writePolicyFile(repoRoot));
+    for (const [key, value] of Object.entries(DEFAULT_LIMITS)) {
+      assert.equal(defaults.limits[key], value, `${key} must default`);
+    }
+    assert.deepEqual(defaults.limits.retryBudget, { ...DEFAULT_RETRY_BUDGET });
+
+    // Explicit fields override, and a partial retry budget merges.
+    const custom = loadPolicy(writePolicyFile(repoRoot, {
+      limits: {
+        maxTurns: 4,
+        maxReadLines: 10,
+        maxPatchBytes: 10,
+        maxToolResultBytes: 10,
+        modelRequestTimeoutMs: 5000,
+        taskDeadlineMs: 9000,
+        retryBudget: { patch_rejected: 3 },
+      },
+    }));
+    assert.equal(custom.limits.modelRequestTimeoutMs, 5000);
+    assert.equal(custom.limits.taskDeadlineMs, 9000);
+    assert.equal(custom.limits.mcpRequestTimeoutMs, DEFAULT_LIMITS.mcpRequestTimeoutMs);
+    assert.equal(custom.limits.retryBudget.patch_rejected, 3);
+    assert.equal(custom.limits.retryBudget.model_failure, DEFAULT_RETRY_BUDGET.model_failure);
+
+    const base = { maxTurns: 4, maxReadLines: 10, maxPatchBytes: 10, maxToolResultBytes: 10 };
+    assert.throws(
+      () => loadPolicy(writePolicyFile(repoRoot, { limits: { ...base, modelRequestTimeoutMs: 0 } })),
+      (e) => e instanceof AgentError && /modelRequestTimeoutMs/.test(e.message),
+    );
+    assert.throws(
+      () => loadPolicy(writePolicyFile(repoRoot, { limits: { ...base, retryBudget: { nope: 1 } } })),
+      (e) => e instanceof AgentError && /unknown failure class/.test(e.message),
+    );
+    assert.throws(
+      () => loadPolicy(writePolicyFile(repoRoot, { limits: { ...base, retryBudget: { check_failed: -1 } } })),
+      (e) => e instanceof AgentError && /non-negative integer/.test(e.message),
+    );
+    assert.throws(
+      () => loadPolicy(writePolicyFile(repoRoot, { limits: { ...base, retryBudget: [] } })),
+      (e) => e instanceof AgentError && /retryBudget must be an object/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('classifyFailure: model, MCP, patch, check, cancellation, and deadline stay distinct', () => {
+  const cases = {
+    model_timeout: 'model_failure',
+    model_error: 'model_failure',
+    no_api_key: 'model_failure',
+    mcp_timeout: 'mcp_failure',
+    mcp_tool_error: 'mcp_failure',
+    patch_mismatch: 'patch_rejected',
+    contract_path_denied: 'patch_rejected',
+    check_failed: 'check_failed',
+    check_timeout: 'check_failed',
+    git_timeout: 'harness_failure',
+    cancelled: 'coordinator_cancelled',
+    deadline_exceeded: 'deadline_exceeded',
+    unknown_tool: 'harness_failure',
+  };
+  for (const [code, expected] of Object.entries(cases)) {
+    assert.equal(classifyFailure(new AgentError('x', { code })), expected, code);
+    assert.ok(FAILURE_CLASSES.includes(expected));
+  }
+  assert.equal(classifyFailure(new Error('plain')), 'harness_failure');
+  // Transport-shaped faults are retryable; configuration decisions are not.
+  assert.equal(isRetryable(new AgentError('x', { code: 'model_timeout' })), true);
+  assert.equal(isRetryable(new AgentError('x', { code: 'patch_mismatch' })), true);
+  assert.equal(isRetryable(new AgentError('x', { code: 'no_api_key' })), false);
+  assert.equal(isRetryable(new AgentError('x', { code: 'contract_path_denied' })), false);
+  assert.equal(isRetryable(new AgentError('x', { code: 'unknown_tool' })), false);
+});
+
+test('exitCodeForStatus: maps every terminal status', () => {
+  assert.equal(exitCodeForStatus('awaiting_review'), 0);
+  assert.equal(exitCodeForStatus('stopped_after_patch'), 0);
+  assert.equal(exitCodeForStatus('stopped_after_failed_check'), 0);
+  assert.equal(exitCodeForStatus('no_changes'), 2);
+  assert.equal(exitCodeForStatus('cancelled'), 3);
+  assert.equal(exitCodeForStatus('deadline_exceeded'), 3);
+  assert.equal(exitCodeForStatus('failed'), 1);
+});
+
+test('createDeadline: reports expiry and bounds each request by the remaining time', () => {
+  const live = createDeadline(10000);
+  assert.equal(live.expired(), false);
+  assert.ok(live.remainingMs() > 0);
+  assert.ok(live.boundedTimeout(1000) <= 1000);
+  assert.ok(live.boundedTimeout(999999) <= 10000);
+  live.assertLive('a turn');
+
+  const dead = createDeadline(-1);
+  assert.equal(dead.expired(), true);
+  assert.equal(dead.boundedTimeout(1000), 0);
+  assert.throws(() => dead.assertLive('a turn'), (e) => e instanceof AgentError && e.code === 'deadline_exceeded');
+});
+
+test('combineSignals: combines a cancellation signal with a per-request timeout', () => {
+  assert.equal(combineSignals(null, 0), undefined);
+  const timeoutOnly = combineSignals(null, 1000);
+  assert.ok(timeoutOnly instanceof AbortSignal);
+  const controller = new AbortController();
+  const both = combineSignals(controller.signal, 1000);
+  assert.equal(both.aborted, false);
+  controller.abort();
+  assert.equal(both.aborted, true, 'cancelling the outer signal aborts the combined signal');
+});
+
+test('nearbySourceContext: returns numbered current source around the anchor, or the head with no anchor', () => {
+  const content = ['a', 'b', 'target line', 'c', 'd'].join('\n');
+  const found = nearbySourceContext(content, 'target line\nmore', 'src/a.rs');
+  assert.ok(found.includes('src/a.rs: current source lines'));
+  assert.ok(found.includes('3: target line'));
+  const missing = nearbySourceContext(content, 'nothing like this', 'src/a.rs');
+  assert.ok(missing.includes('no anchor line from oldText was found'));
+  assert.ok(missing.includes('1: a'));
+  // Blank leading lines are skipped when choosing the anchor.
+  const blankLed = nearbySourceContext(content, '\n\n  target line  ', 'src/a.rs');
+  assert.ok(blankLed.includes('3: target line'));
+});
+
+test('TaskState: checkpoints the compact record, reloads it, and refuses a different task', () => {
+  const dir = makeTempDirSync();
+  try {
+    const statePath = path.join(dir, 'state', 'python-decorators-01.json');
+    const state = new TaskState({
+      statePath,
+      taskId: 'python-decorators-01',
+      taskHash: hashText('the task'),
+      contractId: 'slice-1',
+      contractHash: hashText('contract'),
+      tools: ['read_file', 'apply_patch'],
+    });
+    state.setTurn(6);
+    state.notePatch('src/chunk.rs', hashText('one'));
+    state.notePatch('tests/cases/indexing.rs', hashText('two'));
+    state.noteCheck('Indexing', 'passed');
+    state.setStatus('awaiting_review');
+    state.save();
+
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(raw.task_id, 'python-decorators-01');
+    assert.equal(raw.status, 'awaiting_review');
+    assert.equal(raw.turn, 6);
+    assert.equal(raw.patches_applied, 2);
+    assert.deepEqual(raw.checks_run, [{ suite: 'Indexing', result: 'passed' }]);
+    assert.deepEqual(raw.files_changed, ['src/chunk.rs', 'tests/cases/indexing.rs']);
+    assert.equal(raw.last_failure, null);
+    assert.ok(raw.diff_id, 'accepted patches must produce a diff identity');
+    // The conversation is never persisted.
+    assert.ok(!('messages' in raw));
+    assert.ok(!('conversation' in raw));
+    assert.ok(!('task' in raw));
+
+    const reloaded = TaskState.load(statePath, {
+      taskId: 'python-decorators-01',
+      taskHash: hashText('the task'),
+      contractId: 'slice-1',
+      contractHash: hashText('contract'),
+    });
+    assert.equal(reloaded.record.patches_applied, 2);
+    assert.ok(reloaded.resumeSummary().includes('python-decorators-01'));
+
+    assert.throws(
+      () => TaskState.load(statePath, { taskId: 'other', taskHash: hashText('the task') }),
+      (e) => e instanceof AgentError && e.code === 'state_mismatch',
+    );
+    assert.throws(
+      () => TaskState.load(statePath, { taskId: 'python-decorators-01', taskHash: hashText('changed') }),
+      (e) => e instanceof AgentError && e.code === 'state_mismatch',
+    );
+    assert.throws(
+      () => TaskState.load(path.join(dir, 'nope.json'), {}),
+      (e) => e instanceof AgentError && e.code === 'state_missing',
+    );
+    fs.writeFileSync(path.join(dir, 'bad.json'), '{ not json', 'utf8');
+    assert.throws(
+      () => TaskState.load(path.join(dir, 'bad.json'), {}),
+      (e) => e instanceof AgentError && e.code === 'state_corrupt',
+    );
+    assert.throws(
+      () => new TaskState({ statePath, taskId: 'bad id', taskHash: 'x' }),
+      (e) => e instanceof AgentError && e.code === 'bad_task_id',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('TaskState: failures and retries are recorded per class and cleared by an accepted patch', () => {
+  const dir = makeTempDirSync();
+  try {
+    const state = new TaskState({ statePath: path.join(dir, 's.json'), taskId: 't1', taskHash: 'h' });
+    state.noteFailure({ failureClass: 'patch_rejected', code: 'patch_mismatch', turn: 2 });
+    assert.equal(state.record.last_failure.class, 'patch_rejected');
+    assert.equal(state.retriesUsed('patch_rejected'), 0);
+    assert.equal(state.noteRetry('patch_rejected'), 1);
+    assert.equal(state.retriesUsed('patch_rejected'), 1);
+    state.notePatch('src/a.rs', 'hash');
+    assert.equal(state.record.last_failure, null, 'an accepted patch clears the last failure');
+    assert.ok(state.resumeSummary().includes('src/a.rs'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: a model transport timeout is retried once, then reported as a model failure', async () => {
+  const fixture = await makeLoopFixture('lca-timeout-');
+  const realFetch = globalThis.fetch;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    const e = new Error('The operation was aborted due to timeout');
+    e.name = 'TimeoutError';
+    throw e;
+  };
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.class, 'model_failure');
+    assert.equal(outcome.failure.code, 'model_timeout');
+    assert.equal(attempts, 2, 'the same request is retried exactly once');
+    const retry = readAuditLines(fixture.policy).find((l) => l.kind === 'lifecycle' && l.event === 'retry');
+    assert.ok(retry, 'the retry must be audited');
+    assert.equal(retry.failureClass, 'model_failure');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: a patch precondition mismatch returns the current nearby source and is corrected', async () => {
+  const fixture = await makeLoopFixture('lca-mismatch-');
+  const realFetch = globalThis.fetch;
+  const script = scriptModel([
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn missing() {}', newText: 'x' })],
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn two() {}', newText: 'fn two() { /* patched */ }' })],
+    'corrected',
+  ]);
+  globalThis.fetch = script.handler;
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'awaiting_review');
+    assert.equal(outcome.finalText, 'corrected');
+    assert.ok(fs.readFileSync(fixture.target, 'utf8').includes('/* patched */'));
+    const lines = readAuditLines(fixture.policy);
+    const failed = lines.find((l) => l.kind === 'tool' && l.tool === 'apply_patch' && l.ok === false);
+    assert.equal(failed.error, 'patch_mismatch');
+    const retry = lines.find((l) => l.kind === 'lifecycle' && l.event === 'retry');
+    assert.equal(retry.failureClass, 'patch_rejected');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: the mismatch tool result carries the current nearby source for a fresh exact patch', async () => {
+  const fixture = await makeLoopFixture('lca-mismatch-ctx-');
+  try {
+    await assert.rejects(
+      () => fixture.tools.apply_patch.fn({ path: 'src/a.rs', oldText: 'fn two() { }', newText: 'z' }),
+      (e) => e instanceof AgentError
+        && e.code === 'patch_mismatch'
+        && e.fatal === false
+        && /current source lines|no anchor line/.test(e.message)
+        && e.message.includes('fn two() {}'),
+    );
+  } finally {
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: a repeated identical failing tool call stops and returns control to the coordinator', async () => {
+  const fixture = await makeLoopFixture('lca-repeat-');
+  const realFetch = globalThis.fetch;
+  // The same failing call, verbatim, every turn.
+  const script = scriptModel([
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn missing() {}', newText: 'x' }, 'call_same')],
+  ]);
+  globalThis.fetch = script.handler;
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.failure.class, 'patch_rejected');
+    assert.equal(outcome.failure.repeated, true);
+    // Stopped on the second identical failure, well inside maxTurns.
+    assert.equal(script.calls.length, 2);
+    const repeated = readAuditLines(fixture.policy).find((l) => l.kind === 'lifecycle' && l.event === 'repeated_failure');
+    assert.ok(repeated, 'the repeated failure must be audited');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: a final response with no requested file change gets one correction, then reports no_changes', async () => {
+  const fixture = await makeLoopFixture('lca-nochange-');
+  const realFetch = globalThis.fetch;
+  const script = scriptModel(['I looked around and changed nothing.']);
+  globalThis.fetch = script.handler;
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, task: 'x', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'no_changes');
+    assert.equal(script.calls.length, 2, 'exactly one short correction prompt is sent');
+    const correction = readAuditLines(fixture.policy).find((l) => l.kind === 'lifecycle' && l.event === 'no_change_correction');
+    assert.ok(correction, 'the correction must be audited');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: stop-after-first-patch stops as soon as one patch is accepted', async () => {
+  const fixture = await makeLoopFixture('lca-stoppatch-');
+  const realFetch = globalThis.fetch;
+  const script = scriptModel([
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn one() {}', newText: 'fn one() { /* a */ }' })],
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn two() {}', newText: 'fn two() { /* b */ }' })],
+    'done',
+  ]);
+  globalThis.fetch = script.handler;
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, task: 'x', systemPrompt: 'test', stopAfterFirstPatch: true });
+    assert.equal(outcome.status, 'stopped_after_patch');
+    assert.equal(script.calls.length, 1);
+    const content = fs.readFileSync(fixture.target, 'utf8');
+    assert.ok(content.includes('/* a */'));
+    assert.ok(!content.includes('/* b */'), 'the second patch must never run');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: stop-after-first-failed-check stops on the first failing check', async () => {
+  const fixture = await makeLoopFixture('lca-stopcheck-');
+  const realFetch = globalThis.fetch;
+  // A scripted failing check: no PowerShell suite is ever spawned.
+  const tools = {
+    ...fixture.tools,
+    run_check: {
+      fn: async () => {
+        throw new AgentError('run_check chunk failed (exit 1):\n<failure output>', { code: 'check_failed', fatal: false });
+      },
+      schema: {},
+    },
+  };
+  const script = scriptModel([[toolCall('run_check', { suite: 'chunk' })], 'done']);
+  globalThis.fetch = script.handler;
+  const state = new TaskState({
+    statePath: path.join(fixture.repoRoot, 'state.json'),
+    taskId: 'stopcheck',
+    taskHash: hashText('x'),
+  });
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({
+      policy: fixture.policy,
+      audit: fixture.audit,
+      tools,
+      state,
+      task: 'x',
+      systemPrompt: 'test',
+      stopAfterFirstFailedCheck: true,
+    });
+    assert.equal(outcome.status, 'stopped_after_failed_check');
+    assert.equal(outcome.failure.class, 'check_failed');
+    assert.equal(script.calls.length, 1, 'the run stops without another model turn');
+    assert.deepEqual(state.record.checks_run, [{ suite: 'chunk', result: 'failed' }]);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: cancellation stops gracefully and checkpoints as cancelled', async () => {
+  const fixture = await makeLoopFixture('lca-cancel-');
+  const realFetch = globalThis.fetch;
+  const controller = new AbortController();
+  const statePath = path.join(fixture.repoRoot, 'state.json');
+  const state = new TaskState({ statePath, taskId: 'cancel-1', taskHash: hashText('x') });
+  // Cancel while the first model request is in flight.
+  globalThis.fetch = async () => {
+    controller.abort();
+    const e = new Error('aborted');
+    e.name = 'AbortError';
+    throw e;
+  };
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({
+      ...fixture,
+      state,
+      task: 'x',
+      systemPrompt: 'test',
+      signal: controller.signal,
+    });
+    assert.equal(outcome.status, 'cancelled');
+    assert.equal(outcome.failure.class, 'coordinator_cancelled');
+    const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(saved.status, 'cancelled');
+    assert.equal(saved.last_failure.class, 'coordinator_cancelled');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: an expired task deadline stops before any model contact', async () => {
+  const fixture = await makeLoopFixture('lca-deadline-');
+  const realFetch = globalThis.fetch;
+  let contacted = 0;
+  globalThis.fetch = async () => {
+    contacted += 1;
+    return Response.json({ choices: [{ message: { content: 'x' } }] });
+  };
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({
+      ...fixture,
+      task: 'x',
+      systemPrompt: 'test',
+      deadline: createDeadline(-1),
+    });
+    assert.equal(outcome.status, 'deadline_exceeded');
+    assert.equal(outcome.failure.class, 'deadline_exceeded');
+    assert.equal(contacted, 0, 'no model request may start after the deadline');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: a checkpoint is written after every accepted patch and a resumed run continues the counters', async () => {
+  const fixture = await makeLoopFixture('lca-checkpoint-');
+  const realFetch = globalThis.fetch;
+  const statePath = path.join(fixture.repoRoot, 'state', 'resume-1.json');
+  const taskHash = hashText('the task');
+  const first = new TaskState({ statePath, taskId: 'resume-1', taskHash, tools: ['apply_patch'] });
+  const script = scriptModel([
+    [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn one() {}', newText: 'fn one() { /* a */ }' })],
+    'first slice done',
+  ]);
+  globalThis.fetch = script.handler;
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({ ...fixture, state: first, task: 'the task', systemPrompt: 'test' });
+    assert.equal(outcome.status, 'awaiting_review');
+    const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(saved.patches_applied, 1);
+    assert.deepEqual(saved.files_changed, ['src/a.rs']);
+    assert.ok(saved.diff_id, 'the accepted patch must give the run a diff identity');
+    const firstDiffId = saved.diff_id;
+
+    // Resume: the checkpoint is reloaded and the second patch continues the
+    // same counters and diff identity chain.
+    const resumed = TaskState.load(statePath, { taskId: 'resume-1', taskHash });
+    const script2 = scriptModel([
+      [toolCall('apply_patch', { path: 'src/a.rs', oldText: 'fn two() {}', newText: 'fn two() { /* b */ }' })],
+      'second slice done',
+    ]);
+    globalThis.fetch = script2.handler;
+    const outcome2 = await runAgentLoop({
+      ...fixture,
+      state: resumed,
+      task: 'the task',
+      systemPrompt: 'test',
+      resumeSummary: resumed.resumeSummary(),
+    });
+    assert.equal(outcome2.status, 'awaiting_review');
+    const saved2 = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(saved2.patches_applied, 2);
+    assert.ok(saved2.turn > saved.turn, 'a resumed run continues the turn counter');
+    assert.notEqual(saved2.diff_id, firstDiffId, 'the diff identity changes with a new accepted patch');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('main: --resume refuses a checkpoint written for a different task', async () => {
+  const repoRoot = await makeTempDir('lca-main-resume-');
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ choices: [{ message: { content: 'x' } }] });
+  };
+  try {
+    const policyPath = writePolicyFile(repoRoot);
+    const statePath = path.join(repoRoot, 'state.json');
+    const other = new TaskState({ statePath, taskId: 'other-task', taskHash: hashText('a different task') });
+    other.save();
+    await assert.rejects(
+      () => main(['--policy', policyPath, '--task', 'do the thing', '--task-id', 'other-task', '--state', statePath, '--resume']),
+      (e) => e instanceof AgentError && e.code === 'state_mismatch',
+    );
+    assert.equal(fetchCalls, 0, 'a mismatched checkpoint must be refused before any model or MCP contact');
+  } finally {
+    globalThis.fetch = realFetch;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('main: --dry-run reports the request bounds, retry budget, task id, and checkpoint path', async () => {
+  const repoRoot = await makeTempDir('lca-dry-recovery-');
+  const realStdout = process.stdout.write;
+  let captured = '';
+  process.stdout.write = (chunk) => { captured += String(chunk); return true; };
+  try {
+    const policyPath = writePolicyFile(repoRoot);
+    const code = await main(['--policy', policyPath, '--task', 'do the thing', '--task-id', 'dry-1', '--dry-run']);
+    assert.equal(code, 0);
+    assert.ok(captured.includes('timeouts: model='));
+    assert.ok(captured.includes('retry budget: model_failure=1'));
+    assert.ok(captured.includes('task id: dry-1'));
+    assert.ok(captured.includes('checkpoint:'));
+    assert.ok(captured.includes('stopAfterFirstPatch: false'));
+  } finally {
+    process.stdout.write = realStdout;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('TaskState: resume rejects changed, missing, and unsafe recorded files', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const target = path.join(repoRoot, 'a.rs');
+    const statePath = path.join(repoRoot, 'state.json');
+    fs.writeFileSync(target, 'one', 'utf8');
+    const state = new TaskState({ statePath, taskId: 'drift-1', taskHash: hashText('task') });
+    state.notePatch('a.rs', hashText('one'));
+    state.save();
+    assert.doesNotThrow(() => TaskState.load(statePath, { taskId: 'drift-1', taskHash: hashText('task'), repoRoot }));
+
+    fs.writeFileSync(target, 'two', 'utf8');
+    assert.throws(
+      () => TaskState.load(statePath, { taskId: 'drift-1', taskHash: hashText('task'), repoRoot }),
+      (e) => e instanceof AgentError && e.code === 'state_drift',
+    );
+    fs.rmSync(target);
+    assert.throws(
+      () => TaskState.load(statePath, { taskId: 'drift-1', taskHash: hashText('task'), repoRoot }),
+      (e) => e instanceof AgentError && e.code === 'state_drift',
+    );
+
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    raw.file_hashes = { '../outside': hashText('x') };
+    fs.writeFileSync(statePath, JSON.stringify(raw), 'utf8');
+    assert.throws(
+      () => TaskState.load(statePath, { taskId: 'drift-1', taskHash: hashText('task'), repoRoot }),
+      (e) => e instanceof AgentError && e.code === 'state_corrupt',
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('runAgentLoop: deadline expiry during a model request is not a model timeout', async () => {
+  const fixture = await makeLoopFixture('lca-model-deadline-');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+  });
+  try {
+    process.env.QWEN_API_KEY = 'test-key';
+    const outcome = await runAgentLoop({
+      ...fixture,
+      task: 'x',
+      systemPrompt: 'test',
+      deadline: createDeadline(25),
+    });
+    assert.equal(outcome.status, 'deadline_exceeded');
+    assert.equal(outcome.failure.code, 'deadline_exceeded');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.QWEN_API_KEY;
+    await fsp.rm(fixture.repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('McpClient: deadline expiry during a request is distinct from an MCP timeout', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+  });
+  try {
+    const client = new McpClient('http://127.0.0.1:8768/mcp', {
+      timeoutMs: 1000,
+      deadline: createDeadline(25),
+    });
+    await assert.rejects(
+      () => client.initialize(),
+      (e) => e instanceof AgentError && e.code === 'deadline_exceeded',
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('runFixedCommand: deadline and operation timeout codes stay distinct', async () => {
+  await assert.rejects(
+    () => runFixedCommand({
+      argv: [process.execPath, '-e', 'setTimeout(() => {}, 1000)'],
+      cwd: process.cwd(),
+      timeoutMs: 1000,
+      timeoutCode: 'check_timeout',
+      deadline: createDeadline(25),
+    }),
+    (e) => e instanceof AgentError && e.code === 'deadline_exceeded',
+  );
+  await assert.rejects(
+    () => runFixedCommand({
+      argv: [process.execPath, '-e', 'setTimeout(() => {}, 1000)'],
+      cwd: process.cwd(),
+      timeoutMs: 25,
+      timeoutCode: 'git_timeout',
+    }),
+    (e) => e instanceof AgentError && e.code === 'git_timeout',
+  );
+});
+
+test('runFixedCommand: large output is bounded without killing a successful command', async () => {
+  const result = await runFixedCommand({
+    argv: [process.execPath, '-e', "process.stdout.write('x'.repeat(100000))"],
+    cwd: process.cwd(),
+    timeoutMs: 5000,
+    timeoutCode: 'git_timeout',
+    maxBytes: 1024,
+  });
+  assert.equal(result.code, 0);
+  assert.ok(Buffer.byteLength(result.stdout, 'utf8') <= 100000);
+  assert.ok(boundOutput(result.stdout, 1024).includes('[truncated:'));
 });
