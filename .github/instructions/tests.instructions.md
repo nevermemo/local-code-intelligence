@@ -1,0 +1,14 @@
+---
+name: LCI test and acceptance evidence
+description: Testing rules for unit, integration, evaluation, and live acceptance work.
+applyTo: "{src/**/*test*.rs,tests/**/*.rs,scripts/Acceptance*.ps1,evaluations/**/*}"
+---
+
+- Test observable contracts and failure recovery. Avoid tests that merely reproduce the implementation or match documentation wording.
+- Use the existing mock model service and temporary external LanceDB directories for automated tests. Automated tests must not require ports 8765, 8766, or 8767.
+- Keep live model acceptance separate from automated tests. Live retrieval may use 8766 and 8767; it must not contact 8765.
+- Verify incremental work with actual parse and embedding request counts rather than timing alone.
+- Preserve previous-snapshot searchability after failed updates and ensure later retries can recover.
+- For retrieval changes, cover semantic, lexical, LSP, fusion, reranking, filtered-empty, and fail-open paths that the change affects.
+- Save live reports under `test-results`; never stage them.
+- Run focused checks during correction, then run `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` once for the completed slice.
