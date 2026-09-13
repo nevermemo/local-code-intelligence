@@ -12,6 +12,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 dunce = "1"
 futures = "0.3"
+globset = "0.4"
 ignore = "0.4"
 # 0.38.0's job module references Error::Http without a feature guard.
 # Enable remote to compile upstream; the application opens only local paths.

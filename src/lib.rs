@@ -1,7 +1,9 @@
 pub mod app;
 pub mod chunk;
 pub mod config;
-pub(crate) mod language;
+pub mod evaluate;
+pub mod filter;
+pub mod language;
 pub mod lexical;
 pub mod lsp;
 pub mod manifest;

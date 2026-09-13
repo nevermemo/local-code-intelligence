@@ -1,4 +1,8 @@
-use crate::{chunk::Chunk, workspace::Workspace};
+use crate::{
+    chunk::Chunk,
+    filter::{EffectiveFilter, SourceRole, classify_source_role},
+    workspace::Workspace,
+};
 use anyhow::{Context, Result, ensure};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array,
@@ -32,6 +36,15 @@ pub struct Hit {
     pub fusion_score: f32,
     pub retrieval_channels: Vec<String>,
     pub reranker_score: Option<f32>,
+    pub source_role: SourceRole,
+    pub source_role_prior: f32,
+}
+
+pub const fn source_role_prior(role: SourceRole) -> f32 {
+    match role {
+        SourceRole::Source => 0.004,
+        _ => 0.0,
+    }
 }
 
 pub struct Snapshot {
@@ -205,17 +218,21 @@ impl Store {
         workspace: &Workspace,
         vector: &[f32],
         limit: usize,
+        filters: &EffectiveFilter,
     ) -> Result<Vec<Hit>> {
         ensure!(
             vector.len() == snapshot.dimension,
             "query embedding dimension differs from index; reindex workspace"
         );
+        // LanceDB cannot express every shared glob/role predicate. Keep the
+        // fallback bounded while allowing selective filters more headroom.
+        let oversampled_limit = limit.saturating_mul(4).min(160);
         let batches = snapshot
             .table
             .query()
             .nearest_to(vector)?
             .distance_type(DistanceType::Cosine)
-            .limit(limit)
+            .limit(oversampled_limit)
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -227,6 +244,11 @@ impl Store {
                     Ok(column::<StringArray>(&batch, name)?.value(i).into())
                 };
                 let path = text("relative_file_path")?;
+                let language = text("language")?;
+                let source_role = classify_source_role(&path);
+                if !filters.matches(&language, &path, source_role) {
+                    continue;
+                }
                 let distance = column::<Float32Array>(&batch, "_distance")?.value(i);
                 ensure!(distance.is_finite(), "nonfinite semantic distance");
                 let rank = hits.len() + 1;
@@ -234,7 +256,7 @@ impl Store {
                     file_path: workspace.path.join(&path).to_string_lossy().into_owned(),
                     chunk: Chunk {
                         relative_file_path: path,
-                        language: text("language")?,
+                        language,
                         start_line: column::<UInt32Array>(&batch, "start_line")?.value(i),
                         end_line: column::<UInt32Array>(&batch, "end_line")?.value(i),
                         code: text("code")?,
@@ -248,7 +270,12 @@ impl Store {
                     fusion_score: 0.0,
                     retrieval_channels: vec!["semantic".into()],
                     reranker_score: None,
+                    source_role,
+                    source_role_prior: source_role_prior(source_role),
                 });
+                if hits.len() == limit {
+                    return Ok(hits);
+                }
             }
         }
         Ok(hits)
@@ -277,6 +304,7 @@ impl Store {
                     Ok(column::<StringArray>(&batch, name)?.value(i).into())
                 };
                 let path = text("relative_file_path")?;
+                let source_role = classify_source_role(&path);
                 hits.push(Hit {
                     file_path: workspace.path.join(&path).to_string_lossy().into_owned(),
                     chunk: Chunk {
@@ -295,6 +323,8 @@ impl Store {
                     fusion_score: 0.0,
                     retrieval_channels: vec![],
                     reranker_score: None,
+                    source_role,
+                    source_role_prior: source_role_prior(source_role),
                 });
             }
         }

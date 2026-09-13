@@ -1,0 +1,106 @@
+# Portable evaluation definition for the local-code-intelligence service.
+#
+# Workspaces:
+#   - "self" (required): this repository. Verifies the service's own
+#     retrieval behavior: first-search index lifecycle, the language
+#     registry / Tree-sitter grammar, Python chunking, Windows ripgrep
+#     resolution, readiness dependency probing, and explicit test-role
+#     retrieval.
+#   - "gust" (optional): the GUST Rust-to-Slang translator repository.
+#     Verifies cross-repository translator retrieval. Skipped (not failed)
+#     when the workspace is not provided.
+#
+# Path patterns are repository-relative globs using `/` separators. Result
+# ranks are one-based. See src/evaluate.rs for the matching and metric rules.
+
+[[workspaces]]
+key = "self"
+required = true
+
+[[workspaces]]
+key = "gust"
+required = false
+
+# ---------------------------------------------------------------------------
+# Self queries
+# ---------------------------------------------------------------------------
+
+# First-search indexing and index lifecycle.
+[[queries]]
+workspace = "self"
+query = "first search creates the embedded index and reports the lifecycle action"
+top_k = 8
+expected_paths = ["src/app.rs"]
+preferred_paths = ["src/store.rs"]
+required_snippet = "IndexAction"
+
+# Language registry and Tree-sitter grammar loading.
+[[queries]]
+workspace = "self"
+query = "language registry recognizes file extensions and loads the Tree-sitter grammar"
+top_k = 8
+expected_paths = ["src/language.rs"]
+required_snippet = "for_extension"
+
+# Python chunking.
+[[queries]]
+workspace = "self"
+query = "chunk Python declarations statements and decorators into stable chunks"
+top_k = 8
+expected_paths = ["src/chunk.rs", "src/language.rs"]
+preferred_paths = ["src/chunk.rs"]
+
+# Windows ripgrep resolution.
+[[queries]]
+workspace = "self"
+query = "resolve ripgrep from PATH and the VS Code bundled version on Windows"
+top_k = 8
+expected_paths = ["src/lexical.rs"]
+required_snippet = "ripgrep"
+
+# Readiness dependency probing.
+[[queries]]
+workspace = "self"
+query = "readiness reports required and optional dependency failures for embeddings and reranking"
+top_k = 8
+expected_paths = ["src/app.rs", "src/server.rs"]
+
+# Explicit test-role retrieval via a source-role filter.
+[[queries]]
+workspace = "self"
+query = "integration test for search index lifecycle and persistence"
+top_k = 8
+expected_paths = ["tests/integration.rs"]
+expected_roles = ["test"]
+
+[queries.filters]
+source_roles = ["test"]
+
+# ---------------------------------------------------------------------------
+# GUST queries (optional workspace)
+# ---------------------------------------------------------------------------
+
+# Exact translator query: lowering syn AST to generated Slang.
+[[queries]]
+workspace = "gust"
+query = "lower syn AST expressions into generated Slang compute shader code"
+top_k = 8
+expected_paths = ["crates/gust-macros/src/slang/**"]
+preferred_paths = ["crates/gust-macros/src/slang/mod.rs"]
+required_snippet = "emit_expression"
+
+# Another translator query: kernel attributes to Slang entry points.
+[[queries]]
+workspace = "gust"
+query = "translate Rust kernel function attributes into Slang entry point declarations"
+top_k = 8
+expected_paths = ["crates/gust-macros/src/slang/**"]
+preferred_paths = ["crates/gust-macros/src/slang/mod.rs"]
+
+# Translator query using test vocabulary.
+[[queries]]
+workspace = "gust"
+query = "regression test that rejects unsupported Rust expressions in the Slang subset"
+top_k = 8
+expected_paths = ["crates/gust-macros/src/tests/regression.rs"]
+required_snippet = "kernel"

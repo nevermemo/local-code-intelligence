@@ -3744,6 +3744,7 @@ dependencies = [
  "clap",
  "dunce",
  "futures",
+ "globset",
  "ignore",
  "lancedb",
  "reqwest 0.13.5",

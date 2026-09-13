@@ -209,6 +209,20 @@ pub fn for_path(path: &Path) -> Option<&'static LanguageAdapter> {
         .and_then(for_extension)
 }
 
+/// Iterate over the registered language identifiers.
+pub fn identifiers() -> impl Iterator<Item = &'static str> {
+    ADAPTERS.iter().map(|adapter| adapter.identifier)
+}
+
+/// Report whether `identifier` is a registered language identifier.
+///
+/// Extensions are not accepted as identifiers.
+pub fn is_registered_identifier(identifier: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.identifier == identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

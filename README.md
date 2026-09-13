@@ -134,6 +134,23 @@ $gust = 'C:\Users\micro\Desktop\gpu-dialect-v0'
 
 The second indexing pass should report zero new embeddings if source and model configuration are unchanged. GUST's actual translator is under `crates/gust-macros/src/slang`; inspect the returned source, not just path names. `scripts/Acceptance.ps1` saves the index, query, and repeat-index reports and checks that a majority of top-eight results are actual Slang translator implementation chunks, including the expression translator.
 
+Search accepts repeatable `--language`, `--include-path`, `--exclude-path`, and `--source-role` filters. Path filters are case-sensitive repository-relative globs: `*` and `?` stay within one path component, while `**` crosses directories. Absolute paths, backslashes, traversal components, empty patterns, and malformed globs are rejected. An explicitly empty include list is a valid filter that returns no results. Requested filters are applied to every retrieval channel and reported back as effective filters; no result may bypass them.
+
+Each result includes a deterministic source role. Classification precedence is generated, test, benchmark, example, documentation, configuration, then source. Production source receives a small transparent `0.004` fusion prior; all other roles receive zero. The role and prior are included in result metadata, and explicit role filters remain authoritative.
+
+Run the portable retrieval evaluation with the same application search path:
+
+```powershell
+& $lci evaluate .\evaluations\core.toml `
+  --workspace "self=$PWD" `
+  --workspace "gust=C:\Users\micro\Desktop\gpu-dialect-v0" `
+  --output .\test-results\evaluation.json
+```
+
+Workspace mappings are supplied at runtime, so checked-in definitions contain no machine-specific absolute paths. The GUST workspace is optional; its queries are explicitly skipped when no mapping is supplied. Without `--output`, JSON is written to stdout. A required missing workspace, search error, expected-path miss, wrong expected role, or missing required snippet produces a failed query and a nonzero process exit after the JSON report is emitted. Valid optional skips do not fail the run.
+
+Reports contain bounded path, line-range, role, rank, score, and preview evidence; per-query hit@1, hit@3, hit@8, reciprocal rank, preference/disfavor counts, role distribution, reranker state, timings, lifecycle, and effective filters; and aggregate hit rates, MRR, median/p95 latency, fallback count, and created/reused/waited index counts. Generated reports belong under `test-results` and are not committed. Evaluation reuses compatible persisted indexes and preserves the existing first-search lifecycle behavior. It calls only the configured embedding and reranking services, whose defaults are ports 8766 and 8767; application paths never contact port 8765.
+
 `scripts/Acceptance-Lsp.ps1` independently checks workspace-symbol, definition, and reference navigation against the same translator and saves each normalized response in `test-results`.
 
 With the real embedding and reranking services running on ports 8766 and 8767, the mixed-language acceptance creates a disposable fixture and data directory under `test-results`, uses the actual debug binary, and never contacts port 8765:

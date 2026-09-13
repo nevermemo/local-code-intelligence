@@ -1,6 +1,7 @@
 use crate::{
     chunk,
     config::Config,
+    filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest},
     language, lexical, lsp,
     manifest::{self, Manifest},
     models::Models,
@@ -115,6 +116,7 @@ pub struct SearchReport {
     pub timings: Timings,
     pub results: Vec<Hit>,
     pub index: SearchIndexLifecycle,
+    pub filters: EffectiveFilterReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +152,14 @@ enum ModelListing {
 
 fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
+    filters.matches(
+        &hit.chunk.language,
+        &hit.chunk.relative_file_path,
+        hit.source_role,
+    )
 }
 
 /// Per-process monotonic sequence for readiness probe filenames. Combined with
@@ -452,11 +462,27 @@ impl App {
         query: &str,
         top_k: Option<usize>,
     ) -> Result<SearchReport> {
+        self.search_with_filters(path, query, top_k, FilterRequest::default())
+            .await
+    }
+
+    pub async fn search_with_filters(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+    ) -> Result<SearchReport> {
         let total = Instant::now();
         ensure!(!query.trim().is_empty(), "query must not be empty");
         ensure!(query.len() <= 16000, "query exceeds 16000 bytes");
         let k = top_k.unwrap_or(self.config.default_top_k);
         ensure!((1..=40).contains(&k), "top_k must be 1..=40");
+        let filtering_requested = filter_request.languages.is_some()
+            || filter_request.include_paths.is_some()
+            || filter_request.exclude_paths.is_some()
+            || filter_request.source_roles.is_some();
+        let filters = EffectiveFilter::from_request(&filter_request)?;
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let coordination = self.lock(&workspace.id).await;
         let initial_snapshot = self.store.snapshot(&workspace).await?;
@@ -547,12 +573,14 @@ impl App {
                 action: index_action,
                 wait_ms: index_wait_ms,
             },
+            filters: filters.report(),
         };
         if snapshot.table.count_rows(None).await? == 0 {
             report.timings.total_ms = ms(total);
             return Ok(report);
         }
-        let all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
+        let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
+        all_chunks.retain(|hit| hit_matches(&filters, hit));
         let has_rust = all_chunks.iter().any(|hit| hit.chunk.language == "rust");
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
@@ -606,6 +634,7 @@ impl App {
                 &report.workspace,
                 &vector,
                 self.config.semantic_candidate_count,
+                &filters,
             )
             .await
             {
@@ -702,10 +731,16 @@ impl App {
                 );
             }
         }
-        ensure!(
-            !semantic.is_empty() || !lexical_hits.is_empty() || !lsp_hits.is_empty(),
-            "semantic, lexical, and LSP retrieval all failed or returned no candidates"
-        );
+        if semantic.is_empty() && lexical_hits.is_empty() && lsp_hits.is_empty() {
+            if filtering_requested {
+                report.timings.total_ms = ms(total);
+                return Ok(report);
+            }
+            ensure!(
+                false,
+                "semantic, lexical, and LSP retrieval all failed or returned no candidates"
+            );
+        }
         let fusion_timer = Instant::now();
         let mut fused = HashMap::<(String, u32, String), Hit>::new();
         for mut hit in semantic {
@@ -757,7 +792,11 @@ impl App {
                 fused.insert(key, hit);
             }
         }
+        for hit in fused.values_mut() {
+            hit.fusion_score += hit.source_role_prior;
+        }
         let mut hits: Vec<_> = fused.into_values().collect();
+        hits.retain(|hit| hit_matches(&filters, hit));
         hits.sort_by(|a, b| {
             b.fusion_score
                 .total_cmp(&a.fusion_score)
@@ -796,6 +835,7 @@ impl App {
             }
             report.timings.reranking_ms = ms(timer);
         }
+        report.results.retain(|hit| hit_matches(&filters, hit));
         report.timings.total_ms = ms(total);
         tracing::info!(
             query_embedding_ms = report.timings.query_embedding_ms,

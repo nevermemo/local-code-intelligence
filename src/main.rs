@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use local_code_intelligence::{app::App, config::Config, server};
+use local_code_intelligence::{app::App, config::Config, evaluate, server};
 use std::{path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
@@ -28,6 +28,21 @@ enum Command {
         query: String,
         #[arg(long)]
         top_k: Option<usize>,
+        #[arg(long = "language")]
+        languages: Vec<String>,
+        #[arg(long = "include-path")]
+        include_paths: Vec<String>,
+        #[arg(long = "exclude-path")]
+        exclude_paths: Vec<String>,
+        #[arg(long = "source-role")]
+        source_roles: Vec<String>,
+    },
+    Evaluate {
+        definition: PathBuf,
+        #[arg(long = "workspace")]
+        workspaces: Vec<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     Symbols {
         workspace: PathBuf,
@@ -60,6 +75,8 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let app = Arc::new(App::open(Config::load(cli.config.as_deref())?).await?);
+    let mut evaluation_failed = false;
+    let mut output_path = None;
     let output = match cli.command.unwrap_or(Command::Serve) {
         Command::Index { workspace } => serde_json::to_value(app.index(&workspace).await?)?,
         Command::Status { workspace } => serde_json::to_value(app.status(&workspace).await?)?,
@@ -67,7 +84,36 @@ async fn main() -> Result<()> {
             workspace,
             query,
             top_k,
-        } => serde_json::to_value(app.search(&workspace, &query, top_k).await?)?,
+            languages,
+            include_paths,
+            exclude_paths,
+            source_roles,
+        } => serde_json::to_value(
+            app.search_with_filters(
+                &workspace,
+                &query,
+                top_k,
+                local_code_intelligence::filter::FilterRequest {
+                    languages: (!languages.is_empty()).then_some(languages),
+                    include_paths: (!include_paths.is_empty()).then_some(include_paths),
+                    exclude_paths: (!exclude_paths.is_empty()).then_some(exclude_paths),
+                    source_roles: (!source_roles.is_empty()).then_some(source_roles),
+                },
+            )
+            .await?,
+        )?,
+        Command::Evaluate {
+            definition,
+            workspaces,
+            output,
+        } => {
+            let definition = evaluate::load_definition(&definition)?;
+            let workspaces = evaluate::parse_workspace_mappings(&workspaces)?;
+            let report = evaluate::run_evaluation(&app, &definition, &workspaces).await?;
+            evaluation_failed = evaluate::has_failures(&report);
+            output_path = output;
+            serde_json::to_value(report)?
+        }
         Command::Symbols { workspace, query } => {
             serde_json::to_value(app.symbols(&workspace, &query).await?)?
         }
@@ -110,6 +156,14 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    let json = serde_json::to_string_pretty(&output)?;
+    if let Some(path) = output_path {
+        std::fs::write(&path, format!("{json}\n"))?;
+    } else {
+        println!("{json}");
+    }
+    if evaluation_failed {
+        anyhow::bail!("one or more required evaluation expectations failed");
+    }
     Ok(())
 }
