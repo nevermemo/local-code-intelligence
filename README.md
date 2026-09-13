@@ -59,7 +59,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | `embedding_batch_size` | 8 |
 | `embedding_timeout_seconds` | 120 per batch |
 | `reranker_timeout_seconds` | 120 |
-| `ripgrep_path` | `rg` |
+| `ripgrep_path` | `rg` (on Windows, also discovers common VS Code-bundled copies) |
 | `semantic_candidate_count` | 40 |
 | `lexical_candidate_count` | 40 |
 | `rerank_candidate_count` | 24 |
@@ -154,6 +154,8 @@ Query: <query>
 7. Retrieve semantic candidates with LanceDB cosine distance while ripgrep independently searches useful query terms across all supported extensions. In indexes containing Rust, rust-analyzer also searches workspace symbols. Map lexical lines to any indexed language and LSP locations only to Rust chunks.
 8. Deduplicate and fuse semantic, lexical, and LSP ranks with Reciprocal Rank Fusion. Results expose channel ranks, lexical match count, fusion score, and retrieval channels.
 9. Rerank the configured fused shortlist. Semantic, lexical, and Rust LSP channels fail independently; available channels continue. If reranking fails, return fusion order with a warning.
+
+When `ripgrep_path` is the default `rg` or `rg.exe`, Windows resolution checks `PATH` first and then common per-user and system-wide VS Code, VS Code Insiders, and VSCodium installations, including versioned application directories. Any other configured value is treated as an explicit command or path and is used unchanged. If ripgrep cannot be started, lexical retrieval fails open and the warning explains how to set `ripgrep_path`.
 
 Embedding response indices are validated and reordered; vectors must have consistent dimensions, finite values, and nonzero norm. Changing an embedding URL/model requires reindexing. Replacing a model behind an unchanged name/URL is not detectable automatically; use a distinct configured model name or a new data directory for that change.
 

@@ -1,7 +1,12 @@
 use crate::language;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use std::{collections::HashMap, path::Path, process::Stdio};
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 #[derive(Debug, Clone)]
 pub struct LexicalMatch {
@@ -55,10 +60,106 @@ pub fn terms(query: &str) -> Vec<String> {
     terms
 }
 
+/// Resolves the default ripgrep command on Windows, including the copy bundled
+/// with common VS Code installations. Explicit custom commands and paths are
+/// returned unchanged.
+pub fn resolve_ripgrep_path(configured: &str) -> PathBuf {
+    resolve_ripgrep_path_from(
+        configured,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+        std::env::var_os("ProgramFiles").as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn resolve_ripgrep_path_from(
+    configured: &str,
+    path: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
+    program_files: Option<&OsStr>,
+    windows: bool,
+) -> PathBuf {
+    let configured_path = PathBuf::from(configured);
+    if !matches!(configured.to_ascii_lowercase().as_str(), "rg" | "rg.exe") {
+        return configured_path;
+    }
+
+    if let Some(found) = find_on_path(path, windows) {
+        return found;
+    }
+    if windows {
+        for root in vscode_install_roots(local_app_data, program_files) {
+            if let Some(found) = find_vscode_ripgrep(&root) {
+                return found;
+            }
+        }
+    }
+    configured_path
+}
+
+fn find_on_path(path: Option<&OsStr>, windows: bool) -> Option<PathBuf> {
+    let names: &[&str] = if windows { &["rg.exe", "rg"] } else { &["rg"] };
+    for directory in std::env::split_paths(path?) {
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn vscode_install_roots(
+    local_app_data: Option<&OsStr>,
+    program_files: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(base) = local_app_data {
+        let programs = Path::new(base).join("Programs");
+        roots.push(programs.join("Microsoft VS Code"));
+        roots.push(programs.join("Microsoft VS Code Insiders"));
+        roots.push(programs.join("VSCodium"));
+    }
+    if let Some(base) = program_files {
+        let base = Path::new(base);
+        roots.push(base.join("Microsoft VS Code"));
+        roots.push(base.join("Microsoft VS Code Insiders"));
+        roots.push(base.join("VSCodium"));
+    }
+    roots
+}
+
+fn find_vscode_ripgrep(install_root: &Path) -> Option<PathBuf> {
+    let mut app_roots = vec![install_root.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(install_root) {
+        let mut children: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        children.sort_by(|a, b| b.cmp(a));
+        app_roots.extend(children);
+    }
+
+    const RELATIVE_PATHS: &[&str] = &[
+        "resources/app/node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe",
+        "resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe",
+    ];
+    app_roots.into_iter().find_map(|root| {
+        RELATIVE_PATHS
+            .iter()
+            .map(|relative| root.join(relative))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<LexicalMatch>> {
     let terms = terms(query);
     ensure!(!terms.is_empty(), "query has no searchable lexical terms");
-    let mut command = tokio::process::Command::new(rg_path);
+    let resolved_rg = resolve_ripgrep_path(rg_path);
+    let mut command = tokio::process::Command::new(&resolved_rg);
     command.args([
         "--json",
         "--line-number",
@@ -77,7 +178,12 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<Lexic
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = command.output().await.context("start ripgrep")?;
+    let output = command.output().await.with_context(|| {
+        format!(
+            "start ripgrep at {}; install rg, add it to PATH, or set ripgrep_path explicitly",
+            resolved_rg.display()
+        )
+    })?;
     ensure!(
         output.status.success() || output.status.code() == Some(1),
         "ripgrep failed: {}",
@@ -121,6 +227,7 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<Lexic
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     #[test]
     fn extracts_useful_terms() {
         assert_eq!(
@@ -135,5 +242,49 @@ mod tests {
                 "syn"
             ]
         );
+    }
+
+    #[test]
+    fn preserves_an_explicit_ripgrep_path() {
+        let resolved = resolve_ripgrep_path_from(r"D:\tools\custom-rg.exe", None, None, None, true);
+        assert_eq!(resolved, PathBuf::from(r"D:\tools\custom-rg.exe"));
+    }
+
+    #[test]
+    fn resolves_ripgrep_from_path_first() {
+        let temp = TempDir::new().unwrap();
+        let path_rg = temp.path().join("rg.exe");
+        std::fs::write(&path_rg, b"").unwrap();
+        let resolved =
+            resolve_ripgrep_path_from("rg", Some(temp.path().as_os_str()), None, None, true);
+        assert_eq!(resolved, path_rg);
+    }
+
+    #[test]
+    fn resolves_versioned_vscode_bundled_ripgrep() {
+        let temp = TempDir::new().unwrap();
+        let bundled = temp
+            .path()
+            .join("Programs/Microsoft VS Code/645f29cc31/resources/app")
+            .join("node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+
+        let resolved =
+            resolve_ripgrep_path_from("rg.exe", None, Some(temp.path().as_os_str()), None, true);
+        assert_eq!(resolved, bundled);
+    }
+
+    #[test]
+    fn leaves_default_command_when_ripgrep_is_not_found() {
+        let temp = TempDir::new().unwrap();
+        let resolved = resolve_ripgrep_path_from(
+            "rg",
+            Some(temp.path().as_os_str()),
+            Some(temp.path().as_os_str()),
+            None,
+            true,
+        );
+        assert_eq!(resolved, PathBuf::from("rg"));
     }
 }
