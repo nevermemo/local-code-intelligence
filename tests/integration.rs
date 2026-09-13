@@ -60,6 +60,7 @@ async fn rerank(
             json!({"results":[{"index":999,"relevance_score":1.0}]}),
         ));
     }
+    let query = body["query"].as_str().unwrap_or("");
     let results: Vec<_> = body["documents"]
         .as_array()
         .unwrap()
@@ -67,8 +68,14 @@ async fn rerank(
         .enumerate()
         .map(|(i, d)| {
             let document = d.as_str().unwrap();
-            let score = if document.contains("src/telemetry.ts\n")
+            let score = if query == "buildProductionTelemetryPipeline"
+                && document.contains("src/telemetry.ts\n")
                 && document.contains("function buildProductionTelemetryPipeline")
+            {
+                0.995
+            } else if query == "build_production_feature_pipeline"
+                && document.contains("src/feature_pipeline.py\n")
+                && document.contains("def build_production_feature_pipeline")
             {
                 0.995
             } else if document.contains("translator") {
@@ -301,11 +308,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/telemetry.test.ts",
         "// Decoy documentation for a production telemetry pipeline test.\nexport const expectedPipelineDescription = 'trim and filter events';\n",
     );
+    write(
+        &workspace,
+        "src/feature_pipeline.py",
+        "# Production feature pipeline implementation.\ndef build_production_feature_pipeline(events):\n    return [event.strip() for event in events if event.strip()]\n",
+    );
+    write(
+        &workspace,
+        "tests/feature_pipeline_test.py",
+        "# Decoy documentation for a production feature pipeline test.\nEXPECTED_PIPELINE_DESCRIPTION = 'strip and filter events'\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 5);
-    assert_eq!(first.parsed_files, 5);
+    assert_eq!(first.files, 7);
+    assert_eq!(first.parsed_files, 7);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -321,6 +338,26 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .chunk
             .code
             .contains("function buildProductionTelemetryPipeline")
+    );
+    let python_production = app
+        .search(&workspace, "build_production_feature_pipeline", Some(8))
+        .await
+        .unwrap();
+    assert_eq!(
+        python_production.results[0].chunk.relative_file_path,
+        "src/feature_pipeline.py"
+    );
+    assert_eq!(python_production.results[0].chunk.language, "python");
+    assert!(
+        python_production.results[0]
+            .chunk
+            .code
+            .contains("def build_production_feature_pipeline")
+    );
+    assert!(python_production.results[0].chunk.start_line >= 1);
+    assert!(
+        python_production.results[0].chunk.end_line
+            >= python_production.results[0].chunk.start_line
     );
     for (query, path, language) in [
         ("TelemetryPanel", "src/panel.tsx", "tsx"),
@@ -346,61 +383,62 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 5);
+    assert_eq!(restarted.unchanged_files, 7);
 
     write(
         &workspace,
-        "src/panel.tsx",
-        "export const TelemetryPanel = () => <section>Updated telemetry</section>;\n",
+        "src/feature_pipeline.py",
+        "# Production feature pipeline implementation.\ndef build_production_feature_pipeline(events):\n    cleaned = [event.strip() for event in events]\n    return [event for event in cleaned if event]\n",
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 4);
+    assert_eq!(changed.unchanged_files, 6);
 
-    std::fs::remove_file(workspace.join("src/audit.js")).unwrap();
+    std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 4);
+    assert_eq!(deleted.files, 6);
     let after_delete = app
-        .search(&workspace, "flushAuditBeacon", Some(8))
+        .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
         .unwrap();
     assert!(
         after_delete
             .results
             .iter()
-            .all(|hit| hit.chunk.relative_file_path != "src/audit.js")
+            .all(|hit| hit.chunk.relative_file_path != "tests/feature_pipeline_test.py")
     );
 
     write(
         &workspace,
-        "src/telemetry.ts",
-        "// Production ingestion implementation.\nexport function buildProductionTelemetryPipeline(events: string[]): string[] {\n  return events.map(event => event.trim()).filter(Boolean);\n}\nexport const uncommittedSnapshotMarker = 'new source';\n",
+        "src/feature_pipeline.py",
+        "# Production feature pipeline implementation.\ndef build_production_feature_pipeline(events):\n    cleaned = [event.strip() for event in events]\n    return [event for event in cleaned if event]\nUNCOMMITTED_SNAPSHOT_MARKER = 'new source'\n",
     );
     fake.embed_fails.store(true, Ordering::SeqCst);
     assert!(app.index(&workspace).await.is_err());
     assert_eq!(app.status(&workspace).await.unwrap().chunks, deleted.chunks);
     assert!(app.status(&workspace).await.unwrap().stale);
+    fake.embed_fails.store(false, Ordering::SeqCst);
     let retained = app
-        .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
+        .search(&workspace, "build_production_feature_pipeline", Some(8))
         .await
         .unwrap();
     let retained_implementation = retained
         .results
         .iter()
-        .find(|hit| hit.chunk.relative_file_path == "src/telemetry.ts")
+        .find(|hit| hit.chunk.relative_file_path == "src/feature_pipeline.py")
         .unwrap();
     assert!(
         retained_implementation
             .chunk
             .code
-            .contains("buildProductionTelemetryPipeline")
+            .contains("def build_production_feature_pipeline")
     );
     assert!(
         !retained_implementation
             .chunk
             .code
-            .contains("uncommittedSnapshotMarker")
+            .contains("UNCOMMITTED_SNAPSHOT_MARKER")
     );
     task.abort();
 }
@@ -460,6 +498,63 @@ async fn typescript_javascript_only_search_skips_rust_analyzer() {
         error
             .to_string()
             .contains("does not support typescript source files")
+    );
+    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+    task.abort();
+}
+
+#[tokio::test]
+async fn python_only_search_and_navigation_skip_rust_analyzer() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("python-only");
+    write(
+        &workspace,
+        "src/revenue.py",
+        "# Quarterly revenue summary implementation.\ndef compute_quarterly_revenue_summary(rows):\n    return [row for row in rows if row.get(\"amount\")]\n",
+    );
+    let app = App::open(config).await.unwrap();
+    let indexed = app.index(&workspace).await.unwrap();
+    assert_eq!(indexed.files, 1);
+    assert_eq!(indexed.parsed_files, 1);
+    assert_eq!(indexed.embedded_chunks, 1);
+
+    let report = app
+        .search(&workspace, "compute_quarterly_revenue_summary", Some(4))
+        .await
+        .unwrap();
+    assert_eq!(report.results[0].chunk.language, "python");
+    assert_eq!(report.results[0].chunk.relative_file_path, "src/revenue.py");
+    assert!(
+        report
+            .warning
+            .as_deref()
+            .is_none_or(|warning| !warning.contains("LSP")),
+        "unexpected warning: {:?}",
+        report.warning
+    );
+    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+
+    let definition_error = app
+        .definition(&workspace, "src/revenue.py", 1, 0)
+        .await
+        .unwrap_err();
+    assert!(
+        definition_error
+            .to_string()
+            .contains("does not support python source files"),
+        "unexpected error: {definition_error}"
+    );
+    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
+
+    let references_error = app
+        .references(&workspace, "src/revenue.py", 1, 0, true)
+        .await
+        .unwrap_err();
+    assert!(
+        references_error
+            .to_string()
+            .contains("does not support python source files"),
+        "unexpected error: {references_error}"
     );
     assert!(!app.status(&workspace).await.unwrap().analyzer_running);
     task.abort();

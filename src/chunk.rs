@@ -504,7 +504,14 @@ export interface TelemetryLifecycle {
             .collect();
         assert_eq!(
             files,
-            HashSet::from(["lib.rs", "types.ts", "panel.tsx", "runtime.js", "view.jsx"])
+            HashSet::from([
+                "lib.rs",
+                "types.ts",
+                "panel.tsx",
+                "runtime.js",
+                "view.jsx",
+                "ignored.py"
+            ])
         );
     }
 
@@ -559,6 +566,139 @@ export interface TelemetryLifecycle {
                 lines[(c.start_line - 1) as usize..c.end_line as usize]
                     .join("\n")
                     .contains(&c.code)
+            );
+        }
+    }
+
+    #[test]
+    fn chunks_python_declarations_statements_and_decorators() {
+        let source = r#"# module comment
+import os
+from os import path
+
+TOP = 1
+
+# leading comment
+@decorator
+def sync_func(a, b=2):
+    """docstring"""
+    x = a + b
+    return x
+
+async def async_func():
+    await something()
+
+@class_decorator
+class Base:
+    """class doc"""
+    class_attr = 1
+
+    @method_decorator
+    def method(self):
+        return self
+
+    async def amethod(self):
+        await thing()
+
+if TOP:
+    print("top")
+"#;
+        let chunks = chunks_for_path("service.py", source).unwrap();
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.language == "python"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "service.py")
+        );
+
+        let sync = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("def sync_func"))
+            .unwrap();
+        assert!(
+            sync.code
+                .starts_with("# leading comment\n@decorator\ndef sync_func")
+        );
+        assert_eq!(sync.start_line, 7);
+        assert_eq!(sync.end_line, 12);
+
+        let async_function = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("async def async_func"))
+            .unwrap();
+        assert_eq!(async_function.start_line, 14);
+        assert_eq!(async_function.end_line, 15);
+
+        let class = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("class Base"))
+            .unwrap();
+        assert!(class.code.starts_with("@class_decorator\nclass Base"));
+        assert!(class.code.contains("@method_decorator\n    def method"));
+        assert!(class.code.contains("async def amethod"));
+
+        assert!(chunks.iter().any(|chunk| chunk.code == "TOP = 1"));
+        assert!(chunks.iter().any(|chunk| chunk.code.contains("if TOP:")));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.code.contains("def sync_func"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.code.contains("class Base"))
+                .count(),
+            1
+        );
+
+        let lines: Vec<_> = source.lines().collect();
+        for chunk in chunks {
+            assert!(
+                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                    .join("\n")
+                    .contains(&chunk.code),
+                "invalid range for {:#?}",
+                chunk
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_decorated_python_function_keeps_header_and_statements() {
+        let statements: Vec<_> = (0..1600)
+            .map(|i| format!("    value_{i} = calculate({i})\n"))
+            .collect();
+        let source = format!(
+            "# explanation\n@trace\nasync def produce():\n{}",
+            statements.concat()
+        );
+
+        let chunks = chunks_for_path("worker.py", &source).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks[0]
+                .code
+                .starts_with("# explanation\n@trace\nasync def produce():")
+        );
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.code.contains("async def produce"))
+                .count(),
+            1
+        );
+        for statement in statements {
+            assert!(
+                chunks
+                    .iter()
+                    .any(|chunk| chunk.code.contains(statement.trim())),
+                "missing {statement}"
             );
         }
     }

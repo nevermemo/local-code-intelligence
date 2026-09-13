@@ -5,6 +5,7 @@ use tree_sitter::Language;
 pub(crate) enum Syntax {
     Rust,
     EcmaScript,
+    Python,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +37,7 @@ impl LanguageAdapter {
             "tsx" => "*.tsx",
             "js" => "*.js",
             "jsx" => "*.jsx",
+            "py" => "*.py",
             _ => unreachable!(),
         }
     }
@@ -50,6 +52,7 @@ impl LanguageAdapter {
                 kind,
                 "program" | "class_body" | "interface_body" | "object_type" | "statement_block"
             ),
+            Syntax::Python => matches!(kind, "module" | "block"),
         }
     }
 
@@ -90,6 +93,10 @@ impl LanguageAdapter {
                     | "arrow_function"
                     | "export_statement"
             ),
+            Syntax::Python => matches!(
+                kind,
+                "function_definition" | "class_definition" | "decorated_definition"
+            ),
         }
     }
 
@@ -100,19 +107,28 @@ impl LanguageAdapter {
                 "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item"
             ),
             Syntax::EcmaScript => matches!(kind, "comment" | "decorator"),
+            Syntax::Python => matches!(kind, "comment" | "decorator"),
         }
     }
 
     pub(crate) fn attaches_header_to_child(&self, parent: &str, child: &str) -> bool {
-        self.syntax == Syntax::EcmaScript
-            && (matches!(
-                parent,
-                "export_statement"
-                    | "lexical_declaration"
-                    | "variable_declaration"
-                    | "variable_declarator"
-                    | "arrow_function"
-            ) || (self.is_declaration(parent) && self.is_container(child)))
+        match self.syntax {
+            Syntax::EcmaScript => {
+                matches!(
+                    parent,
+                    "export_statement"
+                        | "lexical_declaration"
+                        | "variable_declaration"
+                        | "variable_declarator"
+                        | "arrow_function"
+                ) || (self.is_declaration(parent) && self.is_container(child))
+            }
+            Syntax::Python => {
+                (parent == "decorated_definition" && self.is_declaration(child))
+                    || (self.is_declaration(parent) && self.is_container(child))
+            }
+            Syntax::Rust => false,
+        }
     }
 }
 
@@ -130,6 +146,10 @@ fn typescript() -> Language {
 
 fn tsx() -> Language {
     tree_sitter_typescript::LANGUAGE_TSX.into()
+}
+
+fn python() -> Language {
+    tree_sitter_python::LANGUAGE.into()
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -168,6 +188,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: javascript,
         syntax: Syntax::EcmaScript,
     },
+    LanguageAdapter {
+        extension: "py",
+        identifier: "python",
+        cache_version: "python-chunks-v1",
+        grammar: python,
+        syntax: Syntax::Python,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -194,13 +221,14 @@ mod tests {
             ("tsx", "tsx", "*.tsx"),
             ("js", "javascript", "*.js"),
             ("jsx", "jsx", "*.jsx"),
+            ("py", "python", "*.py"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
             assert!(!adapter.cache_version().is_empty());
         }
-        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "py"] {
+        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY"] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }
     }
