@@ -1,3 +1,4 @@
 {
-    "chat.agentHost.byokModels.enabled": true
+    "chat.agentHost.byokModels.enabled": true,
+    "chat.editing.alwaysSaveWithGeneratedChanges": true
 }
