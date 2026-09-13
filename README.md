@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-Windows-native Rust, TypeScript, and JavaScript code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent rust-analyzer retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
+Windows-native Rust, TypeScript, JavaScript, and Python code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent rust-analyzer retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
 
 Supported source extensions and result language identifiers are exact and case-sensitive:
 
@@ -11,8 +11,9 @@ Supported source extensions and result language identifiers are exact and case-s
 | `.tsx` | `tsx` | Tree-sitter TSX |
 | `.js` | `javascript` | Tree-sitter JavaScript |
 | `.jsx` | `jsx` | Tree-sitter JavaScript/JSX |
+| `.py` | `python` | Tree-sitter Python |
 
-TypeScript and JavaScript have syntax indexing and retrieval, but no language-server integration. Rust remains the only language supported by symbol, definition, and reference navigation.
+TypeScript, JavaScript, and Python have Tree-sitter syntax indexing and retrieval, but no language-server integration. Rust remains the only language supported by symbol, definition, and reference navigation.
 
 ## Build and run
 
@@ -138,8 +139,8 @@ It verifies all supported language IDs, semantic and lexical retrieval with live
 
 ## Retrieval and persistence behavior
 
-1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, and `.jsx` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
-2. Select a static language adapter and Tree-sitter grammar by extension. Rust retains its original declaration boundaries. TypeScript/JavaScript chunks preserve imports, executable top-level statements, exports, comments/decorators, functions, classes and methods, interfaces and signatures, type aliases, enums, and variable-assigned arrow functions. Oversized syntax splits only at named syntax boundaries toward 6,000-byte groups, with declarations preserved up to 24,000 bytes. Large indivisible leaves stay whole rather than being truncated; parser error recovery remains searchable.
+1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.py` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
+2. Select a static language adapter and Tree-sitter grammar by extension. Rust retains its original declaration boundaries. TypeScript/JavaScript chunks preserve imports, executable top-level statements, exports, comments/decorators, functions, classes and methods, interfaces and signatures, type aliases, enums, and variable-assigned arrow functions. Python chunks preserve imports, assignments, executable top-level statements, synchronous functions, asynchronous functions, classes, methods, decorators, and associated leading comments. Oversized syntax splits only at named syntax boundaries toward 6,000-byte groups, with declarations preserved up to 24,000 bytes. Large indivisible leaves stay whole rather than being truncated; parser error recovery remains searchable.
 3. Hash each complete source file and persist its parsed chunks, language identifier, and adapter version in the external manifest. A later manual or watched pass reparses only changed/new files or files whose selected adapter version changed, including after restart. Fingerprints include path, content, language, and adapter version. A missing, incompatible, or malformed manifest safely causes a full parse.
 4. Hash each exact source chunk. Reuse vectors from the current workspace snapshot when content hashes and the stored embedding URL/model/document-format identity match. Parser adapter versions are intentionally decoupled from embedding compatibility, so unchanged chunk text keeps its vector. Duplicate new chunks are embedded once. Documents are embedded as source, without a query instruction.
 5. Build a complete workspace snapshot in memory and commit a LanceDB table overwrite after embedding succeeds. Save the matching parse manifest only after that commit. Removed chunks disappear from the current snapshot; line-only changes update locations without re-embedding unchanged chunks. Previous Lance versions may remain on disk. This is a straightforward small/medium-repository design, not a streaming indexer for huge monorepos.
@@ -177,4 +178,4 @@ $env:PROTOC = Join-Path (Get-Location) '.tools\protoc\bin\protoc.exe'
 cargo clippy --locked --all-targets -j 8 -- -D warnings
 ```
 
-Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all five language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, and actual Streamable HTTP initialization/tool discovery. Live GUST and multilingual acceptance use the real local Qwen services separately.
+Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all six language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, and actual Streamable HTTP initialization/tool discovery. Live GUST and multilingual acceptance use the real local Qwen services separately.

@@ -57,6 +57,18 @@ Write-Utf8 (Join-Path $fixture 'tests\telemetry.test.ts') @'
 // Search decoy: buildProductionTelemetryPipeline is mentioned only in a test.
 export const productionPipelineDocumentation = "trim and filter events";
 '@
+Write-Utf8 (Join-Path $fixture 'src\feature_pipeline.py') @'
+# Production feature normalization used by the live feature pipeline.
+
+
+def build_production_feature_pipeline(features):
+    normalized = [feature.strip().lower() for feature in features]
+    return [feature for feature in normalized if feature]
+'@
+Write-Utf8 (Join-Path $fixture 'tests\feature_pipeline.test.py') @'
+# Search decoy: build_production_feature_pipeline is mentioned only in a test.
+production_pipeline_documentation = "strip, lowercase, and drop empty features"
+'@
 
 $normalizedDataDir = $dataDir.Replace('\', '/')
 Write-Utf8 $configPath @"
@@ -111,11 +123,39 @@ function Assert-SearchResult(
 }
 
 $first = Run-Report 'multilingual-index' @('index', $fixture)
+if ($first.files -ne 8) {
+    throw "Initial index included $($first.files) files instead of 8"
+}
 $rustSearch = Assert-SearchResult 'multilingual-search-rust' 'rust_fixture_anchor' 'src/lib.rs' 'rust' 'rust_fixture_anchor'
 $productionSearch = Assert-SearchResult 'multilingual-search-typescript' 'buildProductionTelemetryPipeline' 'src/telemetry.ts' 'typescript' 'function buildProductionTelemetryPipeline'
 $tsxSearch = Assert-SearchResult 'multilingual-search-tsx' 'TelemetryPanel' 'src/panel.tsx' 'tsx' 'TelemetryPanel'
 $javascriptSearch = Assert-SearchResult 'multilingual-search-javascript' 'flushAuditBeacon' 'src/audit.js' 'javascript' 'flushAuditBeacon'
 $jsxSearch = Assert-SearchResult 'multilingual-search-jsx' 'TelemetryBadge' 'src/badge.jsx' 'jsx' 'TelemetryBadge'
+$pythonSearch = Assert-SearchResult 'multilingual-search-python' 'build_production_feature_pipeline' 'src/feature_pipeline.py' 'python' 'def build_production_feature_pipeline'
+$pythonDecoy = @($pythonSearch.results | Where-Object {
+    $_.relative_file_path -eq 'tests/feature_pipeline.test.py' -and
+    $_.language -eq 'python'
+})
+if ($pythonDecoy.Count -eq 0) {
+    throw 'Initial index did not include the Python test decoy as python'
+}
+if ($pythonSearch.results[0].relative_file_path -ne 'src/feature_pipeline.py' -or
+    $pythonSearch.results[0].code -notmatch 'def build_production_feature_pipeline') {
+    throw 'Production Python implementation did not outrank the test decoy'
+}
+$pythonProduction = @($pythonSearch.results | Where-Object {
+    $_.relative_file_path -eq 'src/feature_pipeline.py' -and
+    $_.code -match 'def build_production_feature_pipeline'
+})[0]
+if ($pythonProduction.start_line -lt 1 -or $pythonProduction.end_line -lt $pythonProduction.start_line) {
+    throw "Python production result has an invalid one-based line range: $($pythonProduction.start_line)-$($pythonProduction.end_line)"
+}
+if ($null -eq $pythonProduction.semantic_score) {
+    throw 'Python production result is missing a semantic score'
+}
+if ($pythonSearch.reranked -and $null -eq $pythonProduction.reranker_score) {
+    throw 'Python production result is missing a reranker score while live reranking is available'
+}
 if ($productionSearch.results[0].relative_file_path -ne 'src/telemetry.ts' -or
     $productionSearch.results[0].code -notmatch 'function buildProductionTelemetryPipeline') {
     throw 'Production TypeScript implementation did not outrank the test decoy'
@@ -135,6 +175,22 @@ $changed = Run-Report 'multilingual-typescript-update' @('index', $fixture)
 if ($changed.parsed_files -ne 1) {
     throw "TypeScript update parsed $($changed.parsed_files) files instead of exactly one"
 }
+if ($changed.reused_chunks -eq 0) {
+    throw 'TypeScript update did not reuse unchanged chunks from other languages'
+}
+
+[System.IO.File]::AppendAllText(
+    (Join-Path $fixture 'src\feature_pipeline.py'),
+    "`nfeature_pipeline_revision = 2`n",
+    $utf8NoBom
+)
+$pythonChanged = Run-Report 'multilingual-python-update' @('index', $fixture)
+if ($pythonChanged.parsed_files -ne 1) {
+    throw "Python update parsed $($pythonChanged.parsed_files) files instead of exactly one"
+}
+if ($pythonChanged.reused_chunks -le 0) {
+    throw 'Python-only update did not reuse unchanged chunks from other languages'
+}
 
 Remove-Item -LiteralPath (Join-Path $fixture 'src\audit.js')
 $deleted = Run-Report 'multilingual-javascript-delete' @('index', $fixture)
@@ -146,9 +202,24 @@ if ($deletedSearch.results | Where-Object { $_.relative_file_path -eq 'src/audit
     throw 'Deleted JavaScript chunks remain searchable'
 }
 
+Remove-Item -LiteralPath (Join-Path $fixture 'tests\feature_pipeline.test.py')
+$pythonDeleted = Run-Report 'multilingual-python-delete' @('index', $fixture)
+if ($pythonDeleted.removed_files -ne 1) {
+    throw "Python decoy deletion removed $($pythonDeleted.removed_files) cached files instead of one"
+}
+$pythonDeletedSearch = Run-Report 'multilingual-search-after-python-delete' @('search', $fixture, 'build_production_feature_pipeline', '--top-k', '8')
+if ($pythonDeletedSearch.results | Where-Object { $_.relative_file_path -eq 'tests/feature_pipeline.test.py' }) {
+    throw 'Deleted Python decoy chunks remain searchable'
+}
+
 [System.IO.File]::AppendAllText(
     (Join-Path $fixture 'src\telemetry.ts'),
     "`nexport const failedUpdateMarker = 'not committed';`n",
+    $utf8NoBom
+)
+[System.IO.File]::AppendAllText(
+    (Join-Path $fixture 'src\feature_pipeline.py'),
+    "`nfailedUpdateMarker = 'not committed'`n",
     $utf8NoBom
 )
 $previousErrorActionPreference = $ErrorActionPreference
@@ -175,9 +246,20 @@ if ($retainedProduction.Count -eq 0) {
 if ($retainedProduction | Where-Object { $_.code -match 'failedUpdateMarker' }) {
     throw 'Failed update leaked into the persisted snapshot'
 }
+$pythonRetained = Run-Report 'multilingual-search-retained-python-snapshot' @('search', $fixture, 'build_production_feature_pipeline', '--top-k', '8')
+$pythonRetainedProduction = @($pythonRetained.results | Where-Object {
+    $_.relative_file_path -eq 'src/feature_pipeline.py' -and
+    $_.code -match 'def build_production_feature_pipeline'
+})
+if ($pythonRetainedProduction.Count -eq 0) {
+    throw 'Previous Python snapshot was not searchable after the failed update'
+}
+if ($pythonRetainedProduction | Where-Object { $_.code -match 'failedUpdateMarker' }) {
+    throw 'Failed Python update leaked into the persisted snapshot'
+}
 $status = Run-Report 'multilingual-status-after-failure' @('status', $fixture)
 if (-not $status.stale) {
     throw 'Failed source update was not reported as stale'
 }
 
-Write-Host "PASS: $($first.files) files; all five language IDs; zero-work repeat; one-file TS update; JS deletion; failed-update retention. Reports: $outputDir"
+Write-Host "PASS: $($first.files) files; all six language IDs; zero-work repeat; one-file TS and Python updates; JS and Python decoy deletions; failed-update retention. Reports: $outputDir"
