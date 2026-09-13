@@ -26,6 +26,8 @@ import {
   loadPolicy,
   checkAccess,
   resolveRepoPath,
+  loadTaskContract,
+  contractTaskText,
   AuditLog,
   boundOutput,
   parseSse,
@@ -80,6 +82,25 @@ function writePolicyFile(repoRoot, overrides = {}) {
   const policyPath = path.join(repoRoot, 'policy.json');
   fs.writeFileSync(policyPath, JSON.stringify(merged, null, 2), 'utf8');
   return policyPath;
+}
+
+// Write a task-contract JSON file (valid or invalid) into a temp repo. Does
+// NOT call loadTaskContract: rejection tests must invoke loadTaskContract
+// inside assert.throws so the throw is observed rather than escaping.
+function writeContractFile(repoRoot, overrides = {}) {
+  const base = {
+    schema: 'local-agent.task/v1',
+    id: 'task-1',
+    objective: 'SECRET_OBJECTIVE do the thing',
+    allowedFiles: ['src/a.rs'],
+    acceptance: ['SECRET_ACCEPTANCE criterion'],
+    prohibited: ['SECRET_PROHIBITED action'],
+    checkSuites: ['chunk'],
+  };
+  const merged = { ...base, ...overrides };
+  const contractPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(contractPath, JSON.stringify(merged, null, 2), 'utf8');
+  return contractPath;
 }
 
 async function makeTempDir(prefix) {
@@ -208,6 +229,43 @@ test('parseArgs: --task without a value throws', () => {
 
 test('parseArgs: --task-file without a value throws', () => {
   assert.throws(() => parseArgs(['--policy', 'p.json', '--task-file']), AgentError);
+});
+
+test('parseArgs: success with --contract', () => {
+  const out = parseArgs(['--policy', 'p.json', '--contract', 'task.json', '--dry-run']);
+  assert.equal(out.policy, 'p.json');
+  assert.equal(out.contract, 'task.json');
+  assert.equal(out.task, null);
+  assert.equal(out.taskFile, null);
+  assert.equal(out.dryRun, true);
+  assert.equal(out.help, false);
+});
+
+test('parseArgs: --contract without a value throws', () => {
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--contract']), AgentError);
+});
+
+test('parseArgs: duplicate --contract throws', () => {
+  assert.throws(() => parseArgs(['--policy', 'p.json', '--contract', 'a.json', '--contract', 'b.json']), AgentError);
+});
+
+test('parseArgs: --contract conflicts with --task', () => {
+  assert.throws(
+    () => parseArgs(['--policy', 'p.json', '--contract', 't.json', '--task', 'x']),
+    (e) => e instanceof AgentError && /exactly one/.test(e.message),
+  );
+});
+
+test('parseArgs: --contract conflicts with --task-file', () => {
+  assert.throws(
+    () => parseArgs(['--policy', 'p.json', '--contract', 't.json', '--task-file', 'f.md']),
+    (e) => e instanceof AgentError && /exactly one/.test(e.message),
+  );
+});
+
+test('parseArgs: --help short-circuits even with --contract', () => {
+  const out = parseArgs(['--help', '--policy', 'p.json', '--contract', 't.json']);
+  assert.equal(out.help, true);
 });
 
 test('parseArgs: unknown argument throws with a helpful message', () => {
@@ -545,6 +603,207 @@ test('loadPolicy: rejects a missing audit.jsonlPath', () => {
   try {
     const policyPath = writePolicyFile(repoRoot, { audit: { jsonlPath: '' } });
     assert.throws(() => loadPolicy(policyPath), AgentError);
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// loadTaskContract / contractTaskText
+// ---------------------------------------------------------------------------
+
+test('loadTaskContract: resolves a valid contract and builds compact labeled task text', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = writeContractFile(repoRoot);
+    const contract = loadTaskContract(contractPath, policy);
+    assert.equal(contract.schema, 'local-agent.task/v1');
+    assert.equal(contract.id, 'task-1');
+    assert.deepEqual(contract.allowedFiles, ['src/a.rs']);
+    assert.deepEqual(contract.checkSuites, ['chunk']);
+    const text = contractTaskText(contract);
+    assert.ok(text.includes('Task contract: task-1'));
+    assert.ok(text.includes('Objective: SECRET_OBJECTIVE do the thing'));
+    assert.ok(text.includes('  - src/a.rs'));
+    assert.ok(text.includes('  - SECRET_ACCEPTANCE criterion'));
+    assert.ok(text.includes('  - SECRET_PROHIBITED action'));
+    assert.ok(text.includes('Allowed check suites: chunk'));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects a missing file', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    assert.throws(
+      () => loadTaskContract(path.join(repoRoot, 'nope.json'), policy),
+      (e) => e instanceof AgentError && /contract file not found/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects invalid JSON', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = path.join(repoRoot, 'task.json');
+    fs.writeFileSync(contractPath, '{ not json', 'utf8');
+    assert.throws(
+      () => loadTaskContract(contractPath, policy),
+      (e) => e instanceof AgentError && /not valid JSON/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects a wrong schema', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = writeContractFile(repoRoot, { schema: 'wrong/v0' });
+    assert.throws(
+      () => loadTaskContract(contractPath, policy),
+      (e) => e instanceof AgentError && /unsupported contract schema/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects an invalid or empty id', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const badId = writeContractFile(repoRoot, { id: 'bad id!' });
+    assert.throws(() => loadTaskContract(badId, policy), (e) => e instanceof AgentError && /contract.id/.test(e.message));
+    const emptyId = writeContractFile(repoRoot, { id: '' });
+    assert.throws(() => loadTaskContract(emptyId, policy), (e) => e instanceof AgentError && /contract.id/.test(e.message));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects an empty objective', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = writeContractFile(repoRoot, { objective: '   ' });
+    assert.throws(
+      () => loadTaskContract(contractPath, policy),
+      (e) => e instanceof AgentError && /contract.objective/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects an empty allowedFiles list', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = writeContractFile(repoRoot, { allowedFiles: [] });
+    assert.throws(
+      () => loadTaskContract(contractPath, policy),
+      (e) => e instanceof AgentError && /allowedFiles/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects duplicate allowedFiles after normalization', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const contractPath = writeContractFile(repoRoot, { allowedFiles: ['src/a.rs', './src/a.rs'] });
+    assert.throws(
+      () => loadTaskContract(contractPath, policy),
+      (e) => e instanceof AgentError && /duplicate after normalization/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects absolute and traversal allowedFiles paths', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['**'], write: ['**'] });
+    const absPath = writeContractFile(repoRoot, { allowedFiles: ['/etc/passwd'] });
+    assert.throws(() => loadTaskContract(absPath, policy), (e) => e instanceof AgentError && /absolute/.test(e.message));
+    const traversal = writeContractFile(repoRoot, { allowedFiles: ['src/../../a.rs'] });
+    assert.throws(() => loadTaskContract(traversal, policy), (e) => e instanceof AgentError && /traversal/.test(e.message));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects an allowedFile denied or unwritable by the base policy', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['**'], write: ['src/**'], deny: ['secret/**'] });
+    const denied = writeContractFile(repoRoot, { allowedFiles: ['secret/a.rs'] });
+    assert.throws(
+      () => loadTaskContract(denied, policy),
+      (e) => e instanceof AgentError && /denied by policy/.test(e.message),
+    );
+    const unwritable = writeContractFile(repoRoot, { allowedFiles: ['other/a.rs'] });
+    assert.throws(
+      () => loadTaskContract(unwritable, policy),
+      (e) => e instanceof AgentError && /not writable/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects empty or duplicate acceptance entries', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const empty = writeContractFile(repoRoot, { acceptance: [] });
+    assert.throws(() => loadTaskContract(empty, policy), (e) => e instanceof AgentError && /acceptance/.test(e.message));
+    const blank = writeContractFile(repoRoot, { acceptance: [''] });
+    assert.throws(() => loadTaskContract(blank, policy), (e) => e instanceof AgentError && /acceptance/.test(e.message));
+    const dup = writeContractFile(repoRoot, { acceptance: ['a', 'a'] });
+    assert.throws(() => loadTaskContract(dup, policy), (e) => e instanceof AgentError && /duplicate/.test(e.message));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects invalid or duplicate prohibited entries', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const invalid = writeContractFile(repoRoot, { prohibited: ['ok', ''] });
+    assert.throws(() => loadTaskContract(invalid, policy), (e) => e instanceof AgentError && /prohibited/.test(e.message));
+    const dup = writeContractFile(repoRoot, { prohibited: ['x', 'x'] });
+    assert.throws(() => loadTaskContract(dup, policy), (e) => e instanceof AgentError && /duplicate/.test(e.message));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadTaskContract: rejects invalid, duplicate, or unknown checkSuites', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const invalid = writeContractFile(repoRoot, { checkSuites: ['chunk', ''] });
+    assert.throws(() => loadTaskContract(invalid, policy), (e) => e instanceof AgentError && /checkSuites/.test(e.message));
+    const dup = writeContractFile(repoRoot, { checkSuites: ['chunk', 'chunk'] });
+    assert.throws(() => loadTaskContract(dup, policy), (e) => e instanceof AgentError && /duplicate/.test(e.message));
+    const unknown = writeContractFile(repoRoot, { checkSuites: ['nope'] });
+    assert.throws(
+      () => loadTaskContract(unknown, policy),
+      (e) => e instanceof AgentError && /unknown suite/.test(e.message),
+    );
   } finally {
     fs.rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -924,6 +1183,84 @@ test('apply_patch: rejects a path that is not writable per policy', async () => 
 });
 
 // ---------------------------------------------------------------------------
+// buildTools with an active task contract
+// ---------------------------------------------------------------------------
+
+test('buildTools contract: apply_patch succeeds on an allowed file and rejects a different policy-writable file without mutation', async () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    const allowed = path.join(repoRoot, 'src', 'a.rs');
+    const other = path.join(repoRoot, 'src', 'b.rs');
+    fs.writeFileSync(allowed, 'MARK\n', 'utf8');
+    fs.writeFileSync(other, 'MARK\n', 'utf8');
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const audit = new AuditLog(policy, { contractId: 'task-1' });
+    const contract = {
+      schema: 'local-agent.task/v1',
+      id: 'task-1',
+      objective: 'x',
+      allowedFiles: ['src/a.rs'],
+      acceptance: ['a'],
+      prohibited: [],
+      checkSuites: ['chunk'],
+    };
+    const tools = buildTools(policy, audit, { dryRun: false, contract });
+    const out = await tools.apply_patch.fn({ path: 'src/a.rs', oldText: 'MARK', newText: 'DONE' });
+    assert.equal(out, 'applied 1 replacement(s) to src/a.rs');
+    assert.equal(fs.readFileSync(allowed, 'utf8'), 'DONE\n');
+    await assert.rejects(
+      () => tools.apply_patch.fn({ path: 'src/b.rs', oldText: 'MARK', newText: 'DONE' }),
+      (e) => e instanceof AgentError && e.code === 'contract_path_denied',
+    );
+    assert.equal(fs.readFileSync(other, 'utf8'), 'MARK\n', 'the non-allowed file must be unchanged');
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('buildTools contract: a listed check suite reaches the configured script check; an unlisted otherwise-valid suite is rejected before spawn', async () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'scripts'), { recursive: true });
+    // Harmless temporary fixture: the fixed runner is `powershell -File` on
+    // Windows and `pwsh -File` elsewhere; neither binary is guaranteed to
+    // exist, so the listed-suite case is expected to fail at spawn (proof it
+    // passed the contract gate), while the unlisted suite must fail earlier
+    // with the contract denial.
+    const script = path.join(repoRoot, 'scripts', 'Test.ps1');
+    fs.writeFileSync(script, 'Write-Output ok', 'utf8');
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    // Add a second policy suite that the contract does NOT list.
+    policy.checks.suites.full = 'Full';
+    const audit = new AuditLog(policy, { contractId: 'task-1' });
+    const contract = {
+      schema: 'local-agent.task/v1',
+      id: 'task-1',
+      objective: 'x',
+      allowedFiles: ['src/a.rs'],
+      acceptance: ['a'],
+      prohibited: [],
+      checkSuites: ['chunk'],
+    };
+    const tools = buildTools(policy, audit, { dryRun: false, contract });
+    // Listed suite: accepted by the contract gate, so it reaches the
+    // configured fixed runner (spawn) and fails there, not at the gate.
+    await assert.rejects(
+      () => tools.run_check.fn({ suite: 'chunk' }),
+      (e) => e instanceof AgentError && e.code !== 'contract_suite_denied' && e.code !== 'bad_suite',
+    );
+    // Unlisted but policy-valid suite: rejected before any process is spawned.
+    await assert.rejects(
+      () => tools.run_check.fn({ suite: 'full' }),
+      (e) => e instanceof AgentError && e.code === 'contract_suite_denied',
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Dry-run and check suites
 // ---------------------------------------------------------------------------
 
@@ -1034,14 +1371,41 @@ test('AuditLog: never records secret content, only metadata fields', () => {
     const line = JSON.parse(raw.trim());
     assert.deepEqual(
       Object.keys(line).sort(),
-      ['durationMs', 'error', 'inputBytes', 'kind', 'ok', 'outputBytes', 'tool', 'ts'].sort(),
+      ['contractId', 'durationMs', 'error', 'inputBytes', 'kind', 'ok', 'outputBytes', 'tool', 'ts'].sort(),
     );
     assert.equal(line.error, 'patch_mismatch');
+    // No contract is active here, so the id is null (never a contract body).
+    assert.equal(line.contractId, null);
     // The audit line must not carry any free-form content fields.
     assert.ok(!('content' in line));
     assert.ok(!('task' in line));
     assert.ok(!('patch' in line));
     assert.ok(!('source' in line));
+    assert.ok(!('model' in line));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('AuditLog: an active contract records contractId on model and tool records and never records contract contents', () => {
+  const repoRoot = makeTempDirSync();
+  try {
+    const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
+    const audit = new AuditLog(policy, { contractId: 'task-1' });
+    audit.toolCall({ tool: 'apply_patch', ok: true, error: null, inputBytes: 5, outputBytes: 7, durationMs: 3 });
+    audit.modelTurn({ turn: 1, ok: true, error: null, inputBytes: 30, outputBytes: 40, durationMs: 2 });
+    const raw = fs.readFileSync(policy.audit.jsonlPath, 'utf8');
+    const lines = raw.trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].contractId, 'task-1');
+    assert.equal(lines[1].contractId, 'task-1');
+    // Only the short identifier is recorded: no contract text of any kind.
+    assert.ok(!raw.includes('SECRET_OBJECTIVE'));
+    assert.ok(!raw.includes('SECRET_ACCEPTANCE'));
+    assert.ok(!raw.includes('SECRET_PROHIBITED'));
+    assert.ok(!raw.includes('objective'));
+    assert.ok(!raw.includes('acceptance'));
+    assert.ok(!raw.includes('prohibited'));
   } finally {
     fs.rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -1663,6 +2027,379 @@ test('main: a model HTTP error surfaces as model_error', async () => {
     assert.ok(capturedErr.includes('agent failed:'), 'the failure must be reported on stderr');
     assert.ok(capturedErr.includes('model request failed (HTTP 500)'), 'the model error must be surfaced');
   } finally {
+    process.stderr.write = realStderr;
+    globalThis.fetch = realFetch;
+    if (prevQwApiKey === undefined) delete process.env.QW_API_KEY;
+    else process.env.QW_API_KEY = prevQwApiKey;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Remaining public-behavior regressions
+// ---------------------------------------------------------------------------
+
+// list_files must accept a parent directory that is authorized only because a
+// read glob matches its descendants (e.g. `tools/local-agent/**`), return the
+// readable immediate descendants, and omit any child matched by a deny glob.
+test('list_files: accepts an authorized parent directory under a descendant-only read glob and omits denied children', async () => {
+  const repoRoot = await makeTempDir('lca-listfiles-');
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'tools', 'local-agent'), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, 'tools', 'local-agent', 'agent.mjs'), 'x', 'utf8');
+    fs.writeFileSync(path.join(repoRoot, 'tools', 'local-agent', 'secret.txt'), 'x', 'utf8');
+    const policy = makePolicy({
+      repoRoot,
+      read: ['tools/local-agent/**'],
+      write: ['tools/local-agent/**'],
+      deny: ['tools/local-agent/secret.txt'],
+    });
+    const audit = new AuditLog(policy);
+    const tools = buildTools(policy, audit, { dryRun: false });
+    const out = await tools.list_files.fn({ path: 'tools/local-agent' });
+    assert.ok(out.includes('- tools/local-agent/agent.mjs'), 'readable immediate descendant must be listed');
+    assert.ok(!out.includes('secret.txt'), 'denied child must be omitted');
+  } finally {
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// McpClient.close must be idempotent and overlap-safe: concurrent closes plus
+// a later close send no more than one closing HTTP request and leave
+// sessionId null.
+test('McpClient: close invoked twice concurrently and once later sends at most one closing request and leaves sessionId null', async () => {
+  const realFetch = globalThis.fetch;
+  const { handler } = makeFakeMcp();
+  let closeRequests = 0;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(String(options.body ?? ''));
+    if (body.method === 'initialize' || body.method === 'notifications/initialized') {
+      return handler(url, options);
+    }
+    closeRequests += 1;
+    return new Response(null, { status: 202 });
+  };
+  try {
+    const client = new McpClient('http://127.0.0.1:0/mcp');
+    await client.initialize();
+    const [r1, r2] = await Promise.all([client.close(), client.close()]);
+    assert.equal(r1, r2, 'concurrent closes must share the same teardown result');
+    await client.close();
+    assert.equal(client.sessionId, null, 'sessionId must be null after close');
+    assert.equal(client.initialized, false);
+    assert.ok(closeRequests <= 1, `at most one closing request may be sent, got ${closeRequests}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// main with a valid --contract and --dry-run must perform no fetch at all,
+// print the contract id and the numeric allowed-file/check counts, and never
+// leak the contract objective, acceptance, or prohibited text.
+test('main: valid --contract --dry-run performs no fetch and reports only the contract id and counts', async () => {
+  const repoRoot = await makeTempDir('lca-contract-dryrun-');
+  const realFetch = globalThis.fetch;
+  const realStdout = process.stdout.write;
+  let fetchCalls = 0;
+  let captured = '';
+  process.stdout.write = (chunk) => { captured += String(chunk); return true; };
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ choices: [{ message: { content: 'nope' } }] });
+  };
+  try {
+    const policyPath = writePolicyFile(repoRoot);
+    const contractPath = writeContractFile(repoRoot, {
+      id: 'contract-dry-1',
+      allowedFiles: ['src/a.rs', 'src/b.rs'],
+      checkSuites: ['chunk'],
+    });
+    const code = await main(['--policy', policyPath, '--contract', contractPath, '--dry-run']);
+    assert.equal(code, 0);
+    assert.equal(fetchCalls, 0, 'dry-run must not perform any fetch');
+    assert.ok(captured.includes('contract: contract-dry-1'), 'output must contain the contract id');
+    assert.ok(captured.includes('contract allowed files: 2'), 'output must contain the numeric allowed-file count');
+    assert.ok(captured.includes('contract check suites: 1'), 'output must contain the numeric check count');
+    assert.ok(!captured.includes('SECRET_OBJECTIVE'), 'objective text must not leak');
+    assert.ok(!captured.includes('SECRET_ACCEPTANCE'), 'acceptance text must not leak');
+    assert.ok(!captured.includes('SECRET_PROHIBITED'), 'prohibited text must not leak');
+  } finally {
+    process.stdout.write = realStdout;
+    globalThis.fetch = realFetch;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Additional public-behavior regressions (appended)
+// ---------------------------------------------------------------------------
+
+// list_files must accept a readable parent directory and filter out children
+// that are denied by the policy, while still listing readable children.
+test('list_files accepts readable parent and filters denied children', async () => {
+  const repoRoot = await makeTempDir('lca-listfiles-denied-');
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'tools', 'local-agent'), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, 'tools', 'local-agent', 'visible.txt'), 'visible', 'utf8');
+    fs.writeFileSync(path.join(repoRoot, 'tools', 'local-agent', 'secret.txt'), 'secret', 'utf8');
+    const policy = makePolicy({
+      repoRoot,
+      read: ['tools/local-agent/**'],
+      write: ['tools/local-agent/**'],
+      deny: ['**/secret.txt'],
+    });
+    const audit = new AuditLog(policy);
+    const tools = buildTools(policy, audit, { dryRun: false });
+    const out = await tools.list_files.fn({ path: 'tools/local-agent' });
+    assert.ok(out.includes('tools/local-agent/visible.txt'), 'readable child must be listed');
+    assert.ok(!out.includes('secret.txt'), 'denied child must be filtered out');
+  } finally {
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// McpClient.close must be idempotent across concurrent and repeated calls:
+// no more than one closing request is sent and the session id is cleared.
+test('McpClient close is idempotent across concurrent and repeated calls', async () => {
+  const realFetch = globalThis.fetch;
+  const { handler } = makeFakeMcp();
+  let closeRequests = 0;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(String(options.body ?? ''));
+    if (body.method === 'initialize' || body.method === 'notifications/initialized') {
+      return handler(url, options);
+    }
+    closeRequests += 1;
+    return new Response(null, { status: 202 });
+  };
+  try {
+    const client = new McpClient('http://127.0.0.1:0/mcp');
+    await client.initialize();
+    assert.equal(client.sessionId, 'fake-session-1', 'initialize must store the session id');
+    await Promise.all([client.close(), client.close()]);
+    await client.close();
+    assert.ok(closeRequests <= 1, `at most one closing request may be sent, got ${closeRequests}`);
+    assert.equal(client.sessionId, null, 'sessionId must be null after close');
+    assert.equal(client.initialized, false, 'initialized must be false after close');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// main with a valid --contract and --dry-run must report only the contract
+// metadata (id and counts) and never leak the contract text.
+test('main contract dry-run reports metadata without leaking contract text', async () => {
+  const repoRoot = await makeTempDir('lca-contract-dryrun-meta-');
+  const realFetch = globalThis.fetch;
+  const realStdout = process.stdout.write;
+  let fetchCalls = 0;
+  let captured = '';
+  process.stdout.write = (chunk) => { captured += String(chunk); return true; };
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('fetch must not be called during dry-run');
+  };
+  try {
+    const policyPath = writePolicyFile(repoRoot);
+    const contractPath = writeContractFile(repoRoot, {
+      id: 'contract-meta-1',
+      allowedFiles: ['src/a.rs', 'src/b.rs'],
+      checkSuites: ['chunk'],
+    });
+    const code = await main(['--policy', policyPath, '--contract', contractPath, '--dry-run']);
+    assert.equal(code, 0, 'dry-run must return 0');
+    assert.equal(fetchCalls, 0, 'dry-run must not perform any fetch');
+    assert.ok(captured.includes('contract: contract-meta-1'), 'output must contain the contract id');
+    assert.ok(captured.includes('contract allowed files: 2'), 'output must contain the allowed-file count');
+    assert.ok(captured.includes('contract check suites: 1'), 'output must contain the check-suite count');
+    assert.ok(!captured.includes('SECRET_OBJECTIVE'), 'objective text must not leak');
+    assert.ok(!captured.includes('SECRET_ACCEPTANCE'), 'acceptance text must not leak');
+    assert.ok(!captured.includes('SECRET_PROHIBITED'), 'prohibited text must not leak');
+  } finally {
+    process.stdout.write = realStdout;
+    globalThis.fetch = realFetch;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// main must reject a contract whose allowedFiles are not writable by the base
+// policy before any model contact or mutation.
+test('main rejects unauthorized contract before model contact or mutation', async () => {
+  const repoRoot = await makeTempDir('lca-contract-unauth-');
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ choices: [{ message: { content: 'nope' } }] });
+  };
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    const target = path.join(repoRoot, 'src', 'a.rs');
+    const original = 'MARK\n';
+    fs.writeFileSync(target, original, 'utf8');
+    const policyPath = writePolicyFile(repoRoot);
+    const contractPath = writeContractFile(repoRoot, { allowedFiles: ['docs/no.md'] });
+    await assert.rejects(
+      () => main(['--policy', policyPath, '--contract', contractPath]),
+      (e) => e instanceof AgentError && /not writable/.test(e.message),
+    );
+    assert.equal(fetchCalls, 0, 'no fetch may occur before contract validation');
+    assert.equal(fs.readFileSync(target, 'utf8'), original, 'target file must be unchanged');
+  } finally {
+    globalThis.fetch = realFetch;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// main with a valid non-dry-run --contract and mocked MCP/model must return 0
+// and record the contractId on the audit model_turn record.
+test('main live contract path audits contract id', async () => {
+  const repoRoot = await makeTempDir('lca-contract-live-audit-');
+  const realFetch = globalThis.fetch;
+  const realStdout = process.stdout.write;
+  const realStderr = process.stderr.write;
+  const mcpMethods = [];
+  let modelContacted = false;
+  let capturedOut = '';
+  let capturedErr = '';
+  process.stdout.write = (chunk) => { capturedOut += String(chunk); return true; };
+  process.stderr.write = (chunk) => { capturedErr += String(chunk); return true; };
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url);
+    if (u.includes('/chat/completions')) {
+      modelContacted = true;
+      return Response.json({ choices: [{ message: { content: 'live contract final answer' } }] });
+    }
+    const body = JSON.parse(String(options.body ?? ''));
+    mcpMethods.push(body.method);
+    if (body.method === 'initialize') {
+      return Response.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'fake', version: '0' } },
+      }, { headers: { 'mcp-session-id': 'live-contract-session' } });
+    }
+    if (body.method === 'notifications/initialized') {
+      return new Response(null, { status: 202 });
+    }
+    return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'unknown method' } });
+  };
+  const prevQwApiKey = process.env.QW_API_KEY;
+  try {
+    process.env.QW_API_KEY = 'test-key';
+    const policyPath = writePolicyFile(repoRoot);
+    const contractPath = writeContractFile(repoRoot, { id: 'contract-live-audit-1' });
+    const code = await main(['--policy', policyPath, '--contract', contractPath]);
+    assert.equal(code, 0, 'live contract run must return 0');
+    assert.ok(modelContacted, 'the model must be contacted on the live path');
+    assert.ok(capturedOut.includes('live contract final answer'));
+    assert.ok(mcpMethods.includes('initialize'), 'MCP initialize must be mocked and used');
+    const policy = loadPolicy(policyPath);
+    const lines = readAuditLines(policy);
+    const modelLine = lines.find((l) => l.kind === 'model_turn');
+    assert.ok(modelLine, 'a model turn must be audited');
+    assert.equal(modelLine.contractId, 'contract-live-audit-1', 'the audit model record must carry the contractId');
+  } finally {
+    process.stdout.write = realStdout;
+    process.stderr.write = realStderr;
+    globalThis.fetch = realFetch;
+    if (prevQwApiKey === undefined) delete process.env.QW_API_KEY;
+    else process.env.QW_API_KEY = prevQwApiKey;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// main with an invalid contract, or a contract whose allowedFiles are not
+// authorized by the base policy, must reject before any fetch or model
+// contact and leave the target file unchanged.
+test('main: invalid or base-policy-unauthorized --contract rejects before any fetch and leaves the target file unchanged', async () => {
+  const repoRoot = await makeTempDir('lca-contract-reject-');
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ choices: [{ message: { content: 'nope' } }] });
+  };
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    const target = path.join(repoRoot, 'src', 'a.rs');
+    const original = 'MARK\n';
+    fs.writeFileSync(target, original, 'utf8');
+    const policyPath = writePolicyFile(repoRoot);
+
+    // Case 1: invalid contract (bad schema).
+    const invalidPath = writeContractFile(repoRoot, { schema: 'wrong/v0' });
+    await assert.rejects(
+      () => main(['--policy', policyPath, '--contract', invalidPath]),
+      (e) => e instanceof AgentError && /unsupported contract schema/.test(e.message),
+    );
+
+    // Case 2: contract allowedFile not writable by the base policy.
+    const unauthorizedPath = writeContractFile(repoRoot, { allowedFiles: ['other/a.rs'] });
+    await assert.rejects(
+      () => main(['--policy', policyPath, '--contract', unauthorizedPath]),
+      (e) => e instanceof AgentError && /not writable/.test(e.message),
+    );
+
+    assert.equal(fetchCalls, 0, 'no fetch may occur before contract validation');
+    assert.equal(fs.readFileSync(target, 'utf8'), original, 'target file must be unchanged');
+  } finally {
+    globalThis.fetch = realFetch;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// main with a valid non-dry-run --contract and mocked MCP initialize/close
+// plus a mocked model final response must return 0 and record the contractId
+// on the audit model record.
+test('main: valid non-dry-run --contract with mocked MCP and model returns 0 and audits the contractId', async () => {
+  const repoRoot = await makeTempDir('lca-contract-live-');
+  const realFetch = globalThis.fetch;
+  const realStdout = process.stdout.write;
+  const realStderr = process.stderr.write;
+  const mcpMethods = [];
+  let modelContacted = false;
+  let capturedOut = '';
+  let capturedErr = '';
+  process.stdout.write = (chunk) => { capturedOut += String(chunk); return true; };
+  process.stderr.write = (chunk) => { capturedErr += String(chunk); return true; };
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url);
+    if (u.includes('/chat/completions')) {
+      modelContacted = true;
+      return Response.json({ choices: [{ message: { content: 'contract final answer' } }] });
+    }
+    const body = JSON.parse(String(options.body ?? ''));
+    mcpMethods.push(body.method);
+    if (body.method === 'initialize') {
+      return Response.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'fake', version: '0' } },
+      }, { headers: { 'mcp-session-id': 'contract-live-session' } });
+    }
+    if (body.method === 'notifications/initialized') {
+      return new Response(null, { status: 202 });
+    }
+    return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'unknown method' } });
+  };
+  const prevQwApiKey = process.env.QW_API_KEY;
+  try {
+    process.env.QW_API_KEY = 'test-key';
+    const policyPath = writePolicyFile(repoRoot);
+    const contractPath = writeContractFile(repoRoot, { id: 'contract-live-1' });
+    const code = await main(['--policy', policyPath, '--contract', contractPath]);
+    assert.equal(code, 0);
+    assert.ok(modelContacted, 'the model must be contacted on the live path');
+    assert.ok(capturedOut.includes('contract final answer'));
+    assert.ok(mcpMethods.includes('initialize'), 'MCP initialize must be mocked and used');
+    const policy = loadPolicy(policyPath);
+    const lines = readAuditLines(policy);
+    const modelLine = lines.find((l) => l.kind === 'model_turn');
+    assert.ok(modelLine, 'a model turn must be audited');
+    assert.equal(modelLine.contractId, 'contract-live-1', 'the audit model record must carry the contractId');
+  } finally {
+    process.stdout.write = realStdout;
     process.stderr.write = realStderr;
     globalThis.fetch = realFetch;
     if (prevQwApiKey === undefined) delete process.env.QW_API_KEY;

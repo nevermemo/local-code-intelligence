@@ -57,15 +57,55 @@ Deny wins: a path matching `deny` is neither readable nor writable, even when
 ## CLI
 
 `--policy <path>` is required for every non-help invocation, and exactly one
-of `--task <text>` / `--task-file <path>` is required.
+of the three mutually exclusive input modes is required: `--task <text>`,
+`--task-file <path>`, or `--contract <json>`.
 
 ```
 node agent.mjs --task "..." --policy policy.json
 node agent.mjs --task-file task.md --policy policy.json --dry-run
+node agent.mjs --contract contract.json --policy policy.json
 ```
 
-`--dry-run` resolves the policy, validates the task, and lists the planned
-tool calls without contacting the model or writing files.
+`--dry-run` resolves the policy, validates the task or contract, and lists the
+planned tool calls without contacting the model or writing files.
+
+### Task contract (`--contract`)
+
+`--contract <json>` is the third input mode: a single JSON document of type
+`local-agent.task/v1` that fully specifies one bounded slice.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable contract identifier (recorded in the audit log as `contractId`) |
+| `objective` | One-sentence objective for the slice |
+| `allowedFiles` | Exact relative paths the slice may write |
+| `acceptance` | What a correct result must satisfy |
+| `prohibited` | What the slice must not do |
+| `checkSuites` | Named `Test.ps1` suites the slice may run via `run_check` |
+
+The base policy remains the outer authority: the contract narrows the exact
+writable files and the runnable named suites at the tool layer, and cannot
+widen anything the policy denies. Invalid contracts (unknown type, missing or
+malformed fields, files outside the policy `write` globs, suites not declared
+in `checks.suites`) fail before any model or MCP contact and before any
+mutation.
+
+Audit records carry `contractId` only; contract contents are never written to
+the audit log.
+
+Compact valid example:
+
+```json
+{
+  "type": "local-agent.task/v1",
+  "id": "slice-001",
+  "objective": "Add the contract loader to agent.mjs",
+  "allowedFiles": ["tools/local-agent/agent.mjs"],
+  "acceptance": "CLI accepts --contract and rejects invalid contracts",
+  "prohibited": ["no new dependencies", "no schema changes"],
+  "checkSuites": ["Unit"]
+}
+```
 
 ## Commands
 
@@ -84,6 +124,9 @@ node --test test/agent.test.mjs
 
 # Bounded task run: one task, one policy, real model + LCI endpoints.
 node agent.mjs --task-file task.md --policy policy.json
+
+# Contract run: one task contract, one policy, real model + LCI endpoints.
+node agent.mjs --contract contract.json --policy policy.json
 ```
 
 A bounded task run is a single task with an explicit allowed-file list, one
@@ -93,16 +136,24 @@ run; the dry-run and test commands above are fully offline.
 
 ## Workflow
 
-1. Bounded assignment: the coordinator gives the subagent one task with an
-   explicit allowed-file list.
-2. LCI retrieval: `search_code` / `index_status` only; routine reindexing is
-   forbidden.
-3. Small patch: one exact-text `apply_patch` within the byte limit.
-4. Focused check: one named `run_check` suite proportional to the change.
-5. Coordinator diff review: the saved diff is reviewed against the assignment;
-   a valid saved diff counts even without prose.
-6. Correction: findings are fixed in a bounded correction pass.
-7. Final: one full check (`Test.ps1 -Suite Full`) and a coordinator commit.
+1. Contract: the coordinator defines one task contract (`local-agent.task/v1`)
+   per slice and runs it with `--contract`.
+2. Implementation: Qwen edits within the contract's `allowedFiles` and runs at
+   most one named suite from `checkSuites`; no repeated exploration or test
+   runs.
+3. Coordinator review: the coordinator reviews the saved diff once against the
+   contract's `acceptance` and `prohibited`; a valid saved diff counts even
+   without prose.
+4. Correction: if the review rejects the diff, the coordinator issues a
+   correction contract with the specific findings; the subagent fixes only
+   those findings.
+5. Broad verification: after all slices are accepted, the coordinator runs one
+   full check (`Test.ps1 -Suite Full`).
+6. Commit: the coordinator commits outside the harness.
+
+Routine indexing and broad baseline tests are not startup chores: the LCI
+index is reused via `search_code` / `index_status`, and the full suite runs
+once at the end, not before or between slices.
 
 ## Smoke (Windows PowerShell)
 
@@ -112,6 +163,7 @@ node .\agent.mjs --help
 node .\agent.mjs --task "Implement the policy loader" --policy .\policy.example.json --dry-run
 node --test .\test\agent.test.mjs
 node .\agent.mjs --task-file .\task.md --policy .\policy.json
+node .\agent.mjs --contract .\contract.json --policy .\policy.json
 ```
 
 ## Audit
@@ -119,5 +171,6 @@ node .\agent.mjs --task-file .\task.md --policy .\policy.json
 The harness appends one JSON line per tool call and model turn to
 `audit.jsonlPath` (default `test-results/local-agent/audit.jsonl`). Records
 carry metadata only (tool name, ok, error class, byte counts, duration) and
-never task text, model output, source, or patch content. Generated reports
-under `test-results` are never committed.
+never task text, model output, source, or patch content. Contract runs record
+`contractId` only; contract contents are never written to the audit log.
+Generated reports under `test-results` are never committed.

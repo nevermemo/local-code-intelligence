@@ -40,6 +40,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SCHEMA = 'local-agent.policy/v1';
+const CONTRACT_SCHEMA = 'local-agent.task/v1';
+const CONTRACT_ID_RE = /^[A-Za-z0-9._-]+$/;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -61,11 +63,15 @@ export class AgentError extends Error {
 const HELP_TEXT = `Usage:
   node agent.mjs --task "..." --policy policy.json
   node agent.mjs --task-file task.md --policy policy.json [--dry-run]
+  node agent.mjs --contract task.json --policy policy.json [--dry-run]
 
 Options:
   --policy <path>      Path to a local-agent.policy/v1 JSON file (required).
-  --task <text>        Task text (exactly one of --task / --task-file).
+  --task <text>        Task text (exactly one of --task / --task-file / --contract).
   --task-file <path>   Path to a file containing the task text.
+  --contract <path>    Path to a local-agent.task/v1 JSON contract. The
+                       contract supplies the task text and the allowed-file /
+                       check-suite restrictions enforced by the tools.
   --dry-run            Resolve and validate the policy and task, list the
                        planned tool surface, and exit without contacting the
                        model or writing files.
@@ -73,7 +79,7 @@ Options:
 `;
 
 export function parseArgs(argv) {
-  const out = { policy: null, task: null, taskFile: null, dryRun: false, help: false };
+  const out = { policy: null, task: null, taskFile: null, contract: null, dryRun: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -92,6 +98,11 @@ export function parseArgs(argv) {
         out.taskFile = argv[++i];
         if (out.taskFile === undefined) throw new AgentError('--task-file requires a value');
         break;
+      case '--contract':
+        if (out.contract !== null) throw new AgentError('--contract given more than once');
+        out.contract = argv[++i];
+        if (out.contract === undefined) throw new AgentError('--contract requires a value');
+        break;
       case '--dry-run':
         out.dryRun = true;
         break;
@@ -105,10 +116,9 @@ export function parseArgs(argv) {
   }
   if (!out.help) {
     if (!out.policy) throw new AgentError('missing required --policy <path>');
-    const hasTask = out.task !== null;
-    const hasTaskFile = out.taskFile !== null;
-    if (hasTask === hasTaskFile) {
-      throw new AgentError('exactly one of --task or --task-file is required');
+    const sources = [out.task, out.taskFile, out.contract].filter((x) => x !== null).length;
+    if (sources !== 1) {
+      throw new AgentError('exactly one of --task, --task-file, or --contract is required');
     }
   }
   return out;
@@ -306,6 +316,142 @@ export function checkAccess(policy, relPath, mode) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Task contracts (local-agent.task/v1)
+// ---------------------------------------------------------------------------
+
+// Load and validate a task contract. The contract supplies the task text and
+// the restrictions (allowedFiles, checkSuites) that buildTools enforces.
+// Validation is pure policy work: it never touches the model or the
+// filesystem beyond reading the contract file itself, so an invalid contract
+// fails before any model contact or mutation.
+export function loadTaskContract(contractPath, policy) {
+  const absContract = path.resolve(contractPath);
+  if (!fs.existsSync(absContract)) {
+    throw new AgentError(`contract file not found: ${absContract}`);
+  }
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(absContract, 'utf8'));
+  } catch (e) {
+    throw new AgentError(`contract file is not valid JSON: ${e.message}`);
+  }
+  if (raw.schema !== CONTRACT_SCHEMA) {
+    throw new AgentError(`unsupported contract schema: ${String(raw.schema)} (expected ${CONTRACT_SCHEMA})`);
+  }
+
+  const id = raw.id;
+  if (typeof id !== 'string' || !CONTRACT_ID_RE.test(id)) {
+    throw new AgentError('contract.id must match [A-Za-z0-9._-]+');
+  }
+
+  const objective = raw.objective;
+  if (typeof objective !== 'string' || objective.trim().length === 0) {
+    throw new AgentError('contract.objective must be a non-empty string');
+  }
+
+  // allowedFiles: nonempty, unique after normalization, relative, and each
+  // must pass the base policy write access and deny rules.
+  const allowedFilesRaw = raw.allowedFiles;
+  if (!Array.isArray(allowedFilesRaw) || allowedFilesRaw.length === 0) {
+    throw new AgentError('contract.allowedFiles must be a non-empty array');
+  }
+  const allowedFiles = [];
+  const seenAllowed = new Set();
+  for (const f of allowedFilesRaw) {
+    if (typeof f !== 'string' || f.length === 0) {
+      throw new AgentError('contract.allowedFiles entries must be non-empty strings');
+    }
+    const rel = normalizeRelPath(f); // rejects absolute / traversal / NUL
+    if (seenAllowed.has(rel)) {
+      throw new AgentError(`contract.allowedFiles contains a duplicate after normalization: ${rel}`);
+    }
+    seenAllowed.add(rel);
+    checkAccess(policy, rel, 'write'); // deny rules + write globs
+    allowedFiles.push(rel);
+  }
+
+  // acceptance: nonempty, unique strings.
+  const acceptance = raw.acceptance;
+  if (!Array.isArray(acceptance) || acceptance.length === 0) {
+    throw new AgentError('contract.acceptance must be a non-empty array of strings');
+  }
+  const seenAcceptance = new Set();
+  for (const a of acceptance) {
+    if (typeof a !== 'string' || a.length === 0) {
+      throw new AgentError('contract.acceptance entries must be non-empty strings');
+    }
+    if (seenAcceptance.has(a)) {
+      throw new AgentError(`contract.acceptance contains a duplicate: ${a}`);
+    }
+    seenAcceptance.add(a);
+  }
+
+  // prohibited: unique nonempty strings; may be empty.
+  const prohibited = raw.prohibited;
+  if (!Array.isArray(prohibited)) {
+    throw new AgentError('contract.prohibited must be an array of non-empty strings');
+  }
+  const seenProhibited = new Set();
+  for (const p of prohibited) {
+    if (typeof p !== 'string' || p.length === 0) {
+      throw new AgentError('contract.prohibited entries must be non-empty strings');
+    }
+    if (seenProhibited.has(p)) {
+      throw new AgentError(`contract.prohibited contains a duplicate: ${p}`);
+    }
+    seenProhibited.add(p);
+  }
+
+  // checkSuites: unique strings; may be empty; each must exist in policy checks.
+  const checkSuites = raw.checkSuites;
+  if (!Array.isArray(checkSuites)) {
+    throw new AgentError('contract.checkSuites must be an array of strings');
+  }
+  const seenSuites = new Set();
+  for (const s of checkSuites) {
+    if (typeof s !== 'string' || s.length === 0) {
+      throw new AgentError('contract.checkSuites entries must be non-empty strings');
+    }
+    if (seenSuites.has(s)) {
+      throw new AgentError(`contract.checkSuites contains a duplicate: ${s}`);
+    }
+    seenSuites.add(s);
+    if (!(s in policy.checks.suites)) {
+      throw new AgentError(`contract.checkSuites references unknown suite: ${s}`);
+    }
+  }
+
+  return {
+    schema: CONTRACT_SCHEMA,
+    id,
+    objective,
+    allowedFiles,
+    acceptance,
+    prohibited,
+    checkSuites,
+  };
+}
+
+// Compact, labeled task text derived from the contract. This is the only
+// contract content that reaches the model; audit records never carry it.
+export function contractTaskText(contract) {
+  const lines = [
+    `Task contract: ${contract.id}`,
+    `Objective: ${contract.objective}`,
+    `Allowed files (apply_patch restricted to these):`,
+    ...contract.allowedFiles.map((f) => `  - ${f}`),
+    `Acceptance criteria:`,
+    ...contract.acceptance.map((a) => `  - ${a}`),
+  ];
+  if (contract.prohibited.length > 0) {
+    lines.push('Prohibited:');
+    for (const p of contract.prohibited) lines.push(`  - ${p}`);
+  }
+  lines.push(`Allowed check suites: ${contract.checkSuites.length ? contract.checkSuites.join(', ') : '(none)'}`);
+  return lines.join('\n');
+}
+
 // Resolve a normalized relative path to an absolute path inside repoRoot and
 // reject symlink/junction escape for existing targets.
 export function resolveRepoPath(policy, relPath) {
@@ -342,9 +488,12 @@ export function resolveRepoPath(policy, relPath) {
 // ---------------------------------------------------------------------------
 
 export class AuditLog {
-  constructor(policy) {
+  constructor(policy, { contractId = null } = {}) {
     this.path = policy.audit.jsonlPath;
     this.dir = path.dirname(this.path);
+    // Contract id only (a short identifier). Never task text, source, patch,
+    // or model output.
+    this.contractId = contractId;
     fs.mkdirSync(this.dir, { recursive: true });
   }
   append(entry) {
@@ -365,6 +514,7 @@ export class AuditLog {
       inputBytes,
       outputBytes,
       durationMs,
+      contractId: this.contractId,
     });
   }
   modelTurn({ turn, ok, error, inputBytes, outputBytes, durationMs }) {
@@ -377,6 +527,7 @@ export class AuditLog {
       inputBytes,
       outputBytes,
       durationMs,
+      contractId: this.contractId,
     });
   }
 }
@@ -442,23 +593,93 @@ function runFixedCommand({ argv, cwd, timeoutMs = 120000, maxBytes }) {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function buildTools(policy, audit, { dryRun = false } = {}) {
+export function buildTools(policy, audit, { dryRun = false, contract = null } = {}) {
   const maxResult = policy.limits.maxToolResultBytes;
+  // Contract restrictions (null when no contract is active). When active,
+  // apply_patch is limited to contract.allowedFiles and run_check to
+  // contract.checkSuites, on top of the base policy rules.
+  const allowedFilesSet = contract ? new Set(contract.allowedFiles) : null;
+  const checkSuitesSet = contract ? new Set(contract.checkSuites) : null;
 
   // The LCI MCP client is injected after construction (see main()). The
   // wrappers below read this closure variable, so `_setMcp` can reassign it
   // and the already-constructed tool functions observe the new client.
   let mcpClient = null;
 
+  // True when the path itself is readable, or (for directories) when it
+  // could contain readable descendants: a readable glob that matches the
+  // path itself or anything below it. Deny rules still beat allow.
+  function hasReadableDescendants(rel) {
+    const denied = policy.denyRe.some((re) => re.test(rel));
+    if (denied) return false;
+    const selfReadable = policy.readRe.some((re) => re.test(rel));
+    if (selfReadable) return true;
+    // A read glob can match a descendant of `rel` only if it is a
+    // directory-shaped prefix of the glob (e.g. `tools/local-agent/**`
+    // matches `tools/local-agent/agent.mjs`).
+    const directoryPrefix = `${rel}/`;
+    return policy.read.some((glob) => {
+      const normalizedGlob = String(glob).replace(/\\/g, '/');
+      const wildcard = normalizedGlob.search(/[?*]/);
+      const literalPrefix = wildcard === -1 ? normalizedGlob : normalizedGlob.slice(0, wildcard);
+      return literalPrefix.startsWith(directoryPrefix);
+    });
+  }
+
+  // Recursively collect descendants of a directory, keeping traversal and
+  // symlink safety: every existing path is resolved through resolveRepoPath
+  // (which rejects `..` traversal and symlink/junction escape), and every
+  // returned descendant is filtered through read access + deny rules.
+  // Directories are only listed (and descended into) when they could
+  // contain readable descendants; denied entries are never exposed.
+  function collectDescendants(baseRel, baseAbs, out) {
+    const entries = fs.readdirSync(baseAbs, { withFileTypes: true });
+    for (const e of entries) {
+      const childRel = baseRel ? `${baseRel}/${e.name}` : e.name;
+      const childAbs = path.join(baseAbs, e.name);
+      // Symlink/junction escape check for existing targets (and parents).
+      const { rel } = resolveRepoPath(policy, childRel);
+      // Filter every returned entry: include it only if the entry itself is
+      // readable, or it is a directory that could contain readable
+      // descendants. Never expose denied entries.
+      let include = false;
+      try {
+        checkAccess(policy, rel, 'read');
+        include = true;
+      } catch {
+        if (e.isDirectory()) include = hasReadableDescendants(rel);
+      }
+      if (!include) continue;
+      const st = fs.statSync(childAbs);
+      if (st.isDirectory()) {
+        out.push(`d ${rel}`);
+        collectDescendants(rel, childAbs, out);
+      } else {
+        out.push(`- ${rel}`);
+      }
+    }
+  }
+
   async function listFiles({ path: p }) {
     const { rel, abs } = resolveRepoPath(policy, p);
-    checkAccess(policy, rel, 'read');
     const st = fs.statSync(abs);
     if (!st.isDirectory()) throw new AgentError(`not a directory: ${rel}`);
-    const entries = fs.readdirSync(abs, { withFileTypes: true });
-    const lines = entries
-      .map((e) => `${e.isDirectory() ? 'd' : '-'} ${e.name}`)
-      .sort();
+    // The directory itself must be readable, or it must have potentially
+    // readable descendants (so an authorized directory like
+    // tools/local-agent is listable even when the readable glob is
+    // `tools/local-agent/**` and the directory path itself does not match).
+    let dirReadable = true;
+    try {
+      checkAccess(policy, rel, 'read');
+    } catch {
+      dirReadable = false;
+    }
+    if (!dirReadable && !hasReadableDescendants(rel)) {
+      throw new AgentError(`directory is not readable per policy: ${rel}`);
+    }
+    const out = [];
+    collectDescendants(rel, abs, out);
+    const lines = out.sort();
     return boundOutput(lines.join('\n') || '(empty directory)', maxResult);
   }
 
@@ -499,6 +720,9 @@ export function buildTools(policy, audit, { dryRun = false } = {}) {
     }
     const { rel, abs } = resolveRepoPath(policy, p);
     checkAccess(policy, rel, 'write');
+    if (allowedFilesSet && !allowedFilesSet.has(rel)) {
+      throw new AgentError(`path is not in the task contract allowedFiles: ${rel}`, { code: 'contract_path_denied' });
+    }
     if (!fs.existsSync(abs)) throw new AgentError(`file does not exist: ${rel}`);
     const st = fs.statSync(abs);
     if (!st.isFile()) throw new AgentError(`not a file: ${rel}`);
@@ -547,6 +771,9 @@ export function buildTools(policy, audit, { dryRun = false } = {}) {
     if (typeof suite !== 'string' || !(suite in policy.checks.suites)) {
       const known = Object.keys(policy.checks.suites).join(', ');
       throw new AgentError(`unknown check suite: ${String(suite)} (known: ${known})`, { code: 'bad_suite' });
+    }
+    if (checkSuitesSet && !checkSuitesSet.has(suite)) {
+      throw new AgentError(`check suite is not in the task contract checkSuites: ${suite}`, { code: 'contract_suite_denied' });
     }
     const suiteValue = policy.checks.suites[suite];
     const scriptAbs = path.resolve(policy.repoRoot, policy.checks.script);
@@ -720,9 +947,23 @@ export class McpClient {
 
   // Best-effort session teardown. The current LCI server does not require a
   // close handshake, so this is a no-op unless a future client adds one.
+  // Idempotent and overlap-safe: a single in-flight close promise guards the
+  // teardown, the session is cleared exactly once, and no close/delete
+  // request is ever sent twice.
   async close() {
-    this.initialized = false;
-    this.sessionId = null;
+    if (this._closePromise) return this._closePromise;
+    this._closePromise = (async () => {
+      // Clear the session exactly once.
+      this.initialized = false;
+      this.sessionId = null;
+    })();
+    try {
+      return await this._closePromise;
+    } catch {
+      // A failed teardown must not prevent a later close from retrying.
+      this._closePromise = null;
+      throw new AgentError('MCP close failed', { code: 'mcp_error' });
+    }
   }
 }
 
@@ -962,10 +1203,23 @@ export async function runAgentLoop({ policy, audit, tools, task, systemPrompt })
 // System prompt
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt(policy) {
+function buildSystemPrompt(policy, contract = null) {
   const suites = Object.entries(policy.checks.suites)
     .map(([k, v]) => `  - ${k} -> ${v}`)
     .join('\n');
+  const contractLines = [];
+  if (contract) {
+    // Only the contract id and the allowed file/suite names are stated here;
+    // the task text already carries the criteria, so no other contract
+    // content is duplicated.
+    contractLines.push(
+      `Active task contract: ${contract.id}`,
+      'Tool-enforced contract restrictions apply: apply_patch is restricted to these files: ' +
+        (contract.allowedFiles.length ? contract.allowedFiles.join(', ') : '(none)'),
+      'run_check is restricted to these suites: ' +
+        (contract.checkSuites.length ? contract.checkSuites.join(', ') : '(none)'),
+    );
+  }
   return [
     'You are a bounded implementation subagent for a local code repository.',
     'Follow AGENTS.md. Use LCI (lci_index_status / lci_search_code) before broad file reading.',
@@ -982,6 +1236,7 @@ function buildSystemPrompt(policy) {
     `Limits: maxTurns=${policy.limits.maxTurns} maxReadLines=${policy.limits.maxReadLines} maxPatchBytes=${policy.limits.maxPatchBytes} maxToolResultBytes=${policy.limits.maxToolResultBytes}`,
     'Available check suites:',
     suites,
+    ...contractLines,
     'Prefer small, exact-text patches and one focused check proportional to the change.',
   ].join('\n');
 }
@@ -990,7 +1245,7 @@ function buildSystemPrompt(policy) {
 // Dry-run
 // ---------------------------------------------------------------------------
 
-function dryRunReport(policy, task) {
+function dryRunReport(policy, task, contract = null) {
   const lines = [
     'Dry-run: policy resolved and task validated. No model contact, no writes.',
     `  policy: ${policy.policyPath}`,
@@ -1001,11 +1256,22 @@ function dryRunReport(policy, task) {
     `  audit: ${policy.audit.jsonlPath}`,
     `  limits: maxTurns=${policy.limits.maxTurns} maxReadLines=${policy.limits.maxReadLines} maxPatchBytes=${policy.limits.maxPatchBytes} maxToolResultBytes=${policy.limits.maxToolResultBytes}`,
     `  task bytes: ${Buffer.byteLength(task, 'utf8')}`,
+  ];
+  if (contract) {
+    // Contract summary only: the id plus the allowed-file/check counts.
+    // Never the contract text.
+    lines.push(
+      `  contract: ${contract.id}`,
+      `  contract allowed files: ${contract.allowedFiles.length}`,
+      `  contract check suites: ${contract.checkSuites.length}`,
+    );
+  }
+  lines.push(
     '  planned tool surface:',
     '    list_files, read_file, apply_patch (blocked in dry-run), git_diff,',
     '    run_check (blocked in dry-run), lci_index_status, lci_search_code',
     `  check suites: ${Object.keys(policy.checks.suites).join(', ')}`,
-  ];
+  );
   return lines.join('\n');
 }
 
@@ -1021,8 +1287,14 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const policy = loadPolicy(args.policy);
 
+  // Contract path: load and validate the task contract before any dry-run,
+  // model contact, or mutation. An invalid contract throws here.
+  let contract = null;
   let task;
-  if (args.task !== null) {
+  if (args.contract !== null) {
+    contract = loadTaskContract(args.contract, policy);
+    task = contractTaskText(contract);
+  } else if (args.task !== null) {
     task = args.task;
   } else {
     const absTaskFile = path.resolve(args.taskFile);
@@ -1036,12 +1308,12 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   if (args.dryRun) {
-    process.stdout.write(dryRunReport(policy, task) + '\n');
+    process.stdout.write(dryRunReport(policy, task, contract) + '\n');
     return 0;
   }
 
-  const audit = new AuditLog(policy);
-  const tools = buildTools(policy, audit, { dryRun: false });
+  const audit = new AuditLog(policy, { contractId: contract ? contract.id : null });
+  const tools = buildTools(policy, audit, { dryRun: false, contract });
   const mcp = new McpClient(policy.lci.endpoint);
   // Initialize the MCP session once, before the model loop can call any LCI
   // tool. This is the live path only: --help, --dry-run, imports, and offline
@@ -1059,7 +1331,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   tools._setMcp(mcp);
 
-  const systemPrompt = buildSystemPrompt(policy);
+  const systemPrompt = buildSystemPrompt(policy, contract);
   try {
     const finalText = await runAgentLoop({ policy, audit, tools, task, systemPrompt });
     process.stdout.write(finalText + '\n');
