@@ -19,12 +19,18 @@ runnable named suites.
   `oldText` must occur exactly `expectedReplacements` times and every
   occurrence is replaced with `newText` (an empty `newText` removes the
   matched text).
-- Run at most one named `run_check` suite from the contract's `checkSuites`;
-  do not run the full suite and do not repeat test runs.
+- After your edits are complete, call `plan_verification` exactly once with
+  the changed repository-relative paths, and run at most the returned
+  contract-authorized focused suites: one `run_check` per focused suite from
+  the contract's `checkSuites`. The planner only plans — it does not execute
+  any checks — so do not claim that tests are automatically executed. Do not
+  run the deferred full suite, do not widen the scope for unmatched paths,
+  and do not repeat test runs.
 
 ## Output
 
-- Return the saved diff plus one line of evidence: the suite run and its
-  result. A valid saved diff counts even when you return no prose.
-- Keep the response succinct: no repeated repository reads, no repeated test
-  runs, no exploration narrative.
+- Return the saved diff plus one line of evidence: the `plan_verification`
+  result and the focused suite run (if any) with its result. A valid saved
+  diff counts even when you return no prose.
+- Keep the response succinct: no repeated repository reads, no repeated
+  planner or test runs, no exploration narrative.

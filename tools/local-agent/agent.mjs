@@ -280,6 +280,59 @@ export function loadPolicy(policyPath) {
     checks.suites[name] = suite;
   }
 
+  // Optional change-aware verification planning fields. Backward
+  // compatibility: absent pathRules means an empty array; absent finalSuite
+  // means null.
+  const pathRulesRaw = raw.checks.pathRules;
+  const pathRules = [];
+  if (pathRulesRaw !== undefined) {
+    if (!Array.isArray(pathRulesRaw)) {
+      throw new AgentError('checks.pathRules must be an array of rule objects');
+    }
+    const seenRule = new Set();
+    for (const rule of pathRulesRaw) {
+      if (typeof rule !== 'object' || rule === null || Array.isArray(rule)) {
+        throw new AgentError('checks.pathRules entries must be objects');
+      }
+      const glob = requireString(rule, 'glob', 'checks.pathRules entry');
+      const suites = rule.suites;
+      if (!Array.isArray(suites) || suites.length === 0) {
+        throw new AgentError('checks.pathRules entry.suites must be a non-empty array');
+      }
+      const seenSuite = new Set();
+      for (const s of suites) {
+        if (typeof s !== 'string' || s.length === 0) {
+          throw new AgentError('checks.pathRules entry.suites entries must be non-empty strings');
+        }
+        if (seenSuite.has(s)) {
+          throw new AgentError(`checks.pathRules entry.suites contains a duplicate: ${s}`);
+        }
+        seenSuite.add(s);
+        if (!(s in checks.suites)) {
+          throw new AgentError(`checks.pathRules entry.suites references unknown suite: ${s}`);
+        }
+      }
+      const reason = requireString(rule, 'reason', 'checks.pathRules entry');
+      const normalizedGlob = normalizeRelPath(glob);
+      const ruleKey = `${normalizedGlob}|${suites.join(',')}|${reason}`;
+      if (seenRule.has(ruleKey)) {
+        throw new AgentError(`checks.pathRules contains a duplicate rule: ${normalizedGlob}`);
+      }
+      seenRule.add(ruleKey);
+      pathRules.push({ glob: normalizedGlob, suites, reason });
+    }
+  }
+  let finalSuite = null;
+  if (raw.checks.finalSuite !== undefined) {
+    if (typeof raw.checks.finalSuite !== 'string' || raw.checks.finalSuite.length === 0) {
+      throw new AgentError('checks.finalSuite must be a non-empty string');
+    }
+    if (!(raw.checks.finalSuite in checks.suites)) {
+      throw new AgentError(`checks.finalSuite references unknown suite: ${raw.checks.finalSuite}`);
+    }
+    finalSuite = raw.checks.finalSuite;
+  }
+
   const audit = { jsonlPath: requireString(raw.audit, 'jsonlPath', 'audit') };
 
   // Resolve policy-relative paths to absolute.
@@ -293,7 +346,7 @@ export function loadPolicy(policyPath) {
     model,
     lci,
     limits,
-    checks,
+    checks: { ...checks, pathRules, finalSuite },
     audit: { jsonlPath: path.resolve(repoRoot, audit.jsonlPath) },
   };
   // Pre-compile glob regexes.
@@ -314,6 +367,119 @@ export function checkAccess(policy, relPath, mode) {
     throw new AgentError(`path is not ${mode === 'read' ? 'readable' : 'writable'} per policy: ${relPath}`);
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic change-aware verification planning
+// ---------------------------------------------------------------------------
+
+// Pure planner: given a resolved policy, the changed repository-relative
+// paths, and an optional active task contract, produce a stable,
+// JSON-serializable verification plan. No filesystem, process, MCP, model,
+// or Git action is performed.
+//
+// - changedPaths must be a nonempty array of unique normalized
+//   repository-relative paths (absolute / traversal / NUL / non-string
+//   entries are rejected).
+// - Every path is matched against every policy checks.pathRules entry using
+//   the existing globMatch. Suggested suites are collected and deduped in
+//   policy declaration order, with the reasons and matched paths attached.
+// - When a contract is active, suggested suites not listed in
+//   contract.checkSuites go to `deferred` (reason: not authorized by active
+//   contract); allowed ones go to `focused`.
+// - policy.checks.finalSuite, when set, is always `deferred` (reason: run
+//   once after all accepted slices) unless it is already a focused suite.
+//   It is never recommended during an ordinary slice.
+// - Unmatched paths are reported in `unmatchedPaths`; they are not
+//   automatically escalated to the full suite.
+export function planVerification(policy, changedPaths, { contract = null } = {}) {
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
+    throw new AgentError('planVerification requires a non-empty changedPaths array');
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const p of changedPaths) {
+    const rel = normalizeRelPath(p); // rejects absolute / traversal / NUL / non-string
+    if (seen.has(rel)) {
+      throw new AgentError(`planVerification changedPaths contains a duplicate after normalization: ${rel}`);
+    }
+    seen.add(rel);
+    normalized.push(rel);
+  }
+
+  const rules = Array.isArray(policy.checks?.pathRules) ? policy.checks.pathRules : [];
+  const finalSuite = policy.checks?.finalSuite ?? null;
+  const contractSuites = contract ? new Set(contract.checkSuites) : null;
+
+  // Collect suggested suites in policy declaration order (rule order, then
+  // the suites order within each rule), deduped.
+  const focused = [];
+  const deferred = [];
+  const focusedSet = new Set();
+  const deferredSet = new Set();
+  const unmatchedPaths = [];
+
+  for (const rel of normalized) {
+    let matchedAny = false;
+    for (const rule of rules) {
+      if (!globMatch(rule.glob, rel)) continue;
+      matchedAny = true;
+      for (const suite of rule.suites) {
+        if (focusedSet.has(suite) || deferredSet.has(suite)) continue;
+        const authorized = contractSuites === null || contractSuites.has(suite);
+        if (authorized) {
+          focusedSet.add(suite);
+          focused.push({ suite, reasons: [rule.reason], matchedPaths: [rel] });
+        } else {
+          deferredSet.add(suite);
+          deferred.push({
+            suite,
+            reasons: ['not authorized by active contract'],
+            matchedPaths: [rel],
+          });
+        }
+      }
+    }
+    if (!matchedAny) unmatchedPaths.push(rel);
+  }
+
+  // Attach additional reasons / matched paths to suites already planned by
+  // earlier rules or paths (declaration order is preserved).
+  for (const rel of normalized) {
+    for (const rule of rules) {
+      if (!globMatch(rule.glob, rel)) continue;
+      for (const suite of rule.suites) {
+        const entry = focusedSet.has(suite)
+          ? focused.find((e) => e.suite === suite)
+          : deferredSet.has(suite)
+            ? deferred.find((e) => e.suite === suite)
+            : null;
+        if (!entry) continue;
+        if (!entry.reasons.includes(rule.reason)) entry.reasons.push(rule.reason);
+        if (!entry.matchedPaths.includes(rel)) entry.matchedPaths.push(rel);
+      }
+    }
+  }
+
+  // finalSuite is always deferred (run once after all accepted slices)
+  // unless it is already a focused suite.
+  if (finalSuite !== null && !focusedSet.has(finalSuite)) {
+    if (!deferredSet.has(finalSuite)) {
+      deferredSet.add(finalSuite);
+      deferred.push({
+        suite: finalSuite,
+        reasons: ['run once after all accepted slices'],
+        matchedPaths: [],
+      });
+    } else {
+      const entry = deferred.find((e) => e.suite === finalSuite);
+      if (!entry.reasons.includes('run once after all accepted slices')) {
+        entry.reasons.push('run once after all accepted slices');
+      }
+    }
+  }
+
+  return { focused, deferred, unmatchedPaths };
 }
 
 // ---------------------------------------------------------------------------
@@ -823,12 +989,22 @@ export function buildTools(policy, audit, { dryRun = false, contract = null } = 
     return boundOutput(typeof result === 'string' ? result : JSON.stringify(result, null, 2), maxResult);
   }
 
+  // Deterministic change-aware verification planner. Pure: it reads only the
+  // already-resolved policy and the active contract (if any) and returns a
+  // bounded pretty-JSON plan. It performs no filesystem, process, MCP,
+  // model, or Git action.
+  async function planVerificationTool({ changedPaths }) {
+    const plan = planVerification(policy, changedPaths, { contract });
+    return boundOutput(JSON.stringify(plan, null, 2), maxResult);
+  }
+
   const tools = {
     list_files: { fn: listFiles, schema: { path: 'string (relative)' } },
     read_file: { fn: readFile, schema: { path: 'string (relative)', startLine: 'int', endLine: 'int' } },
     apply_patch: { fn: applyPatch, schema: { path: 'string (relative)', oldText: 'string (exact text to replace)', newText: 'string (replacement text; empty removes)', expectedReplacements: 'int' } },
     git_diff: { fn: gitDiff, schema: {} },
     run_check: { fn: runCheck, schema: { suite: 'string (named suite from policy)' } },
+    plan_verification: { fn: planVerificationTool, schema: { changedPaths: 'array of repository-relative paths' } },
     lci_index_status: { fn: lciIndexStatus, schema: { workspacePath: 'string (optional)' } },
     lci_search_code: { fn: lciSearchCode, schema: { query: 'string', workspacePath: 'string (optional)', topK: 'int' } },
   };
@@ -1063,6 +1239,24 @@ const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'plan_verification',
+      description: 'Plan deterministic change-aware verification for the given changed repository-relative paths using the current policy pathRules and active contract. Returns {focused, deferred, unmatchedPaths}. Performs no filesystem, process, MCP, model, or Git action.',
+      parameters: {
+        type: 'object',
+        properties: {
+          changedPaths: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Nonempty array of unique repository-relative changed paths',
+          },
+        },
+        required: ['changedPaths'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'lci_index_status',
       description: 'Call LCI index_status via the MCP endpoint.',
       parameters: {
@@ -1238,6 +1432,8 @@ function buildSystemPrompt(policy, contract = null) {
     suites,
     ...contractLines,
     'Prefer small, exact-text patches and one focused check proportional to the change.',
+    'After making edits, call plan_verification with the changed repository-relative paths and run at most the returned contract-authorized focused suites.',
+    'Do not run the deferred finalSuite (e.g. full) during an ordinary slice; it is run once after all accepted slices by the coordinator final integration.',
   ].join('\n');
 }
 
@@ -1269,7 +1465,7 @@ function dryRunReport(policy, task, contract = null) {
   lines.push(
     '  planned tool surface:',
     '    list_files, read_file, apply_patch (blocked in dry-run), git_diff,',
-    '    run_check (blocked in dry-run), lci_index_status, lci_search_code',
+    '    run_check (blocked in dry-run), plan_verification, lci_index_status, lci_search_code',
     `  check suites: ${Object.keys(policy.checks.suites).join(', ')}`,
   );
   return lines.join('\n');

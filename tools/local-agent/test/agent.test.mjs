@@ -31,6 +31,7 @@ import {
   AuditLog,
   boundOutput,
   parseSse,
+  planVerification,
   buildTools,
   McpClient,
   runAgentLoop,
@@ -1229,7 +1230,7 @@ test('buildTools contract: a listed check suite reaches the configured script ch
     // passed the contract gate), while the unlisted suite must fail earlier
     // with the contract denial.
     const script = path.join(repoRoot, 'scripts', 'Test.ps1');
-    fs.writeFileSync(script, 'Write-Output ok', 'utf8');
+    fs.writeFileSync(script, 'throw "intentional test failure"', 'utf8');
     const policy = makePolicy({ repoRoot, read: ['src/**'], write: ['src/**'] });
     // Add a second policy suite that the contract does NOT list.
     policy.checks.suites.full = 'Full';
@@ -2398,12 +2399,338 @@ test('main: valid non-dry-run --contract with mocked MCP and model returns 0 and
     const modelLine = lines.find((l) => l.kind === 'model_turn');
     assert.ok(modelLine, 'a model turn must be audited');
     assert.equal(modelLine.contractId, 'contract-live-1', 'the audit model record must carry the contractId');
+    // MARKER-PLANNER-SECTION-ANCHOR
   } finally {
     process.stdout.write = realStdout;
     process.stderr.write = realStderr;
     globalThis.fetch = realFetch;
     if (prevQwApiKey === undefined) delete process.env.QW_API_KEY;
     else process.env.QW_API_KEY = prevQwApiKey;
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Planner policy validation and planVerification (offline, pure)
+// ---------------------------------------------------------------------------
+// These tests cover loadPolicy's backward-compatible planner defaults,
+// valid and malformed pathRules/finalSuite fields, the pure
+// planVerification planner (changed-path validation, stable deduped
+// multi-file planning, active-contract filtering, final-suite deferral,
+// unmatched paths, overlapping-rule aggregation), and the
+// plan_verification tool wrapper. None of them contact a model, an MCP
+// endpoint, or a repository process, and the in-memory planner tests never
+// touch the filesystem.
+
+function makePlanPolicy({ pathRules, finalSuite = 'full' } = {}) {
+  const policy = makePolicy({ repoRoot: 'C:\\plan' });
+  policy.checks = {
+    script: 'scripts/Test.ps1',
+    suites: { chunk: 'Chunk', filter: 'Filter', evaluation: 'Evaluation', full: 'Full' },
+    pathRules: pathRules ?? [
+      { glob: 'src/**', suites: ['chunk'], reason: 'chunk sources changed' },
+      { glob: 'src/filter/**', suites: ['filter', 'chunk'], reason: 'filter sources changed' },
+      { glob: 'tests/**', suites: ['evaluation'], reason: 'evaluation tests changed' },
+    ],
+    finalSuite,
+  };
+  return policy;
+}
+
+test('loadPolicy: absent planner fields keep backward-compatible defaults and plan as unmatched', async () => {
+  const repoRoot = await makeTempDir('lca-planner-defaults-');
+  try {
+    const policyPath = writePolicyFile(repoRoot); // base checks has no pathRules/finalSuite
+    const policy = loadPolicy(policyPath);
+    assert.deepEqual(policy.checks.pathRules, [], 'absent pathRules must resolve to []');
+    assert.equal(policy.checks.finalSuite, null, 'absent finalSuite must resolve to null');
+    assert.deepEqual(planVerification(policy, ['src/a.rs']), {
+      focused: [],
+      deferred: [],
+      unmatchedPaths: ['src/a.rs'],
+    });
+  } finally {
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadPolicy: valid pathRules/finalSuite resolve and malformed planner fields are rejected', async () => {
+  const repoRoot = await makeTempDir('lca-planner-policy-');
+  try {
+    const suites = { chunk: 'Chunk', filter: 'Filter', full: 'Full' };
+    const withPlanner = (pathRules, finalSuite) => {
+      const checks = { script: 'scripts/Test.ps1', suites, pathRules };
+      if (finalSuite !== undefined) checks.finalSuite = finalSuite;
+      return checks;
+    };
+
+    // Valid shape: globs are normalized, suites keep rule order, finalSuite resolves.
+    const validPath = writePolicyFile(repoRoot, {
+      checks: withPlanner(
+        [
+          { glob: 'src\\filter/**', suites: ['filter', 'chunk'], reason: 'filter sources changed' },
+          { glob: 'tests/**', suites: ['chunk'], reason: 'tests changed' },
+        ],
+        'full',
+      ),
+    });
+    const policy = loadPolicy(validPath);
+    assert.deepEqual(policy.checks.pathRules, [
+      { glob: 'src/filter/**', suites: ['filter', 'chunk'], reason: 'filter sources changed' },
+      { glob: 'tests/**', suites: ['chunk'], reason: 'tests changed' },
+    ]);
+    assert.equal(policy.checks.finalSuite, 'full');
+
+    const badCases = [
+      [{ checks: withPlanner('not-an-array', 'full') }, /checks\.pathRules must be an array/],
+      [{ checks: withPlanner([42], 'full') }, /checks\.pathRules entries must be objects/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: ['chunk'] }], 'full') }, /entry\.reason must be a non-empty string/],
+      [{ checks: withPlanner([{ suites: ['chunk'], reason: 'r' }], 'full') }, /entry\.glob must be a non-empty string/],
+      [{ checks: withPlanner([{ glob: 'src/**' }], 'full') }, /entry\.suites must be a non-empty array/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: [], reason: 'r' }], 'full') }, /entry\.suites must be a non-empty array/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: [7], reason: 'r' }], 'full') }, /entry\.suites entries must be non-empty strings/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: ['chunk', 'chunk'], reason: 'r' }], 'full') }, /entry\.suites contains a duplicate: chunk/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: ['nope'], reason: 'r' }], 'full') }, /references unknown suite: nope/],
+      [{ checks: withPlanner([{ glob: 'src/**', suites: ['chunk'], reason: 'r' }, { glob: 'src/**', suites: ['chunk'], reason: 'r' }], 'full') }, /duplicate rule: src\/\*\*/],
+      [{ checks: withPlanner([], 0) }, /finalSuite must be a non-empty string/],
+      [{ checks: withPlanner([], 'nope') }, /finalSuite references unknown suite: nope/],
+    ];
+    for (const [overrides, pattern] of badCases) {
+      const badPath = writePolicyFile(repoRoot, overrides);
+      assert.throws(
+        () => loadPolicy(badPath),
+        (e) => e instanceof AgentError && pattern.test(e.message),
+        `expected rejection for ${JSON.stringify(overrides)}`,
+      );
+    }
+  } finally {
+    await fsp.rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('planVerification: changed-path validation rejects empty, duplicate, unsafe, and non-string inputs', () => {
+  const policy = makePlanPolicy();
+  assert.throws(
+    () => planVerification(policy, []),
+    (e) => e instanceof AgentError && /non-empty changedPaths/.test(e.message),
+  );
+  assert.throws(
+    () => planVerification(policy, 'src/a.rs'),
+    (e) => e instanceof AgentError && /non-empty changedPaths/.test(e.message),
+  );
+  assert.throws(
+    () => planVerification(policy, null),
+    (e) => e instanceof AgentError && /non-empty changedPaths/.test(e.message),
+  );
+  assert.throws(
+    () => planVerification(policy, ['src/a.rs', './src/a.rs']),
+    (e) => e instanceof AgentError && /duplicate after normalization: src\/a\.rs/.test(e.message),
+  );
+  const unsafeCases = [
+    [['src/a.rs', '/abs/a.rs'], /absolute paths are not allowed/],
+    [['src/a.rs', 'C:\\abs\\a.rs'], /absolute paths are not allowed/],
+    [['src/a.rs', '../a.rs'], /path traversal is not allowed/],
+    [['src/a.rs', 'src/\x00a.rs'], /NUL byte/],
+    [['src/a.rs', 42], /non-empty string/],
+    [['src/a.rs', null], /non-empty string/],
+  ];
+  for (const [input, pattern] of unsafeCases) {
+    assert.throws(
+      () => planVerification(policy, input),
+      (e) => e instanceof AgentError && pattern.test(e.message),
+      `expected rejection for ${JSON.stringify(input)}`,
+    );
+  }
+});
+
+test('planVerification: stable deduped multi-file planning keeps policy declaration order', () => {
+  const policy = makePlanPolicy();
+  const input = ['src/filter/x.rs', 'tests/t.rs'];
+  const expected = {
+    focused: [
+      { suite: 'chunk', reasons: ['chunk sources changed', 'filter sources changed'], matchedPaths: ['src/filter/x.rs'] },
+      { suite: 'filter', reasons: ['filter sources changed'], matchedPaths: ['src/filter/x.rs'] },
+      { suite: 'evaluation', reasons: ['evaluation tests changed'], matchedPaths: ['tests/t.rs'] },
+    ],
+    deferred: [
+      { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+    ],
+    unmatchedPaths: [],
+  };
+  assert.deepEqual(planVerification(policy, input), expected);
+  assert.deepEqual(planVerification(policy, [...input]), expected, 'identical inputs must yield an identical plan');
+  // Multiple files under the same rule collapse into one deduped entry.
+  const multi = planVerification(policy, ['src/app/b.rs', 'src/a.rs']);
+  assert.deepEqual(multi.focused, [
+    { suite: 'chunk', reasons: ['chunk sources changed'], matchedPaths: ['src/app/b.rs', 'src/a.rs'] },
+  ]);
+  assert.deepEqual(multi.deferred, [
+    { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+  ]);
+});
+
+test('planVerification: active contract moves unauthorized suites to deferred', () => {
+  const policy = makePlanPolicy();
+  const plan = planVerification(policy, ['src/filter/x.rs', 'tests/t.rs'], {
+    contract: { id: 'slice-1', checkSuites: ['filter'] },
+  });
+  assert.deepEqual(plan, {
+    focused: [
+      { suite: 'filter', reasons: ['filter sources changed'], matchedPaths: ['src/filter/x.rs'] },
+    ],
+    deferred: [
+      { suite: 'chunk', reasons: ['not authorized by active contract', 'chunk sources changed', 'filter sources changed'], matchedPaths: ['src/filter/x.rs'] },
+      { suite: 'evaluation', reasons: ['not authorized by active contract', 'evaluation tests changed'], matchedPaths: ['tests/t.rs'] },
+      { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+    ],
+    unmatchedPaths: [],
+  });
+  // An empty contract suite authorizes nothing; every suggested suite defers.
+  const none = planVerification(policy, ['src/a.rs'], { contract: { checkSuites: [] } });
+  assert.deepEqual(none.focused, []);
+  assert.deepEqual(none.deferred, [
+    { suite: 'chunk', reasons: ['not authorized by active contract', 'chunk sources changed'], matchedPaths: ['src/a.rs'] },
+    { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+  ]);
+});
+
+test('planVerification: finalSuite deferral is focused-first, idempotent, and mergeable', () => {
+  // Rule-matched change: finalSuite is deferred once with empty matchedPaths.
+  const policy = makePlanPolicy();
+  const plan = planVerification(policy, ['tests/t.rs']);
+  assert.deepEqual(plan.focused, [
+    { suite: 'evaluation', reasons: ['evaluation tests changed'], matchedPaths: ['tests/t.rs'] },
+  ]);
+  assert.deepEqual(plan.deferred, [
+    { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+  ]);
+  assert.deepEqual(plan.unmatchedPaths, []);
+
+  // A focused finalSuite is never double-listed as deferred.
+  const focusedPolicy = makePlanPolicy({ pathRules: [{ glob: 'src/**', suites: ['full'], reason: 'full sources changed' }] });
+  const focusedPlan = planVerification(focusedPolicy, ['src/a.rs']);
+  assert.deepEqual(focusedPlan.focused, [
+    { suite: 'full', reasons: ['full sources changed'], matchedPaths: ['src/a.rs'] },
+  ]);
+  assert.deepEqual(focusedPlan.deferred, []);
+
+  // A contract-deferred finalSuite gains the deferral reason on the same entry.
+  const mergedPlan = planVerification(focusedPolicy, ['src/a.rs'], { contract: { checkSuites: [] } });
+  assert.deepEqual(mergedPlan.focused, []);
+  assert.deepEqual(mergedPlan.deferred, [
+    {
+      suite: 'full',
+      reasons: ['not authorized by active contract', 'full sources changed', 'run once after all accepted slices'],
+      matchedPaths: ['src/a.rs'],
+    },
+  ]);
+
+  // Without a finalSuite nothing is deferred at all.
+  const noFinal = makePlanPolicy({ finalSuite: null, pathRules: [{ glob: 'src/**', suites: ['chunk'], reason: 'chunk sources changed' }] });
+  assert.deepEqual(planVerification(noFinal, ['src/a.rs']), {
+    focused: [{ suite: 'chunk', reasons: ['chunk sources changed'], matchedPaths: ['src/a.rs'] }],
+    deferred: [],
+    unmatchedPaths: [],
+  });
+});
+
+test('planVerification: unmatched paths are reported without escalation to any suite', () => {
+  const policy = makePlanPolicy();
+  const plan = planVerification(policy, ['docs/readme.md', 'src/a.rs', 'tools/local-agent/x.mjs']);
+  assert.deepEqual(plan.unmatchedPaths, ['docs/readme.md', 'tools/local-agent/x.mjs']);
+  assert.ok(plan.focused.some((e) => e.suite === 'chunk'), 'matched paths still plan normally');
+  for (const entry of [...plan.focused, ...plan.deferred]) {
+    for (const p of entry.matchedPaths) {
+      assert.ok(!plan.unmatchedPaths.includes(p), `${p} must not appear in both buckets`);
+    }
+  }
+});
+
+test('planVerification: overlapping rules aggregate into one deduped entry per suite', () => {
+  const policy = makePlanPolicy({
+    pathRules: [
+      { glob: 'src/**', suites: ['chunk'], reason: 'chunk sources changed' },
+      { glob: 'src/filter/**', suites: ['chunk', 'filter'], reason: 'filter sources changed' },
+    ],
+  });
+  const plan = planVerification(policy, ['src/filter/x.rs', 'src/other/y.rs']);
+  // chunk is created once in declaration order and aggregates both rules'
+  // reasons plus every matched path; filter is focused from the narrow rule.
+  assert.deepEqual(plan, {
+    focused: [
+      {
+        suite: 'chunk',
+        reasons: ['chunk sources changed', 'filter sources changed'],
+        matchedPaths: ['src/filter/x.rs', 'src/other/y.rs'],
+      },
+      { suite: 'filter', reasons: ['filter sources changed'], matchedPaths: ['src/filter/x.rs'] },
+    ],
+    deferred: [
+      { suite: 'full', reasons: ['run once after all accepted slices'], matchedPaths: [] },
+    ],
+    unmatchedPaths: [],
+  });
+});
+
+test('plan_verification tool: matches the pure planner and performs no fetch or file mutation', async () => {
+  const repoRoot = await makeTempDir('lca-planner-tool-');
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('plan_verification must not fetch');
+  };
+  try {
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    const target = path.join(repoRoot, 'src', 'a.rs');
+    const original = 'MARK\n';
+    fs.writeFileSync(target, original, 'utf8');
+    const policyPath = writePolicyFile(repoRoot, {
+      checks: {
+        script: 'scripts/Test.ps1',
+        suites: { chunk: 'Chunk', filter: 'Filter', full: 'Full' },
+        pathRules: [
+          { glob: 'src/**', suites: ['chunk'], reason: 'chunk sources changed' },
+          { glob: 'src/filter/**', suites: ['filter'], reason: 'filter sources changed' },
+        ],
+        finalSuite: 'full',
+      },
+    });
+    const policy = loadPolicy(policyPath);
+    const tools = buildTools(policy, {}, {});
+    assert.ok(tools.plan_verification, 'plan_verification must be exposed as a tool');
+
+    const changedPaths = ['src/a.rs', 'src/filter/b.rs'];
+    const expected = planVerification(policy, changedPaths);
+    const out = await tools.plan_verification.fn({ changedPaths });
+    assert.equal(out, JSON.stringify(expected, null, 2), 'tool output must be the pretty JSON of the pure plan');
+    assert.deepEqual(JSON.parse(out), expected);
+
+    // The active contract flows through the tool into the same pure planner.
+    const contractPath = writeContractFile(repoRoot, { checkSuites: ['chunk'] });
+    const contract = loadTaskContract(contractPath, policy);
+    const contractOut = await buildTools(policy, {}, { contract }).plan_verification.fn({ changedPaths });
+    assert.deepEqual(JSON.parse(contractOut), planVerification(policy, changedPaths, { contract }));
+
+    // Validation errors surface through the same pure planner.
+    await assert.rejects(
+      () => tools.plan_verification.fn({ changedPaths: [] }),
+      (e) => e instanceof AgentError && /non-empty changedPaths/.test(e.message),
+    );
+    await assert.rejects(
+      () => tools.plan_verification.fn({ changedPaths: ['../x.rs'] }),
+      (e) => e instanceof AgentError && /path traversal/.test(e.message),
+    );
+
+    assert.equal(fetchCalls, 0, 'no fetch may occur for plan_verification');
+    assert.equal(fs.readFileSync(target, 'utf8'), original, 'repository files must be untouched');
+    assert.deepEqual(
+      fs.readdirSync(repoRoot).sort(),
+      ['policy.json', 'src', 'task.json'].sort(),
+      'no audit, temp, or process artifacts may appear',
+    );
+  } finally {
+    globalThis.fetch = realFetch;
     await fsp.rm(repoRoot, { recursive: true, force: true });
   }
 });

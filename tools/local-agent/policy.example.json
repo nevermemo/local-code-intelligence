@@ -48,7 +48,19 @@
       "watching": "Watching",
       "lsp": "LSP",
       "full": "Full"
-    }
+    },
+    "pathRules": [
+      { "glob": "src/chunk.rs", "suites": ["chunk", "indexing"], "reason": "chunking and indexing behavior" },
+      { "glob": "src/language.rs", "suites": ["chunk", "indexing"], "reason": "language chunking and indexing behavior" },
+      { "glob": "src/filter.rs", "suites": ["filter", "evaluation"], "reason": "filtering and evaluation behavior" },
+      { "glob": "src/source_role.rs", "suites": ["filter", "evaluation"], "reason": "source role filtering and evaluation" },
+      { "glob": "src/lsp.rs", "suites": ["lsp"], "reason": "LSP navigation behavior" },
+      { "glob": "src/server.rs", "suites": ["mcp", "readiness"], "reason": "MCP server and readiness behavior" },
+      { "glob": "src/request.rs", "suites": ["mcp", "readiness"], "reason": "MCP request handling and readiness" },
+      { "glob": "tests/cases/indexing.rs", "suites": ["indexing"], "reason": "indexing test cases" },
+      { "glob": "tests/cases/mcp.rs", "suites": ["mcp"], "reason": "MCP test cases" }
+    ],
+    "finalSuite": "full"
   },
   "audit": {
     "jsonlPath": "test-results/local-agent/audit.jsonl"

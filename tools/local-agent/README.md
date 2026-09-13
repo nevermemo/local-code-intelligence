@@ -28,6 +28,8 @@ dry-run path.
 | `limits.maxPatchBytes` | Maximum bytes per `apply_patch` (measured over `oldText` + `newText`) |
 | `limits.maxToolResultBytes` | Maximum bytes returned per tool result |
 | `checks.script` / `checks.suites` | `scripts/Test.ps1` and the named suites accepted by `run_check` |
+| `checks.pathRules` | Ordered `{glob, suites, reason}` rules: the deterministic change-aware planner matches each changed repository-relative path against these globs to derive the focused suites |
+| `checks.finalSuite` | Suite (e.g. `full`) the planner always defers; it is not run during a slice and the coordinator runs it once after all slices are accepted |
 | `audit.jsonlPath` | JSONL audit log (under `test-results`, never committed) |
 
 Deny wins: a path matching `deny` is neither readable nor writable, even when
@@ -53,6 +55,7 @@ Deny wins: a path matching `deny` is neither readable nor writable, even when
 | `apply_patch` | Exact-text replace (`oldText` -> `newText`), bounded by `maxPatchBytes` |
 | `git_diff` | Read-only |
 | `run_check` | Named `Test.ps1` suite only |
+| `plan_verification` | Deterministic change-aware planner: input is the changed repository-relative paths; output is `{focused, deferred, unmatchedPaths}`; performs no filesystem, process, MCP, model, or Git action |
 
 ## CLI
 
@@ -85,13 +88,43 @@ planned tool calls without contacting the model or writing files.
 
 The base policy remains the outer authority: the contract narrows the exact
 writable files and the runnable named suites at the tool layer, and cannot
-widen anything the policy denies. Invalid contracts (unknown type, missing or
-malformed fields, files outside the policy `write` globs, suites not declared
-in `checks.suites`) fail before any model or MCP contact and before any
-mutation.
+widen anything the policy denies. `plan_verification` derives focused suites
+from the policy `pathRules` and then contract-filters them: a suite may be
+focused only if the contract's `checkSuites` also authorizes it, so a contract
+can narrow the planner output but never widen it.
+Invalid contracts (unknown type, missing or malformed fields, files outside
+the policy `write` globs, suites not declared in `checks.suites`) fail before
+any model or MCP contact and before any mutation.
 
 Audit records carry `contractId` only; contract contents are never written to
 the audit log.
+
+## Verification planning
+
+`plan_verification` is the deterministic change-aware verification planner. It
+maps the changed files of a slice to the smallest set of named suites that
+could be affected, so a slice runs only the focused checks instead of repeated
+broad tests.
+
+- Input: the slice's changed repository-relative paths (forward slashes,
+  relative to `repositoryRoot`).
+- Matching: each path is tested against the ordered `checks.pathRules` globs;
+  the union of the matched rules' `suites` (with the rule `reason` as
+  justification) is the focused candidate set.
+- Contract filtering: focused suites are intersected with the active task
+  contract's `checkSuites`; the contract can narrow the result but never
+  widen it.
+- `deferred`: the `checks.finalSuite` suite is always deferred by the planner,
+  never focused.
+- `unmatchedPaths`: changed paths no `pathRules` glob matches; the planner
+  reports them as-is instead of widening the scope.
+- Output: `{focused, deferred, unmatchedPaths}`. The tool performs no
+  filesystem, process, MCP, model, or Git action; it only plans, it never
+  executes checks.
+- No automatic escalation: the planner never adds suites on its own. Focused
+  stays focused — there is no automatic escalation to `Full` (or any other
+  suite) while a slice is in progress. `Full` runs exactly once, after all
+  accepted slices, when the coordinator runs `checks.finalSuite`.
 
 Compact valid example:
 
@@ -138,18 +171,21 @@ run; the dry-run and test commands above are fully offline.
 
 1. Contract: the coordinator defines one task contract (`local-agent.task/v1`)
    per slice and runs it with `--contract`.
-2. Implementation: Qwen edits within the contract's `allowedFiles` and runs at
-   most one named suite from `checkSuites`; no repeated exploration or test
-   runs.
-3. Coordinator review: the coordinator reviews the saved diff once against the
+2. Implementation: Qwen edits within the contract's `allowedFiles`.
+3. Planning: Qwen calls `plan_verification` once with the changed
+   repository-relative paths and runs at most the returned
+   contract-authorized focused suites — one `run_check` per focused suite.
+   The `checks.finalSuite` and any unmatched or deferred paths never trigger
+   extra suites; there is no automatic `Full` escalation during a slice.
+4. Coordinator review: the coordinator reviews the saved diff once against the
    contract's `acceptance` and `prohibited`; a valid saved diff counts even
    without prose.
-4. Correction: if the review rejects the diff, the coordinator issues a
+5. Correction: if the review rejects the diff, the coordinator issues a
    correction contract with the specific findings; the subagent fixes only
    those findings.
-5. Broad verification: after all slices are accepted, the coordinator runs one
-   full check (`Test.ps1 -Suite Full`).
-6. Commit: the coordinator commits outside the harness.
+6. Broad verification: after all slices are accepted, the coordinator runs one
+   full check — `checks.finalSuite` (`Test.ps1 -Suite Full`) — exactly once.
+7. Commit: the coordinator commits outside the harness.
 
 Routine indexing and broad baseline tests are not startup chores: the LCI
 index is reused via `search_code` / `index_status`, and the full suite runs
