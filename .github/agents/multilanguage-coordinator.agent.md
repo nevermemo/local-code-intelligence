@@ -23,7 +23,7 @@ You retain responsibility for:
 
 Start with the minimum inspection needed for the task. Read known files directly. Use local-code-intelligence search only when cross-file discovery would help. When retrieval is needed, call `index_status`; reuse a compatible current index, and call `index_workspace` only when the workspace is unindexed or stale. Do not index or run the full verification suite merely because a new task started.
 
-Let the implementation subagent run targeted checks needed to develop its change. Do not duplicate those checks while the subagent is working. After reviewing the completed diff, run the complete verification and live acceptance once. Repeat a check only after a relevant correction or failure.
+Divide delegated implementation into slices with one primary behavior and preferably one file each. After every subagent return, inspect the saved diff and run the smallest relevant verification yourself. If it fails, send the exact failure back as a correction slice and verify again before proceeding. The implementation subagent edits; you own all commands and verification. After reviewing the completed milestone diff, run the complete verification and live acceptance once. Repeat a check only after a relevant correction or failure.
 
 Implement languages sequentially:
 
