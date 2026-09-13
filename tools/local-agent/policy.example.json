@@ -1,0 +1,56 @@
+{
+  "schema": "local-agent.policy/v1",
+  "repositoryRoot": "../..",
+  "read": [
+    "AGENTS.md",
+    "README.md",
+    "Cargo.toml",
+    "config.example.toml",
+    "docs/**",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+    "tools/local-agent/**"
+  ],
+  "write": [
+    "tools/local-agent/**"
+  ],
+  "deny": [
+    ".agents/skills/rust-skills/**",
+    ".git/**",
+    "Cargo.lock",
+    "target/**",
+    "test-results/**"
+  ],
+  "model": {
+    "name": "qwen3.8-27b",
+    "endpoint": "http://127.0.0.1:8765/v1",
+    "apiKeyEnv": "QWEN_API_KEY"
+  },
+  "lci": {
+    "endpoint": "http://127.0.0.1:8768/mcp"
+  },
+  "limits": {
+    "maxTurns": 24,
+    "maxReadLines": 400,
+    "maxPatchBytes": 24576,
+    "maxToolResultBytes": 16384
+  },
+  "checks": {
+    "script": "scripts/Test.ps1",
+    "suites": {
+      "chunk": "Chunk",
+      "filter": "Filter",
+      "evaluation": "Evaluation",
+      "indexing": "Indexing",
+      "readiness": "Readiness",
+      "mcp": "MCP",
+      "watching": "Watching",
+      "lsp": "LSP",
+      "full": "Full"
+    }
+  },
+  "audit": {
+    "jsonlPath": "test-results/local-agent/audit.jsonl"
+  }
+}

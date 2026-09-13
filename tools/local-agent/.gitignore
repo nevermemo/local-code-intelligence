@@ -1,0 +1,6 @@
+# Local runtime artifacts; keep policy.example.json and prompts/
+policy.json
+task.md
+*.local.json
+audit*.jsonl
+node_modules/
