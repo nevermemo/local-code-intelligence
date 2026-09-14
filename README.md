@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-Windows-native Rust, TypeScript, JavaScript, Python, and C# code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent rust-analyzer retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
+Windows-native Rust, TypeScript, JavaScript, Python, and C# code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
 
 Supported source extensions and result language identifiers are exact and case-sensitive:
 
@@ -14,7 +14,7 @@ Supported source extensions and result language identifiers are exact and case-s
 | `.py` | `python` | Tree-sitter Python |
 | `.cs` | `csharp` | Tree-sitter C# |
 
-TypeScript, JavaScript, Python, and C# have Tree-sitter syntax indexing and retrieval, but no language-server integration. Rust remains the only language supported by symbol, definition, and reference navigation.
+TypeScript, JavaScript, Python, and C# always have Tree-sitter syntax indexing and retrieval. Rust navigation uses optional `rust-analyzer`; C# navigation uses optional standalone `csharp-ls` when configured. C# syntax retrieval remains available when C# LSP is disabled or unavailable.
 
 ## Documentation
 
@@ -23,7 +23,7 @@ TypeScript, JavaScript, Python, and C# have Tree-sitter syntax indexing and retr
 
 ## Build and run
 
-Build prerequisites are Rust stable 1.91 or newer, the MSVC C++ build tools/Windows SDK, CMake, and `protoc`; the setup script downloads the official Windows `protoc` binary into `.tools` inside this project. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. No Python environment or database server is required.
+Build prerequisites are Rust stable 1.91 or newer, the MSVC C++ build tools/Windows SDK, CMake, and `protoc`; the setup script downloads the official Windows `protoc` binary into `.tools` inside this project. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. C# navigation optionally needs a standalone `csharp-ls` executable; it is not bundled or installed by LCI. No Python environment or database server is required.
 
 ```powershell
 cd C:\Users\micro\Desktop\local-code-intelligence
@@ -75,6 +75,9 @@ Defaults work with the services specified for this project. Copy `config.example
 | `watch_poll_milliseconds` | 2000 |
 | `watch_debounce_milliseconds` | 750 |
 | `rust_analyzer_path` | `rust-analyzer` |
+| `[csharp].path` | unset (disabled) |
+| `[csharp].args` | `[]` |
+| `[csharp].disabled` | `false` |
 | `lsp_timeout_seconds` | 60 |
 | `lsp_candidate_count` | 40 |
 | `index.freshness` | `on-search` (allowed: `manual`, `on-search`, `watch`) |
@@ -95,9 +98,9 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `index_status` | `workspace_path` | Whether indexed/indexing/stale/watched, chunk count, embedding dimension, configuration compatibility, last successful indexing time |
 | `watch_workspace` | `workspace_path` | Start debounced polling and automatic reindexing for an indexed workspace |
 | `unwatch_workspace` | `workspace_path` | Stop automatic reindexing for a workspace |
-| `search_symbols` | `workspace_path`, `query` | Workspace symbols from rust-analyzer |
-| `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations from rust-analyzer |
-| `find_references` | the definition arguments plus optional `include_declaration` | Reference locations from rust-analyzer |
+| `search_symbols` | `workspace_path`, `query` | Workspace symbols from applicable enabled Rust/C# language servers, with provider/language metadata |
+| `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations routed by `.rs`/`.cs` extension |
+| `find_references` | the definition arguments plus optional `include_declaration` | Reference locations routed by `.rs`/`.cs` extension |
 | `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, and index lifecycle metadata |
 | `service_status` | none | The same required/optional readiness report as `/ready` |
 
@@ -121,11 +124,11 @@ Once an index exists, the `[index]` `freshness` policy (default `on-search`) dec
 
 The search result's separate `index` object explains first-search latency. `action: created` means that request performed initial indexing, `waited_for_existing_job` means another concurrent request performed it, `refreshed_incrementally` means the search found and applied a staleness refresh before continuing, and `reused` means a compatible, current-enough snapshot was already available. `wait_ms` covers index creation, refresh, or waiting and is zero or near zero for plain reuse; it does not overload retrieval-stage timing fields. Indexing is synchronous and finishes when the new index is persisted, so allow a long client tool timeout for a first search, an automatic refresh, or an explicit indexing pass. Index writes are serialized in the running service, with per-workspace read/write coordination. This version is intended for one running service per data directory; multiple clients should connect to that service.
 
-Readiness requires a writable application data directory, accessible embedded LanceDB storage, a reachable embedding endpoint, and the configured embedding model in its OpenAI-compatible model listing. Reranking and ripgrep are optional fail-open channels. Rust-analyzer is optional and affects only Rust navigation and the Rust LSP candidate channel. Dependency probes use `readiness_timeout_seconds`; readiness never downloads, starts, stops, or manages dependencies, and it never inspects or contacts the independent generation service on port 8765.
+Readiness requires a writable application data directory, accessible embedded LanceDB storage, a reachable embedding endpoint, and the configured embedding model in its OpenAI-compatible model listing. Reranking, ripgrep, rust-analyzer, and csharp-ls are optional fail-open components. Readiness reports Rust and C# tooling independently; absent C# tooling does not disable C# syntax retrieval. Dependency probes use `readiness_timeout_seconds`; readiness never downloads, starts, stops, or manages dependencies, and it never inspects or contacts the independent generation service on port 8765.
 
 Watching is opt-in for each server run. It polls only after `watch_workspace`, debounces a detected source change, and calls the same safe indexing path. Watch registrations are not restored after a process restart; persistent indexes and manifests are. A failed automatic update is logged and retried after another poll while the prior LanceDB snapshot remains searchable.
 
-The first Rust LSP request for a workspace starts one long-lived rust-analyzer process and waits briefly for crate discovery. Later MCP calls and mixed-language searches reuse it. A failed request discards the process and retries once with a fresh analyzer. `search_code` uses Rust LSP as an independent fail-open candidate channel only when the index contains Rust chunks; a TypeScript/JavaScript-only index does not start rust-analyzer or emit an LSP warning. LSP locations map only to Rust chunks. Direct navigation rejects recognized non-Rust paths before starting rust-analyzer and returns an MCP error when Rust tooling is unavailable. Definition/reference input lines are one-based; character offsets follow LSP and are zero-based UTF-16 units.
+The first applicable Rust or C# LSP request for a workspace starts one long-lived provider process; later calls reuse it. A failed request discards the process and retries once with a fresh provider. `search_code` queries Rust and C# providers independently only when filtered indexed chunks contain that language, and maps locations only to same-language chunks. A missing C# server leaves semantic and lexical retrieval available. Direct navigation rejects unsupported extensions before startup and returns an MCP error when the selected provider is disabled or unavailable. Definition/reference input lines are one-based; character offsets follow LSP and are zero-based UTF-16 units.
 
 ## Direct CLI and acceptance test
 

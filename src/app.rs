@@ -70,6 +70,7 @@ pub struct Status {
     pub stale: bool,
     pub watched: bool,
     pub analyzer_running: bool,
+    pub csharp_analyzer_running: bool,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -405,6 +406,7 @@ impl App {
                 || stored_manifest.fingerprint != current_fingerprint);
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let analyzer_running = self.analyzer.running(&workspace.id).await;
+        let csharp_analyzer_running = self.analyzer.csharp_running(&workspace.id).await;
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -420,6 +422,7 @@ impl App {
             stale,
             watched,
             analyzer_running,
+            csharp_analyzer_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }
@@ -506,7 +509,41 @@ impl App {
     pub async fn symbols(&self, path: &Path, query: &str) -> Result<NavigationReport> {
         ensure!(!query.trim().is_empty(), "query must not be empty");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
-        let results = self.analyzer.symbols(&workspace, query).await?;
+        let snapshot = self
+            .store
+            .snapshot(&workspace)
+            .await?
+            .context("workspace is not indexed; call index_workspace first")?;
+        let chunks = Store::chunks(&snapshot, &workspace).await?;
+        let has_rust = chunks.iter().any(|hit| hit.chunk.language == "rust");
+        let has_csharp = chunks.iter().any(|hit| hit.chunk.language == "csharp");
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        if has_rust {
+            match self.analyzer.symbols(&workspace, query).await {
+                Ok(mut found) => results.append(&mut found),
+                Err(error) => failures.push(format!("rust-analyzer: {error:#}")),
+            }
+        }
+        if has_csharp && self.config.csharp.enabled() {
+            match self.analyzer.csharp_symbols(&workspace, query).await {
+                Ok(mut found) => results.append(&mut found),
+                Err(error) => failures.push(format!("csharp-ls: {error:#}")),
+            }
+        }
+        results.sort_by(|a, b| {
+            a.relative_file_path
+                .cmp(&b.relative_file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.language.cmp(&b.language))
+        });
+        results.dedup();
+        if results.is_empty() && !failures.is_empty() {
+            anyhow::bail!(
+                "all applicable language servers failed: {}",
+                failures.join("; ")
+            );
+        }
         Ok(NavigationReport { workspace, results })
     }
 
@@ -524,15 +561,33 @@ impl App {
         Ok(file)
     }
 
-    fn ensure_rust_navigation(file: &Path) -> Result<()> {
+    fn navigation_language(file: &Path) -> Result<&'static str> {
         match language::for_path(file) {
-            Some(adapter) if adapter.identifier() == "rust" => Ok(()),
+            Some(adapter) if adapter.identifier() == "rust" => Ok("rust"),
+            Some(adapter) if adapter.identifier() == "csharp" => Ok("csharp"),
             Some(adapter) => anyhow::bail!(
-                "rust-analyzer navigation does not support {} source files",
+                "language-server navigation does not support {} source files",
                 adapter.identifier()
             ),
-            None => anyhow::bail!("rust-analyzer navigation requires a Rust .rs source path"),
+            None => anyhow::bail!("language-server navigation requires a recognized source path"),
         }
+    }
+
+    async fn ensure_indexed_language(
+        workspace: &Workspace,
+        language: &str,
+        store: &Store,
+    ) -> Result<()> {
+        let snapshot = store
+            .snapshot(workspace)
+            .await?
+            .context("workspace is not indexed; call index_workspace first")?;
+        let chunks = Store::chunks(&snapshot, workspace).await?;
+        ensure!(
+            chunks.iter().any(|hit| hit.chunk.language == language),
+            "workspace index contains no {language} chunks"
+        );
+        Ok(())
     }
 
     pub async fn definition(
@@ -545,11 +600,21 @@ impl App {
         ensure!(line > 0, "line must be one-based and positive");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let file = Self::source_path(&workspace, relative_file_path)?;
-        Self::ensure_rust_navigation(&file)?;
-        let results = self
-            .analyzer
-            .definition(&workspace, &file, line - 1, character)
-            .await?;
+        let language = Self::navigation_language(&file)?;
+        Self::ensure_indexed_language(&workspace, language, &self.store).await?;
+        let results = match language {
+            "rust" => {
+                self.analyzer
+                    .definition(&workspace, &file, line - 1, character)
+                    .await?
+            }
+            "csharp" => {
+                self.analyzer
+                    .csharp_definition(&workspace, &file, line - 1, character)
+                    .await?
+            }
+            _ => unreachable!(),
+        };
         Ok(NavigationReport { workspace, results })
     }
 
@@ -564,11 +629,21 @@ impl App {
         ensure!(line > 0, "line must be one-based and positive");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let file = Self::source_path(&workspace, relative_file_path)?;
-        Self::ensure_rust_navigation(&file)?;
-        let results = self
-            .analyzer
-            .references(&workspace, &file, line - 1, character, include_declaration)
-            .await?;
+        let language = Self::navigation_language(&file)?;
+        Self::ensure_indexed_language(&workspace, language, &self.store).await?;
+        let results = match language {
+            "rust" => {
+                self.analyzer
+                    .references(&workspace, &file, line - 1, character, include_declaration)
+                    .await?
+            }
+            "csharp" => {
+                self.analyzer
+                    .csharp_references(&workspace, &file, line - 1, character, include_declaration)
+                    .await?
+            }
+            _ => unreachable!(),
+        };
         Ok(NavigationReport { workspace, results })
     }
 
@@ -714,6 +789,7 @@ impl App {
         let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
         all_chunks.retain(|hit| hit_matches(&filters, hit));
         let has_rust = all_chunks.iter().any(|hit| hit.chunk.language == "rust");
+        let has_csharp = all_chunks.iter().any(|hit| hit.chunk.language == "csharp");
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
                 let timer = Instant::now();
@@ -728,11 +804,11 @@ impl App {
             },
             async {
                 let timer = Instant::now();
-                if !has_rust {
-                    return (Ok(Vec::new()), ms(timer));
+                if !has_rust && (!has_csharp || !self.config.csharp.enabled()) {
+                    return ((Vec::new(), Vec::new()), ms(timer));
                 }
                 let mut found = Vec::new();
-                let mut failure = None;
+                let mut failures = Vec::new();
                 let mut symbol_queries = Vec::new();
                 for term in lexical::terms(query) {
                     if term.ends_with('s') && term.len() > 4 {
@@ -742,23 +818,40 @@ impl App {
                 }
                 symbol_queries.dedup();
                 for term in symbol_queries.into_iter().take(8) {
-                    match self.analyzer.symbols(&report.workspace, &term).await {
-                        Ok(mut locations) => found.append(&mut locations),
-                        Err(error) => {
-                            failure = Some(error);
-                            break;
+                    if has_rust {
+                        match self.analyzer.symbols(&report.workspace, &term).await {
+                            Ok(mut locations) => found.append(&mut locations),
+                            Err(error) => failures.push(format!("rust-analyzer: {error:#}")),
+                        }
+                    }
+                    if has_csharp && self.config.csharp.enabled() {
+                        match self.analyzer.csharp_symbols(&report.workspace, &term).await {
+                            Ok(mut locations) => found.append(&mut locations),
+                            Err(error) => failures.push(format!("csharp-ls: {error:#}")),
                         }
                     }
                 }
-                (failure.map_or(Ok(found), Err), ms(timer))
+                ((found, failures), ms(timer))
             },
         );
         let (query_vector, query_ms) = query_result;
         let (lexical_matches, lexical_ms) = lexical_result;
-        let (lsp_locations, lsp_ms) = lsp_result;
+        let ((lsp_locations, lsp_failures), lsp_ms) = lsp_result;
         report.timings.query_embedding_ms = query_ms;
         report.timings.lexical_search_ms = lexical_ms;
         report.timings.lsp_search_ms = lsp_ms;
+        if !lsp_failures.is_empty() {
+            let message = format!(
+                "Optional LSP provider unavailable: {}",
+                lsp_failures.join("; ")
+            );
+            report.warning = Some(
+                report
+                    .warning
+                    .take()
+                    .map_or(message.clone(), |w| format!("{w}; {message}")),
+            );
+        }
         let semantic_timer = Instant::now();
         let semantic = match query_vector {
             Ok(vector) => match Store::search(
@@ -836,42 +929,31 @@ impl App {
             }
         }
         let mut lsp_hits = Vec::new();
-        match lsp_locations {
-            Ok(locations) => {
-                let mut indexes = Vec::new();
-                for location in locations {
-                    let Some(relative) = location.relative_file_path else {
-                        continue;
-                    };
-                    if let Some((index, _)) = all_chunks.iter().enumerate().find(|(_, hit)| {
-                        hit.chunk.language == "rust"
-                            && hit.chunk.relative_file_path.eq_ignore_ascii_case(&relative)
-                            && hit.chunk.start_line <= location.start_line
-                            && hit.chunk.end_line >= location.start_line
-                    }) && !indexes.contains(&index)
-                    {
-                        indexes.push(index);
-                    }
-                }
-                for (rank, index) in indexes
-                    .into_iter()
-                    .take(self.config.lsp_candidate_count)
-                    .enumerate()
+        {
+            let mut indexes = Vec::new();
+            for location in lsp_locations {
+                let Some(relative) = location.relative_file_path else {
+                    continue;
+                };
+                if let Some((index, _)) = all_chunks.iter().enumerate().find(|(_, hit)| {
+                    location.language.as_deref() == Some(hit.chunk.language.as_str())
+                        && hit.chunk.relative_file_path.eq_ignore_ascii_case(&relative)
+                        && hit.chunk.start_line <= location.start_line
+                        && hit.chunk.end_line >= location.start_line
+                }) && !indexes.contains(&index)
                 {
-                    let mut hit = all_chunks[index].clone();
-                    hit.lsp_rank = Some(rank + 1);
-                    hit.retrieval_channels.push("lsp".into());
-                    lsp_hits.push(hit);
+                    indexes.push(index);
                 }
             }
-            Err(error) => {
-                let message = format!("LSP retrieval unavailable: {error:#}");
-                report.warning = Some(
-                    report
-                        .warning
-                        .take()
-                        .map_or(message.clone(), |w| format!("{w}; {message}")),
-                );
+            for (rank, index) in indexes
+                .into_iter()
+                .take(self.config.lsp_candidate_count)
+                .enumerate()
+            {
+                let mut hit = all_chunks[index].clone();
+                hit.lsp_rank = Some(rank + 1);
+                hit.retrieval_channels.push("lsp".into());
+                lsp_hits.push(hit);
             }
         }
         if semantic.is_empty() && lexical_hits.is_empty() && lsp_hits.is_empty() {
@@ -1007,6 +1089,7 @@ impl App {
         let reranker_model = self.config.reranker_model.clone();
         let ripgrep_resolved = lexical::resolve_ripgrep_path(&self.config.ripgrep_path);
         let rust_analyzer_path = self.config.rust_analyzer_path.clone();
+        let csharp_config = self.config.csharp.clone();
         let client = self.models.client();
 
         let (
@@ -1018,6 +1101,7 @@ impl App {
             reranker_models,
             ripgrep_probe,
             rust_analyzer_probe,
+            csharp_probe,
         ) = tokio::join!(
             Self::probe_data_dir(&data_dir),
             self.store.accessibility_probe(&lancedb_path),
@@ -1039,6 +1123,17 @@ impl App {
             ),
             Self::probe_subprocess_version(&ripgrep_resolved, timeout),
             Self::probe_subprocess_version(std::path::Path::new(&rust_analyzer_path), timeout),
+            async {
+                if csharp_config.disabled || csharp_config.path.is_none() {
+                    Ok(())
+                } else {
+                    Self::probe_subprocess_version(
+                        std::path::Path::new(csharp_config.path.as_deref().unwrap()),
+                        timeout,
+                    )
+                    .await
+                }
+            },
         );
 
         let data_dir_ready = data_dir_probe.is_ok();
@@ -1047,6 +1142,7 @@ impl App {
         let reranker_reach_ready = reranker_reach.is_ok();
         let ripgrep_ready = ripgrep_probe.is_ok();
         let rust_analyzer_ready = rust_analyzer_probe.is_ok();
+        let csharp_ready = csharp_probe.is_ok();
 
         // Required embedding listing: any non-Listed outcome fails readiness.
         let (embedding_models_ready, embedding_models_detail) = match &embedding_models {
@@ -1127,6 +1223,21 @@ impl App {
                         "configured rust-analyzer command {} unavailable: {e:#}",
                         rust_analyzer_path
                     ),
+                }),
+            },
+            ReadinessComponent {
+                name: "csharp_language_server_available",
+                ready: csharp_ready,
+                required: false,
+                detail: Some(if csharp_config.disabled {
+                    "C# language server disabled".into()
+                } else if let Some(path) = csharp_config.path.as_deref() {
+                    match csharp_probe {
+                        Ok(()) => format!("configured csharp-ls command {path}"),
+                        Err(e) => format!("configured csharp-ls command {path} unavailable: {e:#}"),
+                    }
+                } else {
+                    "C# language server not configured".into()
                 }),
             },
         ];

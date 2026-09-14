@@ -23,6 +23,15 @@ rust_analyzer_path = "rust-analyzer"
 lsp_timeout_seconds = 60
 lsp_candidate_count = 40
 
+# Optional C# language server (csharp-ls). C# tooling is optional and
+# fail-open: omitting this section (or leaving path empty) keeps it disabled
+# without affecting syntax retrieval. The shared lsp_timeout_seconds and
+# lsp_candidate_count above also apply to the C# server.
+# [csharp]
+# path = "csharp-ls"
+# args = []
+# disabled = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

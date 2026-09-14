@@ -1,0 +1,240 @@
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, oneshot},
+};
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// Configuration for spawning a JSON-RPC over stdio process.
+pub struct TransportConfig {
+    pub executable: String,
+    pub args: Vec<String>,
+    pub working_dir: PathBuf,
+    pub timeout: Duration,
+    /// Human-readable name used in error messages (e.g. "rust-analyzer").
+    pub label: String,
+}
+
+/// A JSON-RPC client over a child process's stdio.
+///
+/// Handles process lifecycle (spawn, kill on drop), Content-Length framing,
+/// JSON-RPC response correlation by ID, serialized writes, notification
+/// draining, stderr separation from stdout, and bounded request timeouts.
+///
+/// The caller provides a readiness predicate at spawn time. The predicate is
+/// evaluated against each JSON-RPC notification (a message without an `id`
+/// field). When it returns `true`, the client is marked ready and waiters on
+/// [`wait_ready`](Self::wait_ready) are notified.
+pub struct JsonRpcClient {
+    stdin: Mutex<ChildStdin>,
+    child: Mutex<Child>,
+    pending: Pending,
+    next_id: AtomicU64,
+    timeout: Duration,
+    label: String,
+    ready: Arc<tokio::sync::Notify>,
+    is_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JsonRpcClient {
+    /// Spawns the process and sets up stdio pipes and background reader tasks.
+    ///
+    /// `ready_predicate` is called for each notification. When it returns
+    /// `true`, the client transitions to the ready state.
+    pub async fn spawn(
+        config: &TransportConfig,
+        ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+    ) -> Result<Arc<Self>> {
+        let mut child = Command::new(&config.executable)
+            .args(&config.args)
+            .current_dir(&config.working_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("start {}", config.executable))?;
+        let stdin = child
+            .stdin
+            .take()
+            .with_context(|| format!("{} stdin unavailable", config.label))?;
+        let stdout = child
+            .stdout
+            .take()
+            .with_context(|| format!("{} stdout unavailable", config.label))?;
+        let stderr = child
+            .stderr
+            .take()
+            .with_context(|| format!("{} stderr unavailable", config.label))?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_pending = Arc::clone(&pending);
+        let reader_ready = Arc::clone(&ready);
+        let reader_is_ready = Arc::clone(&is_ready);
+        let label = config.label.clone();
+        tokio::spawn(async move {
+            if let Err(error) = read_messages(
+                stdout,
+                reader_pending.clone(),
+                reader_ready,
+                reader_is_ready,
+                ready_predicate,
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "JSON-RPC protocol reader stopped");
+            }
+            let mut pending = reader_pending.lock().await;
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(Err(format!("{label} exited")));
+            }
+        });
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(message = %line, "lsp-stderr");
+            }
+        });
+        Ok(Arc::new(Self {
+            stdin: Mutex::new(stdin),
+            child: Mutex::new(child),
+            pending,
+            next_id: AtomicU64::new(1),
+            timeout: config.timeout,
+            label: config.label.clone(),
+            ready,
+            is_ready,
+        }))
+    }
+
+    /// Sends a JSON-RPC notification (no response expected).
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await
+    }
+
+    /// Sends a JSON-RPC request and waits for the correlated response.
+    ///
+    /// Times out after the configured timeout. On timeout the pending entry
+    /// is removed and an error is returned.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending.lock().await.insert(id, sender);
+        if let Err(error) = self
+            .write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(self.timeout, receiver).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(message))) => bail!(message),
+            Ok(Err(_)) => bail!("{} response channel closed", self.label),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "{} request timed out after {} seconds",
+                    self.label,
+                    self.timeout.as_secs()
+                )
+            }
+        }
+    }
+
+    /// Returns `true` if the readiness predicate has matched a notification.
+    pub fn is_ready(&self) -> bool {
+        self.is_ready.load(Ordering::Acquire)
+    }
+
+    /// Waits for the readiness predicate to match, bounded by `timeout`.
+    /// Returns `true` if ready within the timeout, `false` otherwise.
+    pub async fn wait_ready(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.ready.notified())
+            .await
+            .is_ok()
+    }
+
+    /// The configured request timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    async fn write(&self, value: &Value) -> Result<()> {
+        let body = serde_json::to_vec(value)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await?;
+        stdin.write_all(&body).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+}
+
+impl Drop for JsonRpcClient {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+async fn read_messages(
+    stdout: tokio::process::ChildStdout,
+    pending: Pending,
+    ready: Arc<tokio::sync::Notify>,
+    is_ready: Arc<std::sync::atomic::AtomicBool>,
+    ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(());
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = Some(value.trim().parse::<usize>()?);
+            }
+        }
+        let length = content_length.context("LSP message missing Content-Length")?;
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await?;
+        let message: Value = serde_json::from_slice(&body)?;
+        // Notifications (no id): evaluate readiness predicate.
+        if message.get("id").is_none() && ready_predicate(&message) {
+            is_ready.store(true, Ordering::Release);
+            ready.notify_waiters();
+            ready.notify_one();
+        }
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        if let Some(sender) = pending.lock().await.remove(&id) {
+            let response = match message.get("error") {
+                Some(error) => Err(error.to_string()),
+                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            let _ = sender.send(response);
+        }
+    }
+}

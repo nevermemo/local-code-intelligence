@@ -118,7 +118,7 @@ async fn python_only_search_and_navigation_skip_rust_analyzer() {
 }
 
 #[tokio::test]
-async fn csharp_only_search_and_navigation_skip_rust_analyzer() {
+async fn csharp_only_search_and_navigation_keep_csharp_lsp_optional() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("csharp-only");
     write(
@@ -144,9 +144,7 @@ async fn csharp_only_search_and_navigation_skip_rust_analyzer() {
             .unwrap_err(),
     ] {
         assert!(
-            error
-                .to_string()
-                .contains("does not support csharp source files"),
+            error.to_string().contains("C# language server is disabled"),
             "unexpected error: {error}"
         );
     }

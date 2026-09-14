@@ -104,7 +104,7 @@ impl McpServer {
         result(self.app.unwatch(Path::new(&args.workspace_path)).await)
     }
     #[tool(
-        description = "Find Rust symbols by name using a persistent rust-analyzer process for the workspace."
+        description = "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls."
     )]
     async fn search_symbols(&self, Parameters(args): Parameters<SymbolArgs>) -> CallToolResult {
         result(
@@ -114,7 +114,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Resolve the definition at a one-based source line and zero-based UTF-16 character using rust-analyzer."
+        description = "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls."
     )]
     async fn find_definition(&self, Parameters(args): Parameters<PositionArgs>) -> CallToolResult {
         result(
@@ -129,7 +129,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Find references at a one-based source line and zero-based UTF-16 character using rust-analyzer."
+        description = "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls."
     )]
     async fn find_references(
         &self,
@@ -168,7 +168,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Report service readiness: writable data dir, embedded LanceDB accessibility, embedding endpoint reachability and model listing, reranker endpoint reachability and model listing, and ripgrep/rust-analyzer availability. Returns the shared readiness report with named components and degraded optional components."
+        description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, and csharp-ls. Missing language servers do not make readiness fail."
     )]
     async fn service_status(&self) -> CallToolResult {
         result(Ok(self.app.service_status().await))

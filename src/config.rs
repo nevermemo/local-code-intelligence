@@ -64,7 +64,43 @@ pub struct Config {
     pub rust_analyzer_path: String,
     pub lsp_timeout_seconds: u64,
     pub lsp_candidate_count: usize,
+    /// Optional C# language-server (csharp-ls) settings. Absent or empty
+    /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
+    pub csharp: CSharpLspConfig,
     pub index: IndexConfig,
+}
+
+/// Optional C# language-server (csharp-ls) configuration.
+///
+/// C# tooling is optional and fail-open: an absent or empty `[csharp]`
+/// section keeps the server disabled without affecting syntax retrieval.
+/// The shared `lsp_timeout_seconds` and `lsp_candidate_count` settings apply
+/// to the C# server as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CSharpLspConfig {
+    /// Path to the standalone csharp-ls executable. `None` (the default)
+    /// keeps C# tooling disabled. An empty or whitespace-only value is
+    /// rejected by validation rather than silently counting as enabled.
+    pub path: Option<String>,
+    /// Optional arguments passed to the csharp-ls executable.
+    pub args: Vec<String>,
+    /// Explicitly disable the C# server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl CSharpLspConfig {
+    /// Whether the C# language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
 }
 
 impl Default for Config {
@@ -95,6 +131,7 @@ impl Default for Config {
             rust_analyzer_path: "rust-analyzer".into(),
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
+            csharp: CSharpLspConfig::default(),
             index: IndexConfig::default(),
         }
     }
@@ -138,6 +175,16 @@ impl Config {
             !self.rust_analyzer_path.trim().is_empty() && self.lsp_timeout_seconds > 0,
             "rust-analyzer path must be nonempty and LSP timeout must be positive"
         );
+        // An explicitly configured but empty C# path is malformed: it must be
+        // rejected rather than silently counting as enabled.
+        if !self.csharp.disabled
+            && let Some(path) = &self.csharp.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "csharp.path must be nonempty when set; omit it or set csharp.disabled = true to keep C# tooling disabled"
+            );
+        }
         ensure!(
             (1..=40).contains(&self.default_top_k),
             "default_top_k must be 1..=40"
@@ -175,5 +222,87 @@ impl Config {
             self.embedding_model,
             crate::chunk::DOCUMENT_FORMAT_VERSION
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal absolute data_dir so `validate` passes in tests.
+    /// Uses a TOML literal (single-quoted) string so Windows backslashes in
+    /// the temp path are not interpreted as escape sequences.
+    fn base_toml() -> String {
+        format!("data_dir = '{}'\n", std::env::temp_dir().display())
+    }
+
+    #[test]
+    fn default_config_loads_and_csharp_is_disabled() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(!config.csharp.enabled());
+        assert!(config.csharp.path.is_none());
+        assert!(config.csharp.args.is_empty());
+        assert!(!config.csharp.disabled);
+    }
+
+    #[test]
+    fn old_config_shape_still_loads() {
+        // A config containing only the pre-C# LSP fields must still load and
+        // keep C# tooling disabled (backward compatibility).
+        let toml_text = format!(
+            "{}rust_analyzer_path = \"rust-analyzer\"\nlsp_timeout_seconds = 60\nlsp_candidate_count = 40\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.rust_analyzer_path, "rust-analyzer");
+        assert_eq!(config.lsp_timeout_seconds, 60);
+        assert_eq!(config.lsp_candidate_count, 40);
+        assert!(!config.csharp.enabled());
+    }
+
+    #[test]
+    fn csharp_section_enables_server() {
+        let toml_text = format!(
+            "{}[csharp]\npath = \"csharp-ls\"\nargs = [\"--stdio\"]\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(config.csharp.enabled());
+        assert_eq!(config.csharp.path.as_deref(), Some("csharp-ls"));
+        assert_eq!(config.csharp.args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn csharp_disabled_flag_overrides_path() {
+        let toml_text = format!(
+            "{}[csharp]\npath = \"csharp-ls\"\ndisabled = true\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(!config.csharp.enabled());
+    }
+
+    #[test]
+    fn empty_csharp_path_is_rejected() {
+        // An explicitly configured but empty path is malformed and must be
+        // rejected rather than silently counting as enabled.
+        let toml_text = format!("{}[csharp]\npath = \"   \"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("csharp.path"));
+    }
+
+    #[test]
+    fn unknown_csharp_field_is_rejected() {
+        // `deny_unknown_fields` keeps the C# section narrow.
+        let toml_text = format!(
+            "{}[csharp]\npath = \"csharp-ls\"\nnot_a_field = 1\n",
+            base_toml()
+        );
+        assert!(toml::from_str::<Config>(&toml_text).is_err());
     }
 }
