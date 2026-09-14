@@ -484,11 +484,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/feature_pipeline_test.py",
         "# Decoy documentation for a production feature pipeline test.\nEXPECTED_PIPELINE_DESCRIPTION = 'strip and filter events'\n",
     );
+    write(
+        &workspace,
+        "src/TelemetryProcessor.cs",
+        "namespace Telemetry;\n/// <summary>Production telemetry normalization.</summary>\npublic sealed class TelemetryProcessor { public string NormalizeProductionEvent(string value) => value.Trim().ToLowerInvariant(); }\n",
+    );
+    write(
+        &workspace,
+        "tests/TelemetryProcessorTests.cs",
+        "namespace Telemetry.Tests;\n// Search decoy for NormalizeProductionEvent.\npublic sealed class TelemetryProcessorTests { public const string Expected = \"trim lowercase\"; }\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 7);
-    assert_eq!(first.parsed_files, 7);
+    assert_eq!(first.files, 9);
+    assert_eq!(first.parsed_files, 9);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -525,6 +535,26 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         python_production.results[0].chunk.end_line
             >= python_production.results[0].chunk.start_line
     );
+    let csharp_production = app
+        .search(&workspace, "NormalizeProductionEvent", Some(8))
+        .await
+        .unwrap();
+    let csharp_implementation = csharp_production
+        .results
+        .iter()
+        .find(|hit| hit.chunk.relative_file_path == "src/TelemetryProcessor.cs")
+        .unwrap();
+    assert_eq!(csharp_implementation.chunk.language, "csharp");
+    assert_eq!(
+        csharp_implementation.source_role,
+        local_code_intelligence::filter::SourceRole::Source
+    );
+    assert!(csharp_implementation.chunk.start_line >= 1);
+    assert!(csharp_implementation.chunk.end_line >= csharp_implementation.chunk.start_line);
+    assert!(csharp_production.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "tests/TelemetryProcessorTests.cs"
+            && hit.source_role == local_code_intelligence::filter::SourceRole::Test
+    }));
     for (query, path, language) in [
         ("TelemetryPanel", "src/panel.tsx", "tsx"),
         ("flushAuditBeacon", "src/audit.js", "javascript"),
@@ -549,21 +579,35 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 7);
+    assert_eq!(restarted.unchanged_files, 9);
 
     write(
         &workspace,
-        "src/feature_pipeline.py",
-        "# Production feature pipeline implementation.\ndef build_production_feature_pipeline(events):\n    cleaned = [event.strip() for event in events]\n    return [event for event in cleaned if event]\n",
+        "src/TelemetryProcessor.cs",
+        "namespace Telemetry;\n/// <summary>Production telemetry normalization.</summary>\npublic sealed class TelemetryProcessor { public string NormalizeProductionEvent(string value) { var trimmed = value.Trim(); return trimmed.ToLowerInvariant(); } }\n",
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 6);
+    assert_eq!(changed.unchanged_files, 8);
+
+    std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
+    let csharp_deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(csharp_deleted.removed_files, 1);
+    let after_csharp_delete = app
+        .search(&workspace, "TelemetryProcessorTests", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_csharp_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "tests/TelemetryProcessorTests.cs")
+    );
 
     std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 6);
+    assert_eq!(deleted.files, 7);
     let after_delete = app
         .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
@@ -577,8 +621,8 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
 
     write(
         &workspace,
-        "src/feature_pipeline.py",
-        "# Production feature pipeline implementation.\ndef build_production_feature_pipeline(events):\n    cleaned = [event.strip() for event in events]\n    return [event for event in cleaned if event]\nUNCOMMITTED_SNAPSHOT_MARKER = 'new source'\n",
+        "src/TelemetryProcessor.cs",
+        "namespace Telemetry;\npublic sealed class TelemetryProcessor { public string NormalizeProductionEvent(string value) => value.Trim(); public const string UNCOMMITTED_SNAPSHOT_MARKER = \"new source\"; }\n",
     );
     fake.embed_fails.store(true, Ordering::SeqCst);
     assert!(app.index(&workspace).await.is_err());
@@ -586,19 +630,19 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     assert!(app.status(&workspace).await.unwrap().stale);
     fake.embed_fails.store(false, Ordering::SeqCst);
     let retained = app
-        .search(&workspace, "build_production_feature_pipeline", Some(8))
+        .search(&workspace, "NormalizeProductionEvent", Some(8))
         .await
         .unwrap();
     let retained_implementation = retained
         .results
         .iter()
-        .find(|hit| hit.chunk.relative_file_path == "src/feature_pipeline.py")
+        .find(|hit| hit.chunk.relative_file_path == "src/TelemetryProcessor.cs")
         .unwrap();
     assert!(
         retained_implementation
             .chunk
             .code
-            .contains("def build_production_feature_pipeline")
+            .contains("NormalizeProductionEvent")
     );
     assert!(
         !retained_implementation

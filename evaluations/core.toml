@@ -3,7 +3,7 @@
 # Workspaces:
 #   - "self" (required): this repository. Verifies the service's own
 #     retrieval behavior: first-search index lifecycle, the language
-#     registry / Tree-sitter grammar, Python chunking, Windows ripgrep
+#     registry / Tree-sitter grammar, Python and C# chunking, Windows ripgrep
 #     resolution, readiness dependency probing, and explicit test-role
 #     retrieval.
 #   - "gust" (optional): the GUST Rust-to-Slang translator repository.
@@ -46,6 +46,14 @@ required_snippet = "for_extension"
 [[queries]]
 workspace = "self"
 query = "chunk Python declarations statements and decorators into stable chunks"
+top_k = 8
+expected_paths = ["src/chunk.rs", "src/language.rs"]
+preferred_paths = ["src/chunk.rs"]
+
+# C# chunking.
+[[queries]]
+workspace = "self"
+query = "chunk C# namespaces types members attributes and top-level statements into stable chunks"
 top_k = 8
 expected_paths = ["src/chunk.rs", "src/language.rs"]
 preferred_paths = ["src/chunk.rs"]

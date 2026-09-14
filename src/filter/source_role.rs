@@ -194,6 +194,11 @@ fn is_test_file_name(file_name: &str) -> bool {
             return true;
         }
     }
+    if file_name.strip_suffix(".cs").is_some_and(|stripped| {
+        stripped.ends_with("Tests") || stripped.ends_with("Test") || stripped.ends_with(".Tests")
+    }) {
+        return true;
+    }
     false
 }
 

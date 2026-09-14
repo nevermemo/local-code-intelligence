@@ -509,7 +509,9 @@ export interface TelemetryLifecycle {
             ("panel.tsx", "export const Panel = () => <main />;\n"),
             ("runtime.js", "export function run() {}\n"),
             ("view.jsx", "export const View = () => <main />;\n"),
+            ("Service.cs", "public sealed class Service {}\n"),
             ("ignored.RS", "fn uppercase() {}\n"),
+            ("ignored.CS", "public sealed class Ignored {}\n"),
             ("ignored.mts", "export const ignored = 1;\n"),
             ("ignored.py", "ignored = True\n"),
         ] {
@@ -528,7 +530,8 @@ export interface TelemetryLifecycle {
                 "panel.tsx",
                 "runtime.js",
                 "view.jsx",
-                "ignored.py"
+                "ignored.py",
+                "Service.cs"
             ])
         );
     }
@@ -719,5 +722,106 @@ if TOP:
                 "missing {statement}"
             );
         }
+    }
+
+    #[test]
+    fn chunks_csharp_namespaces_types_members_attributes_and_top_level_statements() {
+        let source = r#"using System;
+
+Console.WriteLine("startup");
+
+namespace Telemetry;
+
+/// <summary>Processes production telemetry.</summary>
+[Obsolete]
+public sealed class TelemetryProcessor
+{
+    public event EventHandler? Completed;
+    public string Name { get; init; } = "production";
+
+    public TelemetryProcessor(string name) { Name = name; }
+
+    public string Normalize(string value)
+    {
+        string Trimmed() => value.Trim();
+        return Trimmed().ToLowerInvariant();
+    }
+}
+
+public interface ITelemetrySink
+{
+    void Write(string value);
+}
+"#;
+        let chunks = chunks_for_path("TelemetryProcessor.cs", source).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.language == "csharp"));
+        for expected in [
+            "using System",
+            "Console.WriteLine",
+            "class TelemetryProcessor",
+            "event EventHandler",
+            "string Name",
+            "TelemetryProcessor(string name)",
+            "string Normalize",
+            "string Trimmed()",
+            "interface ITelemetrySink",
+            "void Write",
+        ] {
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(expected)),
+                "missing {expected}: {chunks:#?}"
+            );
+        }
+        let class = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
+            .unwrap();
+        assert!(class.code.contains("/// <summary>"));
+        assert!(class.code.contains("[Obsolete]"));
+        for chunk in &chunks {
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1);
+            assert!(chunk.end_line >= chunk.start_line);
+        }
+    }
+
+    #[test]
+    fn oversized_csharp_method_splits_at_statements_and_keeps_its_header() {
+        let statements = (0..1200)
+            .map(|i| format!("        total += {i};\n"))
+            .collect::<String>();
+        let source = format!(
+            "public class LargeCalculator\n{{\n    [Obsolete]\n    public int Calculate()\n    {{\n        var total = 0;\n{statements}        return total;\n    }}\n}}\n"
+        );
+        let chunks = chunks_for_path("LargeCalculator.cs", &source).unwrap();
+        assert!(
+            chunks.len() > 2,
+            "oversized member was not split: {chunks:#?}"
+        );
+        let header = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("public int Calculate"))
+            .unwrap();
+        assert!(header.code.contains("[Obsolete]"));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("return total;"))
+        );
+        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
+    }
+
+    #[test]
+    fn csharp_parser_recovery_keeps_following_declarations_searchable() {
+        let source =
+            "public class Broken { void Run( { }\npublic record HealthyRecord(int Value);\n";
+        let chunks = chunks_for_path("Recovered.cs", source).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("HealthyRecord")),
+            "valid declaration after syntax damage was lost: {chunks:#?}"
+        );
     }
 }

@@ -6,6 +6,7 @@ pub(crate) enum Syntax {
     Rust,
     EcmaScript,
     Python,
+    CSharp,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +39,7 @@ impl LanguageAdapter {
             "js" => "*.js",
             "jsx" => "*.jsx",
             "py" => "*.py",
+            "cs" => "*.cs",
             _ => unreachable!(),
         }
     }
@@ -53,18 +55,41 @@ impl LanguageAdapter {
                 "program" | "class_body" | "interface_body" | "object_type" | "statement_block"
             ),
             Syntax::Python => matches!(kind, "module" | "block"),
+            Syntax::CSharp => matches!(
+                kind,
+                "compilation_unit"
+                    | "namespace_declaration"
+                    | "file_scoped_namespace_declaration"
+                    | "declaration_list"
+                    | "class_body"
+                    | "enum_body"
+                    | "block"
+            ),
         }
     }
 
     pub(crate) fn is_boundary(&self, kind: &str) -> bool {
-        self.syntax == Syntax::EcmaScript
-            && matches!(
+        match self.syntax {
+            Syntax::EcmaScript => matches!(
                 kind,
                 "export_statement"
                     | "class_declaration"
                     | "abstract_class_declaration"
                     | "interface_declaration"
-            )
+            ),
+            Syntax::CSharp => matches!(
+                kind,
+                "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "enum_declaration"
+                    | "delegate_declaration"
+                    | "namespace_declaration"
+                    | "file_scoped_namespace_declaration"
+            ),
+            Syntax::Rust | Syntax::Python => false,
+        }
     }
 
     pub(crate) fn is_declaration(&self, kind: &str) -> bool {
@@ -97,6 +122,28 @@ impl LanguageAdapter {
                 kind,
                 "function_definition" | "class_definition" | "decorated_definition"
             ),
+            Syntax::CSharp => matches!(
+                kind,
+                "namespace_declaration"
+                    | "file_scoped_namespace_declaration"
+                    | "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "enum_declaration"
+                    | "delegate_declaration"
+                    | "method_declaration"
+                    | "constructor_declaration"
+                    | "destructor_declaration"
+                    | "operator_declaration"
+                    | "property_declaration"
+                    | "indexer_declaration"
+                    | "event_field_declaration"
+                    | "event_declaration"
+                    | "field_declaration"
+                    | "base_field_declaration"
+                    | "local_function_statement"
+            ),
         }
     }
 
@@ -108,6 +155,7 @@ impl LanguageAdapter {
             ),
             Syntax::EcmaScript => matches!(kind, "comment" | "decorator"),
             Syntax::Python => matches!(kind, "comment" | "decorator"),
+            Syntax::CSharp => matches!(kind, "comment" | "attribute_list"),
         }
     }
 
@@ -128,6 +176,7 @@ impl LanguageAdapter {
                     || (self.is_declaration(parent) && self.is_container(child))
             }
             Syntax::Rust => false,
+            Syntax::CSharp => self.is_declaration(parent) && self.is_container(child),
         }
     }
 }
@@ -150,6 +199,10 @@ fn tsx() -> Language {
 
 fn python() -> Language {
     tree_sitter_python::LANGUAGE.into()
+}
+
+fn csharp() -> Language {
+    tree_sitter_c_sharp::LANGUAGE.into()
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -195,6 +248,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: python,
         syntax: Syntax::Python,
     },
+    LanguageAdapter {
+        extension: "cs",
+        identifier: "csharp",
+        cache_version: "csharp-chunks-v1",
+        grammar: csharp,
+        syntax: Syntax::CSharp,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -236,13 +296,14 @@ mod tests {
             ("js", "javascript", "*.js"),
             ("jsx", "jsx", "*.jsx"),
             ("py", "python", "*.py"),
+            ("cs", "csharp", "*.cs"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
             assert!(!adapter.cache_version().is_empty());
         }
-        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY"] {
+        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS"] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }
     }

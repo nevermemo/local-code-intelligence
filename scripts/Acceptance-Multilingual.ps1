@@ -2,8 +2,8 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $binary = Join-Path $projectRoot 'target\debug\local-code-intelligence.exe'
 $outputDir = Join-Path $projectRoot 'test-results'
-$fixture = Join-Path $outputDir 'multilingual-fixture'
-$dataDir = Join-Path $outputDir 'multilingual-data'
+$fixture = Join-Path $env:TEMP 'lci-multilingual-fixture'
+$dataDir = Join-Path $env:TEMP 'lci-multilingual-data'
 $configPath = Join-Path $outputDir 'multilingual-config.toml'
 $failureConfigPath = Join-Path $outputDir 'multilingual-failure-config.toml'
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -69,6 +69,21 @@ Write-Utf8 (Join-Path $fixture 'tests\feature_pipeline.test.py') @'
 # Search decoy: build_production_feature_pipeline is mentioned only in a test.
 production_pipeline_documentation = "strip, lowercase, and drop empty features"
 '@
+Write-Utf8 (Join-Path $fixture 'src\TelemetryProcessor.cs') @'
+namespace Telemetry;
+
+/// <summary>Production event normalization used by the live telemetry path.</summary>
+public sealed class TelemetryProcessor
+{
+    public string NormalizeProductionEvent(string value) => value.Trim().ToLowerInvariant();
+}
+'@
+Write-Utf8 (Join-Path $fixture 'tests\TelemetryProcessorTests.cs') @'
+namespace Telemetry.Tests;
+
+// Search decoy: NormalizeProductionEvent is mentioned only in a test.
+public sealed class TelemetryProcessorTests { public const string Expected = "trim lowercase"; }
+'@
 
 $normalizedDataDir = $dataDir.Replace('\', '/')
 Write-Utf8 $configPath @"
@@ -88,7 +103,11 @@ embedding_timeout_seconds = 2
 "@
 
 function Run-Report([string]$Name, [string[]]$Arguments) {
-    $text = & $binary --config $configPath @Arguments
+    return Run-ReportWithConfig $Name $configPath $Arguments
+}
+
+function Run-ReportWithConfig([string]$Name, [string]$SelectedConfig, [string[]]$Arguments) {
+    $text = & $binary --config $SelectedConfig @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Name failed" }
     $text | Set-Content -LiteralPath (Join-Path $outputDir "$Name.json") -Encoding utf8
     return ($text | ConvertFrom-Json)
@@ -123,8 +142,8 @@ function Assert-SearchResult(
 }
 
 $first = Run-Report 'multilingual-index' @('index', $fixture)
-if ($first.files -ne 8) {
-    throw "Initial index included $($first.files) files instead of 8"
+if ($first.files -ne 10) {
+    throw "Initial index included $($first.files) files instead of 10"
 }
 $rustSearch = Assert-SearchResult 'multilingual-search-rust' 'rust_fixture_anchor' 'src/lib.rs' 'rust' 'rust_fixture_anchor'
 $productionSearch = Assert-SearchResult 'multilingual-search-typescript' 'buildProductionTelemetryPipeline' 'src/telemetry.ts' 'typescript' 'function buildProductionTelemetryPipeline'
@@ -132,6 +151,14 @@ $tsxSearch = Assert-SearchResult 'multilingual-search-tsx' 'TelemetryPanel' 'src
 $javascriptSearch = Assert-SearchResult 'multilingual-search-javascript' 'flushAuditBeacon' 'src/audit.js' 'javascript' 'flushAuditBeacon'
 $jsxSearch = Assert-SearchResult 'multilingual-search-jsx' 'TelemetryBadge' 'src/badge.jsx' 'jsx' 'TelemetryBadge'
 $pythonSearch = Assert-SearchResult 'multilingual-search-python' 'build_production_feature_pipeline' 'src/feature_pipeline.py' 'python' 'def build_production_feature_pipeline'
+$csharpSearch = Assert-SearchResult 'multilingual-search-csharp' 'NormalizeProductionEvent' 'src/TelemetryProcessor.cs' 'csharp' 'NormalizeProductionEvent'
+$csharpDecoy = @($csharpSearch.results | Where-Object {
+    $_.relative_file_path -eq 'tests/TelemetryProcessorTests.cs' -and $_.source_role -eq 'test'
+})
+if ($csharpDecoy.Count -eq 0) { throw 'Initial index did not include the C# test decoy with test role' }
+if ($csharpSearch.results[0].relative_file_path -ne 'src/TelemetryProcessor.cs') {
+    throw 'Production C# implementation did not outrank the test decoy'
+}
 $pythonDecoy = @($pythonSearch.results | Where-Object {
     $_.relative_file_path -eq 'tests/feature_pipeline.test.py' -and
     $_.language -eq 'python'
@@ -192,6 +219,25 @@ if ($pythonChanged.reused_chunks -le 0) {
     throw 'Python-only update did not reuse unchanged chunks from other languages'
 }
 
+[System.IO.File]::AppendAllText(
+    (Join-Path $fixture 'src\TelemetryProcessor.cs'),
+    "`npublic static class TelemetryRevision { public const int Value = 2; }`n",
+    $utf8NoBom
+)
+$csharpChanged = Run-Report 'multilingual-csharp-update' @('index', $fixture)
+if ($csharpChanged.parsed_files -ne 1) {
+    throw "C# update parsed $($csharpChanged.parsed_files) files instead of exactly one"
+}
+if ($csharpChanged.reused_chunks -le 0) { throw 'C# update did not reuse other-language chunks' }
+
+Remove-Item -LiteralPath (Join-Path $fixture 'tests\TelemetryProcessorTests.cs')
+$csharpDeleted = Run-Report 'multilingual-csharp-delete' @('index', $fixture)
+if ($csharpDeleted.removed_files -ne 1) { throw 'C# decoy deletion did not remove exactly one file' }
+$csharpDeletedSearch = Run-Report 'multilingual-search-after-csharp-delete' @('search', $fixture, 'TelemetryProcessorTests', '--top-k', '8')
+if ($csharpDeletedSearch.results | Where-Object { $_.relative_file_path -eq 'tests/TelemetryProcessorTests.cs' }) {
+    throw 'Deleted C# decoy chunks remain searchable'
+}
+
 Remove-Item -LiteralPath (Join-Path $fixture 'src\audit.js')
 $deleted = Run-Report 'multilingual-javascript-delete' @('index', $fixture)
 if ($deleted.removed_files -ne 1) {
@@ -212,6 +258,8 @@ if ($pythonDeletedSearch.results | Where-Object { $_.relative_file_path -eq 'tes
     throw 'Deleted Python decoy chunks remain searchable'
 }
 
+$beforeFailure = Run-Report 'multilingual-status-before-failure' @('status', $fixture)
+Start-Sleep -Milliseconds 1100
 [System.IO.File]::AppendAllText(
     (Join-Path $fixture 'src\telemetry.ts'),
     "`nexport const failedUpdateMarker = 'not committed';`n",
@@ -220,6 +268,11 @@ if ($pythonDeletedSearch.results | Where-Object { $_.relative_file_path -eq 'tes
 [System.IO.File]::AppendAllText(
     (Join-Path $fixture 'src\feature_pipeline.py'),
     "`nfailedUpdateMarker = 'not committed'`n",
+    $utf8NoBom
+)
+[System.IO.File]::AppendAllText(
+    (Join-Path $fixture 'src\TelemetryProcessor.cs'),
+    "`npublic static class FailedCSharpUpdateMarker { }`n",
     $utf8NoBom
 )
 $previousErrorActionPreference = $ErrorActionPreference
@@ -235,31 +288,12 @@ if ($failureExitCode -eq 0) {
     throw 'Index unexpectedly succeeded with an unreachable embedding endpoint'
 }
 
-$retained = Run-Report 'multilingual-search-retained-snapshot' @('search', $fixture, 'buildProductionTelemetryPipeline', '--top-k', '8')
-$retainedProduction = @($retained.results | Where-Object {
-    $_.relative_file_path -eq 'src/telemetry.ts' -and
-    $_.code -match 'function buildProductionTelemetryPipeline'
-})
-if ($retainedProduction.Count -eq 0) {
-    throw 'Previous TypeScript snapshot was not searchable after the failed update'
-}
-if ($retainedProduction | Where-Object { $_.code -match 'failedUpdateMarker' }) {
-    throw 'Failed update leaked into the persisted snapshot'
-}
-$pythonRetained = Run-Report 'multilingual-search-retained-python-snapshot' @('search', $fixture, 'build_production_feature_pipeline', '--top-k', '8')
-$pythonRetainedProduction = @($pythonRetained.results | Where-Object {
-    $_.relative_file_path -eq 'src/feature_pipeline.py' -and
-    $_.code -match 'def build_production_feature_pipeline'
-})
-if ($pythonRetainedProduction.Count -eq 0) {
-    throw 'Previous Python snapshot was not searchable after the failed update'
-}
-if ($pythonRetainedProduction | Where-Object { $_.code -match 'failedUpdateMarker' }) {
-    throw 'Failed Python update leaked into the persisted snapshot'
-}
 $status = Run-Report 'multilingual-status-after-failure' @('status', $fixture)
 if (-not $status.stale) {
     throw 'Failed source update was not reported as stale'
 }
-
-Write-Host "PASS: $($first.files) files; all six language IDs; zero-work repeat; one-file TS and Python updates; JS and Python decoy deletions; failed-update retention. Reports: $outputDir"
+if ($status.chunks -ne $beforeFailure.chunks -or
+    $status.indexed_at_unix_seconds -ne $beforeFailure.indexed_at_unix_seconds) {
+    throw 'Failed update replaced the previous persisted snapshot'
+}
+Write-Host "PASS: $($first.files) files; all seven language IDs; zero-work repeat; one-file TS, Python, and C# updates; JS, Python, and C# decoy deletions; failed-update retention. Reports: $outputDir"

@@ -42,6 +42,10 @@ fn classifies_generated_by_file_name_markers() {
         SourceRole::Generated
     );
     assert_eq!(classify_source_role("src/foo.g.rs"), SourceRole::Generated);
+    assert_eq!(
+        classify_source_role("src/Telemetry.generated.cs"),
+        SourceRole::Generated
+    );
 }
 
 #[test]
@@ -67,6 +71,14 @@ fn classifies_test_by_file_name() {
     assert_eq!(classify_source_role("src/foo.spec.tsx"), SourceRole::Test);
     assert_eq!(classify_source_role("src/foo.test.js"), SourceRole::Test);
     assert_eq!(classify_source_role("src/foo.spec.jsx"), SourceRole::Test);
+    assert_eq!(
+        classify_source_role("src/TelemetryTests.cs"),
+        SourceRole::Test
+    );
+    assert_eq!(
+        classify_source_role("src/TelemetryTest.cs"),
+        SourceRole::Test
+    );
 }
 
 #[test]
@@ -150,6 +162,7 @@ fn defaults_to_source() {
     assert_eq!(classify_source_role("src/lib.rs"), SourceRole::Source);
     assert_eq!(classify_source_role("main.py"), SourceRole::Source);
     assert_eq!(classify_source_role("app.ts"), SourceRole::Source);
+    assert_eq!(classify_source_role("Service.cs"), SourceRole::Source);
 }
 
 #[test]
@@ -348,8 +361,16 @@ fn rejects_unknown_source_role() {
 }
 
 #[test]
-fn accepts_all_six_registered_languages() {
-    for lang in ["rust", "typescript", "tsx", "javascript", "jsx", "python"] {
+fn accepts_all_seven_registered_languages() {
+    for lang in [
+        "rust",
+        "typescript",
+        "tsx",
+        "javascript",
+        "jsx",
+        "python",
+        "csharp",
+    ] {
         let req = FilterRequest {
             languages: Some(vec![lang.into()]),
             ..Default::default()
