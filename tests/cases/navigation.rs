@@ -1,4 +1,209 @@
 use super::*;
+use local_code_intelligence::{config::CSharpLspConfig, lsp::Manager, workspace::Workspace};
+
+fn fake_csharp_fixture(
+    temp: &tempfile::TempDir,
+    mode: &str,
+) -> (Config, Workspace, std::path::PathBuf) {
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let state_path = temp.path().join("state");
+    std::fs::create_dir_all(workspace_path.join("src")).unwrap();
+    std::fs::create_dir_all(&data_path).unwrap();
+    write(
+        &workspace_path,
+        "src/Calculator.cs",
+        "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n",
+    );
+    write(
+        &workspace_path,
+        "src/CallSite.cs",
+        "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\n",
+    );
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let config = Config {
+        data_dir: data_path,
+        lsp_timeout_seconds: 1,
+        csharp: CSharpLspConfig {
+            path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+            args: vec![
+                "--mode".to_owned(),
+                mode.to_owned(),
+                "--state".to_owned(),
+                state_path.to_string_lossy().into_owned(),
+            ],
+            disabled: false,
+        },
+        ..Config::default()
+    };
+    (config, workspace, state_path)
+}
+
+fn state_count(state: &std::path::Path, name: &str) -> u64 {
+    std::fs::read_to_string(state.join(name))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
+    for (mode, operation) in [
+        ("workspace-symbols", "symbols"),
+        ("definition", "definition"),
+        ("references", "references"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, workspace, _) = fake_csharp_fixture(&temp, mode);
+        let manager = Manager::new(&config);
+        let results = match operation {
+            "symbols" => manager
+                .csharp_symbols(&workspace, "Calculator")
+                .await
+                .unwrap(),
+            "definition" => manager
+                .csharp_definition(&workspace, &workspace.path.join("src/CallSite.cs"), 1, 72)
+                .await
+                .unwrap(),
+            "references" => manager
+                .csharp_references(
+                    &workspace,
+                    &workspace.path.join("src/Calculator.cs"),
+                    1,
+                    49,
+                    true,
+                )
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| {
+            result.language.as_deref() == Some("csharp")
+                && result.provider.as_deref() == Some("csharp-ls")
+                && result.start_line >= 1
+        }));
+        assert_eq!(
+            results[0].relative_file_path.as_deref(),
+            Some("src/Calculator.cs")
+        );
+        if operation == "references" {
+            assert!(
+                results.iter().any(|result| {
+                    result.relative_file_path.as_deref() == Some("src/CallSite.cs")
+                })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn fake_csharp_lsp_correlates_responses_and_reuses_healthy_child() {
+    for mode in ["unsolicited", "stderr"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, workspace, state) = fake_csharp_fixture(&temp, mode);
+        let manager = Manager::new(&config);
+        for _ in 0..2 {
+            let results = manager
+                .csharp_symbols(&workspace, "Calculator")
+                .await
+                .unwrap();
+            assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+        }
+        assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    }
+}
+
+#[tokio::test]
+async fn fake_csharp_lsp_discards_failed_session_and_restarts_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) = fake_csharp_fixture(&temp, "restart-success");
+    let manager = Manager::new(&config);
+    let results = manager
+        .csharp_symbols(&workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+}
+
+#[tokio::test]
+async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() {
+    for mode in ["timeout", "malformed", "exit-during-request"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, workspace, state) = fake_csharp_fixture(&temp, mode);
+        let manager = Manager::new(&config);
+        let error = manager
+            .csharp_symbols(&workspace, "Calculator")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("timed out")
+                || message.contains("exited")
+                || message.contains("restart after"),
+            "unexpected {mode} error: {message}"
+        );
+        let expected_spawns = if mode == "timeout" { 1 } else { 2 };
+        assert_eq!(
+            state_count(&state, "spawn_count.txt"),
+            expected_spawns,
+            "unexpected spawn count for {mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("csharp-timeout");
+    let state = temp.path().join("csharp-timeout-state");
+    write(
+        &workspace,
+        "src/Calculator.cs",
+        "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n",
+    );
+    config.lsp_timeout_seconds = 1;
+    config.csharp = CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: vec![
+            "--mode".to_owned(),
+            "timeout".to_owned(),
+            "--state".to_owned(),
+            state.to_string_lossy().into_owned(),
+        ],
+        disabled: false,
+    };
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .search(&workspace, "Calculator Add", Some(4))
+        .await
+        .unwrap();
+    assert!(report.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "src/Calculator.cs" && hit.chunk.language == "csharp"
+    }));
+    assert!(
+        report
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("csharp-ls") && warning.contains("timed out")),
+        "unexpected warning: {:?}",
+        report.warning
+    );
+
+    let error = app
+        .definition(&workspace, "src/Calculator.cs", 2, 28)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected navigation error: {error:#}"
+    );
+    task.abort();
+}
 
 #[tokio::test]
 async fn typescript_javascript_only_search_skips_rust_analyzer() {

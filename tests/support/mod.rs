@@ -1,3 +1,5 @@
+pub mod fake_lsp;
+
 use axum::{
     Json, Router,
     extract::State,

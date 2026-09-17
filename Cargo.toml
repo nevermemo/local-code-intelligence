@@ -37,6 +37,10 @@ tree-sitter-typescript = "0.23"
 [dev-dependencies]
 tempfile = "3"
 
+[[bin]]
+name = "fake-lsp-server"
+path = "tests/support/fake_lsp_bin.rs"
+
 [profile.dev]
 debug = 0
 
