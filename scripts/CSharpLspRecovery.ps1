@@ -141,17 +141,10 @@ public sealed class Calculator : ICalculator
     Set-Stage 'start-serve'
     $stdoutPath = Join-Path $fixture 'serve.stdout.log'
     $stderrPath = Join-Path $fixture 'serve.stderr.log'
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $binary
-    $psi.Arguments = "--config `"$configPath`" serve"
-    $psi.WorkingDirectory = $fixture
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $lci = [System.Diagnostics.Process]::new()
-    $lci.StartInfo = $psi
-    $lci.Start() | Out-Null
+    $lci = Start-Process -FilePath $binary `
+        -ArgumentList @('--config', $configPath, 'serve') `
+        -WorkingDirectory $fixture -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     $evidence.lci_pid = $lci.Id
     Save-Evidence
 
@@ -234,21 +227,24 @@ public sealed class Calculator : ICalculator
 
     $evidence.status = 'passed'
     Save-Evidence
-    Write-Host "PASS: C# LSP persistent-reuse and recovery acceptance. Evidence: $evidencePath"
 }
 catch {
     $evidence.status = 'failed'
     $evidence.failed_stage = $evidence.stage
     $evidence.error = $_.Exception.Message
     Save-Evidence
-    Write-Host "FAIL at stage '$($evidence.stage)': $($_.Exception.Message). Evidence: $evidencePath"
-    exit 1
 }
 finally {
     $evidence.stage = 'cleanup'
-    # Only ever terminate the process we started ourselves.
+    # Stop only the LCI process we started and its direct language-server
+    # children. Windows PowerShell does not expose Process.Kill(bool), so
+    # invoking that overload can silently leave the acceptance server alive.
     if ($lci -and -not $lci.HasExited) {
-        try { $lci.Kill($true) } catch {}
+        try {
+            @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($lci.Id)" -ErrorAction SilentlyContinue) |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        } catch {}
+        try { Stop-Process -Id $lci.Id -Force -ErrorAction SilentlyContinue } catch {}
         try { $lci.WaitForExit(5000) | Out-Null } catch {}
     }
     $evidence.cleanup.lci_removed = ($null -eq $lci) -or $lci.HasExited
@@ -260,5 +256,17 @@ finally {
         Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     $evidence.cleanup.data_removed = -not (Test-Path -LiteralPath $dataDir)
+    if (-not $evidence.cleanup.lci_removed -or -not $evidence.cleanup.fixture_removed -or -not $evidence.cleanup.data_removed) {
+        $evidence.status = 'failed'
+        $evidence.failed_stage = 'cleanup'
+        $evidence.error = "cleanup incomplete: lci_removed=$($evidence.cleanup.lci_removed), fixture_removed=$($evidence.cleanup.fixture_removed), data_removed=$($evidence.cleanup.data_removed)"
+    }
     Save-Evidence
 }
+
+if ($evidence.status -eq 'passed') {
+    Write-Host "PASS: C# LSP persistent-reuse and recovery acceptance. Evidence: $evidencePath"
+    exit 0
+}
+Write-Host "FAIL at stage '$($evidence.failed_stage)': $($evidence.error). Evidence: $evidencePath"
+exit 1

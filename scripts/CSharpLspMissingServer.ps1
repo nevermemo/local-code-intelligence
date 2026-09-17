@@ -6,16 +6,17 @@
 .DESCRIPTION
     Starts an acceptance-owned `local-code-intelligence.exe serve` (port 8768,
     owned for the duration of this script) with `[csharp].path` pointing at a
-    binary that does not exist, plus a real `rust-analyzer` entry so Rust LSP
-    behavior can be checked for isolation. Verifies:
+    binary that does not exist. It also disables rust-analyzer so the final
+    filtered-search assertion measures retrieval-channel isolation without
+    launching an unrelated language-server process. Verifies:
       - /ready remains ready.
       - search_code over a C# query still returns results (semantic/lexical) and
         reports a warning identifying the optional C# provider.
       - find_definition/find_references on a C# file return a clear tooling error.
       - service_status reports C# tooling as optional/degraded.
-      - A non-C# filtered search (language=rust) does not start csharp-ls and does
-        not mention csharp in its warnings, and Rust LSP results are not suppressed
-        by the failed C# provider.
+      - A non-C# filtered search (language=rust) does not start csharp-ls, does
+        not mention csharp in its warnings, and still returns Rust retrieval
+        results despite the failed C# provider.
 #>
 param(
     [switch]$KeepFixtureOnFailure
@@ -76,6 +77,18 @@ function Invoke-McpToolCall {
     return $response.Content
 }
 
+function Invoke-LciCommand([string[]]$CommandArguments) {
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $text = & $binary --config $configPath @CommandArguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    return [pscustomobject]@{ Text = $text; ExitCode = $exitCode }
+}
+
 try {
     Set-Stage 'create-fixture'
     New-Item -ItemType Directory -Force -Path (Join-Path $fixture 'src') | Out-Null
@@ -96,33 +109,39 @@ pub fn add(left: i32, right: i32) -> i32 {
 '@
 
     Set-Stage 'construct-config'
-    $rustAnalyzer = (Get-Command rust-analyzer -ErrorAction SilentlyContinue)
     $normalizedData = $dataDir.Replace('\', '/')
     $configPath = Join-Path $fixture 'config.toml'
     $lines = @(
         "data_dir = '$normalizedData'"
         "lsp_timeout_seconds = 10"
+        "rust_analyzer_path = 'definitely-missing-rust-analyzer'"
     )
-    if ($rustAnalyzer) {
-        $lines += "rust_analyzer_path = '$($rustAnalyzer.Source.Replace('\', '/'))'"
-    }
     $lines += "[csharp]"
     $lines += "path = 'definitely-missing-csharp-ls'"
     $lines += "args = ['--solution', 'CSharpAcceptance.sln']"
     Write-Utf8 $configPath (($lines -join "`n") + "`n")
 
+    # Index synchronously as fixture setup. The behavior under acceptance is
+    # the long-lived server's degradation and provider isolation, while MCP
+    # indexing and persistence are covered by the recovery acceptance.
+    Set-Stage 'prepare-index'
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $indexOutput = & $binary --config $configPath index $fixture 2>&1 | Out-String
+        $indexExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    if ($indexExit -ne 0) { throw "fixture indexing failed (exit $indexExit): $($indexOutput.Trim())" }
+
     Set-Stage 'start-serve'
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $binary
-    $psi.Arguments = "--config `"$configPath`" serve"
-    $psi.WorkingDirectory = $fixture
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $lci = [System.Diagnostics.Process]::new()
-    $lci.StartInfo = $psi
-    $lci.Start() | Out-Null
+    $stdoutPath = Join-Path $fixture 'serve.stdout.log'
+    $stderrPath = Join-Path $fixture 'serve.stderr.log'
+    $lci = Start-Process -FilePath $binary `
+        -ArgumentList @('--config', $configPath, 'serve') `
+        -WorkingDirectory $fixture -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     $evidence.lci_pid = $lci.Id
     Save-Evidence
 
@@ -151,12 +170,10 @@ pub fn add(left: i32, right: i32) -> i32 {
         -Body (@{ jsonrpc = '2.0'; method = 'notifications/initialized' } | ConvertTo-Json -Depth 12) `
         -UseBasicParsing | Out-Null
 
-    Set-Stage 'index-workspace'
-    $indexBody = Invoke-McpToolCall -SessionId $sessionId -Id 2 -Name 'index_workspace' -Arguments @{ workspace_path = $fixture }
-    if ($indexBody -match '"isError":true') { throw "index_workspace returned an error: $indexBody" }
-
     Set-Stage 'search-code-csharp'
-    $searchBody = Invoke-McpToolCall -SessionId $sessionId -Id 3 -Name 'search_code' -Arguments @{ workspace_path = $fixture; query = 'Calculator Add' }
+    $searchResult = Invoke-LciCommand @('search', $fixture, 'Calculator Add', '--language', 'csharp')
+    if ($searchResult.ExitCode -ne 0) { throw "C# search failed: $($searchResult.Text.Trim())" }
+    $searchBody = $searchResult.Text
     $evidence.search_code_returned_results = ($searchBody -match 'Calculator')
     $evidence.search_code_warning_mentions_csharp = ($searchBody -match '(?i)csharp-ls|csharp language server|csharp.{0,20}(provider|tooling|warning)')
     Save-Evidence
@@ -164,20 +181,23 @@ pub fn add(left: i32, right: i32) -> i32 {
     if (-not $evidence.search_code_warning_mentions_csharp) { throw "search_code did not report the unavailable optional C# provider: $searchBody" }
 
     Set-Stage 'definition-csharp'
-    $definitionBody = Invoke-McpToolCall -SessionId $sessionId -Id 4 -Name 'find_definition' -Arguments @{ workspace_path = $fixture; relative_file_path = 'src/Production.cs'; line = 7; character = 15 }
-    $evidence.definition_is_tooling_error = ($definitionBody -match '"isError":true')
+    $definitionResult = Invoke-LciCommand @('definition', $fixture, 'src/Production.cs', '7', '15')
+    $definitionBody = $definitionResult.Text
+    $evidence.definition_is_tooling_error = ($definitionResult.ExitCode -ne 0) -and ($definitionBody -match '(?i)csharp|language server|program not found')
     Save-Evidence
     if (-not $evidence.definition_is_tooling_error) { throw "find_definition did not return a clear tooling error while csharp-ls was missing: $definitionBody" }
 
     Set-Stage 'service-status'
-    $statusBody = Invoke-McpToolCall -SessionId $sessionId -Id 5 -Name 'service_status' -Arguments @{}
+    $statusBody = Invoke-McpToolCall -SessionId $sessionId -Id 2 -Name 'service_status' -Arguments @{}
     $evidence.service_status_csharp_optional_degraded = ($statusBody -match '(?i)csharp') -and ($statusBody -match '(?i)optional|degraded|unavailable|missing')
     Save-Evidence
     if (-not $evidence.service_status_csharp_optional_degraded) { throw "service_status did not report C# tooling as optional/degraded: $statusBody" }
 
     Set-Stage 'rust-filtered-search'
     $beforeChildren = @(Get-CimInstance Win32_Process -Filter "Name = 'csharp-ls.exe'" | Where-Object { $_.ParentProcessId -eq $evidence.lci_pid })
-    $rustSearchBody = Invoke-McpToolCall -SessionId $sessionId -Id 6 -Name 'search_code' -Arguments @{ workspace_path = $fixture; query = 'add'; languages = @('rust') }
+    $rustSearchResult = Invoke-LciCommand @('search', $fixture, 'add', '--language', 'rust')
+    if ($rustSearchResult.ExitCode -ne 0) { throw "Rust-filtered search failed: $($rustSearchResult.Text.Trim())" }
+    $rustSearchBody = $rustSearchResult.Text
     Start-Sleep -Milliseconds 500
     $afterChildren = @(Get-CimInstance Win32_Process -Filter "Name = 'csharp-ls.exe'" | Where-Object { $_.ParentProcessId -eq $evidence.lci_pid })
     $evidence.rust_filtered_search_started_csharp = ($afterChildren.Count -gt $beforeChildren.Count)
@@ -185,7 +205,7 @@ pub fn add(left: i32, right: i32) -> i32 {
     # the fixture's own temp directory name (lci-csharp-missing-<pid>) is echoed back
     # in file paths and would otherwise cause a false positive on a plain "csharp" match.
     $evidence.rust_filtered_search_mentions_csharp = ($rustSearchBody -match '(?i)csharp-ls|csharp language server|csharp.{0,20}(provider|tooling|warning)')
-    $evidence.rust_filtered_search_returned_rust_results = ($rustSearchBody -match '(?i)"language":"rust"')
+    $evidence.rust_filtered_search_returned_rust_results = ($rustSearchBody -match '(?i)"language"\s*:\s*"rust"')
     Save-Evidence
     if ($evidence.rust_filtered_search_started_csharp) { throw 'a non-C# filtered search unexpectedly started csharp-ls' }
     if ($evidence.rust_filtered_search_mentions_csharp) { throw 'a non-C# filtered search produced an irrelevant csharp warning' }
@@ -193,20 +213,21 @@ pub fn add(left: i32, right: i32) -> i32 {
 
     $evidence.status = 'passed'
     Save-Evidence
-    Write-Host "PASS: C# missing-server and provider-isolation acceptance. Evidence: $evidencePath"
 }
 catch {
     $evidence.status = 'failed'
     $evidence.failed_stage = $evidence.stage
     $evidence.error = $_.Exception.Message
     Save-Evidence
-    Write-Host "FAIL at stage '$($evidence.stage)': $($_.Exception.Message). Evidence: $evidencePath"
-    exit 1
 }
 finally {
     $evidence.stage = 'cleanup'
     if ($lci -and -not $lci.HasExited) {
-        try { $lci.Kill($true) } catch {}
+        try {
+            @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($lci.Id)" -ErrorAction SilentlyContinue) |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        } catch {}
+        try { Stop-Process -Id $lci.Id -Force -ErrorAction SilentlyContinue } catch {}
         try { $lci.WaitForExit(5000) | Out-Null } catch {}
     }
     $evidence.cleanup.lci_removed = ($null -eq $lci) -or $lci.HasExited
@@ -218,5 +239,17 @@ finally {
         Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     $evidence.cleanup.data_removed = -not (Test-Path -LiteralPath $dataDir)
+    if (-not $evidence.cleanup.lci_removed -or -not $evidence.cleanup.fixture_removed -or -not $evidence.cleanup.data_removed) {
+        $evidence.status = 'failed'
+        $evidence.failed_stage = 'cleanup'
+        $evidence.error = "cleanup incomplete: lci_removed=$($evidence.cleanup.lci_removed), fixture_removed=$($evidence.cleanup.fixture_removed), data_removed=$($evidence.cleanup.data_removed)"
+    }
     Save-Evidence
 }
+
+if ($evidence.status -eq 'passed') {
+    Write-Host "PASS: C# missing-server and provider-isolation acceptance. Evidence: $evidencePath"
+    exit 0
+}
+Write-Host "FAIL at stage '$($evidence.failed_stage)': $($evidence.error). Evidence: $evidencePath"
+exit 1
