@@ -1,7 +1,7 @@
 ---
 name: LCI test and acceptance evidence
 description: Testing rules for unit, integration, evaluation, and live acceptance work.
-applyTo: "{src/**/*test*.rs,tests/**/*.rs,scripts/Acceptance*.ps1,evaluations/**/*}"
+applyTo: "{src/**/*test*.rs,tests/**/*.rs,xtask/src/acceptance/**/*.rs,evaluations/**/*}"
 ---
 
 - Test observable contracts and failure recovery. Avoid tests that merely reproduce the implementation or match documentation wording.

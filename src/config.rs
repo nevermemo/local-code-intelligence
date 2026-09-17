@@ -105,11 +105,12 @@ impl CSharpLspConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-            .unwrap_or_default();
+        // Per-OS local data directory: %LOCALAPPDATA% on Windows,
+        // ~/Library/Application Support on macOS, $XDG_DATA_HOME or
+        // ~/.local/share on Linux. Falls back to an empty relative path when
+        // none of those resolve (rare: no home directory available), which
+        // `validate()` rejects via its `data_dir.is_absolute()` check.
+        let base = dirs::data_local_dir().unwrap_or_default();
         Self {
             embedding_url: "http://localhost:8766/v1".into(),
             embedding_model: "qwen3-embedding-4b".into(),
@@ -150,7 +151,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.data_dir.is_absolute(),
-            "data_dir must be absolute; set it explicitly if LOCALAPPDATA is unavailable"
+            "data_dir must be absolute; set it explicitly if the platform's local data directory is unavailable"
         );
         ensure!(
             (1..=200).contains(&self.semantic_candidate_count)

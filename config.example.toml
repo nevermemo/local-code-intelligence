@@ -3,7 +3,9 @@ embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
 reranker_model = "qwen3-reranker-4b"
 default_top_k = 8
-# Defaults to %LOCALAPPDATA%\local-code-intelligence on Windows.
+# Defaults to the OS-native local data directory joined with
+# "local-code-intelligence": %LOCALAPPDATA% on Windows, ~/Library/Application
+# Support on macOS, $XDG_DATA_HOME or ~/.local/share on Linux.
 # Must be outside every workspace you index.
 # data_dir = 'C:\Users\you\AppData\Local\local-code-intelligence'
 embedding_batch_size = 8

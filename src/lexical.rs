@@ -287,4 +287,37 @@ mod tests {
         );
         assert_eq!(resolved, PathBuf::from("rg"));
     }
+
+    #[test]
+    fn resolves_ripgrep_from_path_on_non_windows() {
+        // On non-Windows, only the bare `rg` name is tried (no `.exe`
+        // variant), and the Windows-only VS Code bundle probe is skipped
+        // entirely even when local_app_data/program_files are supplied.
+        let temp = TempDir::new().unwrap();
+        let path_rg = temp.path().join("rg");
+        std::fs::write(&path_rg, b"").unwrap();
+        let resolved = resolve_ripgrep_path_from(
+            "rg",
+            Some(temp.path().as_os_str()),
+            Some(temp.path().as_os_str()),
+            Some(temp.path().as_os_str()),
+            false,
+        );
+        assert_eq!(resolved, path_rg);
+    }
+
+    #[test]
+    fn does_not_probe_vscode_bundle_on_non_windows() {
+        let temp = TempDir::new().unwrap();
+        let bundled = temp
+            .path()
+            .join("Programs/Microsoft VS Code/resources/app")
+            .join("node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+
+        let resolved =
+            resolve_ripgrep_path_from("rg", None, Some(temp.path().as_os_str()), None, false);
+        assert_eq!(resolved, PathBuf::from("rg"));
+    }
 }

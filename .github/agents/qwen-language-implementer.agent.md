@@ -18,7 +18,7 @@ Work only on the bounded task given by the parent agent. Read explicitly named f
 
 Preserve these architectural boundaries:
 
-- The application is a standalone Windows-native Rust MCP service.
+- The application is a standalone, cross-platform (Windows/macOS/Linux) Rust MCP service.
 - It must remain independent of Kilo, GitHub Copilot, and editor internals.
 - It owns its embedded LanceDB index.
 - Persistent data remains outside indexed repositories.

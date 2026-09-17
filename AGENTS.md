@@ -1,6 +1,6 @@
 # local-code-intelligence agent guidance
 
-This repository builds a standalone, Windows-native Rust MCP service for reusable code retrieval. Keep it independent of Kilo, GitHub Copilot, Codex, and other clients. The service owns its indexes and stores persistent data outside indexed repositories.
+This repository builds a standalone, cross-platform (Windows/macOS/Linux) Rust MCP service for reusable code retrieval. Keep it independent of Kilo, GitHub Copilot, Codex, and other clients. The service owns its indexes and stores persistent data outside indexed repositories. Dev/build/test/acceptance tasks run through the `xtask` crate (`cargo xtask <command>`), not shell scripts, so the workflow stays portable across operating systems.
 
 ## Boundaries
 

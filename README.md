@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-Windows-native Rust, TypeScript, JavaScript, Python, and C# code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
+Cross-platform (Windows, macOS, Linux) Rust, TypeScript, JavaScript, Python, and C# code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
 
 Supported source extensions and result language identifiers are exact and case-sensitive:
 
@@ -23,14 +23,16 @@ TypeScript, JavaScript, Python, and C# always have Tree-sitter syntax indexing a
 
 ## Build and run
 
-Build prerequisites are Rust stable 1.91 or newer, the MSVC C++ build tools/Windows SDK, CMake, and `protoc`; the setup script downloads the official Windows `protoc` binary into `.tools` inside this project. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. C# navigation optionally needs a standalone `csharp-ls` executable; it is not bundled or installed by LCI. No Python environment or database server is required.
+Build prerequisites are Rust stable 1.91 or newer, a C/C++ toolchain (MSVC + Windows SDK on Windows; a system compiler on macOS/Linux), CMake, and `protoc`. `cargo xtask setup` auto-downloads and verifies the official `protoc` release on Windows; on macOS/Linux it checks `PATH` for `protoc`/`cmake` and prints an install hint (`brew install protobuf cmake`, `apt install protobuf-compiler cmake`, etc.) if either is missing. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. C# navigation optionally needs a standalone `csharp-ls` executable; it is not bundled or installed by LCI. No Python environment or database server is required.
 
-```powershell
-cd C:\Users\micro\Desktop\local-code-intelligence
-.\scripts\Setup-BuildTools.ps1
+All dev/build/test/acceptance tasks run through the `xtask` crate (`cargo xtask <command>`) instead of shell scripts, so the workflow is identical on Windows, macOS, and Linux:
+
+```bash
+cd local-code-intelligence
+cargo xtask setup
 rustup component add rust-analyzer rust-src
-.\scripts\Build.ps1 -Test
-.\target\debug\local-code-intelligence.exe serve
+cargo xtask build --test
+./target/debug/local-code-intelligence serve   # local-code-intelligence.exe on Windows
 ```
 
 The first build compiles LanceDB and its dependencies and can take several minutes. Subsequent builds reuse Cargo's cache.
@@ -43,17 +45,17 @@ The executable serves:
 - Health: `http://127.0.0.1:8768/health`
 - Readiness: `http://127.0.0.1:8768/ready`
 
-Smoke test from another PowerShell window:
+Smoke test from another terminal:
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8768/health
+```bash
+curl http://127.0.0.1:8768/health
 ```
 
 The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation and supports session-based older clients as well as the SDK's current protocol. `/health` is a cheap process-liveness check and never contacts model services. `/ready` and the MCP `service_status` tool return the same bounded dependency report. They return HTTP 200 when a new semantic index can be created, even if optional channels are degraded, and `/ready` returns HTTP 503 when a required dependency is unavailable. Ctrl+C stops the server.
 
 ## Configuration
 
-Defaults work with the services specified for this project. Copy `config.example.toml` to `config.toml` to override them, then pass `--config .\config.toml` before or after a subcommand. Configuration files are read only when explicitly supplied. Unknown fields are errors.
+Defaults work with the services specified for this project. Copy `config.example.toml` to `config.toml` to override them, then pass `--config config.toml` before or after a subcommand. Configuration files are read only when explicitly supplied. Unknown fields are errors.
 
 | Setting | Default |
 | --- | --- |
@@ -61,7 +63,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | `embedding_model` | `qwen3-embedding-4b` |
 | `reranker_url` | `http://localhost:8767/rerank` |
 | `reranker_model` | `qwen3-reranker-4b` |
-| `data_dir` | `%LOCALAPPDATA%\local-code-intelligence` on Windows |
+| `data_dir` | OS-native local data dir + `local-code-intelligence`: `%LOCALAPPDATA%\local-code-intelligence` (Windows), `~/Library/Application Support/local-code-intelligence` (macOS), `$XDG_DATA_HOME` or `~/.local/share/local-code-intelligence` (Linux) |
 | `default_top_k` | 8 (allowed: 1–40) |
 | `embedding_batch_size` | 8 |
 | `embedding_timeout_seconds` | 120 per batch |
@@ -134,19 +136,19 @@ The first applicable Rust or C# LSP request for a workspace starts one long-live
 
 The CLI calls the same application logic and is useful for testing without configuring an editor. Use it while the server is stopped to avoid concurrent processes writing the same data directory.
 
-```powershell
-$lci = '.\target\debug\local-code-intelligence.exe'
-$gust = 'C:\Users\micro\Desktop\gpu-dialect-v0'
-& $lci index $gust
-& $lci status $gust
-& $lci search $gust 'lower syn AST expressions into generated Slang compute shader code'
-& $lci symbols $gust 'emit_expression#'
-& $lci definition $gust 'crates/gust-macros/src/slang/mod.rs' 266 24
-& $lci references $gust 'crates/gust-macros/src/slang/mod.rs' 581 8 --include-declaration
-& $lci index $gust
+```bash
+lci=./target/debug/local-code-intelligence   # local-code-intelligence.exe on Windows
+gust=/path/to/gpu-dialect-v0
+"$lci" index "$gust"
+"$lci" status "$gust"
+"$lci" search "$gust" 'lower syn AST expressions into generated Slang compute shader code'
+"$lci" symbols "$gust" 'emit_expression#'
+"$lci" definition "$gust" 'crates/gust-macros/src/slang/mod.rs' 266 24
+"$lci" references "$gust" 'crates/gust-macros/src/slang/mod.rs' 581 8 --include-declaration
+"$lci" index "$gust"
 ```
 
-The second indexing pass should report zero new embeddings if source and model configuration are unchanged. GUST's actual translator is under `crates/gust-macros/src/slang`; inspect the returned source, not just path names. `scripts/Acceptance.ps1` saves the index, query, and repeat-index reports and checks that a majority of top-eight results are actual Slang translator implementation chunks, including the expression translator.
+The second indexing pass should report zero new embeddings if source and model configuration are unchanged. GUST's actual translator is under `crates/gust-macros/src/slang`; inspect the returned source, not just path names. `cargo xtask acceptance core` saves the index, query, and repeat-index reports and checks that a majority of top-eight results are actual Slang translator implementation chunks, including the expression translator.
 
 Search accepts repeatable `--language`, `--include-path`, `--exclude-path`, and `--source-role` filters. Path filters are case-sensitive repository-relative globs: `*` and `?` stay within one path component, while `**` crosses directories. Absolute paths, backslashes, traversal components, empty patterns, and malformed globs are rejected. An explicitly empty include list is a valid filter that returns no results. Requested filters are applied to every retrieval channel and reported back as effective filters; no result may bypass them.
 
@@ -154,26 +156,28 @@ Each result includes a deterministic source role. Classification precedence is g
 
 Run the portable retrieval evaluation with the same application search path:
 
-```powershell
-& $lci evaluate .\evaluations\core.toml `
-  --workspace "self=$PWD" `
-  --workspace "gust=C:\Users\micro\Desktop\gpu-dialect-v0" `
-  --output .\test-results\evaluation.json
+```bash
+"$lci" evaluate ./evaluations/core.toml \
+  --workspace "self=$PWD" \
+  --workspace "gust=/path/to/gpu-dialect-v0" \
+  --output ./test-results/evaluation.json
 ```
 
 Workspace mappings are supplied at runtime, so checked-in definitions contain no machine-specific absolute paths. The GUST workspace is optional; its queries are explicitly skipped when no mapping is supplied. Without `--output`, JSON is written to stdout. A required missing workspace, search error, expected-path miss, wrong expected role, or missing required snippet produces a failed query and a nonzero process exit after the JSON report is emitted. Valid optional skips do not fail the run.
 
 Reports contain bounded path, line-range, role, rank, score, and preview evidence; per-query hit@1, hit@3, hit@8, reciprocal rank, preference/disfavor counts, role distribution, reranker state, timings, lifecycle, and effective filters; and aggregate hit rates, MRR, median/p95 latency, fallback count, and created/reused/waited index counts. Generated reports belong under `test-results` and are not committed. Evaluation reuses compatible persisted indexes and preserves the existing first-search lifecycle behavior. It calls only the configured embedding and reranking services, whose defaults are ports 8766 and 8767; application paths never contact port 8765.
 
-`scripts/Acceptance-Lsp.ps1` independently checks workspace-symbol, definition, and reference navigation against the same translator and saves each normalized response in `test-results`.
+`cargo xtask acceptance lsp` independently checks workspace-symbol, definition, and reference navigation against the same translator and saves each normalized response in `test-results`.
 
 With the real embedding and reranking services running on ports 8766 and 8767, the mixed-language acceptance creates a disposable fixture and data directory under `test-results`, uses the actual debug binary, and never contacts port 8765:
 
-```powershell
-.\scripts\Acceptance-Multilingual.ps1
+```bash
+cargo xtask acceptance multilingual
 ```
 
-It verifies all supported language IDs, semantic and lexical retrieval with live reranking, production TypeScript, Python, and C# ranking over test decoys, zero-work unchanged indexing, one-file invalidation, deletion, restart reuse, and prior-snapshot retrieval after a deliberately unreachable embedding endpoint causes an update to fail. Reports are written as `test-results\multilingual-*.json`.
+It verifies all supported language IDs, semantic and lexical retrieval with live reranking, production TypeScript, Python, and C# ranking over test decoys, zero-work unchanged indexing, one-file invalidation, deletion, restart reuse, and prior-snapshot retrieval after a deliberately unreachable embedding endpoint causes an update to fail. Reports are written as `test-results/multilingual-*.json`.
+
+C# language-server acceptance is split across three more subcommands: `cargo xtask acceptance csharp-lsp` (real `dotnet` fixture + `csharp-ls`, plus `--probe-only` for a standalone JSON-RPC protocol probe with no LCI binary involved), `cargo xtask acceptance csharp-missing` (provider-isolation/degradation when `csharp-ls` is unavailable), and `cargo xtask acceptance csharp-recovery` (persistent process reuse and forced-kill recovery). Each requires `dotnet` and `csharp-ls` on `PATH` and skips gracefully (printing `PREREQUISITE_UNAVAILABLE`) when they're missing.
 
 ## Retrieval and persistence behavior
 
@@ -193,7 +197,7 @@ Query: <query>
 8. Deduplicate and fuse semantic, lexical, and LSP ranks with Reciprocal Rank Fusion. Results expose channel ranks, lexical match count, fusion score, and retrieval channels.
 9. Rerank the configured fused shortlist. Semantic, lexical, and Rust LSP channels fail independently; available channels continue. If reranking fails, return fusion order with a warning.
 
-When `ripgrep_path` is the default `rg` or `rg.exe`, Windows resolution checks `PATH` first and then common per-user and system-wide VS Code, VS Code Insiders, and VSCodium installations, including versioned application directories. Any other configured value is treated as an explicit command or path and is used unchanged. If ripgrep cannot be started, lexical retrieval fails open and the warning explains how to set `ripgrep_path`.
+When `ripgrep_path` is the default `rg` or `rg.exe`, resolution checks `PATH` first. On Windows, if `rg` isn't on `PATH`, it also checks common per-user and system-wide VS Code, VS Code Insiders, and VSCodium installations, including versioned application directories, since Windows users are less likely to have a system-wide ripgrep install than macOS/Linux users with a package manager. Any other configured value is treated as an explicit command or path and is used unchanged. If ripgrep cannot be started, lexical retrieval fails open and the warning explains how to set `ripgrep_path`.
 
 Embedding response indices are validated and reordered; vectors must have consistent dimensions, finite values, and nonzero norm. Changing an embedding URL/model requires reindexing. Replacing a model behind an unchanged name/URL is not detectable automatically; use a distinct configured model name or a new data directory for that change.
 
@@ -214,13 +218,11 @@ JSON timing fields measure query embedding, LanceDB search, lexical search, Rust
 
 There is no BM25, editor-specific integration, Docker setup, generation proxy, or web frontend yet. Later candidate sources can join the same fusion boundary before reranking.
 
-```powershell
-.\scripts\Build.ps1 -Test
-cargo fmt --all --check
-$env:PROTOC = Join-Path (Get-Location) '.tools\protoc\bin\protoc.exe'
-cargo clippy --locked --all-targets -j 8 -- -D warnings
+```bash
+cargo xtask build --test
+cargo xtask test --suite Full
 ```
 
-For focused iteration, `scripts/Test.ps1 -Suite <name>` runs the matching test modules: `Unit`, `Chunk`, `Filter`, `Evaluation`, `Indexing`, `Readiness`, `MCP`, `Watching`, `LSP`, or `Full`. The integration suites filter the single `tests/integration.rs` binary by the module names registered there (`evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `watching`); [docs/development/testing.md](docs/development/testing.md) maps each change to its suite.
+`cargo xtask test --suite Full` runs `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` in sequence, setting `PROTOC` from `.tools/protoc` when the auto-downloaded copy is present. For focused iteration, `cargo xtask test --suite <name>` runs the matching test modules: `Unit`, `Chunk`, `Filter`, `Evaluation`, `Indexing`, `Readiness`, `Mcp`, `Watching`, `Lsp`, or `Full`. The integration suites filter the single `tests/integration.rs` binary by the module names registered there (`evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `watching`); [docs/development/testing.md](docs/development/testing.md) maps each change to its suite.
 
 Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all seven language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, and actual Streamable HTTP initialization/tool discovery. Live GUST and multilingual acceptance use the real local Qwen services separately.

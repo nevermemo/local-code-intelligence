@@ -5,18 +5,19 @@ the full deterministic gates once after the complete change is ready.
 
 | Change | Focused command |
 | --- | --- |
-| Chunking or scanning | `scripts/Test.ps1 -Suite Chunk` |
-| Retrieval filters or source roles | `scripts/Test.ps1 -Suite Filter` |
-| Evaluation definitions or metrics | `scripts/Test.ps1 -Suite Evaluation` |
-| Index lifecycle or persistence | `scripts/Test.ps1 -Suite Indexing` |
-| Readiness and health | `scripts/Test.ps1 -Suite Readiness` |
-| MCP transport and tools | `scripts/Test.ps1 -Suite MCP` |
-| Watched refresh | `scripts/Test.ps1 -Suite Watching` |
-| LSP/navigation behavior | `scripts/Test.ps1 -Suite LSP` |
+| Chunking or scanning | `cargo xtask test --suite Chunk` |
+| Retrieval filters or source roles | `cargo xtask test --suite Filter` |
+| Evaluation definitions or metrics | `cargo xtask test --suite Evaluation` |
+| Index lifecycle or persistence | `cargo xtask test --suite Indexing` |
+| Readiness and health | `cargo xtask test --suite Readiness` |
+| MCP transport and tools | `cargo xtask test --suite Mcp` |
+| Watched refresh | `cargo xtask test --suite Watching` |
+| LSP/navigation behavior | `cargo xtask test --suite Lsp` |
 
-`scripts/Test.ps1 -Suite Full` runs formatting, all workspace tests, and Clippy.
-Live model acceptance remains separate because it depends on locally running
-services. Generated reports belong under `test-results` and are never committed.
+`cargo xtask test --suite Full` runs formatting, all workspace tests, and Clippy.
+Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
+it depends on locally running services. Generated reports belong under
+`test-results` and are never committed.
 
 The integration cases remain one Cargo test binary. Their source is divided by
 behavior so agents can read and run a narrow group without paying the compile
