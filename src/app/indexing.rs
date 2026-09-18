@@ -44,6 +44,7 @@ pub struct Status {
     pub csharp_analyzer_running: bool,
     pub typescript_analyzer_running: bool,
     pub python_analyzer_running: bool,
+    pub go_analyzer_running: bool,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -289,6 +290,7 @@ impl App {
             .running("typescript-language-server", &workspace.id)
             .await;
         let python_analyzer_running = self.analyzer.running("pyright", &workspace.id).await;
+        let go_analyzer_running = self.analyzer.running("gopls", &workspace.id).await;
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -307,6 +309,7 @@ impl App {
             csharp_analyzer_running,
             typescript_analyzer_running,
             python_analyzer_running,
+            go_analyzer_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }

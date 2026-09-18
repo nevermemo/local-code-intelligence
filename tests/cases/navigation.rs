@@ -571,6 +571,58 @@ async fn python_only_search_and_navigation_keep_python_lsp_optional() {
 }
 
 #[tokio::test]
+async fn go_only_search_and_navigation_keep_go_lsp_optional() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("go-only");
+    write(
+        &workspace,
+        "revenue.go",
+        "package revenue\n\n// ComputeQuarterlyRevenueSummary sums quarterly revenue rows.\nfunc ComputeQuarterlyRevenueSummary(rows []int) int {\n\ttotal := 0\n\tfor _, row := range rows {\n\t\ttotal += row\n\t}\n\treturn total\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+    let indexed = app.index(&workspace).await.unwrap();
+    assert_eq!(indexed.files, 1);
+    assert_eq!(indexed.parsed_files, 1);
+
+    let report = app
+        .search(&workspace, "ComputeQuarterlyRevenueSummary", Some(4))
+        .await
+        .unwrap();
+    assert_eq!(report.results[0].chunk.language, "go");
+    assert_eq!(report.results[0].chunk.relative_file_path, "revenue.go");
+    assert!(
+        report
+            .warning
+            .as_deref()
+            .is_none_or(|warning| !warning.contains("LSP")),
+        "unexpected warning: {:?}",
+        report.warning
+    );
+    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
+
+    let definition_error = app
+        .definition(&workspace, "revenue.go", 1, 0)
+        .await
+        .unwrap_err();
+    assert!(
+        definition_error.to_string().contains("gopls is disabled"),
+        "unexpected error: {definition_error}"
+    );
+    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
+
+    let references_error = app
+        .references(&workspace, "revenue.go", 1, 0, true)
+        .await
+        .unwrap_err();
+    assert!(
+        references_error.to_string().contains("gopls is disabled"),
+        "unexpected error: {references_error}"
+    );
+    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
+    task.abort();
+}
+
+#[tokio::test]
 async fn csharp_only_search_and_navigation_keep_csharp_lsp_optional() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("csharp-only");

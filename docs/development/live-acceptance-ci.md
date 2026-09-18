@@ -73,6 +73,7 @@ them for you:
 | `dotnet` + `csharp-ls` | `cargo xtask acceptance csharp-lsp/-missing/-recovery` | installed |
 | `pyright` (`pyright-langserver`) | `cargo xtask acceptance python-lsp/-missing/-recovery` | not installed -- `npm install -g pyright` |
 | `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | not installed -- `npm install -g typescript-language-server typescript` |
+| `go` + `gopls` | `cargo xtask acceptance go-lsp/-missing/-recovery` | installed (`go install golang.org/x/tools/gopls@latest`) |
 
 Every `*-lsp`/`*-missing`/`*-recovery` subcommand skips gracefully (prints
 `PREREQUISITE_UNAVAILABLE`) rather than failing when its tool isn't on

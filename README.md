@@ -16,7 +16,7 @@ Supported source extensions and result language identifiers are exact and case-s
 | `.go` | `go` | Tree-sitter Go |
 | `.java` | `java` | Tree-sitter Java |
 
-All nine languages always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`). Go and Java have syntax indexing and retrieval only; neither has a navigation server integration yet. None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session.
+All nine languages always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`); Go uses `gopls`. Java has syntax indexing and retrieval only; it has no navigation server integration yet. None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session. Go's `gopls` needs a `go.mod` at or above the workspace root to build its package graph; without one it degrades to a much weaker fallback (fail-open, same as every other adapter here -- LCI never writes one on the caller's behalf).
 
 ## Documentation
 
@@ -26,7 +26,7 @@ All nine languages always have Tree-sitter syntax indexing and retrieval regardl
 
 ## Build and run
 
-Build prerequisites are Rust stable 1.91 or newer, a C/C++ toolchain (MSVC + Windows SDK on Windows; a system compiler on macOS/Linux), CMake, and `protoc`. `cargo xtask setup` auto-downloads and verifies the official `protoc` release on Windows; on macOS/Linux it checks `PATH` for `protoc`/`cmake` and prints an install hint (`brew install protobuf cmake`, `apt install protobuf-compiler cmake`, etc.) if either is missing. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. C# navigation optionally needs a standalone `csharp-ls` executable. TypeScript/JavaScript navigation optionally needs `typescript-language-server` (`npm install -g typescript-language-server typescript`; the workspace itself also needs its own `typescript` dependency, same as any real TS/JS project). Python navigation optionally needs `pyright` (`npm install -g pyright`, providing `pyright-langserver`). None of these are bundled or installed by LCI. No Python environment or database server is required to build or run LCI itself.
+Build prerequisites are Rust stable 1.91 or newer, a C/C++ toolchain (MSVC + Windows SDK on Windows; a system compiler on macOS/Linux), CMake, and `protoc`. `cargo xtask setup` auto-downloads and verifies the official `protoc` release on Windows; on macOS/Linux it checks `PATH` for `protoc`/`cmake` and prints an install hint (`brew install protobuf cmake`, `apt install protobuf-compiler cmake`, etc.) if either is missing. Ripgrep is optional and fails open when unavailable. Rust navigation additionally needs the optional `rust-analyzer` and `rust-src` Rustup components. C# navigation optionally needs a standalone `csharp-ls` executable. TypeScript/JavaScript navigation optionally needs `typescript-language-server` (`npm install -g typescript-language-server typescript`; the workspace itself also needs its own `typescript` dependency, same as any real TS/JS project). Python navigation optionally needs `pyright` (`npm install -g pyright`, providing `pyright-langserver`). Go navigation optionally needs `gopls` (`go install golang.org/x/tools/gopls@latest`). None of these are bundled or installed by LCI. No Python environment or database server is required to build or run LCI itself.
 
 All dev/build/test/acceptance tasks run through the `xtask` crate (`cargo xtask <command>`) instead of shell scripts, so the workflow is identical on Windows, macOS, and Linux:
 
@@ -89,6 +89,9 @@ Defaults work with the services specified for this project. Copy `config.example
 | `[python].path` | unset (disabled) |
 | `[python].args` | `[]` (appended after the `--stdio` flag LCI always supplies) |
 | `[python].disabled` | `false` |
+| `[go].path` | unset (disabled) |
+| `[go].args` | `[]` (gopls needs no forced leading flag, unlike csharp-ls/typescript-language-server/pyright) |
+| `[go].disabled` | `false` |
 | `lsp_timeout_seconds` | 60 |
 | `lsp_candidate_count` | 40 |
 | `index.freshness` | `on-search` (allowed: `manual`, `on-search`, `watch`) |
@@ -111,8 +114,8 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `watch_workspace` | `workspace_path` | Start debounced polling and automatic reindexing for an indexed workspace |
 | `unwatch_workspace` | `workspace_path` | Stop automatic reindexing for a workspace |
 | `search_symbols` | `workspace_path`, `query` | Workspace symbols from applicable enabled Rust/C# language servers, with provider/language metadata |
-| `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations routed by `.rs`/`.cs` extension |
-| `find_references` | the definition arguments plus optional `include_declaration` | Reference locations routed by `.rs`/`.cs` extension |
+| `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations routed by extension to the matching language server |
+| `find_references` | the definition arguments plus optional `include_declaration` | Reference locations routed by extension to the matching language server |
 | `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, and index lifecycle metadata |
 | `service_status` | none | The same required/optional readiness report as `/ready` |
 
@@ -136,7 +139,7 @@ Once an index exists, the `[index]` `freshness` policy (default `on-search`) dec
 
 The search result's separate `index` object explains first-search latency. `action: created` means that request performed initial indexing, `waited_for_existing_job` means another concurrent request performed it, `refreshed_incrementally` means the search found and applied a staleness refresh before continuing, and `reused` means a compatible, current-enough snapshot was already available. `wait_ms` covers index creation, refresh, or waiting and is zero or near zero for plain reuse; it does not overload retrieval-stage timing fields. Indexing is synchronous and finishes when the new index is persisted, so allow a long client tool timeout for a first search, an automatic refresh, or an explicit indexing pass. Index writes are serialized in the running service, with per-workspace read/write coordination. This version is intended for one running service per data directory; multiple clients should connect to that service.
 
-Readiness requires a writable application data directory, accessible embedded LanceDB storage, a reachable embedding endpoint, and the configured embedding model in its OpenAI-compatible model listing. Reranking, ripgrep, rust-analyzer, csharp-ls, typescript-language-server, and pyright are optional fail-open components. Readiness reports each language server independently; an absent one never disables syntax retrieval for its language. Dependency probes use `readiness_timeout_seconds`; readiness never downloads, starts, stops, or manages dependencies, and it never inspects or contacts the independent generation service on port 8765.
+Readiness requires a writable application data directory, accessible embedded LanceDB storage, a reachable embedding endpoint, and the configured embedding model in its OpenAI-compatible model listing. Reranking, ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, and gopls are optional fail-open components. Readiness reports each language server independently; an absent one never disables syntax retrieval for its language. Dependency probes use `readiness_timeout_seconds`; readiness never downloads, starts, stops, or manages dependencies, and it never inspects or contacts the independent generation service on port 8765.
 
 Watching is opt-in for each server run. It polls only after `watch_workspace`, debounces a detected source change, and calls the same safe indexing path. Watch registrations are not restored after a process restart; persistent indexes and manifests are. A failed automatic update is logged and retried after another poll while the prior LanceDB snapshot remains searchable.
 
@@ -190,7 +193,7 @@ It verifies all supported language IDs, semantic and lexical retrieval with live
 
 C# language-server acceptance is split across three more subcommands: `cargo xtask acceptance csharp-lsp` (real `dotnet` fixture + `csharp-ls`, plus `--probe-only` for a standalone JSON-RPC protocol probe with no LCI binary involved), `cargo xtask acceptance csharp-missing` (provider-isolation/degradation when `csharp-ls` is unavailable), and `cargo xtask acceptance csharp-recovery` (persistent process reuse and forced-kill recovery). Each requires `dotnet` and `csharp-ls` on `PATH` and skips gracefully (printing `PREREQUISITE_UNAVAILABLE`) when they're missing.
 
-TypeScript/JavaScript and Python follow the same three-subcommand pattern: `cargo xtask acceptance typescript-lsp` / `typescript-missing` / `typescript-recovery` against a real npm-scaffolded fixture and `typescript-language-server` (`--typescript-language-server <path>` overrides discovery), and `cargo xtask acceptance python-lsp` / `python-missing` / `python-recovery` against a real Python package fixture and `pyright` (`--pyright <path>` overrides discovery). Both skip gracefully when their server isn't found on `PATH`.
+TypeScript/JavaScript, Python, and Go follow the same three-subcommand pattern: `cargo xtask acceptance typescript-lsp` / `typescript-missing` / `typescript-recovery` against a real npm-scaffolded fixture and `typescript-language-server` (`--typescript-language-server <path>` overrides discovery); `cargo xtask acceptance python-lsp` / `python-missing` / `python-recovery` against a real Python package fixture and `pyright` (`--pyright <path>` overrides discovery); and `cargo xtask acceptance go-lsp` / `go-missing` / `go-recovery` against a real `go.mod`-rooted module and `gopls` (`--gopls <path>` overrides discovery). All three skip gracefully when their server isn't found on `PATH`.
 
 ## Retrieval and persistence behavior
 
@@ -206,7 +209,7 @@ Instruct: Given a code search query, retrieve relevant code passages that answer
 Query: <query>
 ```
 
-7. Retrieve semantic candidates with LanceDB cosine distance while ripgrep independently searches useful query terms across all supported extensions. For each language present in the filtered index, its enabled language server (rust-analyzer, csharp-ls, typescript-language-server, pyright) also searches workspace symbols. Map lexical lines to any indexed language and LSP locations only to same-language chunks.
+7. Retrieve semantic candidates with LanceDB cosine distance while ripgrep independently searches useful query terms across all supported extensions. For each language present in the filtered index, its enabled language server (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls) also searches workspace symbols. Map lexical lines to any indexed language and LSP locations only to same-language chunks.
 8. Deduplicate and fuse semantic, lexical, and LSP ranks with Reciprocal Rank Fusion. Results expose channel ranks, lexical match count, fusion score, and retrieval channels.
 9. Rerank the configured fused shortlist. Semantic, lexical, and Rust LSP channels fail independently; available channels continue. If reranking fails, return fusion order with a warning.
 
@@ -222,7 +225,7 @@ JSON timing fields measure query embedding, LanceDB search, lexical search, Rust
 - `language` / `chunk` / `manifest`: static language adapters, ignore-aware incremental scan, Tree-sitter chunks, and persistent per-file parse reuse.
 - `models`: embedding and reranking HTTP clients.
 - `lexical`: ripgrep-based lexical candidate channel.
-- `lsp`: the shared `LspAdapter` trait and JSON-RPC transport, plus one adapter module per optional language server (rust-analyzer, csharp-ls, typescript-language-server, pyright) and normalized navigation locations.
+- `lsp`: the shared `LspAdapter` trait and JSON-RPC transport, plus one adapter module per optional language server (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls) and normalized navigation locations.
 - `store`: embedded LanceDB schema, snapshot writes, cosine candidates.
 - `filter`: retrieval filter validation and deterministic source-role classification.
 - `evaluate`: portable evaluation definitions, execution, and metrics; it observes retrieval without changing ranking.

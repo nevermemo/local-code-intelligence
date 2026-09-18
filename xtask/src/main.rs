@@ -90,6 +90,18 @@ enum AcceptanceCommand {
         #[arg(long)]
         pyright: Option<PathBuf>,
     },
+    /// Real gopls acceptance (workspace symbols, definition, references).
+    GoLsp {
+        #[arg(long)]
+        gopls: Option<PathBuf>,
+    },
+    /// Go provider-isolation/degradation acceptance (missing gopls binary).
+    GoMissing,
+    /// Go LSP persistent-process reuse and forced-kill recovery acceptance.
+    GoRecovery {
+        #[arg(long)]
+        gopls: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -123,6 +135,9 @@ async fn main() -> Result<()> {
             AcceptanceCommand::PythonRecovery { pyright } => {
                 acceptance::python_recovery::run(pyright).await
             }
+            AcceptanceCommand::GoLsp { gopls } => acceptance::go_lsp::run(gopls).await,
+            AcceptanceCommand::GoMissing => acceptance::go_missing::run().await,
+            AcceptanceCommand::GoRecovery { gopls } => acceptance::go_recovery::run(gopls).await,
         },
     }
 }

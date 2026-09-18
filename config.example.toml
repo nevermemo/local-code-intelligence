@@ -51,6 +51,16 @@ lsp_candidate_count = 40
 # args = []
 # disabled = false
 
+# Optional Go language server (gopls, go install
+# golang.org/x/tools/gopls@latest). Optional and fail-open, same as csharp
+# above. Unlike csharp-ls/typescript-language-server/pyright, gopls needs no
+# forced leading transport flag -- stdio is its default communication mode.
+# Needs a go.mod at or above the workspace root to build its package graph.
+# [go]
+# path = "gopls"
+# args = []
+# disabled = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

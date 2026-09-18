@@ -75,6 +75,10 @@ pub struct Config {
     /// configuration keeps Python navigation disabled; syntax retrieval is
     /// unaffected.
     pub python: PythonLspConfig,
+    /// Optional Go language-server (gopls) settings. Absent or empty
+    /// configuration keeps Go navigation disabled; syntax retrieval is
+    /// unaffected.
+    pub go: GoLspConfig,
     pub index: IndexConfig,
 }
 
@@ -183,6 +187,43 @@ impl PythonLspConfig {
     }
 }
 
+/// Optional Go language-server (gopls) configuration.
+///
+/// Go navigation is optional and fail-open: an absent or empty `[go]`
+/// section keeps the server disabled without affecting syntax retrieval.
+/// The shared `lsp_timeout_seconds` and `lsp_candidate_count` settings apply
+/// to this server as well. Unlike csharp-ls/typescript-language-server/
+/// pyright, gopls needs no forced leading transport flag: stdio is its
+/// default communication mode with no `-mode`/`--stdio`-equivalent flag
+/// required (confirmed against `gopls help serve`, where `-mode` is
+/// documented as "no effect").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoLspConfig {
+    /// Path to the standalone gopls executable. `None` (the default) keeps
+    /// Go navigation disabled. An empty or whitespace-only value is
+    /// rejected by validation rather than silently counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to gopls.
+    pub args: Vec<String>,
+    /// Explicitly disable the Go server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl GoLspConfig {
+    /// Whether the Go language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Per-OS local data directory: %LOCALAPPDATA% on Windows,
@@ -215,6 +256,7 @@ impl Default for Config {
             csharp: CSharpLspConfig::default(),
             typescript: TypeScriptLspConfig::default(),
             python: PythonLspConfig::default(),
+            go: GoLspConfig::default(),
             index: IndexConfig::default(),
         }
     }
@@ -283,6 +325,14 @@ impl Config {
             ensure!(
                 !path.trim().is_empty(),
                 "python.path must be nonempty when set; omit it or set python.disabled = true to keep Python navigation disabled"
+            );
+        }
+        if !self.go.disabled
+            && let Some(path) = &self.go.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "go.path must be nonempty when set; omit it or set go.disabled = true to keep Go navigation disabled"
             );
         }
         ensure!(
@@ -404,5 +454,38 @@ mod tests {
             base_toml()
         );
         assert!(toml::from_str::<Config>(&toml_text).is_err());
+    }
+
+    #[test]
+    fn default_go_is_disabled() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(!config.go.enabled());
+        assert!(config.go.path.is_none());
+    }
+
+    #[test]
+    fn go_section_enables_server() {
+        let toml_text = format!("{}[go]\npath = \"gopls\"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(config.go.enabled());
+        assert_eq!(config.go.path.as_deref(), Some("gopls"));
+    }
+
+    #[test]
+    fn go_disabled_flag_overrides_path() {
+        let toml_text = format!("{}[go]\npath = \"gopls\"\ndisabled = true\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(!config.go.enabled());
+    }
+
+    #[test]
+    fn empty_go_path_is_rejected() {
+        let toml_text = format!("{}[go]\npath = \"   \"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("go.path"));
     }
 }
