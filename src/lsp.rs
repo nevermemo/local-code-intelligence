@@ -1,7 +1,10 @@
 use crate::{
     config::Config,
     language,
-    lsp::{adapter::LspAdapter, csharp::CSharpServer, rust::RustServer, transport::JsonRpcClient},
+    lsp::{
+        adapter::LspAdapter, csharp::CSharpServer, python::PythonServer, rust::RustServer,
+        transport::JsonRpcClient, typescript::TypeScriptServer,
+    },
     workspace::Workspace,
 };
 use anyhow::{Context, Result, anyhow};
@@ -16,8 +19,10 @@ use tokio::sync::Mutex;
 
 pub mod adapter;
 pub mod csharp;
+pub mod python;
 pub mod rust;
 pub mod transport;
+pub mod typescript;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct Location {
@@ -72,12 +77,12 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(config: &Config) -> Self {
+        let timeout = std::time::Duration::from_secs(config.lsp_timeout_seconds);
         let adapters: Vec<Arc<dyn LspAdapter>> = vec![
             Arc::new(RustServer::new(config)),
-            Arc::new(CSharpServer::new(
-                &config.csharp,
-                std::time::Duration::from_secs(config.lsp_timeout_seconds),
-            )),
+            Arc::new(CSharpServer::new(&config.csharp, timeout)),
+            Arc::new(TypeScriptServer::new(&config.typescript, timeout)),
+            Arc::new(PythonServer::new(&config.python, timeout)),
         ];
         Self {
             adapters,

@@ -27,6 +27,15 @@ pub struct FakeLspConfig {
     pub state_dir: Option<PathBuf>,
     pub process_id: Option<u32>,
     pub exit_code: Option<i32>,
+    /// Workspace-relative path used to build the primary canned location
+    /// (definition target, first symbol/reference result). Defaults to a C#
+    /// fixture path for backward compatibility; other adapters' tests pass
+    /// a path with their own extension so `locations_for`'s per-file
+    /// language derivation resolves to the language under test.
+    pub primary_file: String,
+    /// Workspace-relative path used to build the secondary canned location
+    /// (the second `references` result, the call site).
+    pub secondary_file: String,
 }
 
 pub fn run_from_env() -> io::Result<()> {
@@ -64,11 +73,17 @@ pub fn run_from_env() -> io::Result<()> {
             ));
         }
     };
+    let primary_file =
+        cli_arg(&cli, "--primary-file").unwrap_or_else(|| "src/Calculator.cs".to_string());
+    let secondary_file =
+        cli_arg(&cli, "--secondary-file").unwrap_or_else(|| "src/CallSite.cs".to_string());
     let config = FakeLspConfig {
         scenario,
         state_dir: state_path,
         process_id,
         exit_code: None,
+        primary_file,
+        secondary_file,
     };
     run_server(config)
 }
@@ -198,8 +213,8 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             // captured workspace root so results survive `locations_for`.
             let base = root_uri.as_deref().unwrap_or("file:///workspace/");
             let base = base.trim_end_matches('/');
-            let calc_uri = format!("{base}/src/Calculator.cs");
-            let call_uri = format!("{base}/src/CallSite.cs");
+            let calc_uri = format!("{base}/{}", config.primary_file);
+            let call_uri = format!("{base}/{}", config.secondary_file);
             match (config.scenario, method) {
                 (
                     FakeScenario::WorkspaceSymbols

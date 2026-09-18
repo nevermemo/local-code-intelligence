@@ -72,6 +72,8 @@ pub struct Status {
     pub watched: bool,
     pub analyzer_running: bool,
     pub csharp_analyzer_running: bool,
+    pub typescript_analyzer_running: bool,
+    pub python_analyzer_running: bool,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -408,6 +410,11 @@ impl App {
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let analyzer_running = self.analyzer.running("rust-analyzer", &workspace.id).await;
         let csharp_analyzer_running = self.analyzer.running("csharp-ls", &workspace.id).await;
+        let typescript_analyzer_running = self
+            .analyzer
+            .running("typescript-language-server", &workspace.id)
+            .await;
+        let python_analyzer_running = self.analyzer.running("pyright", &workspace.id).await;
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -424,6 +431,8 @@ impl App {
             watched,
             analyzer_running,
             csharp_analyzer_running,
+            typescript_analyzer_running,
+            python_analyzer_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }

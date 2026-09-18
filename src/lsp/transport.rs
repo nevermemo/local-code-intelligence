@@ -38,7 +38,7 @@ pub struct TransportConfig {
 /// field). When it returns `true`, the client is marked ready and waiters on
 /// [`wait_ready`](Self::wait_ready) are notified.
 pub struct JsonRpcClient {
-    stdin: Mutex<ChildStdin>,
+    stdin: Arc<Mutex<ChildStdin>>,
     child: Mutex<Child>,
     pending: Pending,
     next_id: AtomicU64,
@@ -78,9 +78,11 @@ impl JsonRpcClient {
             .stderr
             .take()
             .with_context(|| format!("{} stderr unavailable", config.label))?;
+        let stdin = Arc::new(Mutex::new(stdin));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let ready = Arc::new(tokio::sync::Notify::new());
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stdin = Arc::clone(&stdin);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
@@ -88,6 +90,7 @@ impl JsonRpcClient {
         tokio::spawn(async move {
             if let Err(error) = read_messages(
                 stdout,
+                reader_stdin,
                 reader_pending.clone(),
                 reader_ready,
                 reader_is_ready,
@@ -109,7 +112,7 @@ impl JsonRpcClient {
             }
         });
         Ok(Arc::new(Self {
-            stdin: Mutex::new(stdin),
+            stdin,
             child: Mutex::new(child),
             pending,
             next_id: AtomicU64::new(1),
@@ -175,15 +178,22 @@ impl JsonRpcClient {
     }
 
     async fn write(&self, value: &Value) -> Result<()> {
-        let body = serde_json::to_vec(value)?;
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-            .await?;
-        stdin.write_all(&body).await?;
-        stdin.flush().await?;
-        Ok(())
+        write_framed(&self.stdin, value).await
     }
+}
+
+/// Writes one Content-Length-framed JSON-RPC message. Shared by the client's
+/// own outgoing requests/notifications and the reader task's automatic
+/// responses to server-initiated requests (both write to the same stdin).
+async fn write_framed(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    let mut stdin = stdin.lock().await;
+    stdin
+        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+        .await?;
+    stdin.write_all(&body).await?;
+    stdin.flush().await?;
+    Ok(())
 }
 
 impl Drop for JsonRpcClient {
@@ -196,6 +206,7 @@ impl Drop for JsonRpcClient {
 
 async fn read_messages(
     stdout: tokio::process::ChildStdout,
+    stdin: Arc<Mutex<ChildStdin>>,
     pending: Pending,
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
@@ -220,13 +231,38 @@ async fn read_messages(
         let mut body = vec![0; length];
         reader.read_exact(&mut body).await?;
         let message: Value = serde_json::from_slice(&body)?;
+        let id = message.get("id").and_then(Value::as_u64);
+        let method = message.get("method").and_then(Value::as_str);
+        // A message with both an id and a method is a request FROM the
+        // server (e.g. pyright's `workspace/configuration`, or
+        // `client/registerCapability`), not a response to one of ours or a
+        // plain notification. A well-behaved client must answer these —
+        // some servers (pyright confirmed) block subsequent work while
+        // waiting for a reply that never comes otherwise. Answer generically
+        // with the conservative "no special configuration/capability"
+        // shape each known method expects; anything unrecognized gets a
+        // bare null result, which every server observed so far accepts.
+        if let (Some(id), Some(method)) = (id, method) {
+            let result = match method {
+                "workspace/configuration" => {
+                    let count = message["params"]["items"].as_array().map_or(1, Vec::len);
+                    Value::Array(vec![Value::Null; count])
+                }
+                _ => Value::Null,
+            };
+            let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+            if let Err(error) = write_framed(&stdin, &response).await {
+                tracing::warn!(error = %error, %method, "failed to answer server-initiated request");
+            }
+            continue;
+        }
         // Notifications (no id): evaluate readiness predicate.
-        if message.get("id").is_none() && ready_predicate(&message) {
+        if id.is_none() && ready_predicate(&message) {
             is_ready.store(true, Ordering::Release);
             ready.notify_waiters();
             ready.notify_one();
         }
-        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+        let Some(id) = id else {
             continue;
         };
         if let Some(sender) = pending.lock().await.remove(&id) {

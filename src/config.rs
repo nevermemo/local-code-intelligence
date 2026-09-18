@@ -67,6 +67,14 @@ pub struct Config {
     /// Optional C# language-server (csharp-ls) settings. Absent or empty
     /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
     pub csharp: CSharpLspConfig,
+    /// Optional TypeScript/JavaScript language-server
+    /// (typescript-language-server) settings. Absent or empty configuration
+    /// keeps TS/JS navigation disabled; syntax retrieval is unaffected.
+    pub typescript: TypeScriptLspConfig,
+    /// Optional Python language-server (pyright) settings. Absent or empty
+    /// configuration keeps Python navigation disabled; syntax retrieval is
+    /// unaffected.
+    pub python: PythonLspConfig,
     pub index: IndexConfig,
 }
 
@@ -91,6 +99,78 @@ pub struct CSharpLspConfig {
 
 impl CSharpLspConfig {
     /// Whether the C# language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
+/// Optional TypeScript/JavaScript language-server
+/// (typescript-language-server) configuration.
+///
+/// TS/JS navigation is optional and fail-open: an absent or empty
+/// `[typescript]` section keeps the server disabled without affecting
+/// syntax retrieval. The shared `lsp_timeout_seconds` and
+/// `lsp_candidate_count` settings apply to this server as well. One
+/// configured server navigates `.ts`, `.tsx`, `.js`, and `.jsx` files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TypeScriptLspConfig {
+    /// Path to the standalone typescript-language-server executable. `None`
+    /// (the default) keeps TS/JS navigation disabled. An empty or
+    /// whitespace-only value is rejected by validation rather than silently
+    /// counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to typescript-language-server, appended
+    /// after the `--stdio` flag this application always supplies.
+    pub args: Vec<String>,
+    /// Explicitly disable the TS/JS server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl TypeScriptLspConfig {
+    /// Whether the TypeScript/JavaScript language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
+/// Optional Python language-server (pyright) configuration.
+///
+/// Python navigation is optional and fail-open: an absent or empty
+/// `[python]` section keeps the server disabled without affecting syntax
+/// retrieval. The shared `lsp_timeout_seconds` and `lsp_candidate_count`
+/// settings apply to this server as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PythonLspConfig {
+    /// Path to the standalone pyright-langserver executable. `None` (the
+    /// default) keeps Python navigation disabled. An empty or
+    /// whitespace-only value is rejected by validation rather than silently
+    /// counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to pyright-langserver, appended after the
+    /// `--stdio` flag this application always supplies.
+    pub args: Vec<String>,
+    /// Explicitly disable the Python server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl PythonLspConfig {
+    /// Whether the Python language server is enabled.
     ///
     /// Enabled only when not explicitly disabled and a nonempty executable
     /// path is configured.
@@ -133,6 +213,8 @@ impl Default for Config {
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
             csharp: CSharpLspConfig::default(),
+            typescript: TypeScriptLspConfig::default(),
+            python: PythonLspConfig::default(),
             index: IndexConfig::default(),
         }
     }
@@ -176,14 +258,31 @@ impl Config {
             !self.rust_analyzer_path.trim().is_empty() && self.lsp_timeout_seconds > 0,
             "rust-analyzer path must be nonempty and LSP timeout must be positive"
         );
-        // An explicitly configured but empty C# path is malformed: it must be
-        // rejected rather than silently counting as enabled.
+        // An explicitly configured but empty C#/TypeScript/Python path is
+        // malformed: it must be rejected rather than silently counting as
+        // enabled.
         if !self.csharp.disabled
             && let Some(path) = &self.csharp.path
         {
             ensure!(
                 !path.trim().is_empty(),
                 "csharp.path must be nonempty when set; omit it or set csharp.disabled = true to keep C# tooling disabled"
+            );
+        }
+        if !self.typescript.disabled
+            && let Some(path) = &self.typescript.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "typescript.path must be nonempty when set; omit it or set typescript.disabled = true to keep TypeScript/JavaScript navigation disabled"
+            );
+        }
+        if !self.python.disabled
+            && let Some(path) = &self.python.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "python.path must be nonempty when set; omit it or set python.disabled = true to keep Python navigation disabled"
             );
         }
         ensure!(
