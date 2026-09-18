@@ -22,6 +22,7 @@ All nine languages always have Tree-sitter syntax indexing and retrieval regardl
 
 - [Architecture guide](docs/architecture.md): runtime boundaries, data flow, and the agent control-plane exclusion.
 - [Testing guide](docs/development/testing.md): focused suite selection and the full deterministic gate.
+- [Live acceptance CI](docs/development/live-acceptance-ci.md): running `cargo xtask acceptance`/`evaluate` against real services on every push, via a self-hosted runner.
 
 ## Build and run
 

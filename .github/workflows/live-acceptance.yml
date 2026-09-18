@@ -1,0 +1,83 @@
+name: Live Acceptance
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Runs the live acceptance/evaluation suite (cargo xtask acceptance <name>,
+# and `evaluate ./evaluations/core.toml`) against real locally running
+# embedding/reranker services and real language-server executables. Those
+# services live on the machine registered as the self-hosted runner below,
+# not in this workflow -- see docs/development/live-acceptance-ci.md for
+# what to install and how to register the runner. Deliberately never
+# triggers on `pull_request`: a self-hosted runner must not execute code
+# from an untrusted fork PR.
+concurrency:
+  group: live-acceptance
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: [self-hosted, lci-live]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Acceptance - core (index/search/reindex smoke test)
+        run: cargo xtask acceptance core
+
+      - name: Acceptance - multilingual (fixture indexing/search/decoy-ranking, embedding + reranker only)
+        run: cargo xtask acceptance multilingual
+
+      - name: Acceptance - rust-analyzer LSP
+        run: cargo xtask acceptance lsp
+
+      - name: Acceptance - Python LSP (pyright)
+        run: cargo xtask acceptance python-lsp
+      - name: Acceptance - Python LSP provider isolation
+        run: cargo xtask acceptance python-missing
+      - name: Acceptance - Python LSP recovery
+        run: cargo xtask acceptance python-recovery
+
+      - name: Acceptance - TypeScript/JavaScript LSP
+        run: cargo xtask acceptance typescript-lsp
+      - name: Acceptance - TypeScript/JavaScript LSP provider isolation
+        run: cargo xtask acceptance typescript-missing
+      - name: Acceptance - TypeScript/JavaScript LSP recovery
+        run: cargo xtask acceptance typescript-recovery
+
+      - name: Acceptance - C# LSP (dotnet + csharp-ls)
+        run: cargo xtask acceptance csharp-lsp
+      - name: Acceptance - C# LSP provider isolation
+        run: cargo xtask acceptance csharp-missing
+      - name: Acceptance - C# LSP recovery
+        run: cargo xtask acceptance csharp-recovery
+
+      - name: Evaluate - retrieval quality (self workspace)
+        run: >
+          cargo run --bin local-code-intelligence --
+          evaluate ./evaluations/core.toml
+          --workspace "self=${{ github.workspace }}"
+          --output ./test-results/evaluation.json
+
+      # Only sweeps fixture temp directories (named lci-<fixture>-<pid> by
+      # Fixture::create in xtask/src/acceptance/mod.rs, so this pattern can
+      # never match anything else). Deliberately does NOT force-kill
+      # processes by name: this runner is this machine, not a disposable CI
+      # sandbox, and a blanket `Stop-Process -Name rust-analyzer` (etc.)
+      # would just as happily kill your editor's language servers or the
+      # long-running `local-code-intelligence serve` process alongside any
+      # genuinely orphaned one from a crashed run. Each acceptance test's
+      # own ManagedServer/Fixture cleanup already handles the normal case;
+      # a truly orphaned process from a crashed job needs a human to check
+      # Task Manager, not a workflow step guessing by process name alone.
+      - name: Sweep leftover fixture temp directories
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path $env:TEMP -Filter 'lci-*' -Directory -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
