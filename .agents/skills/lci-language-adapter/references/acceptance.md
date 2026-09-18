@@ -15,5 +15,6 @@ A language-support claim requires evidence for the affected language:
 11. Semantic and lexical retrieval plus reranking and reranker fail-open behavior.
 12. A production implementation ranked against a realistic test, example, or documentation decoy.
 13. README, MCP, CLI, filter, and evaluation-definition updates.
+14. LSP navigation available via the language-server adapter contract, or explicitly and honestly recorded as not yet added.
 
-Use mocks for deterministic automated coverage and the configured 8766/8767 services for one bounded live acceptance. Report those evidence classes separately. LSP evidence belongs to `$lci-lsp-adapter`.
+Use mocks for deterministic automated coverage and the configured 8766/8767 services for one bounded live acceptance. Report those evidence classes separately. LSP evidence belongs to `$lci-lsp-adapter`, whose own acceptance bar (real workspace symbol/definition/reference evidence, provider-isolation, and recovery) is the source of truth for item 14 -- this item only requires that a language's LSP status be stated accurately here and in public documentation, not duplicated.
