@@ -1039,4 +1039,137 @@ interface TelemetrySink {
             "valid declaration after syntax damage was lost: {chunks:#?}"
         );
     }
+
+    #[test]
+    fn chunks_c_declarations_with_leading_comments_attached() {
+        let source = r#"#include <stdio.h>
+
+// Add returns the sum of two numbers.
+int add(int a, int b) {
+    return a + b;
+}
+
+// Counter tracks a running total.
+struct Counter {
+    int total;
+};
+
+// increment adds n to the counter's total.
+void increment(struct Counter *c, int n) {
+    c->total += n;
+}
+
+#define MAX_RETRIES 3
+
+int default_timeout = 30;
+"#;
+        let chunks = chunks_for_path("service.c", source).unwrap();
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.language == "c"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "service.c")
+        );
+
+        let add = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("int add"))
+            .unwrap();
+        assert!(
+            add.code
+                .starts_with("// Add returns the sum of two numbers.\nint add")
+        );
+
+        let counter = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("struct Counter"))
+            .unwrap();
+        assert!(
+            counter
+                .code
+                .starts_with("// Counter tracks a running total.\nstruct Counter")
+        );
+
+        let increment = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("void increment"))
+            .unwrap();
+        assert!(
+            increment
+                .code
+                .starts_with("// increment adds n to the counter's total.\nvoid increment")
+        );
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("#define MAX_RETRIES 3"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("int default_timeout = 30;"))
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.code.contains("int add"))
+                .count(),
+            1
+        );
+
+        let lines: Vec<_> = source.lines().collect();
+        for chunk in chunks {
+            assert!(
+                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                    .join("\n")
+                    .contains(&chunk.code),
+                "invalid range for {:#?}",
+                chunk
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_c_function_splits_at_statements_without_losing_them() {
+        let statements: Vec<_> = (0..2000)
+            .map(|i| format!("\tint value{i} = {i};\n\t(void)value{i};\n"))
+            .collect();
+        let source = format!(
+            "int large(void) {{\n{}\treturn 0;\n}}\n",
+            statements.concat()
+        );
+        let chunks = chunks_for_path("large.c", &source).unwrap();
+        assert!(chunks.len() > 1);
+        for statement in statements {
+            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    chunks.iter().any(|c| c.code.contains(line.trim())),
+                    "missing statement: {line}"
+                );
+            }
+        }
+        for c in chunks {
+            let lines: Vec<_> = source.lines().collect();
+            assert!(
+                lines[(c.start_line - 1) as usize..c.end_line as usize]
+                    .join("\n")
+                    .contains(&c.code)
+            );
+        }
+    }
+
+    #[test]
+    fn c_parser_recovery_keeps_following_declarations_searchable() {
+        let source = "int broken( {\nint healthy_value(void) { return 42; }\n";
+        let chunks = chunks_for_path("recovered.c", source).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("healthy_value")),
+            "valid declaration after syntax damage was lost: {chunks:#?}"
+        );
+    }
 }

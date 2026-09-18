@@ -9,6 +9,7 @@ pub(crate) enum Syntax {
     CSharp,
     Go,
     Java,
+    C,
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +45,7 @@ impl LanguageAdapter {
             "cs" => "*.cs",
             "go" => "*.go",
             "java" => "*.java",
+            "c" => "*.c",
             _ => unreachable!(),
         }
     }
@@ -92,6 +94,13 @@ impl LanguageAdapter {
                     | "block"
                     | "constructor_body"
             ),
+            // C has no nested container below file scope either: struct/
+            // union/enum bodies hold only data fields (never further
+            // declarations or code), so decomposing them per-field would add
+            // noise without the payoff class/impl decomposition gives OOP
+            // languages. Mirrors Go's minimalism exactly, including relying
+            // on the size-threshold path for the rare oversized function.
+            Syntax::C => matches!(kind, "translation_unit"),
         }
     }
 
@@ -123,7 +132,7 @@ impl LanguageAdapter {
                     | "record_declaration"
                     | "annotation_type_declaration"
             ),
-            Syntax::Rust | Syntax::Python | Syntax::Go => false,
+            Syntax::Rust | Syntax::Python | Syntax::Go | Syntax::C => false,
         }
     }
 
@@ -201,6 +210,17 @@ impl LanguageAdapter {
                     | "constant_declaration"
                     | "static_initializer"
             ),
+            Syntax::C => matches!(
+                kind,
+                "function_definition"
+                    | "declaration"
+                    | "type_definition"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "enum_specifier"
+                    | "preproc_def"
+                    | "preproc_function_def"
+            ),
         }
     }
 
@@ -218,6 +238,10 @@ impl LanguageAdapter {
             // declaration they modify (inside its `modifiers` node), not as
             // a preceding sibling, so only leading comments need attaching.
             Syntax::Java => matches!(kind, "line_comment" | "block_comment"),
+            // C's attributes (`[[nodiscard]]`, `__attribute__((...))`) are
+            // likewise children of the declaration they modify, not
+            // preceding siblings -- only comments need attaching.
+            Syntax::C => matches!(kind, "comment"),
         }
     }
 
@@ -237,7 +261,12 @@ impl LanguageAdapter {
                 (parent == "decorated_definition" && self.is_declaration(child))
                     || (self.is_declaration(parent) && self.is_container(child))
             }
-            Syntax::Rust | Syntax::Go => false,
+            // C has no container below file scope (see is_container), so
+            // this never actually triggers -- a leading comment on an
+            // oversized function still attaches correctly via the
+            // unconditional `range.0 = child_start` rewrite in `ranges()`,
+            // the same mechanism Go relies on.
+            Syntax::Rust | Syntax::Go | Syntax::C => false,
             Syntax::CSharp | Syntax::Java => {
                 self.is_declaration(parent) && self.is_container(child)
             }
@@ -275,6 +304,10 @@ fn csharp() -> Language {
 
 fn java() -> Language {
     tree_sitter_java::LANGUAGE.into()
+}
+
+fn c() -> Language {
+    tree_sitter_c::LANGUAGE.into()
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -341,6 +374,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: java,
         syntax: Syntax::Java,
     },
+    LanguageAdapter {
+        extension: "c",
+        identifier: "c",
+        cache_version: "c-chunks-v1",
+        grammar: c,
+        syntax: Syntax::C,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -385,6 +425,7 @@ mod tests {
             ("cs", "csharp", "*.cs"),
             ("go", "go", "*.go"),
             ("java", "java", "*.java"),
+            ("c", "c", "*.c"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
@@ -392,7 +433,8 @@ mod tests {
             assert!(!adapter.cache_version().is_empty());
         }
         for extension in [
-            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class",
+            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "h",
+            "cpp",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }

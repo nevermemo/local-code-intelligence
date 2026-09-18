@@ -106,6 +106,36 @@ async fn java_source_is_indexed_and_searchable() {
 }
 
 #[tokio::test]
+async fn c_source_is_indexed_and_searchable() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("c-service");
+    write(
+        &workspace,
+        "greet.c",
+        "// Greet returns a friendly greeting for name.\nconst char *greet(const char *name) {\n    return name;\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    // A single top-level function (with its leading comment attached) is
+    // the only child of translation_unit, so it collapses into one chunk --
+    // unlike Go/Java, C has no mandatory top-level statement that would
+    // force a second chunk.
+    assert_eq!(report.chunks, 1);
+
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].language, "c");
+    assert_eq!(indexed.files[0].chunks, 1);
+
+    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
+    assert_eq!(found.results[0].chunk.language, "c");
+    assert!(found.results[0].chunk.code.contains("const char *greet"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("listing");
@@ -606,11 +636,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/OrderValidatorTest.java",
         "package orders;\n\n// Decoy documentation for a production order test. isValidProductionOrder is mentioned only here.\npublic final class OrderValidatorTest {\n    public static final String EXPECTED_ORDER_VALIDATION_DESCRIPTION = \"reject orders with no id or no items\";\n}\n",
     );
+    write(
+        &workspace,
+        "src/cache.c",
+        "// Evicts the least-recently-used entry once the cache exceeds its capacity.\nint evict_least_recently_used(int *usage, int count, int capacity) {\n    if (count <= capacity) {\n        return -1;\n    }\n    int oldest_index = 0;\n    for (int i = 1; i < count; i++) {\n        if (usage[i] < usage[oldest_index]) {\n            oldest_index = i;\n        }\n    }\n    return oldest_index;\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/cache_test.c",
+        "// Decoy documentation for a cache eviction test. evict_least_recently_used is mentioned only here.\nconst char *expected_cache_eviction_description = \"evict least recently used entry\";\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 13);
-    assert_eq!(first.parsed_files, 13);
+    assert_eq!(first.files, 15);
+    assert_eq!(first.parsed_files, 15);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -673,6 +713,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         ("translator", "src/lib.rs", "rust"),
         ("BuildProductionEventPipeline", "src/pipeline.go", "go"),
         ("isValidProductionOrder", "src/OrderValidator.java", "java"),
+        ("evict_least_recently_used", "src/cache.c", "c"),
     ] {
         let report = app.search(&workspace, query, Some(8)).await.unwrap();
         assert!(
@@ -693,7 +734,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 13);
+    assert_eq!(restarted.unchanged_files, 15);
 
     write(
         &workspace,
@@ -702,7 +743,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 12);
+    assert_eq!(changed.unchanged_files, 14);
 
     write(
         &workspace,
@@ -711,7 +752,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let go_changed = app.index(&workspace).await.unwrap();
     assert_eq!(go_changed.parsed_files, 1);
-    assert_eq!(go_changed.unchanged_files, 12);
+    assert_eq!(go_changed.unchanged_files, 14);
     let go_updated = app
         .search(&workspace, "BuildProductionEventPipeline", Some(8))
         .await
@@ -731,7 +772,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let java_changed = app.index(&workspace).await.unwrap();
     assert_eq!(java_changed.parsed_files, 1);
-    assert_eq!(java_changed.unchanged_files, 12);
+    assert_eq!(java_changed.unchanged_files, 14);
     let java_updated = app
         .search(&workspace, "isValidProductionOrder", Some(8))
         .await
@@ -744,6 +785,26 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
                 |hit| hit.chunk.relative_file_path == "src/OrderValidator.java"
                     && hit.chunk.code.contains("trimmedId")
             )
+    );
+
+    write(
+        &workspace,
+        "src/cache.c",
+        "// Evicts the least-recently-used entry once the cache exceeds its capacity.\nint evict_least_recently_used(int *usage, int count, int capacity) {\n    if (count <= capacity) {\n        return -1;\n    }\n    int oldest_index = 0;\n    for (int i = 1; i < count; i++) {\n        if (usage[i] <= usage[oldest_index]) {\n            oldest_index = i;\n        }\n    }\n    return oldest_index;\n}\n",
+    );
+    let c_changed = app.index(&workspace).await.unwrap();
+    assert_eq!(c_changed.parsed_files, 1);
+    assert_eq!(c_changed.unchanged_files, 14);
+    let c_updated = app
+        .search(&workspace, "evict_least_recently_used", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        c_updated
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "src/cache.c"
+                && hit.chunk.code.contains("usage[i] <= usage[oldest_index]"))
     );
 
     std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
@@ -763,7 +824,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 11);
+    assert_eq!(deleted.files, 13);
     let after_delete = app
         .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
@@ -778,7 +839,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/pipeline_test.go")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 10);
+    assert_eq!(deleted.files, 12);
     let after_go_delete = app
         .search(&workspace, "ExpectedPipelineDescription", Some(8))
         .await
@@ -793,7 +854,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/OrderValidatorTest.java")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 9);
+    assert_eq!(deleted.files, 11);
     let after_java_delete = app
         .search(&workspace, "EXPECTED_ORDER_VALIDATION_DESCRIPTION", Some(8))
         .await
@@ -803,6 +864,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .results
             .iter()
             .all(|hit| hit.chunk.relative_file_path != "tests/OrderValidatorTest.java")
+    );
+
+    std::fs::remove_file(workspace.join("tests/cache_test.c")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 10);
+    let after_c_delete = app
+        .search(&workspace, "expected_cache_eviction_description", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_c_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "tests/cache_test.c")
     );
 
     write(

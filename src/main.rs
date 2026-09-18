@@ -6,7 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, and Java code retrieval over MCP, all seven with optional language-server navigation"
+    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, Java, and C code retrieval over MCP (C: syntax indexing and retrieval only; the other seven additionally support optional language-server navigation)"
 )]
 struct Cli {
     #[arg(long, global = true)]
