@@ -49,6 +49,34 @@ async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings
 }
 
 #[tokio::test]
+async fn go_source_is_indexed_and_searchable() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("go-service");
+    write(
+        &workspace,
+        "main.go",
+        "package main\n\n// Greet returns a friendly greeting for name.\nfunc Greet(name string) string {\n\treturn \"hello \" + name\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    // "package main" and the doc-commented Greet function are separate
+    // top-level chunks (source_file is a container), so 2 not 1.
+    assert_eq!(report.chunks, 2);
+
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].language, "go");
+    assert_eq!(indexed.files[0].chunks, 2);
+
+    let found = app.search(&workspace, "Greet", Some(1)).await.unwrap();
+    assert_eq!(found.results[0].chunk.language, "go");
+    assert!(found.results[0].chunk.code.contains("func Greet"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("listing");

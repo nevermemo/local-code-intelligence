@@ -7,6 +7,7 @@ pub(crate) enum Syntax {
     EcmaScript,
     Python,
     CSharp,
+    Go,
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +41,7 @@ impl LanguageAdapter {
             "jsx" => "*.jsx",
             "py" => "*.py",
             "cs" => "*.cs",
+            "go" => "*.go",
             _ => unreachable!(),
         }
     }
@@ -65,6 +67,14 @@ impl LanguageAdapter {
                     | "enum_body"
                     | "block"
             ),
+            // Go has no nested class/impl body: every function, method, type,
+            // const, and var declaration lives directly at file scope, so
+            // `source_file` is the only container -- matching Rust's
+            // minimalism rather than Python's `block`-is-a-container choice,
+            // since Go function bodies are idiomatically small and rely on
+            // the size-threshold path (MAX_DECLARATION_BYTES) for the rare
+            // oversized one instead of always chunking statement-by-statement.
+            Syntax::Go => matches!(kind, "source_file"),
         }
     }
 
@@ -88,7 +98,7 @@ impl LanguageAdapter {
                     | "namespace_declaration"
                     | "file_scoped_namespace_declaration"
             ),
-            Syntax::Rust | Syntax::Python => false,
+            Syntax::Rust | Syntax::Python | Syntax::Go => false,
         }
     }
 
@@ -144,6 +154,14 @@ impl LanguageAdapter {
                     | "base_field_declaration"
                     | "local_function_statement"
             ),
+            Syntax::Go => matches!(
+                kind,
+                "function_declaration"
+                    | "method_declaration"
+                    | "type_declaration"
+                    | "const_declaration"
+                    | "var_declaration"
+            ),
         }
     }
 
@@ -156,6 +174,7 @@ impl LanguageAdapter {
             Syntax::EcmaScript => matches!(kind, "comment" | "decorator"),
             Syntax::Python => matches!(kind, "comment" | "decorator"),
             Syntax::CSharp => matches!(kind, "comment" | "attribute_list"),
+            Syntax::Go => matches!(kind, "comment"),
         }
     }
 
@@ -175,7 +194,7 @@ impl LanguageAdapter {
                 (parent == "decorated_definition" && self.is_declaration(child))
                     || (self.is_declaration(parent) && self.is_container(child))
             }
-            Syntax::Rust => false,
+            Syntax::Rust | Syntax::Go => false,
             Syntax::CSharp => self.is_declaration(parent) && self.is_container(child),
         }
     }
@@ -183,6 +202,10 @@ impl LanguageAdapter {
 
 fn rust() -> Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+fn go() -> Language {
+    tree_sitter_go::LANGUAGE.into()
 }
 
 fn javascript() -> Language {
@@ -255,6 +278,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: csharp,
         syntax: Syntax::CSharp,
     },
+    LanguageAdapter {
+        extension: "go",
+        identifier: "go",
+        cache_version: "go-chunks-v1",
+        grammar: go,
+        syntax: Syntax::Go,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -297,13 +327,14 @@ mod tests {
             ("jsx", "jsx", "*.jsx"),
             ("py", "python", "*.py"),
             ("cs", "csharp", "*.cs"),
+            ("go", "go", "*.go"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
             assert!(!adapter.cache_version().is_empty());
         }
-        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS"] {
+        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO"] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }
     }

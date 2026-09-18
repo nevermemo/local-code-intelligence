@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-Cross-platform (Windows, macOS, Linux) Rust, TypeScript, JavaScript, Python, and C# code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
+Cross-platform (Windows, macOS, Linux) Rust, TypeScript, JavaScript, Python, C#, and Go code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
 
 Supported source extensions and result language identifiers are exact and case-sensitive:
 
@@ -13,8 +13,9 @@ Supported source extensions and result language identifiers are exact and case-s
 | `.jsx` | `jsx` | Tree-sitter JavaScript/JSX |
 | `.py` | `python` | Tree-sitter Python |
 | `.cs` | `csharp` | Tree-sitter C# |
+| `.go` | `go` | Tree-sitter Go |
 
-All seven languages always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`). None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session.
+All eight languages always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`). Go has syntax indexing and retrieval only; it has no navigation server integration yet. None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session.
 
 ## Documentation
 

@@ -824,4 +824,123 @@ public interface ITelemetrySink
             "valid declaration after syntax damage was lost: {chunks:#?}"
         );
     }
+
+    #[test]
+    fn chunks_go_declarations_with_leading_comments_attached() {
+        let source = r#"package example
+
+// Add returns the sum of two numbers.
+func Add(a, b int) int {
+	return a + b
+}
+
+// Counter tracks a running total.
+type Counter struct {
+	Total int
+}
+
+// Increment adds n to the counter's total.
+func (c *Counter) Increment(n int) {
+	c.Total += n
+}
+
+const MaxRetries = 3
+
+var DefaultTimeout = 30
+"#;
+        let chunks = chunks_for_path("service.go", source).unwrap();
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.language == "go"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "service.go")
+        );
+
+        let add = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("func Add"))
+            .unwrap();
+        assert!(
+            add.code
+                .starts_with("// Add returns the sum of two numbers.\nfunc Add")
+        );
+
+        let counter = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("type Counter struct"))
+            .unwrap();
+        assert!(
+            counter
+                .code
+                .starts_with("// Counter tracks a running total.\ntype Counter")
+        );
+
+        let increment = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("func (c *Counter) Increment"))
+            .unwrap();
+        assert!(increment.code.starts_with(
+            "// Increment adds n to the counter's total.\nfunc (c *Counter) Increment"
+        ));
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("const MaxRetries = 3"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("var DefaultTimeout = 30"))
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.code.contains("func Add"))
+                .count(),
+            1
+        );
+
+        let lines: Vec<_> = source.lines().collect();
+        for chunk in chunks {
+            assert!(
+                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                    .join("\n")
+                    .contains(&chunk.code),
+                "invalid range for {:#?}",
+                chunk
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_go_function_splits_at_statements_without_losing_them() {
+        let statements: Vec<_> = (0..2000)
+            .map(|i| format!("\tvalue{i} := {i}\n\t_ = value{i}\n"))
+            .collect();
+        let source = format!(
+            "package example\n\nfunc large() {{\n{}}}\n",
+            statements.concat()
+        );
+        let chunks = chunks_for_path("large.go", &source).unwrap();
+        assert!(chunks.len() > 1);
+        for statement in statements {
+            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    chunks.iter().any(|c| c.code.contains(line.trim())),
+                    "missing statement: {line}"
+                );
+            }
+        }
+        for c in chunks {
+            let lines: Vec<_> = source.lines().collect();
+            assert!(
+                lines[(c.start_line - 1) as usize..c.end_line as usize]
+                    .join("\n")
+                    .contains(&c.code)
+            );
+        }
+    }
 }
