@@ -2,6 +2,8 @@
 
 This repository builds a standalone, cross-platform (Windows/macOS/Linux) Rust MCP service for reusable code retrieval. Keep it independent of Kilo, GitHub Copilot, Codex, and other clients. The service owns its indexes and stores persistent data outside indexed repositories. Dev/build/test/acceptance tasks run through the `xtask` crate (`cargo xtask <command>`), not shell scripts, so the workflow stays portable across operating systems.
 
+The workspace is split into `lci-core` (chunking, language adapters, filters, lexical search, manifest, workspace identity, config, models, LSP adapters -- no LanceDB/arrow dependency) and the root crate (`App`, `Store`, MCP server, `main`), so pure-logic changes can be checked with `cargo check -p lci-core` / `cargo test -p lci-core --lib <module>::` in seconds instead of the several minutes a full-workspace build takes. See `docs/development/testing.md` for the full mapping and a cache-sharing gotcha worth knowing before you mix scoped and unscoped commands.
+
 ## Boundaries
 
 - Port 8765 is the separate generation model. Application code, tests, readiness probes, and acceptance scripts must not contact or manage it.

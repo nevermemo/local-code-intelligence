@@ -36,7 +36,7 @@ cargo xtask build --test
 ./target/debug/local-code-intelligence serve   # local-code-intelligence.exe on Windows
 ```
 
-The first build compiles LanceDB and its dependencies and can take several minutes. Subsequent builds reuse Cargo's cache.
+The first build compiles LanceDB and its dependencies and can take several minutes. Subsequent builds reuse Cargo's cache. When iterating on chunking, language adapters, filters, or LSP adapters, `cargo check -p lci-core` / `cargo test -p lci-core --lib` skip that dependency tree entirely and finish in seconds -- see `docs/development/testing.md` for the full picture, including an optional personal (not project) sccache/linker setup that speeds up full-workspace builds too.
 
 Build note: LanceDB 0.38.0 requires its `remote` Cargo feature to compile because its job module references an HTTP error variant without a feature guard. This project enables that compile-time feature but uses only local embedded database paths.
 
