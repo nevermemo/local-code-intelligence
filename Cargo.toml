@@ -11,6 +11,7 @@ rust-version = "1.91"
 anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
+async-trait = "0.1.92"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

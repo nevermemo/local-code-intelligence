@@ -7,7 +7,9 @@
 //! server without contacting a real process; spawning is left to the caller.
 
 use crate::config::CSharpLspConfig;
+use crate::lsp::adapter::LspAdapter;
 use crate::lsp::transport::TransportConfig;
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -143,6 +145,47 @@ impl CSharpServer {
                 "csharpLspProject": project.path.to_string_lossy()
             }
         }))
+    }
+}
+
+#[async_trait]
+impl LspAdapter for CSharpServer {
+    fn provider(&self) -> &'static str {
+        "csharp-ls"
+    }
+
+    fn languages(&self) -> &'static [&'static str] {
+        &[LANGUAGE_IDENTIFIER]
+    }
+
+    // Calls are qualified with the type name (rather than `self.enabled()`
+    // etc.) even though inherent methods would win method resolution anyway
+    // — this makes it unambiguous to a reader that these delegate to the
+    // inherent methods above, not recurse into the trait method itself.
+    fn enabled(&self) -> bool {
+        CSharpServer::enabled(self)
+    }
+
+    fn configured_command(&self) -> Option<String> {
+        self.config.path.clone()
+    }
+
+    fn readiness_component_name(&self) -> &'static str {
+        "csharp_language_server_available"
+    }
+
+    fn transport_config(&self, root: &Path) -> Option<TransportConfig> {
+        CSharpServer::transport_config(self, root)
+    }
+
+    fn initialize_params(&self, root: &Path) -> Option<Value> {
+        CSharpServer::initialize_params(self, root)
+    }
+
+    fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        // csharp-ls has no analogous quiescent-server notification; readiness
+        // relies purely on the bounded request timeout.
+        Box::new(|_| false)
     }
 }
 

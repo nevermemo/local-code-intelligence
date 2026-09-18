@@ -1,9 +1,7 @@
 use crate::{
     config::Config,
-    lsp::{
-        csharp::CSharpServer,
-        transport::{JsonRpcClient, TransportConfig},
-    },
+    language,
+    lsp::{adapter::LspAdapter, csharp::CSharpServer, rust::RustServer, transport::JsonRpcClient},
     workspace::Workspace,
 };
 use anyhow::{Context, Result, anyhow};
@@ -13,11 +11,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 use tokio::sync::Mutex;
 
+pub mod adapter;
 pub mod csharp;
+pub mod rust;
 pub mod transport;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
@@ -34,85 +33,25 @@ pub struct Location {
     pub provider: Option<String>,
 }
 
-struct Client {
-    rpc: Arc<JsonRpcClient>,
-    timeout: Duration,
-}
-
-impl Client {
-    async fn spawn(config: &Config, workspace: &Workspace) -> Result<Arc<Self>> {
-        let transport_config = TransportConfig {
-            executable: config.rust_analyzer_path.clone(),
-            args: Vec::new(),
-            working_dir: workspace.path.clone(),
-            timeout: Duration::from_secs(config.lsp_timeout_seconds),
-            label: "rust-analyzer".into(),
-        };
-        let rpc = JsonRpcClient::spawn(
-            &transport_config,
-            Box::new(|msg: &Value| {
-                msg.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
-                    && msg["params"]["quiescent"].as_bool() == Some(true)
-            }),
-        )
-        .await?;
-        let client = Arc::new(Self {
-            rpc: Arc::clone(&rpc),
-            timeout: Duration::from_secs(config.lsp_timeout_seconds),
-        });
-        let root_uri = reqwest::Url::from_directory_path(&workspace.path)
-            .map_err(|_| anyhow!("cannot convert workspace path to file URI"))?;
-        let root_uri = root_uri.to_string();
-        client
-            .rpc
-            .request(
-                "initialize",
-                json!({
-                    "processId": std::process::id(), "rootUri": &root_uri,
-                    "capabilities": {"workspace":{"symbol":{"resolveSupport":{"properties":["location.range"]}}},"experimental":{"serverStatusNotification":true}},
-                    "workspaceFolders":[{"uri":&root_uri,"name":workspace.path.file_name().and_then(|v|v.to_str()).unwrap_or("workspace")}],
-                    "initializationOptions":{"workspace":{"symbol":{"search":{"scope":"workspace","kind":"all_symbols","limit":256}}}}
-                }),
-            )
-            .await
-            .context("initialize rust-analyzer")?;
-        client.rpc.notify("initialized", json!({})).await?;
-        if !client.rpc.is_ready() {
-            // Some rust-analyzer builds do not emit serverStatus even when the
-            // capability is advertised. Give crate discovery a bounded head
-            // start, then rely on normal request timeouts and restart recovery.
-            let readiness_wait = client.timeout.min(Duration::from_secs(10));
-            let _ = client.rpc.wait_ready(readiness_wait).await;
-        }
-        Ok(client)
-    }
-
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.rpc.request(method, params).await
-    }
-}
-
-struct CSharpClient {
+/// A live JSON-RPC session with one spawned, initialized language server.
+struct GenericClient {
     rpc: Arc<JsonRpcClient>,
 }
 
-impl CSharpClient {
-    async fn spawn(config: &Config, workspace: &Workspace) -> Result<Arc<Self>> {
-        let adapter = CSharpServer::new(
-            &config.csharp,
-            Duration::from_secs(config.lsp_timeout_seconds),
-        );
+impl GenericClient {
+    async fn spawn(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Result<Arc<Self>> {
         let transport = adapter
             .transport_config(&workspace.path)
-            .context("C# language server is disabled or has no executable")?;
-        let rpc = JsonRpcClient::spawn(&transport, Box::new(|_| false)).await?;
+            .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
+        let rpc = JsonRpcClient::spawn(&transport, adapter.ready_predicate()).await?;
         let params = adapter
             .initialize_params(&workspace.path)
-            .context("cannot build C# language-server initialization")?;
+            .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;
         rpc.request("initialize", params)
             .await
-            .context("initialize csharp-ls")?;
+            .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
+        adapter.after_initialized(&rpc).await?;
         Ok(Arc::new(Self { rpc }))
     }
 
@@ -121,196 +60,175 @@ impl CSharpClient {
     }
 }
 
+/// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
+/// and C# (csharp-ls) are always constructed; TypeScript/JavaScript and
+/// Python join the same registry once their adapters land. A disabled or
+/// unconfigured adapter simply never produces a session (`transport_config`
+/// returns `None`), which surfaces as a clear error from the caller.
 pub struct Manager {
-    path: String,
-    timeout_seconds: u64,
-    sessions: Mutex<HashMap<String, Arc<Client>>>,
-    csharp: crate::config::CSharpLspConfig,
-    csharp_sessions: Mutex<HashMap<String, Arc<CSharpClient>>>,
+    adapters: Vec<Arc<dyn LspAdapter>>,
+    sessions: Mutex<HashMap<(String, String), Arc<GenericClient>>>,
 }
 
 impl Manager {
     pub fn new(config: &Config) -> Self {
+        let adapters: Vec<Arc<dyn LspAdapter>> = vec![
+            Arc::new(RustServer::new(config)),
+            Arc::new(CSharpServer::new(
+                &config.csharp,
+                std::time::Duration::from_secs(config.lsp_timeout_seconds),
+            )),
+        ];
         Self {
-            path: config.rust_analyzer_path.clone(),
-            timeout_seconds: config.lsp_timeout_seconds,
+            adapters,
             sessions: Mutex::new(HashMap::new()),
-            csharp: config.csharp.clone(),
-            csharp_sessions: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn client(&self, workspace: &Workspace) -> Result<Arc<Client>> {
-        if let Some(client) = self.sessions.lock().await.get(&workspace.id).cloned() {
-            return Ok(client);
-        }
-        let config = Config {
-            rust_analyzer_path: self.path.clone(),
-            lsp_timeout_seconds: self.timeout_seconds,
-            ..Config::default()
-        };
-        let client = Client::spawn(&config, workspace).await?;
-        self.sessions
-            .lock()
-            .await
-            .insert(workspace.id.clone(), client.clone());
-        Ok(client)
+    pub fn adapters(&self) -> &[Arc<dyn LspAdapter>] {
+        &self.adapters
     }
 
-    async fn request(&self, workspace: &Workspace, method: &str, params: Value) -> Result<Value> {
-        let client = self.client(workspace).await?;
-        match client.request(method, params.clone()).await {
-            Ok(value) => Ok(value),
-            Err(first) => {
-                self.sessions.lock().await.remove(&workspace.id);
-                let client = self
-                    .client(workspace)
-                    .await
-                    .with_context(|| format!("rust-analyzer restart after: {first:#}"))?;
-                client.request(method, params).await
-            }
-        }
+    /// Every adapter that can navigate the given Tree-sitter language
+    /// identifier (normally at most one, but the registry allows more).
+    pub fn adapters_for_language(&self, language: &str) -> Vec<&Arc<dyn LspAdapter>> {
+        self.adapters
+            .iter()
+            .filter(|adapter| adapter.languages().contains(&language))
+            .collect()
     }
 
-    async fn csharp_client(&self, workspace: &Workspace) -> Result<Arc<CSharpClient>> {
-        if let Some(client) = self
-            .csharp_sessions
-            .lock()
-            .await
-            .get(&workspace.id)
-            .cloned()
-        {
-            return Ok(client);
-        }
-        let config = Config {
-            csharp: self.csharp.clone(),
-            lsp_timeout_seconds: self.timeout_seconds,
-            ..Config::default()
-        };
-        let client = CSharpClient::spawn(&config, workspace).await?;
-        self.csharp_sessions
-            .lock()
-            .await
-            .insert(workspace.id.clone(), client.clone());
-        Ok(client)
+    fn session_key(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> (String, String) {
+        (adapter.provider().to_string(), workspace.id.clone())
     }
 
-    async fn csharp_request(
+    async fn client(
         &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+    ) -> Result<Arc<GenericClient>> {
+        let key = Self::session_key(adapter, workspace);
+        if let Some(client) = self.sessions.lock().await.get(&key).cloned() {
+            return Ok(client);
+        }
+        let client = GenericClient::spawn(adapter, workspace).await?;
+        self.sessions.lock().await.insert(key, client.clone());
+        Ok(client)
+    }
+
+    /// A request with no per-file preparation step: spawn-or-reuse a client,
+    /// and on any failure discard the session and retry once with a fresh
+    /// client (never a retry loop).
+    async fn request(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        let client = self.csharp_client(workspace).await?;
+        let key = Self::session_key(adapter, workspace);
+        let client = self.client(adapter, workspace).await?;
         match client.request(method, params.clone()).await {
             Ok(value) => Ok(value),
             Err(first) => {
-                self.csharp_sessions.lock().await.remove(&workspace.id);
+                self.sessions.lock().await.remove(&key);
                 let client = self
-                    .csharp_client(workspace)
+                    .client(adapter, workspace)
                     .await
-                    .with_context(|| format!("csharp-ls restart after: {first:#}"))?;
+                    .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 client.request(method, params).await
             }
         }
     }
 
-    pub async fn symbols(&self, workspace: &Workspace, query: &str) -> Result<Vec<Location>> {
-        let value = self
-            .request(
-                workspace,
-                "workspace/symbol",
-                json!({
-                    "query": query, "searchScope":"workspace", "searchKind":"allSymbols"
-                }),
-            )
-            .await?;
-        locations_for(value, workspace, "rust", "rust-analyzer")
+    /// Same retry contract as [`Self::request`], but runs the adapter's
+    /// `before_position_request` hook (e.g. TypeScript's `textDocument/
+    /// didOpen`) against the same client before every attempt.
+    async fn position_request(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let key = Self::session_key(adapter, workspace);
+        let attempt = async {
+            let client = self.client(adapter, workspace).await?;
+            adapter
+                .before_position_request(&client.rpc, file, relative)
+                .await?;
+            client.request(method, params.clone()).await
+        };
+        match attempt.await {
+            Ok(value) => Ok(value),
+            Err(first) => {
+                self.sessions.lock().await.remove(&key);
+                let client = self
+                    .client(adapter, workspace)
+                    .await
+                    .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
+                adapter
+                    .before_position_request(&client.rpc, file, relative)
+                    .await?;
+                client.request(method, params).await
+            }
+        }
     }
 
-    pub async fn csharp_symbols(
+    pub async fn symbols(
         &self,
+        adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
         query: &str,
     ) -> Result<Vec<Location>> {
         let value = self
-            .csharp_request(workspace, "workspace/symbol", json!({"query": query}))
+            .request(
+                adapter,
+                workspace,
+                "workspace/symbol",
+                json!({"query": query, "searchScope":"workspace", "searchKind":"allSymbols"}),
+            )
             .await?;
-        locations_for(value, workspace, "csharp", "csharp-ls")
+        locations_for(value, workspace, adapter.provider())
     }
 
     pub async fn definition(
         &self,
+        adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
         file: &Path,
+        relative: &str,
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
         let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?;
-        let uri = uri.to_string();
+            .map_err(|_| anyhow!("cannot convert file path to URI"))?
+            .to_string();
         let value = self
-            .request(
+            .position_request(
+                adapter,
                 workspace,
+                file,
+                relative,
                 "textDocument/definition",
-                json!({
-                    "textDocument":{"uri":uri}, "position":{"line":line,"character":character}
-                }),
+                json!({"textDocument":{"uri":uri}, "position":{"line":line,"character":character}}),
             )
             .await?;
-        locations_for(value, workspace, "rust", "rust-analyzer")
+        locations_for(value, workspace, adapter.provider())
     }
 
+    // One more parameter than `definition` (`include_declaration`), which is
+    // enough to cross clippy's default threshold; a parameter struct would
+    // add indirection for one caller (`app.rs`) without real benefit here.
+    #[allow(clippy::too_many_arguments)]
     pub async fn references(
         &self,
+        adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
         file: &Path,
-        line: u32,
-        character: u32,
-        include_declaration: bool,
-    ) -> Result<Vec<Location>> {
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?;
-        let uri = uri.to_string();
-        let value = self
-            .request(
-                workspace,
-                "textDocument/references",
-                json!({
-                    "textDocument":{"uri":uri}, "position":{"line":line,"character":character},
-                    "context":{"includeDeclaration":include_declaration}
-                }),
-            )
-            .await?;
-        locations_for(value, workspace, "rust", "rust-analyzer")
-    }
-
-    pub async fn csharp_definition(
-        &self,
-        workspace: &Workspace,
-        file: &Path,
-        line: u32,
-        character: u32,
-    ) -> Result<Vec<Location>> {
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        let value = self
-            .csharp_request(
-                workspace,
-                "textDocument/definition",
-                json!({
-                    "textDocument":{"uri":uri}, "position":{"line":line,"character":character}
-                }),
-            )
-            .await?;
-        locations_for(value, workspace, "csharp", "csharp-ls")
-    }
-
-    pub async fn csharp_references(
-        &self,
-        workspace: &Workspace,
-        file: &Path,
+        relative: &str,
         line: u32,
         character: u32,
         include_declaration: bool,
@@ -319,8 +237,11 @@ impl Manager {
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();
         let value = self
-            .csharp_request(
+            .position_request(
+                adapter,
                 workspace,
+                file,
+                relative,
                 "textDocument/references",
                 json!({
                     "textDocument":{"uri":uri}, "position":{"line":line,"character":character},
@@ -328,24 +249,23 @@ impl Manager {
                 }),
             )
             .await?;
-        locations_for(value, workspace, "csharp", "csharp-ls")
+        locations_for(value, workspace, adapter.provider())
     }
 
-    pub async fn running(&self, workspace_id: &str) -> bool {
-        self.sessions.lock().await.contains_key(workspace_id)
-    }
-
-    pub async fn csharp_running(&self, workspace_id: &str) -> bool {
-        self.csharp_sessions.lock().await.contains_key(workspace_id)
+    pub async fn running(&self, provider: &str, workspace_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .contains_key(&(provider.to_string(), workspace_id.to_string()))
     }
 }
 
-fn locations_for(
-    value: Value,
-    workspace: &Workspace,
-    language: &str,
-    provider: &str,
-) -> Result<Vec<Location>> {
+/// Normalizes an LSP `workspace/symbol`/`textDocument/definition`/
+/// `textDocument/references` response into this app's `Location` shape.
+/// Each location's `language` is derived from its own file (not fixed to one
+/// value), since a single TypeScript-adapter response can legitimately span
+/// `.ts`/`.tsx`/`.js`/`.jsx` results.
+fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<Vec<Location>> {
     let values = if value.is_null() {
         vec![]
     } else if let Some(items) = value.as_array() {
@@ -381,6 +301,8 @@ fn locations_for(
         let Some(relative_file_path) = relative_file_path else {
             continue;
         };
+        let detected_language = language::for_path(Path::new(&relative_file_path))
+            .map(|adapter| adapter.identifier().to_string());
         output.push(Location {
             file_path,
             relative_file_path: Some(relative_file_path),
@@ -390,7 +312,7 @@ fn locations_for(
             end_character: range["end"]["character"].as_u64().unwrap_or(0) as u32,
             name: item.get("name").and_then(Value::as_str).map(str::to_owned),
             kind: item.get("kind").and_then(Value::as_u64),
-            language: Some(language.to_string()),
+            language: detected_language,
             provider: Some(provider.to_string()),
         });
     }
@@ -412,13 +334,20 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "fn item() {}\n").unwrap();
         let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
-        let result = locations_for(json!([
-            {"name":"item","kind":12,"location":{"uri":uri,"range":{"start":{"line":2,"character":3},"end":{"line":2,"character":7}}}},
-            {"targetUri":uri,"targetSelectionRange":{"start":{"line":4,"character":1},"end":{"line":4,"character":5}}}
-        ]), &workspace, "rust", "rust-analyzer").unwrap();
+        let result = locations_for(
+            json!([
+                {"name":"item","kind":12,"location":{"uri":uri,"range":{"start":{"line":2,"character":3},"end":{"line":2,"character":7}}}},
+                {"targetUri":uri,"targetSelectionRange":{"start":{"line":4,"character":1},"end":{"line":4,"character":5}}}
+            ]),
+            &workspace,
+            "rust-analyzer",
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].relative_file_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(result[0].start_line, 3);
+        assert_eq!(result[0].language.as_deref(), Some("rust"));
+        assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
     }
 }

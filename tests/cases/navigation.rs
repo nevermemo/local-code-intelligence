@@ -1,5 +1,19 @@
 use super::*;
-use local_code_intelligence::{config::CSharpLspConfig, lsp::Manager, workspace::Workspace};
+use local_code_intelligence::{
+    config::CSharpLspConfig,
+    lsp::{Manager, adapter::LspAdapter},
+    workspace::Workspace,
+};
+use std::sync::Arc;
+
+fn csharp_adapter(manager: &Manager) -> Arc<dyn LspAdapter> {
+    manager
+        .adapters_for_language("csharp")
+        .into_iter()
+        .next()
+        .cloned()
+        .expect("csharp-ls adapter is always constructed")
+}
 
 fn fake_csharp_fixture(
     temp: &tempfile::TempDir,
@@ -57,19 +71,29 @@ async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
         let temp = tempfile::tempdir().unwrap();
         let (config, workspace, _) = fake_csharp_fixture(&temp, mode);
         let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
         let results = match operation {
             "symbols" => manager
-                .csharp_symbols(&workspace, "Calculator")
+                .symbols(&adapter, &workspace, "Calculator")
                 .await
                 .unwrap(),
             "definition" => manager
-                .csharp_definition(&workspace, &workspace.path.join("src/CallSite.cs"), 1, 72)
+                .definition(
+                    &adapter,
+                    &workspace,
+                    &workspace.path.join("src/CallSite.cs"),
+                    "src/CallSite.cs",
+                    1,
+                    72,
+                )
                 .await
                 .unwrap(),
             "references" => manager
-                .csharp_references(
+                .references(
+                    &adapter,
                     &workspace,
                     &workspace.path.join("src/Calculator.cs"),
+                    "src/Calculator.cs",
                     1,
                     49,
                     true,
@@ -104,9 +128,10 @@ async fn fake_csharp_lsp_correlates_responses_and_reuses_healthy_child() {
         let temp = tempfile::tempdir().unwrap();
         let (config, workspace, state) = fake_csharp_fixture(&temp, mode);
         let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
         for _ in 0..2 {
             let results = manager
-                .csharp_symbols(&workspace, "Calculator")
+                .symbols(&adapter, &workspace, "Calculator")
                 .await
                 .unwrap();
             assert_eq!(results[0].name.as_deref(), Some("Calculator"));
@@ -120,8 +145,9 @@ async fn fake_csharp_lsp_discards_failed_session_and_restarts_once() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state) = fake_csharp_fixture(&temp, "restart-success");
     let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
     let results = manager
-        .csharp_symbols(&workspace, "Calculator")
+        .symbols(&adapter, &workspace, "Calculator")
         .await
         .unwrap();
     assert_eq!(results[0].name.as_deref(), Some("Calculator"));
@@ -134,8 +160,9 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
         let temp = tempfile::tempdir().unwrap();
         let (config, workspace, state) = fake_csharp_fixture(&temp, mode);
         let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
         let error = manager
-            .csharp_symbols(&workspace, "Calculator")
+            .symbols(&adapter, &workspace, "Calculator")
             .await
             .unwrap_err();
         let message = format!("{error:#}");
@@ -349,7 +376,7 @@ async fn csharp_only_search_and_navigation_keep_csharp_lsp_optional() {
             .unwrap_err(),
     ] {
         assert!(
-            error.to_string().contains("C# language server is disabled"),
+            error.to_string().contains("csharp-ls is disabled"),
             "unexpected error: {error}"
         );
     }

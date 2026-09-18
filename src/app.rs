@@ -2,7 +2,8 @@ use crate::{
     chunk,
     config::{Config, IndexFreshness},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest},
-    language, lexical, lsp,
+    language, lexical,
+    lsp::{self, adapter::LspAdapter},
     manifest::{self, Manifest},
     models::Models,
     store::{Hit, Store},
@@ -405,8 +406,8 @@ impl App {
             && (stored_manifest.fingerprint.is_empty()
                 || stored_manifest.fingerprint != current_fingerprint);
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
-        let analyzer_running = self.analyzer.running(&workspace.id).await;
-        let csharp_analyzer_running = self.analyzer.csharp_running(&workspace.id).await;
+        let analyzer_running = self.analyzer.running("rust-analyzer", &workspace.id).await;
+        let csharp_analyzer_running = self.analyzer.running("csharp-ls", &workspace.id).await;
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -515,20 +516,26 @@ impl App {
             .await?
             .context("workspace is not indexed; call index_workspace first")?;
         let chunks = Store::chunks(&snapshot, &workspace).await?;
-        let has_rust = chunks.iter().any(|hit| hit.chunk.language == "rust");
-        let has_csharp = chunks.iter().any(|hit| hit.chunk.language == "csharp");
-        let mut results = Vec::new();
-        let mut failures = Vec::new();
-        if has_rust {
-            match self.analyzer.symbols(&workspace, query).await {
-                Ok(mut found) => results.append(&mut found),
-                Err(error) => failures.push(format!("rust-analyzer: {error:#}")),
+        let indexed_languages: HashSet<&str> = chunks
+            .iter()
+            .map(|hit| hit.chunk.language.as_str())
+            .collect();
+        let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
+        for language in indexed_languages {
+            for adapter in self.analyzer.adapters_for_language(language) {
+                if adapter.enabled() {
+                    applicable
+                        .entry(adapter.provider())
+                        .or_insert_with(|| Arc::clone(adapter));
+                }
             }
         }
-        if has_csharp && self.config.csharp.enabled() {
-            match self.analyzer.csharp_symbols(&workspace, query).await {
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        for adapter in applicable.values() {
+            match self.analyzer.symbols(adapter, &workspace, query).await {
                 Ok(mut found) => results.append(&mut found),
-                Err(error) => failures.push(format!("csharp-ls: {error:#}")),
+                Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
             }
         }
         results.sort_by(|a, b| {
@@ -561,16 +568,23 @@ impl App {
         Ok(file)
     }
 
-    fn navigation_language(file: &Path) -> Result<&'static str> {
-        match language::for_path(file) {
-            Some(adapter) if adapter.identifier() == "rust" => Ok("rust"),
-            Some(adapter) if adapter.identifier() == "csharp" => Ok("csharp"),
-            Some(adapter) => anyhow::bail!(
-                "language-server navigation does not support {} source files",
-                adapter.identifier()
-            ),
-            None => anyhow::bail!("language-server navigation requires a recognized source path"),
-        }
+    /// Resolves a source file to its Tree-sitter language identifier and the
+    /// one LSP adapter that navigates it, or a clear error for an
+    /// unrecognized or Tree-sitter-only (no navigation adapter) file.
+    fn navigation_target(&self, file: &Path) -> Result<(&'static str, Arc<dyn LspAdapter>)> {
+        let identifier = language::for_path(file)
+            .map(|adapter| adapter.identifier())
+            .context("language-server navigation requires a recognized source path")?;
+        let adapter = self
+            .analyzer
+            .adapters_for_language(identifier)
+            .into_iter()
+            .next()
+            .cloned()
+            .with_context(|| {
+                format!("language-server navigation does not support {identifier} source files")
+            })?;
+        Ok((identifier, adapter))
     }
 
     async fn ensure_indexed_language(
@@ -600,21 +614,19 @@ impl App {
         ensure!(line > 0, "line must be one-based and positive");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let file = Self::source_path(&workspace, relative_file_path)?;
-        let language = Self::navigation_language(&file)?;
+        let (language, adapter) = self.navigation_target(&file)?;
         Self::ensure_indexed_language(&workspace, language, &self.store).await?;
-        let results = match language {
-            "rust" => {
-                self.analyzer
-                    .definition(&workspace, &file, line - 1, character)
-                    .await?
-            }
-            "csharp" => {
-                self.analyzer
-                    .csharp_definition(&workspace, &file, line - 1, character)
-                    .await?
-            }
-            _ => unreachable!(),
-        };
+        let results = self
+            .analyzer
+            .definition(
+                &adapter,
+                &workspace,
+                &file,
+                relative_file_path,
+                line - 1,
+                character,
+            )
+            .await?;
         Ok(NavigationReport { workspace, results })
     }
 
@@ -629,21 +641,20 @@ impl App {
         ensure!(line > 0, "line must be one-based and positive");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let file = Self::source_path(&workspace, relative_file_path)?;
-        let language = Self::navigation_language(&file)?;
+        let (language, adapter) = self.navigation_target(&file)?;
         Self::ensure_indexed_language(&workspace, language, &self.store).await?;
-        let results = match language {
-            "rust" => {
-                self.analyzer
-                    .references(&workspace, &file, line - 1, character, include_declaration)
-                    .await?
-            }
-            "csharp" => {
-                self.analyzer
-                    .csharp_references(&workspace, &file, line - 1, character, include_declaration)
-                    .await?
-            }
-            _ => unreachable!(),
-        };
+        let results = self
+            .analyzer
+            .references(
+                &adapter,
+                &workspace,
+                &file,
+                relative_file_path,
+                line - 1,
+                character,
+                include_declaration,
+            )
+            .await?;
         Ok(NavigationReport { workspace, results })
     }
 
@@ -788,8 +799,20 @@ impl App {
         }
         let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
         all_chunks.retain(|hit| hit_matches(&filters, hit));
-        let has_rust = all_chunks.iter().any(|hit| hit.chunk.language == "rust");
-        let has_csharp = all_chunks.iter().any(|hit| hit.chunk.language == "csharp");
+        let indexed_languages: HashSet<&str> = all_chunks
+            .iter()
+            .map(|hit| hit.chunk.language.as_str())
+            .collect();
+        let mut applicable_adapters: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
+        for language in indexed_languages {
+            for adapter in self.analyzer.adapters_for_language(language) {
+                if adapter.enabled() {
+                    applicable_adapters
+                        .entry(adapter.provider())
+                        .or_insert_with(|| Arc::clone(adapter));
+                }
+            }
+        }
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
                 let timer = Instant::now();
@@ -804,7 +827,7 @@ impl App {
             },
             async {
                 let timer = Instant::now();
-                if !has_rust && (!has_csharp || !self.config.csharp.enabled()) {
+                if applicable_adapters.is_empty() {
                     return ((Vec::new(), Vec::new()), ms(timer));
                 }
                 let mut found = Vec::new();
@@ -818,16 +841,16 @@ impl App {
                 }
                 symbol_queries.dedup();
                 for term in symbol_queries.into_iter().take(8) {
-                    if has_rust {
-                        match self.analyzer.symbols(&report.workspace, &term).await {
+                    for adapter in applicable_adapters.values() {
+                        match self
+                            .analyzer
+                            .symbols(adapter, &report.workspace, &term)
+                            .await
+                        {
                             Ok(mut locations) => found.append(&mut locations),
-                            Err(error) => failures.push(format!("rust-analyzer: {error:#}")),
-                        }
-                    }
-                    if has_csharp && self.config.csharp.enabled() {
-                        match self.analyzer.csharp_symbols(&report.workspace, &term).await {
-                            Ok(mut locations) => found.append(&mut locations),
-                            Err(error) => failures.push(format!("csharp-ls: {error:#}")),
+                            Err(error) => {
+                                failures.push(format!("{}: {error:#}", adapter.provider()))
+                            }
                         }
                     }
                 }
@@ -1088,9 +1111,22 @@ impl App {
         let reranker_url = self.config.reranker_url.clone();
         let reranker_model = self.config.reranker_model.clone();
         let ripgrep_resolved = lexical::resolve_ripgrep_path(&self.config.ripgrep_path);
-        let rust_analyzer_path = self.config.rust_analyzer_path.clone();
-        let csharp_config = self.config.csharp.clone();
         let client = self.models.client();
+
+        let lsp_probes_future =
+            futures::future::join_all(self.analyzer.adapters().iter().map(|adapter| {
+                let adapter = Arc::clone(adapter);
+                async move {
+                    let probe: Result<()> = if !adapter.enabled() {
+                        Ok(())
+                    } else if let Some(command) = adapter.configured_command() {
+                        Self::probe_subprocess_version(Path::new(&command), timeout).await
+                    } else {
+                        Ok(())
+                    };
+                    (adapter, probe)
+                }
+            }));
 
         let (
             data_dir_probe,
@@ -1100,8 +1136,7 @@ impl App {
             reranker_reach,
             reranker_models,
             ripgrep_probe,
-            rust_analyzer_probe,
-            csharp_probe,
+            lsp_probes,
         ) = tokio::join!(
             Self::probe_data_dir(&data_dir),
             self.store.accessibility_probe(&lancedb_path),
@@ -1122,18 +1157,7 @@ impl App {
                 timeout
             ),
             Self::probe_subprocess_version(&ripgrep_resolved, timeout),
-            Self::probe_subprocess_version(std::path::Path::new(&rust_analyzer_path), timeout),
-            async {
-                if csharp_config.disabled || csharp_config.path.is_none() {
-                    Ok(())
-                } else {
-                    Self::probe_subprocess_version(
-                        std::path::Path::new(csharp_config.path.as_deref().unwrap()),
-                        timeout,
-                    )
-                    .await
-                }
-            },
+            lsp_probes_future,
         );
 
         let data_dir_ready = data_dir_probe.is_ok();
@@ -1141,8 +1165,6 @@ impl App {
         let embedding_reach_ready = embedding_reach.is_ok();
         let reranker_reach_ready = reranker_reach.is_ok();
         let ripgrep_ready = ripgrep_probe.is_ok();
-        let rust_analyzer_ready = rust_analyzer_probe.is_ok();
-        let csharp_ready = csharp_probe.is_ok();
 
         // Required embedding listing: any non-Listed outcome fails readiness.
         let (embedding_models_ready, embedding_models_detail) = match &embedding_models {
@@ -1213,34 +1235,29 @@ impl App {
                     ),
                 }),
             },
-            ReadinessComponent {
-                name: "rust_analyzer_available",
-                ready: rust_analyzer_ready,
-                required: false,
-                detail: Some(match rust_analyzer_probe {
-                    Ok(()) => format!("configured rust-analyzer command {}", rust_analyzer_path),
-                    Err(e) => format!(
-                        "configured rust-analyzer command {} unavailable: {e:#}",
-                        rust_analyzer_path
-                    ),
-                }),
-            },
-            ReadinessComponent {
-                name: "csharp_language_server_available",
-                ready: csharp_ready,
-                required: false,
-                detail: Some(if csharp_config.disabled {
-                    "C# language server disabled".into()
-                } else if let Some(path) = csharp_config.path.as_deref() {
-                    match csharp_probe {
-                        Ok(()) => format!("configured csharp-ls command {path}"),
-                        Err(e) => format!("configured csharp-ls command {path} unavailable: {e:#}"),
-                    }
-                } else {
-                    "C# language server not configured".into()
-                }),
-            },
         ];
+        let components: Vec<ReadinessComponent> = components
+            .into_iter()
+            .chain(lsp_probes.iter().map(|(adapter, probe)| {
+                let detail = match adapter.configured_command() {
+                    None => format!("{} not configured", adapter.provider()),
+                    Some(_) if !adapter.enabled() => format!("{} disabled", adapter.provider()),
+                    Some(command) => match probe {
+                        Ok(()) => format!("configured {} command {command}", adapter.provider()),
+                        Err(e) => format!(
+                            "configured {} command {command} unavailable: {e:#}",
+                            adapter.provider()
+                        ),
+                    },
+                };
+                ReadinessComponent {
+                    name: adapter.readiness_component_name(),
+                    ready: probe.is_ok(),
+                    required: false,
+                    detail: Some(detail),
+                }
+            }))
+            .collect();
 
         // The report requests overall degraded components/reasons, so every
         // unavailable component is listed with its reason, required or not.
