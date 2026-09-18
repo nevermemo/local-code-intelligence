@@ -3,15 +3,15 @@
 # Workspaces:
 #   - "self" (required): this repository. Verifies the service's own
 #     retrieval behavior: first-search index lifecycle, the language
-#     registry / Tree-sitter grammar, Python and C# chunking, Windows ripgrep
-#     resolution, readiness dependency probing, and explicit test-role
-#     retrieval.
+#     registry / Tree-sitter grammar, Python, C#, and Go chunking, Windows
+#     ripgrep resolution, readiness dependency probing, and explicit
+#     test-role retrieval.
 #   - "gust" (optional): the GUST Rust-to-Slang translator repository.
 #     Verifies cross-repository translator retrieval. Skipped (not failed)
 #     when the workspace is not provided.
 #
 # Path patterns are repository-relative globs using `/` separators. Result
-# ranks are one-based. See src/evaluate.rs for the matching and metric rules.
+# ranks are one-based. See src/evaluate/ for the matching and metric rules.
 
 [[workspaces]]
 key = "self"
@@ -30,7 +30,7 @@ required = false
 workspace = "self"
 query = "first search creates the embedded index and reports the lifecycle action"
 top_k = 8
-expected_paths = ["src/app.rs"]
+expected_paths = ["src/app/indexing.rs"]
 preferred_paths = ["src/store.rs"]
 required_snippet = "IndexAction"
 
@@ -39,7 +39,7 @@ required_snippet = "IndexAction"
 workspace = "self"
 query = "language registry recognizes file extensions and loads the Tree-sitter grammar"
 top_k = 8
-expected_paths = ["src/language.rs"]
+expected_paths = ["lci-core/src/language.rs"]
 required_snippet = "for_extension"
 
 # Python chunking.
@@ -47,23 +47,31 @@ required_snippet = "for_extension"
 workspace = "self"
 query = "chunk Python declarations statements and decorators into stable chunks"
 top_k = 8
-expected_paths = ["src/chunk.rs", "src/language.rs"]
-preferred_paths = ["src/chunk.rs"]
+expected_paths = ["lci-core/src/chunk.rs", "lci-core/src/language.rs"]
+preferred_paths = ["lci-core/src/chunk.rs"]
 
 # C# chunking.
 [[queries]]
 workspace = "self"
 query = "chunk C# namespaces types members attributes and top-level statements into stable chunks"
 top_k = 8
-expected_paths = ["src/chunk.rs", "src/language.rs"]
-preferred_paths = ["src/chunk.rs"]
+expected_paths = ["lci-core/src/chunk.rs", "lci-core/src/language.rs"]
+preferred_paths = ["lci-core/src/chunk.rs"]
+
+# Go chunking.
+[[queries]]
+workspace = "self"
+query = "chunk Go function method type and const declarations with leading comments into stable chunks"
+top_k = 8
+expected_paths = ["lci-core/src/chunk.rs", "lci-core/src/language.rs"]
+preferred_paths = ["lci-core/src/chunk.rs"]
 
 # Windows ripgrep resolution.
 [[queries]]
 workspace = "self"
 query = "resolve ripgrep from PATH and the VS Code bundled version on Windows"
 top_k = 8
-expected_paths = ["src/lexical.rs"]
+expected_paths = ["lci-core/src/lexical.rs"]
 required_snippet = "ripgrep"
 
 # Readiness dependency probing.
@@ -71,7 +79,7 @@ required_snippet = "ripgrep"
 workspace = "self"
 query = "readiness reports required and optional dependency failures for embeddings and reranking"
 top_k = 8
-expected_paths = ["src/app.rs", "src/server.rs"]
+expected_paths = ["src/app/readiness.rs", "src/server.rs"]
 
 # Explicit test-role retrieval via a source-role filter.
 [[queries]]

@@ -59,6 +59,28 @@ const TELEMETRY_PROCESSOR_TESTS_CS: &str = r#"namespace Telemetry.Tests;
 public sealed class TelemetryProcessorTests { public const string Expected = "trim lowercase"; }
 "#;
 
+const PIPELINE_GO_V1: &str = r#"package pipeline
+
+import "strings"
+
+// BuildProductionEventPipeline trims and filters production events.
+func BuildProductionEventPipeline(events []string) []string {
+	result := make([]string, 0, len(events))
+	for _, event := range events {
+		if trimmed := strings.TrimSpace(event); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+"#;
+
+const PIPELINE_TEST_GO: &str = r#"package pipeline
+
+// Search decoy: BuildProductionEventPipeline is mentioned only in a test.
+const ExpectedPipelineDescription = "trim and filter events"
+"#;
+
 const FIXTURE_CARGO_TOML: &str = r#"[package]
 name = "multilingual-acceptance-fixture"
 version = "0.1.0"
@@ -113,6 +135,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         "tests/TelemetryProcessorTests.cs",
         TELEMETRY_PROCESSOR_TESTS_CS,
     )?;
+    fixture.write("src/pipeline.go", PIPELINE_GO_V1)?;
+    fixture.write("tests/pipeline_test.go", PIPELINE_TEST_GO)?;
 
     evidence.stage("write-config")?;
     let config_path = fixture.write_config(&[
@@ -141,8 +165,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     let files = first["files"]
         .as_u64()
         .context("index report missing files count")?;
-    if files != 10 {
-        bail!("Initial index included {files} files instead of 10");
+    if files != 12 {
+        bail!("Initial index included {files} files instead of 12");
     }
     evidence.set("initial_files", files)?;
 
@@ -224,6 +248,17 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     )
     .await?;
 
+    let go_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-go",
+        "BuildProductionEventPipeline",
+        "src/pipeline.go",
+        "go",
+        "func BuildProductionEventPipeline",
+    )
+    .await?;
+
     evidence.stage("ranking-and-decoys")?;
     let csharp_results = results_array(&csharp_search)?;
     let csharp_decoy_present = csharp_results.iter().any(|hit| {
@@ -239,6 +274,22 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         != Some("src/TelemetryProcessor.cs")
     {
         bail!("Production C# implementation did not outrank the test decoy");
+    }
+
+    let go_results = results_array(&go_search)?;
+    let go_decoy_present = go_results.iter().any(|hit| {
+        hit["relative_file_path"].as_str() == Some("tests/pipeline_test.go")
+            && hit["source_role"].as_str() == Some("test")
+    });
+    if !go_decoy_present {
+        bail!("Initial index did not include the Go test decoy with test role");
+    }
+    if go_results
+        .first()
+        .and_then(|hit| hit["relative_file_path"].as_str())
+        != Some("src/pipeline.go")
+    {
+        bail!("Production Go implementation did not outrank the test decoy");
     }
 
     let python_results = results_array(&python_search)?;
@@ -368,6 +419,23 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("C# update did not reuse other-language chunks");
     }
 
+    evidence.stage("go-update")?;
+    let pipeline_go_v2 = format!("{PIPELINE_GO_V1}\nfunc PipelineRevision() int {{ return 2 }}\n");
+    fixture.write("src/pipeline.go", &pipeline_go_v2)?;
+    let go_changed = run_report(
+        &config_path,
+        "multilingual-go-update",
+        &["index", &workspace],
+    )
+    .await?;
+    if go_changed["parsed_files"].as_u64() != Some(1) {
+        let parsed = go_changed["parsed_files"].as_u64().unwrap_or_default();
+        bail!("Go update parsed {parsed} files instead of exactly one");
+    }
+    if go_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
+        bail!("Go update did not reuse other-language chunks");
+    }
+
     evidence.stage("csharp-decoy-delete")?;
     std::fs::remove_file(fixture.dir.join("tests/TelemetryProcessorTests.cs"))
         .context("remove C# decoy test file")?;
@@ -457,6 +525,38 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("Deleted Python decoy chunks remain searchable");
     }
 
+    evidence.stage("go-decoy-delete")?;
+    std::fs::remove_file(fixture.dir.join("tests/pipeline_test.go"))
+        .context("remove Go decoy test file")?;
+    let go_deleted = run_report(
+        &config_path,
+        "multilingual-go-delete",
+        &["index", &workspace],
+    )
+    .await?;
+    if go_deleted["removed_files"].as_u64() != Some(1) {
+        let removed = go_deleted["removed_files"].as_u64().unwrap_or_default();
+        bail!("Go decoy deletion removed {removed} cached files instead of one");
+    }
+    let go_deleted_search = run_report(
+        &config_path,
+        "multilingual-search-after-go-delete",
+        &[
+            "search",
+            &workspace,
+            "ExpectedPipelineDescription",
+            "--top-k",
+            "8",
+        ],
+    )
+    .await?;
+    if results_array(&go_deleted_search)?
+        .iter()
+        .any(|hit| hit["relative_file_path"].as_str() == Some("tests/pipeline_test.go"))
+    {
+        bail!("Deleted Go decoy chunks remain searchable");
+    }
+
     evidence.stage("failed-update-retention")?;
     let before_failure = run_report(
         &config_path,
@@ -476,6 +576,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         "{telemetry_processor_cs_v2}\npublic static class FailedCSharpUpdateMarker {{ }}\n"
     );
     fixture.write("src/TelemetryProcessor.cs", &telemetry_processor_cs_v3)?;
+    let pipeline_go_v3 = format!("{pipeline_go_v2}\n// failedUpdateMarker: not committed\n");
+    fixture.write("src/pipeline.go", &pipeline_go_v3)?;
 
     let failure_output = run_lci(&failure_config_path, &["index", &workspace]).await?;
     let failure_evidence = serde_json::json!({

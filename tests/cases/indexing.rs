@@ -557,11 +557,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/TelemetryProcessorTests.cs",
         "namespace Telemetry.Tests;\n// Search decoy for NormalizeProductionEvent.\npublic sealed class TelemetryProcessorTests { public const string Expected = \"trim lowercase\"; }\n",
     );
+    write(
+        &workspace,
+        "src/pipeline.go",
+        "package pipeline\n\nimport \"strings\"\n\n// BuildProductionEventPipeline trims and filters production events.\nfunc BuildProductionEventPipeline(events []string) []string {\n\tresult := make([]string, 0, len(events))\n\tfor _, event := range events {\n\t\tif trimmed := strings.TrimSpace(event); trimmed != \"\" {\n\t\t\tresult = append(result, trimmed)\n\t\t}\n\t}\n\treturn result\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/pipeline_test.go",
+        "package pipeline\n\n// Decoy documentation for a production event pipeline test.\nconst ExpectedPipelineDescription = \"trim and filter events\"\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 9);
-    assert_eq!(first.parsed_files, 9);
+    assert_eq!(first.files, 11);
+    assert_eq!(first.parsed_files, 11);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -622,6 +632,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         ("TelemetryPanel", "src/panel.tsx", "tsx"),
         ("flushAuditBeacon", "src/audit.js", "javascript"),
         ("translator", "src/lib.rs", "rust"),
+        ("BuildProductionEventPipeline", "src/pipeline.go", "go"),
     ] {
         let report = app.search(&workspace, query, Some(8)).await.unwrap();
         assert!(
@@ -642,7 +653,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 9);
+    assert_eq!(restarted.unchanged_files, 11);
 
     write(
         &workspace,
@@ -651,7 +662,27 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 8);
+    assert_eq!(changed.unchanged_files, 10);
+
+    write(
+        &workspace,
+        "src/pipeline.go",
+        "package pipeline\n\nimport \"strings\"\n\n// BuildProductionEventPipeline trims and filters production events.\nfunc BuildProductionEventPipeline(events []string) []string {\n\tresult := make([]string, 0, len(events))\n\tfor _, event := range events {\n\t\tif trimmed := strings.TrimSpace(event); trimmed != \"\" {\n\t\t\tresult = append(result, strings.ToLower(trimmed))\n\t\t}\n\t}\n\treturn result\n}\n",
+    );
+    let go_changed = app.index(&workspace).await.unwrap();
+    assert_eq!(go_changed.parsed_files, 1);
+    assert_eq!(go_changed.unchanged_files, 10);
+    let go_updated = app
+        .search(&workspace, "BuildProductionEventPipeline", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        go_updated
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "src/pipeline.go"
+                && hit.chunk.code.contains("ToLower"))
+    );
 
     std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
     let csharp_deleted = app.index(&workspace).await.unwrap();
@@ -670,7 +701,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 7);
+    assert_eq!(deleted.files, 9);
     let after_delete = app
         .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
@@ -680,6 +711,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .results
             .iter()
             .all(|hit| hit.chunk.relative_file_path != "tests/feature_pipeline_test.py")
+    );
+
+    std::fs::remove_file(workspace.join("tests/pipeline_test.go")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 8);
+    let after_go_delete = app
+        .search(&workspace, "ExpectedPipelineDescription", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_go_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "tests/pipeline_test.go")
     );
 
     write(
