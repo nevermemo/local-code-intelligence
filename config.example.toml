@@ -34,6 +34,23 @@ lsp_candidate_count = 40
 # args = []
 # disabled = false
 
+# Optional TypeScript/JavaScript language server (typescript-language-server,
+# npm install -g typescript-language-server typescript). One configured
+# server navigates .ts/.tsx/.js/.jsx. Optional and fail-open, same as csharp
+# above. LCI always passes --stdio; args here are appended after it.
+# [typescript]
+# path = "typescript-language-server"
+# args = []
+# disabled = false
+
+# Optional Python language server (pyright, npm install -g pyright, which
+# provides pyright-langserver). Optional and fail-open, same as csharp above.
+# LCI always passes --stdio; args here are appended after it.
+# [python]
+# path = "pyright-langserver"
+# args = []
+# disabled = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

@@ -66,6 +66,30 @@ enum AcceptanceCommand {
         #[arg(long)]
         csharp_ls: Option<PathBuf>,
     },
+    /// Real typescript-language-server acceptance (workspace symbols, definition, references).
+    TypescriptLsp {
+        #[arg(long)]
+        typescript_language_server: Option<PathBuf>,
+    },
+    /// TypeScript provider-isolation/degradation acceptance (missing typescript-language-server binary).
+    TypescriptMissing,
+    /// TypeScript LSP persistent-process reuse and forced-kill recovery acceptance.
+    TypescriptRecovery {
+        #[arg(long)]
+        typescript_language_server: Option<PathBuf>,
+    },
+    /// Real pyright acceptance (workspace symbols, definition, references).
+    PythonLsp {
+        #[arg(long)]
+        pyright: Option<PathBuf>,
+    },
+    /// Python provider-isolation/degradation acceptance (missing pyright binary).
+    PythonMissing,
+    /// Python LSP persistent-process reuse and forced-kill recovery acceptance.
+    PythonRecovery {
+        #[arg(long)]
+        pyright: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -86,6 +110,18 @@ async fn main() -> Result<()> {
             AcceptanceCommand::CsharpMissing => acceptance::csharp_missing::run().await,
             AcceptanceCommand::CsharpRecovery { csharp_ls } => {
                 acceptance::csharp_recovery::run(csharp_ls).await
+            }
+            AcceptanceCommand::TypescriptLsp {
+                typescript_language_server,
+            } => acceptance::typescript_lsp::run(typescript_language_server).await,
+            AcceptanceCommand::TypescriptMissing => acceptance::typescript_missing::run().await,
+            AcceptanceCommand::TypescriptRecovery {
+                typescript_language_server,
+            } => acceptance::typescript_recovery::run(typescript_language_server).await,
+            AcceptanceCommand::PythonLsp { pyright } => acceptance::python_lsp::run(pyright).await,
+            AcceptanceCommand::PythonMissing => acceptance::python_missing::run().await,
+            AcceptanceCommand::PythonRecovery { pyright } => {
+                acceptance::python_recovery::run(pyright).await
             }
         },
     }

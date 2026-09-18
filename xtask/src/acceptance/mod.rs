@@ -10,6 +10,12 @@ pub mod csharp_missing;
 pub mod csharp_recovery;
 pub mod lsp;
 pub mod multilingual;
+pub mod python_lsp;
+pub mod python_missing;
+pub mod python_recovery;
+pub mod typescript_lsp;
+pub mod typescript_missing;
+pub mod typescript_recovery;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -40,11 +46,23 @@ pub fn test_results_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Cross-platform PATH lookup, trying `name` and (on Windows) `name.exe`.
+/// Cross-platform PATH lookup, trying `name` and (on Windows) `name.exe`
+/// and `name.cmd` — npm and npm-installed shims (typescript-language-server,
+/// pyright-langserver) are batch-file wrappers on Windows, not native `.exe`.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // `.exe`/`.cmd` are tried before the bare name on Windows: several
+    // npm-ecosystem installs (confirmed with nvm-for-windows' `npm`) ship a
+    // bare, extensionless file that is a POSIX shell script, not a valid
+    // Win32 executable, alongside the real `name.cmd` shim in the same PATH
+    // directory. Preferring the bare name first would silently resolve to
+    // that broken script instead of the working one.
     let candidates: Vec<String> = if cfg!(windows) && !name.eq_ignore_ascii_case("") {
-        vec![name.to_string(), format!("{name}.exe")]
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_string(),
+        ]
     } else {
         vec![name.to_string()]
     };
@@ -136,7 +154,9 @@ impl ManagedServer {
 
     /// Direct children of this server matching `process_name` (e.g.
     /// "csharp-ls"), compared case-insensitively and without a platform
-    /// executable suffix.
+    /// executable suffix. Only useful for a server that spawns as a native
+    /// executable directly; see [`Self::descendants_named`] for npm-style
+    /// tools that spawn through an intermediate shell wrapper on Windows.
     pub fn children_named(&self, process_name: &str) -> Vec<u32> {
         let mut system = System::new_all();
         system.refresh_all();
@@ -155,6 +175,55 @@ impl ManagedServer {
             .collect()
     }
 
+    /// Every descendant of this server at any depth matching `process_name`
+    /// (case-insensitive, without a platform executable suffix). On Windows,
+    /// an npm-installed tool invoked via its `.cmd` shim spawns as
+    /// `local-code-intelligence.exe -> cmd.exe -> node.exe [-> node.exe...]`
+    /// — the real server process is a grandchild or deeper, not a direct
+    /// child — so `children_named` alone will not find it. Prefer this for
+    /// typescript-language-server/pyright; `children_named` remains correct
+    /// and sufficient for csharp-ls, a native executable spawned directly.
+    pub fn descendants_named(&self, process_name: &str) -> Vec<u32> {
+        let mut system = System::new_all();
+        system.refresh_all();
+        Self::descendants_of(&system, self.pid)
+            .into_iter()
+            .filter(|pid| {
+                system
+                    .process(Pid::from_u32(*pid))
+                    .map(|process| {
+                        process
+                            .name()
+                            .to_string_lossy()
+                            .trim_end_matches(".exe")
+                            .eq_ignore_ascii_case(process_name)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// BFS over the process table for every descendant PID of `root`, at any
+    /// depth, using one already-refreshed `System` snapshot.
+    fn descendants_of(system: &System, root: u32) -> Vec<u32> {
+        let mut frontier = vec![root];
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(parent) = frontier.pop() {
+            for process in system.processes().values() {
+                if process.parent().map(|p| p.as_u32()) != Some(parent) {
+                    continue;
+                }
+                let pid = process.pid().as_u32();
+                if seen.insert(pid) {
+                    found.push(pid);
+                    frontier.push(pid);
+                }
+            }
+        }
+        found
+    }
+
     pub fn kill_process(pid: u32) {
         let mut system = System::new_all();
         system.refresh_all();
@@ -163,18 +232,16 @@ impl ManagedServer {
         }
     }
 
-    /// Kills every direct child of the owned server, then the server itself,
-    /// mirroring the .ps1 cleanup order (children first, then parent).
+    /// Kills every descendant of the owned server at any depth, then the
+    /// server itself, mirroring the .ps1 cleanup order (children first, then
+    /// parent) but extended to the full tree — a shallow direct-children-only
+    /// kill can leave an npm-style tool's real process (a grandchild via an
+    /// intermediate `cmd.exe` on Windows) orphaned and running.
     pub async fn kill_tree(&mut self) {
         let mut system = System::new_all();
         system.refresh_all();
-        let children: Vec<u32> = system
-            .processes()
-            .values()
-            .filter(|process| process.parent().map(|parent| parent.as_u32()) == Some(self.pid))
-            .map(|process| process.pid().as_u32())
-            .collect();
-        for pid in children {
+        let descendants = Self::descendants_of(&system, self.pid);
+        for pid in descendants {
             Self::kill_process(pid);
         }
         let _ = self.child.start_kill();
@@ -373,6 +440,29 @@ impl LciOutput {
         serde_json::from_str(self.stdout.trim())
             .with_context(|| format!("invalid JSON on stdout: {}", self.stdout))
     }
+}
+
+/// Runs `npm <args>` in `dir`, bailing with combined stdout/stderr on a
+/// nonzero exit — the shared pattern for scaffolding real TypeScript/Python
+/// fixtures (`npm init`, `npm install typescript`, etc.).
+pub async fn run_npm(dir: &Path, args: &[&str]) -> Result<()> {
+    let npm = which("npm").context("npm not found on PATH")?;
+    let output = Command::new(npm)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .await
+        .with_context(|| format!("run npm {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "npm {} failed ({}): {}{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Runs the compiled `local-code-intelligence` CLI (not the MCP server) with
