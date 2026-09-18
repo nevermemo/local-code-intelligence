@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Automated tests use only a local mock model HTTP service and a fake LSP
+# binary built as part of the workspace (see tests/support). They never
+# contact ports 8765/8766/8767 or a real rust-analyzer/csharp-ls, so this
+# workflow needs no external services. Live model/LSP acceptance
+# (`cargo xtask acceptance <name>`) is intentionally not run here: it
+# requires locally running embedding/reranker services and, for the C#
+# subcommands, a real dotnet SDK + csharp-ls install.
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc and cmake (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Provision protoc (Windows)
+        if: runner.os == 'Windows'
+        run: cargo xtask setup
+
+      - name: Build and test
+        run: cargo xtask test --suite Full
