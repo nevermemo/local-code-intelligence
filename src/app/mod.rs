@@ -8,7 +8,9 @@ mod navigation;
 mod readiness;
 mod search;
 
-pub use indexing::{IndexAction, IndexReport, Status, WatchReport};
+pub use indexing::{
+    IndexAction, IndexReport, IndexedFile, IndexedFilesReport, Status, WatchReport,
+};
 pub use navigation::NavigationReport;
 pub use readiness::{ReadinessComponent, ReadinessDegraded, ServiceStatus};
 pub use search::{SearchIndexLifecycle, SearchReport, Timings};

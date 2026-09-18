@@ -23,6 +23,9 @@ enum Command {
     Status {
         workspace: PathBuf,
     },
+    ListFiles {
+        workspace: PathBuf,
+    },
     Search {
         workspace: PathBuf,
         query: String,
@@ -80,6 +83,9 @@ async fn main() -> Result<()> {
     let output = match cli.command.unwrap_or(Command::Serve) {
         Command::Index { workspace } => serde_json::to_value(app.index(&workspace).await?)?,
         Command::Status { workspace } => serde_json::to_value(app.status(&workspace).await?)?,
+        Command::ListFiles { workspace } => {
+            serde_json::to_value(app.indexed_files(&workspace).await?)?
+        }
         Command::Search {
             workspace,
             query,

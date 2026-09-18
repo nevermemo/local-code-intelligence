@@ -48,6 +48,19 @@ pub struct Status {
 }
 
 #[derive(Debug, Serialize)]
+pub struct IndexedFile {
+    pub relative_file_path: String,
+    pub language: String,
+    pub chunks: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexedFilesReport {
+    pub workspace: Workspace,
+    pub files: Vec<IndexedFile>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct WatchReport {
     pub workspace: Workspace,
     pub watched: bool,
@@ -296,6 +309,31 @@ impl App {
             python_analyzer_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
+    }
+
+    /// Lists every file the persistent index currently has cached chunks
+    /// for, from the workspace manifest -- the same data `index_workspace`
+    /// wrote, not a fresh directory scan, so this reflects what was
+    /// actually indexed (respecting gitignore and per-language support)
+    /// rather than what's on disk right now.
+    pub async fn indexed_files(&self, path: &Path) -> Result<IndexedFilesReport> {
+        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
+        ensure!(
+            self.store.snapshot(&workspace).await?.is_some(),
+            "workspace is not indexed; call index_workspace first"
+        );
+        let manifest = manifest::load(&self.config.data_dir, &workspace);
+        let mut files: Vec<IndexedFile> = manifest
+            .files
+            .into_iter()
+            .map(|(relative_file_path, cached)| IndexedFile {
+                relative_file_path,
+                language: cached.language,
+                chunks: cached.chunks.len(),
+            })
+            .collect();
+        files.sort_by(|a, b| a.relative_file_path.cmp(&b.relative_file_path));
+        Ok(IndexedFilesReport { workspace, files })
     }
 
     pub async fn watch(self: &Arc<Self>, path: &Path) -> Result<WatchReport> {

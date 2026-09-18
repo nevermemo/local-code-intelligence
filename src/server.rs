@@ -92,6 +92,19 @@ impl McpServer {
         result(self.app.status(Path::new(&args.workspace_path)).await)
     }
     #[tool(
+        description = "List every file the persistent index currently has cached chunks for, with language and chunk count. Reflects the last successful index_workspace, not a fresh directory scan."
+    )]
+    async fn list_indexed_files(
+        &self,
+        Parameters(args): Parameters<WorkspaceArgs>,
+    ) -> CallToolResult {
+        result(
+            self.app
+                .indexed_files(Path::new(&args.workspace_path))
+                .await,
+        )
+    }
+    #[tool(
         description = "Watch an indexed workspace for Rust, TypeScript, TSX, JavaScript, JSX, Python, and C# source changes. Debounces changes and refreshes the persistent index while the server is running."
     )]
     async fn watch_workspace(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {

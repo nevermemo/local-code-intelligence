@@ -104,6 +104,7 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | --- | --- | --- |
 | `index_workspace` | `workspace_path` | Canonical workspace/ID, file/chunk counts, parsed/unchanged/removed files, newly embedded/reused chunks, total time |
 | `index_status` | `workspace_path` | Whether indexed/indexing/stale/watched, chunk count, embedding dimension, configuration compatibility, last successful indexing time |
+| `list_indexed_files` | `workspace_path` | Every file the persistent index has cached chunks for, with language and chunk count, from the last successful `index_workspace` |
 | `watch_workspace` | `workspace_path` | Start debounced polling and automatic reindexing for an indexed workspace |
 | `unwatch_workspace` | `workspace_path` | Stop automatic reindexing for a workspace |
 | `search_symbols` | `workspace_path`, `query` | Workspace symbols from applicable enabled Rust/C# language servers, with provider/language metadata |
@@ -147,6 +148,7 @@ lci=./target/debug/local-code-intelligence   # local-code-intelligence.exe on Wi
 gust=/path/to/gpu-dialect-v0
 "$lci" index "$gust"
 "$lci" status "$gust"
+"$lci" list-files "$gust"
 "$lci" search "$gust" 'lower syn AST expressions into generated Slang compute shader code'
 "$lci" symbols "$gust" 'emit_expression#'
 "$lci" definition "$gust" 'crates/gust-macros/src/slang/mod.rs' 266 24

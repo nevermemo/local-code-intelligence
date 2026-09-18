@@ -49,6 +49,41 @@ async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings
 }
 
 #[tokio::test]
+async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("listing");
+    write(&workspace, "src/lib.rs", "fn one() {}\nfn two() {}\n");
+    write(&workspace, "src/app.py", "def main():\n    pass\n");
+    let app = App::open(config).await.unwrap();
+
+    let error = app.indexed_files(&workspace).await.unwrap_err();
+    assert!(format!("{error:#}").contains("workspace is not indexed"));
+
+    app.index(&workspace).await.unwrap();
+    let report = app.indexed_files(&workspace).await.unwrap();
+    let paths: Vec<_> = report
+        .files
+        .iter()
+        .map(|f| f.relative_file_path.as_str())
+        .collect();
+    assert_eq!(paths, ["src/app.py", "src/lib.rs"]);
+    let rust_file = report
+        .files
+        .iter()
+        .find(|f| f.relative_file_path == "src/lib.rs")
+        .unwrap();
+    assert_eq!(rust_file.language, "rust");
+    assert_eq!(rust_file.chunks, 2);
+    let python_file = report
+        .files
+        .iter()
+        .find(|f| f.relative_file_path == "src/app.py")
+        .unwrap();
+    assert_eq!(python_file.language, "python");
+    task.abort();
+}
+
+#[tokio::test]
 async fn concurrent_first_searches_share_one_initial_index_job() {
     let (temp, config, fake, task) = fixture().await;
     fake.embed_delay_milliseconds.store(200, Ordering::SeqCst);
