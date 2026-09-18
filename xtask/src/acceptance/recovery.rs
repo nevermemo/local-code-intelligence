@@ -266,6 +266,10 @@ pub async fn run(spec: RecoverySpec, explicit: Option<PathBuf>) -> Result<()> {
     final_result
 }
 
+/// Resolves the server executable/install directory for a recovery spec.
+/// Accepts directories as well as files in the fallback check -- Java's
+/// `path` is a jdtls installation directory, not an executable (see
+/// `config.rs`'s `JavaLspConfig` doc comment).
 fn resolve_server(spec: &RecoverySpec, explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         return Some(path);
@@ -277,7 +281,7 @@ fn resolve_server(spec: &RecoverySpec, explicit: Option<PathBuf>) -> Option<Path
         && let Some(fallback) = spec.windows_fallback
     {
         let fallback = PathBuf::from(fallback);
-        if fallback.is_file() {
+        if fallback.exists() {
             return Some(fallback);
         }
     }

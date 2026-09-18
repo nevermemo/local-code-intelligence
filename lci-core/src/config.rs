@@ -79,6 +79,10 @@ pub struct Config {
     /// configuration keeps Go navigation disabled; syntax retrieval is
     /// unaffected.
     pub go: GoLspConfig,
+    /// Optional Java language-server (jdtls) settings. Absent or empty
+    /// configuration keeps Java navigation disabled; syntax retrieval is
+    /// unaffected.
+    pub java: JavaLspConfig,
     pub index: IndexConfig,
 }
 
@@ -224,6 +228,66 @@ impl GoLspConfig {
     }
 }
 
+/// Optional Java language-server (jdtls / Eclipse JDT Language Server)
+/// configuration.
+///
+/// Java navigation is optional and fail-open: an absent or empty `[java]`
+/// section keeps the server disabled without affecting syntax retrieval.
+/// The shared `lsp_timeout_seconds` and `lsp_candidate_count` settings
+/// apply to this server as well.
+///
+/// `path` is the jdtls *installation directory* (e.g. the extracted
+/// `jdt-language-server-*.tar.gz`), not an executable -- unlike every other
+/// adapter here, jdtls has no single native binary to spawn directly.
+/// `JavaServer` builds the real `java -jar <equinox launcher> -data <dir>`
+/// invocation itself (globbing `<path>/plugins/org.eclipse.equinox.
+/// launcher_*.jar` and selecting `<path>/config_win`/`config_mac`/
+/// `config_linux`), spawning `java` as a direct child.
+///
+/// This was **not** the first design: jdtls's own official cross-platform
+/// launcher is a Python script (`<path>/bin/jdtls`) that does the same
+/// jar/config-dir resolution, and reusing it was tried first. On Windows
+/// that produces a `local-code-intelligence.exe -> python.exe -> java.exe`
+/// process chain, and killing the direct child (`python.exe`, via
+/// `kill_on_drop`) does not cascade to the `java.exe` grandchild -- Windows
+/// only cascades process termination through a Job Object, which plain
+/// `std`/`tokio` process spawning does not set up. The orphaned `java.exe`
+/// then keeps its inherited stdout pipe handle open, so the next read on
+/// that pipe blocks forever with neither data nor EOF, hanging the whole
+/// calling process indefinitely -- confirmed by reproducing the hang, then
+/// confirming a direct `java` invocation (no Python hop) exits cleanly
+/// within seconds of being killed, with zero orphaned processes. Spawning
+/// `java` directly, like every other adapter here, avoids the multi-hop
+/// process tree entirely rather than trying to fix Windows job-object
+/// semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JavaLspConfig {
+    /// Path to the jdtls installation directory. `None` (the default) keeps
+    /// Java navigation disabled. An empty or whitespace-only value is
+    /// rejected by validation rather than silently counting as enabled.
+    pub path: Option<String>,
+    /// Additional JVM/jdtls arguments, appended after the `-data <dir>`
+    /// flag this application always supplies.
+    pub args: Vec<String>,
+    /// Explicitly disable the Java server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl JavaLspConfig {
+    /// Whether the Java language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty interpreter
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Per-OS local data directory: %LOCALAPPDATA% on Windows,
@@ -257,6 +321,7 @@ impl Default for Config {
             typescript: TypeScriptLspConfig::default(),
             python: PythonLspConfig::default(),
             go: GoLspConfig::default(),
+            java: JavaLspConfig::default(),
             index: IndexConfig::default(),
         }
     }
@@ -333,6 +398,14 @@ impl Config {
             ensure!(
                 !path.trim().is_empty(),
                 "go.path must be nonempty when set; omit it or set go.disabled = true to keep Go navigation disabled"
+            );
+        }
+        if !self.java.disabled
+            && let Some(path) = &self.java.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "java.path must be nonempty when set; omit it or set java.disabled = true to keep Java navigation disabled"
             );
         }
         ensure!(
@@ -487,5 +560,45 @@ mod tests {
         let config: Config = toml::from_str(&toml_text).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("go.path"));
+    }
+
+    #[test]
+    fn default_java_is_disabled() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(!config.java.enabled());
+        assert!(config.java.path.is_none());
+    }
+
+    #[test]
+    fn java_section_enables_server() {
+        let toml_text = format!(
+            "{}[java]\npath = \"C:/tools/jdtls\"\nargs = ['-Xmx2G']\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(config.java.enabled());
+        assert_eq!(config.java.path.as_deref(), Some("C:/tools/jdtls"));
+        assert_eq!(config.java.args, vec!["-Xmx2G".to_string()]);
+    }
+
+    #[test]
+    fn java_disabled_flag_overrides_path() {
+        let toml_text = format!(
+            "{}[java]\npath = \"C:/tools/jdtls\"\ndisabled = true\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(!config.java.enabled());
+    }
+
+    #[test]
+    fn empty_java_path_is_rejected() {
+        let toml_text = format!("{}[java]\npath = \"   \"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("java.path"));
     }
 }

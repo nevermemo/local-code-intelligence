@@ -61,6 +61,17 @@ lsp_candidate_count = 40
 # args = []
 # disabled = false
 
+# Optional Java language server (jdtls / Eclipse JDT Language Server).
+# Unlike every other server above, path is the jdtls *installation
+# directory* (e.g. an extracted jdt-language-server-*.tar.gz), not an
+# executable -- LCI spawns java directly, finding the Equinox launcher jar
+# and platform config dir under that directory itself. Optional and
+# fail-open, same as csharp above.
+# [java]
+# path = "C:/tools/jdtls"
+# args = []
+# disabled = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

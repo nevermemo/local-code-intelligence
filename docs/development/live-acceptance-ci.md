@@ -65,7 +65,7 @@ them for you:
    `pull_request`-less trigger alone -- self-hosted runners on public repos
    are a known code-execution risk surface if that default is ever changed.
 
-## Prerequisites checked on this machine (2026-09-18)
+## Prerequisites checked on this machine (2026-09-19)
 
 | Tool | Needed for | Status |
 | --- | --- | --- |
@@ -74,6 +74,7 @@ them for you:
 | `pyright` (`pyright-langserver`) | `cargo xtask acceptance python-lsp/-missing/-recovery` | not installed -- `npm install -g pyright` |
 | `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | not installed -- `npm install -g typescript-language-server typescript` |
 | `go` + `gopls` | `cargo xtask acceptance go-lsp/-missing/-recovery` | installed (`go install golang.org/x/tools/gopls@latest`) |
+| JDK 21+ + jdtls install | `cargo xtask acceptance java-lsp/-missing/-recovery` | installed (Temurin 25; jdtls extracted to `C:\Users\micro\tools\jdtls` -- `[java].path`/`--java <dir>` point at that directory, not an executable) |
 
 Every `*-lsp`/`*-missing`/`*-recovery` subcommand skips gracefully (prints
 `PREREQUISITE_UNAVAILABLE`) rather than failing when its tool isn't on

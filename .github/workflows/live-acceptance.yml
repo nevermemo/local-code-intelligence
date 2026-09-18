@@ -57,6 +57,13 @@ jobs:
       - name: Acceptance - Go LSP recovery
         run: cargo xtask acceptance go-recovery
 
+      - name: Acceptance - Java LSP (jdtls)
+        run: cargo xtask acceptance java-lsp
+      - name: Acceptance - Java LSP provider isolation
+        run: cargo xtask acceptance java-missing
+      - name: Acceptance - Java LSP recovery
+        run: cargo xtask acceptance java-recovery
+
       - name: Acceptance - C# LSP (dotnet + csharp-ls)
         run: cargo xtask acceptance csharp-lsp
       - name: Acceptance - C# LSP provider isolation

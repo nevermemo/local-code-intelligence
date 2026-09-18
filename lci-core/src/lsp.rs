@@ -2,8 +2,9 @@ use crate::{
     config::Config,
     language,
     lsp::{
-        adapter::LspAdapter, csharp::CSharpServer, go::GoServer, python::PythonServer,
-        rust::RustServer, transport::JsonRpcClient, typescript::TypeScriptServer,
+        adapter::LspAdapter, csharp::CSharpServer, go::GoServer, java::JavaServer,
+        python::PythonServer, rust::RustServer, transport::JsonRpcClient,
+        typescript::TypeScriptServer,
     },
     workspace::Workspace,
 };
@@ -20,6 +21,7 @@ use tokio::sync::Mutex;
 pub mod adapter;
 pub mod csharp;
 pub mod go;
+pub mod java;
 pub mod python;
 pub mod rust;
 pub mod transport;
@@ -68,10 +70,10 @@ impl GenericClient {
 
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
 /// and C# (csharp-ls) are always constructed; TypeScript/JavaScript, Python,
-/// and Go join the same registry as optional, individually disableable
-/// adapters. A disabled or unconfigured adapter simply never produces a
-/// session (`transport_config` returns `None`), which surfaces as a clear
-/// error from the caller.
+/// Go, and Java join the same registry as optional, individually
+/// disableable adapters. A disabled or unconfigured adapter simply never
+/// produces a session (`transport_config` returns `None`), which surfaces
+/// as a clear error from the caller.
 pub struct Manager {
     adapters: Vec<Arc<dyn LspAdapter>>,
     sessions: Mutex<HashMap<(String, String), Arc<GenericClient>>>,
@@ -86,6 +88,7 @@ impl Manager {
             Arc::new(TypeScriptServer::new(&config.typescript, timeout)),
             Arc::new(PythonServer::new(&config.python, timeout)),
             Arc::new(GoServer::new(&config.go, timeout)),
+            Arc::new(JavaServer::new(config, timeout)),
         ];
         Self {
             adapters,

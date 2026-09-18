@@ -173,11 +173,17 @@ pub async fn run(spec: LspFullFlowSpec, explicit: Option<PathBuf>) -> Result<()>
 }
 
 /// Resolves the server executable: the explicit CLI flag (either a literal
-/// file, or a bare command name looked up on PATH), else a PATH lookup,
-/// else (Windows only) a well-known fallback install location.
+/// file/directory, or a bare command name looked up on PATH), else a PATH
+/// lookup, else (Windows only) a well-known fallback install location.
+///
+/// Accepts directories as well as files: every family resolves to a single
+/// executable except Java, where `path` in the written config is a jdtls
+/// *installation directory* (`JavaServer` finds the actual launcher jar and
+/// spawns `java` itself -- see `config.rs`'s `JavaLspConfig` doc comment
+/// for why).
 fn resolve_server(spec: &LspFullFlowSpec, explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = explicit {
-        if path.is_file() {
+        if path.exists() {
             return Some(path);
         }
         if let Some(name) = path.to_str()
@@ -194,7 +200,7 @@ fn resolve_server(spec: &LspFullFlowSpec, explicit: Option<PathBuf>) -> Option<P
         && let Some(fallback) = spec.windows_fallback
     {
         let fallback = PathBuf::from(fallback);
-        if fallback.is_file() {
+        if fallback.exists() {
             return Some(fallback);
         }
     }

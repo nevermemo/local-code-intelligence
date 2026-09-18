@@ -102,6 +102,20 @@ enum AcceptanceCommand {
         #[arg(long)]
         gopls: Option<PathBuf>,
     },
+    /// Real jdtls acceptance (workspace symbols, definition, references).
+    JavaLsp {
+        /// Path to the jdtls installation directory (not an executable).
+        #[arg(long)]
+        java: Option<PathBuf>,
+    },
+    /// Java provider-isolation/degradation acceptance (missing jdtls install).
+    JavaMissing,
+    /// Java LSP persistent-process reuse and forced-kill recovery acceptance.
+    JavaRecovery {
+        /// Path to the jdtls installation directory (not an executable).
+        #[arg(long)]
+        java: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +152,9 @@ async fn main() -> Result<()> {
             AcceptanceCommand::GoLsp { gopls } => acceptance::go_lsp::run(gopls).await,
             AcceptanceCommand::GoMissing => acceptance::go_missing::run().await,
             AcceptanceCommand::GoRecovery { gopls } => acceptance::go_recovery::run(gopls).await,
+            AcceptanceCommand::JavaLsp { java } => acceptance::java_lsp::run(java).await,
+            AcceptanceCommand::JavaMissing => acceptance::java_missing::run().await,
+            AcceptanceCommand::JavaRecovery { java } => acceptance::java_recovery::run(java).await,
         },
     }
 }
