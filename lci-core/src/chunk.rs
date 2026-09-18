@@ -943,4 +943,100 @@ var DefaultTimeout = 30
             );
         }
     }
+
+    #[test]
+    fn chunks_java_packages_types_members_annotations_and_javadoc() {
+        let source = r#"package com.example.telemetry;
+
+import java.util.List;
+
+/**
+ * Processes production telemetry.
+ */
+@Deprecated
+public class TelemetryProcessor {
+    private String name = "production";
+
+    public TelemetryProcessor(String name) {
+        this.name = name;
+    }
+
+    public String normalize(String value) {
+        String trimmed = value.trim();
+        return trimmed.toLowerCase();
+    }
+}
+
+interface TelemetrySink {
+    void write(String value);
+}
+"#;
+        let chunks = chunks_for_path("TelemetryProcessor.java", source).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.language == "java"));
+        for expected in [
+            "import java.util.List",
+            "class TelemetryProcessor",
+            "private String name",
+            "TelemetryProcessor(String name)",
+            "String normalize",
+            "interface TelemetrySink",
+            "void write",
+        ] {
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(expected)),
+                "missing {expected}: {chunks:#?}"
+            );
+        }
+        let class = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
+            .unwrap();
+        assert!(class.code.contains("/**"));
+        assert!(class.code.contains("@Deprecated"));
+        for chunk in &chunks {
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1);
+            assert!(chunk.end_line >= chunk.start_line);
+        }
+    }
+
+    #[test]
+    fn oversized_java_method_splits_at_statements_and_keeps_its_header() {
+        let statements = (0..1200)
+            .map(|i| format!("        total += {i};\n"))
+            .collect::<String>();
+        let source = format!(
+            "public class LargeCalculator {{\n    @Deprecated\n    public int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}}\n"
+        );
+        let chunks = chunks_for_path("LargeCalculator.java", &source).unwrap();
+        assert!(
+            chunks.len() > 2,
+            "oversized member was not split: {chunks:#?}"
+        );
+        let header = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("public int calculate"))
+            .unwrap();
+        assert!(header.code.contains("@Deprecated"));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("return total;"))
+        );
+        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
+    }
+
+    #[test]
+    fn java_parser_recovery_keeps_following_declarations_searchable() {
+        let source =
+            "public class Broken { void run( { }\npublic record HealthyRecord(int value) {}\n";
+        let chunks = chunks_for_path("Recovered.java", source).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("HealthyRecord")),
+            "valid declaration after syntax damage was lost: {chunks:#?}"
+        );
+    }
 }

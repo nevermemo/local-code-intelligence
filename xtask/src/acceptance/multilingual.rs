@@ -81,6 +81,27 @@ const PIPELINE_TEST_GO: &str = r#"package pipeline
 const ExpectedPipelineDescription = "trim and filter events"
 "#;
 
+const ORDER_VALIDATOR_JAVA_V1: &str = r#"package orders;
+
+import java.util.List;
+
+/** Validates a production order before it is queued for fulfillment. */
+public final class OrderValidator {
+    public static boolean isValidProductionOrder(String orderId, List<String> items) {
+        return orderId != null && !orderId.isEmpty() && !items.isEmpty();
+    }
+}
+"#;
+
+const ORDER_VALIDATOR_TEST_JAVA: &str = r#"package orders;
+
+// Search decoy: isValidProductionOrder is mentioned only in a test.
+public final class OrderValidatorTest {
+    public static final String EXPECTED_ORDER_VALIDATION_DESCRIPTION =
+        "reject orders with no id or no items";
+}
+"#;
+
 const FIXTURE_CARGO_TOML: &str = r#"[package]
 name = "multilingual-acceptance-fixture"
 version = "0.1.0"
@@ -137,6 +158,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     )?;
     fixture.write("src/pipeline.go", PIPELINE_GO_V1)?;
     fixture.write("tests/pipeline_test.go", PIPELINE_TEST_GO)?;
+    fixture.write("src/OrderValidator.java", ORDER_VALIDATOR_JAVA_V1)?;
+    fixture.write("tests/OrderValidatorTest.java", ORDER_VALIDATOR_TEST_JAVA)?;
 
     evidence.stage("write-config")?;
     let config_path = fixture.write_config(&[
@@ -165,8 +188,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     let files = first["files"]
         .as_u64()
         .context("index report missing files count")?;
-    if files != 12 {
-        bail!("Initial index included {files} files instead of 12");
+    if files != 14 {
+        bail!("Initial index included {files} files instead of 14");
     }
     evidence.set("initial_files", files)?;
 
@@ -259,6 +282,17 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     )
     .await?;
 
+    let java_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-java",
+        "isValidProductionOrder",
+        "src/OrderValidator.java",
+        "java",
+        "static boolean isValidProductionOrder",
+    )
+    .await?;
+
     evidence.stage("ranking-and-decoys")?;
     let csharp_results = results_array(&csharp_search)?;
     let csharp_decoy_present = csharp_results.iter().any(|hit| {
@@ -290,6 +324,22 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         != Some("src/pipeline.go")
     {
         bail!("Production Go implementation did not outrank the test decoy");
+    }
+
+    let java_results = results_array(&java_search)?;
+    let java_decoy_present = java_results.iter().any(|hit| {
+        hit["relative_file_path"].as_str() == Some("tests/OrderValidatorTest.java")
+            && hit["source_role"].as_str() == Some("test")
+    });
+    if !java_decoy_present {
+        bail!("Initial index did not include the Java test decoy with test role");
+    }
+    if java_results
+        .first()
+        .and_then(|hit| hit["relative_file_path"].as_str())
+        != Some("src/OrderValidator.java")
+    {
+        bail!("Production Java implementation did not outrank the test decoy");
     }
 
     let python_results = results_array(&python_search)?;
@@ -436,6 +486,25 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("Go update did not reuse other-language chunks");
     }
 
+    evidence.stage("java-update")?;
+    let order_validator_java_v2 = format!(
+        "{ORDER_VALIDATOR_JAVA_V1}\nfinal class OrderValidatorRevision {{ static final int VALUE = 2; }}\n"
+    );
+    fixture.write("src/OrderValidator.java", &order_validator_java_v2)?;
+    let java_changed = run_report(
+        &config_path,
+        "multilingual-java-update",
+        &["index", &workspace],
+    )
+    .await?;
+    if java_changed["parsed_files"].as_u64() != Some(1) {
+        let parsed = java_changed["parsed_files"].as_u64().unwrap_or_default();
+        bail!("Java update parsed {parsed} files instead of exactly one");
+    }
+    if java_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
+        bail!("Java update did not reuse other-language chunks");
+    }
+
     evidence.stage("csharp-decoy-delete")?;
     std::fs::remove_file(fixture.dir.join("tests/TelemetryProcessorTests.cs"))
         .context("remove C# decoy test file")?;
@@ -557,6 +626,38 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("Deleted Go decoy chunks remain searchable");
     }
 
+    evidence.stage("java-decoy-delete")?;
+    std::fs::remove_file(fixture.dir.join("tests/OrderValidatorTest.java"))
+        .context("remove Java decoy test file")?;
+    let java_deleted = run_report(
+        &config_path,
+        "multilingual-java-delete",
+        &["index", &workspace],
+    )
+    .await?;
+    if java_deleted["removed_files"].as_u64() != Some(1) {
+        let removed = java_deleted["removed_files"].as_u64().unwrap_or_default();
+        bail!("Java decoy deletion removed {removed} cached files instead of one");
+    }
+    let java_deleted_search = run_report(
+        &config_path,
+        "multilingual-search-after-java-delete",
+        &[
+            "search",
+            &workspace,
+            "EXPECTED_ORDER_VALIDATION_DESCRIPTION",
+            "--top-k",
+            "8",
+        ],
+    )
+    .await?;
+    if results_array(&java_deleted_search)?
+        .iter()
+        .any(|hit| hit["relative_file_path"].as_str() == Some("tests/OrderValidatorTest.java"))
+    {
+        bail!("Deleted Java decoy chunks remain searchable");
+    }
+
     evidence.stage("failed-update-retention")?;
     let before_failure = run_report(
         &config_path,
@@ -578,6 +679,9 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     fixture.write("src/TelemetryProcessor.cs", &telemetry_processor_cs_v3)?;
     let pipeline_go_v3 = format!("{pipeline_go_v2}\n// failedUpdateMarker: not committed\n");
     fixture.write("src/pipeline.go", &pipeline_go_v3)?;
+    let order_validator_java_v3 =
+        format!("{order_validator_java_v2}\n// failedUpdateMarker: not committed\n");
+    fixture.write("src/OrderValidator.java", &order_validator_java_v3)?;
 
     let failure_output = run_lci(&failure_config_path, &["index", &workspace]).await?;
     let failure_evidence = serde_json::json!({

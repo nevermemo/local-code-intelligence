@@ -8,6 +8,7 @@ pub(crate) enum Syntax {
     Python,
     CSharp,
     Go,
+    Java,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,7 @@ impl LanguageAdapter {
             "py" => "*.py",
             "cs" => "*.cs",
             "go" => "*.go",
+            "java" => "*.java",
             _ => unreachable!(),
         }
     }
@@ -75,6 +77,21 @@ impl LanguageAdapter {
             // the size-threshold path (MAX_DECLARATION_BYTES) for the rare
             // oversized one instead of always chunking statement-by-statement.
             Syntax::Go => matches!(kind, "source_file"),
+            // Java mirrors C#'s class-based container shape: the file, each
+            // type body, and a declaration's own block are all containers,
+            // so ordinary members chunk individually and only an oversized
+            // method body ever needs to descend into per-statement groups.
+            Syntax::Java => matches!(
+                kind,
+                "program"
+                    | "class_body"
+                    | "interface_body"
+                    | "enum_body"
+                    | "enum_body_declarations"
+                    | "annotation_type_body"
+                    | "block"
+                    | "constructor_body"
+            ),
         }
     }
 
@@ -97,6 +114,14 @@ impl LanguageAdapter {
                     | "delegate_declaration"
                     | "namespace_declaration"
                     | "file_scoped_namespace_declaration"
+            ),
+            Syntax::Java => matches!(
+                kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
             ),
             Syntax::Rust | Syntax::Python | Syntax::Go => false,
         }
@@ -162,6 +187,20 @@ impl LanguageAdapter {
                     | "const_declaration"
                     | "var_declaration"
             ),
+            Syntax::Java => matches!(
+                kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+                    | "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "field_declaration"
+                    | "constant_declaration"
+                    | "static_initializer"
+            ),
         }
     }
 
@@ -175,6 +214,10 @@ impl LanguageAdapter {
             Syntax::Python => matches!(kind, "comment" | "decorator"),
             Syntax::CSharp => matches!(kind, "comment" | "attribute_list"),
             Syntax::Go => matches!(kind, "comment"),
+            // Java's annotations (`@Override`) parse as a child of the
+            // declaration they modify (inside its `modifiers` node), not as
+            // a preceding sibling, so only leading comments need attaching.
+            Syntax::Java => matches!(kind, "line_comment" | "block_comment"),
         }
     }
 
@@ -195,7 +238,9 @@ impl LanguageAdapter {
                     || (self.is_declaration(parent) && self.is_container(child))
             }
             Syntax::Rust | Syntax::Go => false,
-            Syntax::CSharp => self.is_declaration(parent) && self.is_container(child),
+            Syntax::CSharp | Syntax::Java => {
+                self.is_declaration(parent) && self.is_container(child)
+            }
         }
     }
 }
@@ -226,6 +271,10 @@ fn python() -> Language {
 
 fn csharp() -> Language {
     tree_sitter_c_sharp::LANGUAGE.into()
+}
+
+fn java() -> Language {
+    tree_sitter_java::LANGUAGE.into()
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -285,6 +334,13 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: go,
         syntax: Syntax::Go,
     },
+    LanguageAdapter {
+        extension: "java",
+        identifier: "java",
+        cache_version: "java-chunks-v1",
+        grammar: java,
+        syntax: Syntax::Java,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -328,13 +384,16 @@ mod tests {
             ("py", "python", "*.py"),
             ("cs", "csharp", "*.cs"),
             ("go", "go", "*.go"),
+            ("java", "java", "*.java"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
             assert!(!adapter.cache_version().is_empty());
         }
-        for extension in ["RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO"] {
+        for extension in [
+            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class",
+        ] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }
     }

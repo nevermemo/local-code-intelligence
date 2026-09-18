@@ -77,6 +77,35 @@ async fn go_source_is_indexed_and_searchable() {
 }
 
 #[tokio::test]
+async fn java_source_is_indexed_and_searchable() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("java-service");
+    write(
+        &workspace,
+        "Greeter.java",
+        "package main;\n\n// Greet returns a friendly greeting for name.\npublic class Greeter {\n    public static String greet(String name) {\n        return \"hello \" + name;\n    }\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    // "package main" and the doc-commented class (with its single member
+    // attached, per attaches_header_to_child) are separate top-level
+    // chunks (program is a container), so 2 not 1.
+    assert_eq!(report.chunks, 2);
+
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].language, "java");
+    assert_eq!(indexed.files[0].chunks, 2);
+
+    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
+    assert_eq!(found.results[0].chunk.language, "java");
+    assert!(found.results[0].chunk.code.contains("static String greet"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("listing");
@@ -567,11 +596,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/pipeline_test.go",
         "package pipeline\n\n// Decoy documentation for a production event pipeline test.\nconst ExpectedPipelineDescription = \"trim and filter events\"\n",
     );
+    write(
+        &workspace,
+        "src/OrderValidator.java",
+        "package orders;\n\nimport java.util.List;\n\n/** Validates a production order before it is queued for fulfillment. */\npublic final class OrderValidator {\n    public static boolean isValidProductionOrder(String orderId, List<String> items) {\n        return orderId != null && !orderId.isEmpty() && !items.isEmpty();\n    }\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/OrderValidatorTest.java",
+        "package orders;\n\n// Decoy documentation for a production order test. isValidProductionOrder is mentioned only here.\npublic final class OrderValidatorTest {\n    public static final String EXPECTED_ORDER_VALIDATION_DESCRIPTION = \"reject orders with no id or no items\";\n}\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 11);
-    assert_eq!(first.parsed_files, 11);
+    assert_eq!(first.files, 13);
+    assert_eq!(first.parsed_files, 13);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -633,6 +672,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         ("flushAuditBeacon", "src/audit.js", "javascript"),
         ("translator", "src/lib.rs", "rust"),
         ("BuildProductionEventPipeline", "src/pipeline.go", "go"),
+        ("isValidProductionOrder", "src/OrderValidator.java", "java"),
     ] {
         let report = app.search(&workspace, query, Some(8)).await.unwrap();
         assert!(
@@ -653,7 +693,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 11);
+    assert_eq!(restarted.unchanged_files, 13);
 
     write(
         &workspace,
@@ -662,7 +702,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 10);
+    assert_eq!(changed.unchanged_files, 12);
 
     write(
         &workspace,
@@ -671,7 +711,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let go_changed = app.index(&workspace).await.unwrap();
     assert_eq!(go_changed.parsed_files, 1);
-    assert_eq!(go_changed.unchanged_files, 10);
+    assert_eq!(go_changed.unchanged_files, 12);
     let go_updated = app
         .search(&workspace, "BuildProductionEventPipeline", Some(8))
         .await
@@ -682,6 +722,28 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .iter()
             .any(|hit| hit.chunk.relative_file_path == "src/pipeline.go"
                 && hit.chunk.code.contains("ToLower"))
+    );
+
+    write(
+        &workspace,
+        "src/OrderValidator.java",
+        "package orders;\n\nimport java.util.List;\n\n/** Validates a production order before it is queued for fulfillment. */\npublic final class OrderValidator {\n    public static boolean isValidProductionOrder(String orderId, List<String> items) {\n        String trimmedId = orderId == null ? null : orderId.trim();\n        return trimmedId != null && !trimmedId.isEmpty() && !items.isEmpty();\n    }\n}\n",
+    );
+    let java_changed = app.index(&workspace).await.unwrap();
+    assert_eq!(java_changed.parsed_files, 1);
+    assert_eq!(java_changed.unchanged_files, 12);
+    let java_updated = app
+        .search(&workspace, "isValidProductionOrder", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        java_updated
+            .results
+            .iter()
+            .any(
+                |hit| hit.chunk.relative_file_path == "src/OrderValidator.java"
+                    && hit.chunk.code.contains("trimmedId")
+            )
     );
 
     std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
@@ -701,7 +763,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 9);
+    assert_eq!(deleted.files, 11);
     let after_delete = app
         .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
@@ -716,7 +778,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/pipeline_test.go")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 8);
+    assert_eq!(deleted.files, 10);
     let after_go_delete = app
         .search(&workspace, "ExpectedPipelineDescription", Some(8))
         .await
@@ -726,6 +788,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .results
             .iter()
             .all(|hit| hit.chunk.relative_file_path != "tests/pipeline_test.go")
+    );
+
+    std::fs::remove_file(workspace.join("tests/OrderValidatorTest.java")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 9);
+    let after_java_delete = app
+        .search(&workspace, "EXPECTED_ORDER_VALIDATION_DESCRIPTION", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_java_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "tests/OrderValidatorTest.java")
     );
 
     write(
