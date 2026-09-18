@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "lci-core"]
 
 [package]
 name = "local-code-intelligence"
@@ -11,14 +11,11 @@ rust-version = "1.91"
 anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
-async-trait = "0.1.92"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
 dunce = "1"
 futures = "0.3"
-globset = "0.4"
-ignore = "0.4"
+lci-core = { path = "lci-core" }
 # 0.38.0's job module references Error::Http without a feature guard.
 # Enable remote to compile upstream; the application opens only local paths.
 lancedb = { version = "=0.38.0", default-features = false, features = ["remote"] }
@@ -26,18 +23,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rmcp = { version = "=3.2.0", features = ["transport-streamable-http-server"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tree-sitter = "0.25"
-tree-sitter-c-sharp = "0.23.5"
-tree-sitter-javascript = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-rust = "0.24"
-tree-sitter-typescript = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
