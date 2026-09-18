@@ -10,6 +10,7 @@ pub(crate) enum Syntax {
     Go,
     Java,
     C,
+    Cpp,
 }
 
 #[derive(Clone, Copy)]
@@ -46,6 +47,8 @@ impl LanguageAdapter {
             "go" => "*.go",
             "java" => "*.java",
             "c" => "*.c",
+            "cpp" => "*.cpp",
+            "hpp" => "*.hpp",
             _ => unreachable!(),
         }
     }
@@ -101,6 +104,18 @@ impl LanguageAdapter {
             // languages. Mirrors Go's minimalism exactly, including relying
             // on the size-threshold path for the rare oversized function.
             Syntax::C => matches!(kind, "translation_unit"),
+            // Unlike C, C++ classes/structs/unions and namespaces DO nest
+            // further declarations (methods, fields, nested types), so this
+            // mirrors C#/Java's OOP container shape instead of C's flat one:
+            // the file, a namespace's body, a class/struct/union's body, and
+            // a function's own block are all containers.
+            Syntax::Cpp => matches!(
+                kind,
+                "translation_unit"
+                    | "declaration_list"
+                    | "field_declaration_list"
+                    | "compound_statement"
+            ),
         }
     }
 
@@ -131,6 +146,10 @@ impl LanguageAdapter {
                     | "enum_declaration"
                     | "record_declaration"
                     | "annotation_type_declaration"
+            ),
+            Syntax::Cpp => matches!(
+                kind,
+                "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
             ),
             Syntax::Rust | Syntax::Python | Syntax::Go | Syntax::C => false,
         }
@@ -221,6 +240,20 @@ impl LanguageAdapter {
                     | "preproc_def"
                     | "preproc_function_def"
             ),
+            Syntax::Cpp => matches!(
+                kind,
+                "namespace_definition"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "function_definition"
+                    | "declaration"
+                    | "type_definition"
+                    | "enum_specifier"
+                    | "template_declaration"
+                    | "preproc_def"
+                    | "preproc_function_def"
+            ),
         }
     }
 
@@ -242,6 +275,7 @@ impl LanguageAdapter {
             // likewise children of the declaration they modify, not
             // preceding siblings -- only comments need attaching.
             Syntax::C => matches!(kind, "comment"),
+            Syntax::Cpp => matches!(kind, "comment"),
         }
     }
 
@@ -269,6 +303,17 @@ impl LanguageAdapter {
             Syntax::Rust | Syntax::Go | Syntax::C => false,
             Syntax::CSharp | Syntax::Java => {
                 self.is_declaration(parent) && self.is_container(child)
+            }
+            // `template<typename T> class Foo { ... }` / `template<typename
+            // T> T add(...)`: the template parameter list is a sibling
+            // inside `template_declaration`, not part of the wrapped
+            // class/function itself, so it needs the same decorator-style
+            // attachment Python uses for `decorated_definition` -- without
+            // it, "template<typename T>" would split into its own orphan
+            // chunk instead of staying with the declaration it introduces.
+            Syntax::Cpp => {
+                (parent == "template_declaration" && self.is_declaration(child))
+                    || (self.is_declaration(parent) && self.is_container(child))
             }
         }
     }
@@ -308,6 +353,10 @@ fn java() -> Language {
 
 fn c() -> Language {
     tree_sitter_c::LANGUAGE.into()
+}
+
+fn cpp() -> Language {
+    tree_sitter_cpp::LANGUAGE.into()
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -381,6 +430,20 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: c,
         syntax: Syntax::C,
     },
+    LanguageAdapter {
+        extension: "cpp",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v1",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "hpp",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v1",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
 ];
 
 pub fn for_extension(extension: &str) -> Option<&'static LanguageAdapter> {
@@ -426,6 +489,8 @@ mod tests {
             ("go", "go", "*.go"),
             ("java", "java", "*.java"),
             ("c", "c", "*.c"),
+            ("cpp", "cpp", "*.cpp"),
+            ("hpp", "cpp", "*.hpp"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
@@ -434,7 +499,7 @@ mod tests {
         }
         for extension in [
             "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "h",
-            "cpp",
+            "CPP", "HPP", "cc", "cxx", "hh", "hxx",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }

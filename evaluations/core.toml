@@ -3,9 +3,9 @@
 # Workspaces:
 #   - "self" (required): this repository. Verifies the service's own
 #     retrieval behavior: first-search index lifecycle, the language
-#     registry / Tree-sitter grammar, Python, C#, Go, Java, and C chunking,
-#     Windows ripgrep resolution, readiness dependency probing, and
-#     explicit test-role retrieval.
+#     registry / Tree-sitter grammar, Python, C#, Go, Java, C, and C++
+#     chunking, Windows ripgrep resolution, readiness dependency probing,
+#     and explicit test-role retrieval.
 #   - "gust" (optional): the GUST Rust-to-Slang translator repository.
 #     Verifies cross-repository translator retrieval. Skipped (not failed)
 #     when the workspace is not provided.
@@ -84,6 +84,14 @@ preferred_paths = ["lci-core/src/chunk.rs"]
 [[queries]]
 workspace = "self"
 query = "chunk C function struct union enum typedef and preprocessor macro declarations into stable chunks"
+top_k = 8
+expected_paths = ["lci-core/src/chunk.rs", "lci-core/src/language.rs"]
+preferred_paths = ["lci-core/src/chunk.rs"]
+
+# C++ chunking.
+[[queries]]
+workspace = "self"
+query = "chunk C++ namespaces classes structs templates methods fields and leading comments into stable chunks"
 top_k = 8
 expected_paths = ["lci-core/src/chunk.rs", "lci-core/src/language.rs"]
 preferred_paths = ["lci-core/src/chunk.rs"]

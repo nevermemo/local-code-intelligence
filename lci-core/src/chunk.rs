@@ -1172,4 +1172,121 @@ int default_timeout = 30;
             "valid declaration after syntax damage was lost: {chunks:#?}"
         );
     }
+
+    #[test]
+    fn chunks_cpp_namespaces_classes_members_templates_and_leading_comments() {
+        let source = r#"namespace telemetry {
+
+// Processes production telemetry events.
+class Processor {
+public:
+    // Normalizes a single event value.
+    std::string normalize(std::string value) {
+        return value;
+    }
+
+private:
+    int count_;
+};
+
+// add returns the sum of two values of any numeric type.
+template<typename T>
+T add(T a, T b) {
+    return a + b;
+}
+
+}
+"#;
+        let chunks = chunks_for_path("processor.cpp", source).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.language == "cpp"));
+        for expected in [
+            "class Processor",
+            "std::string normalize",
+            "int count_;",
+            "T add(T a, T b)",
+        ] {
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(expected)),
+                "missing {expected}: {chunks:#?}"
+            );
+        }
+
+        let class = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("class Processor"))
+            .unwrap();
+        assert!(
+            class
+                .code
+                .contains("// Processes production telemetry events.")
+        );
+
+        let template_fn = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("T add(T a, T b)"))
+            .unwrap();
+        assert!(template_fn.code.contains("template<typename T>"));
+        assert!(
+            template_fn
+                .code
+                .contains("// add returns the sum of two values of any numeric type.")
+        );
+
+        for chunk in &chunks {
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1);
+            assert!(chunk.end_line >= chunk.start_line);
+        }
+    }
+
+    #[test]
+    fn oversized_cpp_method_splits_at_statements_and_keeps_its_header() {
+        let statements = (0..1200)
+            .map(|i| format!("        total += {i};\n"))
+            .collect::<String>();
+        let source = format!(
+            "class LargeCalculator {{\npublic:\n    int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}};\n"
+        );
+        let chunks = chunks_for_path("LargeCalculator.cpp", &source).unwrap();
+        assert!(
+            chunks.len() > 2,
+            "oversized member was not split: {chunks:#?}"
+        );
+        let header = chunks
+            .iter()
+            .find(|chunk| chunk.code.contains("int calculate"))
+            .unwrap();
+        assert!(header.code.contains("int calculate"));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("return total;"))
+        );
+        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
+    }
+
+    #[test]
+    fn cpp_parser_recovery_keeps_following_declarations_searchable() {
+        let source = "class Broken { void run( { }\nint healthy_value() { return 42; }\n";
+        let chunks = chunks_for_path("recovered.cpp", source).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("healthy_value")),
+            "valid declaration after syntax damage was lost: {chunks:#?}"
+        );
+    }
+
+    #[test]
+    fn chunks_hpp_extension_as_cpp() {
+        let source = "class Widget {\npublic:\n    int size() const { return 0; }\n};\n";
+        let chunks = chunks_for_path("widget.hpp", source).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.language == "cpp"));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("class Widget"))
+        );
+    }
 }

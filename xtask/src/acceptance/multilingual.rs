@@ -121,6 +121,27 @@ const CACHE_TEST_C: &str = r#"// Search decoy: evict_least_recently_used is ment
 const char *expected_cache_eviction_description = "evict least recently used entry";
 "#;
 
+const RATE_LIMITER_CPP_V1: &str = r#"namespace throttling {
+
+// Determines whether a new request should be admitted given recent request timestamps.
+class RateLimiter {
+public:
+    bool should_admit_production_request(int recent_count, int max_per_window) {
+        return recent_count < max_per_window;
+    }
+};
+
+}
+"#;
+
+const RATE_LIMITER_TEST_CPP: &str = r#"namespace throttling {
+
+// Search decoy: should_admit_production_request is mentioned only in a test.
+const char *expected_rate_limiter_description = "admit requests under the configured limit";
+
+}
+"#;
+
 const FIXTURE_CARGO_TOML: &str = r#"[package]
 name = "multilingual-acceptance-fixture"
 version = "0.1.0"
@@ -181,6 +202,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     fixture.write("tests/OrderValidatorTest.java", ORDER_VALIDATOR_TEST_JAVA)?;
     fixture.write("src/cache.c", CACHE_C_V1)?;
     fixture.write("tests/cache_test.c", CACHE_TEST_C)?;
+    fixture.write("src/RateLimiter.cpp", RATE_LIMITER_CPP_V1)?;
+    fixture.write("tests/RateLimiterTest.cpp", RATE_LIMITER_TEST_CPP)?;
 
     evidence.stage("write-config")?;
     let config_path = fixture.write_config(&[
@@ -209,8 +232,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     let files = first["files"]
         .as_u64()
         .context("index report missing files count")?;
-    if files != 16 {
-        bail!("Initial index included {files} files instead of 16");
+    if files != 18 {
+        bail!("Initial index included {files} files instead of 18");
     }
     evidence.set("initial_files", files)?;
 
@@ -325,6 +348,17 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     )
     .await?;
 
+    let cpp_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-cpp",
+        "should_admit_production_request",
+        "src/RateLimiter.cpp",
+        "cpp",
+        "bool should_admit_production_request",
+    )
+    .await?;
+
     evidence.stage("ranking-and-decoys")?;
     let csharp_results = results_array(&csharp_search)?;
     let csharp_decoy_present = csharp_results.iter().any(|hit| {
@@ -388,6 +422,22 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         != Some("src/cache.c")
     {
         bail!("Production C implementation did not outrank the test decoy");
+    }
+
+    let cpp_results = results_array(&cpp_search)?;
+    let cpp_decoy_present = cpp_results.iter().any(|hit| {
+        hit["relative_file_path"].as_str() == Some("tests/RateLimiterTest.cpp")
+            && hit["source_role"].as_str() == Some("test")
+    });
+    if !cpp_decoy_present {
+        bail!("Initial index did not include the C++ test decoy with test role");
+    }
+    if cpp_results
+        .first()
+        .and_then(|hit| hit["relative_file_path"].as_str())
+        != Some("src/RateLimiter.cpp")
+    {
+        bail!("Production C++ implementation did not outrank the test decoy");
     }
 
     let python_results = results_array(&python_search)?;
@@ -571,6 +621,26 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     }
     if c_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
         bail!("C update did not reuse other-language chunks");
+    }
+
+    evidence.stage("cpp-update")?;
+    let rate_limiter_cpp_v2 = RATE_LIMITER_CPP_V1.replace(
+        "return recent_count < max_per_window;",
+        "return recent_count < max_per_window && recent_count >= 0;",
+    );
+    fixture.write("src/RateLimiter.cpp", &rate_limiter_cpp_v2)?;
+    let cpp_changed = run_report(
+        &config_path,
+        "multilingual-cpp-update",
+        &["index", &workspace],
+    )
+    .await?;
+    if cpp_changed["parsed_files"].as_u64() != Some(1) {
+        let parsed = cpp_changed["parsed_files"].as_u64().unwrap_or_default();
+        bail!("C++ update parsed {parsed} files instead of exactly one");
+    }
+    if cpp_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
+        bail!("C++ update did not reuse other-language chunks");
     }
 
     evidence.stage("csharp-decoy-delete")?;
@@ -758,6 +828,38 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("Deleted C decoy chunks remain searchable");
     }
 
+    evidence.stage("cpp-decoy-delete")?;
+    std::fs::remove_file(fixture.dir.join("tests/RateLimiterTest.cpp"))
+        .context("remove C++ decoy test file")?;
+    let cpp_deleted = run_report(
+        &config_path,
+        "multilingual-cpp-delete",
+        &["index", &workspace],
+    )
+    .await?;
+    if cpp_deleted["removed_files"].as_u64() != Some(1) {
+        let removed = cpp_deleted["removed_files"].as_u64().unwrap_or_default();
+        bail!("C++ decoy deletion removed {removed} cached files instead of one");
+    }
+    let cpp_deleted_search = run_report(
+        &config_path,
+        "multilingual-search-after-cpp-delete",
+        &[
+            "search",
+            &workspace,
+            "expected_rate_limiter_description",
+            "--top-k",
+            "8",
+        ],
+    )
+    .await?;
+    if results_array(&cpp_deleted_search)?
+        .iter()
+        .any(|hit| hit["relative_file_path"].as_str() == Some("tests/RateLimiterTest.cpp"))
+    {
+        bail!("Deleted C++ decoy chunks remain searchable");
+    }
+
     evidence.stage("failed-update-retention")?;
     let before_failure = run_report(
         &config_path,
@@ -784,6 +886,9 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     fixture.write("src/OrderValidator.java", &order_validator_java_v3)?;
     let cache_c_v3 = format!("{cache_c_v2}\n// failedUpdateMarker: not committed\n");
     fixture.write("src/cache.c", &cache_c_v3)?;
+    let rate_limiter_cpp_v3 =
+        format!("{rate_limiter_cpp_v2}\n// failedUpdateMarker: not committed\n");
+    fixture.write("src/RateLimiter.cpp", &rate_limiter_cpp_v3)?;
 
     let failure_output = run_lci(&failure_config_path, &["index", &workspace]).await?;
     let failure_evidence = serde_json::json!({

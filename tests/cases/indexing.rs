@@ -136,6 +136,35 @@ async fn c_source_is_indexed_and_searchable() {
 }
 
 #[tokio::test]
+async fn cpp_source_is_indexed_and_searchable() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("cpp-service");
+    write(
+        &workspace,
+        "greet.cpp",
+        "// Greet returns a friendly greeting for name.\nstd::string greet(const std::string &name) {\n    return name;\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    // Same shape as the C smoke test: a single top-level function (with its
+    // leading comment attached) is the only child of translation_unit, so
+    // it collapses into one chunk.
+    assert_eq!(report.chunks, 1);
+
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].language, "cpp");
+    assert_eq!(indexed.files[0].chunks, 1);
+
+    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
+    assert_eq!(found.results[0].chunk.language, "cpp");
+    assert!(found.results[0].chunk.code.contains("std::string greet"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("listing");
@@ -646,11 +675,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         "tests/cache_test.c",
         "// Decoy documentation for a cache eviction test. evict_least_recently_used is mentioned only here.\nconst char *expected_cache_eviction_description = \"evict least recently used entry\";\n",
     );
+    write(
+        &workspace,
+        "src/RateLimiter.cpp",
+        "namespace throttling {\n\n// Determines whether a new request should be admitted given recent request timestamps.\nclass RateLimiter {\npublic:\n    bool should_admit_production_request(int recent_count, int max_per_window) {\n        return recent_count < max_per_window;\n    }\n};\n\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/RateLimiterTest.cpp",
+        "namespace throttling {\n\n// Decoy documentation for a rate limiter test. should_admit_production_request is mentioned only here.\nconst char *expected_rate_limiter_description = \"admit requests under the configured limit\";\n\n}\n",
+    );
 
     let app = App::open(config.clone()).await.unwrap();
     let first = app.index(&workspace).await.unwrap();
-    assert_eq!(first.files, 15);
-    assert_eq!(first.parsed_files, 15);
+    assert_eq!(first.files, 17);
+    assert_eq!(first.parsed_files, 17);
 
     let production = app
         .search(&workspace, "buildProductionTelemetryPipeline", Some(8))
@@ -714,6 +753,11 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
         ("BuildProductionEventPipeline", "src/pipeline.go", "go"),
         ("isValidProductionOrder", "src/OrderValidator.java", "java"),
         ("evict_least_recently_used", "src/cache.c", "c"),
+        (
+            "should_admit_production_request",
+            "src/RateLimiter.cpp",
+            "cpp",
+        ),
     ] {
         let report = app.search(&workspace, query, Some(8)).await.unwrap();
         assert!(
@@ -734,7 +778,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     let restarted = app.index(&workspace).await.unwrap();
     assert_eq!(restarted.parsed_files, 0);
     assert_eq!(restarted.embedded_chunks, 0);
-    assert_eq!(restarted.unchanged_files, 15);
+    assert_eq!(restarted.unchanged_files, 17);
 
     write(
         &workspace,
@@ -743,7 +787,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let changed = app.index(&workspace).await.unwrap();
     assert_eq!(changed.parsed_files, 1);
-    assert_eq!(changed.unchanged_files, 14);
+    assert_eq!(changed.unchanged_files, 16);
 
     write(
         &workspace,
@@ -752,7 +796,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let go_changed = app.index(&workspace).await.unwrap();
     assert_eq!(go_changed.parsed_files, 1);
-    assert_eq!(go_changed.unchanged_files, 14);
+    assert_eq!(go_changed.unchanged_files, 16);
     let go_updated = app
         .search(&workspace, "BuildProductionEventPipeline", Some(8))
         .await
@@ -772,7 +816,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let java_changed = app.index(&workspace).await.unwrap();
     assert_eq!(java_changed.parsed_files, 1);
-    assert_eq!(java_changed.unchanged_files, 14);
+    assert_eq!(java_changed.unchanged_files, 16);
     let java_updated = app
         .search(&workspace, "isValidProductionOrder", Some(8))
         .await
@@ -794,7 +838,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     let c_changed = app.index(&workspace).await.unwrap();
     assert_eq!(c_changed.parsed_files, 1);
-    assert_eq!(c_changed.unchanged_files, 14);
+    assert_eq!(c_changed.unchanged_files, 16);
     let c_updated = app
         .search(&workspace, "evict_least_recently_used", Some(8))
         .await
@@ -805,6 +849,26 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .iter()
             .any(|hit| hit.chunk.relative_file_path == "src/cache.c"
                 && hit.chunk.code.contains("usage[i] <= usage[oldest_index]"))
+    );
+
+    write(
+        &workspace,
+        "src/RateLimiter.cpp",
+        "namespace throttling {\n\n// Determines whether a new request should be admitted given recent request timestamps.\nclass RateLimiter {\npublic:\n    bool should_admit_production_request(int recent_count, int max_per_window) {\n        return recent_count < max_per_window && recent_count >= 0;\n    }\n};\n\n}\n",
+    );
+    let cpp_changed = app.index(&workspace).await.unwrap();
+    assert_eq!(cpp_changed.parsed_files, 1);
+    assert_eq!(cpp_changed.unchanged_files, 16);
+    let cpp_updated = app
+        .search(&workspace, "should_admit_production_request", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        cpp_updated
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "src/RateLimiter.cpp"
+                && hit.chunk.code.contains("recent_count >= 0"))
     );
 
     std::fs::remove_file(workspace.join("tests/TelemetryProcessorTests.cs")).unwrap();
@@ -824,7 +888,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/feature_pipeline_test.py")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 13);
+    assert_eq!(deleted.files, 15);
     let after_delete = app
         .search(&workspace, "EXPECTED_PIPELINE_DESCRIPTION", Some(8))
         .await
@@ -839,7 +903,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/pipeline_test.go")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 12);
+    assert_eq!(deleted.files, 14);
     let after_go_delete = app
         .search(&workspace, "ExpectedPipelineDescription", Some(8))
         .await
@@ -854,7 +918,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/OrderValidatorTest.java")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 11);
+    assert_eq!(deleted.files, 13);
     let after_java_delete = app
         .search(&workspace, "EXPECTED_ORDER_VALIDATION_DESCRIPTION", Some(8))
         .await
@@ -869,7 +933,7 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     std::fs::remove_file(workspace.join("tests/cache_test.c")).unwrap();
     let deleted = app.index(&workspace).await.unwrap();
     assert_eq!(deleted.removed_files, 1);
-    assert_eq!(deleted.files, 10);
+    assert_eq!(deleted.files, 12);
     let after_c_delete = app
         .search(&workspace, "expected_cache_eviction_description", Some(8))
         .await
@@ -879,6 +943,21 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .results
             .iter()
             .all(|hit| hit.chunk.relative_file_path != "tests/cache_test.c")
+    );
+
+    std::fs::remove_file(workspace.join("tests/RateLimiterTest.cpp")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 11);
+    let after_cpp_delete = app
+        .search(&workspace, "expected_rate_limiter_description", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_cpp_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "tests/RateLimiterTest.cpp")
     );
 
     write(
