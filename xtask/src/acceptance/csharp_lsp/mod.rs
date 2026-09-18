@@ -10,7 +10,6 @@ mod full_flow;
 mod probe;
 
 use anyhow::Result;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::Evidence;
@@ -87,22 +86,4 @@ pub(crate) fn bound_text(text: &str, max: usize) -> String {
     } else {
         trimmed.chars().take(max).collect()
     }
-}
-
-/// True if `relative_path` has a `bin/` or `obj/` path segment, matching the
-/// .ps1 scripts' `(^|/)(bin|obj)/` regex check for leaked build output.
-pub(crate) fn is_build_output(relative_path: &str) -> bool {
-    relative_path
-        .split('/')
-        .any(|segment| segment == "bin" || segment == "obj")
-}
-
-/// Extracts the `results` array from a `local-code-intelligence` CLI JSON
-/// report (symbols/definition/references/search all share this shape).
-pub(crate) fn results(value: &Value) -> Vec<Value> {
-    value
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
 }

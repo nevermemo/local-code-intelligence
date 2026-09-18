@@ -9,6 +9,7 @@ pub mod csharp_lsp;
 pub mod csharp_missing;
 pub mod csharp_recovery;
 pub mod lsp;
+mod lsp_full;
 mod missing;
 pub mod multilingual;
 pub mod python_lsp;
