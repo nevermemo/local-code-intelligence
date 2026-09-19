@@ -134,6 +134,14 @@ impl Fixture {
     }
 }
 
+/// Port every acceptance-owned `serve` process binds to. Deliberately
+/// distinct from the default 8768 a developer's own persistent `serve`
+/// instance typically uses on the same machine (e.g. a self-hosted
+/// live-acceptance runner) -- reusing 8768 here let a stale instance silently
+/// swallow the acceptance harness's requests instead of the fixture server
+/// actually failing to bind, producing confusing false failures.
+pub const PORT: u16 = 8769;
+
 /// A `local-code-intelligence serve` process this acceptance run owns, plus
 /// cross-platform helpers to inspect and kill its child language-server
 /// processes.
@@ -151,6 +159,8 @@ impl ManagedServer {
             .arg("--config")
             .arg(config_path)
             .arg("serve")
+            .arg("--port")
+            .arg(PORT.to_string())
             .current_dir(working_dir)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))

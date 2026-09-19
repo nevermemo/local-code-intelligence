@@ -27,7 +27,7 @@ use std::time::Duration;
 
 const DEFAULT_WORKSPACE: &str = r"C:\Users\micro\Desktop\gpu-dialect-v0";
 const TARGET_FILE: &str = "crates/gust-macros/src/slang/mod.rs";
-const BASE: &str = "http://127.0.0.1:8768";
+const BASE: &str = "http://127.0.0.1:8769"; // matches acceptance::PORT
 
 /// Saves a tool's structured JSON report to `test-results/<name>.json`,
 /// matching the `Run-Report` convention in the original `.ps1` scripts.

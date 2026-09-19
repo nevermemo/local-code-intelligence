@@ -8,8 +8,9 @@ async fn http_mcp_initialization_tools_and_health() {
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = local_code_intelligence::server::router(app, token.clone());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

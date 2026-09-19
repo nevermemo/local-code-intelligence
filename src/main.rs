@@ -16,7 +16,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Serve,
+    Serve {
+        /// TCP port to bind the MCP/health server to.
+        #[arg(long, default_value_t = 8768)]
+        port: u16,
+    },
     Index {
         workspace: PathBuf,
     },
@@ -80,7 +84,7 @@ async fn main() -> Result<()> {
     let app = Arc::new(App::open(Config::load(cli.config.as_deref())?).await?);
     let mut evaluation_failed = false;
     let mut output_path = None;
-    let output = match cli.command.unwrap_or(Command::Serve) {
+    let output = match cli.command.unwrap_or(Command::Serve { port: 8768 }) {
         Command::Index { workspace } => serde_json::to_value(app.index(&workspace).await?)?,
         Command::Status { workspace } => serde_json::to_value(app.status(&workspace).await?)?,
         Command::ListFiles { workspace } => {
@@ -148,11 +152,13 @@ async fn main() -> Result<()> {
             )
             .await?,
         )?,
-        Command::Serve => {
+        Command::Serve { port } => {
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let router = server::router(app, cancellation.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:8768").await?;
-            tracing::info!("MCP: http://127.0.0.1:8768/mcp; health: http://127.0.0.1:8768/health");
+            let router = server::router(app, cancellation.clone(), port);
+            let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+            tracing::info!(
+                "MCP: http://127.0.0.1:{port}/mcp; health: http://127.0.0.1:{port}/health"
+            );
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;

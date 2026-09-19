@@ -15,8 +15,9 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
     let app = Arc::new(App::open(unavailable).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = local_code_intelligence::server::router(app, token.clone());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let client = reqwest::Client::new();
     assert_eq!(
@@ -67,8 +68,9 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
 
     let token = tokio_util::sync::CancellationToken::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = local_code_intelligence::server::router(app, token.clone());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let ready = client.get(format!("{base}/ready")).send().await.unwrap();
     assert_eq!(ready.status(), StatusCode::OK);

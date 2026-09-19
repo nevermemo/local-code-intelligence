@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const BASE: &str = "http://127.0.0.1:8768";
+const BASE: &str = "http://127.0.0.1:8769"; // matches acceptance::PORT
 
 pub enum ProcessCheck {
     /// A native executable spawned directly as a child (csharp-ls). Exactly

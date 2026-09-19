@@ -197,15 +197,19 @@ impl ServerHandler for McpServer {
     }
 }
 
-pub fn router(app: Arc<App>, cancellation: tokio_util::sync::CancellationToken) -> axum::Router {
+pub fn router(
+    app: Arc<App>,
+    cancellation: tokio_util::sync::CancellationToken,
+    port: u16,
+) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
     let mut config = StreamableHttpServerConfig::default();
     config.cancellation_token = cancellation;
     config.allowed_origins = vec![
-        "http://127.0.0.1:8768".into(),
-        "http://localhost:8768".into(),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
     ];
     let ready_app = app.clone();
     let service = StreamableHttpService::new(

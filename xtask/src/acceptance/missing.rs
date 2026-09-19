@@ -28,7 +28,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 use std::time::Duration;
 
-const BASE: &str = "http://127.0.0.1:8768";
+const BASE: &str = "http://127.0.0.1:8769"; // matches acceptance::PORT
 
 /// How to detect whether the missing server's process ever started, for the
 /// final Rust-filtered-search isolation check.
