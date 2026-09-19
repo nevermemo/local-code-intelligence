@@ -20,7 +20,16 @@ concurrency:
 jobs:
   live:
     runs-on: [self-hosted, lci-live]
-    timeout-minutes: 60
+    # Generous headroom: a real run building from a clean checkout, then
+    # indexing a real external Cargo workspace for the rust-analyzer LSP
+    # flow (documented elsewhere as "2 to 10+ minutes" of embedding time
+    # alone), then all six languages' full/isolation/recovery LSP triples
+    # plus the retrieval-quality evaluation, was observed taking a bit
+    # over an hour end to end on first real measurement -- the original
+    # 60-minute bound cut a fully-passing run off right at the finish
+    # line (all acceptance steps green; only Evaluate + cleanup were cut
+    # off). 150 minutes leaves real slack over that observed number.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
