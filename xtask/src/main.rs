@@ -1,5 +1,6 @@
 mod acceptance;
 mod build;
+mod live_acceptance;
 mod setup;
 mod test;
 
@@ -35,6 +36,19 @@ enum Command {
     Acceptance {
         #[command(subcommand)]
         which: AcceptanceCommand,
+    },
+    /// Run the full live-acceptance/evaluation suite locally (no GitHub
+    /// Actions), with each step bounded by its own timeout instead of one
+    /// shared ceiling. See docs/development/local-live-acceptance.md.
+    LiveAcceptance {
+        /// Only run steps whose name or xtask acceptance subcommand
+        /// contains one of these substrings (case-insensitive). Repeatable
+        /// or comma-separated: --only python --only core, or --only python,core
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Skip the initial `cargo build --workspace` step.
+        #[arg(long)]
+        skip_build: bool,
     },
 }
 
@@ -156,5 +170,6 @@ async fn main() -> Result<()> {
             AcceptanceCommand::JavaMissing => acceptance::java_missing::run().await,
             AcceptanceCommand::JavaRecovery { java } => acceptance::java_recovery::run(java).await,
         },
+        Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
     }
 }

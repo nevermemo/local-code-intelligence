@@ -1,5 +1,13 @@
 # Live acceptance in CI
 
+> Prefer running this locally instead of through GitHub Actions? See
+> [`local-live-acceptance.md`](local-live-acceptance.md) -- same commands,
+> same real services, driven from a normal terminal instead of a registered
+> self-hosted runner. It sidesteps GitHub Actions' own blind
+> `timeout-minutes` (see that doc for why a fixed wall-clock bound isn't a
+> great fit for this suite) and needs no GitHub account, runner
+> registration, or repo at all.
+
 `.github/workflows/live-acceptance.yml` runs `cargo xtask acceptance <name>`
 and `evaluate ./evaluations/core.toml` against the *real* embedding/reranker
 services (ports 8766/8767) and real language-server executables, the same
@@ -71,8 +79,8 @@ them for you:
 | --- | --- | --- |
 | `rust-analyzer` | `cargo xtask acceptance lsp` | installed |
 | `dotnet` + `csharp-ls` | `cargo xtask acceptance csharp-lsp/-missing/-recovery` | installed |
-| `pyright` (`pyright-langserver`) | `cargo xtask acceptance python-lsp/-missing/-recovery` | not installed -- `npm install -g pyright` |
-| `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | not installed -- `npm install -g typescript-language-server typescript` |
+| `pyright` (`pyright-langserver`) | `cargo xtask acceptance python-lsp/-missing/-recovery` | installed |
+| `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | installed |
 | `go` + `gopls` | `cargo xtask acceptance go-lsp/-missing/-recovery` | installed (`go install golang.org/x/tools/gopls@latest`) |
 | JDK 21+ + jdtls install | `cargo xtask acceptance java-lsp/-missing/-recovery` | installed (Temurin 25; jdtls extracted to `C:\Users\micro\tools\jdtls` -- `[java].path`/`--java <dir>` point at that directory, not an executable) |
 

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Optional local live-acceptance trigger. Not enabled by default -- enable
+# with:
+#   git config core.hooksPath .githooks
+#
+# Runs `cargo xtask live-acceptance` in the background whenever a push
+# includes main, so `git push` itself isn't blocked for the ~50+ minutes
+# the full suite can take. Logs land under test-results/live-acceptance-logs/
+# (gitignored); nothing here reports back to git or blocks the push on
+# failure -- check the log directory (or just run the command directly
+# instead of relying on the hook) for results.
+
+triggers=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main) triggers=1 ;;
+    esac
+done
+
+if [ "$triggers" = "1" ]; then
+    repo_root="$(git rev-parse --show-toplevel)"
+    (cd "$repo_root" && nohup cargo xtask live-acceptance >/dev/null 2>&1 &)
+    disown 2>/dev/null || true
+    echo "live-acceptance: started in background -- logs under test-results/live-acceptance-logs/"
+fi
+
+exit 0
