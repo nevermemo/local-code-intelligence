@@ -16,7 +16,8 @@ The workspace is split into `lci-core` (chunking, language adapters, filters, le
 
 ## Working method
 
-- Inspect the narrow owning module and its contract before editing. Use `search_code` instead of routine reindexing; it creates a missing index automatically.
+- Inspect the narrow owning module and its contract before editing. This repository dogfoods itself: when the `lci` MCP tools are connected, prefer `search_code` / `find_definition` / `find_references` / `search_symbols` over ad hoc `grep`/file-by-file reads for exploring it, the same way any other LCI user would. Use `search_code` instead of routine reindexing; it creates a missing index automatically.
+- If the `lci` MCP connection is unavailable, do not silently fall back to manual search for the rest of the session. Check whether `local-code-intelligence serve` is already running (`curl http://127.0.0.1:8768/health`); if not, build it (`cargo xtask build --test` is fastest, or `cargo build --release` for the persistent dev instance) and start it (`./target/{debug,release}/local-code-intelligence serve`). An agent cannot re-dial an already-configured MCP connection itself -- tell the user it's now reachable and ask them to reconnect it (`/mcp` in Claude Code), then continue using manual tools only until it's back.
 - Preserve existing user changes. Keep generated reports, temporary fixtures, model files, `target`, and editor settings out of commits.
 - Run focused checks while correcting a defect. Run formatting, the full workspace tests, and Clippy once after the complete slice is ready.
 - Report mock tests, live embedding/reranking acceptance, LSP acceptance, and external repository evaluation as separate evidence.

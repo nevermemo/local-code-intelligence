@@ -16,7 +16,7 @@ not belong in the service.
 - `lexical` and `lsp` are independent, fail-open retrieval channels.
 - `filter` validates retrieval controls and classifies source roles.
 - `evaluate` measures retrieval behavior without influencing ranking.
-- `server` and `main` expose the MCP, HTTP, and command-line interfaces.
+- `server` and `main` expose the MCP, REST/OpenAPI, and command-line interfaces; `rest` mirrors the MCP tools as plain JSON-over-HTTP on the same process and port.
 
 Port 8765 hosts the separate generation model. Production code, tests, and
 acceptance scripts in this repository must not contact or manage it.

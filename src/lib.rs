@@ -1,5 +1,6 @@
 pub mod app;
 pub mod evaluate;
+mod rest;
 pub mod server;
 pub mod store;
 

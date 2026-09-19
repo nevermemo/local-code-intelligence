@@ -116,3 +116,97 @@ async fn http_mcp_initialization_tools_and_health() {
     server.abort();
     models_task.abort();
 }
+
+#[tokio::test]
+async fn rest_surface_mirrors_the_mcp_tools() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("rest-repository");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let openapi = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(openapi["openapi"], "3.0.3");
+    for path in [
+        "/v1/index_workspace",
+        "/v1/index_status",
+        "/v1/list_indexed_files",
+        "/v1/watch_workspace",
+        "/v1/unwatch_workspace",
+        "/v1/search_symbols",
+        "/v1/find_definition",
+        "/v1/find_references",
+        "/v1/search_code",
+        "/v1/service_status",
+    ] {
+        assert!(openapi["paths"][path].is_object(), "{path}: {openapi}");
+    }
+
+    let indexed = client
+        .post(format!("{base}/v1/index_workspace"))
+        .json(&json!({"workspace_path": workspace}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(indexed.status(), StatusCode::OK);
+    let indexed = indexed.json::<Value>().await.unwrap();
+    assert!(indexed["embedded_chunks"].is_number(), "{indexed}");
+
+    let status = client
+        .post(format!("{base}/v1/index_status"))
+        .json(&json!({"workspace_path": workspace}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert!(status.json::<Value>().await.unwrap()["embedding_dimension"].is_number());
+
+    let searched = client
+        .post(format!("{base}/v1/search_code"))
+        .json(&json!({"workspace_path": workspace, "query": "translator"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(searched.status(), StatusCode::OK);
+    assert!(
+        searched.json::<Value>().await.unwrap()["results"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty())
+    );
+
+    let ready = client
+        .get(format!("{base}/v1/service_status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert!(ready.json::<Value>().await.unwrap()["ready"].is_boolean());
+
+    let failed = client
+        .post(format!("{base}/v1/index_status"))
+        .json(&json!({"workspace_path": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(failed.json::<Value>().await.unwrap()["error"].is_string());
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

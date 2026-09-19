@@ -228,6 +228,7 @@ pub fn router(
         config,
     );
     axum::Router::new()
+        .merge(crate::rest::routes())
         .route(
             "/health",
             axum::routing::get(|| async {

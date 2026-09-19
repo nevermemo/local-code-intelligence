@@ -23,7 +23,7 @@ jobs:
     # Generous headroom: a real run building from a clean checkout, then
     # indexing a real external Cargo workspace for the rust-analyzer LSP
     # flow (documented elsewhere as "2 to 10+ minutes" of embedding time
-    # alone), then all six languages' full/isolation/recovery LSP triples
+    # alone), then all seven languages' full/isolation/recovery LSP triples
     # plus the retrieval-quality evaluation, was observed taking a bit
     # over an hour end to end on first real measurement -- the original
     # 60-minute bound cut a fully-passing run off right at the finish

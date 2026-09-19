@@ -14,3 +14,11 @@ language support without checking that file first.
 
 For the fast `lci-core`-scoped build/test loop, see
 `docs/development/testing.md`.
+
+This repository dogfoods itself: when the `lci` MCP tools are connected in
+this session, prefer them (`search_code`, `find_definition`,
+`find_references`, `search_symbols`) over ad hoc `grep`/file-by-file reads
+for exploring this codebase. If they are not connected, do not just quietly
+fall back to manual search -- see AGENTS.md's "Working method" section for
+how to check whether the service is running, build/start it if not, and get
+the connection reconnected.

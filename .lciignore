@@ -6,4 +6,9 @@
 .github/skills/**
 .codex/**
 .claude/**
+# Kilo's own control-plane directory. In particular, worktrees/ under it
+# holds full nested checkouts of this repository (their own src/, tests/,
+# etc.) -- leaving this out would silently double-index this project's own
+# source under a second path.
+.kilo/**
 test-results/**

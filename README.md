@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-Cross-platform (Windows, macOS, Linux) Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code retrieval for any Streamable HTTP MCP client. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent Rust and C# language-server retrieval, Reciprocal Rank Fusion, and fail-open neural reranking.
+Cross-platform (Windows, macOS, Linux) Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code retrieval for any Streamable HTTP MCP client, or directly over a plain REST/OpenAPI surface for clients that don't speak MCP. It combines Tree-sitter syntax chunks, an owned embedded LanceDB index, local Qwen embeddings, ripgrep lexical search, optional persistent language-server retrieval for every supported language, Reciprocal Rank Fusion, and fail-open neural reranking.
 
 Supported source extensions and result language identifiers are exact and case-sensitive:
 
@@ -19,7 +19,7 @@ Supported source extensions and result language identifiers are exact and case-s
 | `.cpp` | `cpp` | Tree-sitter C++ |
 | `.hpp` | `cpp` | Tree-sitter C++ |
 
-All eleven extensions (ten distinct languages -- `.cpp` and `.hpp` both identify as `cpp`) always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`); Go uses `gopls`; Java uses `jdtls` (Eclipse JDT Language Server); C and C++ share one `clangd` instance. None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session. Go's `gopls` needs a `go.mod` at or above the workspace root to build its package graph; without one it degrades to a much weaker fallback (fail-open, same as every other adapter here -- LCI never writes one on the caller's behalf). Unlike every other server, `[java].path` configures the jdtls *installation directory*, not an executable: `jdtls` has no single native binary, so LCI spawns `java` directly itself, finding the Equinox launcher jar and platform config directory under that path (an earlier design that reused jdtls's own Python launcher script produced a `local-code-intelligence -> python -> java` process chain that hung indefinitely on Windows, since killing the direct `python` child does not cascade to the `java` grandchild without a Job Object; spawning `java` directly, like every other adapter, avoids that entirely). `clangd` needs no `compile_commands.json` for LCI's per-file navigation use case -- confirmed live against a standalone fixture with no build system present -- but a workspace with a real build system can still point it at its own compilation database via `[clangd].args` (e.g. `--compile-commands-dir=...`); LCI never generates one on the caller's behalf.
+All twelve extensions (eleven distinct languages -- `.cpp` and `.hpp` both identify as `cpp`) always have Tree-sitter syntax indexing and retrieval regardless of LSP configuration. Navigation (`search_symbols`/`find_definition`/`find_references`) is additionally available behind an optional, independently-configured language server per language family: Rust uses `rust-analyzer`; C# uses standalone `csharp-ls`; TypeScript/TSX/JavaScript/JSX share one `typescript-language-server` instance; Python uses `pyright` (`pyright-langserver`); Go uses `gopls`; Java uses `jdtls` (Eclipse JDT Language Server); C and C++ share one `clangd` instance. None of these are bundled or installed by LCI, and a disabled or unavailable one never affects syntax retrieval for its language — only navigation on that language's files fails with a clear tooling error. `workspace/symbol` search (`search_symbols`) is honestly limited for TypeScript/Python: since LCI never writes a `tsconfig.json`/`pyrightconfig.json` into a user's repository, a freshly spawned server has no project context until `find_definition`/`find_references` open a file, so `search_symbols` results depend on what's already been opened in that server session. Go's `gopls` needs a `go.mod` at or above the workspace root to build its package graph; without one it degrades to a much weaker fallback (fail-open, same as every other adapter here -- LCI never writes one on the caller's behalf). Unlike every other server, `[java].path` configures the jdtls *installation directory*, not an executable: `jdtls` has no single native binary, so LCI spawns `java` directly itself, finding the Equinox launcher jar and platform config directory under that path (an earlier design that reused jdtls's own Python launcher script produced a `local-code-intelligence -> python -> java` process chain that hung indefinitely on Windows, since killing the direct `python` child does not cascade to the `java` grandchild without a Job Object; spawning `java` directly, like every other adapter, avoids that entirely). `clangd` needs no `compile_commands.json` for LCI's per-file navigation use case -- confirmed live against a standalone fixture with no build system present -- but a workspace with a real build system can still point it at its own compilation database via `[clangd].args` (e.g. `--compile-commands-dir=...`); LCI never generates one on the caller's behalf.
 
 ## Documentation
 
@@ -48,6 +48,8 @@ Build note: LanceDB 0.38.0 requires its `remote` Cargo feature to compile becaus
 The executable serves:
 
 - MCP: `http://127.0.0.1:8768/mcp`
+- REST: `http://127.0.0.1:8768/v1/*` (plain JSON-over-HTTP mirror of the MCP tools, for non-MCP clients)
+- OpenAPI document: `http://127.0.0.1:8768/openapi.json`
 - Health: `http://127.0.0.1:8768/health`
 - Readiness: `http://127.0.0.1:8768/ready`
 
@@ -154,6 +156,33 @@ Watching is opt-in for each server run. It polls only after `watch_workspace`, d
 
 The first applicable LSP request for a workspace starts one long-lived provider process per language server; later calls reuse it. A failed request discards the process and retries once with a fresh provider. `search_code` queries each applicable, enabled provider independently only when filtered indexed chunks contain a language it navigates, and maps locations only to same-language chunks. A missing or disabled optional server leaves semantic and lexical retrieval available. Direct navigation rejects unsupported extensions before startup and returns an MCP error when the selected provider is disabled or unavailable. Definition/reference input lines are one-based; character offsets follow LSP and are zero-based UTF-16 units.
 
+### REST/OpenAPI surface
+
+Every MCP tool above is also reachable as plain JSON-over-HTTP, for clients that don't speak MCP. It's the same process, the same port, and the same `App` methods behind both -- not a second service -- so behavior, filters, and index lifecycle semantics are identical either way.
+
+| MCP tool | REST endpoint |
+| --- | --- |
+| `index_workspace` | `POST /v1/index_workspace` |
+| `index_status` | `POST /v1/index_status` |
+| `list_indexed_files` | `POST /v1/list_indexed_files` |
+| `watch_workspace` | `POST /v1/watch_workspace` |
+| `unwatch_workspace` | `POST /v1/unwatch_workspace` |
+| `search_symbols` | `POST /v1/search_symbols` |
+| `find_definition` | `POST /v1/find_definition` |
+| `find_references` | `POST /v1/find_references` |
+| `search_code` | `POST /v1/search_code` |
+| `service_status` | `GET /v1/service_status` |
+
+Every `POST` endpoint takes the identical JSON arguments as its MCP tool (see the table above) as the request body. A successful call returns HTTP 200 with the same structured JSON an MCP `tools/call` would return; a failed call returns HTTP 500 with `{"error": "<message>"}` rather than MCP's `isError` content block.
+
+```bash
+curl -X POST http://127.0.0.1:8768/v1/search_code \
+  -H 'Content-Type: application/json' \
+  -d '{"workspace_path":"/path/to/gpu-dialect-v0","query":"lower syn AST expressions into generated Slang compute shader code"}'
+```
+
+`GET /openapi.json` serves an OpenAPI 3.0.3 document describing every endpoint above. Its request-body schemas are generated directly from the same `schemars`-derived argument structs the MCP tools themselves use, so they cannot drift from what a request actually accepts; response bodies are documented as an open JSON object, matching the exact shapes in the MCP tools table above rather than duplicating them a second time.
+
 ## Direct CLI and acceptance test
 
 The CLI calls the same application logic and is useful for testing without configuring an editor. Use it while the server is stopped to avoid concurrent processes writing the same data directory.
@@ -206,7 +235,7 @@ TypeScript/JavaScript, Python, Go, Java, C, and C++ follow the same three-subcom
 
 ## Retrieval and persistence behavior
 
-1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.cs`, `.go`, `.java`, `.c`, `.cpp`, and `.hpp` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. The checked-in `.lciignore` is honored as an additional ignore file and keeps agent control-plane material (`.agents`, `.github/agents`, `.github/instructions`, `.github/skills`, `.codex`, `.claude`) and generated `test-results` out of this repository's searchable corpus while leaving those files available to agents on disk. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
+1. Scan exact lowercase `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.cs`, `.go`, `.java`, `.c`, `.cpp`, and `.hpp` extensions recursively with `.gitignore`, nested ignores, and standard `ignore` crate rules. The checked-in `.lciignore` is honored as an additional ignore file and keeps agent control-plane material (`.agents`, `.github/agents`, `.github/instructions`, `.github/skills`, `.codex`, `.claude`, `.kilo`) and generated `test-results` out of this repository's searchable corpus while leaving those files available to agents on disk. Symlinks are not followed and `.git` is skipped. Hidden source files are eligible when not ignored. Read/traversal errors abort the update and preserve the previous index.
 2. Select a static language adapter and Tree-sitter grammar by extension. Rust retains its original declaration boundaries. TypeScript/JavaScript chunks preserve imports, executable top-level statements, exports, comments/decorators, functions, classes and methods, interfaces and signatures, type aliases, enums, and variable-assigned arrow functions. Python chunks preserve imports, assignments, executable top-level statements, synchronous functions, asynchronous functions, classes, methods, decorators, and associated leading comments. C# chunks preserve using directives, namespaces, top-level statements, types, members, attributes, XML documentation comments, and local functions. Go chunks preserve top-level functions, methods, type/const/var declarations, and associated leading comments. Java chunks preserve packages, imports, classes, interfaces, enums, records, methods, constructors, fields, annotations, and Javadoc comments. C chunks preserve functions, structs, unions, enums, typedefs, preprocessor macros, global declarations, and associated leading comments. C++ chunks preserve namespaces, classes, structs, unions, templates, methods, fields, and associated leading comments. Oversized syntax splits only at named syntax boundaries toward 6,000-byte groups, with declarations preserved up to 24,000 bytes. Large indivisible leaves stay whole rather than being truncated; parser error recovery remains searchable.
 3. Hash each complete source file and persist its parsed chunks, language identifier, and adapter version in the external manifest. A later manual or watched pass reparses only changed/new files or files whose selected adapter version changed, including after restart. Fingerprints include path, content, language, and adapter version. A missing, incompatible, or malformed manifest safely causes a full parse.
 4. Hash each exact source chunk. Reuse vectors from the current workspace snapshot when content hashes and the stored embedding URL/model/document-format identity match. Parser adapter versions are intentionally decoupled from embedding compatibility, so unchanged chunk text keeps its vector. Duplicate new chunks are embedded once. Documents are embedded as source, without a query instruction.
@@ -239,7 +268,7 @@ JSON timing fields measure query embedding, LanceDB search, lexical search, Rust
 - `filter`: retrieval filter validation and deterministic source-role classification.
 - `evaluate`: portable evaluation definitions, execution, and metrics; it observes retrieval without changing ranking.
 - `app`: indexing/cache coordination and retrieval pipeline.
-- `server`: MCP tools and HTTP transport. `main`: CLI/server startup.
+- `server`: MCP tools and HTTP transport. `rest`: the plain JSON-over-HTTP/OpenAPI mirror of the same tools. `main`: CLI/server startup.
 
 There is no BM25, editor-specific integration, Docker setup, generation proxy, or web frontend yet. Later candidate sources can join the same fusion boundary before reranking.
 
@@ -250,4 +279,4 @@ cargo xtask test --suite Full
 
 `cargo xtask test --suite Full` runs `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` in sequence, setting `PROTOC` from `.tools/protoc` when the auto-downloaded copy is present. For focused iteration, `cargo xtask test --suite <name>` runs the matching test modules: `Unit`, `Chunk`, `Filter`, `Evaluation`, `Indexing`, `Readiness`, `Mcp`, `Watching`, `Lsp`, or `Full`. The integration suites filter the single `tests/integration.rs` binary by the module names registered there (`evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `watching`); [docs/development/testing.md](docs/development/testing.md) maps each change to its suite.
 
-Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all seven language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, and actual Streamable HTTP initialization/tool discovery. Live GUST and multilingual acceptance use the real local Qwen services separately.
+Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all eight language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, actual Streamable HTTP initialization/tool discovery, and the REST/OpenAPI mirror's success and error responses. Live GUST and multilingual acceptance use the real local Qwen services separately.
