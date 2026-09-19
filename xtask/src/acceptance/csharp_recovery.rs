@@ -27,8 +27,6 @@ public sealed class Calculator : ICalculator
 }
 "#;
 
-const WINDOWS_CSHARP_LS_FALLBACK: &str = r"C:\Users\micro\.dotnet\tools\csharp-ls.exe";
-
 pub async fn run(csharp_ls: Option<PathBuf>) -> Result<()> {
     super::recovery::run(
         RecoverySpec {
@@ -36,7 +34,7 @@ pub async fn run(csharp_ls: Option<PathBuf>) -> Result<()> {
             display_name: "C#",
             which_name: "csharp-ls",
             cli_flag_display: "csharp-ls",
-            windows_fallback: Some(WINDOWS_CSHARP_LS_FALLBACK),
+            fallback_env: Some(super::CSHARP_LS_FALLBACK_ENV),
             requires_tool: Some("dotnet"),
             scaffold: FixtureScaffold::DotNetSolution {
                 csproj_filename: "CSharpAcceptance.csproj",

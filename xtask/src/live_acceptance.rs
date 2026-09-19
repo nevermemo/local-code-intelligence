@@ -294,14 +294,15 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
     // LSP flows (full/isolation/recovery per language) are generously
     // bounded at 10 minutes even though they normally finish in well under
     // a minute -- the ceiling only matters when something is actually
-    // stuck. rust-analyzer LSP gets 30 minutes since it cold-embeds a real
-    // external Cargo workspace (documented elsewhere as "2 to 10+ minutes"
-    // of embedding time alone).
+    // stuck. `core` and `lsp` default to cold-embedding this repository
+    // itself (documented elsewhere as "2 to 10+ minutes" of embedding time
+    // alone for a workspace this size), so `core` gets 20 minutes and
+    // rust-analyzer LSP gets 30.
     let acceptance_steps: &[(&str, &str, u64)] = &[
         (
             "Acceptance - core (index/search/reindex smoke test)",
             "core",
-            10,
+            20,
         ),
         (
             "Acceptance - multilingual (fixture indexing/search/decoy-ranking)",

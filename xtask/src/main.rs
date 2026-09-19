@@ -54,13 +54,20 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AcceptanceCommand {
-    /// Index/search/reindex smoke test against an external workspace.
+    /// Index/search/reindex smoke test. Defaults to this repository; pass
+    /// --profile gust for the optional external GUST example.
     Core {
+        #[arg(long, value_enum, default_value = "self")]
+        profile: acceptance::AcceptanceProfile,
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
-    /// Symbols/definition/references smoke test against an external workspace.
+    /// Symbols/definition/references smoke test. Defaults to this
+    /// repository; pass --profile gust for the optional external GUST
+    /// example.
     Lsp {
+        #[arg(long, value_enum, default_value = "self")]
+        profile: acceptance::AcceptanceProfile,
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
@@ -164,8 +171,12 @@ async fn main() -> Result<()> {
         Command::Build { test } => build::run_build(test),
         Command::Test { suite } => test::run(suite),
         Command::Acceptance { which } => match which {
-            AcceptanceCommand::Core { workspace } => acceptance::core::run(workspace).await,
-            AcceptanceCommand::Lsp { workspace } => acceptance::lsp::run(workspace).await,
+            AcceptanceCommand::Core { profile, workspace } => {
+                acceptance::core::run(profile, workspace).await
+            }
+            AcceptanceCommand::Lsp { profile, workspace } => {
+                acceptance::lsp::run(profile, workspace).await
+            }
             AcceptanceCommand::Multilingual => acceptance::multilingual::run().await,
             AcceptanceCommand::CsharpLsp {
                 csharp_ls,

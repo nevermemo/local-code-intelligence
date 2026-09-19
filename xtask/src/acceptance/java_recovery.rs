@@ -14,8 +14,6 @@ use super::recovery::{FixtureScaffold, NavigationProbe, ProcessCheck, RecoverySp
 use anyhow::Result;
 use std::path::PathBuf;
 
-const WINDOWS_JDTLS_FALLBACK: &str = r"C:\Users\micro\tools\jdtls";
-
 const CALCULATOR_JAVA: &str = "package acceptance;\n\npublic class Calculator {\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
 
 const CALLSITE_JAVA: &str = "package acceptance;\n\npublic class CallSite {\n    public int run(Calculator calculator) {\n        return calculator.add(1, 2);\n    }\n}\n";
@@ -27,7 +25,7 @@ pub async fn run(java_dir: Option<PathBuf>) -> Result<()> {
             display_name: "Java",
             which_name: "jdtls",
             cli_flag_display: "java",
-            windows_fallback: Some(WINDOWS_JDTLS_FALLBACK),
+            fallback_env: Some(super::JDTLS_FALLBACK_ENV),
             requires_tool: None,
             scaffold: FixtureScaffold::None,
             source_files: vec![

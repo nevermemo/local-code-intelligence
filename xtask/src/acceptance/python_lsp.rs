@@ -31,7 +31,7 @@ pub async fn run(pyright: Option<PathBuf>) -> Result<()> {
             display_name: "Python",
             which_name: "pyright-langserver",
             cli_flag_display: "pyright",
-            windows_fallback: None,
+            fallback_env: None,
             // Unlike csharp-ls/typescript-language-server,
             // pyright-langserver has no standalone `--version`/`--help`
             // output: any argument other than a transport flag

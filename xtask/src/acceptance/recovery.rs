@@ -164,9 +164,9 @@ pub struct RecoverySpec {
     /// prerequisite-unavailable message (e.g. `"pyright"` for
     /// `--pyright`, distinct from the `pyright-langserver` executable name).
     pub cli_flag_display: &'static str,
-    /// A well-known fallback install location checked on Windows only, after
-    /// PATH, before giving up (csharp-ls's dotnet-tools install location).
-    pub windows_fallback: Option<&'static str>,
+    /// Name of an environment variable holding a fallback path, checked
+    /// after `PATH` and before giving up.
+    pub fallback_env: Option<&'static str>,
     /// An external tool that must additionally be on PATH to scaffold the
     /// fixture (`"dotnet"` for C#), checked after the server itself
     /// resolves.
@@ -194,10 +194,9 @@ pub async fn run(spec: RecoverySpec, explicit: Option<PathBuf>) -> Result<()> {
     evidence.stage("resolve-prerequisites")?;
     let Some(server_path) = resolve_server(&spec, explicit) else {
         evidence.set("status", "prerequisite-unavailable")?;
-        let fallback_note = if spec.windows_fallback.is_some() {
-            ", or at the Windows fallback location"
-        } else {
-            ""
+        let fallback_note = match spec.fallback_env {
+            Some(var) => format!(", or via ${var}"),
+            None => String::new(),
         };
         println!(
             "PREREQUISITE_UNAVAILABLE: {} not found on PATH or via --{}{fallback_note}. Evidence: {}",
@@ -277,13 +276,10 @@ fn resolve_server(spec: &RecoverySpec, explicit: Option<PathBuf>) -> Option<Path
     if let Some(path) = which(spec.which_name) {
         return Some(path);
     }
-    if cfg!(windows)
-        && let Some(fallback) = spec.windows_fallback
+    if let Some(var) = spec.fallback_env
+        && let Some(found) = super::env_fallback(var)
     {
-        let fallback = PathBuf::from(fallback);
-        if fallback.exists() {
-            return Some(fallback);
-        }
+        return Some(found);
     }
     None
 }

@@ -20,7 +20,7 @@ pub async fn run(gopls: Option<PathBuf>) -> Result<()> {
             display_name: "Go",
             which_name: "gopls",
             cli_flag_display: "gopls",
-            windows_fallback: None,
+            fallback_env: None,
             version_arg: Some("version"),
             scaffold: FixtureScaffold::None,
             source_files: vec![

@@ -39,7 +39,7 @@ pub async fn run(pyright: Option<PathBuf>) -> Result<()> {
             display_name: "Python",
             which_name: "pyright-langserver",
             cli_flag_display: "pyright",
-            windows_fallback: None,
+            fallback_env: None,
             requires_tool: None,
             scaffold: FixtureScaffold::None,
             source_files: vec![

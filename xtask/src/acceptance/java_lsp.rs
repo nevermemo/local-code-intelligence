@@ -7,11 +7,10 @@
 //! (`lci-core/src/lsp/java.rs`) spawns `java` directly, finding the launcher
 //! jar and platform config dir itself. There is no PATH-discoverable jdtls
 //! command to resolve via `which_name`, so this always resolves through
-//! `windows_fallback` (a hardcoded install location, the same precedent
-//! `csharp_recovery.rs` uses for `WINDOWS_CSHARP_LS_FALLBACK`) unless a real
-//! `--java <dir>` CLI override is given. `version_arg: None`, matching
-//! pyright's precedent: `resolve_server` now resolves a directory here, and
-//! a directory cannot be executed for a `--version` probe.
+//! either a real `--java <dir>` CLI override or the `LCI_ACCEPTANCE_JDTLS`
+//! environment variable naming the install directory. `version_arg: None`,
+//! matching pyright's precedent: `resolve_server` now resolves a directory
+//! here, and a directory cannot be executed for a `--version` probe.
 
 use crate::acceptance::lsp_full::{
     IndexedFilesAssertion, LspFullFlowSpec, SearchAssertion, SymbolsStage,
@@ -19,8 +18,6 @@ use crate::acceptance::lsp_full::{
 use crate::acceptance::recovery::FixtureScaffold;
 use anyhow::Result;
 use std::path::PathBuf;
-
-const WINDOWS_JDTLS_FALLBACK: &str = r"C:\Users\micro\tools\jdtls";
 
 pub(crate) const DOT_PROJECT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <projectDescription>
@@ -62,7 +59,7 @@ pub async fn run(java_dir: Option<PathBuf>) -> Result<()> {
             display_name: "Java",
             which_name: "jdtls",
             cli_flag_display: "java",
-            windows_fallback: Some(WINDOWS_JDTLS_FALLBACK),
+            fallback_env: Some(crate::acceptance::JDTLS_FALLBACK_ENV),
             version_arg: None,
             scaffold: FixtureScaffold::None,
             source_files: vec![

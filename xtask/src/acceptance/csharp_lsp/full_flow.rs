@@ -32,7 +32,7 @@ pub async fn run(csharp_ls: &Path) -> Result<()> {
             display_name: "C#",
             which_name: "csharp-ls",
             cli_flag_display: "csharp-ls",
-            windows_fallback: None,
+            fallback_env: None,
             version_arg: Some("--version"),
             scaffold: FixtureScaffold::DotNetSolution {
                 csproj_filename: "CSharpAcceptance.csproj",

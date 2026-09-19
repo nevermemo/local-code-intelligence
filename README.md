@@ -130,19 +130,21 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, and index lifecycle metadata |
 | `service_status` | none | The same required/optional readiness report as `/ready` |
 
-Example arguments:
+Example arguments (these index this repository itself -- the one workspace every reader already has on disk):
 
 ```json
-{"workspace_path":"C:\\Users\\micro\\Desktop\\gpu-dialect-v0"}
+{"workspace_path":"C:\\code\\local-code-intelligence"}
 ```
 
 ```json
 {
-  "workspace_path": "C:\\Users\\micro\\Desktop\\gpu-dialect-v0",
-  "query": "lower syn AST expressions into generated Slang compute shader code",
+  "workspace_path": "C:\\code\\local-code-intelligence",
+  "query": "plain REST JSON-over-HTTP mirror of the MCP tools",
   "top_k": 8
 }
 ```
+
+On macOS/Linux the same argument is a plain `/path/to/local-code-intelligence`; the doubled backslashes above are JSON string escaping, not part of the path.
 
 `search_code` automatically creates a missing workspace index, waits for its commit, and continues the requested search in the same call. Concurrent first searches for one workspace share that indexing job; different callers receive results from the committed snapshot without duplicate document embeddings. A compatible persisted index is reused immediately after restart.
 
@@ -178,7 +180,7 @@ Every `POST` endpoint takes the identical JSON arguments as its MCP tool (see th
 ```bash
 curl -X POST http://127.0.0.1:8768/v1/search_code \
   -H 'Content-Type: application/json' \
-  -d '{"workspace_path":"/path/to/gpu-dialect-v0","query":"lower syn AST expressions into generated Slang compute shader code"}'
+  -d '{"workspace_path":"/path/to/local-code-intelligence","query":"plain REST JSON-over-HTTP mirror of the MCP tools"}'
 ```
 
 `GET /openapi.json` serves an OpenAPI 3.0.3 document describing every endpoint above. Its request-body schemas are generated directly from the same `schemars`-derived argument structs the MCP tools themselves use, so they cannot drift from what a request actually accepts; response bodies are documented as an open JSON object, matching the exact shapes in the MCP tools table above rather than duplicating them a second time.
@@ -189,18 +191,19 @@ The CLI calls the same application logic and is useful for testing without confi
 
 ```bash
 lci=./target/debug/local-code-intelligence   # local-code-intelligence.exe on Windows
-gust=/path/to/gpu-dialect-v0
-"$lci" index "$gust"
-"$lci" status "$gust"
-"$lci" list-files "$gust"
-"$lci" search "$gust" 'lower syn AST expressions into generated Slang compute shader code'
-"$lci" symbols "$gust" 'emit_expression#'
-"$lci" definition "$gust" 'crates/gust-macros/src/slang/mod.rs' 266 24
-"$lci" references "$gust" 'crates/gust-macros/src/slang/mod.rs' 581 8 --include-declaration
-"$lci" index "$gust"
+repo=$PWD                                    # this repository: the walkthrough indexes LCI's own source
+"$lci" index "$repo"
+"$lci" status "$repo"
+"$lci" list-files "$repo"
+"$lci" search "$repo" 'plain REST JSON-over-HTTP mirror of the MCP tools'
+"$lci" symbols "$repo" 'openapi_document#'
+"$lci" definition "$repo" 'src/rest.rs' 230 52
+"$lci" references "$repo" 'src/rest.rs' 144 3 --include-declaration
+"$lci" references "$repo" 'lci-core/src/workspace.rs' 17 11 --include-declaration
+"$lci" index "$repo"
 ```
 
-The second indexing pass should report zero new embeddings if source and model configuration are unchanged. GUST's actual translator is under `crates/gust-macros/src/slang`; inspect the returned source, not just path names. `cargo xtask acceptance core` saves the index, query, and repeat-index reports and checks that a majority of top-eight results are actual Slang translator implementation chunks, including the expression translator.
+Everything above runs against this repository, so the walkthrough needs nothing but a clone, a build, and the embedding/reranking services. `search` returns `openapi_document` in `src/rest.rs` as its top hit -- the function that builds the document served at `/openapi.json`. `definition` starts from the router wiring on the last line of `src/rest.rs` and resolves to that function's declaration; the first `references` call starts from the declaration and returns both it and the wiring. The second `references` call starts from `Workspace::resolve` in `lci-core/src/workspace.rs` and crosses crates: its callers live in `src/app/` and `tests/cases/`. Lines are one-based and characters are zero-based UTF-16, as in every navigation call; the numbers above are this repository's own, so if a file has shifted since, `grep -n openapi_document src/rest.rs` gives the current ones. The second indexing pass should report zero new embeddings if source and model configuration are unchanged. `cargo xtask acceptance core` runs this same index/search/repeat-index flow against this repository and checks that production implementation chunks dominate the top eight results, including `openapi_document`. Pointing any of these at another repository is just a different first argument -- the optional GUST example under retrieval evaluation below shows one.
 
 Search accepts repeatable `--language`, `--include-path`, `--exclude-path`, and `--source-role` filters. Path filters are case-sensitive repository-relative globs: `*` and `?` stay within one path component, while `**` crosses directories. Absolute paths, backslashes, traversal components, empty patterns, and malformed globs are rejected. An explicitly empty include list is a valid filter that returns no results. Requested filters are applied to every retrieval channel and reported back as effective filters; no result may bypass them.
 
@@ -219,7 +222,7 @@ Workspace mappings are supplied at runtime, so checked-in definitions contain no
 
 Reports contain bounded path, line-range, role, rank, score, and preview evidence; per-query hit@1, hit@3, hit@8, reciprocal rank, preference/disfavor counts, role distribution, reranker state, timings, lifecycle, and effective filters; and aggregate hit rates, MRR, median/p95 latency, fallback count, and created/reused/waited index counts. Generated reports belong under `test-results` and are not committed. Evaluation reuses compatible persisted indexes and preserves the existing first-search lifecycle behavior. It calls only the configured embedding and reranking services, whose defaults are ports 8766 and 8767; application paths never contact port 8765.
 
-`cargo xtask acceptance lsp` independently checks workspace-symbol, definition, and reference navigation against the same translator and saves each normalized response in `test-results`.
+`cargo xtask acceptance lsp` independently checks workspace-symbol, definition, and reference navigation against the same symbol and saves each normalized response in `test-results`. Both `cargo xtask acceptance core` and `cargo xtask acceptance lsp` default to this repository and need no arguments; `--profile gust --workspace /path/to/gpu-dialect-v0` (or `$LCI_ACCEPTANCE_GUST_WORKSPACE`) runs the same flows against the optional external GUST example instead, exactly like `evaluations/core.toml`'s optional `gust` workspace.
 
 With the real embedding and reranking services running on ports 8766 and 8767, the mixed-language acceptance creates a disposable fixture and data directory under `test-results`, uses the actual debug binary, and never contacts port 8765:
 
@@ -229,9 +232,9 @@ cargo xtask acceptance multilingual
 
 It verifies all supported language IDs, semantic and lexical retrieval with live reranking, production TypeScript, Python, and C# ranking over test decoys, zero-work unchanged indexing, one-file invalidation, deletion, restart reuse, and prior-snapshot retrieval after a deliberately unreachable embedding endpoint causes an update to fail. Reports are written as `test-results/multilingual-*.json`.
 
-C# language-server acceptance is split across three more subcommands: `cargo xtask acceptance csharp-lsp` (real `dotnet` fixture + `csharp-ls`, plus `--probe-only` for a standalone JSON-RPC protocol probe with no LCI binary involved), `cargo xtask acceptance csharp-missing` (provider-isolation/degradation when `csharp-ls` is unavailable), and `cargo xtask acceptance csharp-recovery` (persistent process reuse and forced-kill recovery). Each requires `dotnet` and `csharp-ls` on `PATH` and skips gracefully (printing `PREREQUISITE_UNAVAILABLE`) when they're missing.
+C# language-server acceptance is split across three more subcommands: `cargo xtask acceptance csharp-lsp` (real `dotnet` fixture + `csharp-ls`, plus `--probe-only` for a standalone JSON-RPC protocol probe with no LCI binary involved), `cargo xtask acceptance csharp-missing` (provider-isolation/degradation when `csharp-ls` is unavailable), and `cargo xtask acceptance csharp-recovery` (persistent process reuse and forced-kill recovery). Each requires `dotnet` and `csharp-ls` on `PATH` (or `$LCI_ACCEPTANCE_CSHARP_LS` naming the executable, for a `dotnet tool` install that isn't on `PATH`) and skips gracefully (printing `PREREQUISITE_UNAVAILABLE`) when they're missing.
 
-TypeScript/JavaScript, Python, Go, Java, C, and C++ follow the same three-subcommand pattern: `cargo xtask acceptance typescript-lsp` / `typescript-missing` / `typescript-recovery` against a real npm-scaffolded fixture and `typescript-language-server` (`--typescript-language-server <path>` overrides discovery); `cargo xtask acceptance python-lsp` / `python-missing` / `python-recovery` against a real Python package fixture and `pyright` (`--pyright <path>` overrides discovery); `cargo xtask acceptance go-lsp` / `go-missing` / `go-recovery` against a real `go.mod`-rooted module and `gopls` (`--gopls <path>` overrides discovery); `cargo xtask acceptance java-lsp` / `java-missing` / `java-recovery` against a real Eclipse `.project`/`.classpath` fixture and jdtls (`--java <jdtls install directory>` overrides discovery -- a directory, not an executable, matching `[java].path`); and `cargo xtask acceptance c-lsp` / `c-missing` / `c-recovery` and `cpp-lsp` / `cpp-missing` / `cpp-recovery` against real standalone C/C++ fixtures and one shared `clangd` (`--clangd <path>` overrides discovery for each). All six skip gracefully when their server isn't found.
+TypeScript/JavaScript, Python, Go, Java, C, and C++ follow the same three-subcommand pattern: `cargo xtask acceptance typescript-lsp` / `typescript-missing` / `typescript-recovery` against a real npm-scaffolded fixture and `typescript-language-server` (`--typescript-language-server <path>` overrides discovery); `cargo xtask acceptance python-lsp` / `python-missing` / `python-recovery` against a real Python package fixture and `pyright` (`--pyright <path>` overrides discovery); `cargo xtask acceptance go-lsp` / `go-missing` / `go-recovery` against a real `go.mod`-rooted module and `gopls` (`--gopls <path>` overrides discovery); `cargo xtask acceptance java-lsp` / `java-missing` / `java-recovery` against a real Eclipse `.project`/`.classpath` fixture and jdtls (`--java <jdtls install directory>` overrides discovery -- a directory, not an executable, matching `[java].path`; `$LCI_ACCEPTANCE_JDTLS` sets the same directory for repeated local runs); and `cargo xtask acceptance c-lsp` / `c-missing` / `c-recovery` and `cpp-lsp` / `cpp-missing` / `cpp-recovery` against real standalone C/C++ fixtures and one shared `clangd` (`--clangd <path>` overrides discovery for each). All six skip gracefully when their server isn't found.
 
 ## Retrieval and persistence behavior
 
@@ -279,4 +282,4 @@ cargo xtask test --suite Full
 
 `cargo xtask test --suite Full` runs `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` in sequence, setting `PROTOC` from `.tools/protoc` when the auto-downloaded copy is present. For focused iteration, `cargo xtask test --suite <name>` runs the matching test modules: `Unit`, `Chunk`, `Filter`, `Evaluation`, `Indexing`, `Readiness`, `Mcp`, `Watching`, `Lsp`, or `Full`. The integration suites filter the single `tests/integration.rs` binary by the module names registered there (`evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `watching`); [docs/development/testing.md](docs/development/testing.md) maps each change to its suite.
 
-Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all eight language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, actual Streamable HTTP initialization/tool discovery, and the REST/OpenAPI mirror's success and error responses. Live GUST and multilingual acceptance use the real local Qwen services separately.
+Automated tests use a local mock model HTTP service and real embedded LanceDB. They exercise Rust boundary regression, all eight language adapters, schema-v1 migration, per-language parse compatibility, persistent parse/vector reuse across reopen, mixed-language metadata and retrieval, TS/JS-only LSP gating, stale detection, deleted files, failed update preservation, watched refresh, embedding configuration changes, reranker failure/invalid replies, query instruction formatting, ignore handling, actual Streamable HTTP initialization/tool discovery, and the REST/OpenAPI mirror's success and error responses. Live self-workspace and multilingual acceptance use the real local Qwen services separately.

@@ -89,6 +89,76 @@ pub fn which(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Environment variable naming a jdtls *installation directory* to fall back
+/// to when `jdtls` is not discoverable on `PATH` and no `--java` flag was
+/// given. Deliberately an environment variable rather than a literal path:
+/// where a developer extracted jdtls is a property of their machine, not of
+/// this repository.
+pub const JDTLS_FALLBACK_ENV: &str = "LCI_ACCEPTANCE_JDTLS";
+
+/// Environment variable naming a `csharp-ls` executable to fall back to when
+/// it is not on `PATH` and no `--csharp-ls` flag was given -- `dotnet tool
+/// install` puts it in a per-user directory that is not always on `PATH`.
+pub const CSHARP_LS_FALLBACK_ENV: &str = "LCI_ACCEPTANCE_CSHARP_LS";
+
+/// Resolves an optional machine-local fallback path from `var`. Returns
+/// `None` when the variable is unset, empty, or names a path that no longer
+/// exists, so a stale value degrades to the normal PREREQUISITE_UNAVAILABLE
+/// skip rather than a confusing spawn failure.
+pub fn env_fallback(var: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(var)?;
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    path.exists().then_some(path)
+}
+
+/// Which workspace an external-workspace acceptance run targets.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum AcceptanceProfile {
+    /// This repository itself -- the default, so `cargo xtask acceptance
+    /// core`/`lsp` work on any clone with nothing installed beyond the
+    /// embedding/reranking services the acceptance bar already requires.
+    #[value(name = "self")]
+    SelfRepo,
+    /// The GUST Rust-to-Slang translator repository: an optional, external
+    /// example, exactly the treatment `evaluations/core.toml` already gives
+    /// its optional `gust` workspace. Has no default path -- this repository
+    /// must not carry one that exists on a single machine.
+    Gust,
+}
+
+/// Environment variable naming a GUST checkout, so a developer who runs the
+/// optional profile regularly can set it once instead of passing
+/// `--workspace` every time. Read only for `AcceptanceProfile::Gust`, so it
+/// can never silently redirect a default `self` run.
+pub const GUST_WORKSPACE_ENV: &str = "LCI_ACCEPTANCE_GUST_WORKSPACE";
+
+/// Resolves the workspace for `profile`: the explicit `--workspace` flag,
+/// else (for `gust`) `$LCI_ACCEPTANCE_GUST_WORKSPACE`, else (for `self`)
+/// this repository.
+pub fn resolve_acceptance_workspace(
+    profile: AcceptanceProfile,
+    explicit: Option<PathBuf>,
+    command: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    match profile {
+        AcceptanceProfile::SelfRepo => Ok(workspace_root()),
+        AcceptanceProfile::Gust => env_fallback(GUST_WORKSPACE_ENV).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`cargo xtask acceptance {command} --profile gust` needs an external \
+                 workspace: pass --workspace <path to a gpu-dialect-v0 checkout>, or set \
+                 ${GUST_WORKSPACE_ENV}. Example:\n  \
+                 cargo xtask acceptance {command} --profile gust --workspace /path/to/gpu-dialect-v0"
+            )
+        }),
+    }
+}
+
 /// A disposable acceptance fixture: an isolated workspace directory and an
 /// isolated LanceDB data directory, both under the OS temp dir, named with
 /// this process's PID so concurrent runs never collide.

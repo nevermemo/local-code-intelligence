@@ -86,7 +86,9 @@ pub struct LspFullFlowSpec {
     pub display_name: &'static str,
     pub which_name: &'static str,
     pub cli_flag_display: &'static str,
-    pub windows_fallback: Option<&'static str>,
+    /// Name of an environment variable holding a fallback path, checked
+    /// after `PATH` and before giving up.
+    pub fallback_env: Option<&'static str>,
     /// Argument passed to `<server> <version_arg>` to record a version in
     /// evidence, or `None` when the server has no usable standalone version
     /// probe (pyright-langserver exits with a connection error for any
@@ -144,10 +146,9 @@ pub async fn run(spec: LspFullFlowSpec, explicit: Option<PathBuf>) -> Result<()>
     let mut evidence = Evidence::new(&format!("{}-lsp-acceptance", spec.language_key))?;
     let Some(resolved) = resolve_server(&spec, explicit) else {
         evidence.set("status", "prerequisite-unavailable")?;
-        let fallback_note = if spec.windows_fallback.is_some() {
-            ", or at the Windows fallback location"
-        } else {
-            ""
+        let fallback_note = match spec.fallback_env {
+            Some(var) => format!(", or via ${var}"),
+            None => String::new(),
         };
         println!(
             "PREREQUISITE_UNAVAILABLE: {} not found on PATH or via --{}{fallback_note}. Evidence: {}",
@@ -213,13 +214,10 @@ fn resolve_server(spec: &LspFullFlowSpec, explicit: Option<PathBuf>) -> Option<P
     if let Some(found) = which(spec.which_name) {
         return Some(found);
     }
-    if cfg!(windows)
-        && let Some(fallback) = spec.windows_fallback
+    if let Some(var) = spec.fallback_env
+        && let Some(found) = super::env_fallback(var)
     {
-        let fallback = PathBuf::from(fallback);
-        if fallback.exists() {
-            return Some(fallback);
-        }
+        return Some(found);
     }
     None
 }

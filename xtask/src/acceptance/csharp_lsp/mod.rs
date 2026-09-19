@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use super::Evidence;
 
 /// Resolves the csharp-ls executable: the explicit `--csharp-ls` flag if
-/// given, else a PATH lookup, else (Windows only) the hardcoded default the
-/// original PowerShell probe script fell back to.
+/// given, else a PATH lookup, else the path named by `$LCI_ACCEPTANCE_CSHARP_LS`
+/// if it exists -- `dotnet tool install` puts csharp-ls in a per-user
+/// directory that isn't always on `PATH`.
 fn resolve_csharp_ls(csharp_ls: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = csharp_ls {
         if path.is_file() {
@@ -33,13 +34,7 @@ fn resolve_csharp_ls(csharp_ls: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(found) = super::which("csharp-ls") {
         return Some(found);
     }
-    if cfg!(windows) {
-        let fallback = PathBuf::from(r"C:\Users\micro\.dotnet\tools\csharp-ls.exe");
-        if fallback.is_file() {
-            return Some(fallback);
-        }
-    }
-    None
+    super::env_fallback(super::CSHARP_LS_FALLBACK_ENV)
 }
 
 pub async fn run(csharp_ls: Option<PathBuf>, probe_only: bool) -> Result<()> {
@@ -54,7 +49,10 @@ pub async fn run(csharp_ls: Option<PathBuf>, probe_only: bool) -> Result<()> {
         if let Ok(mut evidence) = Evidence::new(name) {
             let _ = evidence.set("status", "prerequisite-unavailable");
         }
-        println!("PREREQUISITE_UNAVAILABLE: csharp-ls not found");
+        println!(
+            "PREREQUISITE_UNAVAILABLE: csharp-ls not found on PATH, via --csharp-ls, or via ${}",
+            super::CSHARP_LS_FALLBACK_ENV
+        );
         return Ok(());
     };
     if probe_only {

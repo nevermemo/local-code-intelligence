@@ -21,7 +21,7 @@ pub async fn run(clangd: Option<PathBuf>) -> Result<()> {
             display_name: "C",
             which_name: "clangd",
             cli_flag_display: "clangd",
-            windows_fallback: None,
+            fallback_env: None,
             version_arg: Some("--version"),
             scaffold: FixtureScaffold::None,
             source_files: vec![("calculator.c", CALCULATOR_C), ("callsite.c", CALLSITE_C)],

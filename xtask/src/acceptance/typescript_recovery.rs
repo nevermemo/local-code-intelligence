@@ -37,7 +37,7 @@ pub async fn run(typescript_language_server: Option<PathBuf>) -> Result<()> {
             display_name: "TypeScript",
             which_name: "typescript-language-server",
             cli_flag_display: "typescript-language-server",
-            windows_fallback: None,
+            fallback_env: None,
             requires_tool: Some("npm"),
             // Written before `npm install`/indexing so both npm and the
             // indexer skip the tens of thousands of files a real
