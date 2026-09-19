@@ -83,6 +83,7 @@ them for you:
 | `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | installed |
 | `go` + `gopls` | `cargo xtask acceptance go-lsp/-missing/-recovery` | installed (`go install golang.org/x/tools/gopls@latest`) |
 | JDK 21+ + jdtls install | `cargo xtask acceptance java-lsp/-missing/-recovery` | installed (Temurin 25; jdtls extracted to `C:\Users\micro\tools\jdtls` -- `[java].path`/`--java <dir>` point at that directory, not an executable) |
+| `clangd` | `cargo xtask acceptance c-lsp/-missing/-recovery`, `cpp-lsp/-missing/-recovery` | installed (`winget install LLVM.clangd`) -- one instance navigates both `c` and `cpp` |
 
 Every `*-lsp`/`*-missing`/`*-recovery` subcommand skips gracefully (prints
 `PREREQUISITE_UNAVAILABLE`) rather than failing when its tool isn't on

@@ -51,11 +51,17 @@ impl ProcessCheck {
 }
 
 pub struct MissingServerSpec {
-    /// Short identifier used to name the fixture, evidence file, and config
-    /// section (e.g. `"csharp"`, `"typescript"`, `"python"`).
+    /// Short identifier used to name the fixture and evidence file (e.g.
+    /// `"csharp"`, `"typescript"`, `"python"`, or `"c"`/`"cpp"` when two
+    /// language keys share one `config_section` -- see `config_section`).
     pub language_key: &'static str,
     /// Human-readable name for log/error messages (e.g. `"C#"`).
     pub display_name: &'static str,
+    /// TOML config section this server's settings live under (e.g.
+    /// `"go"`). Usually equal to `language_key`, but distinct when one
+    /// server navigates more than one language key under a single shared
+    /// section -- clangd's `c`/`cpp` both write `[clangd]`.
+    pub config_section: &'static str,
     /// Value written as `path = '...'` under `[language_key]` to guarantee
     /// the configured server cannot resolve to a real executable.
     pub missing_path: &'static str,
@@ -151,7 +157,7 @@ async fn checks(
     let mut lines = vec![
         "lsp_timeout_seconds = 10".to_string(),
         "rust_analyzer_path = 'definitely-missing-rust-analyzer'".to_string(),
-        format!("[{}]", spec.language_key),
+        format!("[{}]", spec.config_section),
         format!("path = '{}'", spec.missing_path),
     ];
     lines.extend(spec.extra_config_lines.iter().cloned());

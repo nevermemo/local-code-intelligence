@@ -80,6 +80,7 @@ pub async fn run(typescript_language_server: Option<PathBuf>) -> Result<()> {
             language_identifier: "typescript",
             provider_name: "typescript-language-server",
             generated_dirs: &["node_modules", "dist", "build"],
+            cross_file_references: true,
         },
         typescript_language_server,
     )

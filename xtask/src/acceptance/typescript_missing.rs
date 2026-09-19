@@ -32,6 +32,7 @@ const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {
         language_key: "typescript",
+        config_section: "typescript",
         display_name: "TypeScript",
         missing_path: "definitely-missing-typescript-language-server",
         extra_config_lines: vec![],

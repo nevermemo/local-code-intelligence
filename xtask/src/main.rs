@@ -130,6 +130,30 @@ enum AcceptanceCommand {
         #[arg(long)]
         java: Option<PathBuf>,
     },
+    /// Real clangd acceptance for C (workspace symbols, definition, references).
+    CLsp {
+        #[arg(long)]
+        clangd: Option<PathBuf>,
+    },
+    /// C provider-isolation/degradation acceptance (missing clangd binary).
+    CMissing,
+    /// C LSP persistent-process reuse and forced-kill recovery acceptance.
+    CRecovery {
+        #[arg(long)]
+        clangd: Option<PathBuf>,
+    },
+    /// Real clangd acceptance for C++ (workspace symbols, definition, references).
+    CppLsp {
+        #[arg(long)]
+        clangd: Option<PathBuf>,
+    },
+    /// C++ provider-isolation/degradation acceptance (missing clangd binary).
+    CppMissing,
+    /// C++ LSP persistent-process reuse and forced-kill recovery acceptance.
+    CppRecovery {
+        #[arg(long)]
+        clangd: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -169,6 +193,14 @@ async fn main() -> Result<()> {
             AcceptanceCommand::JavaLsp { java } => acceptance::java_lsp::run(java).await,
             AcceptanceCommand::JavaMissing => acceptance::java_missing::run().await,
             AcceptanceCommand::JavaRecovery { java } => acceptance::java_recovery::run(java).await,
+            AcceptanceCommand::CLsp { clangd } => acceptance::c_lsp::run(clangd).await,
+            AcceptanceCommand::CMissing => acceptance::c_missing::run().await,
+            AcceptanceCommand::CRecovery { clangd } => acceptance::c_recovery::run(clangd).await,
+            AcceptanceCommand::CppLsp { clangd } => acceptance::cpp_lsp::run(clangd).await,
+            AcceptanceCommand::CppMissing => acceptance::cpp_missing::run().await,
+            AcceptanceCommand::CppRecovery { clangd } => {
+                acceptance::cpp_recovery::run(clangd).await
+            }
         },
         Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
     }

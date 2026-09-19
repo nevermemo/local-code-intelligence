@@ -20,7 +20,7 @@ The workspace is split into `lci-core` (chunking, language adapters, filters, le
 - Preserve existing user changes. Keep generated reports, temporary fixtures, model files, `target`, and editor settings out of commits.
 - Run focused checks while correcting a defect. Run formatting, the full workspace tests, and Clippy once after the complete slice is ready.
 - Report mock tests, live embedding/reranking acceptance, LSP acceptance, and external repository evaluation as separate evidence.
-- A language is supported only after indexing, metadata, incremental reuse, deletion, restart reuse, retrieval, failure preservation, and documentation are verified. Claim LSP support only after real-server acceptance.
+- A language is supported only after indexing, metadata, incremental reuse, deletion, restart reuse, retrieval, failure preservation, documentation, and language-server navigation are verified. LSP navigation is a required part of language completion, not an optional follow-on -- claim it only after real-server acceptance, and do not consider a language finished while it is syntax-only.
 - For coordinator/subagent work, give the local subagent one bounded edit with an allowed-file list. A valid saved diff counts even when the subagent returns no prose. Avoid repeated repository reads and repeated test runs.
 
 ## Project skills

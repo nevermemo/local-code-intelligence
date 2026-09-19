@@ -23,6 +23,7 @@ const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {
         language_key: "java",
+        config_section: "java",
         display_name: "Java",
         missing_path: "C:/definitely-missing-jdtls-install",
         extra_config_lines: vec![],

@@ -23,6 +23,7 @@ const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {
         language_key: "csharp",
+        config_section: "csharp",
         display_name: "C#",
         missing_path: "definitely-missing-csharp-ls",
         extra_config_lines: vec!["args = ['--solution', 'CSharpAcceptance.sln']".to_string()],

@@ -67,6 +67,7 @@ pub async fn run(pyright: Option<PathBuf>) -> Result<()> {
             language_identifier: "python",
             provider_name: "pyright",
             generated_dirs: &["bin", "obj"],
+            cross_file_references: true,
         },
         pyright,
     )

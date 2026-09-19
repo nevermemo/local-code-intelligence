@@ -49,6 +49,7 @@ pub async fn run(gopls: Option<PathBuf>) -> Result<()> {
             language_identifier: "go",
             provider_name: "gopls",
             generated_dirs: &[],
+            cross_file_references: true,
         },
         gopls,
     )

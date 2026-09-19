@@ -46,6 +46,7 @@ pub struct Status {
     pub python_analyzer_running: bool,
     pub go_analyzer_running: bool,
     pub java_analyzer_running: bool,
+    pub clangd_analyzer_running: bool,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -293,6 +294,7 @@ impl App {
         let python_analyzer_running = self.analyzer.running("pyright", &workspace.id).await;
         let go_analyzer_running = self.analyzer.running("gopls", &workspace.id).await;
         let java_analyzer_running = self.analyzer.running("jdtls", &workspace.id).await;
+        let clangd_analyzer_running = self.analyzer.running("clangd", &workspace.id).await;
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -313,6 +315,7 @@ impl App {
             python_analyzer_running,
             go_analyzer_running,
             java_analyzer_running,
+            clangd_analyzer_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }

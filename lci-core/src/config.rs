@@ -83,6 +83,10 @@ pub struct Config {
     /// configuration keeps Java navigation disabled; syntax retrieval is
     /// unaffected.
     pub java: JavaLspConfig,
+    /// Optional C/C++ language-server (clangd) settings. Absent or empty
+    /// configuration keeps C/C++ navigation disabled; syntax retrieval is
+    /// unaffected.
+    pub clangd: ClangdLspConfig,
     pub index: IndexConfig,
 }
 
@@ -288,6 +292,51 @@ impl JavaLspConfig {
     }
 }
 
+/// Optional C/C++ language-server (clangd) configuration.
+///
+/// One configured clangd instance navigates both Tree-sitter-indexed
+/// languages `c` and `cpp` (`.c`, `.cpp`, `.hpp`), the same one-server-many-
+/// languages shape `TypeScriptLspConfig` uses for its four ECMAScript-family
+/// languages. C/C++ navigation is optional and fail-open: an absent or empty
+/// `[clangd]` section keeps the server disabled without affecting syntax
+/// retrieval. The shared `lsp_timeout_seconds` and `lsp_candidate_count`
+/// settings apply to this server as well.
+///
+/// Like gopls, clangd needs no forced leading transport flag -- stdio is its
+/// default communication mode (confirmed against a real installed clangd,
+/// not assumed). It also needs no `compile_commands.json` for LCI's simple
+/// per-file navigation use case: confirmed live against a small standalone
+/// fixture with no build system present, clangd's fallback compilation
+/// database is sufficient for `workspace/symbol`/`definition`/`references`
+/// to resolve correctly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClangdLspConfig {
+    /// Path to the standalone clangd executable. `None` (the default) keeps
+    /// C/C++ navigation disabled. An empty or whitespace-only value is
+    /// rejected by validation rather than silently counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to clangd (e.g. `--compile-commands-dir`
+    /// for a workspace with a real build system).
+    pub args: Vec<String>,
+    /// Explicitly disable the clangd server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl ClangdLspConfig {
+    /// Whether the clangd language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Per-OS local data directory: %LOCALAPPDATA% on Windows,
@@ -322,6 +371,7 @@ impl Default for Config {
             python: PythonLspConfig::default(),
             go: GoLspConfig::default(),
             java: JavaLspConfig::default(),
+            clangd: ClangdLspConfig::default(),
             index: IndexConfig::default(),
         }
     }
@@ -406,6 +456,14 @@ impl Config {
             ensure!(
                 !path.trim().is_empty(),
                 "java.path must be nonempty when set; omit it or set java.disabled = true to keep Java navigation disabled"
+            );
+        }
+        if !self.clangd.disabled
+            && let Some(path) = &self.clangd.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "clangd.path must be nonempty when set; omit it or set clangd.disabled = true to keep C/C++ navigation disabled"
             );
         }
         ensure!(
@@ -600,5 +658,41 @@ mod tests {
         let config: Config = toml::from_str(&toml_text).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("java.path"));
+    }
+
+    #[test]
+    fn default_clangd_is_disabled() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(!config.clangd.enabled());
+        assert!(config.clangd.path.is_none());
+    }
+
+    #[test]
+    fn clangd_section_enables_server() {
+        let toml_text = format!("{}[clangd]\npath = \"clangd\"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(config.clangd.enabled());
+        assert_eq!(config.clangd.path.as_deref(), Some("clangd"));
+    }
+
+    #[test]
+    fn clangd_disabled_flag_overrides_path() {
+        let toml_text = format!(
+            "{}[clangd]\npath = \"clangd\"\ndisabled = true\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(!config.clangd.enabled());
+    }
+
+    #[test]
+    fn empty_clangd_path_is_rejected() {
+        let toml_text = format!("{}[clangd]\npath = \"   \"\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("clangd.path"));
     }
 }

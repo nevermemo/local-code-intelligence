@@ -2,8 +2,8 @@ use crate::{
     config::Config,
     language,
     lsp::{
-        adapter::LspAdapter, csharp::CSharpServer, go::GoServer, java::JavaServer,
-        python::PythonServer, rust::RustServer, transport::JsonRpcClient,
+        adapter::LspAdapter, clangd::ClangdServer, csharp::CSharpServer, go::GoServer,
+        java::JavaServer, python::PythonServer, rust::RustServer, transport::JsonRpcClient,
         typescript::TypeScriptServer,
     },
     workspace::Workspace,
@@ -19,6 +19,7 @@ use std::{
 use tokio::sync::Mutex;
 
 pub mod adapter;
+pub mod clangd;
 pub mod csharp;
 pub mod go;
 pub mod java;
@@ -89,6 +90,7 @@ impl Manager {
             Arc::new(PythonServer::new(&config.python, timeout)),
             Arc::new(GoServer::new(&config.go, timeout)),
             Arc::new(JavaServer::new(config, timeout)),
+            Arc::new(ClangdServer::new(&config.clangd, timeout)),
         ];
         Self {
             adapters,

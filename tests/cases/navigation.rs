@@ -1,6 +1,6 @@
 use super::*;
 use local_code_intelligence::{
-    config::{CSharpLspConfig, PythonLspConfig, TypeScriptLspConfig},
+    config::{CSharpLspConfig, ClangdLspConfig, PythonLspConfig, TypeScriptLspConfig},
     lsp::{Manager, adapter::LspAdapter},
     workspace::Workspace,
 };
@@ -13,6 +13,15 @@ fn csharp_adapter(manager: &Manager) -> Arc<dyn LspAdapter> {
         .next()
         .cloned()
         .expect("csharp-ls adapter is always constructed")
+}
+
+fn clangd_adapter(manager: &Manager, language: &str) -> Arc<dyn LspAdapter> {
+    manager
+        .adapters_for_language(language)
+        .into_iter()
+        .next()
+        .cloned()
+        .expect("clangd adapter is always constructed")
 }
 
 fn typescript_adapter(manager: &Manager) -> Arc<dyn LspAdapter> {
@@ -147,6 +156,53 @@ fn fake_python_fixture(
                 "src/Calculator.py".to_owned(),
                 "--secondary-file".to_owned(),
                 "src/CallSite.py".to_owned(),
+            ],
+            disabled: false,
+        },
+        ..Config::default()
+    };
+    (config, workspace, state_path)
+}
+
+/// Builds a fake-clangd fixture for either `c` or `cpp` (`extension`: `"c"`
+/// or `"cpp"`), since one clangd instance/config navigates both.
+fn fake_clangd_fixture(
+    temp: &tempfile::TempDir,
+    mode: &str,
+    extension: &str,
+) -> (Config, Workspace, std::path::PathBuf) {
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let state_path = temp.path().join("state");
+    std::fs::create_dir_all(workspace_path.join("src")).unwrap();
+    std::fs::create_dir_all(&data_path).unwrap();
+    let primary_file = format!("src/Calculator.{extension}");
+    let secondary_file = format!("src/CallSite.{extension}");
+    write(
+        &workspace_path,
+        &primary_file,
+        "// Calculator performs basic arithmetic for acceptance testing.\nint add(int a, int b) { return a + b; }\n",
+    );
+    write(
+        &workspace_path,
+        &secondary_file,
+        "int run() { return add(1, 2); }\n",
+    );
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let config = Config {
+        data_dir: data_path,
+        lsp_timeout_seconds: 1,
+        clangd: ClangdLspConfig {
+            path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+            args: vec![
+                "--mode".to_owned(),
+                mode.to_owned(),
+                "--state".to_owned(),
+                state_path.to_string_lossy().into_owned(),
+                "--primary-file".to_owned(),
+                primary_file,
+                "--secondary-file".to_owned(),
+                secondary_file,
             ],
             disabled: false,
         },
@@ -435,6 +491,75 @@ async fn fake_python_lsp_maps_symbols_definitions_and_references() {
     }
 }
 
+/// Confirms one shared ClangdServer instance correctly navigates both `c`
+/// and `cpp` -- the same one-adapter-many-languages contract already
+/// exercised for TypeScript's four ECMAScript-family languages.
+#[tokio::test]
+async fn fake_clangd_lsp_maps_symbols_definitions_and_references() {
+    for extension in ["c", "cpp"] {
+        for (mode, operation) in [
+            ("workspace-symbols", "symbols"),
+            ("definition", "definition"),
+            ("references", "references"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (config, workspace, _) = fake_clangd_fixture(&temp, mode, extension);
+            let manager = Manager::new(&config);
+            let adapter = clangd_adapter(&manager, extension);
+            let primary = format!("src/Calculator.{extension}");
+            let secondary = format!("src/CallSite.{extension}");
+            let results = match operation {
+                "symbols" => manager
+                    .symbols(&adapter, &workspace, "Calculator")
+                    .await
+                    .unwrap(),
+                "definition" => manager
+                    .definition(
+                        &adapter,
+                        &workspace,
+                        &workspace.path.join(&secondary),
+                        &secondary,
+                        1,
+                        16,
+                    )
+                    .await
+                    .unwrap(),
+                "references" => manager
+                    .references(
+                        &adapter,
+                        &workspace,
+                        &workspace.path.join(&primary),
+                        &primary,
+                        1,
+                        4,
+                        true,
+                    )
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|result| {
+                result.language.as_deref() == Some(extension)
+                    && result.provider.as_deref() == Some("clangd")
+                    && result.start_line >= 1
+            }));
+            assert_eq!(
+                results[0].relative_file_path.as_deref(),
+                Some(primary.as_str())
+            );
+            if operation == "references" {
+                assert!(
+                    results
+                        .iter()
+                        .any(|result| result.relative_file_path.as_deref()
+                            == Some(secondary.as_str()))
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation() {
     let (temp, mut config, _fake, task) = fixture().await;
@@ -649,6 +774,73 @@ async fn go_only_search_and_navigation_keep_go_lsp_optional() {
         "unexpected error: {references_error}"
     );
     assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
+    task.abort();
+}
+
+#[tokio::test]
+async fn c_only_search_and_navigation_keep_clangd_lsp_optional() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("c-only");
+    write(
+        &workspace,
+        "revenue.c",
+        "// compute_quarterly_revenue_summary sums quarterly revenue rows.\nint compute_quarterly_revenue_summary(int *rows, int count) {\n    int total = 0;\n    for (int i = 0; i < count; i++) {\n        total += rows[i];\n    }\n    return total;\n}\n",
+    );
+    let app = App::open(config).await.unwrap();
+    let indexed = app.index(&workspace).await.unwrap();
+    assert_eq!(indexed.files, 1);
+    assert_eq!(indexed.parsed_files, 1);
+
+    let report = app
+        .search(&workspace, "compute_quarterly_revenue_summary", Some(4))
+        .await
+        .unwrap();
+    assert_eq!(report.results[0].chunk.language, "c");
+    assert_eq!(report.results[0].chunk.relative_file_path, "revenue.c");
+    assert!(
+        report
+            .warning
+            .as_deref()
+            .is_none_or(|warning| !warning.contains("LSP")),
+        "unexpected warning: {:?}",
+        report.warning
+    );
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .clangd_analyzer_running
+    );
+
+    let definition_error = app
+        .definition(&workspace, "revenue.c", 1, 0)
+        .await
+        .unwrap_err();
+    assert!(
+        definition_error.to_string().contains("clangd is disabled"),
+        "unexpected error: {definition_error}"
+    );
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .clangd_analyzer_running
+    );
+
+    let references_error = app
+        .references(&workspace, "revenue.c", 1, 0, true)
+        .await
+        .unwrap_err();
+    assert!(
+        references_error.to_string().contains("clangd is disabled"),
+        "unexpected error: {references_error}"
+    );
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .clangd_analyzer_running
+    );
     task.abort();
 }
 

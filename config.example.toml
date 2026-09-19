@@ -72,6 +72,16 @@ lsp_candidate_count = 40
 # args = []
 # disabled = false
 
+# Optional C/C++ language server (clangd). One configured server navigates
+# both .c and .cpp/.hpp. Optional and fail-open, same as csharp above. Like
+# gopls, clangd needs no forced leading transport flag. No compile_commands.json
+# is needed for simple per-file navigation; point clangd at a real one via
+# args (e.g. "--compile-commands-dir=...") for a workspace with a build system.
+# [clangd]
+# path = "clangd"
+# args = []
+# disabled = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

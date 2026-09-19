@@ -80,6 +80,20 @@ jobs:
       - name: Acceptance - C# LSP recovery
         run: cargo xtask acceptance csharp-recovery
 
+      - name: Acceptance - C LSP (clangd)
+        run: cargo xtask acceptance c-lsp
+      - name: Acceptance - C LSP provider isolation
+        run: cargo xtask acceptance c-missing
+      - name: Acceptance - C LSP recovery
+        run: cargo xtask acceptance c-recovery
+
+      - name: Acceptance - C++ LSP (clangd)
+        run: cargo xtask acceptance cpp-lsp
+      - name: Acceptance - C++ LSP provider isolation
+        run: cargo xtask acceptance cpp-missing
+      - name: Acceptance - C++ LSP recovery
+        run: cargo xtask acceptance cpp-recovery
+
       - name: Evaluate - retrieval quality (self workspace)
         run: >
           cargo run --bin local-code-intelligence --

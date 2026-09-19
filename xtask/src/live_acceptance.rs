@@ -348,6 +348,12 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
             10,
         ),
         ("Acceptance - C# LSP recovery", "csharp-recovery", 10),
+        ("Acceptance - C LSP (clangd)", "c-lsp", 10),
+        ("Acceptance - C LSP provider isolation", "c-missing", 10),
+        ("Acceptance - C LSP recovery", "c-recovery", 10),
+        ("Acceptance - C++ LSP (clangd)", "cpp-lsp", 10),
+        ("Acceptance - C++ LSP provider isolation", "cpp-missing", 10),
+        ("Acceptance - C++ LSP recovery", "cpp-recovery", 10),
     ];
     for (name, cmd, timeout) in acceptance_steps {
         if should_run(&only, name, cmd) {

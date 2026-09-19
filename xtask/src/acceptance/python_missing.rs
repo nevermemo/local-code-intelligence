@@ -24,6 +24,7 @@ const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {
         language_key: "python",
+        config_section: "python",
         display_name: "Python",
         missing_path: "definitely-missing-pyright-langserver",
         extra_config_lines: vec![],

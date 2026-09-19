@@ -4,7 +4,13 @@
 //! and a JSON evidence report, matching the conventions the original
 //! `scripts/*.ps1` acceptance harnesses used.
 
+pub mod c_lsp;
+pub mod c_missing;
+pub mod c_recovery;
 pub mod core;
+pub mod cpp_lsp;
+pub mod cpp_missing;
+pub mod cpp_recovery;
 pub mod csharp_lsp;
 pub mod csharp_missing;
 pub mod csharp_recovery;
