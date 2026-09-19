@@ -211,10 +211,20 @@ pub fn router(
         format!("http://127.0.0.1:{port}"),
         format!("http://localhost:{port}"),
     ];
+    // rmcp's session keep-alive defaults to 5 minutes of "inactivity" --
+    // but a single long-running tool call (e.g. index_workspace cold-
+    // embedding a large real workspace, which can legitimately take well
+    // over 5 minutes) doesn't reset that timer while its response is
+    // still pending, so the session gets torn down mid-request and the
+    // client sees a bogus "Session not found" instead of its result.
+    // Stretched generously here since this server has no reverse proxy in
+    // front of it to worry about zombie connections at a shorter horizon.
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(3600));
     let ready_app = app.clone();
     let service = StreamableHttpService::new(
         move || Ok(McpServer::new(app.clone())),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(session_manager),
         config,
     );
     axum::Router::new()
