@@ -7,13 +7,15 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, oneshot},
 };
+
+type LastActivity = Arc<std::sync::Mutex<Instant>>;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -31,7 +33,8 @@ pub struct TransportConfig {
 ///
 /// Handles process lifecycle (spawn, kill on drop), Content-Length framing,
 /// JSON-RPC response correlation by ID, serialized writes, notification
-/// draining, stderr separation from stdout, and bounded request timeouts.
+/// draining, stderr separation from stdout, and idle-bounded request
+/// timeouts (see [`request`](Self::request)).
 ///
 /// The caller provides a readiness predicate at spawn time. The predicate is
 /// evaluated against each JSON-RPC notification (a message without an `id`
@@ -46,6 +49,12 @@ pub struct JsonRpcClient {
     label: String,
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Updated by the reader task on every parsed message of any kind
+    /// (response, notification, or server-initiated request) — not just
+    /// ones addressed to a particular pending request. `request` bounds its
+    /// wait by *inactivity* against this, not by total call duration: see
+    /// `request`'s doc comment for why.
+    last_activity: LastActivity,
 }
 
 impl JsonRpcClient {
@@ -82,10 +91,12 @@ impl JsonRpcClient {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let ready = Arc::new(tokio::sync::Notify::new());
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_activity: LastActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
         let reader_stdin = Arc::clone(&stdin);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
+        let reader_last_activity = Arc::clone(&last_activity);
         let label = config.label.clone();
         tokio::spawn(async move {
             if let Err(error) = read_messages(
@@ -94,6 +105,7 @@ impl JsonRpcClient {
                 reader_pending.clone(),
                 reader_ready,
                 reader_is_ready,
+                reader_last_activity,
                 ready_predicate,
             )
             .await
@@ -120,6 +132,7 @@ impl JsonRpcClient {
             label: config.label.clone(),
             ready,
             is_ready,
+            last_activity,
         }))
     }
 
@@ -131,8 +144,20 @@ impl JsonRpcClient {
 
     /// Sends a JSON-RPC request and waits for the correlated response.
     ///
-    /// Times out after the configured timeout. On timeout the pending entry
-    /// is removed and an error is returned.
+    /// Bounded by *inactivity*, not total call duration: the deadline is
+    /// `timeout` after the later of (this call starting, the most recent
+    /// message of any kind the reader task observed from the server —
+    /// tracked in `last_activity`, updated for every response, notification,
+    /// or server-initiated request, not just ones matching this call's own
+    /// id). A single request that legitimately takes long — rust-analyzer
+    /// answering `workspace/symbol` while still cold-indexing a large
+    /// project, for instance — keeps extending its own deadline as long as
+    /// the server is visibly still alive and doing *something*, the same way
+    /// a slow-but-progressing download shouldn't be treated identically to a
+    /// stalled one. A server that has gone silent entirely (hung, deadlocked,
+    /// or genuinely dead without the process exiting) still times out after
+    /// exactly `timeout` of true silence, same as before. On timeout the
+    /// pending entry is removed and an error is returned.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
@@ -144,17 +169,35 @@ impl JsonRpcClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        match tokio::time::timeout(self.timeout, receiver).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(message))) => bail!(message),
-            Ok(Err(_)) => bail!("{} response channel closed", self.label),
-            Err(_) => {
+
+        let started = Instant::now();
+        tokio::pin!(receiver);
+        loop {
+            let last_activity = *self.last_activity.lock().unwrap();
+            let deadline = last_activity.max(started) + self.timeout;
+            let now = Instant::now();
+            if now >= deadline {
                 self.pending.lock().await.remove(&id);
                 bail!(
-                    "{} request timed out after {} seconds",
+                    "{} request timed out after {} seconds of inactivity",
                     self.label,
                     self.timeout.as_secs()
-                )
+                );
+            }
+            tokio::select! {
+                result = &mut receiver => {
+                    return match result {
+                        Ok(Ok(value)) => Ok(value),
+                        Ok(Err(message)) => bail!(message),
+                        Err(_) => bail!("{} response channel closed", self.label),
+                    };
+                }
+                _ = tokio::time::sleep(deadline - now) => {
+                    // Re-check above: if the server sent anything in the
+                    // meantime, last_activity moved and the deadline pushes
+                    // out; if not, the next iteration's `now >= deadline`
+                    // catches it immediately.
+                }
             }
         }
     }
@@ -210,6 +253,7 @@ async fn read_messages(
     pending: Pending,
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
+    last_activity: LastActivity,
     ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
@@ -231,6 +275,10 @@ async fn read_messages(
         let mut body = vec![0; length];
         reader.read_exact(&mut body).await?;
         let message: Value = serde_json::from_slice(&body)?;
+        // Any successfully parsed message -- response, notification, or a
+        // server-initiated request -- is evidence the server is alive and
+        // doing something, which is what `request`'s idle timeout keys off.
+        *last_activity.lock().unwrap() = Instant::now();
         let id = message.get("id").and_then(Value::as_u64);
         let method = message.get("method").and_then(Value::as_str);
         // A message with both an id and a method is a request FROM the

@@ -16,6 +16,14 @@ pub enum FakeScenario {
     UnsolicitedNotification,
     Stderr,
     Timeout,
+    /// Answers `workspace/symbol` slower than the configured request timeout
+    /// in TOTAL wall-clock time, but never goes longer than the timeout
+    /// between messages: several `$/progress` notifications, each timeout/2
+    /// apart, followed by the real response. Exercises `JsonRpcClient`'s
+    /// idle-bounded (not duration-bounded) request wait -- a single blind
+    /// per-call timeout would fail this exchange; resetting the deadline on
+    /// any observed server activity should not.
+    SlowWithProgress,
     Malformed,
     ExitDuringRequest,
     RestartSuccess,
@@ -62,6 +70,7 @@ pub fn run_from_env() -> io::Result<()> {
         "unsolicited" => FakeScenario::UnsolicitedNotification,
         "stderr" => FakeScenario::Stderr,
         "timeout" => FakeScenario::Timeout,
+        "slow-with-progress" => FakeScenario::SlowWithProgress,
         "malformed" => FakeScenario::Malformed,
         "exit-during-request" => FakeScenario::ExitDuringRequest,
         "restart-success" => FakeScenario::RestartSuccess,
@@ -223,6 +232,29 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     | FakeScenario::RestartSuccess,
                     Some("workspace/symbol"),
                 ) => {
+                    if let Some(id) = id {
+                        write_message(
+                            &mut stdout,
+                            &json_response(
+                                id,
+                                json!([
+                                    {"name":"Calculator","kind":12,"location":{"uri":calc_uri,"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":16}}}}
+                                ]),
+                            ),
+                        )?;
+                    }
+                }
+                (FakeScenario::SlowWithProgress, Some("workspace/symbol")) => {
+                    // Four notifications, 400ms apart (1.6s total) -- longer
+                    // than the 1s `lsp_timeout_seconds` the matching test
+                    // configures, but each individual gap is well under it.
+                    for _ in 0..4 {
+                        thread::sleep(Duration::from_millis(400));
+                        write_message(
+                            &mut stdout,
+                            &json_notification("$/progress", json!({"kind":"report"})),
+                        )?;
+                    }
                     if let Some(id) = id {
                         write_message(
                             &mut stdout,

@@ -224,6 +224,36 @@ async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
     }
 }
 
+/// `JsonRpcClient::request` bounds its wait by inactivity, not total call
+/// duration (see its doc comment in lci-core/src/lsp/transport.rs): a
+/// single request's response can legitimately arrive well past the
+/// configured `lsp_timeout_seconds` in total wall-clock time, as long as
+/// the server keeps sending *something* (any message) within that timeout
+/// of each other. A blind fixed-duration timeout would fail this exchange
+/// outright; the idle-reset behavior should not.
+#[tokio::test]
+async fn fake_csharp_lsp_survives_a_slow_response_paced_by_progress_notifications() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _) = fake_csharp_fixture(&temp, "slow-with-progress");
+    assert_eq!(config.lsp_timeout_seconds, 1);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let started = std::time::Instant::now();
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("progress notifications should keep the request alive past 1s");
+    let elapsed = started.elapsed();
+
+    assert!(!results.is_empty());
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "expected the exchange to genuinely take longer than the nominal \
+         1s timeout (proving this isn't trivially fast); took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn fake_csharp_lsp_correlates_responses_and_reuses_healthy_child() {
     for mode in ["unsolicited", "stderr"] {
