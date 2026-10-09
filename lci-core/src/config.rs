@@ -58,6 +58,14 @@ pub struct Config {
     pub semantic_candidate_count: usize,
     pub lexical_candidate_count: usize,
     pub rerank_candidate_count: usize,
+    /// Upper bound, in bytes, on the code sent to the reranker per
+    /// candidate (the path is always sent in full). Keeps every
+    /// query/document pair inside the reranker's context window -- an
+    /// oversized chunk otherwise makes the whole rerank request fail -- and
+    /// bounds reranking cost. Chunks are cut at a UTF-8 boundary, keeping
+    /// their head (signature, doc comment, opening body). Indexing, lexical
+    /// search, and returned results always use the full chunk.
+    pub rerank_document_max_bytes: usize,
     pub rrf_k: f32,
     pub watch_poll_milliseconds: u64,
     pub watch_debounce_milliseconds: u64,
@@ -360,6 +368,7 @@ impl Default for Config {
             semantic_candidate_count: 40,
             lexical_candidate_count: 40,
             rerank_candidate_count: 24,
+            rerank_document_max_bytes: 4096,
             rrf_k: 60.0,
             watch_poll_milliseconds: 2000,
             watch_debounce_milliseconds: 750,
@@ -481,6 +490,10 @@ impl Config {
         ensure!(
             (1..=30).contains(&self.readiness_timeout_seconds),
             "readiness_timeout_seconds must be 1..=30"
+        );
+        ensure!(
+            (256..=1_048_576).contains(&self.rerank_document_max_bytes),
+            "rerank_document_max_bytes must be 256..=1048576"
         );
         for value in [&self.embedding_url, &self.reranker_url] {
             let url = reqwest::Url::parse(value)?;

@@ -40,6 +40,8 @@ struct FakeModels {
     /// When set, the reranker accepts a request but never answers in time.
     rerank_hangs: AtomicBool,
     rerank_requests: AtomicUsize,
+    /// Longest single document (in bytes) any rerank request has carried.
+    max_rerank_document_bytes: AtomicUsize,
 }
 
 fn evaluation_query() -> EvalQuery {
@@ -147,6 +149,11 @@ async fn rerank(
         return Ok(Json(
             json!({"results":[{"index":999,"relevance_score":1.0}]}),
         ));
+    }
+    for document in body["documents"].as_array().unwrap() {
+        state
+            .max_rerank_document_bytes
+            .fetch_max(document.as_str().unwrap().len(), Ordering::SeqCst);
     }
     let query = body["query"].as_str().unwrap_or("");
     let results: Vec<_> = body["documents"]

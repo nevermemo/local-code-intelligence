@@ -81,6 +81,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | `semantic_candidate_count` | 40 |
 | `lexical_candidate_count` | 40 |
 | `rerank_candidate_count` | 24 |
+| `rerank_document_max_bytes` | 4096 (allowed: 256–1048576) |
 | `rrf_k` | 60 |
 | `watch_poll_milliseconds` | 2000 |
 | `watch_debounce_milliseconds` | 750 |
@@ -252,7 +253,7 @@ Query: <query>
 
 7. Retrieve semantic candidates with LanceDB cosine distance while ripgrep independently searches useful query terms across all supported extensions. For each language present in the filtered index, its enabled language server (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd) also searches workspace symbols. Map lexical lines to any indexed language and LSP locations only to same-language chunks.
 8. Deduplicate and fuse semantic, lexical, and LSP ranks with Reciprocal Rank Fusion. Results expose channel ranks, lexical match count, fusion score, and retrieval channels.
-9. Rerank the configured fused shortlist. Semantic, lexical, and LSP channels fail independently; available channels continue, and an LSP provider that fails is skipped for the rest of that search. If reranking fails, return fusion order with a warning appended to any earlier warnings.
+9. Rerank the configured fused shortlist, sending each candidate as its path plus at most `rerank_document_max_bytes` of its code (cut at a UTF-8 boundary, keeping the head), so no single chunk can exceed the reranker's context or dominate its cost; results always carry the full chunk. Semantic, lexical, and LSP channels fail independently; available channels continue, and an LSP provider that fails is skipped for the rest of that search. If reranking fails, return fusion order with a warning appended to any earlier warnings.
 
 When `ripgrep_path` is the default `rg` or `rg.exe`, resolution checks `PATH` first. On Windows, if `rg` isn't on `PATH`, it also checks common per-user and system-wide VS Code, VS Code Insiders, and VSCodium installations, including versioned application directories, since Windows users are less likely to have a system-wide ripgrep install than macOS/Linux users with a package manager. Any other configured value is treated as an explicit command or path and is used unchanged. If ripgrep cannot be started, lexical retrieval fails open and the warning explains how to set `ripgrep_path`.
 

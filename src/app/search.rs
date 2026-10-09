@@ -49,6 +49,19 @@ pub struct SearchReport {
     pub filters: EffectiveFilterReport,
 }
 
+/// The longest prefix of `text` that is at most `max_bytes` long and ends on
+/// a UTF-8 character boundary.
+fn head_within(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
     filters.matches(
         &hit.chunk.language,
@@ -559,9 +572,16 @@ impl App {
         k: usize,
         report: &mut SearchReport,
     ) {
+        let max_bytes = self.config.rerank_document_max_bytes;
         let documents: Vec<_> = hits
             .iter()
-            .map(|h| format!("{}\n{}", h.chunk.relative_file_path, h.chunk.code))
+            .map(|h| {
+                format!(
+                    "{}\n{}",
+                    h.chunk.relative_file_path,
+                    head_within(&h.chunk.code, max_bytes)
+                )
+            })
             .collect();
         match self.models.rerank(query, &documents).await {
             Ok(ranks) => {
@@ -592,5 +612,19 @@ impl App {
                 report.results = hits.into_iter().take(k).collect();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head_within;
+
+    #[test]
+    fn head_within_keeps_short_text_and_cuts_on_a_char_boundary() {
+        assert_eq!(head_within("fn main() {}", 64), "fn main() {}");
+        assert_eq!(head_within("abcdef", 3), "abc");
+        // "é" is two bytes; a cut inside it backs off to the boundary.
+        assert_eq!(head_within("caé", 3), "ca");
+        assert_eq!(head_within("caé", 4), "caé");
     }
 }

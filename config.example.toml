@@ -17,6 +17,8 @@ ripgrep_path = "rg"
 semantic_candidate_count = 40
 lexical_candidate_count = 40
 rerank_candidate_count = 24
+# Most bytes of code sent to the reranker per candidate (256-1048576).
+rerank_document_max_bytes = 4096
 rrf_k = 60.0
 # Used only after watch_workspace is called for a workspace.
 watch_poll_milliseconds = 2000

@@ -1126,3 +1126,34 @@ async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn reranker_documents_are_capped_while_results_keep_full_chunks() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.rerank_document_max_bytes = 1024;
+    let workspace = temp.path().join("rerank-cap");
+    let literal = "y".repeat(9_000);
+    write(
+        &workspace,
+        "table.rs",
+        &format!("pub static TABLE: &str = \"{literal}\";\n"),
+    );
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let report = app.search(&workspace, "TABLE", Some(8)).await.unwrap();
+    assert!(report.reranked, "{:?}", report.warning);
+    let longest = fake.max_rerank_document_bytes.load(Ordering::SeqCst);
+    assert!(
+        longest <= "table.rs\n".len() + 1024,
+        "a reranker document carried {longest} bytes"
+    );
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|hit| hit.chunk.code.contains(&literal)),
+        "results still carry the full chunk"
+    );
+    task.abort();
+}
