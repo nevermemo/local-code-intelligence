@@ -125,7 +125,7 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `list_indexed_files` | `workspace_path` | Every file the persistent index has cached chunks for, with language and chunk count, from the last successful `index_workspace` |
 | `watch_workspace` | `workspace_path` | Start debounced polling and automatic reindexing for an indexed workspace |
 | `unwatch_workspace` | `workspace_path` | Stop automatic reindexing for a workspace |
-| `search_symbols` | `workspace_path`, `query` | Workspace symbols from applicable enabled Rust/C# language servers, with provider/language metadata |
+| `search_symbols` | `workspace_path`, `query` | Workspace symbols from every applicable enabled language server (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd), with provider/language metadata |
 | `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations routed by extension to the matching language server |
 | `find_references` | the definition arguments plus optional `include_declaration` | Reference locations routed by extension to the matching language server |
 | `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, and index lifecycle metadata |
@@ -259,7 +259,7 @@ When `ripgrep_path` is the default `rg` or `rg.exe`, resolution checks `PATH` fi
 
 Embedding response indices are validated and reordered; vectors must have consistent dimensions, finite values, and nonzero norm. Model HTTP errors include the service's status and (bounded) response body. Connection errors are retried up to three attempts with backoff; timeouts are retried only for index-time document embedding (a cold model may still be loading), never for the query embedding or the reranker, so a hung service costs a search one timeout rather than three. When the embedding service rejects a batch's input itself (HTTP 400/413/422, typically one chunk longer than the model's context), indexing retries that batch one chunk at a time and embeds a rejected chunk from a progressively halved prefix (down to 512 bytes); the full chunk is still stored, returned, and lexically searchable, and is listed in `truncated_for_embedding`. Its vector is cached by content hash like any other, so raising the server's context limit later needs a reindex into a new data directory to re-embed it in full. Changing an embedding URL/model requires reindexing. Replacing a model behind an unchanged name/URL is not detectable automatically; use a distinct configured model name or a new data directory for that change.
 
-JSON timing fields measure query embedding, LanceDB search, lexical search, Rust LSP search, fusion, reranking, and total retrieval in milliseconds. Total also includes validation and index access/wait time. The same timings appear in tracing logs on stderr; CLI JSON remains on stdout. Set `RUST_LOG=local_code_intelligence=debug` to adjust logging.
+JSON timing fields measure query embedding, LanceDB search, lexical search, LSP search, fusion, reranking, and total retrieval in milliseconds. Total also includes validation and index access/wait time. The same timings appear in tracing logs on stderr; CLI JSON remains on stdout. Set `RUST_LOG=local_code_intelligence=debug` to adjust logging.
 
 ## Module boundaries and checks
 
