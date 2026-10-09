@@ -1,15 +1,38 @@
 # Evaluation workflow
 
-Use the checked-in portable definitions and supply local workspace mappings at runtime.
+Use the checked-in portable definitions and supply local workspace mappings at runtime. This is the procedure that has produced trustworthy before/after evidence in this repository; follow it unless the human asks for something else.
 
-1. Record the baseline commit, configuration, model names, and whether indexes were created or reused.
-2. Run deterministic automated tests with mock services first.
-3. Run the smallest live evaluation that exercises the changed stage with 8766/8767.
-4. Compare hit@1, hit@3, hit@8, MRR, first expected ranks, disfavored results above expected results, fallbacks, and per-stage latency.
-5. Inspect path, line, role, and bounded source evidence for failures; aggregate metrics alone do not prove correctness.
-6. Keep self and external-repository results separate. Report absent optional workspaces as skips.
-7. Save generated reports under `test-results` and keep them out of commits.
+## Procedure
 
-For latency work, separate first indexing, query embedding, LanceDB, lexical, LSP, fusion, reranking, and total time. Warm the relevant model once when startup latency is outside the question. Use a small number of representative runs unless the user asks for extended benchmarking.
+1. Record the baseline commit, configuration overrides, model names, and whether indexes were created or reused.
+2. Run the deterministic automated tests with the fake services first (`cargo xtask test --suite Filter` / `Evaluation` / `Indexing` as relevant).
+3. Freeze the binaries. Build the baseline, copy `target/debug/local-code-intelligence(.exe)` to a scratch path such as `lci-base.exe`; apply the change, build again, copy to `lci-new.exe`. Later rebuilds then cannot disturb a running comparison, and on Windows the running copy does not lock the build output.
+4. Give each scratch configuration its own short `data_dir` (for example `C:\lci-eval\base`). On Windows LanceDB fails with `os error 3` when the data directory is long, because table names are `ws_<64 hex>` plus Lance's internal paths. Never point a scratch run at the running server's data directory.
+5. Run the smallest live evaluation that exercises the changed stage against 8766/8767, once per binary:
 
-Accept a ranking change only when the intended metric or latency improves without material regressions in required queries or fail-open behavior. Never insert evaluation paths, symbols, snippets, or queries into production ranking logic.
+   ```bash
+   <bin> --config <cfg> evaluate ./evaluations/core.toml \
+     --workspace self=<repo> \
+     --output test-results/<name>.json
+   ```
+
+   Keep self and external-repository results separate; absent optional workspaces are skips, not failures.
+6. For a change to priors, source-role classification, fusion, or candidate counts, also run both binaries with the reranker deliberately unreachable (`reranker_url = "http://127.0.0.1:9/rerank"` in the scratch config). The reranker masks fusion-order changes on small fixtures; the fusion-order run is where such a change shows. Expect roughly 9 s of `reranking_ms` per query from connection retries in that mode and ignore latency there.
+7. Compare hit@1, hit@3, hit@8, MRR, first expected ranks, disfavored results above expected results, role failures, fallbacks, and per-stage latency.
+8. Inspect path, line, role, and bounded source evidence for every failure; aggregate metrics alone do not prove correctness.
+9. Save reports under `test-results/` and keep them out of commits. Name them so the pair is obvious (`<change>-baseline-rerank-on.json`, `<change>-after-rerank-off.json`).
+
+## Operating constraints
+
+- Run live evaluations sequentially, never in parallel. The reranker on the shared iGPU is the bottleneck: a reranked query with 24 candidates takes roughly 25-90 s on the current development machine (median about 30 s), so `evaluations/core.toml`'s self set runs for several minutes per binary.
+- Do not compile, run the test suite, or start another indexing pass while a timed live evaluation runs. Heavy CPU/GPU load distorts reranker timings and makes the before/after latency comparison meaningless.
+- Scratch fixtures and decoy evaluation TOMLs live outside the repository (or under `test-results/`), never in `evaluations/`, which holds only portable, path-free definitions.
+- `evaluations/core.toml` has eleven required self queries, so one query is about nine points of hit@1. Treat small metric moves as noise; look at which queries moved and why, and prefer a larger scratch decoy set when the change targets a specific role or language.
+
+## Latency work
+
+Separate first indexing, query embedding, LanceDB, lexical, LSP, fusion, reranking, and total time. Warm the relevant model once when startup latency is outside the question. Use a small number of representative runs unless the human asks for extended benchmarking.
+
+## Decision rule
+
+Accept a ranking change only when the intended metric or latency improves without material regressions in required queries or fail-open behavior, in both the reranked and the fusion-order runs where both apply. Never insert evaluation paths, symbols, snippets, or queries into production ranking logic, and never tune a prior or threshold to a specific evaluation query.
