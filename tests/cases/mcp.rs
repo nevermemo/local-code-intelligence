@@ -210,3 +210,70 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     server.abort();
     models_task.abort();
 }
+
+#[tokio::test]
+async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("rebinding-repository");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let body = json!({"workspace_path": workspace});
+
+    // A page whose domain re-resolved to 127.0.0.1 sends its own Host.
+    let rebinding_host = format!("evil.test:{bound_port}");
+    for (method, path) in [
+        ("POST", "/v1/index_status"),
+        ("POST", "/v1/search_code"),
+        ("GET", "/openapi.json"),
+        ("GET", "/health"),
+        ("GET", "/ready"),
+    ] {
+        let request = match method {
+            "POST" => client.post(format!("{base}{path}")).json(&body),
+            _ => client.get(format!("{base}{path}")),
+        };
+        let response = request
+            .header("Host", &rebinding_host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    // A loopback Host with a foreign browser Origin is rejected too.
+    let foreign_origin = client
+        .post(format!("{base}/v1/index_status"))
+        .header("Origin", "https://untrusted.example")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_origin.status(), StatusCode::FORBIDDEN);
+    assert!(foreign_origin.json::<Value>().await.unwrap()["error"].is_string());
+
+    // This server's own loopback origin, and plain non-browser clients
+    // (no Origin), keep working.
+    let same_origin = client
+        .post(format!("{base}/v1/index_status"))
+        .header("Origin", format!("http://127.0.0.1:{bound_port}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_origin.status(), StatusCode::OK);
+    let plain = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(plain.status(), StatusCode::OK);
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

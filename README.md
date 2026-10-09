@@ -59,7 +59,7 @@ Smoke test from another terminal:
 curl http://127.0.0.1:8768/health
 ```
 
-The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation and supports session-based older clients as well as the SDK's current protocol. `/health` is a cheap process-liveness check and never contacts model services. `/ready` and the MCP `service_status` tool return the same bounded dependency report. They return HTTP 200 when a new semantic index can be created, even if optional channels are degraded, and `/ready` returns HTTP 503 when a required dependency is unavailable. Ctrl+C stops the server.
+The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation and supports session-based older clients as well as the SDK's current protocol. Every other route (the REST mirror, `/openapi.json`, `/health`, `/ready`) applies the same DNS-rebinding protection: the `Host` header must name a loopback address (`127.0.0.1`, `localhost`, `::1`), and a browser `Origin`, when present, must be this server's own `http://127.0.0.1:<port>` or `http://localhost:<port>`; anything else gets HTTP 403. Non-browser clients that send no `Origin` (curl, scripts, the CLI) are unaffected. `/health` is a cheap process-liveness check and never contacts model services. `/ready` and the MCP `service_status` tool return the same bounded dependency report. They return HTTP 200 when a new semantic index can be created, even if optional channels are degraded, and `/ready` returns HTTP 503 when a required dependency is unavailable. Ctrl+C stops the server.
 
 ## Configuration
 

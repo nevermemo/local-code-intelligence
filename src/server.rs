@@ -207,10 +207,7 @@ pub fn router(
     };
     let mut config = StreamableHttpServerConfig::default();
     config.cancellation_token = cancellation;
-    config.allowed_origins = vec![
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ];
+    config.allowed_origins = loopback_origins(port);
     // rmcp's session keep-alive defaults to 5 minutes of "inactivity" --
     // but a single long-running tool call (e.g. index_workspace cold-
     // embedding a large real workspace, which can legitimately take well
@@ -247,6 +244,157 @@ pub fn router(
                 (status, axum::Json(report))
             }),
         )
+        // Applies only to the routes above; `/mcp` below gets rmcp's own
+        // equivalent Host/Origin validation.
+        .route_layer(axum::middleware::from_fn_with_state(port, loopback_guard))
         .nest_service("/mcp", service)
         .with_state(ready_app)
+}
+
+/// The only browser origins allowed to call this server: its own loopback
+/// addresses. Shared by rmcp's `/mcp` validation and [`loopback_guard`].
+fn loopback_origins(port: u16) -> Vec<String> {
+    vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ]
+}
+
+/// DNS-rebinding protection for the routes served outside rmcp (the REST
+/// mirror, `/openapi.json`, `/health`, `/ready`), mirroring rmcp's checks on
+/// `/mcp`: the Host must name a loopback address, and an Origin, when a
+/// browser sends one, must be one of [`loopback_origins`]. Without this, a
+/// web page whose domain re-resolves to 127.0.0.1 could drive the REST tools
+/// and read indexed source back.
+async fn loopback_guard(
+    axum::extract::State(port): axum::extract::State<u16>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match check_loopback_headers(request.uri(), request.headers(), port) {
+        Ok(()) => next.run(request).await,
+        Err(reason) => {
+            tracing::warn!(%reason, uri = %request.uri(), "rejected non-loopback request");
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn check_loopback_headers(
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    port: u16,
+) -> Result<(), String> {
+    use axum::http::{header, uri::Authority};
+    let host = match headers.get(header::HOST) {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| "Host header is not valid text".to_owned())?
+            .to_owned(),
+        // HTTP/2 carries the host in `:authority` rather than `Host`.
+        None => uri
+            .authority()
+            .map(|authority| authority.as_str().to_owned())
+            .ok_or_else(|| "missing Host header".to_owned())?,
+    };
+    let authority =
+        Authority::try_from(host.as_str()).map_err(|_| format!("invalid Host header: {host}"))?;
+    let name = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if !matches!(name.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return Err(format!("Host header is not allowed: {host}"));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin
+            .to_str()
+            .map_err(|_| "Origin header is not valid text".to_owned())?;
+        let allowed = loopback_origins(port);
+        if !allowed
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(origin.trim_end_matches('/')))
+        {
+            return Err(format!("Origin header is not allowed: {origin}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_loopback_headers;
+    use axum::http::{HeaderMap, HeaderValue, Uri, header};
+
+    fn headers(host: Option<&str>, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        }
+        headers
+    }
+
+    fn check(host: Option<&str>, origin: Option<&str>) -> Result<(), String> {
+        check_loopback_headers(
+            &Uri::from_static("/v1/index_status"),
+            &headers(host, origin),
+            8768,
+        )
+    }
+
+    #[test]
+    fn loopback_hosts_without_origin_are_allowed() {
+        for host in [
+            "127.0.0.1:8768",
+            "localhost:8768",
+            "LOCALHOST",
+            "[::1]:8768",
+        ] {
+            assert_eq!(check(Some(host), None), Ok(()), "{host}");
+        }
+    }
+
+    #[test]
+    fn rebinding_hosts_are_rejected() {
+        for host in [
+            "evil.test:8768",
+            "evil.test",
+            "127.0.0.1.evil.test:8768",
+            "10.0.0.5:8768",
+        ] {
+            assert!(check(Some(host), None).is_err(), "{host}");
+        }
+        assert!(check(None, None).is_err());
+    }
+
+    #[test]
+    fn only_this_servers_loopback_origins_are_allowed() {
+        assert_eq!(
+            check(Some("127.0.0.1:8768"), Some("http://127.0.0.1:8768")),
+            Ok(())
+        );
+        assert_eq!(
+            check(Some("localhost:8768"), Some("http://localhost:8768/")),
+            Ok(())
+        );
+        for origin in [
+            "http://evil.test:8768",
+            "https://127.0.0.1:8768",
+            "http://127.0.0.1:9999",
+            "null",
+        ] {
+            assert!(
+                check(Some("127.0.0.1:8768"), Some(origin)).is_err(),
+                "{origin}"
+            );
+        }
+    }
 }
