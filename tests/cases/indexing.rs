@@ -1157,3 +1157,44 @@ async fn reranker_documents_are_capped_while_results_keep_full_chunks() {
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn index_commits_wait_for_another_process_holding_the_data_dir_lock() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("shared-data-dir");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+
+    // Another process sharing the data directory is mid-commit; a separate
+    // handle conflicts with the app's own, as a second process's would.
+    let other = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(app.config.data_dir.join("index.lock"))
+        .unwrap();
+    other.lock().unwrap();
+    let indexing = tokio::spawn({
+        let app = Arc::clone(&app);
+        let workspace = workspace.clone();
+        async move { app.index(&workspace).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !indexing.is_finished(),
+        "the commit waits for the other writer"
+    );
+
+    other.unlock().unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(30), indexing)
+        .await
+        .expect("the commit proceeds once the other writer is done")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.files, 1);
+    // Readers never take the lock.
+    other.lock().unwrap();
+    assert!(app.status(&workspace).await.unwrap().indexed);
+    other.unlock().unwrap();
+    task.abort();
+}
