@@ -4,10 +4,11 @@ use super::{App, WorkspaceCoordination, ms};
 use crate::{
     chunk,
     manifest::{self, Manifest},
+    models::{self, Models},
     store::Store,
     workspace::Workspace,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -27,7 +28,67 @@ pub struct IndexReport {
     pub parsed_files: usize,
     pub unchanged_files: usize,
     pub removed_files: usize,
+    /// Files that were not valid UTF-8 and were indexed from a lossy decoding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lossy_decoded_files: Vec<String>,
+    /// Chunks (`path:start_line`) the embedding service rejected as too long,
+    /// whose vectors were computed from a shortened prefix instead. The full
+    /// chunk is still stored, returned, and lexically searchable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_for_embedding: Vec<String>,
     pub total_ms: f64,
+}
+
+/// Shortest prefix (in bytes) an oversized input is cut down to before
+/// giving up: below this, a rejection can't plausibly be about length.
+const MIN_EMBED_PREFIX_BYTES: usize = 512;
+
+/// Embeds one batch of document texts. When the service rejects the batch's
+/// input itself (HTTP 400/413/422 -- typically one chunk longer than the
+/// model's context, e.g. a large generated literal the chunker cannot
+/// split), the batch is retried one input at a time, and each rejected
+/// input is embedded from a progressively halved prefix. One oversized
+/// chunk therefore costs a few extra requests instead of failing the whole
+/// indexing pass. Returns the vectors plus the batch positions that had to
+/// be shortened. Any other error -- or a rejection that persists down to
+/// [`MIN_EMBED_PREFIX_BYTES`] -- is returned unchanged.
+async fn embed_isolating_oversized(
+    models: &Models,
+    texts: &[String],
+) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
+    match models.embed(texts).await {
+        Ok(vectors) => return Ok((vectors, Vec::new())),
+        Err(error) if !models::is_input_rejected(&error) => return Err(error),
+        Err(_) => {}
+    }
+    let mut vectors = Vec::with_capacity(texts.len());
+    let mut shortened = Vec::new();
+    for (position, text) in texts.iter().enumerate() {
+        let mut input = text.as_str();
+        loop {
+            match models.embed(&[input.to_owned()]).await {
+                Ok(mut vector) => {
+                    vectors.push(vector.remove(0));
+                    if input.len() < text.len() {
+                        shortened.push(position);
+                    }
+                    break;
+                }
+                Err(error)
+                    if models::is_input_rejected(&error)
+                        && input.len() / 2 >= MIN_EMBED_PREFIX_BYTES =>
+                {
+                    let mut end = input.len() / 2;
+                    while !input.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    input = &input[..end];
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok((vectors, shortened))
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +100,10 @@ pub struct Status {
     pub embedding_dimension: Option<usize>,
     pub compatible: bool,
     pub stale: bool,
+    /// Why staleness could not be determined (e.g. an unreadable file);
+    /// `stale` is then reported as `true` for an indexed workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_check_error: Option<String>,
     pub watched: bool,
     pub analyzer_running: bool,
     pub csharp_analyzer_running: bool,
@@ -119,9 +184,24 @@ impl App {
             .filter(|c| !cache.contains_key(&c.content_hash) && seen.insert(c.content_hash.clone()))
             .collect();
         let embedded_chunks = missing.len();
+        let mut truncated_for_embedding = Vec::new();
         for (i, batch) in missing.chunks(self.config.embedding_batch_size).enumerate() {
             let texts: Vec<_> = batch.iter().map(|c| c.code.clone()).collect();
-            let vectors = self.models.embed(&texts).await?;
+            let (vectors, shortened) = embed_isolating_oversized(&self.models, &texts)
+                .await
+                .with_context(|| {
+                    let first = batch[0];
+                    format!(
+                        "embedding a batch starting at {}:{}",
+                        first.relative_file_path, first.start_line
+                    )
+                })?;
+            for position in shortened {
+                let chunk = batch[position];
+                let location = format!("{}:{}", chunk.relative_file_path, chunk.start_line);
+                tracing::warn!(workspace_id = %workspace.id, chunk = %location, bytes = chunk.code.len(), "embedding service rejected the full chunk as too long; embedded a shortened prefix");
+                truncated_for_embedding.push(location);
+            }
             for (c, vector) in batch.iter().zip(vectors) {
                 cache.insert(c.content_hash.clone(), vector);
             }
@@ -140,6 +220,10 @@ impl App {
             .replace(&workspace, &chunks, &vectors, &identity, dimension)
             .await?;
         let files = scan.files.len();
+        for path in &scan.lossy_files {
+            tracing::warn!(workspace_id = %workspace.id, file = %path, "file is not valid UTF-8; indexed from a lossy decoding");
+        }
+        let lossy_decoded_files = scan.lossy_files;
         let next_manifest = Manifest {
             version: manifest::VERSION,
             workspace_id: workspace.id.clone(),
@@ -157,6 +241,8 @@ impl App {
             parsed_files: scan.parsed_files,
             unchanged_files: scan.unchanged_files,
             removed_files: scan.removed_files,
+            lossy_decoded_files,
+            truncated_for_embedding,
             total_ms: ms(start),
         })
     }
@@ -185,7 +271,21 @@ impl App {
         };
         let current_fingerprint = if due {
             let root = workspace.path.clone();
-            Some(tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??)
+            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+                Ok(fingerprint) => Some(fingerprint),
+                // A file that can't be read (permissions, a file vanishing
+                // mid-walk) must not turn ordinary search into a hard
+                // failure while a compatible snapshot exists.
+                Err(error) if !identity_changed => {
+                    return Ok((
+                        IndexAction::Reused,
+                        Some(format!(
+                            "staleness check unavailable; reusing previous snapshot: {error:#}"
+                        )),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -279,11 +379,18 @@ impl App {
         };
         let stored_manifest = manifest::load(&self.config.data_dir, &workspace);
         let root = workspace.path.clone();
-        let current_fingerprint =
-            tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??;
-        let stale = snapshot.is_some()
-            && (stored_manifest.fingerprint.is_empty()
-                || stored_manifest.fingerprint != current_fingerprint);
+        // An unreadable file makes staleness unknown, not the status call a
+        // failure: report the snapshot as stale and say why.
+        let (stale, stale_check_error) =
+            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+                Ok(current_fingerprint) => (
+                    snapshot.is_some()
+                        && (stored_manifest.fingerprint.is_empty()
+                            || stored_manifest.fingerprint != current_fingerprint),
+                    None,
+                ),
+                Err(error) => (snapshot.is_some(), Some(format!("{error:#}"))),
+            };
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let analyzer_running = self.analyzer.running("rust-analyzer", &workspace.id).await;
         let csharp_analyzer_running = self.analyzer.running("csharp-ls", &workspace.id).await;
@@ -308,6 +415,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.identity == self.config.embedding_identity()),
             stale,
+            stale_check_error,
             watched,
             analyzer_running,
             csharp_analyzer_running,

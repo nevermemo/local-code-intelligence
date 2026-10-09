@@ -34,6 +34,12 @@ struct FakeModels {
     rerank_fails: AtomicBool,
     embed_fails: AtomicBool,
     malformed_rerank: AtomicBool,
+    /// When nonzero, any embedding input longer than this many bytes is
+    /// rejected with HTTP 400, like vLLM's context-length validation.
+    max_embed_input_bytes: AtomicUsize,
+    /// When set, the reranker accepts a request but never answers in time.
+    rerank_hangs: AtomicBool,
+    rerank_requests: AtomicUsize,
 }
 
 fn evaluation_query() -> EvalQuery {
@@ -66,11 +72,22 @@ fn evaluation_evidence(path: &str, role: &str, snippet: &str) -> ResultEvidence 
 async fn embed(
     State(state): State<Arc<FakeModels>>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     if state.embed_fails.load(Ordering::SeqCst) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err((StatusCode::SERVICE_UNAVAILABLE, String::new()));
     }
     let inputs = body["input"].as_array().unwrap();
+    let max_input = state.max_embed_input_bytes.load(Ordering::SeqCst);
+    if max_input > 0
+        && inputs
+            .iter()
+            .any(|text| text.as_str().unwrap().len() > max_input)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("This model's maximum context length is {max_input} bytes"),
+        ));
+    }
     if inputs
         .iter()
         .any(|text| !text.as_str().unwrap().starts_with(QUERY_INSTRUCTION))
@@ -119,6 +136,10 @@ async fn rerank(
     State(state): State<Arc<FakeModels>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    state.rerank_requests.fetch_add(1, Ordering::SeqCst);
+    if state.rerank_hangs.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
     if state.rerank_fails.load(Ordering::SeqCst) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }

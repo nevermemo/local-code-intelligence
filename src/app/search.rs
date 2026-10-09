@@ -167,8 +167,16 @@ impl App {
                     symbol_queries.push(format!("{term}#"));
                 }
                 symbol_queries.dedup();
+                // A provider that failed (after its own fresh-process retry)
+                // is skipped for the remaining terms of this search, so a
+                // missing or broken server costs one failure, not one per
+                // symbol query.
+                let mut failed_providers = HashSet::new();
                 for term in symbol_queries.into_iter().take(8) {
                     for adapter in applicable_adapters.values() {
+                        if failed_providers.contains(adapter.provider()) {
+                            continue;
+                        }
                         match self
                             .analyzer
                             .symbols(adapter, &report.workspace, &term)
@@ -176,6 +184,7 @@ impl App {
                         {
                             Ok(mut locations) => found.append(&mut locations),
                             Err(error) => {
+                                failed_providers.insert(adapter.provider());
                                 failures.push(format!("{}: {error:#}", adapter.provider()))
                             }
                         }
@@ -568,10 +577,18 @@ impl App {
                     .collect();
             }
             Err(error) => {
-                tracing::warn!(%error, "reranker failed; returning semantic results");
-                report.warning = Some(format!(
-                    "Reranker unavailable or invalid response; semantic results returned: {error:#}"
-                ));
+                tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
+                // Append: earlier warnings (a refresh fallback, an
+                // unavailable channel) must survive a reranker failure.
+                let message = format!(
+                    "Reranker unavailable or invalid response; fusion-ranked results returned: {error:#}"
+                );
+                report.warning = Some(
+                    report
+                        .warning
+                        .take()
+                        .map_or(message.clone(), |w| format!("{w}; {message}")),
+                );
                 report.results = hits.into_iter().take(k).collect();
             }
         }

@@ -19,6 +19,9 @@ pub struct Scan {
     pub parsed_files: usize,
     pub unchanged_files: usize,
     pub removed_files: usize,
+    /// Repository-relative paths of files that were not valid UTF-8 and were
+    /// indexed from a lossy decoding (invalid bytes become U+FFFD).
+    pub lossy_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +152,19 @@ struct SourceFile {
     source: String,
     content_hash: String,
     adapter: &'static language::LanguageAdapter,
+    lossy: bool,
+}
+
+/// Decodes source bytes as UTF-8, falling back to a lossy decoding (invalid
+/// sequences become U+FFFD) rather than failing. Legacy-encoded files --
+/// e.g. Windows-1252 C sources -- are common in real repositories, and one
+/// of them must not make the whole workspace unindexable or unsearchable.
+/// Line structure is preserved, so line ranges stay valid.
+fn decode_source(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(source) => (source, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+    }
 }
 
 fn sources(root: &Path) -> Result<Vec<SourceFile>> {
@@ -174,14 +190,15 @@ fn sources(root: &Path) -> Result<Vec<SourceFile>> {
             .to_str()
             .context("non-UTF-8 file path")?
             .replace('\\', "/");
-        let source =
-            std::fs::read_to_string(entry.path()).with_context(|| format!("read {relative}"))?;
+        let bytes = std::fs::read(entry.path()).with_context(|| format!("read {relative}"))?;
+        let (source, lossy) = decode_source(bytes);
         let source_hash = hash(&source);
         files.push(SourceFile {
             relative_path: relative,
             source,
             content_hash: source_hash,
             adapter,
+            lossy,
         });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -227,6 +244,11 @@ pub fn scan_incremental(
         .iter()
         .map(fingerprint_material)
         .collect::<String>();
+    let lossy_files = source_files
+        .iter()
+        .filter(|file| file.lossy)
+        .map(|file| file.relative_path.clone())
+        .collect();
     for file in source_files {
         let file_chunks = match previous.get(&file.relative_path) {
             Some(cached)
@@ -263,6 +285,7 @@ pub fn scan_incremental(
         parsed_files,
         unchanged_files,
         removed_files,
+        lossy_files,
     })
 }
 
@@ -481,6 +504,30 @@ export interface TelemetryLifecycle {
         let chunks = scan(temp.path()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].relative_file_path, "lib.rs");
+    }
+
+    #[test]
+    fn non_utf8_files_are_indexed_lossily_instead_of_failing_the_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        // Windows-1252 "café" (0xE9 is not valid UTF-8 on its own).
+        std::fs::write(
+            temp.path().join("legacy.c"),
+            b"/* caf\xe9 */\nint legacy_value(void) { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert_eq!(scan.lossy_files, vec!["legacy.c".to_owned()]);
+        let legacy = scan
+            .chunks
+            .iter()
+            .find(|chunk| chunk.relative_file_path == "legacy.c")
+            .expect("the legacy file is still indexed");
+        assert!(legacy.code.contains("caf\u{FFFD}"), "{}", legacy.code);
+        assert!(legacy.code.contains("legacy_value"));
+        // The staleness fingerprint no longer fails on the same file.
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
     }
 
     #[test]

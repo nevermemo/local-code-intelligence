@@ -993,3 +993,136 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn non_utf8_source_is_indexed_lossily_and_never_breaks_search_or_status() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    let workspace = temp.path().join("legacy-encoding");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    // A Windows-1252 source file appears after the index exists: the
+    // on-search staleness check and the refresh must both handle it.
+    std::fs::write(
+        workspace.join("legacy.c"),
+        b"/* caf\xe9 */\nint legacy_translator(void) { return 7; }\n",
+    )
+    .unwrap();
+    let refreshed = app.search(&workspace, "translator", Some(8)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&refreshed).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(
+        refreshed
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "legacy.c"),
+        "the legacy file is searchable"
+    );
+    let status = app.status(&workspace).await.unwrap();
+    assert!(!status.stale && status.stale_check_error.is_none());
+
+    // Every pass reads (and so decodes) every file, so the report always
+    // names the lossily decoded files in the current index.
+    let reindexed = app.index(&workspace).await.unwrap();
+    assert_eq!(reindexed.lossy_decoded_files, vec!["legacy.c".to_owned()]);
+    assert_eq!(
+        reindexed.parsed_files, 0,
+        "the unchanged file is not reparsed"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_oversized_chunk_is_embedded_from_a_prefix_instead_of_failing_the_index() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("oversized");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    // One indivisible ~9 KB leaf the chunker keeps whole.
+    let literal = "x".repeat(9_000);
+    write(
+        &workspace,
+        "table.rs",
+        &format!("pub static TABLE: &str = \"{literal}\";\n"),
+    );
+    fake.max_embed_input_bytes.store(4_000, Ordering::SeqCst);
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(
+        report.truncated_for_embedding,
+        vec!["table.rs:1".to_owned()]
+    );
+    let found = app.search(&workspace, "TABLE", Some(8)).await.unwrap();
+    // The chunker splits the declaration's header from its indivisible
+    // literal; the literal's chunk is stored and returned in full.
+    assert!(
+        found
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "table.rs"
+                && hit.chunk.code.contains(&literal)),
+        "the oversized chunk is still indexed and returned with its full text"
+    );
+
+    // A rejection that has nothing to do with length still fails loudly.
+    fake.max_embed_input_bytes.store(1, Ordering::SeqCst);
+    write(&workspace, "other.rs", "fn other() {}\n");
+    let error = app.index(&workspace).await.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("embedding service HTTP error"),
+        "{message}"
+    );
+    assert!(message.contains("maximum context length"), "{message}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.reranker_timeout_seconds = 1;
+    let workspace = temp.path().join("hung-reranker");
+    // Rust source makes the (deliberately missing) rust-analyzer channel
+    // applicable, so the search carries an LSP warning before reranking.
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    fake.rerank_hangs.store(true, Ordering::SeqCst);
+    let before = fake.rerank_requests.load(Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    // Three query terms -> three `term#` symbol queries for the provider.
+    let report = app
+        .search(&workspace, "translator helper function", Some(1))
+        .await
+        .unwrap();
+    assert!(!report.reranked);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst) - before,
+        1,
+        "query-time reranking does not retry a timeout"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let warning = report.warning.unwrap();
+    assert!(
+        warning.contains("Optional LSP provider unavailable"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    // Failures are listed as "unavailable: <provider>: ..." then
+    // "; <provider>: ..." for each further one.
+    let rust_analyzer_failures = warning.matches("unavailable: rust-analyzer: ").count()
+        + warning.matches("; rust-analyzer: ").count();
+    assert_eq!(
+        rust_analyzer_failures, 1,
+        "a failed provider is reported once, not once per symbol query: {warning}"
+    );
+    task.abort();
+}
