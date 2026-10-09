@@ -46,6 +46,13 @@ check instead of another narrow invocation.
 | Watched refresh | `cargo xtask test --suite Watching` |
 | LSP/navigation behavior | `cargo xtask test --suite Lsp` (or `cargo test -p lci-core --lib lsp::` for adapter-only logic) |
 
+The unit-test suites (`Unit`, `Chunk`, `Filter`, and the unit halves of
+`Evaluation` and `Lsp`) run `cargo test --workspace --lib <module>::`, so a
+module filter reaches unit tests in both the root crate and `lci-core`, and
+they share `--suite Full`'s feature resolution and build cache. Every focused
+suite counts the tests it executed and fails when its filter matched none, so
+a renamed or moved module can't make a suite pass vacuously.
+
 `cargo xtask test --suite Full` runs formatting, all workspace tests, and Clippy.
 Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
 it depends on locally running services. Generated reports belong under
