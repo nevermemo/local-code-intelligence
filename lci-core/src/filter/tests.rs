@@ -189,6 +189,98 @@ fn src_config_files_remain_source() {
 }
 
 #[test]
+fn classifies_colocated_go_java_c_and_cpp_tests() {
+    for path in [
+        "settings/loader_test.go",
+        "src/main/java/com/acme/ConfigLoaderTest.java",
+        "src/main/java/com/acme/ConfigLoaderTests.java",
+        "src/main/java/com/acme/ConfigLoaderTestCase.java",
+        "src/main/java/com/acme/ConfigLoaderIT.java",
+        "src/main/java/com/acme/Parser2IT.java",
+        "native/config_test.c",
+        "native/config_tests.c",
+        "native/test_config.c",
+        "cpp/config_unittest.cpp",
+        "cpp/config_test.cpp",
+        "cpp/test_config.hpp",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Test, "{path}");
+    }
+}
+
+#[test]
+fn test_name_rules_do_not_catch_lookalike_production_files() {
+    for path in [
+        "contest.go",
+        "testing/helpers.go",
+        "src/main/java/com/acme/Latest.java",
+        "src/main/java/com/acme/Kit.java",
+        "src/main/java/com/acme/GIT.java",
+        "src/main/java/com/acme/TestDataFactory.java",
+        "native/latest.c",
+        "native/attest_util.c",
+        "cpp/contest.cpp",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Source, "{path}");
+    }
+}
+
+#[test]
+fn classifies_gradle_and_android_test_source_sets() {
+    assert_eq!(
+        classify_source_role("app/src/androidTest/java/com/acme/LoaderInstrumented.java"),
+        SourceRole::Test
+    );
+    assert_eq!(
+        classify_source_role("src/integrationTest/java/com/acme/LoaderFlow.java"),
+        SourceRole::Test
+    );
+    assert_eq!(
+        classify_source_role("src/testFixtures/java/com/acme/Fakes.java"),
+        SourceRole::Test
+    );
+}
+
+#[test]
+fn production_code_under_config_directories_stays_source() {
+    for path in [
+        "config/loader.go",
+        "internal/config/loader.go",
+        "src/config/index.ts",
+        "app/configs/settings.py",
+        "configuration/Options.cs",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Source, "{path}");
+    }
+    // Configuration data in those directories keeps its role.
+    assert_eq!(
+        classify_source_role("internal/config/defaults.yaml"),
+        SourceRole::Configuration
+    );
+}
+
+#[test]
+fn jvm_package_names_are_not_repository_layout() {
+    for path in [
+        "src/main/java/com/example/ConfigLoader.java",
+        "src/main/java/com/acme/docs/DocRenderer.java",
+        "src/main/kotlin/org/acme/config/Settings.kt",
+        "src/main/java/com/acme/tools/Formatter.java",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Source, "{path}");
+    }
+    // Layout directories above the source root still count.
+    assert_eq!(
+        classify_source_role("examples/src/main/java/com/acme/Demo.java"),
+        SourceRole::Example
+    );
+    assert_eq!(
+        classify_source_role("src/test/java/com/example/ConfigLoaderSpec.java"),
+        SourceRole::Test
+    );
+}
+
+#[test]
 fn contest_and_latest_are_not_test_or_generated() {
     // `contest` and `latest` are not in the test or generated
     // component lists, so they should fall through to source.
