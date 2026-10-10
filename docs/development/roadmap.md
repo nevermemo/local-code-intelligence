@@ -89,7 +89,7 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- F2a (2026-10-10): per-channel RRF weights, defaults 1.0. Pre-registered grid before any run: `semantic_weight` in {1.0, 1.5, 2.0}, `lexical_weight` = `lsp_weight` = 1.0, fusion-only (reranker off) on core + mined; decision on the even-hash half of the mined set, confirmed on the odd half and the full set with `compare` CIs, then one reranked confirm; the default changes only if every check passes (plan in the session scratchpad `plan-f2a.md`). F2b (per-file cap, `max_chunks_per_file`) follows as its own slice: in `n7b-mined-fusion` 150/350 top-10 slots repeat an already-shown file.
+- F2b (2026-10-10): per-file cap `max_chunks_per_file` on the fused shortlist (results and reranker input). Pre-registered grid before any run: {unlimited (today), 2}; fusion-only core + mined with even/odd halves, then a reranked confirm; same decision rule as F2a. Evidence: in `n7b-mined-fusion` 150/350 top-10 slots repeat an already-shown file.
 
 Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
 decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
@@ -338,7 +338,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | in-progress (2026-10-10: F2a weights; F2b cap next) | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | F2a done (8f56647 weights, 79138e4 default semantic 2.0); F2b per-file cap in progress | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
@@ -419,6 +419,19 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Accept: unit tests on hand-built channel lists (search.rs now has a `tests` module); live E3 sweep of weights {0.5, 1, 2} per channel and cap {0, 2} on the mined set; defaults change only on a win.
 - Risk: do not tune on `core.toml` paths specifically (skill rule); use the mined set.
 
+- F2a result (2026-10-10; frozen build of 8f56647, pre-registered grid, fusion-only unless noted; `test-results/f2-*`):
+
+  | Arm (vs semantic_weight 1.0) | MRR delta [95% CI] | nDCG@10 delta | hit@1 | recall@8 |
+  | --- | --- | --- | --- | --- |
+  | mined, w 1.5 | +0.008 [-0.003, +0.024] | +0.023 (sig) | 0.686 -> 0.686 | - |
+  | mined, w 2.0 | +0.059 [+0.012, +0.118] | +0.041 (sig) | 0.686 -> 0.771 | 0.513 -> 0.558 |
+  | mined even half, w 2.0 (selection) | +0.031 | +0.025 (sig) | | |
+  | mined odd half, w 2.0 (held out) | +0.082 [+0.004, +0.175] | +0.054 | | |
+  | core, w 2.0 | 0.000 (W/L/T 0/0/11) | -0.017 (n.s.) | 0.909 -> 0.909 | 0.727 -> 0.682 |
+  | mined reranked, w 2.0 | +0.002 [-0.065, +0.065] | -0.021 (n.s.) | 0.743 -> 0.743 | 0.611 -> 0.593 |
+
+  Decision: every pre-registered check passed for 2.0, so the default became `semantic_weight = 2.0` (79138e4). Production (reranked) quality is unchanged; the reranker-off/failure path gains. The weight-1.0 arm reproduced `n7b-mined-fusion` exactly (W/L/T 0/0/35).
+- F2b next (in progress): `max_chunks_per_file` on the fused shortlist, pre-registered grid {unlimited, 2}, same decision protocol.
 ### F3 - Query-type routing
 `blocked(F2, L3, R2)` - M - deps: F2, L3, R2 - skill: `lci-retrieval-evaluation`
 - Why: BM25 is best for code-to-code/identifier queries and dense for NL (JetBrains https://arxiv.org/abs/2510.20609); keyword queries collapse dense models (CoREB); Semble raises lexical weight for symbol-like queries. Fixed per-channel depths "may not transfer across changing queries" (https://arxiv.org/abs/2609.15143).
