@@ -164,6 +164,11 @@ starts; remove it when the slice is committed.
   - R3: vote (weight 1.0, 2.0) vs replace at window 24. Same rule.
   - Re-verification of F2a/F2b fusion-only claims (confounded by unequal LSP coverage): rerank off, semantic weight 1 vs 2 (cap 0) and cap 0 vs 2 (weight 2), exact from dumped ranks with LSP present in 33 of 35 mined queries. If either claim fails, record it; the defaults were also justified by clean reranked confirms.
   - Any adopted change gets one live confirm run before a default moves.
+  - RESULT (2026-10-10 morning; deep dumps `test-results/e0-{mined,core}-dump64.json`, window 64, cap 0, plain weights, frozen 6d4110f; all 35 mined and 11 core queries scored, replays exact with 0 refusals; B = window 24, cap 2 shortlist, replace):
+    - R1: window 6, 8, 12 vs 24 on mined: MRR +0.021 / -0.009 / -0.010 and nDCG@10 -0.038 / -0.049 / -0.012, every CI containing 0, no significant odd-half loss; core first-rank losses 2 / 1 / 0. Window 12 is the cheapest cell that passes every check (estimated rerank p50 ~half of window 24; the linear cost model underestimates small windows, so measure it live). Next: one live confirm at `rerank_candidate_count = 12` vs 24 before the default moves.
+    - F2c: cap at results vs shortlist at window 24: mined MRR +0.016, nDCG@10 +0.006 (n.s.), core 3/0/8, but ~1.3 s more estimated reranking. Passes non-inferiority with no measured gain at higher cost: not adopted.
+    - R3: vote weight 1.0 / 2.0 vs replace: mined MRR -0.013 / +0.006, nDCG@10 -0.026 / -0.024 (n.s., W/L/T 8/8 and 8/7): no gain, not adopted.
+    - The earlier W40-dump comparisons against B are void (B refused 11/35 mined, 10/11 core there).
   - Caveat: the dumps predate E2b's mine.rs leakage fix; arms share the dump, so relative comparisons hold, but absolute metrics include the leakage. Re-dump after E2b.
 
 ## P0 - measure first, then cut latency, then fix verified defects
