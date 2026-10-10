@@ -76,8 +76,6 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- R0 (2026-10-10): rerank-on/off evaluation of `evaluations/mined/self.toml`
-  running (`test-results/r0-mined-rerank-{on,off}.json`).
 - V1 (2026-10-10): files downloaded and converted; benchmarks run after R0.
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
@@ -97,7 +95,8 @@ first.
 
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| R0 | Fusion-only baseline: does the reranker help at all on core.toml? | measured (needs E2 + owner decision) | S | - |
+| R0 | Fusion-only baseline: does the reranker help at all on core.toml? | done (2026-10-10: keep the reranker on) | S | - |
+| R7 | Reranker-down fast path: no 9 s of connect retries per search when the reranker is unreachable | ready | S | - |
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | in-progress (2026-10-10) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, Vulkan) behind an `http` / `in-process` backend switch | proposed (after V1) | M | V1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
@@ -115,12 +114,21 @@ first.
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
 ### R0 - Fusion-only baseline
-`ready` - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
+`done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
 - Why: `core.toml` has never been run without the reranker, yet reranking is ~85-95% of search latency on the owner's machine. Measured (2026-10-10, vLLM logs over 44 reranks): the reranker is compute-bound at ~286-290 prompt tokens/s; cost fits `rerank_s ~= 0.4 + computed_tokens / 290` within ~10%; a 24-document rerank computes ~8.5k tokens at the 4096-byte cap. CoREB found no off-the-shelf reranker improves text-to-code retrieval (best: Qwen3-Reranker-4B at -0.1% nDCG@10; https://arxiv.org/abs/2605.04615). If fusion order matches reranked quality here, the default could change (owner decision).
 - Scope: no code. Run the current binary on `core.toml` twice, sequentially: reranker on (default) and reranker unreachable (`reranker_url = "http://127.0.0.1:9/rerank"`; ignore the ~9 s connection-retry latency in that arm, or subtract `reranking_ms`). Compare hit@1/3/8, MRR, first expected ranks per query. Repeat on `evaluations/mined/self.toml` once E2 lands.
 - Accept: both reports under `test-results/`, a per-query table in this item; no default change without the owner if quality differs or the evidence is within noise.
 - Risk: 11 queries cannot detect small differences; this is a go/no-go signal, not a final verdict.
 - Result (2026-10-10, binary at `43d56d9`, same index, sequential runs; reports `test-results/core-eval-cap-4096.json` vs `test-results/r0-core-rerank-off.json`): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955; fusion-only hit@1 0.909 / hit@3 1.0 / MRR 0.939. Per query the reranker fixed one (readiness: fusion rank 3 -> 1) and broke one (language registry: 1 -> 2); the other nine were rank 1 either way. Reranking cost 18-46 s per query (median ~25 s) while everything else took ~0.8-1.3 s warm. Verdict: no measurable quality gain from the reranker on this set at ~25x latency; not enough queries to change the default. Re-run on the E2 mined set; if it holds, propose to the owner a faster default (reranker opt-in, R2-style skipping, or R3 vote mode).
+
+- Result on the mined set (2026-10-10, frozen binary at `7daed93`, 35 queries, sequential; `test-results/r0-mined-rerank-on.json` vs `-off.json`): reranked hit@1 0.743 / hit@3 0.914 / MRR 0.814 / nDCG@10 0.606 / recall@3 0.444; fusion-only 0.686 / 0.800 / 0.759 / 0.555 / 0.379. By tag: keyword (27) reranked hit@1 0.852 / MRR 0.907 vs fusion-only 0.741 / 0.822; keyword-agnostic (8) reranked hit@1 0.375 / hit@3 0.75 / MRR 0.500 vs 0.500 / 0.500 / 0.544 (n=8, noise). Latency: reranked median 34.0 s (reranking p50 32.7 s, p95 44.3 s); the fusion-only arm's median 10.3 s is ~9.2 s of reranker connect retries (R7) on top of ~1.1 s of real work. Verdict: unlike `core.toml`, the larger set shows a consistent reranker gain (+5.7 points hit@1, +11.4 hit@3, +5.1 nDCG@10), so the default stays on; latency work moves to R1 (window), R6 (gating), V1 (serving). Also seen: `lsp_search_ms` p95 10.2 s (p50 32 ms) -- one or two queries hit an LSP timeout or a cold server; check under N2/N3. The keyword-agnostic stratum is the weak spot (hit@1 <= 0.5): target for C2/M1/embedder work.
+
+### R7 - Reranker-down fast path
+`ready` - S - deps: none - skill: `lci-retrieval-evaluation`
+- Why: R0's reranker-unreachable arm spent ~9.2 s per search in `send_with_retry` (`lci-core/src/models.rs`) retrying connection errors with 1 s/2 s backoff (Windows also takes ~2 s to report a refused localhost connection) before failing open. In production, every search pays that while the reranker is down or restarting.
+- Scope: query-time rerank (and query embedding) should not back off on a connection error for seconds: either one attempt for connect errors on `TimeoutRetry::FailFast` paths, or a short circuit breaker that remembers an unreachable reranker for ~30 s and skips straight to fusion order with the existing warning. Indexing (`embed`) keeps its retries. Report the skip in the existing reranker warning.
+- Accept: test with the reranker URL pointing at a closed port: the search returns fusion-ranked results with the warning in < 3 s (fake models); existing fail-open tests stay green. Live: rerun the fusion-only arm and confirm `reranking_ms` p50 falls from ~9.2 s to < 2.5 s.
+- Risk: a reranker that is merely restarting is skipped for the breaker window; keep the window short and document it.
 
 ### V1 - Native-Windows llama.cpp serving trial (owner-requested hardware investigation)
 `in-progress (2026-10-10)` (approved and downloaded: llama.cpp b11539 Vulkan, lemonade-sdk b1342 ROCm gfx1150, Qwen3-Embedding-4B Q8_0, Qwen3-Reranker-4B converted to Q8_0 with LCI's code instruction and vLLM's prompt suffix patched into the converter, ggml-org Qwen3-Reranker-0.6B Q8_0; FastFlowLM 1.0.7 portable zip for V2) - S, live, config-only - deps: none
