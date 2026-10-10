@@ -778,6 +778,14 @@ Evidence for the tier (restated so the file stays self-contained):
 
 ---
 
+## Next-phase candidates (proposed, 2026-10-10)
+
+From the new-niches explorer (25 ideas with value/effort guesstimates; full notes kept locally in `research_notes/explore-new-niches.md`, untracked). Nothing here is ready until the owner picks a theme; items marked (owner) need a product decision.
+
+- Top 8 by value per effort and fit: NI-15 "why this result" provenance and focus lines (S); NI-24 `find_similar` reuse-before-write over the existing vector index (S); NI-25 mask-and-measure evaluation strata for the semantic channel (S); NI-04 test-impact finder `find_tests` (M; precedent: predictive test selection); NI-16 anytime search: return fusion in ~0.4 s and refine with the reranker afterwards, plus a rerank cache (M); NI-23 relevance feedback mined from local agent transcripts (M, owner: transcript mining); NI-02 Unity PackageCache / engine-reference scope (trial S, no code); NI-09 git co-change channel (M, owner: reading git history; local check: an earlier-history co-change top-3 held a co-touched file 46% of the time).
+- Themes: A (conservative) "the fast, measured default" -- NI-16, NI-15, a context packer after A1, a session seen-set, NI-23/NI-25 evaluations; no boundary change. B (moderate) "change-aware retrieval" -- git history as a fail-open fourth signal (NI-09, commit-message expansion, NI-04, then a `review_context` tool). C (bold) "project-native intelligence, Unity first" -- GUID asset-reference table, package/engine scope, Unity queries mined from real sessions; go/no-go after a 2-day trial; alternative bold bet: transcript flywheel -> learned fusion -> distilled small reranker.
+- Owner decisions the themes need: reading git history; non-code families (assets, Markdown, SQL, notebooks) and the language acceptance bar for them; replacing "never tune on the mined set" with a train/test-by-repo protocol (for learned fusion); tool-surface growth; local transcript mining; a ~0.6 GB late-interaction model download (LateOn-Code; vendor claims unverified, LanceDB multivector support in Rust unverified).
+
 ## Investigations (open questions, with how to answer them)
 
 | ID | Question | Design | Metric | Decision rule |
