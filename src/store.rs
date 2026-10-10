@@ -114,13 +114,42 @@ impl Store {
         Ok(())
     }
 
+    /// Opens `name`, or `None` when no such table exists.
+    async fn open_table(&self, name: &str) -> Result<Option<Table>> {
+        match self.db.open_table(name).execute().await {
+            Ok(table) => Ok(Some(table)),
+            Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn snapshot(&self, workspace: &Workspace) -> Result<Option<Snapshot>> {
-        let table = match self.db.open_table(workspace.table_name()).execute().await {
-            Ok(t) => t,
-            Err(lancedb::Error::TableNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        // An index written before the table name was shortened lives under the
+        // legacy name until the workspace's next commit moves it (`replace`).
+        let name = workspace.table_name();
+        let (name, table) = match self.open_table(&name).await? {
+            Some(table) => (name, table),
+            None => {
+                let legacy = workspace.legacy_table_name();
+                match self.open_table(&legacy).await? {
+                    Some(table) => (legacy, table),
+                    None => return Ok(None),
+                }
+            }
         };
         let schema = table.schema().await?;
+        // The short name keeps only 64 bits of the workspace id. A table that
+        // records another workspace path is a collision (or a hand-copied
+        // table): fail loudly instead of serving or overwriting its index.
+        // Tables without the key predate it and are accepted.
+        if let Some(stored) = schema.metadata().get("workspace_path") {
+            let current = workspace.path.to_string_lossy();
+            ensure!(
+                stored.as_str() == current,
+                "index table {name} was written for workspace {stored}, not {current}: \
+                 table-name collision; give one workspace a different data_dir or delete the table"
+            );
+        }
         let identity = schema
             .metadata()
             .get("embedding_identity")
@@ -274,7 +303,29 @@ impl Store {
             .mode(CreateTableMode::Overwrite)
             .execute()
             .await?;
+        self.drop_legacy_table(workspace).await;
         Ok(())
+    }
+
+    /// Removes the index an earlier version left under the long table name,
+    /// now that the same workspace's index is committed under the short one.
+    /// A failure never fails the commit: the short table already serves, and
+    /// the next commit retries (a Windows "in use" error, say).
+    ///
+    /// A crash between the commit and this drop leaves both tables;
+    /// `snapshot` prefers the short one. Callers hold `<data_dir>/index.lock`,
+    /// so two writers never race on the drop.
+    async fn drop_legacy_table(&self, workspace: &Workspace) {
+        let legacy = workspace.legacy_table_name();
+        match self.db.drop_table(&legacy, &[]).await {
+            Ok(()) => {
+                tracing::info!(workspace_id = %workspace.id, table = %legacy, "migrated the index to the short table name")
+            }
+            Err(lancedb::Error::TableNotFound { .. }) => {}
+            Err(error) => {
+                tracing::warn!(workspace_id = %workspace.id, table = %legacy, error = %error, "could not drop the legacy-named index table; the next commit retries")
+            }
+        }
     }
 
     pub async fn search(
@@ -432,5 +483,152 @@ mod tests {
         assert_eq!(a, vector_key(true, HASH, "src/a.rs"));
         // Another chunk of the same file has another key.
         assert_ne!(a, vector_key(true, "0e11d7", "src/a.rs"));
+    }
+
+    fn workspace_at(path: &str) -> Workspace {
+        Workspace {
+            id: crate::workspace::hash(path),
+            path: path.into(),
+        }
+    }
+
+    async fn commit(store: &Store, workspace: &Workspace, codes: &[&str]) {
+        let chunks: Vec<Chunk> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, code)| Chunk {
+                relative_file_path: format!("src/f{i}.rs"),
+                language: "rust".into(),
+                start_line: 1,
+                end_line: 1,
+                code: (*code).into(),
+                content_hash: crate::workspace::hash(code),
+            })
+            .collect();
+        let vectors = vec![vec![1.0, 0.0, 0.0]; chunks.len()];
+        store
+            .replace(workspace, &chunks, &vectors, "identity", 3)
+            .await
+            .unwrap();
+    }
+
+    fn table_dir(lancedb: &Path, name: &str) -> std::path::PathBuf {
+        lancedb.join(format!("{name}.lance"))
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_a_table_written_for_another_workspace_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let a = workspace_at("/projects/a");
+        commit(&store, &a, &["fn a() {}"]).await;
+
+        // The same id (hence the same table name) under another path is what a
+        // short-name collision looks like to the store.
+        let b = Workspace {
+            id: a.id.clone(),
+            path: "/projects/other".into(),
+        };
+        let error = match store.snapshot(&b).await {
+            Ok(_) => panic!("a table written for another workspace path must not be served"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains(&a.table_name()), "{error}");
+        assert!(error.contains("/projects/a"), "{error}");
+        assert!(error.contains("/projects/other"), "{error}");
+        assert!(error.contains("collision"), "{error}");
+        assert!(store.snapshot(&a).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_a_legacy_named_table_and_replace_migrates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let lancedb = temp.path().join("lancedb");
+        let store = Store::open(&lancedb).await.unwrap();
+        let a = workspace_at("/projects/a");
+        commit(&store, &a, &["fn a() {}", "fn b() {}"]).await;
+
+        // An index an earlier version wrote: the same Lance dataset under the
+        // full-id name. Datasets are relocatable, so a rename is the fixture.
+        let short = table_dir(&lancedb, &a.table_name());
+        let legacy = table_dir(&lancedb, &a.legacy_table_name());
+        assert!(short.is_dir(), "{}", short.display());
+        std::fs::rename(&short, &legacy).unwrap();
+
+        let snapshot = store.snapshot(&a).await.unwrap().expect("legacy table");
+        assert_eq!(snapshot.dimension, 3);
+        assert_eq!(snapshot.identity, "identity");
+        assert_eq!(snapshot.table.count_rows(None).await.unwrap(), 2);
+        drop(snapshot);
+        assert!(!short.exists());
+
+        // The next commit writes the short name and removes the legacy table.
+        commit(&store, &a, &["fn a() {}", "fn b() {}", "fn c() {}"]).await;
+        assert!(short.is_dir());
+        assert!(!legacy.exists());
+        let snapshot = store.snapshot(&a).await.unwrap().expect("short table");
+        assert_eq!(snapshot.table.count_rows(None).await.unwrap(), 3);
+
+        // With nothing left to migrate, a commit leaves the short table alone.
+        commit(&store, &a, &["fn a() {}"]).await;
+        assert!(short.is_dir());
+        assert!(!legacy.exists());
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_prefers_the_short_table_when_both_exist_and_replace_drops_the_legacy_one() {
+        // A crash between the short table's commit and the legacy drop leaves
+        // both tables behind.
+        let temp = tempfile::tempdir().unwrap();
+        let lancedb = temp.path().join("lancedb");
+        let store = Store::open(&lancedb).await.unwrap();
+        let a = workspace_at("/projects/a");
+        commit(&store, &a, &["fn a() {}", "fn b() {}"]).await;
+        let short = table_dir(&lancedb, &a.table_name());
+        let legacy = table_dir(&lancedb, &a.legacy_table_name());
+        copy_dir(&short, &legacy);
+
+        let snapshot = store.snapshot(&a).await.unwrap().expect("a table");
+        assert_eq!(snapshot.table.name(), a.table_name());
+        assert_eq!(snapshot.table.count_rows(None).await.unwrap(), 2);
+        drop(snapshot);
+
+        commit(&store, &a, &["fn a() {}", "fn b() {}", "fn c() {}"]).await;
+        assert!(short.is_dir());
+        assert!(!legacy.exists());
+        let snapshot = store.snapshot(&a).await.unwrap().expect("short table");
+        assert_eq!(snapshot.table.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_absent_legacy_table_is_reported_as_not_found() {
+        // `replace` relies on this to tell "nothing to migrate" from a failed
+        // drop; a lancedb change that reports it otherwise would make every
+        // commit log a warning.
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let a = workspace_at("/projects/a");
+        let error = store
+            .db
+            .drop_table(a.legacy_table_name(), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lancedb::Error::TableNotFound { .. }),
+            "{error:?}"
+        );
     }
 }

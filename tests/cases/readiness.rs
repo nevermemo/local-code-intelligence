@@ -117,6 +117,38 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
 }
 
 #[tokio::test]
+async fn readiness_lists_the_data_dir_length_component_as_optional() {
+    // A short data_dir never trips the Windows path-length warning, so the
+    // component is present, optional, ready, and not among the degraded ones.
+    let (_temp, config, _fake, models_task) = fixture().await;
+    let app = App::open(config).await.unwrap();
+    let status = serde_json::to_value(app.service_status().await).unwrap();
+    let component = status["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|component| component["name"] == "data_dir_path_length")
+        .expect("the data_dir length component is reported");
+    assert_eq!(component["required"], false);
+    assert_eq!(component["ready"], true);
+    assert!(
+        component["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("data_dir is ")
+    );
+    assert_eq!(status["ready"], true);
+    assert!(
+        !status["degraded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "data_dir_path_length")
+    );
+    models_task.abort();
+}
+
+#[tokio::test]
 async fn readiness_still_probes_the_embedding_service_when_semantic_search_is_off() {
     // `[channels].semantic = false` only skips query embedding. Indexing
     // still embeds every chunk, so the embedding service stays a required

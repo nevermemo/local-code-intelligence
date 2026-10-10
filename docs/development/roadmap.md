@@ -239,7 +239,7 @@ R5, S5, R4, C1.
 | E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (562a1a5) | XS | - |
 | T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (562a1a5) | XS | - |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | done (3f5861e) | S | - |
-| S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready (verified defect; after the replay items) | S | - |
+| S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | done (2026-10-11: `ws_<16 hex>`; Windows ceiling ~110 -> ~163 characters, not 200; `/ready` warns above 150) | S | - |
 
 ### R0 - Fusion-only baseline
 `done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
@@ -498,11 +498,12 @@ R5, S5, R4, C1.
 - Risk: `test.rs` as a production module name is rare; document the convention.
 
 ### S5 - Windows long-path failure for long `data_dir`
-`ready` - S - deps: none
+`done` (2026-10-11) - S - deps: none
 - Why: verified defect: a `data_dir` longer than ~100 characters fails on Windows with Lance "os error 3" (ERROR_PATH_NOT_FOUND), consistent with MAX_PATH 260: table dir `ws_<64 hex>.lance` (72 chars) plus Lance's internal `_versions/...manifest`, `data/<uuid>.lance`, `_transactions/...` paths.
 - Scope: `lci-core/src/workspace.rs` `table_name()` -> `ws_` + first 20 hex chars of the id; `Store::snapshot` verifies the schema metadata `workspace_path` equals the resolved path (collision guard, error otherwise); migration in `Store`: if the old long-name table exists and the short one does not, read from the old one until the next commit writes the short one, then drop the old. Readiness (`src/app/readiness.rs`): warn when `data_dir` length > 160 on Windows. README "Persistent data" paragraph.
 - Accept: unit test for name length; integration test (tests/cases/indexing.rs) that an index created under the old name is searchable and migrated on refresh; manual repro with a 200-character temp `data_dir` on Windows before/after (note the result in the commit).
 - Risk: changing identity would orphan indexes; this changes the table name only, not `Workspace::id`.
+- RESULT (2026-10-11). Table name `ws_` + the first 16 hex chars of the id (64 bits; the roadmap's 20 was not needed: the birthday bound is ~2.7e-14 for 1,000 workspaces in one `data_dir`, and the collision guard turns any collision into an error naming both paths). `Store::snapshot` opens the short name, falls back to the legacy `ws_<64 hex>` name, and rejects a table whose `workspace_path` metadata names another path; `replace` writes the short name and then drops the legacy table (warn-only on failure, retried by the next commit). Readiness adds the optional `data_dir_path_length` component, degraded on Windows above 150 characters. Root cause traced by the reviewer: `os error 3` comes from lance-io's `LocalWriter`, which persists Lance's data files with `tempfile`'s raw `MoveFileExW` (no `\\?\` prefix), so the binding path is `data\<50-char name>.lance`, 96 characters below `data_dir` after the fix (149 before); the longer staging manifest goes through `object_store`'s verbatim-aware std rename and is not bound. Ceiling: ~110 -> ~163 characters, so the 200-character acceptance was not reachable by renaming alone. Manual repro (copied binaries, scratch configs, reranker and LSP off): base binary fails at a 139-character `data_dir`, the new one indexes and searches there and still fails at 199; `/ready` on a 199-character `data_dir` stays ready and lists `data_dir_path_length` as degraded; an index made by the base binary under the legacy name reads as indexed, and the new binary's next `index` embeds 0 chunks, reuses 1, writes `ws_<16 hex>.lance` and removes the legacy directory. Follow-ups (proposed): lift the ceiling further with Windows long-path support inside lance-io/`tempfile` (an upstream issue) or the OS `LongPathsEnabled` opt-in; if a future lance routes the staging manifest through `LocalWriter`, the ceiling drops to ~148 and 150 becomes unsafe.
 
 ---
 
@@ -871,7 +872,7 @@ From the new-niches explorer (25 ideas with value/effort guesstimates; full note
 | I-6 | Does evaluating mined queries at HEAD (not the parent commit) bias results? | For 50 mined commits, create a `git worktree` at the parent, index into a disposable data dir, compare | delta in hit@3/MRR vs HEAD evaluation | if bias > 0.05 absolute, extend E2 with a `--at-parent` mode |
 | I-7 | Do contextual headers help NL queries without hurting identifier queries? | C2 before/after per stratum | nDCG@10 per stratum | ship if NL improves and identifier is within CI |
 | I-8 | How expensive is harvesting LSP references/call hierarchy at index time with rust-analyzer, jdtls, clangd? | Time per symbol on this repo and a Java fixture | ms per symbol, peak RSS | if > 50 ms/symbol, G1 stays query-time only |
-| I-9 | Is the Windows long-path failure fully explained by table-name length? | Repro with a 200-char temp `data_dir` before and after S5 | pass/fail | if it still fails, open a Lance issue and document a `data_dir` length limit |
+| I-9 | Is the Windows long-path failure fully explained by table-name length? | Repro with a 200-char temp `data_dir` before and after S5 | answered 2026-10-11: partly -- the binding path is Lance's data file persisted by `tempfile` without `\\?\`; S5 raised the ceiling ~110 -> ~163 and documents a 150 limit (see S5's result); a 200-char `data_dir` still fails | upstream lance-io/`tempfile` long-path issue (proposed) |
 | I-10 | Does LCI beat grep-only for a given client model? | Owner-run A/B: same task list in Claude Code with and without the LCI MCP; log tokens, tool calls, cache reads, success | success rate, tokens, wall time | publish per model; this is the number that justifies the semantic channel (Cursor's reversal shows it must be re-measured per model) |
 
 ---

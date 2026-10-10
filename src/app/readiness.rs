@@ -43,6 +43,44 @@ enum ModelListing {
 static READINESS_PROBE_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Longest `data_dir` (in characters) that leaves room on Windows for the
+/// path LanceDB binds to MAX_PATH below it.
+///
+/// That path is Lance's data file, `data\<50-character name>.lance`, which is
+/// 96 characters below `data_dir` (counting `\lancedb\ws_<16 hex>.lance\`).
+/// lance-io's `LocalWriter` persists it at shutdown by moving a tempfile with
+/// a raw `MoveFileExW` call (no `\\?\` prefix), so MAX_PATH applies: the
+/// ceiling is 259 - 96 = 163 characters (about 110 with the old 64-hex table
+/// name). The longer staging manifest under `_versions\` goes through
+/// `object_store`'s `std` rename, which `std` makes verbatim-aware, so it is
+/// not bound, and LCI creates no indices. 150 leaves 13 characters of slack.
+///
+/// Measured on a Windows machine: the old binary failed at a 139-character
+/// `data_dir`; the new one worked at 139 and still failed at 199.
+const WINDOWS_DATA_DIR_LENGTH_LIMIT: usize = 150;
+
+/// Optional readiness component that flags a `data_dir` too long for Windows'
+/// 260-character path limit, which LanceDB hits as `os error 3` once its
+/// internal paths are appended. Never required, so it degrades the report
+/// without changing `ready`. `windows` and `limit` are parameters so the rule
+/// is testable on any platform.
+fn data_dir_length_component(data_dir: &Path, windows: bool, limit: usize) -> ReadinessComponent {
+    let length = data_dir.to_string_lossy().chars().count();
+    let too_long = windows && length > limit;
+    ReadinessComponent {
+        name: "data_dir_path_length",
+        ready: !too_long,
+        required: false,
+        detail: Some(if too_long {
+            format!(
+                "data_dir is {length} characters; above {limit}, LanceDB's internal paths can exceed Windows' 260-character limit (os error 3); use a shorter data_dir"
+            )
+        } else {
+            format!("data_dir is {length} characters")
+        }),
+    }
+}
+
 impl App {
     /// Builds the shared, serializable readiness report. Each named component
     /// is probed independently and concurrently; required components gate the
@@ -145,6 +183,7 @@ impl App {
                 required: true,
                 detail: lancedb_probe.err().map(|e| format!("{e:#}")),
             },
+            data_dir_length_component(&data_dir, cfg!(windows), WINDOWS_DATA_DIR_LENGTH_LIMIT),
             ReadinessComponent {
                 name: "embedding_endpoint_reachable",
                 ready: embedding_reach_ready,
@@ -373,5 +412,55 @@ impl App {
             resolved.display()
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_of(characters: usize) -> std::path::PathBuf {
+        "d".repeat(characters).into()
+    }
+
+    #[test]
+    fn data_dir_length_warns_only_on_windows_above_the_limit() {
+        let at_limit = data_dir_length_component(&dir_of(150), true, 150);
+        assert_eq!(at_limit.name, "data_dir_path_length");
+        assert!(at_limit.ready);
+        assert!(!at_limit.required);
+        assert_eq!(
+            at_limit.detail.as_deref(),
+            Some("data_dir is 150 characters")
+        );
+
+        let above = data_dir_length_component(&dir_of(151), true, 150);
+        assert!(!above.ready);
+        assert!(!above.required);
+        let detail = above.detail.unwrap();
+        assert!(detail.contains("151 characters"), "{detail}");
+        assert!(detail.contains("260"), "{detail}");
+        assert!(detail.contains("shorter data_dir"), "{detail}");
+
+        // Other platforms have no such limit, however long the path.
+        let elsewhere = data_dir_length_component(&dir_of(300), false, 150);
+        assert!(elsewhere.ready);
+        assert!(!elsewhere.required);
+        assert_eq!(
+            elsewhere.detail.as_deref(),
+            Some("data_dir is 300 characters")
+        );
+    }
+
+    #[test]
+    fn data_dir_length_counts_characters_not_bytes() {
+        // 100 two-byte characters are 200 bytes but 100 characters.
+        let multibyte: std::path::PathBuf = "é".repeat(100).into();
+        let component = data_dir_length_component(&multibyte, true, 150);
+        assert!(component.ready);
+        assert_eq!(
+            component.detail.as_deref(),
+            Some("data_dir is 100 characters")
+        );
     }
 }

@@ -1386,6 +1386,77 @@ async fn index_commits_wait_for_another_process_holding_the_data_dir_lock() {
     task.abort();
 }
 
+#[tokio::test]
+async fn legacy_long_table_name_is_searchable_and_migrated_on_refresh() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("legacy-name");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn helper_one() {}\n",
+    );
+    let app = App::open(config.clone()).await.unwrap();
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.chunks, 2);
+    drop(app);
+
+    // An index an earlier version wrote: the same Lance table under the
+    // full-id name. Renaming the table directory reproduces it.
+    let resolved =
+        local_code_intelligence::workspace::Workspace::resolve(&workspace, &config.data_dir)
+            .unwrap();
+    let lancedb = config.data_dir.join("lancedb");
+    let short = lancedb.join(format!("{}.lance", resolved.table_name()));
+    let legacy = lancedb.join(format!("{}.lance", resolved.legacy_table_name()));
+    assert!(short.is_dir(), "{}", short.display());
+    std::fs::rename(&short, &legacy).unwrap();
+
+    let app = App::open(config).await.unwrap();
+    let status = app.status(&workspace).await.unwrap();
+    assert!(status.indexed);
+    assert_eq!(status.chunks, 2);
+    assert!(status.compatible);
+
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let found = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&found).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(found.results[0].chunk.code.contains("translator"));
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents);
+    assert!(legacy.is_dir(), "a read does not migrate");
+    assert!(!short.exists());
+
+    // The next commit moves the index to the short name and re-embeds only
+    // what changed.
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn helper_two() {}\n",
+    );
+    let refreshed = app.index(&workspace).await.unwrap();
+    assert_eq!(refreshed.embedded_chunks, 1);
+    assert_eq!(refreshed.reused_chunks, 1);
+    assert!(short.is_dir());
+    assert!(!legacy.exists());
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    let paths: Vec<_> = indexed
+        .files
+        .iter()
+        .map(|f| f.relative_file_path.as_str())
+        .collect();
+    assert_eq!(paths, ["lib.rs"]);
+    let after = app.search(&workspace, "helper_two", Some(2)).await.unwrap();
+    assert!(
+        after
+            .results
+            .iter()
+            .any(|hit| hit.chunk.code.contains("helper_two"))
+    );
+    task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // `[channels]` switches: each one turns off exactly one retrieval channel (or
 // the reranker) for a search, with no work, no timing, and no warning.

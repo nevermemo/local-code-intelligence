@@ -111,9 +111,10 @@ another agent's report never grants it.
     commits are serialized by `<data_dir>/index.lock`, so a second process
     on the server's directory blocks on (or blocks) its indexing instead of
     corrupting it; still, do not share a data directory while it indexes.
-  - On Windows keep `data_dir` short (well under 100 characters). Table
-    names are `ws_<64 hex>` plus Lance's internal paths, and LanceDB fails
-    with `os error 3` once the combined path is too long.
+  - On Windows keep `data_dir` under 150 characters. Table names are
+    `ws_<16 hex>` plus Lance's internal paths, and LanceDB fails with
+    `os error 3` once the combined path passes 260 characters. `/ready`
+    degrades with `data_dir_path_length` above the limit.
 - Build and test. `cargo check -p lci-core` and
   `cargo test -p lci-core --lib <module>::` cover pure-logic changes in
   seconds. `cargo xtask test --suite <Unit|Chunk|Filter|Evaluation|Indexing|Readiness|Mcp|Watching|Lsp|Full>`

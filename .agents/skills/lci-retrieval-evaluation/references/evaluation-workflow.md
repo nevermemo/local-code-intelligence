@@ -7,7 +7,7 @@ Use the checked-in portable definitions and supply local workspace mappings at r
 1. Record the baseline commit, configuration overrides, model names, and whether indexes were created or reused.
 2. Run the deterministic automated tests with the fake services first (`cargo xtask test --suite Filter` / `Evaluation` / `Indexing` as relevant).
 3. Freeze the binaries. Build the baseline, copy `target/debug/local-code-intelligence(.exe)` to a scratch path such as `lci-base.exe`; apply the change, build again, copy to `lci-new.exe`. Later rebuilds then cannot disturb a running comparison, and on Windows the running copy does not lock the build output.
-4. Give each scratch configuration its own short `data_dir` (for example `C:\lci-eval\base`). On Windows LanceDB fails with `os error 3` when the data directory is long, because table names are `ws_<64 hex>` plus Lance's internal paths. Never point a scratch run at the running server's data directory.
+4. Give each scratch configuration its own short `data_dir` (for example `C:\lci-eval\base`). On Windows LanceDB fails with `os error 3` when the data directory is long, because table names are `ws_<16 hex>` plus Lance's internal paths; keep it under 150 characters (`/ready` flags a longer one as `data_dir_path_length`). Never point a scratch run at the running server's data directory.
 5. Run the smallest live evaluation that exercises the changed stage against 8766/8767, once per binary:
 
    ```bash
