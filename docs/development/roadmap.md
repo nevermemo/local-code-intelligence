@@ -834,6 +834,15 @@ Evidence for the tier (restated so the file stays self-contained):
 
 ---
 
+## Owner-delegated decisions (2026-10-10)
+
+The owner delegated the open decisions ("Do your own strategic and practical decisions"). Taken by the coordinator:
+
+- Production embedder: stay on Qwen3-Embedding-4B until the LCI-map design lands, then decide. M6 shows the 0.6B is non-inferior and indexes 5.5x faster, but the design may move the embedder in-process or to the NPU; switching now would force two re-indexes.
+- V7's NPU arm (a background NPU load while the iGPU reranks): run only after the grand-vision workflow and the design are committed, with nothing else in flight, because hangs are reported for concurrent NPU+iGPU use and a hang would kill the running orchestration.
+- Non-commercial (CC-BY-NC) models such as SweRankEmbed-Large and jina-code-embeddings: not trialled. LCI stays Apache/MIT-clean for its users, and M6 shows the embedder is not the bottleneck on LCI's sets.
+- The mis-quoted allow rule in `.claude/settings.local.json` stays as is: it only fails to auto-approve one command, and the auto-mode check blocks the agent from editing its own permissions.
+
 ## Next-phase candidates (proposed, 2026-10-10)
 
 From the new-niches explorer (25 ideas with value/effort guesstimates; full notes kept locally in `research_notes/explore-new-niches.md`, untracked). Nothing here is ready until the owner picks a theme; items marked (owner) need a product decision.
