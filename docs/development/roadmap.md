@@ -137,8 +137,9 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 | F2c | Apply the per-file cap after reranking instead of before (F2b odd-half reranked MRR -0.089) | ready (replay via E0) | S | E0 |
 | N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | done (446c34a: search max 30.7 -> 1.9 s; background priming) | S-M | - |
 | E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (2026-10-10) | XS | - |
+| E5 | Evaluation determinism: prime LSP before the first query; record LSP budget hits per query; let `compare` exclude them | ready | S | N7 |
 | T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (2026-10-10) | XS | - |
-| H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
+| H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | done (2026-10-10) | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
 ### R0 - Fusion-only baseline
@@ -306,6 +307,12 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
   - `lci-core/src/lexical.rs:959` `a_short_chunk_beats_a_much_longer_chunk_with_the_same_term_counts` (`:970-971`) pins the expected scores through `bm25_term_score` itself, and `:943` `repeated_lines_raise_a_score_with_diminishing_returns` (`:951`) restates the formula inline; a bug in the formula passes both. Add one hand-computed constant: df 2 of 8 files gives `idf = ln(6.5 / 2.5 + 1) = ln 3.6 = 1.280934`; chunk 1 (tf 2, length 8, average length 648 / 8 = 81, `norm = 0.25 + 0.75 * 8 / 81 = 0.324074`) scores `1.280934 * 2 * 2.2 / (2 + 1.2 * 0.324074) = 2.3593`; assert `|scored[0].score - 2.3593| < 1e-4`.
 - Reviewed, no change: `lci-core/src/models.rs:429` (`< 500 ms` for a breaker skip that makes no connection) and `:451` (`< 5 s` for one refused connect vs ~9 s on the old retried path); `tests/cases/indexing.rs:1109` (`< 10 s` with a 1 s reranker timeout), `:1154` (`< 5 s`), `:1174` (`< 250 ms` for a skipped rerank), `:1292` (500 ms sleep while a held file lock blocks the commit); `tests/cases/navigation.rs:307` (lower bound `>= 1.5 s`, the fake sleeps 2 s); `tests/cases/watching.rs:25` (5 s deadline over a 2 s poll). Same-named tests in `lci-core/src/lsp/{csharp,clangd,go,java,python,typescript}.rs` (`empty_or_missing_path_is_not_enabled`, `language_id_matches_extension`, `server_can_be_represented_without_a_process`, `transport_*`) are per-adapter copies in separate modules, not duplicates.
 - Accept: `cargo test -p local-code-intelligence --lib evaluate::` and `cargo test -p lci-core --lib lexical::` pass; the commit body names the two tests and the hand computation.
+
+### E5 - LSP-stable evaluations
+`ready` - S - deps: N7 - skill: `lci-retrieval-evaluation`
+- Why (2026-10-10): after N7 the LSP channel answers in milliseconds once primed, but some runs still hit the 1.5 s budget on late queries (e.g. mined queries 27, 30, 34 in `h1-mined-fusion` vs fast in `f2b-mined-cap2`), possibly rust-analyzer background work (cache priming, flycheck) competing with the run. Each such query loses its LSP candidates, so paired comparisons of identical ranking code flip 1-3 queries (F2b reproduce W/L/T 0/2/33, H1 0/3/32), enough to make nDCG CIs falsely significant.
+- Scope: (1) `evaluate` waits until every applicable language server is started and primed before the first timed query (bounded, logged), since a long-lived `serve` is the production case; (2) per-query `lsp_budget_hit` flag in the report (from the N7 note); (3) `compare --exclude-lsp-budget-hits` drops pairs where either side hit the budget and reports how many; (4) document in the evaluation workflow.
+- Accept: re-running an identical binary twice on mined gives W/L/T 0/0/35 with the exclusion (or with priming alone).
 
 ### H1 - Rust test-file classification
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
