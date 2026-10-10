@@ -317,6 +317,8 @@ R5, S5, R4, C1.
   - Not adopted. Lesson: the prompt template moves results as much as the weights; author-reported code gains did not transfer to LCI's queries.
   - V5 clean confirmation (an extra arm, the `vllm.txt` vLLM reranker on 8767, same tree and binary): llama.cpp vs vLLM mined MRR +0.159 [+0.080, +0.246], nDCG@10 +0.073, hit@1 +0.257 (all significant), W/L/T 11/0/24; core MRR +0.061 (n.s.), 3/1/7; reranking p50 19.6 vs 22.3 s mined and 18.6 vs 22.7 s core (1.14-1.22x). The llama.cpp path is much better as well as faster; vLLM's scores are poorly calibrated (0.32 for an obviously relevant document in the probe), so the vLLM template or scoring path likely degraded quality all along.
 
+- Channel ablation on the same frozen tree (2026-10-10, prompted by the grand-vision digest's "test whether the vector channel earns its place"): fusion only (exact replays of arm 0 with the reranker off), all channels mined MRR 0.781 / nDCG@10 0.583, core MRR 0.875; without vectors mined nDCG@10 -0.075 and core MRR -0.160 (both significant); without lexical or without LSP no significant change (core without LSP +0.080, n.s.). Reranked live without vectors: mined MRR -0.070 (CI [-0.153, 0.000]), W/L/T 1/5/29; core +0.063 (n.s.). The embedder is the channel LCI can least afford to lose, most of all on a no-reranker fast path.
+
 ### V7 - NPU vs iGPU contention measurement
 `ready` (owner question 2026-10-10) - S, live, no code - deps: V5 - skill: `lci-retrieval-evaluation`
 - Why: the NPU is no faster than the iGPU for 4B models (V1 research), but running one model there could stop embedder and reranker from competing. On a handheld with one 4-30 W budget and shared LPDDR5X they may slow each other anyway; measure before porting anything.
