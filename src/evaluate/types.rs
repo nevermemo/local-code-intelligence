@@ -139,6 +139,59 @@ pub enum RerankMode {
     /// No reranker: the results are the head of the fusion order
     /// (`[channels].reranker = false`).
     Off,
+    /// The reranker's order enters as a vote: each shortlisted candidate is
+    /// re-scored `fusion_score + vote_weight / (rrf_k + rerank_rank)` and the
+    /// shortlist is re-sorted. Replay-only: production has no such mode, so
+    /// no dump carries it, but `replay --rerank-mode vote` applies it.
+    Vote,
+}
+
+impl RerankMode {
+    /// The lowercase wire/CLI name of the mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Off => "off",
+            Self::Vote => "vote",
+        }
+    }
+}
+
+/// Why `replay` could not score a dumped query under the replayed arm. A
+/// refused query is never approximated: it is reported as skipped (so
+/// `compare` leaves it out of every pair), counted, and listed under the
+/// report's `replay` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayRefusal {
+    /// The query carries no candidate dump (the report was not made with
+    /// `evaluate --dump-candidates`, or the query was dumped by nothing).
+    NotDumped,
+    /// Fusion recomputed at the dumped arm does not reproduce a row's
+    /// `fusion_score` bit for bit, or the dump is not in `fused_rank` order.
+    FusionMismatch,
+    /// The per-file cap recomputed at the dumped arm does not reproduce a
+    /// row's `capped_rank` or `shortlisted`.
+    ShortlistMismatch,
+    /// The replayed arm uses the reranker but the dumped search has no
+    /// reranker scores (its outcome was not `scored`).
+    RerankNotScored,
+    /// The replayed rerank window holds a candidate the dumped search never
+    /// sent to the reranker, so it has no score.
+    UnscoredWindow,
+}
+
+impl ReplayRefusal {
+    /// The snake_case name used in the report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDumped => "not_dumped",
+            Self::FusionMismatch => "fusion_mismatch",
+            Self::ShortlistMismatch => "shortlist_mismatch",
+            Self::RerankNotScored => "rerank_not_scored",
+            Self::UnscoredWindow => "unscored_window",
+        }
+    }
 }
 
 /// The retrieval configuration one candidate dump was taken under: what a
@@ -366,6 +419,11 @@ pub struct QueryReport {
     /// empty, and absent from the JSON, otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Set by `replay` on a query it refused to score (see
+    /// [`ReplayRefusal`]); such a query is also `skipped`, with the detail
+    /// in `reason`. Absent from every other report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_refusal: Option<ReplayRefusal>,
 }
 
 impl QueryReport {
@@ -404,6 +462,7 @@ impl QueryReport {
             arm: None,
             rerank_outcome: None,
             notes: Vec::new(),
+            replay_refusal: None,
         }
     }
 
@@ -449,6 +508,7 @@ impl QueryReport {
             arm: None,
             rerank_outcome: None,
             notes: Vec::new(),
+            replay_refusal: None,
         }
     }
 

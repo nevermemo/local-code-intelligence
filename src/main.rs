@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand};
 use local_code_intelligence::{
     app::App,
     config::Config,
-    evaluate::{self, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED, RunOptions},
+    evaluate::{
+        self, CapStage, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED, ReplayOptions, RerankMode,
+        RunOptions,
+    },
     server,
 };
 use std::{
@@ -94,6 +97,60 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_RESAMPLES, value_parser = parse_resamples)]
         resamples: usize,
     },
+    /// Score other retrieval settings from the candidate dump of an earlier
+    /// `evaluate --dump-candidates` report, without services. Works offline
+    /// like `compare`: it needs no configuration or index, and its report
+    /// (`--output`) is an ordinary evaluation report that `compare` pairs with
+    /// real ones. Settings you leave out keep the dumped arm's values.
+    /// Queries it cannot score exactly are refused, counted, and reported as
+    /// skipped; `reranking_ms` and `total_ms` are cost-model estimates.
+    Replay {
+        /// Report written by `evaluate --dump-candidates`.
+        report: PathBuf,
+        /// Write the replayed evaluation report (JSON) to this file. The
+        /// summary is printed either way.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Rerank window: how many leading candidates the reranker orders.
+        /// The rest of the fused order follows them. At most the dumped
+        /// shortlist can be scored (default: the dumped
+        /// `rerank_candidate_count`).
+        #[arg(long, value_parser = parse_window)]
+        window: Option<usize>,
+        /// Chunks of one file that keep their place before the rest of that
+        /// file's chunks are demoted (0 is unlimited; default: the dumped
+        /// `max_chunks_per_file`).
+        #[arg(long, value_parser = parse_cap)]
+        cap: Option<u32>,
+        /// Where the cap runs: `shortlist` (before the window cut, as in
+        /// production, the default) or `results` (after reranking).
+        #[arg(long)]
+        cap_stage: Option<CapStage>,
+        /// Weight of the semantic channel in fusion.
+        #[arg(long, value_parser = parse_positive)]
+        semantic_weight: Option<f32>,
+        /// Weight of the lexical channel in fusion.
+        #[arg(long, value_parser = parse_positive)]
+        lexical_weight: Option<f32>,
+        /// Weight of the language-server channel in fusion.
+        #[arg(long, value_parser = parse_positive)]
+        lsp_weight: Option<f32>,
+        /// Reciprocal Rank Fusion constant.
+        #[arg(long, value_parser = parse_positive)]
+        rrf_k: Option<f32>,
+        /// Source-role prior of `source` chunks (production: 0.004).
+        #[arg(long, value_parser = parse_non_negative)]
+        prior: Option<f32>,
+        /// How the reranker's scores order the window: `replace` (production),
+        /// `vote` (fusion score plus --vote-weight / (rrf_k + reranker rank)),
+        /// or `off` (fused order). Default: the dumped mode.
+        #[arg(long)]
+        rerank_mode: Option<RerankMode>,
+        /// Weight of the reranker's vote; required by, and only valid with,
+        /// `--rerank-mode vote`.
+        #[arg(long, value_parser = parse_non_negative)]
+        vote_weight: Option<f32>,
+    },
     Symbols {
         workspace: PathBuf,
         query: String,
@@ -120,6 +177,61 @@ fn parse_resamples(value: &str) -> Result<usize, String> {
         Ok(count) => Ok(count),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn parse_window(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(window) => Ok(window),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn parse_cap(value: &str) -> Result<u32, String> {
+    let cap = value.parse::<u32>().map_err(|error| error.to_string())?;
+    if cap > local_code_intelligence::config::FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT {
+        return Err(format!(
+            "must be 0..={}",
+            local_code_intelligence::config::FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT
+        ));
+    }
+    Ok(cap)
+}
+
+fn parse_positive(value: &str) -> Result<f32, String> {
+    let number = value.parse::<f32>().map_err(|error| error.to_string())?;
+    if number.is_finite() && number > 0.0 {
+        Ok(number)
+    } else {
+        Err("must be a finite number greater than zero".to_owned())
+    }
+}
+
+fn parse_non_negative(value: &str) -> Result<f32, String> {
+    let number = value.parse::<f32>().map_err(|error| error.to_string())?;
+    if number.is_finite() && number >= 0.0 {
+        Ok(number)
+    } else {
+        Err("must be a finite number, zero or more".to_owned())
+    }
+}
+
+/// `replay`: read a candidate dump, score the replayed arm, print the summary,
+/// optionally write the replayed report. Runs without opening the application.
+fn run_replay(source: &Path, output: Option<&Path>, options: &ReplayOptions) -> Result<()> {
+    let replayed = evaluate::replay_file(source, options)?;
+    print!("{}", replayed.render_summary());
+    if let Some(path) = output {
+        let json = serde_json::to_string_pretty(&replayed.to_json()?)?;
+        std::fs::write(
+            path,
+            format!(
+                "{json}
+"
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 /// `compare`: read two saved reports, print the summary, optionally write the
@@ -163,6 +275,38 @@ async fn main() -> Result<()> {
             &candidate,
             output.as_deref(),
             &CompareOptions { seed, resamples },
+        );
+    }
+    if let Command::Replay {
+        report,
+        output,
+        window,
+        cap,
+        cap_stage,
+        semantic_weight,
+        lexical_weight,
+        lsp_weight,
+        rrf_k,
+        prior,
+        rerank_mode,
+        vote_weight,
+    } = command
+    {
+        return run_replay(
+            &report,
+            output.as_deref(),
+            &ReplayOptions {
+                window,
+                cap,
+                cap_stage,
+                semantic_weight,
+                lexical_weight,
+                lsp_weight,
+                rrf_k,
+                prior,
+                rerank_mode,
+                vote_weight,
+            },
         );
     }
     // Read the baseline report before opening the application, so an
@@ -241,6 +385,7 @@ async fn main() -> Result<()> {
             evaluate::report_with_comparison(&report, comparison.as_ref())?
         }
         Command::Compare { .. } => unreachable!("compare returns before the application opens"),
+        Command::Replay { .. } => unreachable!("replay returns before the application opens"),
         Command::Symbols { workspace, query } => {
             serde_json::to_value(app.symbols(&workspace, &query).await?)?
         }

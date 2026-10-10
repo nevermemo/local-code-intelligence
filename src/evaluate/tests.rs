@@ -1,5 +1,8 @@
 use super::*;
-use crate::filter::FilterRequest;
+use crate::app::{CandidateTrace, RerankOutcome};
+use crate::config::{ChannelsConfig, FusionConfig};
+use crate::filter::{FilterRequest, SourceRole};
+use std::collections::BTreeMap;
 
 fn evidence_row(
     rank: usize,
@@ -1715,4 +1718,1422 @@ fn reports_load_from_disk_including_ones_that_embed_a_comparison() {
         "{error:#}"
     );
     assert!(compare_files(&baseline_path, &garbage, &CompareOptions::default()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Offline replay of a candidate dump
+// ---------------------------------------------------------------------------
+
+/// One candidate of a hand-built dump: its channel ranks and, if the dumped
+/// reranker was asked about it, the score it gave.
+#[derive(Clone, Copy)]
+struct Spec {
+    path: &'static str,
+    start: u32,
+    semantic: Option<usize>,
+    lexical: Option<usize>,
+    lsp: Option<usize>,
+    role: SourceRole,
+    rerank: f32,
+    tokens: usize,
+}
+
+const fn spec(
+    path: &'static str,
+    start: u32,
+    semantic: Option<usize>,
+    lexical: Option<usize>,
+    role: SourceRole,
+    rerank: f32,
+    tokens: usize,
+) -> Spec {
+    Spec {
+        path,
+        start,
+        semantic,
+        lexical,
+        lsp: None,
+        role,
+        rerank,
+        tokens,
+    }
+}
+
+// With the default weights (2, 1, 1), rrf_k 60 and the 0.004 source prior the
+// fused order of these six is A1, A20, B1, A40, C1, D1. The reranker (scores
+// below) prefers A40, B1, A20, C1, A1, D1. a.rs holds three chunks, so a cap
+// of 1 demotes A20 and A40 behind the other files, and a cap of 2 demotes A40.
+const A1: Spec = spec("a.rs", 1, Some(1), Some(1), SourceRole::Source, 0.2, 100);
+const A20: Spec = spec("a.rs", 20, Some(2), Some(2), SourceRole::Source, 0.4, 200);
+const A40: Spec = spec("a.rs", 40, Some(3), None, SourceRole::Source, 0.9, 300);
+const B1: Spec = spec("b.rs", 1, Some(4), Some(3), SourceRole::Source, 0.5, 400);
+const C1: Spec = spec("c.rs", 1, Some(5), None, SourceRole::Source, 0.3, 500);
+const D1: Spec = spec("d.rs", 1, None, Some(4), SourceRole::Test, 0.1, 600);
+/// Deliberately not in fused order: the builder sorts.
+const SIX: [Spec; 6] = [D1, A40, B1, A1, C1, A20];
+
+/// The arm of a dump with the default weights and a 1 KiB document budget.
+fn dump_arm(window: usize, k: usize, cap: u32, mode: RerankMode) -> CandidateArm {
+    CandidateArm {
+        rrf_k: 60.0,
+        fusion: FusionConfig {
+            semantic_weight: 2.0,
+            lexical_weight: 1.0,
+            lsp_weight: 1.0,
+            max_chunks_per_file: cap,
+        },
+        rerank_candidate_count: window,
+        rerank_document_max_bytes: 1024,
+        semantic_candidate_count: 40,
+        lexical_candidate_count: 40,
+        lsp_candidate_count: 40,
+        channels: ChannelsConfig {
+            reranker: mode != RerankMode::Off,
+            ..ChannelsConfig::default()
+        },
+        k,
+        embedding_identity: "test-embedding".to_owned(),
+        reranker_model: "test-reranker".to_owned(),
+        rerank_mode: mode,
+    }
+}
+
+/// The documented fusion arithmetic, restated for the builder.
+fn expected_fusion(spec: &Spec, arm: &CandidateArm) -> f32 {
+    let mut score = 0.0_f32;
+    if let Some(rank) = spec.semantic {
+        score += arm.fusion.semantic_weight / (arm.rrf_k + rank as f32);
+    }
+    if let Some(rank) = spec.lexical {
+        score += arm.fusion.lexical_weight / (arm.rrf_k + rank as f32);
+    }
+    if let Some(rank) = spec.lsp {
+        score += arm.fusion.lsp_weight / (arm.rrf_k + rank as f32);
+    }
+    score
+        + if spec.role == SourceRole::Source {
+            0.004
+        } else {
+            0.0
+        }
+}
+
+fn dump_timings(reranking_ms: f64) -> EvalTimings {
+    EvalTimings {
+        query_embedding_ms: 10.0,
+        lancedb_search_ms: 5.0,
+        lexical_search_ms: 5.0,
+        lsp_search_ms: 0.0,
+        fusion_ms: 1.0,
+        reranking_ms,
+        total_ms: 21.0 + reranking_ms,
+    }
+}
+
+/// A query report exactly as `evaluate --dump-candidates` would write it for
+/// a search over `specs` under `arm`: fused order, per-file cap, shortlist,
+/// reranker scores (when `outcome` is `Scored`), and the results the search
+/// returned, built here with a deliberately separate, plain implementation.
+fn dumped_query(
+    text: &str,
+    expected: &[&str],
+    specs: &[Spec],
+    arm: &CandidateArm,
+    outcome: RerankOutcome,
+    reranking_ms: f64,
+) -> QueryReport {
+    let mut rows: Vec<CandidateTrace> = specs
+        .iter()
+        .map(|spec| CandidateTrace {
+            relative_file_path: spec.path.to_owned(),
+            language: "rust".to_owned(),
+            start_line: spec.start,
+            end_line: spec.start + 9,
+            source_role: spec.role,
+            semantic_rank: spec.semantic,
+            semantic_score: spec.semantic.map(|_| 0.5),
+            lexical_rank: spec.lexical,
+            lexical_score: spec.lexical.map(|_| 1.5),
+            lexical_match_count: u32::from(spec.lexical.is_some()),
+            lsp_rank: spec.lsp,
+            prior: if spec.role == SourceRole::Source {
+                0.004
+            } else {
+                0.0
+            },
+            fusion_score: expected_fusion(spec, arm),
+            fused_rank: 0,
+            capped_rank: 0,
+            shortlisted: false,
+            rerank_rank: None,
+            reranker_score: None,
+            document_bytes: None,
+            est_tokens: None,
+            snippet: format!("snippet of {}:{}", spec.path, spec.start),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.fusion_score
+            .total_cmp(&a.fusion_score)
+            .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
+            .then(a.start_line.cmp(&b.start_line))
+    });
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.fused_rank = index + 1;
+    }
+    // The per-file cap, written the plain way.
+    let cap = arm.fusion.max_chunks_per_file as usize;
+    let mut per_file = std::collections::HashMap::<String, usize>::new();
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    for (index, row) in rows.iter().enumerate() {
+        let kept = per_file.entry(row.relative_file_path.clone()).or_insert(0);
+        if cap == 0 || *kept < cap {
+            *kept += 1;
+            head.push(index);
+        } else {
+            tail.push(index);
+        }
+    }
+    let order: Vec<usize> = head.into_iter().chain(tail).collect();
+    for (position, &index) in order.iter().enumerate() {
+        rows[index].capped_rank = position + 1;
+        rows[index].shortlisted = position < arm.rerank_candidate_count;
+    }
+    let shortlist: Vec<usize> = order
+        .iter()
+        .copied()
+        .take(arm.rerank_candidate_count)
+        .collect();
+    let spec_of = |row: &CandidateTrace| {
+        *specs
+            .iter()
+            .find(|spec| spec.path == row.relative_file_path && spec.start == row.start_line)
+            .unwrap()
+    };
+    for &index in &shortlist {
+        let tokens = spec_of(&rows[index]).tokens;
+        rows[index].document_bytes = Some(tokens * 4);
+        rows[index].est_tokens = Some(tokens);
+    }
+    let results: Vec<usize> = if outcome == RerankOutcome::Scored {
+        let mut ranked: Vec<(usize, f32)> = shortlist
+            .iter()
+            .enumerate()
+            .map(|(request, &index)| (request, spec_of(&rows[index]).rerank))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (place, &(request, score)) in ranked.iter().enumerate() {
+            rows[shortlist[request]].rerank_rank = Some(place + 1);
+            rows[shortlist[request]].reranker_score = Some(score);
+        }
+        ranked
+            .iter()
+            .map(|&(request, _)| shortlist[request])
+            .collect()
+    } else {
+        shortlist
+    };
+    let evidence: Vec<ResultEvidence> = results
+        .iter()
+        .take(arm.k)
+        .enumerate()
+        .map(|(position, &index)| ResultEvidence {
+            rank: position + 1,
+            relative_file_path: rows[index].relative_file_path.clone(),
+            language: rows[index].language.clone(),
+            source_role: rows[index].source_role.as_str().to_owned(),
+            start_line: rows[index].start_line,
+            end_line: rows[index].end_line,
+            snippet: rows[index].snippet.clone(),
+            reranker_score: rows[index].reranker_score,
+        })
+        .collect();
+    let query = EvalQuery {
+        query: text.to_owned(),
+        top_k: Some(arm.k),
+        ..query_with(expected)
+    };
+    let mut report = QueryReport::new(
+        query,
+        evidence,
+        outcome == RerankOutcome::Scored,
+        None,
+        None,
+        Some(dump_timings(reranking_ms)),
+        Some(IndexLifecycleAction::Reused),
+        Some(0.0),
+    );
+    report.candidates = rows;
+    report.arm = Some(arm.clone());
+    report.rerank_outcome = Some(outcome);
+    report
+}
+
+/// A report holding the dumped queries.
+fn dump_of(queries: &[QueryReport]) -> AggregateReport {
+    aggregate(queries)
+}
+
+fn replayed(source: &AggregateReport, options: ReplayOptions) -> ReplayReport {
+    replay(source, &options).unwrap()
+}
+
+/// `path:start_line` of each result of a query, best first.
+fn places(report: &QueryReport) -> Vec<String> {
+    report
+        .evidence
+        .iter()
+        .map(|row| format!("{}:{}", row.relative_file_path, row.start_line))
+        .collect()
+}
+
+/// The six-row dump with the whole pool shortlisted and scored: every
+/// replay window and cap is exact against it.
+fn full_dump() -> AggregateReport {
+    let arm = dump_arm(6, 6, 0, RerankMode::Replace);
+    dump_of(&[dumped_query(
+        "full pool",
+        &["a.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Scored,
+        900.0,
+    )])
+}
+
+#[test]
+fn replay_at_the_dumped_arm_reproduces_the_dumped_evidence_and_metrics() {
+    // The whole pool shortlisted: results are the reranker's order.
+    let source = full_dump();
+    assert_eq!(
+        places(&source.queries[0]),
+        ["a.rs:40", "b.rs:1", "a.rs:20", "c.rs:1", "a.rs:1", "d.rs:1"]
+    );
+    let out = replayed(&source, ReplayOptions::default());
+    let (before, after) = (&source.queries[0], &out.report.queries[0]);
+    assert_eq!(after.evidence, before.evidence);
+    assert_eq!(after.metrics, before.metrics);
+    assert_eq!((after.reranked, after.outcome.as_str()), (true, "success"));
+    assert_eq!(out.replay.queries.replayed, 1);
+    assert_eq!(out.replay.queries.refused, 0);
+    assert_eq!(out.replay.past_window_queries, 0);
+    assert_eq!(out.replay.arm.window, 6);
+
+    // The production configuration shape: cap 2, window 4, k 3. a.rs:40 is
+    // demoted behind c.rs and d.rs and out of the shortlist; the reranker
+    // sees A1, A20, B1, C1.
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let source = dump_of(&[dumped_query(
+        "production shape",
+        &["b.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Scored,
+        900.0,
+    )]);
+    assert_eq!(places(&source.queries[0]), ["b.rs:1", "a.rs:20", "c.rs:1"]);
+    let rows = &source.queries[0].candidates;
+    assert_eq!(
+        rows.iter().map(|row| row.capped_rank).collect::<Vec<_>>(),
+        [1, 2, 3, 6, 4, 5]
+    );
+    let out = replayed(&source, ReplayOptions::default());
+    let (before, after) = (&source.queries[0], &out.report.queries[0]);
+    assert_eq!(after.evidence, before.evidence);
+    assert_eq!(after.metrics, before.metrics);
+    assert_eq!(out.replay.queries.refused, 0);
+    // Naming the dumped values explicitly changes nothing.
+    let explicit = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(4),
+            cap: Some(2),
+            cap_stage: Some(CapStage::Shortlist),
+            semantic_weight: Some(2.0),
+            lexical_weight: Some(1.0),
+            lsp_weight: Some(1.0),
+            rrf_k: Some(60.0),
+            prior: Some(0.004),
+            rerank_mode: Some(RerankMode::Replace),
+            vote_weight: None,
+        },
+    );
+    assert_eq!(explicit.report.queries[0].evidence, before.evidence);
+}
+
+#[test]
+fn replay_reproduces_a_pool_without_candidates_and_a_reranker_that_was_off() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let empty = dumped_query("nothing", &["a.rs"], &[], &arm, RerankOutcome::NotRun, 0.0);
+    assert!(!empty.reranked && empty.evidence.is_empty());
+    let source = dump_of(&[empty]);
+    let out = replayed(&source, ReplayOptions::default());
+    assert!(out.report.queries[0].evidence.is_empty());
+    assert!(!out.report.queries[0].reranked);
+    assert_eq!(out.report.queries[0].metrics, source.queries[0].metrics);
+    assert_eq!(out.replay.queries.refused, 0);
+    // An empty pool costs the reranker nothing, whatever the cost model says.
+    assert_eq!(out.report.queries[0].timings.unwrap().reranking_ms, 0.0);
+
+    // `[channels].reranker = false`: fused (capped) order, no scores.
+    let arm = dump_arm(4, 3, 2, RerankMode::Off);
+    let source = dump_of(&[dumped_query(
+        "off",
+        &["c.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Off,
+        0.0,
+    )]);
+    assert_eq!(places(&source.queries[0]), ["a.rs:1", "a.rs:20", "b.rs:1"]);
+    let out = replayed(&source, ReplayOptions::default());
+    assert_eq!(out.report.queries[0].evidence, source.queries[0].evidence);
+    assert_eq!(out.report.queries[0].metrics, source.queries[0].metrics);
+    assert!(!out.report.queries[0].reranked);
+    assert_eq!(out.replay.arm.rerank_mode, RerankMode::Off);
+    assert_eq!(out.replay.past_window_queries, 0);
+
+    // Production cuts the pool to the shortlist even without the reranker, so
+    // a result window of six over a shortlist of four returned four rows;
+    // replay appends the rest of the fused order and counts the query.
+    let arm = dump_arm(4, 6, 2, RerankMode::Off);
+    let source = dump_of(&[dumped_query(
+        "off, wide",
+        &["c.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Off,
+        0.0,
+    )]);
+    assert_eq!(source.queries[0].evidence.len(), 4);
+    let out = replayed(&source, ReplayOptions::default());
+    assert_eq!(
+        places(&out.report.queries[0]),
+        ["a.rs:1", "a.rs:20", "b.rs:1", "c.rs:1", "d.rs:1", "a.rs:40"]
+    );
+    assert_eq!(
+        out.report.queries[0].evidence[..4],
+        source.queries[0].evidence[..]
+    );
+    assert_eq!(out.replay.past_window_queries, 1);
+    assert!(out.render_summary().contains("past the window"));
+}
+
+#[test]
+fn replay_with_a_smaller_window_reranks_only_the_window_and_appends_the_fused_tail() {
+    let source = full_dump();
+    let out = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(2),
+            ..ReplayOptions::default()
+        },
+    );
+    let query = &out.report.queries[0];
+    // Window A1, A20 reranked to A20 (0.4), A1 (0.2); then B1, A40, C1, D1 in
+    // fused order, not in reranker order.
+    assert_eq!(
+        places(query),
+        ["a.rs:20", "a.rs:1", "b.rs:1", "a.rs:40", "c.rs:1", "d.rs:1"]
+    );
+    let scores: Vec<Option<f32>> = query
+        .evidence
+        .iter()
+        .map(|row| row.reranker_score)
+        .collect();
+    assert_eq!(
+        scores,
+        [Some(0.4), Some(0.2), None, None, None, None],
+        "only the window carries reranker scores"
+    );
+    assert!(query.reranked);
+    assert_eq!(query.metrics.reranker, RerankerState::PartiallyScored);
+    assert_eq!(out.replay.past_window_queries, 1);
+
+    // A window of one cannot reorder anything.
+    let one = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(1),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(
+        places(&one.report.queries[0]),
+        ["a.rs:1", "a.rs:20", "b.rs:1", "a.rs:40", "c.rs:1", "d.rs:1"]
+    );
+    // A window at least as large as the pool is the whole pool.
+    let large = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(50),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(large.report.queries[0].evidence, source.queries[0].evidence);
+    assert_eq!(large.replay.past_window_queries, 0);
+}
+
+#[test]
+fn replay_cap_stages_differ_on_a_demoted_chunk() {
+    let source = full_dump();
+    let at = |stage| {
+        let out = replayed(
+            &source,
+            ReplayOptions {
+                window: Some(4),
+                cap: Some(1),
+                cap_stage: Some(stage),
+                ..ReplayOptions::default()
+            },
+        );
+        assert_eq!(out.replay.queries.refused, 0);
+        out.report.queries[0].clone()
+    };
+    // Shortlist stage: the cap demotes A20 and A40 before the window is cut,
+    // so the reranker sees A1, B1, C1, D1 and the demoted chunks trail it.
+    assert_eq!(
+        places(&at(CapStage::Shortlist)),
+        ["b.rs:1", "c.rs:1", "a.rs:1", "d.rs:1", "a.rs:20", "a.rs:40"]
+    );
+    // Results stage: the reranker sees the uncapped head A1, A20, B1, A40 and
+    // lifts A40 to the front; the cap then demotes the second and third a.rs
+    // chunks behind the other files.
+    assert_eq!(
+        places(&at(CapStage::Results)),
+        ["a.rs:40", "b.rs:1", "c.rs:1", "d.rs:1", "a.rs:20", "a.rs:1"]
+    );
+    // Without a cap the stage does not matter.
+    let uncapped = |stage| {
+        replayed(
+            &source,
+            ReplayOptions {
+                cap: Some(0),
+                cap_stage: Some(stage),
+                ..ReplayOptions::default()
+            },
+        )
+        .report
+        .queries[0]
+            .evidence
+            .clone()
+    };
+    assert_eq!(uncapped(CapStage::Shortlist), uncapped(CapStage::Results));
+    assert_eq!(uncapped(CapStage::Results), source.queries[0].evidence);
+}
+
+#[test]
+fn replay_vote_adds_the_reciprocal_rank_of_the_reranker_to_the_fusion_score() {
+    let source = full_dump();
+    let dumped_arm = source.queries[0].arm.clone().unwrap();
+    let vote = |weight: f32| {
+        replayed(
+            &source,
+            ReplayOptions {
+                window: Some(3),
+                rerank_mode: Some(RerankMode::Vote),
+                vote_weight: Some(weight),
+                ..ReplayOptions::default()
+            },
+        )
+    };
+    // Window A1, A20, B1; the reranker ranks them B1 (0.5), A20 (0.4), A1
+    // (0.2), so the reranker ranks are 3, 2, 1.
+    let voted = |spec: &Spec, rank: f32, weight: f32| {
+        expected_fusion(spec, &dumped_arm) + weight / (60.0 + rank)
+    };
+    for weight in [0.0, 1.0, 3.0, 5.0, 10.0] {
+        let mut expected = [(&A1, 3.0), (&A20, 2.0), (&B1, 1.0)];
+        expected.sort_by(|a, b| {
+            voted(b.0, b.1, weight)
+                .total_cmp(&voted(a.0, a.1, weight))
+                .then_with(|| a.0.path.cmp(b.0.path))
+                .then(a.0.start.cmp(&b.0.start))
+        });
+        let mut want: Vec<String> = expected
+            .iter()
+            .map(|(spec, _)| format!("{}:{}", spec.path, spec.start))
+            .collect();
+        want.extend(["a.rs:40", "c.rs:1", "d.rs:1"].map(str::to_owned));
+        let out = vote(weight);
+        assert_eq!(places(&out.report.queries[0]), want, "vote weight {weight}");
+        assert!(out.report.queries[0].reranked);
+    }
+    // Spelled out: a light vote keeps fusion order, a heavy one is the
+    // reranker's order.
+    assert_eq!(
+        &places(&vote(1.0).report.queries[0])[..3],
+        ["a.rs:1", "a.rs:20", "b.rs:1"]
+    );
+    assert_eq!(
+        &places(&vote(10.0).report.queries[0])[..3],
+        ["b.rs:1", "a.rs:20", "a.rs:1"]
+    );
+    // Window rows carry the reranker's score, tail rows none.
+    let evidence = &vote(10.0).report.queries[0].evidence;
+    assert_eq!(evidence[0].reranker_score, Some(0.5));
+    assert!(evidence[3..].iter().all(|row| row.reranker_score.is_none()));
+    // rrf_k enters the vote: at rrf_k 1000 a rank step is worth about 1e-6
+    // per unit of weight, less than the fusion gaps (3e-6 and 5e-6), so a
+    // weight of 1 leaves fusion order, whereas the same vote at the dumped
+    // rrf_k of 60 (2.6e-4 per step) would put B1 first.
+    let flat = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(3),
+            rerank_mode: Some(RerankMode::Vote),
+            vote_weight: Some(1.0),
+            rrf_k: Some(1000.0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(
+        &places(&flat.report.queries[0])[..3],
+        ["a.rs:1", "a.rs:20", "b.rs:1"]
+    );
+}
+
+#[test]
+fn replay_refuses_a_window_holding_an_unscored_candidate_and_counts_it() {
+    // Window 4, cap 2: only A1, A20, B1, C1 reached the reranker.
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let wide = dumped_query(
+        "wide pool",
+        &["b.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Scored,
+        900.0,
+    );
+    // A pool that fits the shortlist entirely: any window is exact.
+    let small = dumped_query(
+        "small pool",
+        &["b.rs"],
+        &[A1, A20, B1],
+        &arm,
+        RerankOutcome::Scored,
+        500.0,
+    );
+    let source = dump_of(&[wide, small]);
+    let out = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(5),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(out.replay.queries.replayed, 1);
+    assert_eq!(out.replay.queries.refused, 1);
+    assert_eq!(
+        out.replay.refused,
+        BTreeMap::from([(ReplayRefusal::UnscoredWindow, 1)])
+    );
+    let refused = &out.report.queries[0];
+    assert!(refused.skipped && refused.evidence.is_empty());
+    assert_eq!(refused.outcome, "skipped");
+    assert_eq!(refused.replay_refusal, Some(ReplayRefusal::UnscoredWindow));
+    assert!(refused.reason.contains("d.rs:1"), "{}", refused.reason);
+    assert_eq!(out.replay.refused_queries.len(), 1);
+    assert_eq!(out.replay.refused_queries[0].query, "wide pool");
+    assert_eq!(out.replay.refused_queries[0].workspace, "ws");
+    assert_eq!(
+        out.replay.refused_queries[0].reason,
+        ReplayRefusal::UnscoredWindow
+    );
+    // The refused query is a skipped one for the aggregate; the other is real.
+    assert_eq!(
+        (out.report.executed_count, out.report.skipped_count),
+        (1, 1)
+    );
+    assert_eq!(out.report.mrr, Some(1.0));
+    assert!(!out.report.queries[1].skipped);
+    assert_eq!(out.report.queries[1].replay_refusal, None);
+    assert_eq!(
+        places(&out.report.queries[1]),
+        ["b.rs:1", "a.rs:20", "a.rs:1"]
+    );
+
+    // A cap different from the dumped one pulls other rows into the window.
+    let no_cap = replayed(
+        &source,
+        ReplayOptions {
+            cap: Some(0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(
+        no_cap.replay.refused,
+        BTreeMap::from([(ReplayRefusal::UnscoredWindow, 1)])
+    );
+    assert!(
+        no_cap.report.queries[0].reason.contains("a.rs:40"),
+        "{}",
+        no_cap.report.queries[0].reason
+    );
+    // Without the reranker no score is needed, whatever the window: the
+    // fused order is exact.
+    let off = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(5),
+            cap: Some(0),
+            rerank_mode: Some(RerankMode::Off),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(off.replay.queries.refused, 0);
+    assert_eq!(
+        places(&off.report.queries[0]),
+        ["a.rs:1", "a.rs:20", "b.rs:1"]
+    );
+    // The summary names the reason and the query.
+    let summary = out.render_summary();
+    assert!(summary.contains("refused unscored_window: 1"), "{summary}");
+    assert!(summary.contains("wide pool"), "{summary}");
+}
+
+#[test]
+fn replay_refuses_the_reranker_when_the_dumped_search_had_no_scores() {
+    let failed_arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let failed = dumped_query(
+        "reranker down",
+        &["a.rs"],
+        &SIX,
+        &failed_arm,
+        RerankOutcome::Failed,
+        0.0,
+    );
+    // The dumped search fell back to fusion order and did not rerank.
+    assert!(!failed.reranked);
+    let source = dump_of(&[failed]);
+    for mode in [None, Some(RerankMode::Replace)] {
+        let out = replayed(
+            &source,
+            ReplayOptions {
+                rerank_mode: mode,
+                ..ReplayOptions::default()
+            },
+        );
+        assert_eq!(
+            out.replay.refused,
+            BTreeMap::from([(ReplayRefusal::RerankNotScored, 1)])
+        );
+        assert!(
+            out.report.queries[0].reason.contains("failed"),
+            "{}",
+            out.report.queries[0].reason
+        );
+    }
+    let vote = replayed(
+        &source,
+        ReplayOptions {
+            rerank_mode: Some(RerankMode::Vote),
+            vote_weight: Some(1.0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(vote.replay.refused[&ReplayRefusal::RerankNotScored], 1);
+    // Fusion order needs no scores, and is exactly what the failed search
+    // returned.
+    let off = replayed(
+        &source,
+        ReplayOptions {
+            rerank_mode: Some(RerankMode::Off),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(off.replay.queries.refused, 0);
+    assert_eq!(off.report.queries[0].evidence, source.queries[0].evidence);
+
+    // A dump taken with the reranker off cannot be reranked afterwards.
+    let off_arm = dump_arm(4, 3, 2, RerankMode::Off);
+    let source = dump_of(&[dumped_query(
+        "reranker off",
+        &["a.rs"],
+        &SIX,
+        &off_arm,
+        RerankOutcome::Off,
+        0.0,
+    )]);
+    let replace = replayed(
+        &source,
+        ReplayOptions {
+            rerank_mode: Some(RerankMode::Replace),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(replace.replay.refused[&ReplayRefusal::RerankNotScored], 1);
+}
+
+#[test]
+fn replay_refuses_a_dump_whose_fusion_or_cap_does_not_reproduce() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let make = |text: &str| dumped_query(text, &["b.rs"], &SIX, &arm, RerankOutcome::Scored, 900.0);
+    let good = make("good");
+
+    let mut drifted = make("drifted score");
+    let bits = drifted.candidates[2].fusion_score.to_bits();
+    drifted.candidates[2].fusion_score = f32::from_bits(bits + 1);
+
+    let mut shuffled = make("shuffled");
+    shuffled.candidates.swap(0, 1);
+
+    let mut misranked = make("wrong rank");
+    misranked.candidates[3].fused_rank = 9;
+
+    let mut mis_capped = make("wrong cap");
+    mis_capped.candidates[5].capped_rank = 2;
+
+    let mut mis_cut = make("wrong cut");
+    mis_cut.candidates[0].shortlisted = false;
+
+    let source = dump_of(&[good, drifted, shuffled, misranked, mis_capped, mis_cut]);
+    let out = replayed(&source, ReplayOptions::default());
+    assert_eq!(out.replay.queries.replayed, 1);
+    assert_eq!(
+        out.replay.refused,
+        BTreeMap::from([
+            (ReplayRefusal::FusionMismatch, 3),
+            (ReplayRefusal::ShortlistMismatch, 2)
+        ])
+    );
+    let reasons: Vec<Option<ReplayRefusal>> = out
+        .report
+        .queries
+        .iter()
+        .map(|query| query.replay_refusal)
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            None,
+            Some(ReplayRefusal::FusionMismatch),
+            Some(ReplayRefusal::FusionMismatch),
+            Some(ReplayRefusal::FusionMismatch),
+            Some(ReplayRefusal::ShortlistMismatch),
+            Some(ReplayRefusal::ShortlistMismatch),
+        ]
+    );
+    // A dump that fails to reproduce at its own arm is refused at every arm.
+    let off = replayed(
+        &source,
+        ReplayOptions {
+            rerank_mode: Some(RerankMode::Off),
+            cap: Some(0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(off.replay.queries.refused, 5);
+}
+
+/// Four candidates whose fused order moves with every fusion setting.
+const WEIGHT_DUMP: [Spec; 4] = [
+    spec("p.rs", 1, Some(1), None, SourceRole::Source, 0.1, 100),
+    spec("q.rs", 1, None, Some(1), SourceRole::Source, 0.2, 100),
+    spec("r.rs", 1, Some(2), Some(3), SourceRole::Test, 0.3, 100),
+    Spec {
+        lsp: Some(1),
+        ..spec("s.rs", 1, None, None, SourceRole::Source, 0.4, 100)
+    },
+];
+
+#[test]
+fn replay_without_the_reranker_reorders_as_fusion_would_under_other_settings() {
+    // Dumped: R 2/62 + 1/63, P 2/61 + 0.004, then Q 1/61 + 0.004 and S
+    // 1/61 + 0.004 (equal scores: the path breaks the tie).
+    let arm = dump_arm(4, 4, 0, RerankMode::Replace);
+    let source = dump_of(&[dumped_query(
+        "weights",
+        &["p.rs"],
+        &WEIGHT_DUMP,
+        &arm,
+        RerankOutcome::Scored,
+        500.0,
+    )]);
+    let off = |options: ReplayOptions| {
+        let out = replayed(
+            &source,
+            ReplayOptions {
+                rerank_mode: Some(RerankMode::Off),
+                ..options
+            },
+        );
+        assert_eq!(out.replay.queries.refused, 0);
+        let query = out.report.queries[0].clone();
+        assert!(!query.reranked);
+        assert!(
+            query
+                .evidence
+                .iter()
+                .all(|row| row.reranker_score.is_none())
+        );
+        places(&query)
+    };
+    assert_eq!(
+        off(ReplayOptions::default()),
+        ["r.rs:1", "p.rs:1", "q.rs:1", "s.rs:1"]
+    );
+    // Lexical weight 4: Q 4/61 + 0.004 passes P.
+    assert_eq!(
+        off(ReplayOptions {
+            lexical_weight: Some(4.0),
+            ..ReplayOptions::default()
+        }),
+        ["r.rs:1", "q.rs:1", "p.rs:1", "s.rs:1"]
+    );
+    // LSP weight 3: S 3/61 + 0.004 passes R and P.
+    assert_eq!(
+        off(ReplayOptions {
+            lsp_weight: Some(3.0),
+            ..ReplayOptions::default()
+        }),
+        ["s.rs:1", "r.rs:1", "p.rs:1", "q.rs:1"]
+    );
+    // Semantic weight 0.5: P 0.5/61 + 0.004 falls behind Q and S (1/61 +
+    // 0.004); R is 0.5/62 + 1/63.
+    assert_eq!(
+        off(ReplayOptions {
+            semantic_weight: Some(0.5),
+            ..ReplayOptions::default()
+        }),
+        ["r.rs:1", "q.rs:1", "s.rs:1", "p.rs:1"]
+    );
+    // rrf_k 1 sharpens rank one: P 2/2 + 0.004 beats R 2/3 + 1/4.
+    assert_eq!(
+        off(ReplayOptions {
+            rrf_k: Some(1.0),
+            ..ReplayOptions::default()
+        }),
+        ["p.rs:1", "r.rs:1", "q.rs:1", "s.rs:1"]
+    );
+    // Source prior 0.05 lifts every `source` row but not R (a test file).
+    assert_eq!(
+        off(ReplayOptions {
+            prior: Some(0.05),
+            ..ReplayOptions::default()
+        }),
+        ["p.rs:1", "q.rs:1", "s.rs:1", "r.rs:1"]
+    );
+    // Source prior 0 removes the advantage the three source rows had over
+    // nothing: the order is unchanged here, but it is recomputed, not copied.
+    assert_eq!(
+        off(ReplayOptions {
+            prior: Some(0.0),
+            ..ReplayOptions::default()
+        }),
+        ["r.rs:1", "p.rs:1", "q.rs:1", "s.rs:1"]
+    );
+    // The window plays no part in the fused order.
+    assert_eq!(
+        off(ReplayOptions {
+            window: Some(1),
+            ..ReplayOptions::default()
+        }),
+        off(ReplayOptions::default())
+    );
+    // Settings given together compose: lexical weight 4 and prior 0.05 give
+    // Q 4/61 + 0.05, R 2/62 + 4/63, P 2/61 + 0.05 and S 1/61 + 0.05.
+    assert_eq!(
+        off(ReplayOptions {
+            lexical_weight: Some(4.0),
+            prior: Some(0.05),
+            ..ReplayOptions::default()
+        }),
+        ["q.rs:1", "r.rs:1", "p.rs:1", "s.rs:1"]
+    );
+}
+
+#[test]
+fn replay_round_trips_through_a_saved_report_and_compare_accepts_it() {
+    let arm = dump_arm(6, 6, 0, RerankMode::Replace);
+    let query = |text: &str, expected: &[&str], tags: &[&str]| {
+        let mut report = dumped_query(text, expected, &SIX, &arm, RerankOutcome::Scored, 900.0);
+        report.query.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+        report
+    };
+    let source = dump_of(&[
+        query("first", &["a.rs"], &["keyword"]),
+        query("second", &["d.rs"], &["keyword-agnostic"]),
+        query("third", &["missing.rs"], &["keyword"]),
+        skipped_query("ws", "fourth"),
+    ]);
+    let out = replayed(&source, ReplayOptions::default());
+
+    // Same evidence and metrics per query, and the same aggregate.
+    for (before, after) in source.queries.iter().zip(&out.report.queries) {
+        assert_eq!(after.evidence, before.evidence, "{}", before.query.query);
+        assert_eq!(after.metrics, before.metrics, "{}", before.query.query);
+        assert_eq!(after.skipped, before.skipped);
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.query.query, before.query.query);
+    }
+    let headline = |report: &AggregateReport| {
+        let mut value = serde_json::to_value(report).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "queries",
+            "median_latency_ms",
+            "p95_latency_ms",
+            "stage_latency",
+        ] {
+            object.remove(key);
+        }
+        value
+    };
+    assert_eq!(headline(&out.report), headline(&source));
+    assert_eq!(out.report.mrr, source.mrr);
+    assert_eq!(out.report.mean_ndcg_at_10, source.mean_ndcg_at_10);
+    assert_eq!(out.report.by_tag, source.by_tag);
+    assert_eq!(out.report.executed_count, 3);
+    assert_eq!(out.replay.queries.source_skipped, 1);
+
+    // Saved and loaded, `compare` pairs it with the real report: every
+    // metric ties.
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("dump.json");
+    let replay_path = temp.path().join("replay.json");
+    std::fs::write(&source_path, serde_json::to_string_pretty(&source).unwrap()).unwrap();
+    let from_file = replay_file(&source_path, &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        from_file.replay.source.as_deref(),
+        Some(source_path.display().to_string().as_str())
+    );
+    std::fs::write(
+        &replay_path,
+        serde_json::to_string_pretty(&from_file.to_json().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let comparison = compare_files(&source_path, &replay_path, &CompareOptions::default()).unwrap();
+    assert_eq!(comparison.paired, 3);
+    assert_eq!(
+        (comparison.skipped_pairs, comparison.unpaired_baseline),
+        (1, 0)
+    );
+    let overall = comparison.overall.unwrap();
+    assert_eq!((overall.wins, overall.losses, overall.ties), (0, 0, 3));
+    assert_eq!(overall.mrr.mean_delta, 0.0);
+    assert_eq!(overall.ndcg_at_10.mean_delta, 0.0);
+    // The replayed report is an ordinary report to the loader.
+    let loaded = load_report(&replay_path).unwrap();
+    assert_eq!(loaded.mrr, source.mrr);
+    assert_eq!(loaded.executed_count, 3);
+    // But not a dump: it carries no candidates to replay again.
+    let error = replay(&loaded, &ReplayOptions::default()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no candidate dump"),
+        "{error:#}"
+    );
+
+    // A refused query reads as skipped to `compare`.
+    let narrow = dump_arm(4, 3, 2, RerankMode::Replace);
+    let source = dump_of(&[
+        dumped_query(
+            "narrow",
+            &["b.rs"],
+            &SIX,
+            &narrow,
+            RerankOutcome::Scored,
+            900.0,
+        ),
+        dumped_query(
+            "small",
+            &["b.rs"],
+            &[A1, A20, B1],
+            &narrow,
+            RerankOutcome::Scored,
+            500.0,
+        ),
+    ]);
+    let out = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(6),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(out.replay.queries.refused, 1);
+    let comparison = compare(&source, &out.report, &CompareOptions::default());
+    assert_eq!(comparison.paired, 1);
+    assert_eq!(
+        (comparison.skipped_pairs, comparison.skipped_candidate),
+        (1, 1)
+    );
+}
+
+#[test]
+fn replay_estimates_reranking_latency_from_a_cost_model_fitted_on_the_dump() {
+    // Two queries whose measured rerank time is exactly 100 + 2 ms per
+    // estimated token: the 6-row pool holds 2100 tokens, the 3-row one 700.
+    let arm = dump_arm(6, 6, 0, RerankMode::Replace);
+    let source = dump_of(&[
+        dumped_query("big", &["a.rs"], &SIX, &arm, RerankOutcome::Scored, 4300.0),
+        dumped_query(
+            "small",
+            &["a.rs"],
+            &[A1, A20, B1],
+            &arm,
+            RerankOutcome::Scored,
+            1500.0,
+        ),
+    ]);
+    let out = replayed(&source, ReplayOptions::default());
+    let model = out.replay.latency.cost_model;
+    assert_eq!(model.basis, CostBasis::Fitted);
+    assert!((model.intercept_ms - 100.0).abs() < 1e-9, "{model:?}");
+    assert!((model.ms_per_token - 2.0).abs() < 1e-12, "{model:?}");
+    let fit = model.fit.unwrap();
+    assert!((fit.r_squared - 1.0).abs() < 1e-12);
+    assert_eq!(fit.samples, 2);
+    assert!(out.replay.latency.estimated);
+    assert!(out.replay.latency.note.contains("estimates"));
+
+    // At the dumped arm the estimate reproduces the measurement.
+    let timings = out.report.queries[0].timings.unwrap();
+    assert!((timings.reranking_ms - 4300.0).abs() < 1e-6);
+    assert!((timings.total_ms - 4321.0).abs() < 1e-6);
+    assert_eq!(timings.query_embedding_ms, 10.0);
+
+    // A window of three (A1 + A20 + B1 = 700 tokens) estimates 1500 ms and
+    // the total follows: dumped total 4321, minus 4300 measured, plus 1500.
+    let narrow = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(3),
+            ..ReplayOptions::default()
+        },
+    );
+    let timings = narrow.report.queries[0].timings.unwrap();
+    assert!((timings.reranking_ms - 1500.0).abs() < 1e-6, "{timings:?}");
+    assert!((timings.total_ms - 1521.0).abs() < 1e-6, "{timings:?}");
+    // Fusion-order arms spend nothing on the reranker.
+    let off = replayed(
+        &source,
+        ReplayOptions {
+            rerank_mode: Some(RerankMode::Off),
+            ..ReplayOptions::default()
+        },
+    );
+    let timings = off.report.queries[0].timings.unwrap();
+    assert_eq!(timings.reranking_ms, 0.0);
+    assert!((timings.total_ms - 21.0).abs() < 1e-6);
+    assert_eq!(
+        off.report.stage_latency.unwrap().reranking_ms.max,
+        0.0,
+        "the aggregate follows the estimates"
+    );
+    // The measurements stay under `replay.original`.
+    let original = &narrow.replay.original;
+    assert_eq!(original.query_timings.len(), 2);
+    assert_eq!(original.query_timings[0].timings.reranking_ms, 4300.0);
+    assert_eq!(original.query_timings[0].query, "big");
+    assert_eq!(original.query_timings[1].index, 1);
+    assert_eq!(original.median_latency_ms, source.median_latency_ms);
+    assert_eq!(original.stage_latency, source.stage_latency);
+}
+
+#[test]
+fn the_cost_model_falls_back_when_the_fit_is_weak_or_missing() {
+    let fallback_slope = 1000.0 / 290.0;
+    let check_fallback = |model: CostModel| {
+        assert_eq!(model.basis, CostBasis::Fallback);
+        assert_eq!(model.intercept_ms, 400.0);
+        assert!((model.ms_per_token - fallback_slope).abs() < 1e-12);
+        assert!((model.estimate_ms(2900) - (400.0 + 10_000.0)).abs() < 1e-9);
+    };
+
+    let exact = CostModel::from_samples(&[(0.0, 50.0), (100.0, 250.0), (400.0, 850.0)]);
+    assert_eq!(exact.basis, CostBasis::Fitted);
+    assert!((exact.intercept_ms - 50.0).abs() < 1e-9);
+    assert!((exact.ms_per_token - 2.0).abs() < 1e-12);
+    assert!((exact.estimate_ms(10) - 70.0).abs() < 1e-9);
+
+    // Time unrelated to the tokens: R^2 below one half.
+    let noisy = CostModel::from_samples(&[
+        (100.0, 900.0),
+        (200.0, 100.0),
+        (300.0, 800.0),
+        (400.0, 200.0),
+        (500.0, 700.0),
+    ]);
+    let fit = noisy.fit.unwrap();
+    assert!(fit.r_squared < MIN_R_SQUARED, "{fit:?}");
+    check_fallback(noisy);
+
+    // A strong fit with a negative slope is nonsense for a cost.
+    let falling = CostModel::from_samples(&[(100.0, 900.0), (200.0, 700.0), (300.0, 500.0)]);
+    assert!(falling.fit.unwrap().r_squared > 0.99);
+    check_fallback(falling);
+
+    // No points, one point, or no spread in the tokens: no fit at all.
+    for samples in [
+        &[][..],
+        &[(100.0, 500.0)][..],
+        &[(100.0, 500.0), (100.0, 700.0)][..],
+    ] {
+        let model = CostModel::from_samples(samples);
+        assert!(model.fit.is_none());
+        check_fallback(model);
+    }
+    // Equal times have no variance to explain.
+    let flat = CostModel::from_samples(&[(100.0, 500.0), (200.0, 500.0), (300.0, 500.0)]);
+    assert_eq!(flat.fit.unwrap().r_squared, 0.0);
+    check_fallback(flat);
+    // An estimate is never negative.
+    let steep = CostModel::from_samples(&[(100.0, 0.0), (200.0, 1000.0)]);
+    assert_eq!(steep.basis, CostBasis::Fitted);
+    assert_eq!(steep.estimate_ms(0), 0.0);
+
+    // End to end: a dump without reranker timings replays with the fallback.
+    let arm = dump_arm(6, 6, 0, RerankMode::Replace);
+    let mut query = dumped_query("untimed", &["a.rs"], &SIX, &arm, RerankOutcome::Scored, 0.0);
+    query.timings = None;
+    let out = replayed(&dump_of(&[query]), ReplayOptions::default());
+    assert_eq!(out.replay.latency.cost_model.basis, CostBasis::Fallback);
+    assert!(out.report.queries[0].timings.is_none());
+    assert!(out.render_summary().contains("ESTIMATED"));
+}
+
+#[test]
+fn replay_carries_over_skipped_and_failed_queries_and_refuses_undumped_ones() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let make = |text: &str| dumped_query(text, &["b.rs"], &SIX, &arm, RerankOutcome::Scored, 900.0);
+    let skipped = skipped_query("ws", "skipped upstream");
+    let failed = QueryReport::failed(
+        compare_query("ws", "search failed", &[]),
+        "search failed: boom".to_owned(),
+    );
+    // A real search that was not dumped: it has timings but no arm.
+    let mut undumped = make("undumped");
+    undumped.candidates.clear();
+    undumped.arm = None;
+    undumped.rerank_outcome = None;
+    let source = dump_of(&[make("dumped"), skipped, failed, undumped]);
+    let out = replayed(&source, ReplayOptions::default());
+    assert_eq!(
+        out.replay.queries,
+        ReplayCounts {
+            total: 4,
+            replayed: 1,
+            refused: 1,
+            source_skipped: 1,
+            source_failed: 1,
+        }
+    );
+    assert_eq!(
+        out.replay.refused,
+        BTreeMap::from([(ReplayRefusal::NotDumped, 1)])
+    );
+    assert_eq!(
+        out.report.queries[1].reason,
+        "optional workspace not provided"
+    );
+    assert_eq!(out.report.queries[1].replay_refusal, None);
+    assert_eq!(out.report.queries[2].outcome, "failure");
+    assert_eq!(out.report.queries[2].reason, "search failed: boom");
+    assert!(!out.report.queries[2].skipped);
+    assert_eq!(
+        out.report.queries[3].replay_refusal,
+        Some(ReplayRefusal::NotDumped)
+    );
+    assert!(out.report.queries[3].skipped);
+    assert_eq!(out.report.failure_count, 1, "only the failed search");
+
+    // No dump anywhere is an error, not a pile of refusals.
+    let plain = dump_of(&[QueryReport::failed(
+        compare_query("ws", "x", &[]),
+        "y".to_owned(),
+    )]);
+    let error = replay(&plain, &ReplayOptions::default()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("--dump-candidates"),
+        "{error:#}"
+    );
+
+    // Queries dumped under different arms cannot share one replayed arm.
+    let other = dump_arm(5, 3, 2, RerankMode::Replace);
+    let mixed = dump_of(&[
+        make("one"),
+        dumped_query("two", &["b.rs"], &SIX, &other, RerankOutcome::Scored, 900.0),
+    ]);
+    let error = replay(&mixed, &ReplayOptions::default()).unwrap_err();
+    assert!(format!("{error:#}").contains("different arms"), "{error:#}");
+    // Their result windows may differ.
+    let other_k = CandidateArm {
+        k: 2,
+        ..arm.clone()
+    };
+    let same_arm = dump_of(&[
+        make("one"),
+        dumped_query(
+            "two",
+            &["b.rs"],
+            &SIX,
+            &other_k,
+            RerankOutcome::Scored,
+            900.0,
+        ),
+    ]);
+    let out = replayed(&same_arm, ReplayOptions::default());
+    assert_eq!(out.report.queries[0].evidence.len(), 3);
+    assert_eq!(out.report.queries[1].evidence.len(), 2);
+    assert_eq!(out.replay.queries.refused, 0);
+}
+
+#[test]
+fn replay_options_are_validated_and_default_to_the_dumped_arm() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let resolve = |options: ReplayOptions| options.resolve(&arm);
+    let resolved = resolve(ReplayOptions::default()).unwrap();
+    assert_eq!(resolved.window, 4);
+    assert_eq!(resolved.fusion, arm.fusion);
+    assert_eq!(resolved.rrf_k, 60.0);
+    assert_eq!(resolved.cap_stage, CapStage::Shortlist);
+    assert_eq!(resolved.rerank_mode, RerankMode::Replace);
+    assert_eq!((resolved.source_prior, resolved.vote_weight), (None, None));
+
+    let with = |change: fn(&mut ReplayOptions)| {
+        let mut options = ReplayOptions::default();
+        change(&mut options);
+        options
+    };
+    let bad = [
+        with(|o| o.window = Some(0)),
+        with(|o| o.cap = Some(101)),
+        with(|o| o.rrf_k = Some(0.0)),
+        with(|o| o.rrf_k = Some(f32::NAN)),
+        with(|o| o.semantic_weight = Some(0.0)),
+        with(|o| o.lexical_weight = Some(-1.0)),
+        with(|o| o.lsp_weight = Some(f32::INFINITY)),
+        with(|o| o.prior = Some(-0.1)),
+        // Vote needs its weight, and the weight needs vote.
+        with(|o| o.rerank_mode = Some(RerankMode::Vote)),
+        with(|o| o.vote_weight = Some(1.0)),
+        with(|o| {
+            o.rerank_mode = Some(RerankMode::Vote);
+            o.vote_weight = Some(-1.0);
+        }),
+    ];
+    for options in bad {
+        assert!(resolve(options).is_err(), "{options:?}");
+    }
+    let good = [
+        with(|o| o.cap = Some(0)),
+        with(|o| o.cap = Some(100)),
+        with(|o| o.prior = Some(0.0)),
+        with(|o| {
+            o.rerank_mode = Some(RerankMode::Vote);
+            o.vote_weight = Some(0.0);
+        }),
+    ];
+    for options in good {
+        assert!(resolve(options).is_ok(), "{options:?}");
+    }
+
+    assert_eq!("shortlist".parse::<CapStage>(), Ok(CapStage::Shortlist));
+    assert_eq!("results".parse::<CapStage>(), Ok(CapStage::Results));
+    assert!("both".parse::<CapStage>().is_err());
+    for (text, mode) in [
+        ("replace", RerankMode::Replace),
+        ("vote", RerankMode::Vote),
+        ("off", RerankMode::Off),
+    ] {
+        assert_eq!(text.parse::<RerankMode>(), Ok(mode));
+        assert_eq!(mode.as_str(), text);
+    }
+    assert!("margin".parse::<RerankMode>().is_err());
+}
+
+#[test]
+fn the_replay_block_and_refusal_flag_are_written_into_the_report_json() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let source = dump_of(&[
+        dumped_query("wide", &["b.rs"], &SIX, &arm, RerankOutcome::Scored, 900.0),
+        dumped_query(
+            "small",
+            &["b.rs"],
+            &[A1, A20, B1],
+            &arm,
+            RerankOutcome::Scored,
+            500.0,
+        ),
+    ]);
+    let out = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(5),
+            semantic_weight: Some(3.0),
+            ..ReplayOptions::default()
+        },
+    );
+    let json = out.to_json().unwrap();
+    let block = &json["replay"];
+    assert_eq!(block["arm"]["window"], 5);
+    assert_eq!(block["arm"]["cap_stage"], "shortlist");
+    assert_eq!(block["arm"]["rerank_mode"], "replace");
+    assert_eq!(block["arm"]["fusion"]["semantic_weight"], 3.0);
+    assert_eq!(block["dumped_arm"]["rerank_candidate_count"], 4);
+    assert_eq!(block["dumped_arm"]["fusion"]["semantic_weight"], 2.0);
+    assert_eq!(block["queries"]["refused"], 1);
+    assert_eq!(block["refused"]["unscored_window"], 1);
+    assert_eq!(block["refused_queries"][0]["query"], "wide");
+    assert_eq!(block["refused_queries"][0]["reason"], "unscored_window");
+    assert_eq!(block["latency"]["estimated"], true);
+    assert_eq!(block["latency"]["cost_model"]["basis"], "fitted");
+    assert_eq!(
+        block["original"]["query_timings"][0]["timings"]["reranking_ms"],
+        900.0
+    );
+    assert_eq!(json["queries"][0]["replay_refusal"], "unscored_window");
+    assert_eq!(json["queries"][0]["outcome"], "skipped");
+    assert_eq!(json["queries"][0]["skipped"], true);
+    assert!(json["queries"][1].get("replay_refusal").is_none());
+    // Replay outputs carry no dump of their own.
+    for query in json["queries"].as_array().unwrap() {
+        for key in ["candidates", "arm", "rerank_outcome", "notes"] {
+            assert!(query.get(key).is_none(), "{key}");
+        }
+    }
+    // The block reads back unchanged.
+    let back: ReplayBlock = serde_json::from_value(block.clone()).unwrap();
+    assert_eq!(back, out.replay);
+    // And the report part is an ordinary report.
+    let loaded: AggregateReport = serde_json::from_value(json).unwrap();
+    assert_eq!(loaded.executed_count, 1);
+    assert_eq!(loaded.skipped_count, 1);
+}
+
+#[test]
+fn replay_breaks_reranker_ties_by_position_in_the_replayed_window() {
+    // The reranker scores both candidates 0.7. Dumped, z.rs fuses ahead of
+    // a.rs (2/62 + 0.004 against 2/61), so z.rs was request index 0 and wins
+    // the tie; path order would put a.rs first.
+    let z = spec("z.rs", 1, Some(2), None, SourceRole::Source, 0.7, 100);
+    let a = spec("a.rs", 1, Some(1), None, SourceRole::Test, 0.7, 100);
+    let arm = dump_arm(2, 2, 0, RerankMode::Replace);
+    let source = dump_of(&[dumped_query(
+        "tie",
+        &["a.rs"],
+        &[z, a],
+        &arm,
+        RerankOutcome::Scored,
+        500.0,
+    )]);
+    assert_eq!(places(&source.queries[0]), ["z.rs:1", "a.rs:1"]);
+    let same = replayed(&source, ReplayOptions::default());
+    assert_eq!(same.report.queries[0].evidence, source.queries[0].evidence);
+
+    // Without the source prior a.rs fuses first, becomes request index 0, and
+    // now wins the tie: the position is the replayed one, not the dumped one.
+    let flipped = replayed(
+        &source,
+        ReplayOptions {
+            prior: Some(0.0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(places(&flipped.report.queries[0]), ["a.rs:1", "z.rs:1"]);
+    assert_eq!(
+        flipped.report.queries[0].metrics.first_expected_rank,
+        Some(1)
+    );
 }

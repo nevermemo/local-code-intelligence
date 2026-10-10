@@ -23,6 +23,24 @@ Use the checked-in portable definitions and supply local workspace mappings at r
 8. Inspect path, line, role, and bounded source evidence for every failure; aggregate metrics alone do not prove correctness.
 9. Save reports under `test-results/` and keep them out of commits. Name them so the pair is obvious (`<change>-baseline-rerank-on.json`, `<change>-after-rerank-off.json`).
 
+## Replaying a dump instead of running live
+
+`evaluate --dump-candidates` records every query's whole fused candidate pool, the dumped configuration (`arm`), and the reranker's scores; `<bin> replay dump.json --output <file> [options]` then scores other settings from that file in seconds, offline (no services, config, or index), through the unchanged metrics. Its output is an evaluate-shaped report, so `<bin> compare dump.json <file>` pairs it with real reports and with other replays. Run one dump live; replay the grid.
+
+Replay when the question is a pure function of the dumped pool and scores, so both arms share identical candidates (which also removes run-to-run LSP coverage differences):
+
+- the rerank window (`--window`), the per-file cap and where it runs (`--cap`, `--cap-stage shortlist|results`);
+- fusion weights, `rrf_k`, and the source-role prior (`--semantic-weight`, `--lexical-weight`, `--lsp-weight`, `--rrf-k`, `--prior`) with `--rerank-mode off`, which is fusion order alone;
+- how the reranker's scores are used (`--rerank-mode replace|vote|off`, `--vote-weight`).
+
+Run live when anything the dump cannot hold changes: `rerank_document_max_bytes`, the reranker model or instruction, the query instruction, chunking, embedding, a window or channel depth larger than the dump took, or a new channel. Run live too for the final acceptance of a replayed winner (one live run of the adopted setting, compared with `compare`) and for every latency claim: replayed `reranking_ms` and `total_ms` are labelled cost-model estimates (`replay.latency`; the fit and its R^2 are reported), the measured timings stay under `replay.original`.
+
+Taking the dump: use a frozen binary and a scratch configuration with `rerank_candidate_count` as large as the largest window you will replay (at most 200) and, to replay either cap stage or other caps, `[fusion] max_chunks_per_file = 0`; a replayed window can only be scored where the dump sent the candidates to the reranker. Before trusting a grid, check determinism: `<bin> replay dump.json --output same.json` (every setting left out keeps the dumped value) must reproduce the dump's evidence and metrics, so `compare dump.json same.json` shows all ties, zero refused queries, and zero `replay.past_window_queries` (production returns at most the window, so with a window smaller than `k` replay returns more rows and counts those queries). A failed determinism check is a defect in replay, not a result.
+
+What is exact: any window up to the dumped shortlist; the per-file cap at either stage; any weights, `rrf_k`, or prior under `--rerank-mode off`; and `replace`/`vote` over candidates the dump scored (the reranker scores each query-document pair independently, so a score does not depend on its neighbours). What is refused, per query and never approximated: a reranked window holding an unscored candidate (`unscored_window`), a reranked arm over a dump whose reranker failed or was off (`rerank_not_scored`), a dump whose fusion or cap does not reproduce at its own arm (`fusion_mismatch`, `shortlist_mismatch`), and a query with no dump (`not_dumped`). Refused queries are written as skipped with a `replay_refusal`, counted in `replay.refused`, and listed in `replay.refused_queries`; `compare` excludes them from every pair, so read its `paired` and skipped counts and report the refused counts with any replayed result. If a refusal differs between the arms you are comparing, the pairs are different query sets: compare each arm against the dumped arm replayed over the same queries.
+
+Pre-register the grid before looking at results, select on one half of the queries, confirm on the other, and apply the decision rule below to the paired intervals as for live arms. Replay does not replace the checks in steps 6 to 8 for the adopted setting; it decides which settings deserve a live run.
+
 ## Operating constraints
 
 - Run live evaluations sequentially, never in parallel. The reranker on the shared iGPU is the bottleneck: a reranked query with 24 candidates takes roughly 25-90 s on the current development machine (median about 30 s), so `evaluations/core.toml`'s self set runs for several minutes per binary.

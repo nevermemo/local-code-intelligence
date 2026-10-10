@@ -758,3 +758,326 @@ async fn evaluate_dump_candidates_writes_the_dump_through_the_command_line_only_
     assert_eq!(plain_query["metrics"], dumped_query["metrics"]);
     task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// `replay`: offline scoring of other arms from a candidate dump, checked
+// against live searches of the same pool.
+// ---------------------------------------------------------------------------
+
+use local_code_intelligence::evaluate::{
+    AggregateReport, CapStage, CompareOptions, ReplayOptions, ReplayRefusal, compare_files, replay,
+    replay_file, report_with_comparison,
+};
+
+/// A definition over the dump workspace with three queries, one per entry of
+/// `top_ks`. A `top_k` within the shortlist of four makes replay at the dumped
+/// arm exact; `None` takes the default of eight, more than production returns
+/// from a shortlist of four.
+fn replay_definition(top_ks: [Option<usize>; 3]) -> EvaluationFile {
+    let mut definition = dump_definition();
+    definition.workspaces.truncate(1);
+    definition.queries.truncate(1);
+    for (index, text) in ["translator_two", "translator"].into_iter().enumerate() {
+        let mut query = definition.queries[0].clone();
+        query.query = text.to_owned();
+        query.tags = vec![format!("tag{index}")];
+        definition.queries.push(query);
+    }
+    for (query, top_k) in definition.queries.iter_mut().zip(top_ks) {
+        query.top_k = top_k;
+    }
+    definition
+}
+
+/// The report as `evaluate --output` writes it, saved to `path`.
+fn save_report(report: &AggregateReport, path: &Path) {
+    let json = serde_json::to_string_pretty(&report_with_comparison(report, None).unwrap());
+    std::fs::write(path, json.unwrap()).unwrap();
+}
+
+fn dump_mappings(workspace: &Path) -> Vec<local_code_intelligence::evaluate::WorkspaceMapping> {
+    parse_workspace_mappings(&[format!("dump={}", workspace.display())]).unwrap()
+}
+
+/// Index a fresh dump workspace under `config` and run the definition once,
+/// with or without the candidate dump. The application is dropped on return
+/// so that another one can open the same data directory.
+async fn live_run(
+    temp: &Path,
+    config: &Config,
+    definition: &EvaluationFile,
+    dump_candidates: bool,
+) -> AggregateReport {
+    let workspace = temp.join("dump-replay");
+    if !workspace.exists() {
+        write_dump_workspace(&workspace);
+    }
+    let app = App::open(config.clone()).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    run_evaluation_with_options(
+        &app,
+        definition,
+        &dump_mappings(&workspace),
+        RunOptions { dump_candidates },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn replay_at_the_dumped_arm_reproduces_a_live_search_exactly() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let definition = replay_definition([Some(3), Some(4), Some(2)]);
+    let dumped = live_run(temp.path(), &config, &definition, true).await;
+    assert!(
+        dumped
+            .queries
+            .iter()
+            .all(|query| query.candidates.len() == 7)
+    );
+
+    // Through the file the command line reads (f32 scores travel as f64).
+    let saved = temp.path().join("dump.json");
+    save_report(&dumped, &saved);
+    let replayed = replay_file(&saved, &ReplayOptions::default()).unwrap();
+
+    // Fusion, the per-file cap, and the shortlist cut of the live search
+    // reproduce bit for bit, so nothing is refused...
+    assert_eq!(replayed.replay.queries.replayed, 3);
+    assert_eq!(replayed.replay.queries.refused, 0, "{:?}", replayed.replay);
+    assert_eq!(replayed.replay.past_window_queries, 0);
+    // ...and the replayed results and metrics are the live ones.
+    for (live, replay) in dumped.queries.iter().zip(&replayed.report.queries) {
+        assert_eq!(replay.evidence, live.evidence, "{}", live.query.query);
+        assert_eq!(replay.metrics, live.metrics, "{}", live.query.query);
+        assert_eq!(replay.reranked, live.reranked);
+        assert_eq!(replay.outcome, live.outcome);
+        assert!(replay.reranked && replay.metrics.success);
+    }
+    assert_eq!(replayed.report.mrr, dumped.mrr);
+    assert_eq!(replayed.report.mean_ndcg_at_10, dumped.mean_ndcg_at_10);
+    assert_eq!(replayed.report.by_tag, dumped.by_tag);
+    assert_eq!(replayed.report.success_count, dumped.success_count);
+    assert_eq!(replayed.replay.dumped_arm.rerank_candidate_count, 4);
+    assert_eq!(replayed.replay.arm.window, 4);
+
+    // A window of two keeps the leading two reranked and appends the rest of
+    // the fused order after them.
+    let narrow = replay_file(
+        &saved,
+        &ReplayOptions {
+            window: Some(2),
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(narrow.replay.queries.refused, 0);
+    assert_eq!(narrow.report.queries[0].evidence.len(), 3);
+
+    // Production returns only the reranked shortlist, so a result window
+    // larger than it (the default of eight against a shortlist of four) is
+    // where replay differs: it appends the fused tail, and says so.
+    let wide = live_run(temp.path(), &config, &replay_definition([None; 3]), true).await;
+    let wide_replay = replay(&wide, &ReplayOptions::default()).unwrap();
+    assert_eq!(wide_replay.replay.queries.refused, 0);
+    assert_eq!(wide_replay.replay.past_window_queries, 3);
+    for (live, replay) in wide.queries.iter().zip(&wide_replay.report.queries) {
+        assert_eq!(live.evidence.len(), 4);
+        assert_eq!(replay.evidence.len(), 7);
+        assert_eq!(replay.evidence[..4], live.evidence[..]);
+        assert!(
+            replay.evidence[4..]
+                .iter()
+                .all(|row| row.reranker_score.is_none())
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn replay_without_the_reranker_ranks_as_a_live_search_under_other_fusion_settings() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    // Production returns at most the shortlist of four even without the
+    // reranker, so the result windows stay within it.
+    let definition = replay_definition([Some(3), Some(4), Some(4)]);
+    let dumped = live_run(temp.path(), &config, &definition, true).await;
+
+    // A live run of other settings: no reranker, no per-file cap, other
+    // weights and rrf_k, on the same index.
+    let mut other = config.clone();
+    other.channels.reranker = false;
+    other.fusion.max_chunks_per_file = 0;
+    other.fusion.semantic_weight = 1.5;
+    other.fusion.lexical_weight = 3.0;
+    other.rrf_k = 20.0;
+    let live = live_run(temp.path(), &other, &definition, false).await;
+    let replayed = replay(
+        &dumped,
+        &ReplayOptions {
+            cap: Some(0),
+            semantic_weight: Some(1.5),
+            lexical_weight: Some(3.0),
+            rrf_k: Some(20.0),
+            rerank_mode: Some(RerankMode::Off),
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(replayed.replay.queries.refused, 0);
+    assert_eq!(replayed.replay.past_window_queries, 0);
+    for (live, replay) in live.queries.iter().zip(&replayed.report.queries) {
+        assert!(!live.evidence.is_empty());
+        assert_eq!(replay.evidence, live.evidence, "{}", live.query.query);
+        assert_eq!(replay.metrics, live.metrics, "{}", live.query.query);
+        assert!(!replay.reranked && !live.reranked);
+    }
+    assert_eq!(replayed.report.mrr, live.mrr);
+    // The comparison would pass vacuously if the settings changed nothing.
+    let places = |report: &AggregateReport| -> Vec<Vec<(String, u32)>> {
+        report
+            .queries
+            .iter()
+            .map(|query| {
+                query
+                    .evidence
+                    .iter()
+                    .map(|row| (row.relative_file_path.clone(), row.start_line))
+                    .collect()
+            })
+            .collect()
+    };
+    assert_ne!(places(&live), places(&dumped));
+
+    // Dropping the cap with the reranker kept would put chunks into the
+    // window that the dump (cap 2, shortlist 4) never sent to the reranker,
+    // so replay refuses rather than guessing their scores.
+    let uncapped = replay(
+        &dumped,
+        &ReplayOptions {
+            cap: Some(0),
+            cap_stage: Some(CapStage::Results),
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(uncapped.replay.queries.refused, 3);
+    assert_eq!(
+        uncapped.replay.refused.get(&ReplayRefusal::UnscoredWindow),
+        Some(&3)
+    );
+    assert_eq!(uncapped.report.executed_count, 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_replay_subcommand_runs_offline_and_its_report_pairs_with_compare() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let definition = replay_definition([Some(3), Some(4), Some(2)]);
+    let dumped = live_run(temp.path(), &config, &definition, true).await;
+    save_report(&dumped, &temp.path().join("dump.json"));
+    let plain = live_run(temp.path(), &config, &definition, false).await;
+    save_report(&plain, &temp.path().join("plain.json"));
+    let binary = env!("CARGO_BIN_EXE_local-code-intelligence");
+    let run = |args: &[&str]| {
+        std::process::Command::new(binary)
+            .current_dir(temp.path())
+            // The configuration named here does not exist: `replay` must not
+            // load it, open an index, or contact a service.
+            .args(["--config", "no-such-config.toml"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let output = run(&[
+        "replay",
+        "dump.json",
+        "--output",
+        "replayed.json",
+        "--window",
+        "2",
+        "--cap",
+        "0",
+        "--cap-stage",
+        "results",
+        "--rerank-mode",
+        "vote",
+        "--vote-weight",
+        "2",
+        // The dumped values, spelled out: the options parse and change nothing.
+        "--prior",
+        "0.004",
+        "--semantic-weight",
+        "2",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Replay of dump.json"), "{stdout}");
+    assert!(stdout.contains("window 2, cap 0 (results)"), "{stdout}");
+    assert!(stdout.contains("vote weight 2"), "{stdout}");
+    assert!(stdout.contains("ESTIMATED"), "{stdout}");
+    let replayed: Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("replayed.json")).unwrap())
+            .unwrap();
+    assert_eq!(replayed["replay"]["source"], "dump.json");
+    assert_eq!(replayed["replay"]["arm"]["cap_stage"], "results");
+    assert_eq!(replayed["replay"]["arm"]["rerank_mode"], "vote");
+    assert_eq!(replayed["replay"]["arm"]["vote_weight"], 2.0);
+    assert_eq!(replayed["replay"]["queries"]["replayed"], 3);
+    assert_eq!(replayed["replay"]["latency"]["estimated"], true);
+    assert_eq!(replayed["query_count"], 3);
+
+    // `compare` pairs the replayed report with the real one.
+    let comparison = compare_files(
+        &temp.path().join("dump.json"),
+        &temp.path().join("replayed.json"),
+        &CompareOptions::default(),
+    )
+    .unwrap();
+    assert_eq!((comparison.paired, comparison.unpaired_baseline), (3, 0));
+    let compared = run(&["compare", "dump.json", "replayed.json"]);
+    assert!(compared.status.success());
+    assert!(String::from_utf8_lossy(&compared.stdout).contains("pairs: 3"));
+
+    // Without --output only the summary is printed, and the defaults are the
+    // dumped arm.
+    let summary = run(&["replay", "dump.json"]);
+    assert!(summary.status.success());
+    let summary = String::from_utf8_lossy(&summary.stdout);
+    assert!(summary.contains("replayed 3 | refused 0"), "{summary}");
+
+    // Bad usage and unreadable input fail with a message.
+    for (args, message) in [
+        (vec!["replay", "dump.json", "--vote-weight", "1"], "vote"),
+        (vec!["replay", "dump.json", "--rerank-mode", "vote"], "vote"),
+        (vec!["replay", "dump.json", "--window", "0"], "at least 1"),
+        (vec!["replay", "dump.json", "--cap", "101"], "0..=100"),
+        (
+            vec!["replay", "dump.json", "--semantic-weight", "0"],
+            "greater than zero",
+        ),
+        (
+            vec!["replay", "dump.json", "--cap-stage", "never"],
+            "cap stage",
+        ),
+        (vec!["replay", "absent.json"], "absent.json"),
+        // A report made without --dump-candidates has nothing to replay.
+        (vec!["replay", "plain.json"], "--dump-candidates"),
+    ] {
+        let failed = run(&args);
+        assert!(!failed.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains(message),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+    }
+    task.abort();
+}
