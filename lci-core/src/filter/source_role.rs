@@ -248,6 +248,27 @@ fn is_test_file_name(file_name: &str) -> bool {
     {
         return true;
     }
+    // Rust: `tests.rs` (the out-of-line `#[cfg(test)] mod tests;`),
+    // `test_*.rs`, `*_test.rs`, `*_tests.rs`. Integration tests under any
+    // `tests/` directory are already caught by the directory rule, and
+    // `benches/` / `examples/` map to the benchmark / example roles.
+    //
+    // A bare `test.rs` deliberately stays `source`: unlike `tests.rs` it has
+    // no test-module convention, and it is a legitimate production module
+    // name (this repository's `xtask/src/test.rs` implements the
+    // `cargo xtask test` command). A `test.rs` inside a `test/` or `tests/`
+    // directory is still a test through the directory rule. Test code in an
+    // inline `#[cfg(test)] mod tests { .. }` block inside a source file
+    // cannot be classified from the path; that is chunk-level information,
+    // not a file role.
+    if file_name.strip_suffix(".rs").is_some_and(|stem| {
+        stem == "tests"
+            || stem.starts_with("test_")
+            || stem.ends_with("_test")
+            || stem.ends_with("_tests")
+    }) {
+        return true;
+    }
     if file_name.strip_suffix(".cs").is_some_and(|stripped| {
         stripped.ends_with("Tests") || stripped.ends_with("Test") || stripped.ends_with(".Tests")
     }) {

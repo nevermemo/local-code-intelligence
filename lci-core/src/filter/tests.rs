@@ -226,6 +226,92 @@ fn test_name_rules_do_not_catch_lookalike_production_files() {
 }
 
 #[test]
+fn classifies_rust_test_files_by_name() {
+    for path in [
+        "tests.rs",
+        "lci-core/src/filter/tests.rs",
+        "src/evaluate/tests.rs",
+        "src/test_config.rs",
+        "src/config_test.rs",
+        "src/config_tests.rs",
+        "lci-core/src/app/search_tests.rs",
+        r"src\evaluate\tests.rs",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Test, "{path}");
+    }
+}
+
+#[test]
+fn rust_test_name_rules_do_not_catch_lookalike_production_files() {
+    for path in [
+        "src/attest.rs",
+        "src/attests.rs",
+        "src/latest.rs",
+        "src/contest.rs",
+        "src/contest_utils.rs",
+        "src/testing.rs",
+        "src/tester.rs",
+        "src/testsuite.rs",
+        "src/protest.rs",
+        "src/lib.rs",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Source, "{path}");
+    }
+}
+
+#[test]
+fn a_bare_test_rs_is_a_production_module_unless_a_test_directory_says_otherwise() {
+    // `xtask/src/test.rs` implements the `cargo xtask test` command, so a
+    // bare `test.rs` carries no test-module convention and stays source.
+    assert_eq!(
+        classify_source_role("xtask/src/test.rs"),
+        SourceRole::Source
+    );
+    assert_eq!(classify_source_role("src/test.rs"), SourceRole::Source);
+    // The directory rule still applies to it.
+    assert_eq!(classify_source_role("tests/test.rs"), SourceRole::Test);
+    assert_eq!(classify_source_role("src/test/test.rs"), SourceRole::Test);
+}
+
+#[test]
+fn rust_tests_directories_count_at_any_depth() {
+    for path in [
+        "tests/it.rs",
+        "xtask/tests/cli.rs",
+        "crates/foo/tests/common/mod.rs",
+        "crates/foo/src/store/tests/basic.rs",
+    ] {
+        assert_eq!(classify_source_role(path), SourceRole::Test, "{path}");
+    }
+}
+
+#[test]
+fn rust_benches_and_examples_keep_their_own_roles() {
+    for path in ["benches/search.rs", "crates/foo/benches/search.rs"] {
+        assert_eq!(classify_source_role(path), SourceRole::Benchmark, "{path}");
+    }
+    for path in ["examples/demo.rs", "crates/foo/examples/demo.rs"] {
+        assert_eq!(classify_source_role(path), SourceRole::Example, "{path}");
+    }
+    // Test beats benchmark, and generated beats test.
+    assert_eq!(classify_source_role("benches/tests.rs"), SourceRole::Test);
+    assert_eq!(
+        classify_source_role("generated/tests.rs"),
+        SourceRole::Generated
+    );
+}
+
+#[test]
+fn inline_rust_test_modules_are_not_a_path_level_role() {
+    // Test code in a `#[cfg(test)] mod tests { .. }` block lives in an
+    // ordinary source file. The path cannot tell; that is chunk-level.
+    assert_eq!(
+        classify_source_role("lci-core/src/filter/source_role.rs"),
+        SourceRole::Source
+    );
+}
+
+#[test]
 fn classifies_gradle_and_android_test_source_sets() {
     assert_eq!(
         classify_source_role("app/src/androidTest/java/com/acme/LoaderInstrumented.java"),
