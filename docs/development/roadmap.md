@@ -103,6 +103,7 @@ first.
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
 | E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | ready | M | E1 |
+| E2b | Mined-set hygiene: `gold-drift` flag and subject-length axis; strata on the clean subset | ready | S | E2 |
 | R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
 | R3 | Reranker as a weighted RRF vote instead of a replacement | ready | S | E3 |
@@ -167,6 +168,7 @@ first.
 - Scope: an opt-in diagnostic on the search report (e.g. `SearchReport.candidates` populated only when an evaluation flag/config asks for it) in `src/app/search.rs`, surfaced by `src/evaluate/runner.rs` into the JSON report; no ranking change; MCP/REST output unchanged by default. Add a small replay script or xtask subcommand later (separate item) that recomputes metrics for alternative orders from the dump.
 - Accept: mock integration test that the dump contains every shortlisted candidate with both scores and is absent by default; one live `evaluate` run produces it.
 - Risk: keep it out of default responses (token budget for agents).
+- Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): priority raised -- two explorers could not separate semantic misses from lexical noise or reranker demotions without channel ranks in the report.
 
 ### E1 - Richer evaluation metrics
 `done` (2a0b9ad) - S - deps: none - skill: `lci-retrieval-evaluation`
@@ -181,6 +183,7 @@ first.
 - Scope: new `xtask/src/mine.rs` + `cargo xtask mine-queries --repo <path> --key <workspace-key> --out evaluations/mined/<key>.toml --max 300` using `git log --no-merges --name-status --format=...` through `std::process` (no new crates). Rules: skip merges/reverts, lockfiles, vendored paths, commits touching >10 or 0 supported-extension files, subjects under 4 words; `expected_paths` = touched files that still exist at HEAD (document that evaluation runs at HEAD, an approximation; see Investigations I-6 for the parent-commit variant). Add optional `tags: Vec<String>` to `EvalQuery` (`src/evaluate/types.rs`) and per-tag aggregates; tag each query `keyword` (subject contains a touched file stem or an identifier from the diff header) or `keyword-agnostic`. Commit a mined set for `self` (this repo).
 - Accept: unit tests for the filters and tagging on synthetic log output; the committed `evaluations/mined/self.toml` validates with `evaluate` (expected paths exist); README documents the command and the HEAD approximation; `.lciignore` unaffected (evaluations are TOML, not indexed).
 - Risk: evaluation must never feed ranking (skill rule); mined files are data, not tuning targets. Keep `core.toml` as the required hand-written set.
+- Follow-up (explorer, 2026-10-10): 5 of the 8 keyword-agnostic queries are gold noise (split files such as `src/app.rs`, churn dominated by dropped `.ps1`/docs, 13-file commits), and the stratum is really "short subject" (mean 10.5 words vs 32.8). New item E2b: flag `gold-drift` when dropped, split or unsupported files carry > 50% of a commit's churn, add a subject-length axis, and report strata on the clean subset.
 
 ### E3 - Paired comparison and arm toggles
 `ready` - M - deps: E1 - skill: `lci-retrieval-evaluation`
@@ -286,6 +289,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Scope: emit relative paths from `rg` (no per-line canonicalize); an interval index (per-file sorted ranges + binary search) in `map_lexical_matches` and `map_lsp_locations`; `rg` flags aligned with the scanner (`--hidden --no-require-git --ignore-file .lciignore --no-config`); a timeout and stdout cap on the lexical channel; pick the newest bundled `rg` by version, not name; split `lexical_search_ms` into spawn/search/parse/map or at least time the mapping.
 - Accept: unit tests for the interval mapping and the path handling (incl. Windows separators); existing lexical/integration tests pass; a debug-binary `core.toml` run shows identical first-expected ranks and lower `lexical_search_ms`/total residual (report names in the commit).
 - Risk: changing the ignore flags changes which files can produce lexical hits; verify with the multilingual acceptance fixture.
+- Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): `lexical::terms()` keeps the 12 *longest* terms, so short decisive words are dropped ("idle", "retry", "lsp" in one query); matching is substring and ranking is matching-line count with no IDF, so generic verbs ("add" hit 45 of 78 files) pull C/Go test chunks into the reranker's 24 slots. Fold into L0/L2: choose terms by rarity (document frequency) instead of length, drop terms matching more than ~25% of files, and add generic English verbs to the stop list. Evaluate with the reranker off (fast since R7) on both strata and `core.toml`; never tune on mined paths.
 
 ### L1 - Lexical engine spike
 `research` - M - deps: E2, E3 - skill: `lci-retrieval-evaluation`
@@ -329,6 +333,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Scope: `document_text(chunk, role)` in `lci-core/src/chunk.rs`: `"// {path} | {language} | {kind} {enclosing}::{symbol} | {signature} | role={role}\n{code}"`, bounded (~200 B header); used by `src/app/indexing.rs` for embedding, by `rerank_into_report` (header + `head_within(code)`), and by L4's BM25 column; rename `DOCUMENT_FORMAT_VERSION` to `"chunks-with-header-v2"` (one full re-embed per workspace, which the identity change already triggers). README step 4/9 wording ("embedded as source") updated.
 - Accept: unit test of the header format; mock test that embedded texts start with the header while `Hit.code` is unchanged; live E3 before/after on `core.toml` + mined set (both strata); `cargo xtask acceptance multilingual` (acceptance item 12) still passes.
 - Risk: full re-embed on the owner's GPU takes minutes per workspace; say so in the commit. Qwen's "no instruction for documents" guidance does not preclude a metadata header, but verify by the ablation, not by assumption.
+- Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): the embedder sees raw `c.code` (`src/app/indexing.rs` ~193) with no path, language or enclosing symbol; gold files linked to a query only by their path (test support files) are unreachable semantically. A C2-lite header `// {path} | {language}` needs no C1 and one re-embed in a scratch data_dir; gate on no keyword-stratum loss and `core.toml` hit@1 >= 0.818. Anthropic's contextual retrieval reports -35% failures, but with LLM-written context, so expect less.
 
 ### F1 - Re-justify the 0.004 production prior
 `ready` - S, live - deps: E3 - skill: `lci-retrieval-evaluation`
@@ -357,6 +362,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Scope: `query_instruction: String` (default = current text) in config; optional per-kind overrides consumed by F3 later; documents never get an instruction (unchanged). README step 6.
 - Accept: unit test of the formatted query; live E3 with two candidate instructions ("Given a bug report or feature request, retrieve the code that must be changed" for issue-like; "Given an identifier or API name, retrieve its definition and usages" for identifiers) on the mined strata.
 - Risk: query-side only; no identity change, no re-embed.
+- Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): candidate instruction for change descriptions: "Given a change description, retrieve the source files that implement it"; query-side only (no re-embed). Evaluate fusion-only first, then reranked.
 
 ### N1 - Per-provider symbol-query syntax
 `ready` - S - deps: none - skill: `lci-lsp-adapter`
