@@ -102,7 +102,7 @@ first.
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
-| E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | ready | M | E1 |
+| E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | in-progress (2026-10-10: part b toggles done, part a comparison next) | M | E1 |
 | E2b | Mined-set hygiene: `gold-drift` flag and subject-length axis; strata on the clean subset | ready | S | E2 |
 | R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
@@ -192,6 +192,21 @@ first.
 - Accept: unit tests for the comparison math; mock integration test that each toggle removes exactly that channel; live: `core.toml` run with reranker on vs off, numbers in the commit message.
 - Risk: toggles are production config, not evaluation data, so they do not violate "evaluation never feeds ranking". Readiness must still probe the embedding service even when `semantic=false` (document).
 
+- Baseline arms (2026-10-10, part (b) toggles, frozen build of the E3b diff, same index; `test-results/e3-{core,mined}-{grep-only,semantic-only,fusion}.json`; reranked rows are the R0 reports `core-eval-cap-4096.json` (43d56d9) and `r0-mined-rerank-on.json` (7daed93)):
+
+  | Set | Arm | hit@1 | hit@3 | MRR | nDCG@10 | recall@8 | median latency |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | core (11) | reranked | 0.909 | 1.000 | 0.955 | - | - | 26.0 s |
+  | core | fusion (reranker off) | 1.000 | 1.000 | 1.000 | 0.745 | 0.682 | 0.68 s |
+  | core | semantic only | 0.909 | 1.000 | 0.955 | 0.734 | 0.727 | 0.22 s |
+  | core | grep only | 0.636 | 0.727 | 0.715 | 0.609 | 0.727 | 0.62 s |
+  | mined (35) | reranked | 0.743 | 0.914 | 0.814 | 0.606 | 0.575 | 34.0 s |
+  | mined | fusion (reranker off) | 0.657 | 0.743 | 0.736 | 0.551 | 0.537 | 0.76 s |
+  | mined | semantic only | 0.771 | 0.886 | 0.829 | 0.517 | 0.463 | 0.27 s |
+  | mined | grep only | 0.114 | 0.457 | 0.325 | 0.276 | 0.356 | 0.67 s |
+
+  Reading: on the mined set semantic-only beats both fusion and the full reranked pipeline at the top (hit@1, MRR) at ~1/125 of the latency, while the reranked pipeline finds more of the gold files (nDCG@10, recall@8). Grep alone is weak, and adding it to fusion costs 11 points of hit@1 versus semantic alone, so the lexical channel currently injects noise into the top ranks (consistent with the agnostic-stratum diagnosis under L0: longest-term selection, substring matching, no IDF). Priorities follow: L2 (rarity-weighted terms) next, then F2 (channel weights), then re-run these arms; the reranker's measured gain over fusion may largely be repairing lexical noise. Caveat: the reranked rows come from earlier binaries; part (a)'s paired bootstrap will put CIs on these deltas.
+
 ### R1 - Reranker depth and document-size sweep
 `ready` (use E3 for the comparison once available) - S, live - deps: none - skill: `lci-retrieval-evaluation`
 - Why: reranking is 35-54 s per search here. Already measured at 24 candidates (commit `43d56d9`): caps uncapped/8192/4096/2048 -> rerank median 29.1/27.4/25.1/22.5 s, quality within noise; 4096 chosen. The cost model from R0's evidence predicts 12 candidates at a 2048-byte cap would take ~8-12 s (estimate, not measured). Whether cost scales with candidates x bytes or is dominated by model load decides every later reranker item (Investigation I-2). Qwen's reranker gains were measured on top-100 shortlists; LCI uses 24.
@@ -265,13 +280,13 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | --- | --- | --- | --- | --- |
 | L0 | Engine-independent lexical fixes (no canonicalize per line, interval mapping, scanner-aligned rg flags, timeout) | ready | S | - |
 | L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research | M | E2, E3 |
-| L2 | IDF weighting and identifier splitting in the existing `rg` channel | ready | S | E3 |
+| L2 | IDF weighting and identifier splitting in the existing `rg` channel | ready, NEXT after E3 (E3 arms: lexical noise drags fusion below semantic-only) | S | E3 |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` | ready | S | E3 |
 | L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) | blocked(L1 decision) | L (split) | L1, L2 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | ready | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | ready (after L2; E3 arms show channel weights matter) | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
