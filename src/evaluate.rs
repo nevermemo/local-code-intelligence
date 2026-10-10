@@ -17,7 +17,8 @@ pub use runner::{
 };
 pub use types::{
     AggregateReport, EvalQuery, EvalTimings, EvalWorkspace, EvaluationFile, IndexLifecycleAction,
-    QueryMetrics, QueryReport, RerankerState, ResultEvidence, SNIPPET_BUDGET, bounded_snippet,
+    LatencyPercentiles, QueryMetrics, QueryReport, RerankerState, ResultEvidence, SNIPPET_BUDGET,
+    StageLatency, bounded_snippet,
 };
 
 #[cfg(test)]

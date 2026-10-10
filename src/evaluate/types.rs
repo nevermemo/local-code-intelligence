@@ -198,6 +198,43 @@ pub struct QueryMetrics {
     /// Whether any returned chunk contains the required snippet. A missing
     /// expectation is satisfied vacuously.
     pub required_snippet_found: Option<bool>,
+    /// Graded nDCG over the first ten results: a result matching an
+    /// expected pattern has gain 2, one matching only a preferred pattern
+    /// has gain 1, anything else 0, with a `log2(rank + 1)` discount. The
+    /// ideal ranking holds one gain-2 slot per distinct expected pattern
+    /// followed by one gain-1 slot per distinct preferred pattern that no
+    /// expected pattern already covers. Each gold pattern earns its gain at
+    /// most once, at the first result that matches it (a repeated chunk of
+    /// the same file earns nothing; when several unsatisfied patterns match,
+    /// the most specific one is credited), so the value stays in `[0, 1]`.
+    /// `0.0` when there is no gold or no gold result in the window.
+    ///
+    /// Bounded by the returned result window: the report holds at most
+    /// `top_k` results (the checked-in definitions use 8), so with
+    /// `top_k < 10` this is effectively nDCG@`top_k`. Set `top_k >= 10` to
+    /// compare with published @10 numbers.
+    #[serde(default)]
+    pub ndcg_at_10: f64,
+    /// Fraction of distinct expected patterns matched by at least one of the
+    /// first three results; `0.0` when there are no expected patterns.
+    #[serde(default)]
+    pub recall_at_3: f64,
+    /// Fraction of distinct expected patterns matched by at least one of the
+    /// first eight results (fewer when the window, `top_k`, is smaller);
+    /// `0.0` when there are no expected patterns.
+    #[serde(default)]
+    pub recall_at_8: f64,
+    /// `1.0` when an expected pattern matches one of the first five
+    /// distinct files (repeated chunks of a file collapse to that file's
+    /// best rank), else `0.0`.
+    #[serde(default)]
+    pub file_acc_at_5: f64,
+    /// `1.0` when an expected pattern matches one of the first ten
+    /// distinct files, else `0.0`. Bounded by the returned result window
+    /// like [`Self::ndcg_at_10`]: with `top_k = 8` it is effectively
+    /// accuracy over the first eight results.
+    #[serde(default)]
+    pub file_acc_at_10: f64,
 }
 
 /// Per-query evaluation report: bounded evidence, reported search state,
@@ -307,6 +344,11 @@ impl QueryReport {
                 reranker: RerankerState::NoResults,
                 expected_roles_satisfied: None,
                 required_snippet_found: None,
+                ndcg_at_10: 0.0,
+                recall_at_3: 0.0,
+                recall_at_8: 0.0,
+                file_acc_at_5: 0.0,
+                file_acc_at_10: 0.0,
             },
         }
     }
@@ -324,6 +366,29 @@ impl QueryReport {
 // ---------------------------------------------------------------------------
 // Aggregate report
 // ---------------------------------------------------------------------------
+
+/// Median and nearest-rank 95th percentile of one latency series, in
+/// milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LatencyPercentiles {
+    /// Median (mean of the two middle values for even sample counts).
+    pub p50: f64,
+    /// Nearest-rank 95th percentile.
+    pub p95: f64,
+}
+
+/// [`LatencyPercentiles`] for every [`EvalTimings`] field; each key mirrors
+/// the timing field it summarizes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StageLatency {
+    pub query_embedding_ms: LatencyPercentiles,
+    pub lancedb_search_ms: LatencyPercentiles,
+    pub lexical_search_ms: LatencyPercentiles,
+    pub lsp_search_ms: LatencyPercentiles,
+    pub fusion_ms: LatencyPercentiles,
+    pub reranking_ms: LatencyPercentiles,
+    pub total_ms: LatencyPercentiles,
+}
 
 /// Aggregate metrics across all query reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,12 +416,34 @@ pub struct AggregateReport {
     /// Mean reciprocal rank over evaluated queries; `None` when none were
     /// evaluated.
     pub mrr: Option<f64>,
+    /// Mean [`QueryMetrics::ndcg_at_10`] over evaluated queries (bounded by
+    /// each query's result window, see there); `None` when none were
+    /// evaluated.
+    #[serde(default)]
+    pub mean_ndcg_at_10: Option<f64>,
+    /// Mean [`QueryMetrics::recall_at_3`] over evaluated queries.
+    #[serde(default)]
+    pub mean_recall_at_3: Option<f64>,
+    /// Mean [`QueryMetrics::recall_at_8`] over evaluated queries.
+    #[serde(default)]
+    pub mean_recall_at_8: Option<f64>,
+    /// Mean [`QueryMetrics::file_acc_at_5`] over evaluated queries.
+    #[serde(default)]
+    pub mean_file_acc_at_5: Option<f64>,
+    /// Mean [`QueryMetrics::file_acc_at_10`] over evaluated queries.
+    #[serde(default)]
+    pub mean_file_acc_at_10: Option<f64>,
     /// Median total latency in milliseconds over evaluated queries with
     /// timings; `None` when there are no samples.
     pub median_latency_ms: Option<f64>,
     /// 95th percentile (nearest-rank) total latency in milliseconds;
     /// `None` when there are no samples.
     pub p95_latency_ms: Option<f64>,
+    /// Per-stage p50/p95 latency over evaluated queries with timings, using
+    /// the same median and nearest-rank percentile as the total-latency
+    /// fields; `None` when there are no samples.
+    #[serde(default)]
+    pub stage_latency: Option<StageLatency>,
     /// Evaluated queries whose report carried a warning (degraded
     /// channel), i.e. fell back.
     pub fallback_queries: usize,
@@ -369,6 +456,9 @@ pub struct AggregateReport {
     pub index_reused: usize,
     /// Evaluated queries that waited for an existing index job.
     pub index_waited: usize,
+    /// Evaluated queries whose stale index was refreshed incrementally.
+    #[serde(default)]
+    pub index_refreshed: usize,
     /// Combined source-role distribution over all evaluated evidence.
     #[serde(default)]
     pub role_distribution: BTreeMap<String, usize>,

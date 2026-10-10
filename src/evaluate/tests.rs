@@ -553,3 +553,454 @@ fn bounded_snippet_truncates_long_code() {
     assert!(snippet.chars().count() <= SNIPPET_BUDGET + 1);
     assert!(snippet.starts_with(&long[..100]));
 }
+
+// ---------------------------------------------------------------------------
+// Rank-aware metrics: nDCG@10, recall@k, file accuracy@k
+// ---------------------------------------------------------------------------
+
+fn rows(paths: &[&str]) -> Vec<ResultEvidence> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| evidence_row(index + 1, path, "source", "", None))
+        .collect()
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-9,
+        "expected {expected}, got {actual}"
+    );
+}
+
+#[test]
+fn ndcg_mixed_expected_and_preferred_is_hand_computed() {
+    let mut query = query_with(&["src/target.rs"]);
+    query.preferred_paths = vec!["src/helper.rs".to_owned()];
+    // Gains by rank: noise 0, helper (preferred) 1, target (expected) 2.
+    let metrics = query_metrics(
+        &query,
+        &rows(&["src/noise.rs", "src/helper.rs", "src/target.rs"]),
+        false,
+    );
+    // DCG  = 1/log2(3) + 2/log2(4) = 1.6309297535714575
+    // IDCG = 2/log2(2) + 1/log2(3) = 2.6309297535714578
+    // nDCG = 0.6199062332840657
+    assert_close(metrics.ndcg_at_10, 0.619_906_233_284_065_7);
+
+    // Ideal order: expected first, then preferred.
+    let ideal = query_metrics(
+        &query,
+        &rows(&["src/target.rs", "src/helper.rs", "src/noise.rs"]),
+        false,
+    );
+    assert_close(ideal.ndcg_at_10, 1.0);
+
+    // Two expected + one preferred, ranked preferred/expected/noise/expected:
+    // DCG  = 1/log2(2) + 2/log2(3) + 2/log2(5) = 3.1232126232897013
+    // IDCG = 2/log2(2) + 2/log2(3) + 1/log2(4) = 3.761859507142915
+    let mut query = query_with(&["src/a.rs", "src/b.rs"]);
+    query.preferred_paths = vec!["src/c.rs".to_owned()];
+    let metrics = query_metrics(
+        &query,
+        &rows(&["src/c.rs", "src/a.rs", "src/noise.rs", "src/b.rs"]),
+        false,
+    );
+    assert_close(metrics.ndcg_at_10, 0.830_231_064_546_517_8);
+}
+
+#[test]
+fn ndcg_credits_each_gold_pattern_once_and_stops_at_rank_ten() {
+    // A second chunk of the same file must not add gain, or nDCG could
+    // exceed 1.
+    let query = query_with(&["src/target.rs"]);
+    let metrics = query_metrics(
+        &query,
+        &rows(&["src/target.rs", "src/target.rs", "src/target.rs"]),
+        false,
+    );
+    assert_close(metrics.ndcg_at_10, 1.0);
+
+    // One glob pattern is one gold slot however many files match it.
+    let query = query_with(&["src/metrics/**"]);
+    let metrics = query_metrics(
+        &query,
+        &rows(&["src/metrics/a.rs", "src/metrics/b.rs"]),
+        false,
+    );
+    assert_close(metrics.ndcg_at_10, 1.0);
+
+    // A hit at rank 11 is outside the nDCG@10 window.
+    let query = query_with(&["src/late.rs"]);
+    let mut paths: Vec<String> = (1..=10).map(|n| format!("src/row{n}.rs")).collect();
+    paths.push("src/late.rs".to_owned());
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let metrics = query_metrics(&query, &rows(&paths), false);
+    assert!(metrics.hit);
+    assert_close(metrics.ndcg_at_10, 0.0);
+}
+
+#[test]
+fn recall_counts_distinct_expected_patterns_within_k() {
+    let query = query_with(&["src/a.rs", "src/b.rs"]);
+
+    // Only one of the two expected patterns is ever found.
+    let one_found = query_metrics(&query, &rows(&["src/x.rs", "src/a.rs", "src/y.rs"]), false);
+    assert_close(one_found.recall_at_3, 0.5);
+    assert_close(one_found.recall_at_8, 0.5);
+
+    // The second pattern arrives at rank 5: outside @3, inside @8.
+    let late = query_metrics(
+        &query,
+        &rows(&["src/a.rs", "src/x.rs", "src/y.rs", "src/z.rs", "src/b.rs"]),
+        false,
+    );
+    assert_close(late.recall_at_3, 0.5);
+    assert_close(late.recall_at_8, 1.0);
+
+    // Duplicate pattern strings are one gold item, not two.
+    let query = query_with(&["src/a.rs", "src/a.rs"]);
+    let metrics = query_metrics(&query, &rows(&["src/a.rs"]), false);
+    assert_close(metrics.recall_at_3, 1.0);
+}
+
+#[test]
+fn file_accuracy_collapses_repeated_chunks_of_one_file() {
+    let query = query_with(&["src/target.rs"]);
+
+    // Chunk rank 8, but only the fifth distinct file: a.rs, b.rs, c.rs and
+    // d.rs occupy one position each however many chunks they contribute.
+    let collapsed = query_metrics(
+        &query,
+        &rows(&[
+            "src/a.rs",
+            "src/a.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs",
+            "src/target.rs",
+        ]),
+        false,
+    );
+    assert_eq!(collapsed.first_expected_rank, Some(8));
+    assert_close(collapsed.file_acc_at_5, 1.0);
+    assert_close(collapsed.file_acc_at_10, 1.0);
+
+    // Sixth distinct file: inside @10 but not @5.
+    let sixth = query_metrics(
+        &query,
+        &rows(&[
+            "src/a.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs",
+            "src/e.rs",
+            "src/target.rs",
+        ]),
+        false,
+    );
+    assert_close(sixth.file_acc_at_5, 0.0);
+    assert_close(sixth.file_acc_at_10, 1.0);
+
+    // Eleventh distinct file: outside both.
+    let mut paths: Vec<String> = (1..=10).map(|n| format!("src/row{n}.rs")).collect();
+    paths.push("src/target.rs".to_owned());
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let far = query_metrics(&query, &rows(&paths), false);
+    assert_close(far.file_acc_at_5, 0.0);
+    assert_close(far.file_acc_at_10, 0.0);
+}
+
+#[test]
+fn rank_aware_metrics_are_zero_on_an_all_miss() {
+    let mut query = query_with(&["src/missing.rs"]);
+    query.preferred_paths = vec!["src/also_missing.rs".to_owned()];
+    let metrics = query_metrics(&query, &rows(&["src/a.rs", "src/b.rs", "src/c.rs"]), false);
+    assert!(!metrics.hit);
+    assert_close(metrics.ndcg_at_10, 0.0);
+    assert_close(metrics.recall_at_3, 0.0);
+    assert_close(metrics.recall_at_8, 0.0);
+    assert_close(metrics.file_acc_at_5, 0.0);
+    assert_close(metrics.file_acc_at_10, 0.0);
+
+    // No results at all is also a miss.
+    let empty = query_metrics(&query, &[], false);
+    assert_close(empty.ndcg_at_10, 0.0);
+    assert_close(empty.recall_at_8, 0.0);
+    assert_close(empty.file_acc_at_10, 0.0);
+}
+
+#[test]
+fn rank_aware_metrics_are_zero_without_gold() {
+    let query = query_with(&[]);
+    let metrics = query_metrics(&query, &rows(&["src/a.rs", "src/b.rs"]), false);
+    assert_close(metrics.ndcg_at_10, 0.0);
+    assert_close(metrics.recall_at_3, 0.0);
+    assert_close(metrics.recall_at_8, 0.0);
+    assert_close(metrics.file_acc_at_5, 0.0);
+    assert_close(metrics.file_acc_at_10, 0.0);
+}
+
+#[test]
+fn skipped_and_failed_reports_carry_zero_rank_aware_metrics() {
+    let skipped = QueryReport::skipped(query_with(&["src/a.rs"]), "optional".to_owned());
+    assert_close(skipped.metrics.ndcg_at_10, 0.0);
+    let failed = QueryReport::failed(query_with(&["src/a.rs"]), "search failed".to_owned());
+    assert_close(failed.metrics.recall_at_8, 0.0);
+    assert_close(failed.metrics.file_acc_at_10, 0.0);
+}
+
+#[test]
+fn aggregate_means_cover_executed_queries_only() {
+    let perfect = QueryReport::new(
+        query_with(&["src/a.rs"]),
+        rows(&["src/a.rs"]),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    // Expected a.rs and b.rs; only a.rs is found, at rank 4.
+    let partial = QueryReport::new(
+        query_with(&["src/a.rs", "src/b.rs"]),
+        rows(&["src/x.rs", "src/y.rs", "src/z.rs", "src/a.rs"]),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let skipped = QueryReport::skipped(query_with(&["src/a.rs"]), "optional".to_owned());
+    let report = aggregate(&[perfect, partial.clone(), skipped]);
+
+    assert_eq!(report.executed_count, 2);
+    assert_eq!(report.mean_recall_at_3, Some(0.5));
+    assert_eq!(report.mean_recall_at_8, Some(0.75));
+    assert_eq!(report.mean_file_acc_at_5, Some(1.0));
+    assert_eq!(report.mean_file_acc_at_10, Some(1.0));
+    // Partial: one gain-2 hit at rank 4 against ideal slots at ranks 1 and 2.
+    // DCG = 2/log2(5), IDCG = 2/log2(2) + 2/log2(3).
+    let partial_ndcg = (2.0 / 5f64.log2()) / (2.0 + 2.0 / 3f64.log2());
+    assert_close(partial.metrics.ndcg_at_10, partial_ndcg);
+    assert_close(
+        report.mean_ndcg_at_10.expect("mean ndcg"),
+        (1.0 + partial_ndcg) / 2.0,
+    );
+
+    let empty = aggregate(&[]);
+    assert_eq!(empty.mean_ndcg_at_10, None);
+    assert_eq!(empty.mean_recall_at_3, None);
+    assert_eq!(empty.mean_recall_at_8, None);
+    assert_eq!(empty.mean_file_acc_at_5, None);
+    assert_eq!(empty.mean_file_acc_at_10, None);
+}
+
+#[test]
+fn refreshed_incrementally_is_counted_so_lifecycle_counts_sum_to_executed() {
+    let make = |action: IndexLifecycleAction| {
+        QueryReport::new(
+            query_with(&["src/missing.rs"]),
+            Vec::new(),
+            false,
+            None,
+            None,
+            None,
+            Some(action),
+            None,
+        )
+    };
+    let reports = vec![
+        make(IndexLifecycleAction::Created),
+        make(IndexLifecycleAction::Reused),
+        make(IndexLifecycleAction::WaitedForExistingJob),
+        make(IndexLifecycleAction::RefreshedIncrementally),
+        make(IndexLifecycleAction::RefreshedIncrementally),
+    ];
+    let report = aggregate(&reports);
+    assert_eq!(report.index_refreshed, 2);
+    assert_eq!(
+        report.index_created + report.index_reused + report.index_waited + report.index_refreshed,
+        report.executed_count
+    );
+}
+
+#[test]
+fn stage_latency_percentiles_on_a_known_set() {
+    // Four queries; each stage gets its own series so a mixed-up field would
+    // show. Sorted series and the expected statistics (median, nearest-rank
+    // p95 = 4th value):
+    //   embedding  10 20 30 40       p50 25   p95 40
+    //   lancedb     1  2  3  5       p50 2.5  p95 5
+    //   lexical     7  7  7  9       p50 7    p95 9
+    //   lsp         0  0  0  0       p50 0    p95 0
+    //   fusion      4  6  8 12       p50 7    p95 12
+    //   reranking 100 200 300 400    p50 250  p95 400
+    //   total     150 250 350 500    p50 300  p95 500
+    let series = [
+        (30.0, 5.0, 7.0, 0.0, 8.0, 400.0, 500.0),
+        (10.0, 1.0, 7.0, 0.0, 4.0, 100.0, 150.0),
+        (40.0, 3.0, 9.0, 0.0, 12.0, 300.0, 350.0),
+        (20.0, 2.0, 7.0, 0.0, 6.0, 200.0, 250.0),
+    ];
+    let reports: Vec<QueryReport> = series
+        .into_iter()
+        .map(|(embed, lance, lexical, lsp, fusion, rerank, total)| {
+            QueryReport::new(
+                query_with(&["src/missing.rs"]),
+                Vec::new(),
+                false,
+                None,
+                None,
+                Some(EvalTimings {
+                    query_embedding_ms: embed,
+                    lancedb_search_ms: lance,
+                    lexical_search_ms: lexical,
+                    lsp_search_ms: lsp,
+                    fusion_ms: fusion,
+                    reranking_ms: rerank,
+                    total_ms: total,
+                }),
+                None,
+                None,
+            )
+        })
+        .collect();
+    let report = aggregate(&reports);
+    let stages = report.stage_latency.expect("stage latency");
+    let check = |stage: LatencyPercentiles, p50: f64, p95: f64| {
+        assert_close(stage.p50, p50);
+        assert_close(stage.p95, p95);
+    };
+    check(stages.query_embedding_ms, 25.0, 40.0);
+    check(stages.lancedb_search_ms, 2.5, 5.0);
+    check(stages.lexical_search_ms, 7.0, 9.0);
+    check(stages.lsp_search_ms, 0.0, 0.0);
+    check(stages.fusion_ms, 7.0, 12.0);
+    check(stages.reranking_ms, 250.0, 400.0);
+    check(stages.total_ms, 300.0, 500.0);
+    // The total stage uses the same statistics as the existing fields.
+    assert_eq!(report.median_latency_ms, Some(stages.total_ms.p50));
+    assert_eq!(report.p95_latency_ms, Some(stages.total_ms.p95));
+
+    // Reports without timings and an empty run have no stage latency.
+    let no_timings = QueryReport::new(
+        query_with(&["src/missing.rs"]),
+        Vec::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(aggregate(&[no_timings]).stage_latency, None);
+    assert_eq!(aggregate(&[]).stage_latency, None);
+}
+
+#[test]
+fn reports_without_the_new_fields_still_deserialize() {
+    let report = QueryReport::new(
+        query_with(&["src/metric.rs"]),
+        rows(&["src/metric.rs"]),
+        false,
+        None,
+        None,
+        Some(timings(5.0)),
+        Some(IndexLifecycleAction::Reused),
+        None,
+    );
+    let mut value = serde_json::to_value(aggregate(std::slice::from_ref(&report))).unwrap();
+    let object = value.as_object_mut().unwrap();
+    for key in [
+        "mean_ndcg_at_10",
+        "mean_recall_at_3",
+        "mean_recall_at_8",
+        "mean_file_acc_at_5",
+        "mean_file_acc_at_10",
+        "stage_latency",
+        "index_refreshed",
+    ] {
+        assert!(object.remove(key).is_some(), "missing serialized {key}");
+    }
+    for query in object["queries"].as_array_mut().unwrap() {
+        let metrics = query["metrics"].as_object_mut().unwrap();
+        for key in [
+            "ndcg_at_10",
+            "recall_at_3",
+            "recall_at_8",
+            "file_acc_at_5",
+            "file_acc_at_10",
+        ] {
+            assert!(metrics.remove(key).is_some(), "missing serialized {key}");
+        }
+    }
+    let back: AggregateReport = serde_json::from_value(value).unwrap();
+    assert_eq!(back.index_refreshed, 0);
+    assert_eq!(back.mean_ndcg_at_10, None);
+    assert_eq!(back.stage_latency, None);
+    assert_eq!(back.queries[0].metrics.ndcg_at_10, 0.0);
+}
+
+#[test]
+fn ndcg_ignores_preferred_patterns_covered_by_an_expected_pattern() {
+    // `mod.rs` is also an expected hit, so its preferred slot could never be
+    // earned and must not count in the ideal ranking.
+    let mut query = query_with(&["src/slang/**"]);
+    query.preferred_paths = vec!["src/slang/mod.rs".to_owned()];
+    let metrics = query_metrics(&query, &rows(&["src/slang/mod.rs", "src/other.rs"]), false);
+    assert_close(metrics.ndcg_at_10, 1.0);
+
+    // A preferred pattern outside the expected glob still counts: with the
+    // expected hit first and the preferred file second, the ranking is ideal;
+    // swapped, it is not.
+    query.preferred_paths.push("src/other.rs".to_owned());
+    let ideal = query_metrics(&query, &rows(&["src/slang/mod.rs", "src/other.rs"]), false);
+    assert_close(ideal.ndcg_at_10, 1.0);
+    let swapped = query_metrics(&query, &rows(&["src/other.rs", "src/slang/mod.rs"]), false);
+    // DCG = 1/log2(2) + 2/log2(3), IDCG = 2/log2(2) + 1/log2(3).
+    assert_close(
+        swapped.ndcg_at_10,
+        (1.0 + 2.0 / 3f64.log2()) / (2.0 + 1.0 / 3f64.log2()),
+    );
+    assert!(swapped.ndcg_at_10 < 1.0);
+
+    // A preferred glob that an expected glob covers is dropped too.
+    let mut query = query_with(&["src/**"]);
+    query.preferred_paths = vec!["src/slang/*.rs".to_owned()];
+    let metrics = query_metrics(&query, &rows(&["src/slang/mod.rs"]), false);
+    assert_close(metrics.ndcg_at_10, 1.0);
+}
+
+#[test]
+fn ndcg_does_not_depend_on_pattern_declaration_order() {
+    // Overlapping expected patterns: the literal path, a one-level glob, and
+    // a recursive glob. Each result must be credited to the most specific
+    // pattern it satisfies, so every declaration order scores the same.
+    let results = rows(&["src/metric.rs", "src/lib.rs", "src/deep/other.rs"]);
+    let orders: [[&str; 3]; 6] = [
+        ["src/**", "src/*.rs", "src/metric.rs"],
+        ["src/**", "src/metric.rs", "src/*.rs"],
+        ["src/*.rs", "src/**", "src/metric.rs"],
+        ["src/*.rs", "src/metric.rs", "src/**"],
+        ["src/metric.rs", "src/**", "src/*.rs"],
+        ["src/metric.rs", "src/*.rs", "src/**"],
+    ];
+    for order in orders {
+        let metrics = query_metrics(&query_with(&order), &results, false);
+        assert_close(metrics.ndcg_at_10, 1.0);
+        assert_close(metrics.recall_at_3, 1.0);
+    }
+
+    // The two-pattern case from review: broad glob declared first or last.
+    let results = rows(&["src/metric.rs", "src/other.rs"]);
+    for order in [["src/**", "src/metric.rs"], ["src/metric.rs", "src/**"]] {
+        let metrics = query_metrics(&query_with(&order), &results, false);
+        assert_close(metrics.ndcg_at_10, 1.0);
+    }
+}
