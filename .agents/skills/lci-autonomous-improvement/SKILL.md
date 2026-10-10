@@ -47,10 +47,19 @@ Repeat until the stop rule fires or the roadmap has no ready item.
 3. **Implement.** Brief an implementer with the plan, the allowed-file list, the relevant contract files, and whether the `lci` MCP tools are connected. Inspect the saved diff for file scope and intent before anything else; a valid diff counts even without prose. Fix small gaps yourself or send one focused continuation; do not start a second implementer on the same files.
 4. **Gate.** Run the focused suite first (`cargo xtask test --suite <name>` or `cargo test -p lci-core --lib <module>::`), then `cargo xtask test --suite Full` once the slice is complete. See "When a gate fails".
 5. **Evaluate (when the plan says so).** Follow `lci-retrieval-evaluation/references/evaluation-workflow.md` exactly: frozen `lci-base`/`lci-new` binaries, scratch configs with short separate data directories, sequential runs, reranked and reranker-unreachable pairs for prior/role/fusion changes, reports under `test-results/`. Do not compile or run tests while a timed run is in progress. Decide with the workflow's decision rule; if the change does not hold up, revert it and record why in the roadmap.
-6. **Review.** Brief a reviewer who did not write the code with the diff, the slice plan, and the evidence. It checks correctness, `AGENTS.md` boundaries (ports, data location, fail-open, freshness semantics), test honesty (no weakened or vacuous tests; suites that still match tests), documentation drift (README tables, `config.example.toml`, skill references, MCP tool descriptions), and scope creep. Address every finding or record why not; a disputed finding goes to the human, not silently dropped.
+6. **Review.** Brief a reviewer who did not write the code with the diff, the slice plan, and the evidence. It checks correctness, `AGENTS.md` boundaries (ports, data location, fail-open, freshness semantics), test honesty (no weakened or vacuous tests; suites that still match tests), documentation drift (README tables, `config.example.toml`, skill references, MCP tool descriptions), and scope creep. Address every finding or record why not; a disputed finding goes to the human, not silently dropped -- unless the human has delegated disputes, in which case pick one side (at random if both are defensible), log the dispute and the pick in the roadmap, and continue.
 7. **Commit and push.** One logical change per commit, message per the template: imperative subject under about 70 characters, a body saying what changed and why, the evidence (test counts, suites, live metrics before/after, report names), and limitations. The client adds the co-author trailer. Stage only the slice's files; never `git add -A` with scratch material present (`reports/`, `research_notes/`, `test-results/` are not slice files). Push the feature branch.
 8. **Record.** Update the roadmap item: status, commit hash, evidence summary, follow-ups discovered. Update any docs the reviewer flagged in the same commit as the code, or in an immediately following one if the review found them afterwards.
-9. **Check usage and continue.** Read the usage figure. Below 90%: run an explorer in the background if none is running and pick the next item. At or above 90%: stop (see below).
+9. **Check usage and continue.** Every fifth slice, run the triage pass below first. Read the usage figure. Below 90%: run an explorer in the background if none is running and pick the next item. At or above 90%: stop (see below).
+
+## Triage pass
+
+Every five slices, and at the start of every roadmap renewal, revisit what did not land:
+
+1. List roadmap items marked `blocked` or reverted, and any test that fails, is ignored, or flaked during the run.
+2. Have a reviewer (fresh subagent) decide each one: **retry** with a new plan (the cause is understood now, or a dependency has landed), **edit** the scope or acceptance into something achievable, or **remove** it (obsolete, superseded, or not worth its cost).
+3. Removing or rewriting a test is allowed only when the review shows the test itself is wrong or obsolete (it asserts behavior the product no longer has, or duplicates another test), never to get a failing slice through. Record the reason in the commit body.
+4. Record every decision in the roadmap: retried and edited items get a new status and a note; removed items move to a "Dropped" list with the reason, so the history stays readable.
 
 ## Token efficiency
 
@@ -86,7 +95,7 @@ Stop the loop, leave the tree clean, and ask the human when:
 
 - the next step is on the `AGENTS.md` approval list (downloads, pull requests, pushing `main`, tags, publishing, boundary changes, deleting user data, starting or stopping services);
 - a roadmap item needs a product decision the roadmap does not already settle (new dependency, new config surface with unclear default, user-visible behavior change);
-- evidence conflicts (tests green but live evaluation regresses, or reviewer and implementer disagree on a contract);
+- evidence conflicts (tests green but live evaluation regresses, or reviewer and implementer disagree on a contract) and the human has not delegated disputes;
 - 8766/8767 are down and you have no permitted way to start them;
 - anything would touch 8765.
 
