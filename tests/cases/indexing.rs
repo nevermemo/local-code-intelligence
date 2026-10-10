@@ -1128,6 +1128,116 @@ async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
 }
 
 #[tokio::test]
+async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    // A port nothing listens on: bind to learn a free one, then release it.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_address = closed.local_addr().unwrap();
+    drop(closed);
+    config.reranker_url = format!("http://{closed_address}/rerank");
+    let workspace = temp.path().join("unreachable-reranker");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap();
+    // Index first so the timed searches measure retrieval, not indexing.
+    app.index(&workspace).await.unwrap();
+
+    // The first search really tries the reranker: one refused connection,
+    // no backoff retries (they used to add about 9 s).
+    // A refused localhost connect alone takes ~2 s on Windows; the old
+    // retried path took ~9 s, so 5 s separates them without flaking.
+    let first = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(
+        first.timings.reranking_ms < 5000.0,
+        "an unreachable reranker must not cost a search seconds of retries: {} ms",
+        first.timings.reranking_ms
+    );
+    assert!(!first.reranked);
+    assert!(!first.results.is_empty());
+    assert!(first.results.iter().all(|hit| hit.reranker_score.is_none()));
+    assert!(first.results.iter().all(|hit| hit.fusion_score > 0.0));
+    let warning = first.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    assert!(!warning.contains("recently unreachable"), "{warning}");
+
+    // A second search inside the window does not touch the reranker at all
+    // and says so in the same warning; the ranking is the same fusion order.
+    let second = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(!second.reranked);
+    assert!(
+        second.timings.reranking_ms < 250.0,
+        "a skipped reranker costs nothing: {} ms",
+        second.timings.reranking_ms
+    );
+    assert!(
+        second
+            .results
+            .iter()
+            .all(|hit| hit.reranker_score.is_none())
+    );
+    let warning = second.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    assert!(warning.contains("recently unreachable"), "{warning}");
+    let order = |report: &local_code_intelligence::app::SearchReport| -> Vec<(String, u32)> {
+        report
+            .results
+            .iter()
+            .map(|hit| (hit.chunk.relative_file_path.clone(), hit.chunk.start_line))
+            .collect()
+    };
+    assert_eq!(order(&first), order(&second));
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_reranker_error_status_is_retried_by_the_next_search() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("failing-reranker");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let before = fake.rerank_requests.load(Ordering::SeqCst);
+
+    // An HTTP 5xx means the reranker is reachable, so it must not start the
+    // unreachable-skip window: the very next search asks it again.
+    fake.rerank_fails.store(true, Ordering::SeqCst);
+    let failed = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(!failed.reranked);
+    let warning = failed.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    assert!(!warning.contains("recently unreachable"), "{warning}");
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst) - before, 1);
+
+    fake.rerank_fails.store(false, Ordering::SeqCst);
+    let recovered = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert!(recovered.reranked, "{:?}", recovered.warning);
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst) - before, 2);
+    assert!(
+        recovered
+            .results
+            .iter()
+            .all(|hit| hit.reranker_score.is_some())
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn reranker_documents_are_capped_while_results_keep_full_chunks() {
     let (temp, mut config, fake, task) = fixture().await;
     config.rerank_document_max_bytes = 1024;
