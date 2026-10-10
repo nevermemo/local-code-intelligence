@@ -170,6 +170,7 @@ starts; remove it when the slice is committed.
     - R3: vote weight 1.0 / 2.0 vs replace: mined MRR -0.013 / +0.006, nDCG@10 -0.026 / -0.024 (n.s., W/L/T 8/8 and 8/7): no gain, not adopted.
     - The earlier W40-dump comparisons against B are void (B refused 11/35 mined, 10/11 core there).
   - Caveat: the dumps predate E2b's mine.rs leakage fix; arms share the dump, so relative comparisons hold, but absolute metrics include the leakage. Re-dump after E2b.
+- V5 (in-progress 2026-10-10, owner-directed): production reranker on llama.cpp ROCm; gate pre-registered in its section (dump64 on llama.cpp, replay B vs the vLLM dump64 B).
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
@@ -216,6 +217,7 @@ R5, S5, R4, C1.
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, ROCm or Vulkan) behind an `http` / `in-process` backend switch | blocked(R1: decide once the rerank window is set; V1 measured the serving ceiling at ~1.3x) | M | V1, R1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
+| V5 | Production reranker on llama.cpp ROCm (port 8767), embedder stays on vLLM | in-progress (2026-10-10, owner-directed) | S | V1 |
 | E0 | Dump every channel candidate, the fused/capped order and every reranker score, for offline replay | done (5c6a7ef dump; replay in E7) | S | E2b preferred |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
@@ -286,6 +288,12 @@ R5, S5, R4, C1.
 `proposed` - S - deps: R4 (only if a small reranker earns a place) - skill: `lci-retrieval-evaluation`
 - Why: `gte-reranker-modernbert-base` (149M, Apache-2.0) is the only small reranker whose code score is not below its first stage (see R4); its official `onnx/model_fp16.onnx` (~300 MB) runs in-process through `ort` with DirectML, estimated 1-3 s for 24 documents, for a cascade (R4) or a vote (R3) while the 4B models stay on HTTP. No 890M DirectML number exists yet.
 - Scope: behind the V3 backend switch (or standalone if V3 is rejected); parity vs the HF fp32 model (Spearman >= 0.99, same top 3), then an E3 comparison.
+
+### V5 - Production reranker on llama.cpp (owner-directed)
+`in-progress (2026-10-10)` - S, live, config-only - deps: V1 (done) - skill: `lci-retrieval-evaluation`
+- Why: the owner asked (2026-10-10) to run each model on its faster server. V1 measured llama.cpp ROCm 1.33x faster than vLLM for the 4B reranker and slower for the embedder, and left one question open: llama.cpp's scores are much sharper (irrelevant ~0.0001 vs vLLM ~0.07-0.20) while the top 3 agree. An `evaluate` run against it settles whether that matters.
+- Scope: no code. Serving lives outside the repo in `C:\Users\micro\lci-serving` (`start-reranker-8767.cmd`: lemonade-sdk b1342 ROCm build, V1's converted Qwen3-Reranker-4B Q8_0 with LCI's code instruction, `--rerank --alias qwen3-reranker-4b -ngl 99 -fa on -c 24576 --parallel 8 --kv-unified -b 4096 -ub 4096`, bound to 127.0.0.1:8767). The WSL vLLM reranker from `vllm.txt` is stopped; the embedder stays on vLLM 8766.
+- Gate (pre-registered 2026-10-10 before any run): dump mined and core at window 64 / cap 0 / plain weights with the same frozen 6d4110f binary and config as `e0-{mined,core}-dump64.json` (the vLLM dumps), then replay B (window 24, cap 2 shortlist, replace) on both and `compare` vLLM-B vs llama-B. Keep llama.cpp if the mined MRR and nDCG@10 CIs contain 0 or improve, no core query loses its first expected rank, and measured reranking p50 at window 64 is lower than vLLM's (mined 33.8 s). Report per-arm LSP coverage and how many queries have identical top-24 shortlists in both dumps (differences outside the shortlist are not the reranker's doing). On a fail, restore the vLLM reranker and report to the owner. Also replay window 12 on the llama dump under E7's R1 rule.
 
 ### E0 - Candidate and score dump for offline replay
 `in-progress (2026-10-10)`, next up 2 (edited in the second 2026-10-10 triage: dump every channel's candidates, not only the 24 reranked, so fusion weights, the prior and the cap replay exactly too) - S - deps: none (E2b preferred first so the dumps are leak-free) - skill: `lci-retrieval-evaluation`
