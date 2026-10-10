@@ -19,13 +19,13 @@ pub use compare::{
 pub use definition::{load_definition, validate_definition};
 pub use metrics::{aggregate, pattern_matches, query_metrics, validate_pattern};
 pub use runner::{
-    WorkspaceMapping, has_failures, parse_workspace_mapping, parse_workspace_mappings,
-    run_evaluation,
+    RunOptions, WorkspaceMapping, has_failures, parse_workspace_mapping, parse_workspace_mappings,
+    run_evaluation, run_evaluation_with_options,
 };
 pub use types::{
-    AggregateReport, EvalQuery, EvalTimings, EvalWorkspace, EvaluationFile, IndexLifecycleAction,
-    LatencyPercentiles, QueryMetrics, QueryReport, RerankerState, ResultEvidence, SNIPPET_BUDGET,
-    StageLatency, bounded_snippet,
+    AggregateReport, CandidateArm, EvalQuery, EvalTimings, EvalWorkspace, EvaluationFile,
+    IndexLifecycleAction, LatencyPercentiles, QueryMetrics, QueryReport, RerankMode, RerankerState,
+    ResultEvidence, SNIPPET_BUDGET, StageLatency, bounded_snippet,
 };
 
 #[cfg(test)]

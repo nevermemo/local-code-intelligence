@@ -13,7 +13,9 @@ pub use indexing::{
 };
 pub use navigation::NavigationReport;
 pub use readiness::{ReadinessComponent, ReadinessDegraded, ServiceStatus};
-pub use search::{SearchIndexLifecycle, SearchReport, Timings};
+pub use search::{
+    CandidateTrace, RerankOutcome, SearchIndexLifecycle, SearchOptions, SearchReport, Timings,
+};
 
 use crate::{config::Config, lsp, models::Models, store::Store};
 use anyhow::Result;

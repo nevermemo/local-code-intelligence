@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use local_code_intelligence::{
     app::App,
     config::Config,
-    evaluate::{self, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED},
+    evaluate::{self, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED, RunOptions},
     server,
 };
 use std::{
@@ -68,6 +68,13 @@ enum Command {
         /// Bootstrap resamples for the `--baseline` comparison.
         #[arg(long, requires = "baseline", value_parser = parse_resamples)]
         resamples: Option<usize>,
+        /// Record every query's whole fused candidate pool (channel ranks,
+        /// scores, per-file cap and shortlist position, reranker scores) and
+        /// the retrieval configuration in the report, so other arms can be
+        /// scored from it without services. Results and metrics are
+        /// unchanged; the pretty-printed report grows by roughly 100 KB per query.
+        #[arg(long)]
+        dump_candidates: bool,
     },
     /// Compare two saved evaluation reports query by query. Works offline: it
     /// needs no services, configuration, or index. A regression is not an
@@ -205,10 +212,17 @@ async fn main() -> Result<()> {
             baseline: _,
             seed,
             resamples,
+            dump_candidates,
         } => {
             let definition = evaluate::load_definition(&definition)?;
             let workspaces = evaluate::parse_workspace_mappings(&workspaces)?;
-            let report = evaluate::run_evaluation(&app, &definition, &workspaces).await?;
+            let report = evaluate::run_evaluation_with_options(
+                &app,
+                &definition,
+                &workspaces,
+                RunOptions { dump_candidates },
+            )
+            .await?;
             evaluation_failed = evaluate::has_failures(&report);
             output_path = output;
             let comparison = baseline_report.map(|(path, baseline)| {

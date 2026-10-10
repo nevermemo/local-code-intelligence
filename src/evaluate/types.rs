@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::{CandidateTrace, RerankOutcome};
+use crate::config::{ChannelsConfig, Config, FusionConfig};
 use crate::filter::{EffectiveFilterReport, FilterRequest};
 
 use super::metrics::query_metrics;
@@ -78,8 +80,9 @@ pub struct EvalQuery {
 // Bounded result evidence
 // ---------------------------------------------------------------------------
 
-/// Maximum characters retained in a bounded evidence snippet.
-pub const SNIPPET_BUDGET: usize = 400;
+// The snippet bound lives in `store`, beside the retrieval pipeline that
+// records it in a candidate dump; evaluation re-exports it.
+pub use crate::store::{SNIPPET_BUDGET, bounded_snippet};
 
 /// Bounded evidence for one returned result: just enough to evaluate a
 /// query without persisting full chunk text.
@@ -104,21 +107,6 @@ pub struct ResultEvidence {
     pub reranker_score: Option<f32>,
 }
 
-/// Truncate code to the bounded snippet budget, marking truncation with a
-/// trailing ellipsis. Short input is returned unchanged.
-pub fn bounded_snippet(code: &str) -> String {
-    if code.len() <= SNIPPET_BUDGET {
-        return code.to_owned();
-    }
-    let mut end = SNIPPET_BUDGET;
-    while !code.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out: String = code[..end].to_owned();
-    out.push('…');
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Reported search state
 // ---------------------------------------------------------------------------
@@ -135,6 +123,81 @@ pub enum RerankerState {
     Reranked,
     /// The report was reranked but some evidence rows lack scores.
     PartiallyScored,
+}
+
+// ---------------------------------------------------------------------------
+// Candidate dump
+// ---------------------------------------------------------------------------
+
+/// How the reranker's output is used to order the results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankMode {
+    /// The reranker's order replaces the fusion order (production behaviour
+    /// whenever `[channels].reranker` is on).
+    Replace,
+    /// No reranker: the results are the head of the fusion order
+    /// (`[channels].reranker = false`).
+    Off,
+}
+
+/// The retrieval configuration one candidate dump was taken under: what a
+/// replay must hold equal (or may only narrow) to reproduce the dumped
+/// search exactly. Recorded on every dumped query so a report stays
+/// self-describing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateArm {
+    /// Reciprocal Rank Fusion constant of the dumped fusion.
+    pub rrf_k: f32,
+    /// Channel weights and the per-file cap (`max_chunks_per_file`; `0` is
+    /// unlimited) of the dumped fusion.
+    pub fusion: FusionConfig,
+    /// Size of the reranker shortlist (the cut after the cap).
+    pub rerank_candidate_count: usize,
+    /// Bytes of code each shortlisted document carried to the reranker.
+    pub rerank_document_max_bytes: usize,
+    /// Depth of the semantic channel's candidate list.
+    pub semantic_candidate_count: usize,
+    /// Depth of the lexical channel's candidate list.
+    pub lexical_candidate_count: usize,
+    /// Depth of the language-server channel's candidate list.
+    pub lsp_candidate_count: usize,
+    /// Which channels and whether the reranker were switched on.
+    pub channels: ChannelsConfig,
+    /// The result window the query asked for: `top_k`, or the configured
+    /// default when the query has none.
+    pub k: usize,
+    /// Embedding endpoint, model, and document format the index was built
+    /// with (`Config::embedding_identity`).
+    pub embedding_identity: String,
+    /// Reranker model name sent with every request.
+    pub reranker_model: String,
+    /// How the reranker's output ordered the dumped results.
+    pub rerank_mode: RerankMode,
+}
+
+impl CandidateArm {
+    /// The arm `config` produces for a query whose result window is `k`.
+    pub fn new(config: &Config, k: usize) -> Self {
+        Self {
+            rrf_k: config.rrf_k,
+            fusion: config.fusion,
+            rerank_candidate_count: config.rerank_candidate_count,
+            rerank_document_max_bytes: config.rerank_document_max_bytes,
+            semantic_candidate_count: config.semantic_candidate_count,
+            lexical_candidate_count: config.lexical_candidate_count,
+            lsp_candidate_count: config.lsp_candidate_count,
+            channels: config.channels,
+            k,
+            embedding_identity: config.embedding_identity(),
+            reranker_model: config.reranker_model.clone(),
+            rerank_mode: if config.channels.reranker {
+                RerankMode::Replace
+            } else {
+                RerankMode::Off
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -281,6 +344,28 @@ pub struct QueryReport {
     pub index_wait_ms: Option<f64>,
     /// Computed metrics.
     pub metrics: QueryMetrics,
+    /// The whole fused candidate pool of the search, in fused order, with
+    /// everything a replay needs (see [`CandidateTrace`]). Only
+    /// `evaluate --dump-candidates` fills it; it is empty, and absent from the
+    /// JSON, otherwise and for skipped or failed queries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<CandidateTrace>,
+    /// The retrieval configuration `candidates` was dumped under. Present
+    /// exactly when the query was dumped, even if its pool is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm: Option<CandidateArm>,
+    /// What the reranker did for a dumped query: scored, failed, off, or not
+    /// run. Present exactly when [`Self::arm`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_outcome: Option<RerankOutcome>,
+    /// The search report's informational notes, for example "LSP still
+    /// starting or slow" when the language-server channel hit its budget and
+    /// contributed nothing or less than usual. A replay can use them to
+    /// exclude or stratify such queries. Never a fallback. Only
+    /// `evaluate --dump-candidates` fills it, together with `arm`; it is
+    /// empty, and absent from the JSON, otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl QueryReport {
@@ -315,6 +400,10 @@ impl QueryReport {
             index_action,
             index_wait_ms,
             metrics,
+            candidates: Vec::new(),
+            arm: None,
+            rerank_outcome: None,
+            notes: Vec::new(),
         }
     }
 
@@ -356,6 +445,10 @@ impl QueryReport {
                 file_acc_at_5: 0.0,
                 file_acc_at_10: 0.0,
             },
+            candidates: Vec::new(),
+            arm: None,
+            rerank_outcome: None,
+            notes: Vec::new(),
         }
     }
 

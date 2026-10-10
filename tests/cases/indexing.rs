@@ -1401,6 +1401,84 @@ async fn default_channels_keep_every_channel_and_the_reranker_on() {
     task.abort();
 }
 
+/// Roadmap E0a. A traced search keeps the rank every channel gave a candidate
+/// (one-based, as fusion consumed it), so the fusion score can be recomputed
+/// from the dump with the documented arithmetic, bit for bit.
+#[tokio::test]
+async fn a_traced_search_records_the_rank_each_channel_gave_every_candidate() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-traced");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-traced");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 30_000;
+    config.csharp = fake_csharp_lsp(&state);
+    let app = App::open(config.clone()).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .search_with_options(
+            &workspace,
+            "Calculator",
+            Some(10),
+            local_code_intelligence::filter::FilterRequest::default(),
+            local_code_intelligence::app::SearchOptions {
+                trace_candidates: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    assert_eq!(
+        channels_seen(&report),
+        channel_set(&["semantic", "lexical", "lsp"])
+    );
+    let rows = report.candidates.as_ref().expect("the pool was traced");
+    assert!(!rows.is_empty());
+    let all_three = rows
+        .iter()
+        .find(|row| {
+            row.semantic_rank.is_some() && row.lexical_rank.is_some() && row.lsp_rank.is_some()
+        })
+        .unwrap_or_else(|| panic!("no candidate has a rank from every channel: {rows:?}"));
+    assert!(all_three.semantic_score.is_some());
+    assert!(all_three.lexical_score.is_some() && all_three.lexical_match_count > 0);
+    assert_eq!(all_three.relative_file_path, "src/Calculator.cs");
+
+    let (rrf_k, weights) = (config.rrf_k, &config.fusion);
+    for row in rows {
+        let mut score = 0.0_f32;
+        if let Some(rank) = row.semantic_rank {
+            score += weights.semantic_weight / (rrf_k + rank as f32);
+        }
+        if let Some(rank) = row.lexical_rank {
+            score += weights.lexical_weight / (rrf_k + rank as f32);
+        }
+        if let Some(rank) = row.lsp_rank {
+            score += weights.lsp_weight / (rrf_k + rank as f32);
+        }
+        assert_eq!(
+            (score + row.prior).to_bits(),
+            row.fusion_score.to_bits(),
+            "{row:?}"
+        );
+    }
+    // The ranks are what each hit in the results carries.
+    for hit in &report.results {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.relative_file_path == hit.chunk.relative_file_path
+                    && row.start_line == hit.chunk.start_line
+            })
+            .expect("a returned hit is in the dump");
+        assert_eq!(row.semantic_rank, hit.semantic_rank);
+        assert_eq!(row.lexical_rank, hit.lexical_rank);
+        assert_eq!(row.lsp_rank, hit.lsp_rank);
+    }
+    task.abort();
+}
+
 fn fake_slow_start_csharp_lsp(
     state: &Path,
     initialize_delay_ms: u64,
@@ -1411,6 +1489,95 @@ fn fake_slow_start_csharp_lsp(
         initialize_delay_ms.to_string(),
     ]);
     csharp
+}
+
+/// Roadmap E0a. A language server that is still starting leaves a note on the
+/// search and contributes nothing, which changes what a dumped pool means. The
+/// dump keeps the note so a replay can exclude or stratify such queries; an
+/// evaluation without the flag stays exactly as it was and carries none.
+#[tokio::test]
+async fn an_evaluation_dump_keeps_the_note_of_a_cold_language_server() {
+    use local_code_intelligence::evaluate::{RunOptions, run_evaluation_with_options};
+
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("dump-cold");
+    write_channel_workspace(&workspace);
+    let definition = EvaluationFile {
+        workspaces: vec![EvalWorkspace {
+            key: "cold".to_owned(),
+            required: true,
+        }],
+        queries: vec![EvalQuery {
+            query: "Calculator".to_owned(),
+            workspace: "cold".to_owned(),
+            top_k: Some(10),
+            filters: None,
+            expected_paths: vec!["src/Calculator.cs".to_owned()],
+            preferred_paths: Vec::new(),
+            disfavored_paths: Vec::new(),
+            expected_roles: Vec::new(),
+            required_snippet: None,
+            tags: Vec::new(),
+        }],
+    };
+    let mappings = parse_workspace_mappings(&[format!("cold={}", workspace.display())]).unwrap();
+
+    // Each run has its own application, data directory, and language-server
+    // state, so the server is still starting at its first search: it needs
+    // 1.5 s for `initialize`, the search waits 200 ms.
+    let mut reports = Vec::new();
+    for (label, dump_candidates) in [("plain", false), ("dump", true)] {
+        let mut config = config.clone();
+        config.data_dir = temp.path().join(format!("data-{label}"));
+        config.lsp_timeout_seconds = 10;
+        config.lsp_search_budget_ms = 200;
+        config.csharp = fake_slow_start_csharp_lsp(&temp.path().join(format!("lsp-{label}")), 1500);
+        let app = App::open(config).await.unwrap();
+        app.index(&workspace).await.unwrap();
+        let report = run_evaluation_with_options(
+            &app,
+            &definition,
+            &mappings,
+            RunOptions { dump_candidates },
+        )
+        .await
+        .unwrap();
+        let query = &report.queries[0];
+        assert!(
+            query.timings.unwrap().lsp_search_ms >= 150.0,
+            "{label}: the language-server channel waited out its budget: {:?}",
+            query.timings
+        );
+        // A note is not a fallback.
+        assert!(query.warning.is_none(), "{label}: {:?}", query.warning);
+        assert_eq!(report.fallback_queries, 0);
+        reports.push(report);
+    }
+
+    let plain = serde_json::to_value(&reports[0]).unwrap();
+    assert!(plain["queries"][0].get("notes").is_none(), "{plain}");
+    assert!(plain["queries"][0].get("candidates").is_none());
+
+    let dumped = &reports[1].queries[0];
+    assert_eq!(dumped.notes.len(), 1, "{:?}", dumped.notes);
+    assert!(
+        dumped.notes[0].contains("LSP still starting") && dumped.notes[0].contains("csharp-ls"),
+        "{:?}",
+        dumped.notes
+    );
+    assert!(
+        dumped.candidates.iter().all(|row| row.lsp_rank.is_none()),
+        "the cold server contributed no candidate"
+    );
+    assert!(!dumped.candidates.is_empty());
+    let dumped_json = serde_json::to_value(&reports[1]).unwrap();
+    assert_eq!(
+        dumped_json["queries"][0]["notes"],
+        json!([dumped.notes[0].clone()])
+    );
+    // The two runs agree on everything else.
+    assert_eq!(reports[0].queries[0].metrics, dumped.metrics);
+    task.abort();
 }
 
 fn spawn_count(state: &Path) -> u64 {

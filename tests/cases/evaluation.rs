@@ -197,3 +197,564 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
         String::from_utf8_lossy(&unreadable.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// `evaluate --dump-candidates`: the candidate dump observes a search, it never
+// changes one.
+// ---------------------------------------------------------------------------
+
+use local_code_intelligence::{
+    app::{CandidateTrace, RerankOutcome, SearchOptions, SearchReport},
+    evaluate::{CandidateArm, RerankMode, RunOptions, load_report, run_evaluation_with_options},
+    filter::FilterRequest,
+};
+
+/// `src/many.rs` holds five chunks that match "translator" better than the
+/// only chunk of each of two other files, as in the per-file cap test.
+/// `src/second.rs` is longer than the reranker's document budget.
+fn write_dump_workspace(root: &Path) {
+    write(
+        root,
+        "src/many.rs",
+        "fn translator_one() {}\nfn translator_two() {}\nfn translator_three() {}\nfn translator_four() {}\nfn translator_five() {}\n",
+    );
+    write(
+        root,
+        "src/second.rs",
+        &format!("pub static SECOND: &str = \"{}\";\n", "y".repeat(300)),
+    );
+    write(root, "src/third.rs", "fn third_file() {}\n");
+}
+
+/// Cap 2 and a shortlist of 4 over seven chunks: the third to fifth `many.rs`
+/// chunks fall behind the other files and out of the shortlist. The reranker
+/// document is cut to 256 bytes (the least allowed) of code.
+fn dump_config(mut config: Config) -> Config {
+    config.channels.lsp = false;
+    config.fusion.max_chunks_per_file = 2;
+    config.rerank_candidate_count = 4;
+    config.rerank_document_max_bytes = 256;
+    config
+}
+
+async fn search_traced(
+    app: &App,
+    workspace: &Path,
+    filters: FilterRequest,
+    trace_candidates: bool,
+) -> SearchReport {
+    app.search_with_options(
+        workspace,
+        "translator",
+        Some(3),
+        filters,
+        SearchOptions { trace_candidates },
+    )
+    .await
+    .unwrap()
+}
+
+/// The report as JSON without what legitimately differs between two searches
+/// (timings, wait) and without the trace.
+fn without_trace_and_timings(report: &SearchReport) -> Value {
+    let mut value = serde_json::to_value(report).unwrap();
+    let object = value.as_object_mut().unwrap();
+    for key in ["timings", "candidates", "rerank_outcome"] {
+        object.remove(key);
+    }
+    object["index"].as_object_mut().unwrap().remove("wait_ms");
+    value
+}
+
+/// A candidate's fusion score from its ranks, as the dump documents it.
+fn recomputed_fusion_score(row: &CandidateTrace, config: &Config) -> f32 {
+    let (rrf_k, weights) = (config.rrf_k, &config.fusion);
+    let mut score = 0.0_f32;
+    if let Some(rank) = row.semantic_rank {
+        score += weights.semantic_weight / (rrf_k + rank as f32);
+    }
+    if let Some(rank) = row.lexical_rank {
+        score += weights.lexical_weight / (rrf_k + rank as f32);
+    }
+    if let Some(rank) = row.lsp_rank {
+        score += weights.lsp_weight / (rrf_k + rank as f32);
+    }
+    score + row.prior
+}
+
+fn locate<'a>(rows: &'a [CandidateTrace], path: &str, start_line: u32) -> &'a CandidateTrace {
+    rows.iter()
+        .find(|row| row.relative_file_path == path && row.start_line == start_line)
+        .unwrap_or_else(|| panic!("{path}:{start_line} is not in the dump"))
+}
+
+#[tokio::test]
+async fn a_traced_search_records_the_pool_and_returns_exactly_what_an_untraced_one_does() {
+    let (temp, config, fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump");
+    write_dump_workspace(&workspace);
+    let app = App::open(config.clone()).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    // Every untraced entry point (the CLI, MCP and REST all use these two)
+    // leaves the trace out of the JSON altogether.
+    let plain = search_traced(&app, &workspace, FilterRequest::default(), false).await;
+    let plain_json = serde_json::to_value(&plain).unwrap();
+    assert!(plain.candidates.is_none() && plain.rerank_outcome.is_none());
+    let via_search =
+        serde_json::to_value(app.search(&workspace, "translator", Some(3)).await.unwrap()).unwrap();
+    for json in [&plain_json, &via_search] {
+        for key in ["candidates", "rerank_outcome", "arm"] {
+            assert!(
+                json.get(key).is_none(),
+                "an untraced search has a {key} key"
+            );
+        }
+    }
+    assert!(plain.reranked, "{:?}", plain.warning);
+
+    // The traced search returns the same thing.
+    let traced = search_traced(&app, &workspace, FilterRequest::default(), true).await;
+    assert_eq!(
+        without_trace_and_timings(&traced),
+        without_trace_and_timings(&plain)
+    );
+    assert_eq!(traced.rerank_outcome, Some(RerankOutcome::Scored));
+    let rows = traced.candidates.as_ref().expect("the pool was traced");
+    assert_eq!(
+        rows.len(),
+        7,
+        "five chunks of many.rs and one of each other file"
+    );
+
+    // Fused order, the exact fusion arithmetic, and the one-based ranks.
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.fused_rank, index + 1);
+        assert!(row.semantic_rank.is_some(), "{row:?}");
+        assert_eq!(
+            row.fusion_score.to_bits(),
+            recomputed_fusion_score(row, &config).to_bits(),
+            "{}:{}",
+            row.relative_file_path,
+            row.start_line
+        );
+    }
+    assert!(rows.windows(2).all(|pair| {
+        pair[0]
+            .fusion_score
+            .total_cmp(&pair[1].fusion_score)
+            .is_ge()
+    }));
+    let mut semantic: Vec<usize> = rows.iter().filter_map(|row| row.semantic_rank).collect();
+    semantic.sort_unstable();
+    assert_eq!(semantic, (1..=7).collect::<Vec<_>>());
+
+    // The cap keeps two chunks of many.rs in front and demotes the other
+    // three behind both other files; the shortlist is the first four.
+    let shortlisted: Vec<_> = rows.iter().filter(|row| row.shortlisted).collect();
+    assert_eq!(shortlisted.len(), 4);
+    assert!(shortlisted.iter().all(|row| row.capped_rank <= 4));
+    let is_many = |row: &CandidateTrace| row.relative_file_path == "src/many.rs";
+    assert_eq!(shortlisted.iter().filter(|row| is_many(row)).count(), 2);
+    let cut: Vec<_> = rows.iter().filter(|row| !row.shortlisted).collect();
+    assert_eq!(cut.len(), 3);
+    assert!(cut.iter().all(|row| is_many(row)));
+    assert!(cut.iter().all(|row| row.capped_rank > row.fused_rank));
+    let mut capped: Vec<usize> = rows.iter().map(|row| row.capped_rank).collect();
+    capped.sort_unstable();
+    assert_eq!(capped, (1..=7).collect::<Vec<_>>());
+
+    // Reranker scores for the shortlist only, ranked 1..=4 as the reranker
+    // ordered them (score descending, request index on ties).
+    assert!(shortlisted.iter().all(|row| row.reranker_score.is_some()));
+    assert!(cut.iter().all(|row| {
+        row.reranker_score.is_none()
+            && row.rerank_rank.is_none()
+            && row.document_bytes.is_none()
+            && row.est_tokens.is_none()
+    }));
+    let mut reranked = shortlisted.clone();
+    reranked.sort_by_key(|row| row.rerank_rank);
+    assert_eq!(
+        reranked
+            .iter()
+            .map(|row| row.rerank_rank)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3), Some(4)]
+    );
+    assert!(reranked.windows(2).all(|pair| {
+        let (a, b) = (
+            pair[0].reranker_score.unwrap(),
+            pair[1].reranker_score.unwrap(),
+        );
+        a > b || (a == b && pair[0].capped_rank < pair[1].capped_rank)
+    }));
+    // The results are the head of that order, with the same scores.
+    for (position, hit) in plain.results.iter().enumerate() {
+        let row = locate(rows, &hit.chunk.relative_file_path, hit.chunk.start_line);
+        assert_eq!(row.rerank_rank, Some(position + 1));
+        assert_eq!(row.reranker_score, hit.reranker_score);
+        assert_eq!(
+            row.snippet,
+            local_code_intelligence::evaluate::bounded_snippet(&hit.chunk.code)
+        );
+        assert_eq!(row.fusion_score.to_bits(), hit.fusion_score.to_bits());
+    }
+
+    // The document sizes are what the reranker received: path, newline, and
+    // at most 256 bytes of code (only `src/second.rs`, with a 300-byte literal, is cut: 14 + 256).
+    let longest = shortlisted
+        .iter()
+        .map(|row| row.document_bytes.unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(longest, "src/second.rs\n".len() + 256);
+    assert_eq!(
+        fake.max_rerank_document_bytes.load(Ordering::SeqCst),
+        longest
+    );
+    for row in &shortlisted {
+        assert_eq!(row.est_tokens, Some(row.document_bytes.unwrap() / 4));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_traced_search_without_reranker_scores_says_why_and_still_returns_the_same_results() {
+    let (temp, config, fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump-unscored");
+    write_dump_workspace(&workspace);
+    let indexer = App::open(config.clone()).await.unwrap();
+    indexer.index(&workspace).await.unwrap();
+    drop(indexer);
+
+    let assert_unscored = |report: &SearchReport| {
+        let rows = report.candidates.as_ref().unwrap();
+        assert_eq!(rows.len(), 7);
+        assert!(
+            rows.iter()
+                .all(|row| row.reranker_score.is_none() && row.rerank_rank.is_none())
+        );
+        // The shortlist still names the four documents the reranker would be
+        // given, in fusion order.
+        assert_eq!(rows.iter().filter(|row| row.shortlisted).count(), 4);
+        assert!(
+            rows.iter()
+                .filter(|row| row.shortlisted)
+                .all(|row| row.document_bytes.is_some())
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|hit| hit.reranker_score.is_none())
+        );
+    };
+
+    // Reranker switched off.
+    let mut off_config = config.clone();
+    off_config.channels.reranker = false;
+    let off_app = App::open(off_config).await.unwrap();
+    let off_plain = search_traced(&off_app, &workspace, FilterRequest::default(), false).await;
+    let off = search_traced(&off_app, &workspace, FilterRequest::default(), true).await;
+    assert_eq!(off.rerank_outcome, Some(RerankOutcome::Off));
+    assert!(!off.reranked && off.warning.is_none(), "{:?}", off.warning);
+    assert_unscored(&off);
+    assert_eq!(
+        without_trace_and_timings(&off),
+        without_trace_and_timings(&off_plain)
+    );
+    // Off is fusion order: the results are the head of the capped order.
+    let rows = off.candidates.as_ref().unwrap();
+    for (position, hit) in off.results.iter().enumerate() {
+        let row = locate(rows, &hit.chunk.relative_file_path, hit.chunk.start_line);
+        assert_eq!(row.capped_rank, position + 1);
+    }
+    drop(off_app);
+
+    // Reranker failing: fusion order, with a warning.
+    let app = App::open(config.clone()).await.unwrap();
+    fake.rerank_fails.store(true, Ordering::SeqCst);
+    let failed_plain = search_traced(&app, &workspace, FilterRequest::default(), false).await;
+    let failed = search_traced(&app, &workspace, FilterRequest::default(), true).await;
+    fake.rerank_fails.store(false, Ordering::SeqCst);
+    assert_eq!(failed.rerank_outcome, Some(RerankOutcome::Failed));
+    assert!(!failed.reranked);
+    assert!(
+        failed
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("fusion-ranked results returned"),
+        "{:?}",
+        failed.warning
+    );
+    assert_unscored(&failed);
+    assert_eq!(
+        without_trace_and_timings(&failed),
+        without_trace_and_timings(&failed_plain)
+    );
+
+    // A filter that matches nothing is an empty report with an empty dump.
+    let nothing = search_traced(
+        &app,
+        &workspace,
+        FilterRequest {
+            languages: Some(vec!["python".to_owned()]),
+            ..FilterRequest::default()
+        },
+        true,
+    )
+    .await;
+    assert!(nothing.results.is_empty());
+    assert_eq!(nothing.candidates, Some(Vec::new()));
+    assert_eq!(nothing.rerank_outcome, Some(RerankOutcome::NotRun));
+    task.abort();
+}
+
+fn dump_definition() -> EvaluationFile {
+    let query = |text: &str, workspace: &str, top_k: Option<usize>| EvalQuery {
+        query: text.to_owned(),
+        workspace: workspace.to_owned(),
+        top_k,
+        filters: None,
+        expected_paths: vec!["src/many.rs".to_owned()],
+        preferred_paths: Vec::new(),
+        disfavored_paths: Vec::new(),
+        expected_roles: Vec::new(),
+        required_snippet: Some("translator".to_owned()),
+        tags: Vec::new(),
+    };
+    EvaluationFile {
+        workspaces: vec![
+            EvalWorkspace {
+                key: "dump".to_owned(),
+                required: true,
+            },
+            EvalWorkspace {
+                key: "absent".to_owned(),
+                required: false,
+            },
+        ],
+        queries: vec![
+            query("translator", "dump", Some(3)),
+            query("translator_two", "dump", None),
+            query("translator", "absent", None),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn the_evaluation_dump_adds_candidates_and_an_arm_and_changes_nothing_else() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump-evaluation");
+    write_dump_workspace(&workspace);
+    let app = App::open(config.clone()).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let definition = dump_definition();
+    let mappings = parse_workspace_mappings(&[format!("dump={}", workspace.display())]).unwrap();
+
+    let plain = run_evaluation_with_options(&app, &definition, &mappings, RunOptions::default())
+        .await
+        .unwrap();
+    let dumped = run_evaluation_with_options(
+        &app,
+        &definition,
+        &mappings,
+        RunOptions {
+            dump_candidates: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Without the flag no query carries a dump key.
+    let plain_json = serde_json::to_value(&plain).unwrap();
+    for query in plain_json["queries"].as_array().unwrap() {
+        for key in ["candidates", "arm", "rerank_outcome", "notes"] {
+            assert!(query.get(key).is_none(), "a plain report has a {key} key");
+        }
+    }
+
+    // With it, everything an evaluation reports is the same.
+    assert_eq!(plain.queries.len(), 3);
+    assert_eq!((plain.executed_count, plain.skipped_count), (2, 1));
+    assert_eq!(plain.success_count, dumped.success_count);
+    assert_eq!(plain.mrr, dumped.mrr);
+    assert_eq!(plain.mean_ndcg_at_10, dumped.mean_ndcg_at_10);
+    assert_eq!(plain.hit_at_1_rate, dumped.hit_at_1_rate);
+    for (before, after) in plain.queries.iter().zip(&dumped.queries) {
+        assert_eq!(
+            serde_json::to_value(&before.evidence).unwrap(),
+            serde_json::to_value(&after.evidence).unwrap(),
+            "{}",
+            before.query.query
+        );
+        assert_eq!(before.metrics, after.metrics);
+        assert_eq!(before.reranked, after.reranked);
+        assert_eq!(before.warning, after.warning);
+        assert_eq!(before.outcome, after.outcome);
+        assert_eq!(before.index_action, after.index_action);
+    }
+
+    // The dumped queries carry the pool, the arm, and the reranker outcome;
+    // a skipped query carries none.
+    let default_top_k = config.default_top_k;
+    for (query, expected_k) in dumped.queries[..2].iter().zip([3, default_top_k]) {
+        assert_eq!(query.candidates.len(), 7, "{}", query.query.query);
+        assert_eq!(query.rerank_outcome, Some(RerankOutcome::Scored));
+        let arm = query.arm.as_ref().expect("a dumped query has an arm");
+        assert_eq!(arm, &CandidateArm::new(&config, expected_k));
+        assert_eq!(arm.k, expected_k);
+        assert_eq!(arm.rrf_k, config.rrf_k);
+        assert_eq!(arm.fusion, config.fusion);
+        assert_eq!(arm.rerank_candidate_count, 4);
+        assert_eq!(arm.rerank_document_max_bytes, 256);
+        assert_eq!(arm.channels, config.channels);
+        assert_eq!(arm.rerank_mode, RerankMode::Replace);
+        assert_eq!(arm.embedding_identity, config.embedding_identity());
+        assert_eq!(arm.reranker_model, config.reranker_model);
+        // The evidence rows are the head of the dumped rerank order, with the
+        // same bounded snippets, so `required_snippet` replays exactly.
+        for row in &query.evidence {
+            let traced = locate(&query.candidates, &row.relative_file_path, row.start_line);
+            assert_eq!(traced.rerank_rank, Some(row.rank));
+            assert_eq!(traced.reranker_score, row.reranker_score);
+            assert_eq!(traced.snippet, row.snippet);
+        }
+    }
+    let skipped = &dumped.queries[2];
+    assert!(skipped.skipped);
+    assert!(
+        skipped.candidates.is_empty()
+            && skipped.arm.is_none()
+            && skipped.rerank_outcome.is_none()
+            && skipped.notes.is_empty()
+    );
+    // These searches had no notes, so a dumped query has no `notes` key
+    // either (the cold language server case is in the indexing tests).
+    let dumped_json = serde_json::to_value(&dumped).unwrap();
+    for query in dumped_json["queries"].as_array().unwrap() {
+        assert!(query.get("notes").is_none(), "{query}");
+    }
+
+    // A saved dump loads back unchanged through the report loader that
+    // `compare` uses, and `compare` accepts it against the plain report.
+    let saved = temp.path().join("dump.json");
+    std::fs::write(&saved, serde_json::to_string_pretty(&dumped).unwrap()).unwrap();
+    let loaded = load_report(&saved).unwrap();
+    for (before, after) in dumped.queries.iter().zip(&loaded.queries) {
+        assert_eq!(before.candidates, after.candidates);
+        assert_eq!(before.arm, after.arm);
+        assert_eq!(before.rerank_outcome, after.rerank_outcome);
+    }
+    let plain_saved = temp.path().join("plain.json");
+    std::fs::write(&plain_saved, serde_json::to_string_pretty(&plain).unwrap()).unwrap();
+    let comparison = local_code_intelligence::evaluate::compare_files(
+        &plain_saved,
+        &saved,
+        &local_code_intelligence::evaluate::CompareOptions {
+            seed: 1,
+            resamples: 100,
+        },
+    )
+    .unwrap();
+    assert_eq!(comparison.paired, 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn evaluate_dump_candidates_writes_the_dump_through_the_command_line_only_when_asked() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("dump-cli");
+    write_dump_workspace(&workspace);
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "data_dir = '{}'\nembedding_url = '{}'\nreranker_url = '{}'\nrerank_candidate_count = 4\nrerank_document_max_bytes = 256\n\n[channels]\nlsp = false\n\n[fusion]\nmax_chunks_per_file = 2\n",
+            temp.path().join("cli-data").display(),
+            config.embedding_url,
+            config.reranker_url,
+        ),
+    )
+    .unwrap();
+    let definition_path = temp.path().join("definition.toml");
+    std::fs::write(
+        &definition_path,
+        "[[workspaces]]\nkey = \"dump\"\nrequired = true\n\n[[queries]]\nworkspace = \"dump\"\nquery = \"translator\"\ntop_k = 3\nexpected_paths = [\"src/many.rs\"]\n",
+    )
+    .unwrap();
+
+    let run = |output: &'static str, dump: bool| {
+        let binary = env!("CARGO_BIN_EXE_local-code-intelligence");
+        let (config_path, definition_path) = (config_path.clone(), definition_path.clone());
+        let output_path = temp.path().join(output);
+        let workspace = format!("dump={}", workspace.display());
+        async move {
+            // The fake model service runs on this runtime, so the command
+            // must not block it.
+            let (result, output_path) = tokio::task::spawn_blocking(move || {
+                let mut command = std::process::Command::new(binary);
+                command
+                    .arg("--config")
+                    .arg(&config_path)
+                    .arg("evaluate")
+                    .arg(&definition_path)
+                    .args(["--workspace", &workspace, "--output"])
+                    .arg(&output_path);
+                if dump {
+                    command.arg("--dump-candidates");
+                }
+                (command.output().unwrap(), output_path)
+            })
+            .await
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            serde_json::from_str::<Value>(&std::fs::read_to_string(output_path).unwrap()).unwrap()
+        }
+    };
+    let plain = run("plain.json", false).await;
+    let dumped = run("dumped.json", true).await;
+
+    let plain_query = &plain["queries"][0];
+    for key in ["candidates", "arm", "rerank_outcome", "notes"] {
+        assert!(plain_query.get(key).is_none(), "{key}");
+    }
+    let dumped_query = &dumped["queries"][0];
+    assert_eq!(dumped_query["candidates"].as_array().unwrap().len(), 7);
+    assert_eq!(dumped_query["rerank_outcome"], "scored");
+    assert_eq!(dumped_query["arm"]["k"], 3);
+    assert_eq!(dumped_query["arm"]["rerank_candidate_count"], 4);
+    assert_eq!(dumped_query["arm"]["fusion"]["max_chunks_per_file"], 2);
+    assert_eq!(dumped_query["arm"]["rerank_mode"], "replace");
+    let first = &dumped_query["candidates"][0];
+    for key in [
+        "relative_file_path",
+        "language",
+        "start_line",
+        "end_line",
+        "source_role",
+        "semantic_rank",
+        "prior",
+        "fusion_score",
+        "fused_rank",
+        "capped_rank",
+        "shortlisted",
+        "document_bytes",
+        "est_tokens",
+        "snippet",
+    ] {
+        assert!(first.get(key).is_some(), "missing {key}: {first}");
+    }
+    assert_eq!(plain_query["evidence"], dumped_query["evidence"]);
+    assert_eq!(plain_query["metrics"], dumped_query["metrics"]);
+    task.abort();
+}

@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::app::{App, IndexAction, SearchReport};
+use crate::app::{App, IndexAction, SearchOptions, SearchReport};
 
 use super::metrics::aggregate;
 use super::types::{
-    AggregateReport, EvalTimings, EvaluationFile, IndexLifecycleAction, QueryReport,
+    AggregateReport, CandidateArm, EvalTimings, EvaluationFile, IndexLifecycleAction, QueryReport,
     ResultEvidence, bounded_snippet,
 };
 // ---------------------------------------------------------------------------
@@ -73,6 +73,17 @@ fn build_evidence(report: &SearchReport) -> Vec<ResultEvidence> {
         .collect()
 }
 
+/// Switches of one evaluation run that never change what it measures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Record, for every executed query, the whole fused candidate pool and
+    /// the retrieval configuration it came from (`evaluate
+    /// --dump-candidates`), so another arm can be scored from the report
+    /// without services. Results, metrics, and every other field of the
+    /// report are the same with it on or off.
+    pub dump_candidates: bool,
+}
+
 /// Execute all queries in an evaluation definition against the supplied
 /// workspace mappings and return the aggregate report.
 ///
@@ -82,6 +93,16 @@ pub async fn run_evaluation(
     app: &App,
     file: &EvaluationFile,
     workspaces: &[WorkspaceMapping],
+) -> Result<AggregateReport> {
+    run_evaluation_with_options(app, file, workspaces, RunOptions::default()).await
+}
+
+/// [`run_evaluation`] with [`RunOptions`].
+pub async fn run_evaluation_with_options(
+    app: &App,
+    file: &EvaluationFile,
+    workspaces: &[WorkspaceMapping],
+    options: RunOptions,
 ) -> Result<AggregateReport> {
     // Build a key → path lookup from the CLI mappings.
     let mut provided: BTreeMap<&str, &Path> = BTreeMap::new();
@@ -119,8 +140,17 @@ pub async fn run_evaluation(
         };
 
         let filter_request = query.filters.clone().unwrap_or_default();
-        let report = match app
-            .search_with_filters(workspace_path, &query.query, query.top_k, filter_request)
+        let search_options = SearchOptions {
+            trace_candidates: options.dump_candidates,
+        };
+        let mut report = match app
+            .search_with_options(
+                workspace_path,
+                &query.query,
+                query.top_k,
+                filter_request,
+                search_options,
+            )
             .await
         {
             Ok(report) => report,
@@ -134,7 +164,9 @@ pub async fn run_evaluation(
         };
 
         let evidence = build_evidence(&report);
-        reports.push(QueryReport::new(
+        let candidates = report.candidates.take();
+        let rerank_outcome = report.rerank_outcome.take();
+        let mut query_report = QueryReport::new(
             query.clone(),
             evidence,
             report.reranked,
@@ -156,7 +188,20 @@ pub async fn run_evaluation(
                 IndexAction::RefreshedIncrementally => IndexLifecycleAction::RefreshedIncrementally,
             }),
             Some(report.index.wait_ms),
-        ));
+        );
+        if let Some(candidates) = candidates {
+            query_report.candidates = candidates;
+            query_report.arm = Some(CandidateArm::new(
+                &app.config,
+                query.top_k.unwrap_or(app.config.default_top_k),
+            ));
+            query_report.rerank_outcome = rerank_outcome;
+            // Notes (an LSP channel that hit its budget, say) change what a
+            // dumped pool means, so a dump keeps them. Without the flag the
+            // report is exactly what it always was and carries none.
+            query_report.notes = report.notes;
+        }
+        reports.push(query_report);
     }
 
     Ok(aggregate(&reports))

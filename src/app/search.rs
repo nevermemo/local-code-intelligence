@@ -5,14 +5,14 @@
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
     config::{FusionConfig, IndexFreshness},
-    filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest},
+    filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest, SourceRole},
     lexical,
     lsp::adapter::LspAdapter,
-    store::{Hit, Snapshot, Store},
+    store::{Hit, Snapshot, Store, bounded_snippet},
     workspace::Workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     path::Path,
@@ -56,6 +56,215 @@ pub struct SearchReport {
     pub results: Vec<Hit>,
     pub index: SearchIndexLifecycle,
     pub filters: EffectiveFilterReport,
+    /// Every candidate of the post-filter fused pool, best first, with the
+    /// evidence needed to replay the search offline. Only present (and only
+    /// serialized) when the search ran with
+    /// [`SearchOptions::trace_candidates`]; absent from every other search's
+    /// JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<CandidateTrace>>,
+    /// What happened to the reranker for this search. Present exactly when
+    /// [`Self::candidates`] is, because only a replay needs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_outcome: Option<RerankOutcome>,
+}
+
+/// Switches of one search that observe it without changing what it returns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Record the fused pool in [`SearchReport::candidates`] (the evaluation
+    /// harness's `--dump-candidates`). The MCP, REST, and CLI `search` never
+    /// set it. Ranking, results, warnings, and the reported stage timings do
+    /// not depend on it.
+    pub trace_candidates: bool,
+}
+
+/// How the reranker took part in one traced search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankOutcome {
+    /// The reranker answered: every shortlisted candidate has a
+    /// `reranker_score` and a `rerank_rank`, and the results follow them.
+    Scored,
+    /// The reranker was asked (or skipped as recently unreachable) and did
+    /// not produce scores: the results are in fusion order, with a warning.
+    /// No candidate has a `reranker_score`.
+    Failed,
+    /// `[channels].reranker = false`: no request was made and the results
+    /// are in fusion order. No candidate has a `reranker_score`.
+    Off,
+    /// There was nothing to rerank (no candidates), so the stage never ran.
+    NotRun,
+}
+
+/// One candidate of the fused pool, as `evaluate --dump-candidates` records
+/// it. Together with the arm's `rrf_k` and channel weights, the fields below
+/// reproduce `fusion_score`, `fused_rank`, `capped_rank`, and `shortlisted`
+/// exactly, so a replay can re-run fusion, the per-file cap, and the shortlist
+/// cut with other settings.
+///
+/// Every rank is **one-based** and every `*_rank` is exactly the value fusion
+/// consumed, so the fusion score is, with all arithmetic in `f32` and in this
+/// order:
+///
+/// ```text
+/// score = 0.0
+/// if semantic_rank: score += semantic_weight / (rrf_k + semantic_rank as f32)
+/// if lexical_rank:  score += lexical_weight  / (rrf_k + lexical_rank  as f32)
+/// if lsp_rank:      score += lsp_weight      / (rrf_k + lsp_rank      as f32)
+/// fusion_score = score + prior
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateTrace {
+    /// Repository-relative file path.
+    pub relative_file_path: String,
+    /// Language identifier.
+    pub language: String,
+    /// One-based inclusive start line of the chunk. With `relative_file_path`
+    /// it breaks `fusion_score` ties in the fused order.
+    pub start_line: u32,
+    /// One-based inclusive end line of the chunk.
+    pub end_line: u32,
+    /// Source role of the file.
+    pub source_role: SourceRole,
+    /// One-based position in the semantic channel's list (cosine order after
+    /// the filters); `None` when that channel did not return the chunk.
+    pub semantic_rank: Option<usize>,
+    /// The semantic channel's `1 - cosine distance`. Never enters fusion.
+    pub semantic_score: Option<f32>,
+    /// One-based position in the lexical channel's list; `None` when that
+    /// channel did not return the chunk.
+    pub lexical_rank: Option<usize>,
+    /// The lexical channel's own chunk score. Never enters fusion.
+    pub lexical_score: Option<f32>,
+    /// Lines of the chunk credited with a query term; `0` when the lexical
+    /// channel did not return the chunk.
+    pub lexical_match_count: u32,
+    /// One-based position in the language-server channel's list; `None` when
+    /// that channel did not return the chunk.
+    pub lsp_rank: Option<usize>,
+    /// The source-role prior added to the channel terms, unscaled.
+    pub prior: f32,
+    /// The fusion score, prior included.
+    pub fusion_score: f32,
+    /// One-based position in the pool ordered by `fusion_score` descending,
+    /// then `relative_file_path`, then `start_line`; before the per-file cap
+    /// and before the shortlist cut. The dump lists candidates in this order.
+    pub fused_rank: usize,
+    /// One-based position after the per-file cap (`max_chunks_per_file` of the
+    /// arm) reordered the fused order, still before the shortlist cut. Equal
+    /// to `fused_rank` when the cap is `0` or demotes nothing. A shortlisted
+    /// candidate's zero-based index in the reranker's request is
+    /// `capped_rank - 1`.
+    pub capped_rank: usize,
+    /// Whether the candidate was inside the shortlist cut
+    /// (`capped_rank <= rerank_candidate_count`). Only these candidates reach
+    /// the reranker and the results of a search.
+    pub shortlisted: bool,
+    /// One-based position in the reranker's output order (`reranker_score`
+    /// descending, then request index); `None` unless the search's
+    /// [`RerankOutcome`] is `scored` and the candidate was shortlisted.
+    pub rerank_rank: Option<usize>,
+    /// The reranker's score; `None` unless `rerank_rank` is set.
+    pub reranker_score: Option<f32>,
+    /// Bytes of the document the reranker is given for this candidate (the
+    /// path, a newline, then the head of the code cut to
+    /// `rerank_document_max_bytes`); `Some` for every shortlisted candidate
+    /// and `None` for the others. Recorded even when the reranker was off or
+    /// failed, where nothing (or nothing usable) came back.
+    pub document_bytes: Option<usize>,
+    /// `document_bytes / 4` (integer division): a rough token count, one token
+    /// per four bytes.
+    pub est_tokens: Option<usize>,
+    /// The bounded evidence snippet of the chunk (the same
+    /// [`bounded_snippet`] an evidence row carries) on every candidate, so a
+    /// replayed result list can check `required_snippet`.
+    pub snippet: String,
+}
+
+/// The document the reranker scores for `hit`: the path, a newline, and at
+/// most `max_bytes` bytes of the head of the chunk.
+fn rerank_document(hit: &Hit, max_bytes: usize) -> String {
+    format!(
+        "{}\n{}",
+        hit.chunk.relative_file_path,
+        head_within(&hit.chunk.code, max_bytes)
+    )
+}
+
+/// Records the fused pool before it is capped and cut, in fused order.
+/// `hits` is the pool exactly as the cap receives it; `max_per_file`,
+/// `shortlist`, and `max_bytes` are the cap, `rerank_candidate_count`, and
+/// `rerank_document_max_bytes` the search then applies. Reranker fields are
+/// left empty (see [`record_rerank_scores`]). Observes only: the cap runs on
+/// positions here, with the same function the search applies to the hits.
+fn trace_candidates(
+    hits: &[Hit],
+    max_per_file: u32,
+    shortlist: usize,
+    max_bytes: usize,
+) -> Vec<CandidateTrace> {
+    let positions: Vec<(usize, &str)> = hits
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| (index, hit.chunk.relative_file_path.as_str()))
+        .collect();
+    let mut capped_rank = vec![0; hits.len()];
+    for (position, (index, _)) in cap_by_file(positions, max_per_file, |&(_, path)| path)
+        .into_iter()
+        .enumerate()
+    {
+        capped_rank[index] = position + 1;
+    }
+    hits.iter()
+        .zip(capped_rank)
+        .enumerate()
+        .map(|(index, (hit, capped_rank))| {
+            let shortlisted = capped_rank <= shortlist;
+            let document_bytes = shortlisted.then(|| rerank_document(hit, max_bytes).len());
+            CandidateTrace {
+                relative_file_path: hit.chunk.relative_file_path.clone(),
+                language: hit.chunk.language.clone(),
+                start_line: hit.chunk.start_line,
+                end_line: hit.chunk.end_line,
+                source_role: hit.source_role,
+                semantic_rank: hit.semantic_rank,
+                semantic_score: hit.semantic_score,
+                lexical_rank: hit.lexical_rank,
+                lexical_score: hit.lexical_score,
+                lexical_match_count: hit.lexical_match_count,
+                lsp_rank: hit.lsp_rank,
+                prior: hit.source_role_prior,
+                fusion_score: hit.fusion_score,
+                fused_rank: index + 1,
+                capped_rank,
+                shortlisted,
+                rerank_rank: None,
+                reranker_score: None,
+                document_bytes,
+                est_tokens: document_bytes.map(|bytes| bytes / 4),
+                snippet: bounded_snippet(&hit.chunk.code),
+            }
+        })
+        .collect()
+}
+
+/// Copies the reranker's answer onto the traced candidates. `ranks` is the
+/// output of `Models::rerank`: `(index in the request, score)`, best first,
+/// where the request held the shortlist in `capped_rank` order.
+fn record_rerank_scores(candidates: &mut [CandidateTrace], ranks: &[(usize, f32)]) {
+    let mut by_request_index = HashMap::<usize, usize>::new();
+    for (position, candidate) in candidates.iter().enumerate() {
+        if candidate.shortlisted {
+            by_request_index.insert(candidate.capped_rank - 1, position);
+        }
+    }
+    for (rerank_position, &(request_index, score)) in ranks.iter().enumerate() {
+        if let Some(&position) = by_request_index.get(&request_index) {
+            candidates[position].rerank_rank = Some(rerank_position + 1);
+            candidates[position].reranker_score = Some(score);
+        }
+    }
 }
 
 /// The longest prefix of `text` that is at most `max_bytes` long and ends on
@@ -90,30 +299,36 @@ fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
 /// which means a demoted chunk can follow a chunk with a lower score. `max ==
 /// 0` means unlimited and returns the list unchanged.
 fn cap_chunks_per_file(hits: Vec<Hit>, max: u32) -> Vec<Hit> {
+    cap_by_file(hits, max, |hit| hit.chunk.relative_file_path.as_str())
+}
+
+/// [`cap_chunks_per_file`] over any items that have a file path, so that the
+/// candidate trace can run the very same cap on positions instead of cloning
+/// hits.
+fn cap_by_file<T>(items: Vec<T>, max: u32, path_of: impl Fn(&T) -> &str) -> Vec<T> {
     if max == 0 {
-        return hits;
+        return items;
     }
     let max = max as usize;
     let keep: Vec<bool> = {
         let mut kept_per_file = HashMap::<&str, usize>::new();
-        hits.iter()
-            .map(|hit| {
-                let kept = kept_per_file
-                    .entry(hit.chunk.relative_file_path.as_str())
-                    .or_default();
+        items
+            .iter()
+            .map(|item| {
+                let kept = kept_per_file.entry(path_of(item)).or_default();
                 let fits = *kept < max;
                 *kept += usize::from(fits);
                 fits
             })
             .collect()
     };
-    let mut head = Vec::with_capacity(hits.len());
+    let mut head = Vec::with_capacity(items.len());
     let mut tail = Vec::new();
-    for (hit, fits) in hits.into_iter().zip(keep) {
+    for (item, fits) in items.into_iter().zip(keep) {
         if fits {
-            head.push(hit);
+            head.push(item);
         } else {
-            tail.push(hit);
+            tail.push(item);
         }
     }
     head.append(&mut tail);
@@ -161,6 +376,20 @@ impl App {
         top_k: Option<usize>,
         filter_request: FilterRequest,
     ) -> Result<SearchReport> {
+        self.search_with_options(path, query, top_k, filter_request, SearchOptions::default())
+            .await
+    }
+
+    /// [`Self::search_with_filters`] with options that observe the search
+    /// without changing what it returns (see [`SearchOptions`]).
+    pub async fn search_with_options(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        options: SearchOptions,
+    ) -> Result<SearchReport> {
         let total = Instant::now();
         ensure!(!query.trim().is_empty(), "query must not be empty");
         ensure!(query.len() <= 16000, "query exceeds 16000 bytes");
@@ -194,6 +423,10 @@ impl App {
                 wait_ms: resolution.wait_ms,
             },
             filters: filters.report(),
+            // A traced search that ends before fusion has an empty pool and
+            // never reached the reranker.
+            candidates: options.trace_candidates.then(Vec::new),
+            rerank_outcome: options.trace_candidates.then_some(RerankOutcome::NotRun),
         };
         if snapshot.table.count_rows(None).await? == 0 {
             report.timings.total_ms = ms(total);
@@ -460,21 +693,50 @@ impl App {
         // `max_chunks_per_file`, before the cut, so the reranker shortlist,
         // the reranker-off results, and the reranker-failure fallback all fill
         // with distinct files first. `0` returns the order unchanged.
+        //
+        // A traced search first records the whole pool (it is what the cap and
+        // the cut are about to discard from); the recording is not fusion work
+        // and stays out of `fusion_ms`.
+        let mut trace_ms = 0.0;
+        let mut traced = options.trace_candidates.then(|| {
+            let timer = Instant::now();
+            let rows = trace_candidates(
+                &hits,
+                self.config.fusion.max_chunks_per_file,
+                self.config.rerank_candidate_count,
+                self.config.rerank_document_max_bytes,
+            );
+            trace_ms = ms(timer);
+            rows
+        });
         hits = cap_chunks_per_file(hits, self.config.fusion.max_chunks_per_file);
         hits.truncate(self.config.rerank_candidate_count);
-        report.timings.fusion_ms = ms(fusion_timer);
+        report.timings.fusion_ms = ms(fusion_timer) - trace_ms;
         report.candidate_count = hits.len();
         if !hits.is_empty() {
             if channels.reranker {
                 let timer = Instant::now();
-                self.rerank_into_report(query, hits, k, &mut report).await;
+                let scores = self.rerank_into_report(query, hits, k, &mut report).await;
                 report.timings.reranking_ms = ms(timer);
+                if let Some(traced) = &mut traced {
+                    report.rerank_outcome = Some(match scores {
+                        Some(ranks) => {
+                            record_rerank_scores(traced, &ranks);
+                            RerankOutcome::Scored
+                        }
+                        None => RerankOutcome::Failed,
+                    });
+                }
             } else {
                 // Deliberately disabled: fusion order, `reranked = false`, no
                 // request, no warning, and a zero reranking time.
                 report.results = hits.into_iter().take(k).collect();
+                if traced.is_some() {
+                    report.rerank_outcome = Some(RerankOutcome::Off);
+                }
             }
         }
+        report.candidates = traced;
         report.results.retain(|hit| hit_matches(&filters, hit));
         report.timings.total_ms = ms(total);
         tracing::info!(
@@ -836,37 +1098,34 @@ impl App {
 
     /// Reranks fused candidates and writes the outcome (reranked results, or
     /// a fail-open fallback to fusion-ranked results with a warning) into
-    /// `report`.
+    /// `report`. Returns the reranker's full answer, as (index in `hits`,
+    /// score) pairs best first, when it scored the candidates, and `None`
+    /// after a fallback.
     async fn rerank_into_report(
         &self,
         query: &str,
         hits: Vec<Hit>,
         k: usize,
         report: &mut SearchReport,
-    ) {
+    ) -> Option<Vec<(usize, f32)>> {
         let max_bytes = self.config.rerank_document_max_bytes;
         let documents: Vec<_> = hits
             .iter()
-            .map(|h| {
-                format!(
-                    "{}\n{}",
-                    h.chunk.relative_file_path,
-                    head_within(&h.chunk.code, max_bytes)
-                )
-            })
+            .map(|hit| rerank_document(hit, max_bytes))
             .collect();
         match self.models.rerank(query, &documents).await {
             Ok(ranks) => {
                 report.reranked = true;
                 report.results = ranks
-                    .into_iter()
+                    .iter()
                     .take(k)
-                    .map(|(i, score)| {
+                    .map(|&(i, score)| {
                         let mut h = hits[i].clone();
                         h.reranker_score = Some(score);
                         h
                     })
                     .collect();
+                Some(ranks)
             }
             Err(error) => {
                 tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
@@ -882,6 +1141,7 @@ impl App {
                         .map_or(message.clone(), |w| format!("{w}; {message}")),
                 );
                 report.results = hits.into_iter().take(k).collect();
+                None
             }
         }
     }
@@ -889,7 +1149,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, cap_chunks_per_file, head_within};
+    use super::{
+        App, CandidateTrace, RerankOutcome, cap_chunks_per_file, head_within, record_rerank_scores,
+        rerank_document, trace_candidates,
+    };
     use crate::{
         chunk::Chunk,
         config::FusionConfig,
@@ -1379,5 +1642,203 @@ mod tests {
         let chunks = [("src/lib.rs", 1), ("tests/lib.rs", 1), ("a.rs", 1)];
         let capped = cap_chunks_per_file(fused_order(&chunks), 1);
         assert_eq!(order(&capped), chunks);
+    }
+
+    // -----------------------------------------------------------------------
+    // Candidate trace (`evaluate --dump-candidates`)
+    // -----------------------------------------------------------------------
+
+    /// `(path, start line)` of each traced row.
+    fn traced(rows: &[CandidateTrace]) -> Vec<(&str, u32)> {
+        rows.iter()
+            .map(|row| (row.relative_file_path.as_str(), row.start_line))
+            .collect()
+    }
+
+    #[test]
+    fn the_trace_records_fused_and_capped_ranks_and_shortlist_membership() {
+        // The interleaved list: a.rs three times among b.rs (two) and c.rs.
+        // Cap 2 demotes only the third a.rs chunk; the shortlist holds 4.
+        let hits = fused_order(&INTERLEAVED);
+        let rows = trace_candidates(&hits, 2, 4, 1024);
+        assert_eq!(traced(&rows), INTERLEAVED, "rows are in fused order");
+        let fused: Vec<usize> = rows.iter().map(|row| row.fused_rank).collect();
+        assert_eq!(fused, [1, 2, 3, 4, 5, 6]);
+        // Capped order: a1 b1 a11 c1 b11 a21.
+        let capped: Vec<usize> = rows.iter().map(|row| row.capped_rank).collect();
+        assert_eq!(capped, [1, 2, 3, 4, 6, 5]);
+        let shortlisted: Vec<bool> = rows.iter().map(|row| row.shortlisted).collect();
+        assert_eq!(shortlisted, [true, true, true, true, false, false]);
+
+        // The positions agree with what the search itself does to the hits.
+        let capped_hits = cap_chunks_per_file(hits.clone(), 2);
+        let mut shortlist: Vec<_> = rows.iter().filter(|row| row.shortlisted).collect();
+        shortlist.sort_by_key(|row| row.capped_rank);
+        let shortlist: Vec<_> = shortlist
+            .into_iter()
+            .map(|row| (row.relative_file_path.as_str(), row.start_line))
+            .collect();
+        assert_eq!(shortlist, order(&capped_hits[..4]));
+
+        // Without a cap the capped order is the fused order.
+        for row in trace_candidates(&hits, 0, 4, 1024) {
+            assert_eq!(row.capped_rank, row.fused_rank);
+            assert_eq!(row.shortlisted, row.fused_rank <= 4);
+        }
+        // A shortlist longer than the pool holds everything.
+        assert!(
+            trace_candidates(&hits, 2, 40, 1024)
+                .iter()
+                .all(|row| row.shortlisted)
+        );
+        assert!(trace_candidates(&[], 2, 4, 1024).is_empty());
+    }
+
+    #[test]
+    fn the_trace_sizes_the_document_the_reranker_is_given() {
+        let hits = fused_order(&INTERLEAVED);
+        // Every code is `fn at_<line>() {}`: 12 bytes for line 1, 13 for 11
+        // and 21. A document is the path, a newline, then the code.
+        let rows = trace_candidates(&hits, 2, 4, 1024);
+        for (row, hit) in rows.iter().zip(&hits).filter(|(row, _)| row.shortlisted) {
+            let document = rerank_document(hit, 1024);
+            assert_eq!(row.document_bytes, Some(document.len()));
+            assert_eq!(row.est_tokens, Some(document.len() / 4));
+        }
+        assert_eq!(rows[0].document_bytes, Some("a.rs\n".len() + 12));
+        // The rows past the shortlist were never going to be sent.
+        assert!(rows[4..].iter().all(|row| row.document_bytes.is_none()));
+        assert!(rows[4..].iter().all(|row| row.est_tokens.is_none()));
+
+        // The code is cut to the byte budget, as `rerank_document` cuts it.
+        let cut = trace_candidates(&hits, 2, 4, 8);
+        assert_eq!(cut[0].document_bytes, Some("a.rs\n".len() + 8));
+        assert_eq!(cut[0].est_tokens, Some(13 / 4));
+        assert_eq!(rerank_document(&hits[0], 8), "a.rs\nfn at_1(");
+        // The snippet is the bounded evidence, not the reranker document.
+        assert_eq!(cut[0].snippet, hits[0].chunk.code);
+    }
+
+    #[test]
+    fn rerank_scores_land_on_the_shortlisted_rows_by_request_index() {
+        let hits = fused_order(&INTERLEAVED);
+        let mut rows = trace_candidates(&hits, 2, 4, 1024);
+        // The request held the shortlist in capped order: index 0 is a1, 1 is
+        // b1, 2 is a11, 3 is c1. The reranker prefers c1, then b1 and a11
+        // tied (the lower request index first), then a1.
+        record_rerank_scores(&mut rows, &[(3, 0.9), (1, 0.5), (2, 0.5), (0, 0.1)]);
+        let outcome: Vec<_> = rows
+            .iter()
+            .map(|row| (row.rerank_rank, row.reranker_score))
+            .collect();
+        assert_eq!(
+            outcome,
+            [
+                (Some(4), Some(0.1)),
+                (Some(2), Some(0.5)),
+                (Some(3), Some(0.5)),
+                (Some(1), Some(0.9)),
+                (None, None),
+                (None, None),
+            ]
+        );
+        // Without scores (reranker off or failed) nothing is set.
+        let rows = trace_candidates(&hits, 2, 4, 1024);
+        assert!(
+            rows.iter()
+                .all(|row| row.rerank_rank.is_none() && row.reranker_score.is_none())
+        );
+    }
+
+    #[test]
+    fn traced_ranks_weights_and_prior_reproduce_every_fusion_score_bit_for_bit() {
+        use SourceRole::{Source, Test};
+        let rows = [
+            row("a.rs", Source, Some(1), Some(3), None),
+            row("b.rs", Source, Some(2), None, None),
+            row("c.rs", Source, None, Some(1), None),
+            row("d.rs", Source, Some(3), Some(2), Some(1)),
+            row("e.rs", Source, None, None, Some(2)),
+            row("tests/f.rs", Test, Some(4), None, Some(3)),
+            row("g.rs", Source, Some(5), Some(7), None),
+            row("h.rs", Source, None, Some(4), Some(4)),
+        ];
+        let weightings = [
+            (RRF_K, FusionConfig::default()),
+            (RRF_K, FusionConfig::UNIT),
+            (
+                7.5,
+                FusionConfig {
+                    semantic_weight: 3.0,
+                    lexical_weight: 0.5,
+                    lsp_weight: 4.0,
+                    max_chunks_per_file: 0,
+                },
+            ),
+            (1.0, FusionConfig::default()),
+        ];
+        for (rrf_k, weights) in weightings {
+            let fused = fuse(rrf_k, &weights, &rows);
+            let traced = trace_candidates(&fused, weights.max_chunks_per_file, 4, 1024);
+            // A dump is read back from JSON before a replay uses it.
+            let traced: Vec<CandidateTrace> =
+                serde_json::from_str(&serde_json::to_string(&traced).unwrap()).unwrap();
+            assert_eq!(traced.len(), rows.len());
+            for row in &traced {
+                // The documented formula, term by term.
+                let mut score = 0.0_f32;
+                if let Some(rank) = row.semantic_rank {
+                    score += weights.semantic_weight / (rrf_k + rank as f32);
+                }
+                if let Some(rank) = row.lexical_rank {
+                    score += weights.lexical_weight / (rrf_k + rank as f32);
+                }
+                if let Some(rank) = row.lsp_rank {
+                    score += weights.lsp_weight / (rrf_k + rank as f32);
+                }
+                score += row.prior;
+                assert_eq!(
+                    score.to_bits(),
+                    row.fusion_score.to_bits(),
+                    "{} at rrf_k {rrf_k}, {weights:?}",
+                    row.relative_file_path
+                );
+            }
+            // The rows are in the fused order: score descending, then path.
+            let mut resorted = traced.clone();
+            resorted.sort_by(|a, b| {
+                b.fusion_score
+                    .total_cmp(&a.fusion_score)
+                    .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
+                    .then(a.start_line.cmp(&b.start_line))
+            });
+            assert_eq!(traced, resorted);
+            assert_eq!(
+                traced.iter().map(|row| row.fused_rank).collect::<Vec<_>>(),
+                (1..=rows.len()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn a_trace_survives_a_json_round_trip_and_the_outcome_is_snake_case() {
+        let hits = fused_order(&INTERLEAVED);
+        let mut rows = trace_candidates(&hits, 2, 4, 1024);
+        record_rerank_scores(&mut rows, &[(0, 0.75), (1, 0.25), (2, 0.5), (3, 0.125)]);
+        let json = serde_json::to_string(&rows).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<CandidateTrace>>(&json).unwrap(),
+            rows
+        );
+        assert_eq!(
+            serde_json::to_string(&[
+                RerankOutcome::Scored,
+                RerankOutcome::Failed,
+                RerankOutcome::Off,
+                RerankOutcome::NotRun
+            ])
+            .unwrap(),
+            r#"["scored","failed","off","not_run"]"#
+        );
     }
 }

@@ -52,6 +52,27 @@ pub const fn source_role_prior(role: SourceRole) -> f32 {
     }
 }
 
+/// Maximum characters retained in a bounded evidence snippet.
+pub const SNIPPET_BUDGET: usize = 400;
+
+/// Truncate code to the bounded snippet budget, marking truncation with a
+/// trailing ellipsis. Short input is returned unchanged.
+///
+/// Lives here, not in `evaluate`, because the retrieval pipeline records the
+/// same snippet in a candidate dump; `evaluate` re-exports both items.
+pub fn bounded_snippet(code: &str) -> String {
+    if code.len() <= SNIPPET_BUDGET {
+        return code.to_owned();
+    }
+    let mut end = SNIPPET_BUDGET;
+    while !code.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out: String = code[..end].to_owned();
+    out.push('…');
+    out
+}
+
 pub struct Snapshot {
     pub table: Table,
     pub identity: String,
