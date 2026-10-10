@@ -89,7 +89,7 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- F2b (2026-10-10): per-file cap `max_chunks_per_file` on the fused shortlist (results and reranker input). Pre-registered grid before any run: {unlimited (today), 2}; fusion-only core + mined with even/odd halves, then a reranked confirm; same decision rule as F2a. Evidence: in `n7b-mined-fusion` 150/350 top-10 slots repeat an already-shown file.
+Nothing in progress.
 
 Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
 decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
@@ -134,6 +134,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 | R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
 | R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
+| F2c | Apply the per-file cap after reranking instead of before (F2b odd-half reranked MRR -0.089) | ready (replay via E0) | S | E0 |
 | N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | done (446c34a: search max 30.7 -> 1.9 s; background priming) | S-M | - |
 | E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (2026-10-10) | XS | - |
 | T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (2026-10-10) | XS | - |
@@ -338,7 +339,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | F2a done (8f56647 weights, 79138e4 default semantic 2.0); F2b per-file cap in progress | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | done (F2a 8f56647+79138e4 semantic 2x; F2b 50fda8a+92a7060 per-file cap 2) | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
@@ -432,6 +433,12 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 
   Decision: every pre-registered check passed for 2.0, so the default became `semantic_weight = 2.0` (79138e4). Production (reranked) quality is unchanged; the reranker-off/failure path gains. The weight-1.0 arm reproduced `n7b-mined-fusion` exactly (W/L/T 0/0/35).
 - F2b next (in progress): `max_chunks_per_file` on the fused shortlist, pre-registered grid {unlimited, 2}, same decision protocol.
+- F2b result (2026-10-10; frozen build of 50fda8a; pre-registered {0, 2}; `test-results/f2b-*`): fusion-only mined nDCG@10 +0.049 [+0.026, +0.077] (both halves significant), MRR +0.037, recall@8 0.558 -> 0.608; core nDCG@10 0.710 -> 0.878 (significant), recall@3 0.682 -> 0.955, first ranks unchanged; reranked mined nDCG@10 +0.046 [+0.002, +0.095], recall@8 0.600 -> 0.660, MRR -0.023 and hit@1 -0.057 (n.s., W/L/T 2/4/29). Default became 2 (92a7060). Caveat: reranked odd half MRR -0.089 [-0.185, -0.002] -- capping before the reranker can push a file's best (third) chunk out of the 24-chunk shortlist; F2c tests capping after reranking (replay with E0).
+
+### F2c - Per-file cap after reranking
+`ready` (best done as an E0 replay) - S - deps: E0 - skill: `lci-retrieval-evaluation`
+- Why: F2b's cap improves recall and nDCG everywhere but, applied before the reranker, cost reranked MRR on half the mined set. Capping the reranked output instead (and the fusion order only when the reranker is off or fails) keeps every chunk eligible for the reranker's top-1 while still diversifying the returned files.
+- Scope: a `cap_stage = "shortlist" | "results"` choice (or move the cap) in `src/app/search.rs`; decide with an E0 replay on the reranked mined/core runs (reranker scores are per pair, so moving the cap is replayable exactly), then one live confirm. Same decision protocol as F2a/F2b.
 ### F3 - Query-type routing
 `blocked(F2, L3, R2)` - M - deps: F2, L3, R2 - skill: `lci-retrieval-evaluation`
 - Why: BM25 is best for code-to-code/identifier queries and dense for NL (JetBrains https://arxiv.org/abs/2510.20609); keyword queries collapse dense models (CoREB); Semble raises lexical weight for symbol-like queries. Fixed per-channel depths "may not transfer across changing queries" (https://arxiv.org/abs/2609.15143).
