@@ -89,7 +89,7 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-Nothing in progress.
+- F2a (2026-10-10): per-channel RRF weights, defaults 1.0. Pre-registered grid before any run: `semantic_weight` in {1.0, 1.5, 2.0}, `lexical_weight` = `lsp_weight` = 1.0, fusion-only (reranker off) on core + mined; decision on the even-hash half of the mined set, confirmed on the odd half and the full set with `compare` CIs, then one reranked confirm; the default changes only if every check passes (plan in the session scratchpad `plan-f2a.md`). F2b (per-file cap, `max_chunks_per_file`) follows as its own slice: in `n7b-mined-fusion` 150/350 top-10 slots repeat an already-shown file.
 
 Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
 decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
@@ -212,6 +212,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Risk: evaluation must never feed ranking (skill rule); mined files are data, not tuning targets. Keep `core.toml` as the required hand-written set.
 - Follow-up (explorer, 2026-10-10): 5 of the 8 keyword-agnostic queries are gold noise (split files such as `src/app.rs`, churn dominated by dropped `.ps1`/docs, 13-file commits), and the stratum is really "short subject" (mean 10.5 words vs 32.8). New item E2b: flag `gold-drift` when dropped, split or unsupported files carry > 50% of a commit's churn, add a subject-length axis, and report strata on the clean subset.
 
+- Leakage (F2 planner, 2026-10-10): 3 of fusion's 7 top-1 losses against semantic-only rank `xtask/src/mine.rs` first; its unit tests quote real commit subjects from this repository, so mined query text appears verbatim in an indexed file. E2b must replace real subjects in mine.rs tests with synthetic ones (and regenerate nothing else); never exclude the file to fix an evaluation.
 ### E3 - Paired comparison and arm toggles
 `done` (fb5e4f9 `[channels]` toggles; 66005e9 `compare` subcommand and `evaluate --baseline` with seeded paired-bootstrap CIs; follow-ups: vary the deltas in `a_consistent_improvement_is_significant_and_a_consistent_loss_is_too`, README notes on --output exit code and sorted unpaired keys; no `--label`, the report records `baseline_source`) - M - deps: E1 - skill: `lci-retrieval-evaluation`
 - Why: every P0/P1 ranking item needs "A vs B on the same queries" with a significance signal (ranx-style paired tests https://github.com/AmenRa/ranx; q-IDF paper used 10,000-resample paired bootstrap https://arxiv.org/abs/2605.18561). The single most important experiment LCI has never run is a grep-only baseline (Cursor switched semantic search off in July 2026 after a +12.5% result eight months earlier https://cursor.com/blog/semsearch, https://forum.cursor.com/t/what-do-you-think-about-cursor-removing-the-codebase-indexing-settings/165899; de4er00 found hybrid can lose to dense alone https://github.com/de4er00/code-rag-mcp).
@@ -337,7 +338,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | ready, NEXT ranking item (post-L2 arms already exist: `test-results/l2-*-new2.json` plus the unchanged semantic-only arm; see E3) | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | in-progress (2026-10-10: F2a weights; F2b cap next) | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
