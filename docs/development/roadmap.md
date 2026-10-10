@@ -76,7 +76,6 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- V1 (2026-10-10): files downloaded and converted; benchmarks run after R0.
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 (LSP document lifecycle) and H1 (Rust `tests.rs` role).
@@ -96,8 +95,8 @@ first.
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | R0 | Fusion-only baseline: does the reranker help at all on core.toml? | done (2026-10-10: keep the reranker on) | S | - |
-| R7 | Reranker-down fast path: no 9 s of connect retries per search when the reranker is unreachable | ready | S | - |
-| V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | in-progress (2026-10-10) | S | - |
+| R7 | Reranker-down fast path: no 9 s of connect retries per search when the reranker is unreachable | done (1213ecc) | S | - |
+| V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, Vulkan) behind an `http` / `in-process` backend switch | proposed (after V1) | M | V1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
@@ -124,18 +123,31 @@ first.
 - Result on the mined set (2026-10-10, frozen binary at `7daed93`, 35 queries, sequential; `test-results/r0-mined-rerank-on.json` vs `-off.json`): reranked hit@1 0.743 / hit@3 0.914 / MRR 0.814 / nDCG@10 0.606 / recall@3 0.444; fusion-only 0.686 / 0.800 / 0.759 / 0.555 / 0.379. By tag: keyword (27) reranked hit@1 0.852 / MRR 0.907 vs fusion-only 0.741 / 0.822; keyword-agnostic (8) reranked hit@1 0.375 / hit@3 0.75 / MRR 0.500 vs 0.500 / 0.500 / 0.544 (n=8, noise). Latency: reranked median 34.0 s (reranking p50 32.7 s, p95 44.3 s); the fusion-only arm's median 10.3 s is ~9.2 s of reranker connect retries (R7) on top of ~1.1 s of real work. Verdict: unlike `core.toml`, the larger set shows a consistent reranker gain (+5.7 points hit@1, +11.4 hit@3, +5.1 nDCG@10), so the default stays on; latency work moves to R1 (window), R6 (gating), V1 (serving). Also seen: `lsp_search_ms` p95 10.2 s (p50 32 ms) -- one or two queries hit an LSP timeout or a cold server; check under N2/N3. The keyword-agnostic stratum is the weak spot (hit@1 <= 0.5): target for C2/M1/embedder work.
 
 ### R7 - Reranker-down fast path
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation`
+`done` (1213ecc; live: reranking_ms p50 9157 -> 0.25 ms with the reranker unreachable, first query one ~2 s refused connect, search median 10.3 -> 0.64 s; `test-results/r7-core-rerank-off.json`) - S - deps: none - skill: `lci-retrieval-evaluation`
 - Why: R0's reranker-unreachable arm spent ~9.2 s per search in `send_with_retry` (`lci-core/src/models.rs`) retrying connection errors with 1 s/2 s backoff (Windows also takes ~2 s to report a refused localhost connection) before failing open. In production, every search pays that while the reranker is down or restarting.
 - Scope: query-time rerank (and query embedding) should not back off on a connection error for seconds: either one attempt for connect errors on `TimeoutRetry::FailFast` paths, or a short circuit breaker that remembers an unreachable reranker for ~30 s and skips straight to fusion order with the existing warning. Indexing (`embed`) keeps its retries. Report the skip in the existing reranker warning.
 - Accept: test with the reranker URL pointing at a closed port: the search returns fusion-ranked results with the warning in < 3 s (fake models); existing fail-open tests stay green. Live: rerun the fusion-only arm and confirm `reranking_ms` p50 falls from ~9.2 s to < 2.5 s.
 - Risk: a reranker that is merely restarting is skipped for the breaker window; keep the window short and document it.
 
 ### V1 - Native-Windows llama.cpp serving trial (owner-requested hardware investigation)
-`in-progress (2026-10-10)` (approved and downloaded: llama.cpp b11539 Vulkan, lemonade-sdk b1342 ROCm gfx1150, Qwen3-Embedding-4B Q8_0, Qwen3-Reranker-4B converted to Q8_0 with LCI's code instruction and vLLM's prompt suffix patched into the converter, ggml-org Qwen3-Reranker-0.6B Q8_0; FastFlowLM 1.0.7 portable zip for V2) - S, live, config-only - deps: none
+`done` (2026-10-10, measured; below the go bar, production unchanged) (approved and downloaded: llama.cpp b11539 Vulkan, lemonade-sdk b1342 ROCm gfx1150, Qwen3-Embedding-4B Q8_0, Qwen3-Reranker-4B converted to Q8_0 with LCI's code instruction and vLLM's prompt suffix patched into the converter, ggml-org Qwen3-Reranker-0.6B Q8_0; FastFlowLM 1.0.7 portable zip for V2) - S, live, config-only - deps: none
 - Why (NPU research, 2026-10-10, sources in the session's npu-research notes): the owner asked to use the Ryzen AI 9 HX 370's XDNA 2 NPU. Findings: no Windows NPU runtime serves reranking (FastFlowLM 1.0.7 exposes chat/embeddings/transcription only; Lemonade 2026.41.1 forwards `/v1/rerank` to llama.cpp on GPU/CPU; OGA is generation-only); the only NPU-ready embedder is EmbeddingGemma-300M (MTEB ~68 vs Qwen3-Embedding-4B ~74.6, int4, 2048-token max, forces a re-index); vendor NPU prefill for a 4B model is ~510-615 tok/s. Today's WSL2 + ROCm vLLM bf16 path reaches only ~290 tok/s (~2.3 TFLOPS) -- a software inefficiency: independent llama.cpp numbers on the 890M imply ~500-670 tok/s for a 4B model (Vulkan or ROCm), halving rerank time (~25-30 s -> ~13-17 s) and cutting model RAM ~17 GB -> ~9 GB. llama-server's `/rerank` already returns LCI's `{results:[{index, relevance_score}]}` and serves `/v1/models`, so no LCI code change is needed.
 - Scope: no code. Owner-approved downloads: llama.cpp Windows Vulkan build (ggml-org release zip, ~32 MB, MIT) and optionally the lemonade-sdk llamacpp-rocm gfx1150 build (~93 MB, MIT); `Qwen/Qwen3-Embedding-4B-GGUF` Q8_0 (~4.3 GB, Apache-2.0); a Qwen3-Reranker-4B GGUF converted from the cached HF weights with a current `convert_hf_to_gguf.py` (verify `pooling_type=RANK` and the rerank template -- older conversions return near-zero scores; `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` is a known-good reference). Serve on scratch ports (e.g. 8770/8771) with `--embedding --pooling last` and `--reranking --pooling rank`; point a scratch config with its own data_dir at them; never run more than two model processes (stop the WSL reranker first if needed).
 - Accept: fixed-payload benchmark (24 docs / ~8.5k tokens rerank, median of 5; 64-chunk embedding in batches of 8) and an `evaluate core.toml` quality check. Go if rerank median <= ~60% of the WSL baseline and metrics within noise; then propose to the owner moving production serving to llama.cpp (re-point 8766/8767 to keep `embedding_identity`, or accept one re-embed).
+- V2 status (2026-10-10): FastFlowLM 1.0.7 portable zip in the session scratchpad validates the NPU stack (XDNA2, driver 32.0.20102.3930). Its only NPU embedder, `FastFlowLM/Embedding-Gemma-300M-NPU2` (~300 MB, q4nx, 2048-token context), is under the Gemma Terms of Use, not Apache/MIT, so downloading it needs the owner's explicit acceptance: `needs-approval(download FastFlowLM/Embedding-Gemma-300M-NPU2, Gemma Terms of Use, ~300 MB)`.
 - Optional NPU measurement (V2, needs approval: FastFlowLM installer ~30 MB, MIT): EmbeddingGemma throughput on the NPU and NPU/iGPU power interference on this 4-30 W handheld; expected to fail the quality gate, so measurement only. A Qwen3-Reranker-4B NPU port via Ryzen AI 1.8 OGA is a 2-4 day speculative spike (custom head, AMD login/EULA) -- parked unless V1 falls short.
+
+- Result (2026-10-10; fixed payload = 24 real LCI source chunks of <= 4096 bytes, ~31k prompt tokens per rerank, 8 of them as an embedding batch; per-run text markers so no server-side prefix-cache hits; median of 5 after a discarded warmup; nothing else running unless noted; script and JSON in the session scratchpad `v1/bench.py`, `v1/bench-*.json`):
+
+  | Server | Rerank 24 docs | Embed batch of 8 | Embed 1 query |
+  | --- | --- | --- | --- |
+  | vLLM ROCm/WSL, `vllm.txt` flags | 62.8 s | 10.9 s | 0.13 s |
+  | vLLM + `--max-num-seqs 32 --max-num-batched-tokens 32768` | 74.1 s (worse) | - | - |
+  | llama.cpp b11539 Vulkan, Q8_0, 8 slots | 67.5 s | - | - |
+  | llama.cpp lemonade b1342 ROCm gfx1150, Q8_0, `-fa on`, 8 slots | 47.2 s | 13.1 s | 0.51 s |
+
+  Parity: llama.cpp embeddings vs vLLM cosine >= 0.9993 (min over 9 vectors). Rerank: identical top 3 and top-1 across all servers; llama.cpp scores are much sharper (irrelevant documents ~0.0001 vs vLLM ~0.07-0.20), so tail Spearman is low (0.07-0.12) although the two llama.cpp builds agree with each other (0.99). The converted GGUF carries LCI's code instruction and the `vllm.txt` template suffix; the remaining calibration difference is unexplained (an `evaluate` run against a llama.cpp reranker would settle whether it matters).
+- Verdict: no switch. The best case (llama.cpp ROCm reranker) is 1.33x faster, short of the <= 60% bar, and the llama.cpp embedder is slower (0.83x batch, 3.8x slower single query). The 890M sustains roughly 500-700 prompt tokens/s for a 4B model in any runtime here, so the latency lever is fewer reranker tokens (R1 window, R6 gating), not the server. Kept as an option: a llama.cpp ROCm reranker on 8767 with the vLLM embedder would save ~25% of rerank time and ~4 GB of RAM (Q8_0) -- owner's call. Measurement lesson recorded in R1: vLLM prefix caching makes repeated identical payloads ~10x cheaper.
 
 ### V3 - In-process llama.cpp backend
 `proposed` (decide after V1) - M - deps: V1 - skill: `lci-retrieval-evaluation`
