@@ -76,6 +76,8 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
+- L2 (2026-10-10): rarity-weighted lexical terms, identifier splitting, IDF chunk scores; plan in the session scratchpad (`plan-l2.md`).
+
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 (LSP document lifecycle) and H1 (Rust `tests.rs` role).
@@ -102,7 +104,7 @@ first.
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
-| E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | in-progress (2026-10-10: part b toggles done, part a comparison next) | M | E1 |
+| E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | done (fb5e4f9 toggles, 66005e9 compare) | M | E1 |
 | E2b | Mined-set hygiene: `gold-drift` flag and subject-length axis; strata on the clean subset | ready | S | E2 |
 | R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
@@ -186,7 +188,7 @@ first.
 - Follow-up (explorer, 2026-10-10): 5 of the 8 keyword-agnostic queries are gold noise (split files such as `src/app.rs`, churn dominated by dropped `.ps1`/docs, 13-file commits), and the stratum is really "short subject" (mean 10.5 words vs 32.8). New item E2b: flag `gold-drift` when dropped, split or unsupported files carry > 50% of a commit's churn, add a subject-length axis, and report strata on the clean subset.
 
 ### E3 - Paired comparison and arm toggles
-`ready` - M - deps: E1 - skill: `lci-retrieval-evaluation`
+`done` (fb5e4f9 `[channels]` toggles; 66005e9 `compare` subcommand and `evaluate --baseline` with seeded paired-bootstrap CIs; follow-ups: vary the deltas in `a_consistent_improvement_is_significant_and_a_consistent_loss_is_too`, README notes on --output exit code and sorted unpaired keys; no `--label`, the report records `baseline_source`) - M - deps: E1 - skill: `lci-retrieval-evaluation`
 - Why: every P0/P1 ranking item needs "A vs B on the same queries" with a significance signal (ranx-style paired tests https://github.com/AmenRa/ranx; q-IDF paper used 10,000-resample paired bootstrap https://arxiv.org/abs/2605.18561). The single most important experiment LCI has never run is a grep-only baseline (Cursor switched semantic search off in July 2026 after a +12.5% result eight months earlier https://cursor.com/blog/semsearch, https://forum.cursor.com/t/what-do-you-think-about-cursor-removing-the-codebase-indexing-settings/165899; de4er00 found hybrid can lose to dense alone https://github.com/de4er00/code-rag-mcp).
 - Scope: (a) `evaluate --baseline <report.json> --label <name>`: per-query deltas of reciprocal rank and nDCG@10, win/loss/tie counts, mean delta with a seeded 95% paired-bootstrap CI (`src/evaluate/compare.rs`, wired in `src/main.rs`). (b) `[channels]` config section in `lci-core/src/config.rs` with `semantic`, `lexical`, `lsp`, `reranker` booleans (default true), honoured in `src/app/search.rs` (a disabled channel contributes no candidates and no timing; disabled reranker reports `reranked=false` with no warning). Grep-only arm = `semantic=false, lsp=false, reranker=false`. Document in `config.example.toml` and README.
 - Accept: unit tests for the comparison math; mock integration test that each toggle removes exactly that channel; live: `core.toml` run with reranker on vs off, numbers in the commit message.
@@ -280,7 +282,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | --- | --- | --- | --- | --- |
 | L0 | Engine-independent lexical fixes (no canonicalize per line, interval mapping, scanner-aligned rg flags, timeout) | ready | S | - |
 | L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research | M | E2, E3 |
-| L2 | IDF weighting and identifier splitting in the existing `rg` channel | ready, NEXT after E3 (E3 arms: lexical noise drags fusion below semantic-only) | S | E3 |
+| L2 | IDF weighting and identifier splitting in the existing `rg` channel | in-progress (2026-10-10) | S | E3 |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` | ready | S | E3 |
 | L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) | blocked(L1 decision) | L (split) | L1, L2 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
