@@ -2156,3 +2156,177 @@ async fn a_configuration_with_no_retrieval_channel_is_rejected_when_the_app_open
     );
     task.abort();
 }
+
+/// Roadmap F2b. `src/many.rs` holds five chunks that match the query better
+/// than the only chunk of each of two other files, and the semantic channel
+/// alone ranks them, so without a cap the top 3 is that one file three times.
+/// With `max_chunks_per_file` the repeats are demoted, not dropped, before the
+/// list is cut for the reranker, and every path that does not rerank (the
+/// reranker switched off, or failed) shows the same capped order.
+#[tokio::test]
+async fn the_per_file_cap_puts_distinct_files_first_in_results_and_the_reranker_shortlist() {
+    use local_code_intelligence::app::SearchReport;
+    use std::collections::BTreeSet;
+
+    let (temp, mut config, fake, task) = fixture().await;
+    // The fake embedder gives every chunk containing "translator" one vector
+    // and every other chunk another, so the five many.rs chunks outrank the
+    // rest and no other channel can reorder them.
+    config.channels.lexical = false;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("per-file-cap");
+    write(
+        &workspace,
+        "src/many.rs",
+        "fn translator_one() {}\nfn translator_two() {}\nfn translator_three() {}\nfn translator_four() {}\nfn translator_five() {}\n",
+    );
+    write(&workspace, "src/second.rs", "fn second_file() {}\n");
+    write(&workspace, "src/third.rs", "fn third_file() {}\n");
+    let indexer = App::open(config.clone()).await.unwrap();
+    assert_eq!(indexer.index(&workspace).await.unwrap().chunks, 7);
+    drop(indexer);
+
+    async fn search(
+        config: &Config,
+        workspace: &Path,
+        cap: u32,
+        shortlist: usize,
+        reranker: bool,
+        top_k: usize,
+    ) -> SearchReport {
+        let mut config = config.clone();
+        config.fusion.max_chunks_per_file = cap;
+        config.rerank_candidate_count = shortlist;
+        config.channels.reranker = reranker;
+        let app = App::open(config).await.unwrap();
+        app.search(workspace, "translator", Some(top_k))
+            .await
+            .unwrap()
+    }
+    fn paths(report: &SearchReport) -> Vec<&str> {
+        report
+            .results
+            .iter()
+            .map(|hit| hit.chunk.relative_file_path.as_str())
+            .collect()
+    }
+    fn distinct<'a>(paths: &[&'a str]) -> BTreeSet<&'a str> {
+        paths.iter().copied().collect()
+    }
+    const MANY: &str = "src/many.rs";
+    let others = BTreeSet::from(["src/second.rs", "src/third.rs"]);
+
+    // Uncapped (the default): the top 3 is one file three times.
+    let uncapped = search(&config, &workspace, 0, 24, false, 3).await;
+    assert!(!uncapped.reranked);
+    assert!(uncapped.warning.is_none(), "{:?}", uncapped.warning);
+    assert_eq!(paths(&uncapped), [MANY, MANY, MANY]);
+
+    // Cap 1, reranker off: distinct files first, many.rs's best chunk leading.
+    let capped = search(&config, &workspace, 1, 24, false, 3).await;
+    assert!(!capped.reranked);
+    assert!(capped.warning.is_none(), "{:?}", capped.warning);
+    let capped_paths = paths(&capped);
+    assert_eq!(capped_paths[0], MANY);
+    assert_eq!(
+        distinct(&capped_paths),
+        BTreeSet::from([MANY, "src/second.rs", "src/third.rs"])
+    );
+    assert_eq!(capped_paths.len(), 3);
+
+    // Demotion never removes a chunk: asking for all seven returns all seven,
+    // the distinct files first and the four demoted many.rs chunks after them.
+    let everything = search(&config, &workspace, 1, 24, false, 8).await;
+    let everything_paths = paths(&everything);
+    assert_eq!(everything_paths.len(), 7);
+    assert_eq!(everything_paths[0], MANY);
+    assert_eq!(distinct(&everything_paths[1..3]), others);
+    assert!(everything_paths[3..].iter().all(|path| *path == MANY));
+
+    // Cap 2: two many.rs chunks keep their place, the other files follow, and
+    // the third many.rs chunk is demoted behind them.
+    let two = search(&config, &workspace, 2, 24, false, 5).await;
+    let two_paths = paths(&two);
+    assert_eq!(two_paths[..2], [MANY, MANY]);
+    assert_eq!(distinct(&two_paths[2..4]), others);
+    assert_eq!(two_paths[4], MANY);
+    // Scores are not rescaled: the demoted many.rs chunk outscored the other
+    // files' chunks it now follows, and the list holds the same scores the
+    // uncapped order does (the semantic ranks 1..=7), only arranged
+    // differently.
+    assert!(two.results[4].fusion_score > two.results[2].fusion_score);
+    let all_scores = |report: &SearchReport| {
+        let mut scores: Vec<u32> = report
+            .results
+            .iter()
+            .map(|hit| hit.fusion_score.to_bits())
+            .collect();
+        scores.sort_unstable();
+        scores
+    };
+    let uncapped_all = search(&config, &workspace, 0, 24, false, 8).await;
+    let capped_all = search(&config, &workspace, 2, 24, false, 8).await;
+    assert_eq!(all_scores(&capped_all), all_scores(&uncapped_all));
+    assert_eq!(all_scores(&everything), all_scores(&uncapped_all));
+
+    // Reranker on with a 3-chunk shortlist: uncapped, the reranker is only
+    // shown many.rs; capped, it is shown one chunk of each file.
+    let requests_before = fake.rerank_requests.load(Ordering::SeqCst);
+    let reranked_uncapped = search(&config, &workspace, 0, 3, true, 3).await;
+    assert!(
+        reranked_uncapped.reranked,
+        "{:?}",
+        reranked_uncapped.warning
+    );
+    assert_eq!(paths(&reranked_uncapped), [MANY, MANY, MANY]);
+    let reranked_capped = search(&config, &workspace, 1, 3, true, 3).await;
+    assert!(reranked_capped.reranked, "{:?}", reranked_capped.warning);
+    assert_eq!(reranked_capped.candidate_count, 3);
+    assert!(
+        reranked_capped
+            .results
+            .iter()
+            .all(|hit| hit.reranker_score.is_some())
+    );
+    let reranked_paths = paths(&reranked_capped);
+    assert_eq!(
+        reranked_paths[0], MANY,
+        "the fake reranker prefers translator"
+    );
+    assert_eq!(
+        distinct(&reranked_paths),
+        BTreeSet::from([MANY, "src/second.rs", "src/third.rs"])
+    );
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst) - requests_before,
+        2
+    );
+
+    // The reranker's own order is final: with a shortlist that holds every
+    // chunk, the cap only decides what it sees first, and the reranker still
+    // puts all five translator chunks ahead of the other files.
+    let reranked_all = search(&config, &workspace, 1, 24, true, 7).await;
+    assert!(reranked_all.reranked, "{:?}", reranked_all.warning);
+    let reranked_all_paths = paths(&reranked_all);
+    assert!(reranked_all_paths[..5].iter().all(|path| *path == MANY));
+    assert_eq!(distinct(&reranked_all_paths[5..]), others);
+
+    // A failing reranker falls back to the capped fusion order, with a warning.
+    fake.rerank_fails.store(true, Ordering::SeqCst);
+    let fallback = search(&config, &workspace, 1, 3, true, 3).await;
+    fake.rerank_fails.store(false, Ordering::SeqCst);
+    assert!(!fallback.reranked);
+    let warning = fallback.warning.as_deref().expect("the fallback warns");
+    assert!(
+        warning.contains("fusion-ranked results returned"),
+        "{warning}"
+    );
+    assert!(fallback.results.iter().all(|h| h.reranker_score.is_none()));
+    let fallback_paths = paths(&fallback);
+    assert_eq!(fallback_paths[0], MANY);
+    assert_eq!(
+        distinct(&fallback_paths),
+        BTreeSet::from([MANY, "src/second.rs", "src/third.rs"])
+    );
+    task.abort();
+}

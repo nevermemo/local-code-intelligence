@@ -98,6 +98,9 @@ impl Default for ChannelsConfig {
 ///
 /// The weights are visible only through `fusion_score`; channel ranks, scores,
 /// and the reranker's input are unchanged.
+///
+/// `max_chunks_per_file` is the one non-weight setting: an optional per-file
+/// cap on the fused ordering (see the field).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FusionConfig {
@@ -107,21 +110,37 @@ pub struct FusionConfig {
     pub lexical_weight: f32,
     /// Weight of the language-server channel's reciprocal-rank contribution.
     pub lsp_weight: f32,
+    /// Most chunks of one file that keep their place in the fused order before
+    /// the rest of that file's chunks are demoted behind every other chunk
+    /// (`0..=100`, `0` = unlimited, the default). It runs after fusion
+    /// ordering and before the list is cut to `rerank_candidate_count`, so the
+    /// reranker's shortlist and the reranker-off and reranker-failure results
+    /// fill with distinct files first, while `top_k` is still filled from the
+    /// demoted chunks when there are too few distinct files. Demotion is
+    /// stable and never removes a chunk. `fusion_score` is not rescaled, so a
+    /// demoted chunk can appear after a chunk with a lower `fusion_score`. The
+    /// reranker's own output order is not capped again.
+    pub max_chunks_per_file: u32,
 }
 
 impl FusionConfig {
-    /// Plain unweighted RRF: every channel weighs `1.0`.
+    /// Largest accepted `max_chunks_per_file`.
+    pub const MAX_CHUNKS_PER_FILE_LIMIT: u32 = 100;
+
+    /// Plain unweighted RRF: every channel weighs `1.0`, and no per-file cap.
     pub const UNIT: Self = Self {
         semantic_weight: 1.0,
         lexical_weight: 1.0,
         lsp_weight: 1.0,
+        max_chunks_per_file: 0,
     };
 }
 
 impl Default for FusionConfig {
     /// `semantic_weight = 2.0` (roadmap F2a: fusion-only mined-set MRR +0.059,
     /// CI [+0.012, +0.118], held-out halves agree, core ranks unchanged,
-    /// reranked confirm n.s.); lexical and LSP stay at `1.0`.
+    /// reranked confirm n.s.); lexical and LSP stay at `1.0`, and
+    /// `max_chunks_per_file` stays `0` (unlimited) until F2b is measured.
     fn default() -> Self {
         Self {
             semantic_weight: 2.0,
@@ -196,6 +215,7 @@ pub struct Config {
     pub channels: ChannelsConfig,
     /// Per-channel Reciprocal Rank Fusion weights; `semantic_weight = 2.0`,
     /// `lexical_weight = lsp_weight = 1.0` by default (all `1.0` is plain RRF).
+    /// Also `max_chunks_per_file` (default `0`, unlimited).
     pub fusion: FusionConfig,
 }
 
@@ -526,6 +546,12 @@ impl Config {
                 "fusion.{name} must be a finite number greater than zero (got {weight}); to turn a channel off use [channels], not a zero weight"
             );
         }
+        ensure!(
+            self.fusion.max_chunks_per_file <= FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT,
+            "fusion.max_chunks_per_file must be 0..={} (got {}); 0 means unlimited",
+            FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT,
+            self.fusion.max_chunks_per_file
+        );
         ensure!(
             self.watch_poll_milliseconds > 0 && self.watch_debounce_milliseconds > 0,
             "watch intervals must be positive"
@@ -993,6 +1019,7 @@ mod tests {
             semantic_weight: 2.0,
             lexical_weight: 1.0,
             lsp_weight: 1.0,
+            max_chunks_per_file: 0,
         };
         // The default, a file without the section, and an empty section all
         // mean semantic_weight 2.0 with lexical and LSP at 1.0.
@@ -1089,6 +1116,76 @@ mod tests {
             let config: Config = toml::from_str(&toml_text).unwrap();
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains("fusion.lexical_weight"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn max_chunks_per_file_defaults_to_unlimited_and_is_range_checked() {
+        // Unlimited (0) is the default everywhere the section can be absent.
+        assert_eq!(Config::default().fusion.max_chunks_per_file, 0);
+        assert_eq!(FusionConfig::default().max_chunks_per_file, 0);
+        assert_eq!(FusionConfig::UNIT.max_chunks_per_file, 0);
+        let absent: Config = toml::from_str(&base_toml()).unwrap();
+        assert_eq!(absent.fusion.max_chunks_per_file, 0);
+        let empty: Config = toml::from_str(&format!("{}[fusion]\n", base_toml())).unwrap();
+        assert_eq!(empty.fusion.max_chunks_per_file, 0);
+
+        // A value is read from the file, validated, and round-trips; it leaves
+        // the weights at their defaults.
+        let capped: Config = toml::from_str(&format!(
+            "{}[fusion]\nmax_chunks_per_file = 2\n",
+            base_toml()
+        ))
+        .unwrap();
+        capped.validate().unwrap();
+        assert_eq!(
+            capped.fusion,
+            FusionConfig {
+                max_chunks_per_file: 2,
+                ..FusionConfig::default()
+            }
+        );
+        let reloaded: Config = toml::from_str(&toml::to_string(&capped).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.fusion, capped.fusion);
+
+        // 0 and 100 are the ends of the accepted range.
+        for good in [0, 1, 2, 100] {
+            let mut config = Config {
+                data_dir: std::env::temp_dir(),
+                ..Config::default()
+            };
+            config.fusion.max_chunks_per_file = good;
+            config.validate().unwrap();
+        }
+        for bad in [101, 1000, u32::MAX] {
+            let mut config = Config {
+                data_dir: std::env::temp_dir(),
+                ..Config::default()
+            };
+            config.fusion.max_chunks_per_file = bad;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("fusion.max_chunks_per_file"),
+                "{bad}: {error}"
+            );
+            assert!(error.contains("0..=100"), "{bad}: {error}");
+        }
+
+        // The check runs at load time, from the file; a negative or fractional
+        // value is not an unsigned integer and fails to parse.
+        let too_big = format!("{}[fusion]\nmax_chunks_per_file = 101\n", base_toml());
+        let config: Config = toml::from_str(&too_big).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fusion.max_chunks_per_file")
+        );
+        for value in ["-1", "1.5", "\"2\""] {
+            let text = format!("{}[fusion]\nmax_chunks_per_file = {value}\n", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{value}");
         }
     }
 }
