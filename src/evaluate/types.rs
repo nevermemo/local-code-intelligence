@@ -66,6 +66,12 @@ pub struct EvalQuery {
     /// snippet; `None` means no snippet expectation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_snippet: Option<String>,
+    /// Free-form labels that stratify the aggregate: the report carries one
+    /// [`TagAggregate`] per distinct tag. Generated query sets use
+    /// `keyword` and `keyword-agnostic`. Tags never affect search or the
+    /// per-query metrics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +396,23 @@ pub struct StageLatency {
     pub total_ms: LatencyPercentiles,
 }
 
+/// Headline metrics for the executed queries that carry one tag (see
+/// [`EvalQuery::tags`]). A query with several tags counts once in each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagAggregate {
+    /// Executed (non-skipped) queries carrying the tag; always at least one.
+    pub executed_count: usize,
+    /// hit@1 rate over those queries.
+    pub hit_at_1_rate: f64,
+    /// hit@3 rate over those queries.
+    pub hit_at_3_rate: f64,
+    /// Mean reciprocal rank over those queries.
+    pub mrr: f64,
+    /// Mean [`QueryMetrics::ndcg_at_10`] over those queries (bounded by each
+    /// query's result window, see there).
+    pub mean_ndcg_at_10: f64,
+}
+
 /// Aggregate metrics across all query reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateReport {
@@ -462,6 +485,11 @@ pub struct AggregateReport {
     /// Combined source-role distribution over all evaluated evidence.
     #[serde(default)]
     pub role_distribution: BTreeMap<String, usize>,
+    /// Per-tag aggregates over executed queries, keyed by tag. Empty (and
+    /// omitted from JSON) when no executed query carries a tag; a tag that
+    /// only appears on skipped queries has no entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_tag: BTreeMap<String, TagAggregate>,
     /// The per-query reports.
     #[serde(default)]
     pub queries: Vec<QueryReport>,

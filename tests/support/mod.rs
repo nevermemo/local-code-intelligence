@@ -55,6 +55,7 @@ fn evaluation_query() -> EvalQuery {
         disfavored_paths: Vec::new(),
         expected_roles: vec!["source".to_owned()],
         required_snippet: Some("query_metrics".to_owned()),
+        tags: Vec::new(),
     }
 }
 

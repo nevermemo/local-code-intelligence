@@ -31,6 +31,7 @@ fn query_with(expected: &[&str]) -> EvalQuery {
         disfavored_paths: Vec::new(),
         expected_roles: Vec::new(),
         required_snippet: None,
+        tags: Vec::new(),
     }
 }
 
@@ -511,6 +512,7 @@ fn evaluation_file_round_trips_through_serde() {
             disfavored_paths: vec!["src/noise.rs".to_owned()],
             expected_roles: vec!["source".to_owned()],
             required_snippet: Some("fn metric".to_owned()),
+            tags: vec!["keyword".to_owned()],
         }],
     };
     let json = serde_json::to_string(&file).unwrap();
@@ -1002,5 +1004,171 @@ fn ndcg_does_not_depend_on_pattern_declaration_order() {
     for order in [["src/**", "src/metric.rs"], ["src/metric.rs", "src/**"]] {
         let metrics = query_metrics(&query_with(&order), &results, false);
         assert_close(metrics.ndcg_at_10, 1.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query tags and per-tag aggregates
+// ---------------------------------------------------------------------------
+
+fn tagged(expected: &str, tags: &[&str]) -> EvalQuery {
+    let mut query = query_with(&[expected]);
+    query.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+    query
+}
+
+fn run_tagged(query: EvalQuery, results: &[&str]) -> QueryReport {
+    QueryReport::new(query, rows(results), false, None, None, None, None, None)
+}
+
+#[test]
+fn tags_round_trip_through_toml_and_default_to_empty() {
+    let raw = r#"
+[[workspaces]]
+key = "self"
+
+[[queries]]
+workspace = "self"
+query = "tagged query"
+expected_paths = ["src/a.rs"]
+tags = ["keyword", "keyword-agnostic"]
+
+[[queries]]
+workspace = "self"
+query = "untagged query"
+expected_paths = ["src/a.rs"]
+"#;
+    let file: EvaluationFile = toml::from_str(raw).unwrap();
+    validate_definition(&file).unwrap();
+    assert_eq!(file.queries[0].tags, ["keyword", "keyword-agnostic"]);
+    assert!(file.queries[1].tags.is_empty());
+
+    let rendered = toml::to_string(&file).unwrap();
+    let back: EvaluationFile = toml::from_str(&rendered).unwrap();
+    assert_eq!(back.queries[0].tags, file.queries[0].tags);
+    assert!(back.queries[1].tags.is_empty());
+    // An empty tag list is not written out.
+    assert!(!toml::to_string(&file.queries[1]).unwrap().contains("tags"));
+    assert!(
+        toml::to_string(&file.queries[0])
+            .unwrap()
+            .contains("keyword-agnostic")
+    );
+}
+
+#[test]
+fn by_tag_aggregates_executed_queries_per_tag() {
+    let reports = [
+        // keyword: found at rank 1.
+        run_tagged(tagged("src/a.rs", &["keyword"]), &["src/a.rs", "src/x.rs"]),
+        // keyword and keyword-agnostic: found at rank 2.
+        run_tagged(
+            tagged("src/a.rs", &["keyword", "keyword-agnostic"]),
+            &["src/x.rs", "src/a.rs"],
+        ),
+        // keyword-agnostic, repeated on the query: a miss; counts once.
+        run_tagged(
+            tagged("src/a.rs", &["keyword-agnostic", "keyword-agnostic"]),
+            &["src/x.rs", "src/y.rs"],
+        ),
+        // Untagged queries only feed the overall aggregate.
+        run_tagged(query_with(&["src/a.rs"]), &["src/a.rs"]),
+        // Skipped queries are excluded, and a tag seen only on a skipped
+        // query has no entry at all.
+        QueryReport::skipped(tagged("src/a.rs", &["keyword"]), "optional".to_owned()),
+        QueryReport::skipped(tagged("src/a.rs", &["skipped-only"]), "optional".to_owned()),
+    ];
+    let report = aggregate(&reports);
+
+    assert_eq!(report.executed_count, 4);
+    assert_eq!(
+        report.by_tag.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["keyword", "keyword-agnostic"]
+    );
+
+    // Rank 2 earns gain 2 at a log2(3) discount against an ideal of 2 at
+    // log2(2), so the second query's nDCG is 1 / log2(3).
+    let rank_two_ndcg = 1.0 / 3f64.log2();
+    let keyword = &report.by_tag["keyword"];
+    assert_eq!(keyword.executed_count, 2);
+    assert_close(keyword.hit_at_1_rate, 0.5);
+    assert_close(keyword.hit_at_3_rate, 1.0);
+    assert_close(keyword.mrr, 0.75);
+    assert_close(keyword.mean_ndcg_at_10, (1.0 + rank_two_ndcg) / 2.0);
+
+    let agnostic = &report.by_tag["keyword-agnostic"];
+    assert_eq!(agnostic.executed_count, 2);
+    assert_close(agnostic.hit_at_1_rate, 0.0);
+    assert_close(agnostic.hit_at_3_rate, 0.5);
+    assert_close(agnostic.mrr, 0.25);
+    assert_close(agnostic.mean_ndcg_at_10, rank_two_ndcg / 2.0);
+
+    // The overall figures still cover every executed query, tagged or not.
+    assert_close(report.mrr.unwrap(), (1.0 + 0.5 + 0.0 + 1.0) / 4.0);
+}
+
+#[test]
+fn untagged_runs_omit_by_tag_and_old_reports_still_load() {
+    let report = aggregate(&[run_tagged(query_with(&["src/a.rs"]), &["src/a.rs"])]);
+    assert!(report.by_tag.is_empty());
+    let mut value = serde_json::to_value(&report).unwrap();
+    // Empty `by_tag` is not serialized, so reports written before the field
+    // existed are indistinguishable from untagged runs.
+    assert!(value.as_object_mut().unwrap().remove("by_tag").is_none());
+    assert!(
+        !serde_json::to_string(&report.queries[0].query)
+            .unwrap()
+            .contains("tags")
+    );
+    let back: AggregateReport = serde_json::from_value(value).unwrap();
+    assert!(back.by_tag.is_empty());
+
+    let tagged_report = aggregate(&[run_tagged(tagged("src/a.rs", &["keyword"]), &["src/a.rs"])]);
+    let json = serde_json::to_string(&tagged_report).unwrap();
+    let back: AggregateReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.by_tag, tagged_report.by_tag);
+    assert_eq!(back.queries[0].query.tags, ["keyword"]);
+}
+
+#[test]
+fn checked_in_definitions_load_and_validate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("evaluations");
+    let core = load_definition(&root.join("core.toml")).expect("core.toml loads");
+    assert!(core.queries.iter().all(|query| query.tags.is_empty()));
+
+    // The git-mined set is generated by `cargo xtask mine-queries`: every
+    // query is stratified, asks for a ten-result window, and is expected to
+    // name at least one file.
+    let mined = load_definition(&root.join("mined").join("self.toml")).expect("mined set loads");
+    assert_eq!(mined.workspaces.len(), 1);
+    assert_eq!(mined.workspaces[0].key, "self");
+    assert!(mined.workspaces[0].required);
+    assert!(!mined.queries.is_empty());
+    for query in &mined.queries {
+        assert_eq!(query.workspace, "self");
+        assert_eq!(query.top_k, Some(10), "{}", query.query);
+        assert!(!query.expected_paths.is_empty(), "{}", query.query);
+        // The mined gold is the files that exist at the commit the set was
+        // generated from. A refactor that moves or deletes one of them leaves
+        // a label no search can meet, so it must regenerate the set.
+        for path in query
+            .expected_paths
+            .iter()
+            .filter(|path| !path.contains(['*', '?', '[']))
+        {
+            assert!(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(path)
+                    .is_file(),
+                "mined expected path {path} no longer exists; regenerate evaluations/mined/self.toml \
+                 with `cargo xtask mine-queries --repo . --key self --out evaluations/mined/self.toml`"
+            );
+        }
+        assert_eq!(query.tags.len(), 1, "{}", query.query);
+        assert!(
+            ["keyword", "keyword-agnostic"].contains(&query.tags[0].as_str()),
+            "{}",
+            query.query
+        );
     }
 }

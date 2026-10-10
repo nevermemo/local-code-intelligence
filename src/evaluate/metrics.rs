@@ -7,7 +7,7 @@ use crate::filter::GlobPattern;
 
 use super::types::{
     AggregateReport, EvalQuery, EvalTimings, IndexLifecycleAction, LatencyPercentiles,
-    QueryMetrics, QueryReport, RerankerState, ResultEvidence, StageLatency,
+    QueryMetrics, QueryReport, RerankerState, ResultEvidence, StageLatency, TagAggregate,
 };
 // ---------------------------------------------------------------------------
 // Pure metrics
@@ -490,8 +490,46 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
             })
             .count(),
         role_distribution,
+        by_tag: tag_aggregates(&executed),
         queries: reports.to_vec(),
     }
+}
+
+/// Group the executed reports by query tag and summarize each group. A
+/// query repeating a tag counts once for it, and a query with several tags
+/// counts once in each group.
+fn tag_aggregates(executed: &[&QueryReport]) -> BTreeMap<String, TagAggregate> {
+    let mut groups: BTreeMap<&str, Vec<&QueryReport>> = BTreeMap::new();
+    for report in executed {
+        let distinct: BTreeSet<&str> = report.query.tags.iter().map(String::as_str).collect();
+        for tag in distinct {
+            groups.entry(tag).or_default().push(report);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(tag, reports)| {
+            let count = reports.len() as f64;
+            let share = |hit: fn(&QueryMetrics) -> bool| {
+                reports.iter().filter(|report| hit(&report.metrics)).count() as f64 / count
+            };
+            let mean = |value: fn(&QueryMetrics) -> f64| {
+                reports
+                    .iter()
+                    .map(|report| value(&report.metrics))
+                    .sum::<f64>()
+                    / count
+            };
+            let aggregate = TagAggregate {
+                executed_count: reports.len(),
+                hit_at_1_rate: share(|metrics| metrics.hit_at_1),
+                hit_at_3_rate: share(|metrics| metrics.hit_at_3),
+                mrr: mean(|metrics| metrics.reciprocal_rank),
+                mean_ndcg_at_10: mean(|metrics| metrics.ndcg_at_10),
+            };
+            (tag.to_owned(), aggregate)
+        })
+        .collect()
 }
 
 /// Mean of a per-query metric over the executed reports; `None` when there

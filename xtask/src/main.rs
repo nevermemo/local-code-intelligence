@@ -1,6 +1,7 @@
 mod acceptance;
 mod build;
 mod live_acceptance;
+mod mine;
 mod setup;
 mod test;
 
@@ -49,6 +50,25 @@ enum Command {
         /// Skip the initial `cargo build --workspace` step.
         #[arg(long)]
         skip_build: bool,
+    },
+    /// Mine an evaluation definition from a repository's git history: each
+    /// qualifying commit message becomes a query and the supported source
+    /// files it touched that still exist at HEAD become its expected paths.
+    /// Reads git history only. See README "Retrieval evaluation".
+    MineQueries {
+        /// Root of the git repository to mine.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Workspace key written into the definition; the same key is passed
+        /// to `evaluate --workspace <key>=<path>`.
+        #[arg(long)]
+        key: String,
+        /// Evaluation definition to write, e.g. evaluations/mined/<key>.toml.
+        #[arg(long)]
+        out: PathBuf,
+        /// Keep at most this many queries (the most recent qualifying ones).
+        #[arg(long, default_value_t = 300)]
+        max: usize,
     },
 }
 
@@ -214,5 +234,11 @@ async fn main() -> Result<()> {
             }
         },
         Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
+        Command::MineQueries {
+            repo,
+            key,
+            out,
+            max,
+        } => mine::run(repo, key, out, max),
     }
 }
