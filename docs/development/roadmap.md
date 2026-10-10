@@ -89,7 +89,7 @@ first.
 
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| R0 | Fusion-only baseline: does the reranker help at all on core.toml? | ready | S | - |
+| R0 | Fusion-only baseline: does the reranker help at all on core.toml? | measured (needs E2 + owner decision) | S | - |
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | ready | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | ready | M | E1 |
@@ -97,7 +97,7 @@ first.
 | R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
 | R3 | Reranker as a weighted RRF vote instead of a replacement | ready | S | E3 |
-| R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | needs-approval(download) | S | E3 |
+| R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
@@ -108,6 +108,7 @@ first.
 - Scope: no code. Run the current binary on `core.toml` twice, sequentially: reranker on (default) and reranker unreachable (`reranker_url = "http://127.0.0.1:9/rerank"`; ignore the ~9 s connection-retry latency in that arm, or subtract `reranking_ms`). Compare hit@1/3/8, MRR, first expected ranks per query. Repeat on `evaluations/mined/self.toml` once E2 lands.
 - Accept: both reports under `test-results/`, a per-query table in this item; no default change without the owner if quality differs or the evidence is within noise.
 - Risk: 11 queries cannot detect small differences; this is a go/no-go signal, not a final verdict.
+- Result (2026-10-10, binary at `43d56d9`, same index, sequential runs; reports `test-results/core-eval-cap-4096.json` vs `test-results/r0-core-rerank-off.json`): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955; fusion-only hit@1 0.909 / hit@3 1.0 / MRR 0.939. Per query the reranker fixed one (readiness: fusion rank 3 -> 1) and broke one (language registry: 1 -> 2); the other nine were rank 1 either way. Reranking cost 18-46 s per query (median ~25 s) while everything else took ~0.8-1.3 s warm. Verdict: no measurable quality gain from the reranker on this set at ~25x latency; not enough queries to change the default. Re-run on the E2 mined set; if it holds, propose to the owner a faster default (reranker opt-in, R2-style skipping, or R3 vote mode).
 
 ### E0 - Candidate and score dump for offline replay
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation`
@@ -159,6 +160,7 @@ first.
 - Risk: keep `fusion_score` and `reranker_score` distinct (retrieval contract).
 
 ### R4 - Trial Qwen3-Reranker-0.6B
+- Downloaded with the owner's approval (2026-10-10, WSL `~/.cache/huggingface/hub`): `Qwen/Qwen3-Reranker-0.6B` (1.2 GB, Apache-2.0), `Alibaba-NLP/gte-reranker-modernbert-base` (575 MB, Apache-2.0), `Qwen/Qwen3-Embedding-0.6B` (1.2 GB, Apache-2.0, for M-items). Already cached: Qwen3-Embedding-4B, Qwen3-Embedding-8B, Qwen3-Reranker-4B. The owner allows a candidate to take the RAM of the model it would replace (stop the 4B reranker, serve the candidate on 8767, restore the `vllm.txt` setup afterwards; never more than two model processes). An NPU/native-Windows serving investigation (owner request) runs first and may change where these models are served.
 `needs-approval(download Qwen/Qwen3-Reranker-0.6B, Apache-2.0, ~0.6B params, ~1.2 GB bf16, https://huggingface.co/Qwen/Qwen3-Reranker-0.6B)` - S - deps: E3
 - Why: a third-party L4 measurement puts the 0.6B at 65 ms p50 vs 580 ms for the 4B (https://superlinked.com/blog/qwen3-embedding-reranker-guide); on an iGPU the ratio should be similar. MTEB-Code drops 81.20 -> 73.42 (https://arxiv.org/abs/2506.05176), but that was over a weak retriever; over LCI's 4B embedder the loss may be small and the latency gain decisive.
 - Scope: no code. Owner approves and serves the model on 8767 under a distinct `reranker_model` name; run E3 comparison (4B vs 0.6B vs off) on `core.toml` + mined set; document the recommended profile in README/`config.example.toml`.
@@ -197,6 +199,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
+| L0 | Engine-independent lexical fixes (no canonicalize per line, interval mapping, scanner-aligned rg flags, timeout) | ready | S | - |
 | L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research | M | E2, E3 |
 | L2 | IDF weighting and identifier splitting in the existing `rg` channel | ready | S | E3 |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` | ready | S | E3 |
@@ -216,8 +219,16 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | N2 | LSP document lifecycle: open once, `didChange` on edits, `didClose`, drop fixed sleeps | ready | M | - |
 | N3 | LSP `shutdown`/`exit`, idle eviction, registry-derived status | ready | S | - |
 
+### L0 - Engine-independent lexical channel fixes
+`ready` - S - deps: none - skill: `lci-retrieval-evaluation` (latency only; no ranking change)
+- Why (explorer, 2026-10-10, measured on this repo): the `rg` subprocess itself is not the cost -- spawn ~48 ms + search 15-26 ms, and lexical runs in parallel with the ~470 ms query embedding (slowest branch in 1 of 135 recorded searches). The real costs sit around it: `dunce::canonicalize` per matching line (`lci-core/src/lexical.rs` ~207-211, ~85-120 us each, 15-260 ms per search) and an O(matches x chunks) scan in `map_lexical_matches` (`src/app/search.rs`, 24-380 ms release / 37-590 ms debug, outside every timer). Also: `rg` uses default ignore rules while the scanner uses `hidden(false)`, `require_git(false)` and `.lciignore`, so the file sets disagree in non-git workspaces; VS Code-bundled `rg` discovery picks the first build by directory-name sort, not the newest; no timeout or stdout cap. Ripgrep vs GNU grep (owner's question): rg 77 ms vs Git-for-Windows grep 140 ms median on the same 12-term search, and that grep silently returns zero hits for `-i -F` and for `-i` with several `-e` -- not a safe fallback.
+- Scope: emit relative paths from `rg` (no per-line canonicalize); an interval index (per-file sorted ranges + binary search) in `map_lexical_matches` and `map_lsp_locations`; `rg` flags aligned with the scanner (`--hidden --no-require-git --ignore-file .lciignore --no-config`); a timeout and stdout cap on the lexical channel; pick the newest bundled `rg` by version, not name; split `lexical_search_ms` into spawn/search/parse/map or at least time the mapping.
+- Accept: unit tests for the interval mapping and the path handling (incl. Windows separators); existing lexical/integration tests pass; a debug-binary `core.toml` run shows identical first-expected ranks and lower `lexical_search_ms`/total residual (report names in the commit).
+- Risk: changing the ignore flags changes which files can produce lexical hits; verify with the multilingual acceptance fixture.
+
 ### L1 - Lexical engine spike
 `research` - M - deps: E2, E3 - skill: `lci-retrieval-evaluation`
+- Explorer findings (2026-10-10): lancedb 0.38 already ships BM25 FTS with no new downloads -- `Table::create_index(&["code"], Index::FTS(InvertedIndexParams::code().split_identifiers(true).preserve_original(true)))` (camelCase/snake_case/digit splitting built in) and `QueryBase::full_text_search(FullTextSearchQuery::new(..))`, ordered by BM25 `_score`. But `Store::replace`'s table overwrite drops every index (lance-table manifest_build.rs:788), so FTS would be rebuilt per commit until S1/S2 land. Zero-download alternative: BM25 in memory over the chunks `Store::chunks` already loads (also fixes rg's live-file vs snapshot skew). Grep crates and Tantivy are not in Cargo.lock (downloads; the owner approved crates on 2026-10-10). Proxy quality signal: SQLite-FTS5 BM25 over this repo's 10 self queries gave MRR 0.875 vs 0.69 for line counts (proxy only). Adoption rule: lexical-only nDCG@10 +20% over L0+L2 on both strata, no full-pipeline regression, p50 lexical time no worse than L0, missing index degrades to rg with a warning.
 - Why: LCI ranks lexical hits by raw matching-line count with no IDF, so common tokens rank like rare identifiers (`src/app/search.rs::map_lexical_matches`). Peers use a ranked BM25 index: Tantivy (ck https://github.com/BeaconBay/ck, codesearch https://github.com/flupkede/codesearch, rutmir), SQLite FTS5, or LanceDB's own Lance-native BM25 index with tokenizer controls (https://docs.lancedb.com/indexing/fts-index; Tantivy support is being removed, https://github.com/lancedb/lancedb/issues/2998). Identifier-aware tokenization "largely eliminated" BM25's gap on CodeSearchNet-Go and a tuned IDF added +89% (https://arxiv.org/abs/2605.18561). ripgrep's own `grep-searcher`/`grep-regex`/`ignore` crates can run in-process (https://crates.io/crates/grep-searcher), removing `rg.exe` discovery and a process spawn per query. Nobody has measured these against each other on code; pick by data, not fashion.
 - Design: four arms over this repo's chunks and the E2 `self` query set, lexical channel only (E3 toggles): (a) current `rg` count ranking; (b) in-process `grep-searcher` + `ignore` with the same ranking (measures spawn cost and Windows-discovery removal only); (c) LanceDB FTS on `code` (+ a pre-split identifier column) with `stem=false`, `remove_stop_words=false`, `lower_case=true`, `max_token_length` >= 100, `with_position=false`; (d) Tantivy with a custom camelCase/snake_case tokenizer. Metrics: lexical-only nDCG@10 / hit@3 / MRR per stratum, p50/p95 query latency, index build time and on-disk size, number of new crates. Arms (b) and (d) live in `xtask` behind an optional cargo feature `lexical-bench` with optional deps; arm (c) is an `#[ignore]`d integration test in `tests/` (LanceDB is already a dependency). Nothing ships in the product from this item.
 - Decision rule: adopt an indexed BM25 (c or d) only if lexical-only nDCG@10 improves >= 20% relative over (a) on both strata with p50 <= (a)'s; prefer (c) over (d) at equal quality (no new dependency); adopt (b) only if it is at least as fast as (a) and removes the "rg not found" failure mode; otherwise keep `rg` and rely on L2.

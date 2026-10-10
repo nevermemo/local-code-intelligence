@@ -52,6 +52,16 @@ Repeat until the stop rule fires or the roadmap has no ready item.
 8. **Record.** Update the roadmap item: status, commit hash, evidence summary, follow-ups discovered. Update any docs the reviewer flagged in the same commit as the code, or in an immediately following one if the review found them afterwards.
 9. **Check usage and continue.** Read the usage figure. Below 90%: run an explorer in the background if none is running and pick the next item. At or above 90%: stop (see below).
 
+## Token efficiency
+
+Long runs are budget-bound; spend tokens on decisions, not on re-reading.
+
+- Short term (each step): cap tool output (`tail`, `grep`, `--stat`, a summary script over JSON reports) instead of printing whole logs, diffs, or reports; read only the section of a file you need; never re-read a file you just edited or already hold; keep status messages to a line or two.
+- Briefs: point at the roadmap item and contract files by path instead of restating them; state only what the agent cannot discover (decisions, constraints, prior evidence). Send follow-ups to the agent that already holds the context rather than starting a fresh one.
+- Model choice: implementers and explorers on the cheaper coding model; planners and reviewers on the stronger one, and only where a second opinion changes the outcome (non-trivial or ranking-affecting diffs). Skip a separate review for docs-only or mechanical slices.
+- Long term (across the run and context compactions): keep durable state in `docs/development/roadmap.md`, commit messages, and `test-results/` reports, so recovery needs three short reads, not a transcript. Write measured results into the roadmap once; reference them afterwards.
+- Avoid repeated work: reuse frozen binaries and existing reports as baselines; do not rerun a live evaluation whose inputs have not changed; batch independent tool calls.
+
 ## When a gate fails
 
 - Read the failure before touching anything. Fix the code if the test is right; fix the test only if the test asserted something the slice legitimately changed, and say so in the commit body.
