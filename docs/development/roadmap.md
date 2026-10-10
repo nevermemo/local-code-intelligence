@@ -89,12 +89,11 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 | --- | --- | --- |
 | V2 | NPU measurement: FastFlowLM `Embedding-Gemma-300M-NPU2` throughput and NPU/iGPU power interference (`needs-approval(download, Gemma Terms of Use, ~300 MB)`) | 2026-10-10 triage. V1 settled the owner's NPU question: no Windows NPU runtime serves reranking, and the only NPU embedder (EmbeddingGemma-300M, MTEB ~68 vs ~74.6, 2048-token context) would force a re-index at lower quality, so V1 already expected it to fail the quality gate; a measurement-only run is not worth a licence acceptance. Revive on the owner's request by granting the download; the FastFlowLM 1.0.7 zip in the session scratchpad validated the XDNA2 stack (driver 32.0.20102.3930). |
 
-## In progress
+## Triage log
 
-Mark an item `in-progress (<date>)` here and in its table row when a slice
-starts; remove it when the slice is committed.
+Decisions from scheduled triage passes, kept for history (latest last).
 
-E0 `in-progress (2026-10-10)`: found uncommitted in the tree during the second
+(Superseded: E0a committed as 5c6a7ef.) E0 `in-progress (2026-10-10)`: found uncommitted in the tree during the second
 triage pass (`src/app/search.rs` `CandidateTrace`/`trace_candidates`/
 `search_with_options`, `src/evaluate/{runner,types}.rs` `dump_candidates`,
 `src/main.rs`, `tests/cases/{evaluation,indexing}.rs`); the triage did not
@@ -153,7 +152,19 @@ reviewer decisions, applied in each item):
   timeout must fire before an 800 ms start completes). Watch, do not change,
   unless a flake is seen; nothing is `#[ignore]`d or `should_panic`.
 
----
+## In progress
+
+Mark an item `in-progress (<date>)` here and in its table row when a slice
+starts; remove it when the slice is committed.
+
+- E7 first replays (pre-registered 2026-10-10 before any replay was run; dumps `test-results/e0-{mined,core}-dump.json` from frozen 5c6a7ef at window 40 / cap 0, all other settings default; replays are exact or refused per query; decide with `compare` CIs, selecting on the even-hash half of mined and confirming on the odd half):
+  - Baseline B = replay window 24, cap 2 at shortlist, rerank replace (today's production defaults).
+  - R1: window in {6, 8, 12, 24} (cap 2 shortlist, replace; past-window rows get the fused tail). Pick the cheapest window whose full-set mined MRR and nDCG@10 CIs vs B contain 0 or improve, with no significant loss on the odd half and no core query losing its first expected rank. Latency from the fitted cost model (mined: 2.77 s + 2.86 ms/token, R^2 0.91).
+  - F2c: cap 2 at results vs at shortlist, window 24 and at R1's winner. Adopt results-stage only under the same rule.
+  - R3: vote (weight 1.0, 2.0) vs replace at window 24. Same rule.
+  - Re-verification of F2a/F2b fusion-only claims (confounded by unequal LSP coverage): rerank off, semantic weight 1 vs 2 (cap 0) and cap 0 vs 2 (weight 2), exact from dumped ranks with LSP present in 33 of 35 mined queries. If either claim fails, record it; the defaults were also justified by clean reranked confirms.
+  - Any adopted change gets one live confirm run before a default moves.
+  - Caveat: the dumps predate E2b's mine.rs leakage fix; arms share the dump, so relative comparisons hold, but absolute metrics include the leakage. Re-dump after E2b.
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
@@ -200,14 +211,14 @@ R5, S5, R4, C1.
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, ROCm or Vulkan) behind an `http` / `in-process` backend switch | blocked(R1: decide once the rerank window is set; V1 measured the serving ceiling at ~1.3x) | M | V1, R1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
-| E0 | Dump every channel candidate, the fused/capped order and every reranker score, for offline replay | in-progress (2026-10-10, uncommitted; next up 2; edited: all channels, not only the 24; live dump runs after E2b) | S | E2b preferred |
+| E0 | Dump every channel candidate, the fused/capped order and every reranker score, for offline replay | done (5c6a7ef dump; replay in E7) | S | E2b preferred |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
 | E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | done (fb5e4f9 toggles, 66005e9 compare) | M | E1 |
 | E2b | Mined-set hygiene: synthetic subjects in `mine.rs` tests (leakage), `gold-drift` flag, subject-length axis; strata on the clean subset | ready, next up 1 (edited 2026-10-10) | S | E2 |
 | E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` exclusion | ready, next up 4 (edited 2026-10-10: budget-hit windows cover 14-22 of 35 queries, not 1-3) | S | N7 |
 | E6 | Identifier-query stratum for `self` (declaration names -> defining file), tagged `identifier` | ready (new 2026-10-10) | S | E2 |
-| E7 | Offline `replay` over E0 dumps: weights, prior, cap stage, window, vote/margin, gate; CIs as `compare` | ready, next up 3 (new 2026-10-10) | S | E0 |
+| E7 | Offline `replay` over E0 dumps: weights, prior, cap stage, window, vote/margin, gate; CIs as `compare` | done (replay tool; first replays in progress) | S | E0 |
 | R1 | Reranker window x document-size sweep; set defaults from data | ready, next up 6 (replay after E0 for the window axis; live only for the chosen cell's latency and the bytes axis) | S | E0, E7 preferred |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | blocked(E6: no identifier queries in either set, so the gate's effect cannot be measured) | S | E6 |
 | R3 | Reranker as a weighted RRF vote instead of a replacement (plus a `margin` arm) | ready (replay after E0) | S | E3, E7 preferred |
