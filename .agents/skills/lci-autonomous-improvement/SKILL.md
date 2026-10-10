@@ -61,6 +61,17 @@ Long runs are budget-bound; spend tokens on decisions, not on re-reading.
 - Model choice: implementers and explorers on the cheaper coding model; planners and reviewers on the stronger one, and only where a second opinion changes the outcome (non-trivial or ranking-affecting diffs). Skip a separate review for docs-only or mechanical slices.
 - Long term (across the run and context compactions): keep durable state in `docs/development/roadmap.md`, commit messages, and `test-results/` reports, so recovery needs three short reads, not a transcript. Write measured results into the roadmap once; reference them afterwards.
 - Avoid repeated work: reuse frozen binaries and existing reports as baselines; do not rerun a live evaluation whose inputs have not changed; batch independent tool calls.
+- Do not load heavyweight helper skills or tools for edits whose keys you already know; write the file directly.
+
+## Compaction strategy
+
+Context compaction is routine in a long run; plan for it instead of fearing it.
+
+1. Durable first: anything worth keeping is written down before it can be lost. Results and decisions go to the roadmap or commit messages; facts about the machine go to the agent's memory; volatile run state (in-flight agents and tasks, frozen binaries, scratch configs, service state, approvals, pending questions, next steps) goes to a short run checkpoint file outside the repository.
+2. Checkpoint at every push: after each `git push`, refresh the run checkpoint and the roadmap status. A push is the natural boundary where the tree is clean and the state is easiest to describe.
+3. Compact early: keep the live context small (roughly a third of the window) so every turn is cheap; the checkpoint makes early compaction nearly lossless.
+4. Re-inject on resume: after a compaction, start from the checkpoint, the roadmap's In progress section, and `git status`/`git log -3` (automate this where the client supports a post-compaction hook) before acting.
+5. Summaries keep only what files do not: the standing mandate, approvals with scope, unanswered questions, and anything decided since the last checkpoint.
 
 ## When a gate fails
 

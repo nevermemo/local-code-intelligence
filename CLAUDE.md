@@ -76,3 +76,12 @@ summary only needs what those do not hold:
   recorded in the roadmap or commit messages, and finished discussions.
 - After compacting, re-read the roadmap's In progress section and
   `git status` before acting.
+
+Mechanics for long runs (see the skill's "Compaction strategy"): the owner
+may set `autoCompactWindow` (e.g. 300000) plus hooks in the git-excluded
+`.claude/settings.local.json` -- a `SessionStart` hook with matcher `compact`
+that prints the run checkpoint, the roadmap's In progress section and git
+state, and a `PostToolUse` hook (`if: "Bash(git push*)"`) reminding the agent
+to refresh the checkpoint after every push. The agent cannot trigger
+compaction itself; it keeps the checkpoint current so any compaction is
+cheap. Keep the checkpoint in the session scratchpad, never in the repo.
