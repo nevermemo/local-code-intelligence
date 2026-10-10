@@ -135,8 +135,8 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 | R5 | Reranker query instruction | ready | S | E3 |
 | R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
 | N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | done (446c34a: search max 30.7 -> 1.9 s; background priming) | S-M | - |
-| E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | ready | XS | - |
-| T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | ready | XS | - |
+| E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (2026-10-10) | XS | - |
+| T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (2026-10-10) | XS | - |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
