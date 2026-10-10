@@ -89,8 +89,7 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- N7 - LSP cold-start budget and warm-up: `in-progress (2026-10-10)`, another
-  agent, files `lci-core/src/lsp*` and `src/app/search.rs`.
+Nothing in progress.
 
 Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
 decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
@@ -135,7 +134,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 | R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
 | R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
-| N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | in-progress (2026-10-10) | S-M | - |
+| N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | done (446c34a: search max 30.7 -> 1.9 s; background priming) | S-M | - |
 | E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | ready | XS | - |
 | T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | ready | XS | - |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
@@ -285,12 +284,13 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Risk: none; query-side only, no re-embedding.
 
 ### N7 - LSP cold-start budget and warm-up
-`in-progress (2026-10-10)` - S-M, live - deps: none (N4 priming builds on it) - skill: `lci-lsp-adapter`
+`done` (446c34a, 2026-10-10) - S-M, live - deps: none (N4 priming builds on it) - skill: `lci-lsp-adapter`
 - Why (explorer, 2026-10-10, from per-query timings in `r0-mined-*`, `e3-mined-fusion`, `r7-core-rerank-off`): every run's first query pays ~10.1-10.4 s because `after_initialized` waits for rust-analyzer's `experimental/serverStatus` quiescent with a 10 s cap (`lci-core/src/lsp/rust.rs` ~87) that always expires; the 8 symbol requests then take ~0.2 s. A second spike of ~24.6-30.1 s hits once per run on the first query issued >= ~20 s after spawn (cause unconfirmed: a blocking first full `workspace/symbol`, or an error in `Manager::request` (`lci-core/src/lsp.rs` ~135-155) that kills and respawns and pays the 10 s wait again). `serve` shares one App, so real users pay both once per workspace per process and again after any LSP request error; the channel runs concurrently with embedding and rg but the join waits for it and it holds the workspace read lock.
 - Scope: (1) add `tracing::warn!` at the respawn path and the quiescence-timeout path to settle the cause; (2) dedupe spawns per (provider, workspace) in `Manager` (`OnceCell`; today `client()` can spawn twice and a dropped spawn is killed by `kill_on_drop`); (3) wrap the LSP channel in a per-query budget (`lsp_search_budget_ms`, default ~1500) that returns no LSP hits on expiry while the session keeps warming in the background (never discard it), reported as a warning-free `lsp_cold` flag or note; (4) do the long quiescence wait only off the query path.
 - Accept: fake-LSP tests (slow initialize -> search returns within the budget with no LSP hits, a later search gets them; no double spawn); live `evaluate` on core + mined: max per-query `lsp_search_ms` <= budget, hit rates unchanged (`compare` CI includes 0 or improves).
 - Risk: early queries lose LSP candidates (they effectively do today); keep fail-open semantics.
 
+- Result (446c34a; frozen build, reranker off; `test-results/n7b-*-fusion.json` vs `l2-*-fusion-new2.json`): mined max search 30.7 s -> 1.9 s; LSP per query after warm-up 2-8 ms (was 20-40 ms); total p50 393 -> 403 ms; MRR +0.024 (n.s.); core metrics identical. The first ~6 queries of a run (~10 s quiescence + ~8 s priming) carry the budget note. Cause of the old ~25-30 s spike: rust-analyzer builds its symbol index on the first full `workspace/symbol` (~8.5 s alone, longer under load); a variant without priming kept cancelling that build (LSP p50 1.5 s over ~16 queries). Follow-up candidates: N4 prime at index/serve start so the first queries also get LSP; consider a shorter quiescence wait now that priming exists.
 ### E4 - Max latency in the aggregate
 `ready` - XS - deps: none - skill: `lci-retrieval-evaluation`
 - Why: `stage_latency` p95 is nearest-rank (`src/evaluate/metrics.rs` ~595), so with 35 queries it is the second-highest value and a single 30 s outlier is invisible.
