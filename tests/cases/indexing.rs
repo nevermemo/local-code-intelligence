@@ -478,7 +478,7 @@ async fn persistence_incremental_isolation_deletion_and_fail_open() {
         .await
         .unwrap();
     assert!(
-        !direct_lexical.is_empty(),
+        !direct_lexical.matches.is_empty(),
         "ripgrep returned no matches for {}",
         a.display()
     );
@@ -1520,7 +1520,11 @@ async fn each_channel_switch_removes_exactly_that_channel() {
                 assert!(hit.semantic_rank.is_none() && hit.semantic_score.is_none());
             }
             if name == "lexical" {
-                assert!(hit.lexical_rank.is_none() && hit.lexical_match_count == 0);
+                assert!(
+                    hit.lexical_rank.is_none()
+                        && hit.lexical_match_count == 0
+                        && hit.lexical_score.is_none()
+                );
             }
             if name == "lsp" {
                 assert!(hit.lsp_rank.is_none());
@@ -1601,6 +1605,140 @@ async fn the_grep_only_arm_runs_lexical_search_alone_and_leaves_indexing_untouch
         .unwrap();
     assert!(none.results.is_empty());
     assert!(none.warning.is_none(), "{:?}", none.warning);
+
+    // A query made only of stop words has no lexical terms at all: also a
+    // clean miss, not a failure and not a warning.
+    let stop_words_only = app
+        .search(&workspace, "add fix when the", Some(5))
+        .await
+        .unwrap();
+    assert!(stop_words_only.results.is_empty());
+    assert!(
+        stop_words_only.warning.is_none(),
+        "{:?}",
+        stop_words_only.warning
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn lexical_ranking_prefers_a_rare_identifier_over_a_common_verb() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.lsp = false;
+    config.channels.reranker = false;
+    let workspace = temp.path().join("lexical-idf");
+    // "process" is on ten lines of one function and on a line of every other
+    // file (ten files in all), so it identifies nothing. Counting matching
+    // lines would put that function first.
+    let busy: String = (0..10)
+        .map(|step| format!("    process(step_{step});\n"))
+        .collect();
+    write(
+        &workspace,
+        "busy.rs",
+        &format!("fn busy_loop() {{\n{busy}}}\n"),
+    );
+    for plain in 0..7 {
+        write(
+            &workspace,
+            &format!("plain_{plain}.rs"),
+            &format!("fn plain_{plain}() {{ process(); }}\n"),
+        );
+    }
+    // The rare identifier is in two files: on five lines of one, one of the
+    // other.
+    write(
+        &workspace,
+        "rare.rs",
+        "fn quasarflux() {\n    process(quasarflux_a);\n    quasarflux_b();\n    quasarflux_c();\n    quasarflux_d();\n}\n",
+    );
+    write(
+        &workspace,
+        "second.rs",
+        "fn second() { process(quasarflux); }\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app
+        .search(&workspace, "process quasarflux", Some(10))
+        .await
+        .unwrap();
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    let paths: Vec<_> = report
+        .results
+        .iter()
+        .map(|hit| hit.chunk.relative_file_path.as_str())
+        .collect();
+    // Chunks that match only the too-common verb are not candidates.
+    assert_eq!(paths, ["rare.rs", "second.rs"]);
+    assert_eq!(report.results[0].lexical_match_count, 5);
+    assert_eq!(report.results[1].lexical_match_count, 1);
+    let scores: Vec<f32> = report
+        .results
+        .iter()
+        .map(|hit| hit.lexical_score.expect("a lexical score"))
+        .collect();
+    assert!(scores[1] > 0.0 && scores[0] > scores[1], "{scores:?}");
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|hit| hit.lexical_rank)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2)]
+    );
+    assert!(report.results.iter().all(|hit| hit.fusion_score > 0.0));
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|hit| hit.semantic_score.is_none() && hit.reranker_score.is_none())
+    );
+
+    // Terms common to every file still return results: with nothing rare to
+    // prefer, nothing is cut, and the function with more lines wins.
+    let common = app.search(&workspace, "process", Some(3)).await.unwrap();
+    assert_eq!(common.results[0].chunk.relative_file_path, "busy.rs");
+    assert_eq!(common.results[0].lexical_match_count, 10);
+    task.abort();
+}
+
+#[tokio::test]
+async fn camel_case_query_finds_snake_case_definition() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.lsp = false;
+    config.channels.reranker = false;
+    let workspace = temp.path().join("lexical-split");
+    write(
+        &workspace,
+        "loader.rs",
+        "fn parse_config(input: &str) -> usize {\n    input.len()\n}\n",
+    );
+    for filler in 0..5 {
+        write(
+            &workspace,
+            &format!("filler_{filler}.rs"),
+            &format!("fn filler_{filler}() {{}}\n"),
+        );
+    }
+    let app = App::open(config).await.unwrap();
+
+    // `parseconfig` itself matches nothing; the `parse` and `config`
+    // sub-tokens find the definition.
+    let report = app
+        .search(&workspace, "parseConfig", Some(5))
+        .await
+        .unwrap();
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    assert_eq!(report.results.len(), 1);
+    let hit = &report.results[0];
+    assert!(hit.chunk.code.contains("fn parse_config"));
+    assert_eq!(hit.retrieval_channels, vec!["lexical".to_owned()]);
+    assert_eq!(hit.lexical_rank, Some(1));
+    assert_eq!(hit.lexical_match_count, 1);
+    assert!(hit.lexical_score.is_some_and(|score| score > 0.0));
     task.abort();
 }
 

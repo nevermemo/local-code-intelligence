@@ -31,7 +31,12 @@ pub struct Hit {
     pub semantic_score: Option<f32>,
     pub semantic_rank: Option<usize>,
     pub lexical_rank: Option<usize>,
+    /// Lines of the chunk credited with a scoring query term (see
+    /// `lexical::score_chunks`); 0 when the lexical channel did not return it.
     pub lexical_match_count: u32,
+    /// IDF-weighted lexical evidence behind `lexical_rank`. Distinct from the
+    /// semantic, fusion, and reranker scores.
+    pub lexical_score: Option<f32>,
     pub lsp_rank: Option<usize>,
     pub fusion_score: f32,
     pub retrieval_channels: Vec<String>,
@@ -266,6 +271,7 @@ impl Store {
                     semantic_rank: Some(rank),
                     lexical_rank: None,
                     lexical_match_count: 0,
+                    lexical_score: None,
                     lsp_rank: None,
                     fusion_score: 0.0,
                     retrieval_channels: vec!["semantic".into()],
@@ -319,6 +325,7 @@ impl Store {
                     semantic_rank: None,
                     lexical_rank: None,
                     lexical_match_count: 0,
+                    lexical_score: None,
                     lsp_rank: None,
                     fusion_score: 0.0,
                     retrieval_channels: vec![],

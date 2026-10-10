@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     path::Path,
     sync::Arc,
     time::Instant,
@@ -290,11 +290,11 @@ impl App {
         if let Some((lexical_matches, lexical_ms)) = lexical_result {
             report.timings.lexical_search_ms = lexical_ms;
             match lexical_matches {
-                Ok(matches) => {
+                Ok(lexical_search) => {
                     lexical_or_lsp_ran = true;
                     lexical_hits = Self::map_lexical_matches(
                         &all_chunks,
-                        matches,
+                        lexical_search,
                         self.config.lexical_candidate_count,
                     );
                 }
@@ -475,32 +475,99 @@ impl App {
         }
     }
 
-    /// Maps ripgrep lexical matches onto the chunks that contain them,
-    /// ranked by how many matches fall within each chunk.
+    /// Maps credited ripgrep lines onto the chunks that contain them and
+    /// ranks the chunks by BM25 over IDF-weighted term evidence (see
+    /// `lexical::score_chunks`), not by matching-line count. Document
+    /// frequencies are measured over indexed files only: a term's `df` is the
+    /// number of indexed files with a credited line, relative to the number of
+    /// indexed files in `all_chunks`, so files ripgrep sees but the index
+    /// does not cannot skew them. Chunk length is its line count, averaged
+    /// over `all_chunks`. Chunks that match only terms too common to score
+    /// are not candidates.
+    ///
+    /// A reported path selects its candidate chunks once (every chunk whose
+    /// file path equals it, or is a `/`-delimited suffix of it, compared
+    /// case-insensitively); each line then takes the first candidate, in
+    /// `all_chunks` order, whose line range holds it.
     fn map_lexical_matches(
         all_chunks: &[Hit],
-        matches: Vec<lexical::LexicalMatch>,
+        search: lexical::LexicalSearch,
         candidate_count: usize,
     ) -> Vec<Hit> {
-        let mut counts = HashMap::<usize, u32>::new();
-        for matched in matches {
-            let matched_path = matched.relative_path.replace('\\', "/").to_lowercase();
-            if let Some((index, _)) = all_chunks.iter().enumerate().find(|(_, h)| {
-                let relative = h.chunk.relative_file_path.to_lowercase();
-                (matched_path == relative || matched_path.ends_with(&format!("/{relative}")))
-                    && h.chunk.start_line <= matched.line
-                    && h.chunk.end_line >= matched.line
+        struct IndexedFile {
+            lowercase_path: String,
+            /// `/` + `lowercase_path`, for suffix matches.
+            path_suffix: String,
+            chunks: Vec<usize>,
+        }
+        let mut file_ids = HashMap::<&str, usize>::new();
+        let mut files: Vec<IndexedFile> = Vec::new();
+        let mut chunk_files = Vec::with_capacity(all_chunks.len());
+        for (index, hit) in all_chunks.iter().enumerate() {
+            let path = hit.chunk.relative_file_path.as_str();
+            let next = files.len();
+            let id = *file_ids.entry(path).or_insert(next);
+            if id == next {
+                let lowercase_path = path.to_lowercase();
+                files.push(IndexedFile {
+                    path_suffix: format!("/{lowercase_path}"),
+                    lowercase_path,
+                    chunks: Vec::new(),
+                });
+            }
+            files[id].chunks.push(index);
+            chunk_files.push(id);
+        }
+        let total_files = files.len();
+        let mut candidates = HashMap::<String, Vec<usize>>::new();
+        let mut credited = Vec::with_capacity(search.matches.len());
+        for matched in search.matches {
+            let (line, term_mask) = (matched.line, matched.term_mask);
+            let chunks = match candidates.entry(matched.relative_path) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let reported = entry.key().replace('\\', "/").to_lowercase();
+                    let mut chunks: Vec<usize> = files
+                        .iter()
+                        .filter(|file| {
+                            reported == file.lowercase_path || reported.ends_with(&file.path_suffix)
+                        })
+                        .flat_map(|file| file.chunks.iter().copied())
+                        .collect();
+                    chunks.sort_unstable();
+                    entry.insert(chunks)
+                }
+            };
+            if let Some(&index) = chunks.iter().find(|&&index| {
+                let chunk = &all_chunks[index].chunk;
+                chunk.start_line <= line && chunk.end_line >= line
             }) {
-                *counts.entry(index).or_default() += 1;
+                credited.push(lexical::CreditedLine {
+                    file: chunk_files[index],
+                    chunk: index,
+                    term_mask,
+                });
             }
         }
-        let mut ranked: Vec<_> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let chunk_lengths: Vec<u32> = all_chunks
+            .iter()
+            .map(|hit| hit.chunk.end_line.saturating_sub(hit.chunk.start_line) + 1)
+            .collect();
+        let mut ranked =
+            lexical::score_chunks(search.terms.len(), total_files, &chunk_lengths, &credited);
+        ranked.sort_by(|a, b| {
+            let (a_chunk, b_chunk) = (&all_chunks[a.chunk].chunk, &all_chunks[b.chunk].chunk);
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a_chunk.relative_file_path.cmp(&b_chunk.relative_file_path))
+                .then(a_chunk.start_line.cmp(&b_chunk.start_line))
+        });
         let mut lexical_hits = Vec::new();
-        for (rank, (index, count)) in ranked.into_iter().take(candidate_count).enumerate() {
-            let mut hit = all_chunks[index].clone();
+        for (rank, scored) in ranked.into_iter().take(candidate_count).enumerate() {
+            let mut hit = all_chunks[scored.chunk].clone();
             hit.lexical_rank = Some(rank + 1);
-            hit.lexical_match_count = count;
+            hit.lexical_score = Some(scored.score as f32);
+            hit.lexical_match_count = scored.credited_lines;
             hit.retrieval_channels.push("lexical".into());
             lexical_hits.push(hit);
         }
@@ -574,6 +641,7 @@ impl App {
             if let Some(existing) = fused.get_mut(&key) {
                 existing.lexical_rank = hit.lexical_rank;
                 existing.lexical_match_count = hit.lexical_match_count;
+                existing.lexical_score = hit.lexical_score;
                 existing.fusion_score += contribution;
                 existing.retrieval_channels.push("lexical".into());
             } else {

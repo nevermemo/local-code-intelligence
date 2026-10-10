@@ -2,16 +2,54 @@ use crate::language;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     process::Stdio,
 };
 
+/// Most terms one query contributes to the `rg` pass. A safety bound on
+/// command-line length and work, not a quality knob: rarity decides which
+/// terms score (see [`select_terms`]). It must not exceed 32 because the
+/// terms a line is credited with are a `u32` bit mask.
+pub const MAX_QUERY_TERMS: usize = 24;
+const _: () = assert!(MAX_QUERY_TERMS <= 32);
+/// Shortest term kept, in characters.
+const MIN_TERM_CHARS: usize = 3;
+/// Terms of at most this many characters must match a whole word (see
+/// [`TermMatcher`]); longer terms match as substrings. A three- or
+/// four-letter fragment is otherwise inside far too many unrelated
+/// identifiers (`padding`, `address`, `added`).
+const WORD_MATCH_MAX_CHARS: usize = 4;
+/// Terms credited in more than this fraction of the indexed files are dropped
+/// from scoring, unless every term is that common.
+pub const MAX_DOCUMENT_FREQUENCY: f64 = 0.25;
+/// Most terms that score a chunk: the rarest ones that survive the
+/// document-frequency cut.
+pub const MAX_SCORING_TERMS: usize = 12;
+/// BM25 term-frequency saturation: more credited lines of one term in a chunk
+/// help with diminishing returns.
+pub const BM25_K1: f64 = 1.2;
+/// BM25 length normalisation (0 = none, 1 = full): a chunk longer than the
+/// average needs proportionally more credited lines to score the same, so a
+/// long chunk does not win just by containing many terms.
+pub const BM25_B: f64 = 0.75;
+
+/// One line ripgrep reported, with the query terms the line is credited with.
 #[derive(Debug, Clone)]
 pub struct LexicalMatch {
     pub relative_path: String,
     pub line: u32,
+    /// Bit `i` is set when `LexicalSearch::terms[i]` is credited on this
+    /// line. Never zero: uncredited lines are not reported.
+    pub term_mask: u32,
+}
+
+/// The terms one lexical search ran with and the credited lines it found.
+#[derive(Debug, Clone, Default)]
+pub struct LexicalSearch {
+    pub terms: Vec<String>,
+    pub matches: Vec<LexicalMatch>,
 }
 
 #[derive(Deserialize)]
@@ -22,34 +60,127 @@ struct Event {
 }
 #[derive(Deserialize)]
 struct EventData {
-    path: Option<PathValue>,
+    path: Option<TextValue>,
+    lines: Option<TextValue>,
     line_number: Option<u32>,
 }
+/// ripgrep's `ArbitraryData`: `text` for valid UTF-8, otherwise only `bytes`.
 #[derive(Deserialize)]
-struct PathValue {
+struct TextValue {
     text: Option<String>,
 }
 
+/// Generic words that never identify code: English function words and the
+/// verbs that fill commit messages and issue titles. Applied to whole tokens
+/// and to identifier sub-tokens, by both [`terms`] and [`query_terms`]. Bare
+/// code nouns (`get`, `set`, `new`, `run`, `call`, `handle`, `check`, `move`,
+/// `return`) are deliberately absent: when they are common the document-
+/// frequency cut ([`select_terms`]) removes them, and when they are the
+/// distinguishing word they must stay searchable.
 const STOP_WORDS: &[&str] = &[
+    // Function words.
     "the",
     "and",
-    "into",
+    "for",
+    "with",
     "from",
+    "into",
+    "when",
+    "where",
+    "which",
     "that",
     "this",
-    "with",
-    "where",
+    "than",
+    "then",
+    "also",
+    "only",
+    "not",
+    "are",
+    "was",
+    "were",
+    "has",
+    "have",
+    "been",
+    "will",
+    "should",
+    "can",
+    "its",
+    "all",
+    "any",
+    "each",
+    "some",
+    "such",
+    "via",
+    "per",
+    "after",
+    "before",
+    "over",
+    "under",
+    // Query-instruction filler.
     "code",
     "generated",
     "given",
     "retrieve",
     "relevant",
+    // Commit-message and code-review verbs.
+    "add",
+    "adds",
+    "added",
+    "remove",
+    "removes",
+    "removed",
+    "fix",
+    "fixes",
+    "fixed",
+    "use",
+    "uses",
+    "used",
+    "make",
+    "makes",
+    "update",
+    "updates",
+    "updated",
+    "change",
+    "changes",
+    "changed",
+    "allow",
+    "allows",
+    "avoid",
+    "avoids",
+    "ensure",
+    "ensures",
+    "keep",
+    "keeps",
+    "rename",
+    "renames",
+    "support",
+    "supports",
+    "implement",
+    "implements",
+    "improve",
+    "improves",
+    "prevent",
+    "prevents",
+    "replace",
+    "replaces",
+    "refactor",
+    "simplify",
 ];
 
+/// The query's tokens (alphanumerics, `_`, and `#`), with `#` trimmed from
+/// the ends; it stays inside a token, for symbol-style queries.
+fn raw_tokens(query: &str) -> impl Iterator<Item = &str> {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '#'))
+        .map(|raw| raw.trim_matches('#'))
+}
+
+/// Whole lowercase tokens of the query, longest first, at most 12. Used for
+/// language-server symbol queries; the ripgrep channel uses [`query_terms`].
 pub fn terms(query: &str) -> Vec<String> {
     let mut counts = HashMap::<String, usize>::new();
-    for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '#')) {
-        let term = raw.trim_matches('#').to_lowercase();
+    for raw in raw_tokens(query) {
+        let term = raw.to_lowercase();
         if term.len() >= 3 && !STOP_WORDS.contains(&term.as_str()) {
             *counts.entry(term).or_default() += 1;
         }
@@ -58,6 +189,194 @@ pub fn terms(query: &str) -> Vec<String> {
     terms.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
     terms.truncate(12);
     terms
+}
+
+fn usable_term(term: &str) -> bool {
+    term.chars().count() >= MIN_TERM_CHARS && !STOP_WORDS.contains(&term)
+}
+
+/// Splits an identifier at `_`, camelCase humps (`parseConfig`, and
+/// `HTTPServer` as `HTTP` + `Server`), and letter/digit boundaries.
+fn split_identifier(token: &str) -> Vec<String> {
+    let chars: Vec<char> = token.chars().collect();
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(previous) = current.chars().next_back() {
+            let next_is_lower = chars.get(index + 1).is_some_and(|next| next.is_lowercase());
+            let boundary = (previous.is_lowercase() && c.is_uppercase())
+                || (previous.is_uppercase() && c.is_uppercase() && next_is_lower)
+                || (previous.is_ascii_digit() != c.is_ascii_digit());
+            if boundary {
+                parts.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// The lowercase terms the ripgrep channel searches for: each token of the
+/// query as written (original first), then its identifier sub-tokens
+/// (`parseConfig` yields `parseconfig`, `parse`, `config`). Terms shorter than
+/// three characters, [`STOP_WORDS`], and purely numeric sub-tokens (`256` in
+/// `sha256`) are dropped and duplicates removed. If
+/// more than [`MAX_QUERY_TERMS`] remain, the longest are kept; which of the
+/// rest score is decided later, by rarity ([`select_terms`]). The result keeps
+/// first-seen order, and its indices are the bit positions of
+/// [`LexicalMatch::term_mask`].
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::<String>::new();
+    let mut found = Vec::new();
+    for raw in raw_tokens(query) {
+        let original = raw.to_lowercase();
+        // Numeric fragments (`256` of `sha256`) carry no identifier meaning.
+        let parts = split_identifier(raw)
+            .into_iter()
+            .filter(|part| !part.chars().all(|c| c.is_ascii_digit()))
+            .map(|part| part.to_lowercase());
+        for term in std::iter::once(original).chain(parts) {
+            if usable_term(&term) && seen.insert(term.clone()) {
+                found.push(term);
+            }
+        }
+    }
+    if found.len() > MAX_QUERY_TERMS {
+        let mut order: Vec<usize> = (0..found.len()).collect();
+        order.sort_by(|&a, &b| {
+            found[b]
+                .chars()
+                .count()
+                .cmp(&found[a].chars().count())
+                .then(a.cmp(&b))
+        });
+        order.truncate(MAX_QUERY_TERMS);
+        order.sort_unstable();
+        found = order.into_iter().map(|i| found[i].clone()).collect();
+    }
+    found
+}
+
+fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_lowercase()
+    } else {
+        c.to_lowercase().next().unwrap_or(c)
+    }
+}
+
+struct MatcherTerm {
+    chars: Vec<char>,
+    /// The term's lowercase bytes when it is ASCII. An ASCII line cannot hold
+    /// a term with any other character.
+    ascii: Option<Vec<u8>>,
+}
+
+/// Decides, per ripgrep line, which query terms the line really holds.
+/// ripgrep matches every term as a case-insensitive substring; this narrows
+/// the credit so a short term only counts as a word: it must start after a
+/// non-alphanumeric character (or the line start) and end before one, or
+/// before an uppercase letter (`add_item` and `addItem` hold `add`; `padding`,
+/// `address`, and `added` do not). Longer terms count as substrings. Matching
+/// is case-insensitive. Source lines are almost always ASCII, so those are
+/// matched on bytes without allocating; any other line is matched on
+/// characters with simple per-character folding. Both give the same answer
+/// for an ASCII line.
+struct TermMatcher {
+    terms: Vec<MatcherTerm>,
+}
+
+impl TermMatcher {
+    fn new(terms: &[String]) -> Self {
+        Self {
+            terms: terms
+                .iter()
+                .map(|term| MatcherTerm {
+                    chars: term.chars().collect(),
+                    ascii: term
+                        .is_ascii()
+                        .then(|| term.to_ascii_lowercase().into_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Bit `i` is set when term `i` is credited on `line`.
+    fn credit(&self, line: &str) -> u32 {
+        if line.is_ascii() {
+            self.credit_ascii(line.as_bytes())
+        } else {
+            self.credit_unicode(line)
+        }
+    }
+
+    fn credit_ascii(&self, line: &[u8]) -> u32 {
+        let mut mask = 0u32;
+        for (index, term) in self.terms.iter().enumerate() {
+            let Some(needle) = term.ascii.as_deref() else {
+                continue;
+            };
+            let Some(last_start) = line.len().checked_sub(needle.len()) else {
+                continue;
+            };
+            let whole_word = needle.len() <= WORD_MATCH_MAX_CHARS;
+            let credited = (0..=last_start).any(|start| {
+                if line[start].to_ascii_lowercase() != needle[0] {
+                    return false;
+                }
+                let end = start + needle.len();
+                line[start..end].eq_ignore_ascii_case(needle)
+                    && (!whole_word || {
+                        let before = start == 0 || !line[start - 1].is_ascii_alphanumeric();
+                        let after = end == line.len()
+                            || !line[end].is_ascii_alphanumeric()
+                            || line[end].is_ascii_uppercase();
+                        before && after
+                    })
+            });
+            if credited {
+                mask |= 1 << index;
+            }
+        }
+        mask
+    }
+
+    fn credit_unicode(&self, line: &str) -> u32 {
+        let original: Vec<char> = line.chars().collect();
+        let folded: Vec<char> = original.iter().map(|&c| fold_char(c)).collect();
+        let mut mask = 0u32;
+        for (index, term) in self.terms.iter().enumerate() {
+            let term = &term.chars;
+            let Some(last_start) = folded.len().checked_sub(term.len()) else {
+                continue;
+            };
+            let whole_word = term.len() <= WORD_MATCH_MAX_CHARS;
+            let credited = (0..=last_start).any(|start| {
+                let end = start + term.len();
+                folded[start..end] == term[..]
+                    && (!whole_word || {
+                        let before = start == 0 || !original[start - 1].is_alphanumeric();
+                        let after = end == original.len()
+                            || !original[end].is_alphanumeric()
+                            || original[end].is_uppercase();
+                        before && after
+                    })
+            });
+            if credited {
+                mask |= 1 << index;
+            }
+        }
+        mask
+    }
 }
 
 /// Resolves the default ripgrep command on Windows, including the copy bundled
@@ -155,9 +474,16 @@ fn find_vscode_ripgrep(install_root: &Path) -> Option<PathBuf> {
     })
 }
 
-pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<LexicalMatch>> {
-    let terms = terms(query);
-    ensure!(!terms.is_empty(), "query has no searchable lexical terms");
+/// Searches the workspace with one ripgrep pass over every [`query_terms`]
+/// term and credits each reported line with the terms it really holds (see
+/// [`TermMatcher`]). Lines that hold no term after crediting are dropped. A
+/// query with no usable term (only stop words or fragments) is an ordinary
+/// empty answer: ripgrep is not started and no match is returned.
+pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSearch> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Ok(LexicalSearch::default());
+    }
     let resolved_rg = resolve_ripgrep_path(rg_path);
     let mut command = tokio::process::Command::new(&resolved_rg);
     command.args([
@@ -169,7 +495,7 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<Lexic
     for adapter in language::ADAPTERS {
         command.arg("--glob").arg(adapter.glob());
     }
-    for term in terms {
+    for term in &terms {
         command.arg("-e").arg(term);
     }
     command
@@ -189,6 +515,10 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<Lexic
         "ripgrep failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let matcher = TermMatcher::new(&terms);
+    // ripgrep repeats a file's path on each of its lines; resolving a path
+    // touches the file system, so each distinct path is resolved once.
+    let mut relative_paths = HashMap::<String, String>::new();
     let mut matches = Vec::new();
     for line in output
         .stdout
@@ -203,25 +533,196 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<Vec<Lexic
         let Some(path) = data.path.and_then(|path| path.text) else {
             continue;
         };
-        let reported = Path::new(&path);
-        let normalized = if reported.is_absolute() {
-            dunce::canonicalize(reported).unwrap_or_else(|_| reported.to_path_buf())
-        } else {
-            root.join(reported)
+        // A line that is not valid UTF-8 arrives as `bytes` only: no credit.
+        let Some(text) = data.lines.and_then(|lines| lines.text) else {
+            continue;
         };
-        let relative = normalized
-            .strip_prefix(root)
-            .unwrap_or(&normalized)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Some(line) = data.line_number {
-            matches.push(LexicalMatch {
-                relative_path: relative,
-                line,
-            });
+        let Some(line) = data.line_number else {
+            continue;
+        };
+        let term_mask = matcher.credit(&text);
+        if term_mask == 0 {
+            continue;
+        }
+        let relative = match relative_paths.get(&path) {
+            Some(relative) => relative.clone(),
+            None => {
+                let relative = relative_to_root(root, Path::new(&path));
+                relative_paths.insert(path, relative.clone());
+                relative
+            }
+        };
+        matches.push(LexicalMatch {
+            relative_path: relative,
+            line,
+            term_mask,
+        });
+    }
+    Ok(LexicalSearch { terms, matches })
+}
+
+/// `reported` (as ripgrep printed it) relative to `root`, with `/` separators.
+fn relative_to_root(root: &Path, reported: &Path) -> String {
+    let normalized = if reported.is_absolute() {
+        dunce::canonicalize(reported).unwrap_or_else(|_| reported.to_path_buf())
+    } else {
+        root.join(reported)
+    };
+    normalized
+        .strip_prefix(root)
+        .unwrap_or(&normalized)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// A credited line already attributed to an indexed chunk and its file.
+#[derive(Debug, Clone, Copy)]
+pub struct CreditedLine {
+    /// Identifies the indexed file; two lines share a file when equal.
+    pub file: usize,
+    /// Identifies the chunk the line falls in.
+    pub chunk: usize,
+    /// Bit `i` is set when term `i` is credited on the line.
+    pub term_mask: u32,
+}
+
+/// A chunk's lexical score: the sum over scoring terms of
+/// [`bm25_term_score`] with `tf` = credited lines of that term in the chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredChunk {
+    pub chunk: usize,
+    pub score: f64,
+    /// Lines of the chunk credited with at least one scoring term.
+    pub credited_lines: u32,
+}
+
+/// Number of distinct files in which each of the `term_count` terms is
+/// credited on at least one line. At most [`MAX_QUERY_TERMS`] terms are
+/// tracked (the width of a term mask is the real bound).
+pub fn document_frequencies(term_count: usize, lines: &[CreditedLine]) -> Vec<usize> {
+    let mut file_masks = HashMap::<usize, u32>::new();
+    for line in lines {
+        *file_masks.entry(line.file).or_default() |= line.term_mask;
+    }
+    let mut frequencies = vec![0; term_count.min(MAX_QUERY_TERMS)];
+    for mask in file_masks.values() {
+        for (term, frequency) in frequencies.iter_mut().enumerate() {
+            if mask & (1 << term) != 0 {
+                *frequency += 1;
+            }
         }
     }
-    Ok(matches)
+    frequencies
+}
+
+/// Okapi-style inverse document frequency of a term credited in
+/// `document_frequency` of `total_files` files; always positive.
+pub fn inverse_document_frequency(document_frequency: usize, total_files: usize) -> f64 {
+    let df = document_frequency as f64;
+    (((total_files as f64 - df + 0.5) / (df + 0.5)) + 1.0).ln()
+}
+
+/// The terms (indices into the query terms) that score chunks, rarest first.
+/// Terms credited in no file are skipped; terms credited in more than
+/// [`MAX_DOCUMENT_FREQUENCY`] of `total_files` are dropped unless that would
+/// leave none, in which case every credited term stays; at most
+/// [`MAX_SCORING_TERMS`] of the rarest remain (ties keep query order).
+pub fn select_terms(document_frequencies: &[usize], total_files: usize) -> Vec<usize> {
+    let credited: Vec<usize> = (0..document_frequencies.len())
+        .filter(|&term| document_frequencies[term] > 0)
+        .collect();
+    let rare: Vec<usize> = credited
+        .iter()
+        .copied()
+        .filter(|&term| {
+            document_frequencies[term] as f64 <= MAX_DOCUMENT_FREQUENCY * total_files as f64
+        })
+        .collect();
+    let mut selected = if rare.is_empty() { credited } else { rare };
+    selected.sort_by_key(|&term| (document_frequencies[term], term));
+    selected.truncate(MAX_SCORING_TERMS);
+    selected
+}
+
+/// One term's BM25 contribution to a chunk: `idf * tf * (k1 + 1) / (tf + k1 *
+/// (1 - b + b * length / average_length))`, where `tf` is the chunk's credited
+/// lines of the term and `length` the chunk's length in lines.
+pub fn bm25_term_score(idf: f64, tf: u32, length: f64, average_length: f64) -> f64 {
+    let tf = f64::from(tf);
+    let norm = 1.0 - BM25_B + BM25_B * length / average_length;
+    idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm)
+}
+
+/// Scores the chunks that hold at least one scoring term (see
+/// [`select_terms`]) by BM25 over IDF-weighted term evidence instead of
+/// matching-line count: a rare identifier outweighs many lines of a common
+/// word, and a short chunk outweighs a long one holding the same terms.
+/// `total_files` is the number of indexed files the document frequencies are
+/// relative to. `chunk_lengths[i]` is the length in lines of chunk `i` for
+/// every indexed chunk of the filtered set; their mean is the average length.
+/// Chunks are returned by score descending, then chunk index.
+pub fn score_chunks(
+    term_count: usize,
+    total_files: usize,
+    chunk_lengths: &[u32],
+    lines: &[CreditedLine],
+) -> Vec<ScoredChunk> {
+    let average_length = if chunk_lengths.is_empty() {
+        1.0
+    } else {
+        chunk_lengths
+            .iter()
+            .map(|&length| f64::from(length.max(1)))
+            .sum::<f64>()
+            / chunk_lengths.len() as f64
+    };
+    let term_count = term_count.min(MAX_QUERY_TERMS);
+    let frequencies = document_frequencies(term_count, lines);
+    let selected = select_terms(&frequencies, total_files);
+    let selected_mask = selected.iter().fold(0u32, |mask, &term| mask | (1 << term));
+    #[derive(Default)]
+    struct Evidence {
+        per_term: [u32; MAX_QUERY_TERMS],
+        credited_lines: u32,
+    }
+    let mut evidence = HashMap::<usize, Evidence>::new();
+    for line in lines {
+        let scoring = line.term_mask & selected_mask;
+        if scoring == 0 {
+            continue;
+        }
+        let chunk = evidence.entry(line.chunk).or_default();
+        chunk.credited_lines += 1;
+        for &term in &selected {
+            if scoring & (1 << term) != 0 {
+                chunk.per_term[term] += 1;
+            }
+        }
+    }
+    let idf: Vec<f64> = (0..term_count)
+        .map(|term| inverse_document_frequency(frequencies[term], total_files))
+        .collect();
+    let mut scored: Vec<ScoredChunk> = evidence
+        .into_iter()
+        .map(|(chunk, evidence)| {
+            let length = chunk_lengths
+                .get(chunk)
+                .map_or(average_length, |&length| f64::from(length.max(1)));
+            ScoredChunk {
+                chunk,
+                score: selected
+                    .iter()
+                    .filter(|&&term| evidence.per_term[term] > 0)
+                    .map(|&term| {
+                        bm25_term_score(idf[term], evidence.per_term[term], length, average_length)
+                    })
+                    .sum(),
+                credited_lines: evidence.credited_lines,
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.chunk.cmp(&b.chunk)));
+    scored
 }
 
 #[cfg(test)]
@@ -241,6 +742,273 @@ mod tests {
                 "ast",
                 "syn"
             ]
+        );
+    }
+
+    #[test]
+    fn splits_identifiers_original_first() {
+        assert_eq!(
+            query_terms("parseConfig"),
+            vec!["parseconfig", "parse", "config"]
+        );
+        assert_eq!(
+            query_terms("build_production_feature_pipeline"),
+            vec![
+                "build_production_feature_pipeline",
+                "build",
+                "production",
+                "feature",
+                "pipeline"
+            ]
+        );
+        // Acronym runs split before the last capital; letter/digit
+        // boundaries split; fragments under three characters and purely
+        // numeric fragments are dropped, but a whole token is never dropped
+        // for being numeric.
+        assert_eq!(
+            query_terms("HTTPServer sha256 404"),
+            vec!["httpserver", "http", "server", "sha256", "sha", "404"]
+        );
+        // Duplicates collapse, whatever their case or origin.
+        assert_eq!(query_terms("config Config"), vec!["config"]);
+        assert_eq!(query_terms("ab c"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn caps_query_terms_keeping_the_longest_in_first_seen_order() {
+        let mut query: String = ('a'..='z').map(|c| format!("xqz{c} ")).collect();
+        query.push_str("longestwordhere");
+        let terms = query_terms(&query);
+        assert_eq!(terms.len(), MAX_QUERY_TERMS);
+        assert_eq!(terms.first().map(String::as_str), Some("xqza"));
+        assert_eq!(terms.last().map(String::as_str), Some("longestwordhere"));
+        assert!(terms.contains(&"xqzw".to_owned()));
+        assert!(!terms.contains(&"xqzx".to_owned()));
+    }
+
+    #[test]
+    fn stop_list_drops_generic_verbs() {
+        assert_eq!(
+            query_terms("add fix the update handler for ensures when parsing"),
+            vec!["handler", "parsing"]
+        );
+        assert_eq!(
+            terms("add fix the update handler for ensures when parsing"),
+            vec!["handler", "parsing"]
+        );
+        // Sub-tokens are filtered too; the original identifier survives.
+        assert_eq!(
+            query_terms("addUserName"),
+            vec!["addusername", "user", "name"]
+        );
+        assert_eq!(query_terms("add fix when the"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bare_code_nouns_stay_searchable() {
+        // The document-frequency cut removes them when they are common; the
+        // stop list must not, or a query about `get` or `run` loses its word.
+        assert_eq!(
+            query_terms("set get new run"),
+            vec!["set", "get", "new", "run"]
+        );
+        assert_eq!(
+            query_terms("getUserName"),
+            vec!["getusername", "get", "user", "name"]
+        );
+        assert_eq!(terms("handle call"), vec!["handle", "call"]);
+    }
+
+    #[tokio::test]
+    async fn a_query_of_only_stop_words_is_an_empty_search_without_starting_ripgrep() {
+        let temp = TempDir::new().unwrap();
+        // The command does not exist: reaching ripgrep would be an error.
+        let found = search(
+            "definitely-missing-ripgrep",
+            temp.path(),
+            "add fix when the",
+        )
+        .await
+        .unwrap();
+        assert!(found.terms.is_empty() && found.matches.is_empty());
+    }
+
+    #[test]
+    fn short_terms_need_word_hits_long_terms_match_substrings() {
+        let matcher = TermMatcher::new(&["add".to_owned(), "retry".to_owned(), "lsp".to_owned()]);
+        let add = 0b001;
+        let retry = 0b010;
+        let lsp = 0b100;
+        // A short term is a whole word: delimited, snake_case, or camelCase.
+        assert_eq!(matcher.credit("add(1, 2)"), add);
+        assert_eq!(matcher.credit("let x = add_item(y);"), add);
+        assert_eq!(matcher.credit("list.addItem(y)"), add);
+        assert_eq!(matcher.credit("Add the item"), add);
+        // ...never a fragment of a longer word.
+        assert_eq!(matcher.credit("padding: 4px"), 0);
+        assert_eq!(matcher.credit("let address = 1;"), 0);
+        assert_eq!(matcher.credit("it was added"), 0);
+        assert_eq!(matcher.credit("fooAdd(x)"), 0);
+        // A long term matches inside identifiers, case-insensitively.
+        assert_eq!(matcher.credit("let n = RetryPolicy::new();"), retry);
+        assert_eq!(matcher.credit("noretrying"), retry);
+        // Every credited term sets its own bit.
+        assert_eq!(matcher.credit("lsp: retry add"), add | retry | lsp);
+        assert_eq!(matcher.credit("unrelated line"), 0);
+    }
+
+    #[test]
+    fn ascii_lines_match_on_bytes_and_other_lines_on_characters() {
+        let matcher = TermMatcher::new(&[
+            "add".to_owned(),
+            "retry".to_owned(),
+            "lsp".to_owned(),
+            "café".to_owned(),
+        ]);
+        // The two paths agree on every ASCII line.
+        for line in [
+            "add(1, 2)",
+            "let x = add_item(y);",
+            "list.addItem(y)",
+            "Add the item",
+            "ADD",
+            "x.ADDItem",
+            "padding: 4px",
+            "let address = 1;",
+            "it was added",
+            "fooAdd(x)",
+            "RetryPolicy",
+            "noretrying",
+            "RETRY",
+            "lsp: retry add",
+            "unrelated line",
+            "ad",
+            "",
+        ] {
+            assert_eq!(
+                matcher.credit_ascii(line.as_bytes()),
+                matcher.credit_unicode(line),
+                "{line:?}"
+            );
+        }
+        // A non-ASCII line is matched on characters, case-insensitively; the
+        // four-character `café` is a whole word.
+        assert_eq!(matcher.credit("Un CAFÉ noir, add_item"), 0b1001);
+        assert_eq!(matcher.credit("x.CAFÉRetry"), 0b1010);
+        assert_eq!(matcher.credit("des cafés"), 0);
+        // A non-ASCII term cannot be held by an ASCII line.
+        assert_eq!(matcher.credit("cafe"), 0);
+    }
+
+    fn credited(file: usize, chunk: usize, term_mask: u32) -> CreditedLine {
+        CreditedLine {
+            file,
+            chunk,
+            term_mask,
+        }
+    }
+
+    #[test]
+    fn rare_terms_outrank_common_and_frequent_terms_are_cut() {
+        // Eight indexed files, one chunk each (chunk == file). Term 0 is
+        // everywhere (and file 0 repeats it on ten lines), term 1 is in two
+        // files (exactly the cutoff), term 2 is in one file.
+        let mut lines = vec![credited(0, 0, 0b001); 10];
+        lines.extend((3..7).map(|file| credited(file, file, 0b001)));
+        lines.extend((1..3).map(|file| credited(file, file, 0b011)));
+        lines.push(credited(7, 7, 0b101));
+
+        let frequencies = document_frequencies(3, &lines);
+        assert_eq!(frequencies, vec![8, 2, 1]);
+        // The term in every file is cut; the rest are kept rarest first.
+        assert_eq!(select_terms(&frequencies, 8), vec![2, 1]);
+
+        let scored = score_chunks(3, 8, &[10; 8], &lines);
+        // File 0's ten lines of the common term earn nothing...
+        assert!(scored.iter().all(|s| s.chunk != 0 && s.chunk <= 7));
+        assert_eq!(
+            scored.iter().map(|s| s.chunk).collect::<Vec<_>>(),
+            vec![7, 1, 2]
+        );
+        // ...and the rarest identifier outranks the middling one.
+        let rare = inverse_document_frequency(1, 8);
+        let middling = inverse_document_frequency(2, 8);
+        assert!(rare > middling && middling > 0.0);
+        assert!((scored[0].score - rare).abs() < 1e-9);
+        assert!((scored[1].score - middling).abs() < 1e-9);
+        assert!(scored.iter().all(|s| s.credited_lines == 1));
+    }
+
+    #[test]
+    fn repeated_lines_raise_a_score_with_diminishing_returns() {
+        // One term in two of eight equal-length files: three credited lines
+        // beat one, but by tf * (k1 + 1) / (tf + k1), not by 3.
+        let mut lines = vec![credited(0, 0, 1); 3];
+        lines.push(credited(1, 1, 1));
+        let scored = score_chunks(1, 8, &[10; 8], &lines);
+        let idf = inverse_document_frequency(2, 8);
+        assert_eq!(scored.iter().map(|s| s.chunk).collect::<Vec<_>>(), [0, 1]);
+        assert!((scored[0].score - idf * 3.0 * (BM25_K1 + 1.0) / (3.0 + BM25_K1)).abs() < 1e-9);
+        // A chunk of average length with one credited line scores its idf.
+        assert!((scored[1].score - idf).abs() < 1e-9);
+        assert!(scored[0].score > scored[1].score && scored[0].score < 3.0 * scored[1].score);
+        assert_eq!(scored[0].credited_lines, 3);
+    }
+
+    #[test]
+    fn a_short_chunk_beats_a_much_longer_chunk_with_the_same_term_counts() {
+        // Chunks 0 (400 lines) and 1 (8 lines) each hold the term on two
+        // lines. Chunk 0 comes first in index order, so only length can put
+        // chunk 1 ahead.
+        let lengths = [400, 8, 40, 40, 40, 40, 40, 40];
+        let mut lines = vec![credited(0, 0, 1); 2];
+        lines.extend(vec![credited(1, 1, 1); 2]);
+        let scored = score_chunks(1, 8, &lengths, &lines);
+        assert_eq!(scored.iter().map(|s| s.chunk).collect::<Vec<_>>(), [1, 0]);
+        let idf = inverse_document_frequency(2, 8);
+        let average = f64::from(lengths.iter().sum::<u32>()) / 8.0;
+        assert!((scored[0].score - bm25_term_score(idf, 2, 8.0, average)).abs() < 1e-9);
+        assert!((scored[1].score - bm25_term_score(idf, 2, 400.0, average)).abs() < 1e-9);
+        assert!(scored[0].score > scored[1].score);
+        // Equal lengths and counts score equally (ties go to the lower index).
+        let even = score_chunks(1, 8, &[40; 8], &lines);
+        assert!((even[0].score - even[1].score).abs() < 1e-12);
+        assert_eq!(even.iter().map(|s| s.chunk).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn keeps_all_terms_when_every_term_is_common() {
+        // Four files, both terms in all of them: nothing is rare, so nothing
+        // is cut, and the more frequent chunk still wins.
+        let mut lines = Vec::new();
+        for file in 0..4 {
+            lines.push(credited(file, file, 0b11));
+        }
+        lines.push(credited(2, 2, 0b01));
+        assert_eq!(
+            select_terms(&document_frequencies(2, &lines), 4),
+            vec![0, 1]
+        );
+        let scored = score_chunks(2, 4, &[10; 4], &lines);
+        assert_eq!(scored.len(), 4);
+        assert_eq!(scored[0].chunk, 2);
+        assert!(scored.iter().all(|s| s.score > 0.0));
+        // A term credited nowhere never scores.
+        assert_eq!(select_terms(&[0, 3], 3), vec![1]);
+        assert!(select_terms(&[0, 0], 3).is_empty());
+        assert!(score_chunks(2, 3, &[10; 3], &[]).is_empty());
+    }
+
+    #[test]
+    fn caps_kept_terms_at_twelve_by_rarity() {
+        // Twenty-four terms in a hundred files, term i in 24 - i of them.
+        let frequencies: Vec<usize> = (0..24).map(|term| 24 - term).collect();
+        let expected: Vec<usize> = (12..24).rev().collect();
+        assert_eq!(select_terms(&frequencies, 100), expected);
+        // Equal rarity keeps query order.
+        assert_eq!(
+            select_terms(&[1; 24], 100),
+            (0..MAX_SCORING_TERMS).collect::<Vec<_>>()
         );
     }
 

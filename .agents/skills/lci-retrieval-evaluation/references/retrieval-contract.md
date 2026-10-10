@@ -15,7 +15,8 @@ validated query and filters
 
 - Semantic, lexical, LSP, and reranker failures remain independently observable. A reranker failure appends its warning to earlier warnings rather than replacing them.
 - A requested filter applies to every channel, fusion, reranker input, and final result. A filtered request with no matching chunks is a valid empty report.
-- Keep semantic score, channel ranks, lexical match count, fusion score, source-role prior, and reranker score distinct.
+- Keep semantic score, channel ranks, lexical match count, lexical score, fusion score, source-role prior, and reranker score distinct.
+- `lexical_score` is the lexical channel's own chunk score: BM25 over the credited query terms, weighted by term rarity across indexed files, with term-frequency saturation and chunk-length normalisation. It only orders the lexical channel (its rank feeds fusion as a reciprocal rank); it is never added into `fusion_score` or `reranker_score`.
 - Deduplicate by stable source identity; do not merge unrelated chunks because their text is equal.
 - Bound candidate counts and the bytes of each document sent to the reranker (`rerank_candidate_count`, `rerank_document_max_bytes`). Results always carry the full chunk. Record stage and total timings.
 - Preserve index lifecycle metadata (`index.action`, `wait_ms`) independently of retrieval timings.
