@@ -41,19 +41,19 @@ another agent) | `ready` (deps met, can start now) | `blocked(reason)` |
 Size: S = under half a day, M = about a day, L = more than a day (must be split
 before it is picked).
 
-## Snapshot: where things stand (verified 2026-10-10 triage pass, branch `fix/verified-bugs`, HEAD `17fbeea`)
+## Snapshot: where things stand (verified 2026-10-10 second triage pass, branch `fix/verified-bugs`, HEAD `cca6744`)
 
 | Fact | Value |
 | --- | --- |
-| Pipeline | Tree-sitter chunks (11 languages, 12 extensions) -> Qwen3-Embedding-4B vectors in embedded LanceDB -> query fans out to LanceDB cosine (40) + `rg` subprocess (40; since L2 `2031ffe` terms are camel/snake-split with a stop list, cut at 25% document frequency, the 12 rarest kept, chunks scored by BM25 k1=1.2 b=0.75 over credited lines) + LSP `workspace/symbol` (40, first-seen order) -> RRF k=60 + 0.004 production-source prior -> top 24 to Qwen3-Reranker-4B (fail-open; unreachable reranker skipped for 30 s, R7) -> top_k (default 8, max 40). `[channels]` toggles (E3) switch any arm off for evaluation |
+| Pipeline | Tree-sitter chunks (11 languages, 12 extensions) -> Qwen3-Embedding-4B vectors in embedded LanceDB -> query fans out to LanceDB cosine (40) + `rg` subprocess (40; since L2 `2031ffe` terms are camel/snake-split with a stop list, cut at 25% document frequency, the 12 rarest kept, chunks scored by BM25 k1=1.2 b=0.75 over credited lines) + LSP `workspace/symbol` (40, first-seen order; up to 8 `term#` queries per provider under a 1.5 s per-search budget, N7) -> weighted RRF k=60 (`[fusion]` semantic 2.0, lexical 1.0, LSP 1.0; F2a `79138e4`) + 0.004 production-source prior -> at most 2 chunks per file ahead of the rest (F2b `92a7060`) -> top 24 to Qwen3-Reranker-4B (fail-open; unreachable reranker skipped for 30 s, R7) -> top_k (default 8, max 40). `[channels]` toggles (E3) switch any arm off for evaluation. Rust `tests.rs`/`test_*.rs`/`*_test(s).rs` are role `test` since H1 `3f5861e` |
 | Pins | `lancedb =0.38.0` (crates.io latest 0.40.0, 2026-10-07), `rmcp =3.2.0` (latest 3.5.1, 2026-10-05; 3.5.0 implements the 2026-07-28 stateless spec), `tree-sitter 0.25`, no `notify`, no `tantivy` |
-| Measured on the owner's machine (AMD iGPU gfx1150, vLLM via WSL ROCm, both models bf16, max-model-len 8192) | mined set after L2 (`test-results/l2-mined-reranked-new2.json`): total p50 17.5 s / p95 29.6 s, reranking p50 16.8 s / p95 28.8 s (before L2: 34.0 / 32.7 s); fusion without the reranker p50 0.3-0.4 s; query embedding 0.2-0.5 s; LanceDB 55-70 ms; lexical channel ~250 ms p50; cold rust-analyzer ~10 s on each run's first query (`lsp_search_ms` p95 10.2 s in every evaluation run; N7 in progress); reranker unreachable: search median 0.64 s (R7) |
-| Evaluation sets | `evaluations/core.toml` (11 required self queries, 3 optional GUST): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955 (R0, `43d56d9`); fusion-only after L2 0.909 / 1.0 / 0.955, nDCG@10 0.727. `evaluations/mined/self.toml` (E2, 35 queries, 27 keyword / 8 keyword-agnostic): reranked after L2 hit@1 0.743 / hit@3 0.857 / MRR 0.808 / nDCG@10 0.624; semantic-only 0.771 / 0.886 / 0.829 / 0.517; fusion-only after L2 0.657 / 0.800 / 0.746 / 0.571 |
+| Measured on the owner's machine (AMD iGPU gfx1150, vLLM via WSL ROCm, both models bf16, max-model-len 8192) | production defaults on the mined set (`test-results/f2b-mined-reranked-cap2.json`, binary `50fda8a` with cap 2): total p50 18.9 s / p95 27.6 s / max 31.6 s, reranking p50 18.1 s / p95 26.8 s / max 30.8 s (after L2, before F2: 17.5 / 16.8 s; before L2: 34.0 / 32.7 s); fusion without the reranker p50 0.40 s when the LSP channel answers, 1.65 s when it hits its budget; query embedding 0.2-0.5 s; LanceDB 55-70 ms; lexical ~270 ms p50; LSP 2-30 ms once primed. Cold rust-analyzer is now bounded by the 1.5 s budget (first ~6 queries of a run carry the note; max search 30.7 -> 1.9 s fusion-only, N7), but every fusion-only run since N7 also shows a later contiguous window of 15-25 s where all queries hit the budget (14-22 of 35; reranked runs, one query per ~17 s, show only the first two) -- N8. Reranker unreachable: search median 0.64 s (R7) |
+| Evaluation sets | `evaluations/core.toml` (11 required self queries, 3 optional GUST): fusion-only at current defaults hit@1 0.909 / hit@3 1.0 / MRR 0.955 / nDCG@10 0.878 (`h1-core-fusion`; nDCG was 0.710 before F2b); reranked 0.909 / 1.0 / 0.955 (R0, `43d56d9`, not re-run since). `evaluations/mined/self.toml` (E2, 35 queries, 27 keyword / 8 keyword-agnostic; 3 fusion top-1s leak through `xtask/src/mine.rs` test strings, E2b): reranked at current defaults hit@1 0.686 / hit@3 0.886 / MRR 0.779 / nDCG@10 0.655 / recall@8 0.660 (`f2b-mined-reranked-cap2`; with cap 0: 0.743 / 0.829 / 0.802 / 0.609 / 0.600; after L2: 0.743 / 0.857 / 0.808 / 0.624 / 0.618); fusion-only at current defaults 0.743 / 0.857 / 0.806 / 0.607 (`h1-mined-fusion`, 20 LSP budget hits; after L2, plain RRF: 0.657 / 0.800 / 0.746 / 0.571); semantic-only 0.771 / 0.886 / 0.829 / 0.517 (pre-L2, unaffected by later changes) |
 | Chunk sizes in this repo | median ~200 B, p90 ~1.3 KB, p99 ~5 KB, max 17 KB (chunker targets 6,000 B groups, keeps declarations whole to 24,000 B) |
-| Storage | every commit overwrites the whole workspace table (`CreateTableMode::Overwrite`, `src/store.rs`); every search loads every chunk row including code (`Store::chunks`); no `optimize`, `cleanup_old_versions`, scalar index, FTS index, or vector index. L2 removed the O(matches x chunks) lexical mapping scan; `map_lsp_locations` (`src/app/search.rs` ~589) still scans linearly |
+| Storage | every commit overwrites the whole workspace table (`CreateTableMode::Overwrite`, `src/store.rs`); every search loads every chunk row including code (`Store::chunks`); no `optimize`, `cleanup_old_versions`, scalar index, FTS index, or vector index. L2 removed the O(matches x chunks) lexical mapping scan; `map_lsp_locations` (`src/app/search.rs` ~999) still scans linearly (1 ms `fusion_ms` at this repo's size) |
 | Freshness | `on-search` (default) re-reads and SHA-256-hashes every supported file at most every 10 s; `watch` polls every 2 s doing the same; `index_status` does it on every call; watch registrations die with the process |
-| LSP | 7 persistent adapters behind `LspAdapter`; `didOpen` with `version: 1` re-sent before every position request, never `didChange`/`didClose`/`shutdown`; TS/Python/Go/clangd sleep up to 3 s after `didOpen`; the same `term#` symbol syntax (rust-analyzer's) is sent to every provider; rust-analyzer's 10 s quiescence wait always expires on the first query (N7) |
-| Evaluation harness | hit@1/3/8, MRR, nDCG@10, recall@k, file Acc@5/10, per-stage p50/p95, `index_refreshed` (E1); `tags` with per-stratum aggregates and `cargo xtask mine-queries` (E2); `[channels]` arm toggles and `compare` / `evaluate --baseline` with seeded paired-bootstrap 95% CIs (E3). Missing: per-stage max and n (E4), candidate/score dump (E0) |
+| LSP | 7 persistent adapters behind `LspAdapter`; since N7 `446c34a` one `Session` per (provider, workspace) started on a detached task shared by concurrent callers, primed with one background `workspace/symbol` ("e#"), searched under `lsp_search_budget_ms` (1500) with `$/cancelRequest` on an abandoned request; rust-analyzer's 10 s quiescence wait still expires but off the query path. Still: `didOpen` with `version: 1` re-sent before every position request, never `didChange`/`didClose`/`shutdown` (N2, N3); TS/Python/Go/clangd sleep up to 3 s after `didOpen`; the same `term#` symbol syntax (rust-analyzer's) is sent to every provider (N1) |
+| Evaluation harness | hit@1/3/8, MRR, nDCG@10, recall@k, file Acc@5/10, per-stage p50/p95, `index_refreshed` (E1); `tags` with per-stratum aggregates and `cargo xtask mine-queries` (E2); `[channels]` arm toggles and `compare` / `evaluate --baseline` with seeded paired-bootstrap 95% CIs (E3); per-stage `max` and `n` (E4). Missing: candidate/score dump (E0) and its offline replay (E7); per-query `lsp_budget_hit` and priming before the first timed query (E5); an identifier-query stratum (E6) |
 
 ## Done
 
@@ -75,6 +75,11 @@ before it is picked).
 | `66005e9` | E3a: `compare` subcommand and `evaluate --baseline` with seeded paired-bootstrap CIs | Every later ranking claim needs a CI, not two numbers |
 | `2031ffe` | L2: identifier splitting, stop list, document-frequency cut, BM25 chunk scoring in the `rg` channel; per-file canonicalize; per-path candidate mapping | Grep-only mined MRR 0.389 -> 0.749; reranked total p50 34.0 -> 17.5 s with quality unchanged |
 | (no code) | R0: keep the reranker on (mined set +5.7 hit@1, +11.4 hit@3 over fusion). V1: no switch to llama.cpp serving (best case 1.33x, below the 0.6x bar) | Decisions recorded in their items |
+| `446c34a` (results `f74824f`) | N7: one LSP session per (provider, workspace) on a detached, shared start; background priming with one `workspace/symbol`; `lsp_search_budget_ms` (1500) that turns a cold or slow server into a `notes` entry, not a warning; `$/cancelRequest` on abandoned requests | Fusion-only mined max search 30.7 -> 1.9 s; the ~10 s and ~25-30 s first-query spikes are off the query path; cause of the second spike found (rust-analyzer's symbol-index build) |
+| `562a1a5` (recorded `686b61e`) | E4: `max` and `n` per stage in `stage_latency`. T1: non-degenerate CI test; hand-computed BM25 constants | Nearest-rank p95 hid the 30 s LSP outlier at n=35; two tests that could not fail now can |
+| `8f56647`, `79138e4` (results `20d0714`) | F2a: `[fusion]` per-channel RRF weights; default `semantic_weight = 2.0` | Fusion-only mined MRR +0.059 [+0.012, +0.118], nDCG@10 +0.041, held-out half confirmed; reranked pair n.s. (production unchanged). Caveat added by this triage: the fusion-only arms had unequal LSP coverage (5 vs 21 budget hits), replay after E0 |
+| `50fda8a`, `92a7060` (results `9a74224`) | F2b: `[fusion] max_chunks_per_file`; default 2, applied to the fused shortlist before the reranker | Fusion-only mined nDCG@10 +0.049 [+0.026, +0.077]; core nDCG@10 0.710 -> 0.878; reranked nDCG@10 +0.046 [+0.002, +0.095] but MRR -0.023 (n.s.) and odd-half MRR -0.089 (sig.) -> F2c. Same LSP-coverage caveat on the fusion-only arms (14 vs 21 hits) |
+| `3f5861e` (recorded `cca6744`) | H1: Rust `tests.rs`, `test_*.rs`, `*_test.rs`, `*_tests.rs` are role `test` | `lci-core/src/filter/tests.rs` and `src/evaluate/tests.rs` lose the production prior; core identical, mined W/L/T 0/3/32 with all three losses on LSP budget hits |
 
 ## Dropped
 
@@ -89,7 +94,15 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-Nothing in progress.
+E0 `in-progress (2026-10-10)`: found uncommitted in the tree during the second
+triage pass (`src/app/search.rs` `CandidateTrace`/`trace_candidates`/
+`search_with_options`, `src/evaluate/{runner,types}.rs` `dump_candidates`,
+`src/main.rs`, `tests/cases/{evaluation,indexing}.rs`); the triage did not
+touch those files. Its shape matches the edited E0 scope (fused list with
+pre-/post-cap ranks, shortlist membership, document bytes, reranker rank and
+score); check before committing that the trace is taken on the full fused list
+(every channel candidate), that per-channel raw scores and the search `notes`
+are included, and run the two live dumps (cap 2 and cap 0) only after E2b.
 
 Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
 decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
@@ -101,6 +114,44 @@ added for test hygiene.
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 (LSP document lifecycle) and H1 (Rust `tests.rs` role).
+
+Second triage pass (2026-10-10, after N7, E4, T1, F2a, F2b, H1; HEAD `cca6744`;
+reviewer decisions, applied in each item):
+
+- New evidence from the reports, not previously recorded: every fusion-only
+  run since N7 loses the LSP channel for a contiguous 15-25 s window after the
+  warm-up (`lsp_search_ms` ~1.5 s on 14-22 of 35 queries: `n7-mined-fusion`
+  22, `f2-mined-w15`/`w20` 20/21, `f2b-mined-cap0`/`cap2` 14/21,
+  `h1-mined-fusion` 20; `n7b-mined-fusion` and `f2-mined-w10` only the first
+  5), while reranked runs (one query per ~17 s) lose only queries 1-2. So the
+  F2a and F2b fusion-only arms compared unequal LSP coverage (w1.0 5 hits vs
+  w2.0 21; cap0 14 vs cap2 21); their reranked confirms (2 vs 2) are clean.
+  Recorded as N8 (product: the channel goes dark under back-to-back searches,
+  which R1/R6 will expose), E5 widened (priming wait, per-query flag,
+  exclusion), and the F2a/F2b fusion-only claims are to be replayed after E0.
+- E0 edited: the dump must hold every channel's candidates (not only the 24
+  reranked) so weights, prior, cap, window, vote and gate replay exactly.
+  New E7: the offline `replay` tool over E0 dumps. Items it makes cheaper are
+  marked "(replay after E0)": R1 (window axis), R3, R6, F1 (fusion part),
+  F2c, and the F2a/F2b re-check.
+- E2b edited: it also owns the `xtask/src/mine.rs` leakage fix and lands first
+  so E0's dump runs are clean. New E6: identifier-query stratum; R2 moves to
+  blocked(E6) and F3 gains the dependency, since neither can be judged on
+  prose-only sets. New F2d: the `definition_boost` half of F2 that needs C1.
+- Retried unchanged (premise intact): V3, V4, R4 (owner-run model swap, after
+  R1), R5 (after R1, cheaper at a smaller window), C1, C2, L0, L1, L3, L4, M1,
+  M2, M3, N1, N2, N5, N6, A1-A4, S1, S2, S4, S5, W1, W2, C3, X1, H2
+  (README still lacks the roadmap link and the two `compare` notes). N3 and
+  N4 edited to build on N7's `Session`/priming. No item dropped this pass.
+- Tests: the N7 tests (`tests/cases/indexing.rs` ~1442-1675,
+  `tests/cases/navigation.rs` ~389-499) use fake-server delays of 500-2000 ms
+  against budgets of 200 ms and bounds of 1200 ms, a 20 s polling cap, and a
+  150 ms give-up against an 800 ms start; margins are 2.5-6x, smaller than
+  the 10x+ of the older timing tests, so a loaded CI box could flake
+  `a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming`
+  (150 ms lower bound) or `a_caller_that_stops_waiting_...` (the 150 ms
+  timeout must fire before an 800 ms start completes). Watch, do not change,
+  unless a flake is seen; nothing is `#[ignore]`d or `should_panic`.
 
 ---
 
@@ -116,6 +167,32 @@ and the work is cutting its cost (R1 window, R2/R6 skipping, R4 model).
 Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 9 points), so the evaluation harness (E1-E3, done) came first.
 
+**Next up** (second triage, 2026-10-10; ordered by expected value per cost:
+production search is ~18.9 s p50 and 96% of it is reranking, fusion-only is
+0.4 s, so the cheapest route is one dump run plus offline replays, with the
+two known evaluation confounds removed first):
+
+1. **E2b** -- replace the real commit subjects quoted in `xtask/src/mine.rs`
+   tests (3 of 35 mined queries leak), add the `gold-drift`/subject-length
+   axes. Lands before any new live run so E0's dumps are clean. S.
+2. **E0** -- candidate dump (code already in progress in the tree, see In
+   progress): all channel candidates, fused order with pre-/post-cap
+   positions, reranker scores; its two live reranked dump runs
+   (`max_chunks_per_file` 2 and 0) plus core wait for E2b. S.
+3. **E7** -- `replay` over E0 dumps (weights, prior, cap stage, window,
+   vote/margin, gate), with `compare`-style CIs; first use: re-check F2a/F2b
+   fusion-only claims on equal LSP coverage. S.
+4. **E5** -- prime LSP before the first timed query, per-query
+   `lsp_budget_hit`, `compare --exclude-lsp-budget-hits`. Needed before the
+   next live-vs-live pair. S.
+5. **F2c** -- cap stage decided by replay on the cap-0 dump, one live
+   confirm; removes the known production MRR risk. S.
+6. **R1** -- window {6, 8, 12, 24} by replay (the window axis is exact), one
+   live latency confirm of the chosen cell (~18 s -> ~6-10 s p50 at W=8). S.
+
+Then R6 (gate, replay), N8 (LSP dark windows, which R1/R6 expose), R3, M1,
+R5, S5, R4, C1.
+
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | R0 | Fusion-only baseline: does the reranker help at all on core.toml? | done (2026-10-10: keep the reranker on) | S | - |
@@ -123,24 +200,27 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, ROCm or Vulkan) behind an `http` / `in-process` backend switch | blocked(R1: decide once the rerank window is set; V1 measured the serving ceiling at ~1.3x) | M | V1, R1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
-| E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
+| E0 | Dump every channel candidate, the fused/capped order and every reranker score, for offline replay | in-progress (2026-10-10, uncommitted; next up 2; edited: all channels, not only the 24; live dump runs after E2b) | S | E2b preferred |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
 | E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | done (fb5e4f9 toggles, 66005e9 compare) | M | E1 |
-| E2b | Mined-set hygiene: `gold-drift` flag and subject-length axis; strata on the clean subset | ready | S | E2 |
-| R1 | Reranker window x document-size sweep; set defaults from data | ready (E3 done; re-baseline on the L2 binary, windows {6, 8, 12, 24}) | S | - |
-| R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
-| R3 | Reranker as a weighted RRF vote instead of a replacement | ready | S | E3 |
-| R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
-| R5 | Reranker query instruction | ready | S | E3 |
-| R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
-| F2c | Apply the per-file cap after reranking instead of before (F2b odd-half reranked MRR -0.089) | ready (replay via E0) | S | E0 |
+| E2b | Mined-set hygiene: synthetic subjects in `mine.rs` tests (leakage), `gold-drift` flag, subject-length axis; strata on the clean subset | ready, next up 1 (edited 2026-10-10) | S | E2 |
+| E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` exclusion | ready, next up 4 (edited 2026-10-10: budget-hit windows cover 14-22 of 35 queries, not 1-3) | S | N7 |
+| E6 | Identifier-query stratum for `self` (declaration names -> defining file), tagged `identifier` | ready (new 2026-10-10) | S | E2 |
+| E7 | Offline `replay` over E0 dumps: weights, prior, cap stage, window, vote/margin, gate; CIs as `compare` | ready, next up 3 (new 2026-10-10) | S | E0 |
+| R1 | Reranker window x document-size sweep; set defaults from data | ready, next up 6 (replay after E0 for the window axis; live only for the chosen cell's latency and the bytes axis) | S | E0, E7 preferred |
+| R2 | Skip the reranker when an exact symbol-definition hit exists | blocked(E6: no identifier queries in either set, so the gate's effect cannot be measured) | S | E6 |
+| R3 | Reranker as a weighted RRF vote instead of a replacement (plus a `margin` arm) | ready (replay after E0) | S | E3, E7 preferred |
+| R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded; owner-run model swap on 8767; after R1 fixes the window) | S | E3, R1 preferred |
+| R5 | Reranker query instruction | ready (after R1: a smaller window makes its live runs cheaper) | S | E3 |
+| R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0, E7: replay the gate on the dumps; R1: window first) | S | E0, E7, R1 |
+| F2c | Apply the per-file cap after reranking instead of before (F2b odd-half reranked MRR -0.089) | ready, next up 5 (replay after E0 from the cap-0 dump; one live confirm) | S | E0, E7 |
 | N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | done (446c34a: search max 30.7 -> 1.9 s; background priming) | S-M | - |
-| E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (2026-10-10) | XS | - |
-| E5 | Evaluation determinism: prime LSP before the first query; record LSP budget hits per query; let `compare` exclude them | ready | S | N7 |
-| T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (2026-10-10) | XS | - |
-| H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | done (2026-10-10) | S | - |
-| S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
+| N8 | LSP channel goes dark for 15-25 s windows under back-to-back searches (every query hits the budget); diagnose and fix | ready (new 2026-10-10; after R1, which exposes it in production) | S-M, live | N7 |
+| E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | done (562a1a5) | XS | - |
+| T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | done (562a1a5) | XS | - |
+| H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | done (3f5861e) | S | - |
+| S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready (verified defect; after the replay items) | S | - |
 
 ### R0 - Fusion-only baseline
 `done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
@@ -192,12 +272,19 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Scope: behind the V3 backend switch (or standalone if V3 is rejected); parity vs the HF fp32 model (Spearman >= 0.99, same top 3), then an E3 comparison.
 
 ### E0 - Candidate and score dump for offline replay
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation`
-- Why: every reranker strategy question (12 vs 24 candidates, vote-into-RRF, confident skip, progressive early exit, score caching) can be answered offline at zero GPU cost if the evaluator records, per query, all reranker candidates with path, start line, channel ranks, fused score/rank, source role, document bytes sent, and reranker score. Today only the top-k results are kept.
-- Scope: an opt-in diagnostic on the search report (e.g. `SearchReport.candidates` populated only when an evaluation flag/config asks for it) in `src/app/search.rs`, surfaced by `src/evaluate/runner.rs` into the JSON report; no ranking change; MCP/REST output unchanged by default. Add a small replay script or xtask subcommand later (separate item) that recomputes metrics for alternative orders from the dump.
-- Accept: mock integration test that the dump contains every shortlisted candidate with both scores and is absent by default; one live `evaluate` run produces it.
-- Risk: keep it out of default responses (token budget for agents).
+`in-progress (2026-10-10)`, next up 2 (edited in the second 2026-10-10 triage: dump every channel's candidates, not only the 24 reranked, so fusion weights, the prior and the cap replay exactly too) - S - deps: none (E2b preferred first so the dumps are leak-free) - skill: `lci-retrieval-evaluation`
+- Why: every reranker strategy question (12 vs 24 candidates, vote-into-RRF, confident skip, progressive early exit, score caching) can be answered offline at zero GPU cost if the evaluator records, per query, all reranker candidates with path, start line, channel ranks, fused score/rank, source role, document bytes sent, and reranker score. Today only the top-k results are kept. Since F2a/F2b the same is true of fusion questions: the Qwen3 reranker scores each (query, document) pair independently, so any strategy that only re-selects or re-orders among dumped candidates (window W <= 24, vote, margin, gate, cap before/after, weights, prior) is replayable bit-exactly; only changes to the documents or the query text (R5, M1, C2, R4) still need the GPU.
+- Scope: an opt-in diagnostic on the search report (`SearchReport.candidates`, populated only when an evaluation flag/config asks for it) in `src/app/search.rs`, surfaced by `src/evaluate/runner.rs` into the JSON report: (a) every candidate of every channel (semantic 40, lexical 40, LSP 40) with path, start/end line, chunk hash, role, channel rank and raw channel score (cosine, BM25, none for LSP), no code; (b) the fused order with `fusion_score`, the position before and after the per-file cap, and shortlist membership; (c) for each reranked candidate the document bytes sent and the reranker score; (d) the search's `notes` (so E5's budget hit is visible per query). No ranking change; MCP/REST output unchanged by default. The replay tool is E7.
+- Accept: mock integration test that the dump contains every channel candidate and every shortlisted one with both scores, and is absent by default; live: two reranked mined runs at the current defaults with `max_chunks_per_file` 2 (production) and 0 (for F2c, whose cap-after-rerank arm needs reranker scores for the uncapped 24), plus core; reports named `e0-*` under `test-results/`.
+- Risk: keep it out of default responses (token budget for agents); report size (~120 candidates x 35 queries) is fine as JSON.
 - Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): priority raised -- two explorers could not separate semantic misses from lexical noise or reranker demotions without channel ranks in the report.
+
+### E2b - Mined-set hygiene and the `mine.rs` leakage
+`ready`, next up 1 (edited in the second 2026-10-10 triage) - S - deps: E2 (done) - skill: `lci-retrieval-evaluation`
+- Why: (1) `xtask/src/mine.rs` unit tests quote real commit subjects of this repository, so 3 of the 35 mined query texts appear verbatim in an indexed file and 3 of fusion's 7 top-1 losses against semantic-only rank that file first (F2 planner, see E2). Every mined-set number since E2 carries it. (2) 5 of the 8 keyword-agnostic queries are gold noise (split files, churn dominated by dropped `.ps1`/docs, 13-file commits) and the stratum is really "short subject" (explorer, see E2).
+- Scope: (1) replace the quoted subjects in `mine.rs` tests with synthetic ones of the same shape; regenerate nothing else; never exclude the file to fix an evaluation. (2) `cargo xtask mine-queries` flags `gold-drift` when dropped, split or unsupported files carry > 50% of a commit's churn, and tags a subject-length axis (`short-subject` < 8 words, `long-subject` >= 25); `evaluate` already aggregates per tag, so strata on the clean subset come for free. Regenerate `evaluations/mined/self.toml` tags only (same queries and gold).
+- Accept: unit tests for the flag and the tags; the leakage fix lands before E0's dump runs (its commit says which three queries it affects); the next fusion-only pair records the new baseline.
+- Risk: changing the index content invalidates every earlier report as a baseline; that is the point of doing it first.
 
 ### E1 - Richer evaluation metrics
 `done` (2a0b9ad) - S - deps: none - skill: `lci-retrieval-evaluation`
@@ -240,23 +327,23 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Post-L2 arms (triage 2026-10-10; L2's own reports, binary `2031ffe`, same index; `test-results/l2-*-new2.json`; the semantic-only rows above are unaffected by L2 and were not re-run): core fusion hit@1 0.909 / MRR 0.955 / nDCG@10 0.727 (one query 1 -> 2); core grep-only 0.818 / 0.855 / 0.789 (was 0.636 / 0.715 / 0.608); mined fusion 0.657 / 0.746 / 0.571 (was 0.657 / 0.736 / 0.551); mined grep-only 0.629 / 0.749 / 0.499 (was 0.114 / 0.325 / 0.276); mined reranked 0.743 / 0.808 / 0.624 at 17.5 s p50 (was 0.743 / 0.814 / 0.606 at 34.0 s). Reading: grep-only is now a real channel, yet fusion still trails semantic-only at the top on the mined set (hit@1 0.657 vs 0.771, MRR 0.746 vs 0.829) and semantic-only trails fusion on nDCG@10 (0.517 vs 0.571). So the remaining gap is fusion weighting, not lexical quality: F2 can start from these reports without another arm run. Note for F2 and N7: fusion-only runs of the same binary differ by up to 0.06 MRR between runs (`e3-mined-fusion` 0.736 vs `l2-mined-fusion-base` 0.706), most plausibly because the LSP channel is missing on cold-start queries (`lsp_search_ms` p95 ~10.2 s); pair runs with `compare` and expect wider CIs until N7 lands.
 
 ### R1 - Reranker window and document-size sweep
-`ready` (triage 2026-10-10: E3's `compare` is available; every earlier cell predates L2, so re-baseline first) - S, live - deps: none - skill: `lci-retrieval-evaluation`
-- Why: reranking is now 16.8 s p50 / 28.8 s p95 per search on the mined set (`l2-mined-reranked-new2`, down from 32.7 s because L2 sends shorter, focused chunks). The cap sweep at 24 candidates (commit `43d56d9`: uncapped/8192/4096/2048 -> rerank median 29.1/27.4/25.1/22.5 s, quality within noise, 4096 chosen) was measured on pre-L2 chunks and is stale as absolute numbers; the shape (cost ~ tokens) is confirmed by I-2 (compute-bound ~290 tok/s, `rerank_s ~= 0.4 + tokens / 290`), so the window is the lever. Qwen's reranker gains were measured on top-100 shortlists; LCI uses 24, and on core the reranker's top-1 always came from fusion rank <= 5 (explorer below).
-- Scope: (1) prerequisite code change (explorer below): decouple the reranked window from the result count so `rerank_candidate_count` < `top_k` appends the remaining fusion-order hits after the reranked window (`hits.truncate` ~303 and `rerank_into_report` ~568-598 in `src/app/search.rs`). (2) Config-only `evaluate` runs on `core.toml` and `evaluations/mined/self.toml` with the L2 binary: `rerank_candidate_count` in {6, 8, 12, 24} x `rerank_document_max_bytes` in {2048, 4096}, each compared to the 24 x 4096 cell with `compare`; the reranker-off arm already exists (`l2-*-fusion-new2`). Record p50/p95/max `reranking_ms` (E4 if landed), hit@1/3, MRR, nDCG@10, recall@8. Change the defaults in `lci-core/src/config.rs`, `config.example.toml`, README only if a cell dominates.
+`ready`, next up 6 (second triage 2026-10-10: the shortlist changed twice since the last plan (semantic 2x, cap 2) and E0/E7 make the window axis an exact offline replay from the production dump: the reranked order at window W is the dump's top-W by reranker score, so run the grid {6, 8, 12, 24} offline, then one live run of the chosen cell for latency and for the 2048-byte axis, which changes the documents and is not replayable) - S, live confirm only - deps: E0, E7 preferred - skill: `lci-retrieval-evaluation`
+- Why: reranking is now 18.1 s p50 / 26.8 s p95 / 30.8 s max per search on the mined set at the production defaults (`f2b-mined-reranked-cap2`; 16.8 s after L2, 32.7 s before it). The cap sweep at 24 candidates (commit `43d56d9`: uncapped/8192/4096/2048 -> rerank median 29.1/27.4/25.1/22.5 s, quality within noise, 4096 chosen) was measured on pre-L2 chunks and is stale as absolute numbers; the shape (cost ~ tokens) is confirmed by I-2 (compute-bound ~290 tok/s, `rerank_s ~= 0.4 + tokens / 290`), so the window is the lever. Qwen's reranker gains were measured on top-100 shortlists; LCI uses 24, and on core the reranker's top-1 always came from fusion rank <= 5 (explorer below).
+- Scope: (1) prerequisite code change (explorer below): decouple the reranked window from the result count so `rerank_candidate_count` < `top_k` appends the remaining fusion-order hits after the reranked window (`hits.truncate` and `rerank_into_report` in `src/app/search.rs`; line numbers moved since N7/F2, grep for them). (2) E7 replay of the E0 production dump (cap 2, or cap 0 if F2c moved the cap) for `rerank_candidate_count` in {6, 8, 12, 24} at 4096 bytes, each compared to 24 with `compare` on the replay reports. (3) One live `evaluate` pair on `core.toml` + `evaluations/mined/self.toml` for the chosen window: at 4096 bytes for latency (p50/p95/max `reranking_ms`) and at 2048 bytes for the document-size axis, which changes the reranker's input and is not replayable. Record hit@1/3, MRR, nDCG@10, recall@8. Change the defaults in `lci-core/src/config.rs`, `config.example.toml`, README only if a cell dominates.
 - Accept: a results table in the commit message and in this item; decision rule: pick the cheapest cell whose MRR and nDCG@10 deltas against 24 x 4096 have a `compare` 95% CI that includes 0 on the mined set and no core query losing its first expected rank.
 - Risk: a 48-candidate cell may exceed vLLM's batch limits; treat 4xx as a data point, not a bug.
 - Explorer (2026-10-10, reranker-gating): on the clean core pair (`core-eval-cap-4096` vs `r0-core-rerank-off`) the reranker's top-1 always came from fusion rank <= 5 (1,3,1,2,1,1,1,1,5,3,1); its only win (q9 readiness, fusion 3 -> 1, score gap 0.226) and only loss (q1, 1 -> 2, gap 0.002) both sit inside fusion top 5. Add windows {6, 8} to the grid; the cost model (0.4 s + W x ~354 tokens / 290 tok/s) predicts ~10 s at W=8 vs ~25 s at 24. Prerequisite code change: today `hits.truncate` (`src/app/search.rs` ~303) couples the candidate pool to the window and `rerank_into_report` (~568-598) keeps only `k` reranked hits, so W < top_k would shorten results; append the remaining fusion-order hits after the reranked window. Measure nDCG@10 and recall@10 as well as hit@1/MRR: in 7/11 core queries the reranked top 3 contains a chunk from outside fusion top 8.
 - Measurement caveat (V1 bench, 2026-10-10): vLLM's prefix cache makes an identical rerank request ~10x cheaper on repeat (24 x 4 KB: 3.4 s cached). Sequential evaluation arms that rerank the same chunks can partly reuse cache; run arms in an order that cannot benefit (largest cap last) or restart the reranker between arms, and never repeat an identical query in a timing run.
 
 ### R2 - Skip reranking on an exact symbol-definition hit
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation`
+`blocked(E6)` (second triage 2026-10-10: neither evaluation set has an identifier query, so the gate would never fire in an evaluation and its only risk -- skipping the reranker when the LSP match at rank <= 3 is not the best answer -- cannot be measured; E6 supplies the stratum. The skip rate on prose queries is replayable from E0 dumps and should be 0) - S - deps: E6 - skill: `lci-retrieval-evaluation`
 - Why: most real code-search queries are identifiers (78.2% at Debian Code Search https://michael.stapelberg.ch/posts/2019-09-29-dcs-positional-turbopfor-index/); short keyword queries make dense models collapse and rerankers inconsistent (CoREB https://arxiv.org/abs/2605.04615). When the LSP channel already returned the symbol the user typed, 35-54 s of reranking buys nothing.
 - Scope: `src/app/search.rs`: after fusion, if `lexical::terms(query)` has exactly one term, the raw query matches `^[A-Za-z_][A-Za-z0-9_:.#]*$`, and an LSP location whose `name` equals that term (case-insensitive, `#` stripped) maps to a fused hit at rank <= 3, return fusion order with `reranked=false` and a new `rerank_skipped: Option<String>` field (`"exact_symbol_match"`). Config `rerank_skip_on_exact_symbol: bool` default true. REST/MCP get the field for free via serde.
 - Accept: mock test with the fake LSP returning a symbol named like the query -> `rerank_skipped` set, zero rerank requests; prose query -> reranked as before. Live: `core.toml` unchanged metrics; a `symbols`-style query shows `reranking_ms` ~0.
 - Risk: none to fail-open; the gate only removes work.
 
 ### R3 - Reranker as a weighted vote in RRF
-`ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
+`ready` (replay after E0: `vote` and `margin` only re-order the dumped shortlist, so E7 decides them offline on the mined and core dumps; the live run is a confirm of the winner) - S - deps: E3 (done), E7 preferred - skill: `lci-retrieval-evaluation`
 - Why: two peers fuse the cross-encoder's order back into RRF rather than letting it replace the ranking; de4er00 measured that replacement raised MRR but lowered file recall@5 (https://github.com/de4er00/code-rag-mcp, https://github.com/rutmir/code-search-mcp). LCI exposes every channel rank already, so this is a small change with an honest A/B.
 - Scope: `rerank_mode = "replace" | "vote"` and `rerank_vote_weight` (default 1.0) in config; in `rerank_into_report` (`src/app/search.rs`) `vote` adds `weight / (rrf_k + rerank_rank)` to `fusion_score` and re-sorts; `reranker_score` stays visible. Default remains `replace` until E3 says otherwise.
 - Accept: unit test on a hand-built hit list; live E3 comparison replace vs vote on `core.toml` + mined set; flip the default only on a non-regressing win.
@@ -264,7 +351,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Explorer (2026-10-10): a rank-only vote cannot separate the core win (q9: fusion 3 -> reranker 1) from the loss (q1: fusion 1 -> reranker 2); only the reranker score gap does (0.226 vs 0.002). Add a third arm, `margin`: take the reranker's order only where its top score beats the fusion top-1's reranker score by >= ~0.05. n=2 and the q9 gap shrinks to 0.023 at larger caps, so this needs the mined set before any default changes.
 
 ### R6 - Rerank only contested queries
-`blocked` (E0: reports must carry channel ranks before the gate can be replayed offline) - S - deps: E0, R1 - skill: `lci-retrieval-evaluation`
+`blocked` (E0, E7: reports must carry channel ranks before the gate can be replayed offline; R1: decide the window first, since the gate's "reranker win lost" criterion depends on it. Second triage 2026-10-10: the semantic 2x weight changes the agreement statistics, so recompute the gate's skip rate and losses on the current dumps, not on the pre-F2 fixture searches) - S - deps: E0, E7, R1 - skill: `lci-retrieval-evaluation`
 - Why: explorer (2026-10-10): in all 12 live fixture searches (`test-results/multilingual-search-*.json`) the fused top-1 was in 2+ channels with semantic and lexical rank <= 2, and the reranker agreed every time. The RRF score ratio did not discriminate (1.12-2.68). The core q9 win had a test/test/source top 3 and would still be reranked.
 - Scope: after fusion (`src/app/search.rs` ~303), skip reranking when the top-1 hit has `retrieval_channels.len() >= 2`, `semantic_rank <= 2` and `lexical_rank <= 2`, and the top 3 do not mix source roles (unless the query mentions tests). Report `rerank_skipped: "uncontested"` (shared field with R2). Config switch, default off until measured.
 - Accept: offline replay over E0-enriched core + mined reports: no reranker win lost and >= 30% of queries skipped; then a live paired run.
@@ -272,7 +359,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 
 ### R4 - Trial Qwen3-Reranker-0.6B
 - Downloaded with the owner's approval (2026-10-10, WSL `~/.cache/huggingface/hub`): `Qwen/Qwen3-Reranker-0.6B` (1.2 GB, Apache-2.0), `Alibaba-NLP/gte-reranker-modernbert-base` (575 MB, Apache-2.0), `Qwen/Qwen3-Embedding-0.6B` (1.2 GB, Apache-2.0, for M-items). Already cached: Qwen3-Embedding-4B, Qwen3-Embedding-8B, Qwen3-Reranker-4B. The owner allows a candidate to take the RAM of the model it would replace (stop the 4B reranker, serve the candidate on 8767, restore the `vllm.txt` setup afterwards; never more than two model processes). V1 (done) kept production serving on WSL vLLM, so candidates are served there as planned.
-`ready` (downloaded 2026-10-10; E3 done; triage 2026-10-10: compare against the L2 binary's `l2-mined-reranked-new2` and `l2-*-fusion-new2`, and prefer running after R1 so the window is fixed first) - S - deps: E3 (done)
+`ready` (downloaded 2026-10-10; E3 done; second triage 2026-10-10: not replayable (a different model scores the pairs), so it stays live; run after R1 so the window is fixed, baseline the current production report `f2b-mined-reranked-cap2` (or its E0 successor), and treat the 8767 swap as owner-run -- the skill's stop-and-ask list covers starting or stopping services, and the standing note above is the owner's allowance, not a licence for the agent to do it alone) - S - deps: E3 (done), R1 preferred
 - Why: a third-party L4 measurement puts the 0.6B at 65 ms p50 vs 580 ms for the 4B (https://superlinked.com/blog/qwen3-embedding-reranker-guide); on an iGPU the ratio should be similar. MTEB-Code drops 81.20 -> 73.42 (https://arxiv.org/abs/2506.05176), but that was over a weak retriever; over LCI's 4B embedder the loss may be small and the latency gain decisive.
 - Scope: no code. Owner approves and serves the model on 8767 under a distinct `reranker_model` name; run E3 comparison (4B vs 0.6B vs off) on `core.toml` + mined set; document the recommended profile in README/`config.example.toml`.
 - Accept: comparison table in the commit; decision rule as R1 (cheapest within CI).
@@ -280,7 +367,7 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Caution (explorer, 2026-10-10): in Qwen's own table the 0.6B reranker (73.42 MTEB-Code) scores *below* the 0.6B first-stage retriever it reranks (75.41), so it may hurt rather than help. `Alibaba-NLP/gte-reranker-modernbert-base` (149M, Apache-2.0; downloaded, see above) is the only small reranker found whose code number (CoIR 79.99) is not below its first stage (79.31) -- one model-card table, protocol unspecified, vLLM ROCm support unverified. bge-reranker-v2-m3 (41.38) and jina-reranker-v2 (58.98, CC-BY-NC) are far below the retriever. A cascade (small model over 24, 4B over the top 8) is the alternative to an outright replacement. R0 is done: fusion alone does not match on the mined set, so a cheaper reranker is still worth trying.
 
 ### R5 - Reranker query instruction
-`ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
+`ready` (second triage 2026-10-10: not replayable (the instruction changes every pair's score), so run it after R1 when a smaller window makes each live arm ~3x cheaper; baseline the E0 production run) - S - deps: E3 (done), R1 preferred - skill: `lci-retrieval-evaluation`
 - Why: the Qwen3-Reranker card says a task instruction gives 1-5% (https://huggingface.co/Qwen/Qwen3-Reranker-4B). LCI sends the raw query.
 - Scope: `reranker_query_prefix: String` (default empty) in config, prepended to `query` in `Models::rerank` (`lci-core/src/models.rs`). First verify how the deployed `/rerank` endpoint applies Qwen3's `<Instruct>/<Query>/<Document>` template (vLLM may already wrap it); record the finding. Candidate text: "Given a code search query, judge whether the code passage answers it".
 - Accept: unit test that the prefix is sent; live E3 comparison with/without; default only changes on a win.
@@ -295,12 +382,13 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 
 - Result (446c34a; frozen build, reranker off; `test-results/n7b-*-fusion.json` vs `l2-*-fusion-new2.json`): mined max search 30.7 s -> 1.9 s; LSP per query after warm-up 2-8 ms (was 20-40 ms); total p50 393 -> 403 ms; MRR +0.024 (n.s.); core metrics identical. The first ~6 queries of a run (~10 s quiescence + ~8 s priming) carry the budget note. Cause of the old ~25-30 s spike: rust-analyzer builds its symbol index on the first full `workspace/symbol` (~8.5 s alone, longer under load); a variant without priming kept cancelling that build (LSP p50 1.5 s over ~16 queries). Follow-up candidates: N4 prime at index/serve start so the first queries also get LSP; consider a shorter quiescence wait now that priming exists.
 ### E4 - Max latency in the aggregate
-`ready` - XS - deps: none - skill: `lci-retrieval-evaluation`
+`done` (562a1a5, recorded 686b61e) - XS - deps: none - skill: `lci-retrieval-evaluation`
 - Why: `stage_latency` p95 is nearest-rank (`src/evaluate/metrics.rs` ~595), so with 35 queries it is the second-highest value and a single 30 s outlier is invisible.
 - Scope: add `max` and `n` per stage next to p50/p95; README/evaluation-workflow mention.
+- Result: `max` and `n` per stage (serde default, old reports load with zeros); the workflow says to read `max`. It is what made the N8 windows visible in this triage.
 
 ### T1 - Test hygiene follow-ups
-`ready` (triage 2026-10-10) - XS - deps: none - no live run
+`done` (562a1a5, recorded 686b61e; varied-gain CI test, three hand-computed BM25 constants) - XS - deps: none - no live run
 - Why: the 2026-10-10 reviews of E3a and L2 left two test-honesty nits, and the triage pass swept the tree for `#[ignore]`, `should_panic` and timing-sensitive assertions. Findings: no `#[ignore]` and no `should_panic` anywhere; the timing assertions below are all backed by deterministic fakes with 2x-1000x margins and stay as they are.
 - Scope (fix):
   - `src/evaluate/tests.rs:1319` `a_consistent_improvement_is_significant_and_a_consistent_loss_is_too`: every pair's delta is the constant +0.0625, so the bootstrap interval is a point and the test duplicates `the_interval_of_a_constant_delta_is_that_delta` (`:1339`). Vary the deltas with one sign (e.g. +0.03, +0.05, +0.08, +0.10, +0.12, +0.06, +0.09, +0.15) so `ci_low > 0` is checked with a non-degenerate interval, and assert `ci_low < mean_delta < ci_high`.
@@ -309,13 +397,34 @@ Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
 - Accept: `cargo test -p local-code-intelligence --lib evaluate::` and `cargo test -p lci-core --lib lexical::` pass; the commit body names the two tests and the hand computation.
 
 ### E5 - LSP-stable evaluations
-`ready` - S - deps: N7 - skill: `lci-retrieval-evaluation`
-- Why (2026-10-10): after N7 the LSP channel answers in milliseconds once primed, but some runs still hit the 1.5 s budget on late queries (e.g. mined queries 27, 30, 34 in `h1-mined-fusion` vs fast in `f2b-mined-cap2`), possibly rust-analyzer background work (cache priming, flycheck) competing with the run. Each such query loses its LSP candidates, so paired comparisons of identical ranking code flip 1-3 queries (F2b reproduce W/L/T 0/2/33, H1 0/3/32), enough to make nDCG CIs falsely significant.
-- Scope: (1) `evaluate` waits until every applicable language server is started and primed before the first timed query (bounded, logged), since a long-lived `serve` is the production case; (2) per-query `lsp_budget_hit` flag in the report (from the N7 note); (3) `compare --exclude-lsp-budget-hits` drops pairs where either side hit the budget and reports how many; (4) document in the evaluation workflow.
-- Accept: re-running an identical binary twice on mined gives W/L/T 0/0/35 with the exclusion (or with priming alone).
+`ready`, next up 4 (edited in the second 2026-10-10 triage with the per-query evidence below) - S - deps: N7 (done) - skill: `lci-retrieval-evaluation`
+- Why (2026-10-10): after N7 the LSP channel answers in milliseconds once primed, but the per-query `lsp_search_ms` of every fusion-only run since N7 shows a contiguous window, after the warm-up, where every query hits the 1.5 s budget: `n7-mined-fusion` queries 14-35 (22 hits), `f2-mined-w15` 21-35 (20), `f2-mined-w20` 15-35 (21), `f2b-mined-cap0` 27-35 (14), `f2b-mined-cap2` 12-27 (21, then recovered), `h1-mined-fusion` 21-35 (20); only `n7b-mined-fusion` and `f2-mined-w10` had just the five start-up hits. Reranked runs, one query per ~17 s, lose only queries 1-2 (every `*-reranked-*` report). Each such query loses its LSP candidates, so the fusion-only arms of F2a (w1.0 5 hits vs w2.0 21) and F2b (cap0 14 vs cap2 21) compared unequal channel sets, and identical-code pairs flip 1-3 queries (F2b reproduce W/L/T 0/2/33, H1 0/3/32), enough to make nDCG CIs falsely significant. The product-side cause and fix are N8; E5 is the evaluation side and must land before the next live-vs-live pair.
+- Scope: (1) `evaluate` waits until every applicable language server is started and primed before the first timed query (bounded by `lsp_timeout_seconds`, logged), since a long-lived `serve` is the production case; (2) per-query `lsp_budget_hit: Vec<provider>` in the report (from the N7 note; today per-query records carry no `notes`); (3) `compare --exclude-lsp-budget-hits` drops pairs where either side hit the budget and reports how many; (4) `evaluate --min-query-interval-ms` (default 0) so an arm can be paced like production while N8 is open; (5) document in the evaluation workflow, including that F2a/F2b fusion-only claims are to be re-checked by E7 replay.
+- Accept: re-running an identical binary twice on mined gives W/L/T 0/0/35 with the exclusion (or with priming alone); the aggregate reports the number of budget-hit queries per run.
+
+### E6 - Identifier-query stratum
+`ready` (new in the second 2026-10-10 triage) - S - deps: E2 (done) - skill: `lci-retrieval-evaluation`
+- Why: 78% of real code-search queries are identifiers (Debian Code Search, see R2), yet both evaluation sets are prose (commit subjects, hand-written questions). R2 (skip the reranker on an exact symbol hit), F3 (per-kind routing), M1's identifier instruction and R6's gate all need this stratum, and `core.toml` cannot grow it by hand without tuning on known paths.
+- Scope: `cargo xtask mine-symbols --repo <path> --key self --out evaluations/mined/self-identifiers.toml --max 40`: deterministic sample (seeded) of declaration names from the repository's own source -- for Rust `^\s*pub(\(crate\))? (fn|struct|enum|trait|type) (\w+)` over `rg --json`, other languages added when a non-Rust workspace is evaluated -- with `expected_paths` = the defining file, `preferred_paths` = up to 3 files that reference the name, tag `identifier`, skipping names shorter than 5 characters, names defined in more than one file, and names that appear in test files only. Commit the generated set; `evaluate` and `compare` need no change (tags already aggregate).
+- Accept: unit tests for the regex/filters on synthetic input; the committed set validates; one fusion-only and one reranked run recorded as the baseline (expect hit@1 near 1.0 fusion-only; the interesting number is the reranker's cost on queries it cannot improve).
+- Risk: evaluation data never feeds ranking; the set is a measurement of identifier handling, not a tuning target. Keep it separate from `self.toml` so the prose aggregates do not move.
+
+### E7 - Offline replay over E0 dumps
+`ready`, next up 3 (new in the second 2026-10-10 triage) - S - deps: E0 - skill: `lci-retrieval-evaluation`
+- Why: with E0's dumps, R1 (window), R3 (vote/margin), R6 (gate), F1 (prior, fusion-only), F2c (cap stage), and the F2a/F2b re-check are all pure functions of the dump: recompute the fused order from channel ranks with alternative weights/prior/cap, pick a window, apply the reranker scores already recorded, and score against the gold. Zero GPU, seconds per grid, and the two arms of every comparison share identical channel candidates, which removes the LSP-coverage confound E5 describes.
+- Scope: `<bin> replay <dump.json> --fusion semantic=2,lexical=1,lsp=1 --prior 0.004 --cap 2 --cap-stage shortlist|results --window 24 --rerank-mode replace|vote:<w>|margin:<gap>|skip-uncontested [--output report.json]` producing a report in the `evaluate` JSON shape (metrics only, no latency) so `compare` works unchanged; `xtask/src/` or `src/evaluate/replay.rs` (pure, unit-tested on a hand-built dump). Reuse `fuse_hits`/`cap_chunks_per_file` from `src/app/search.rs` rather than reimplementing them, so a replay at the production settings reproduces the live report's ranks exactly (the acceptance test).
+- Accept: replaying the E0 production dump at the production settings reproduces its per-query ranks (W/L/T 0/0/35 against the live report); a unit test per knob; the workflow documents when a replay is sufficient (re-selection or re-ordering) and when a live run is still required (new documents, query text, model).
+- Risk: replay cannot see candidates outside the dumped 40 per channel; a window or cap that would have pulled in a 41st candidate is out of reach and must be noted, not guessed.
+
+### N8 - LSP channel goes dark under back-to-back searches
+`ready` (new in the second 2026-10-10 triage; schedule right after R1, which exposes it in production) - S-M, live - deps: N7 (done) - skill: `lci-lsp-adapter`
+- Why: see E5's evidence. A search sends up to 8 sequential `workspace/symbol` requests per provider (`src/app/search.rs` ~487-518, `provider_symbols` ~974) and at the 1.5 s budget drops the future, which cancels the in-flight request (`$/cancelRequest`) and never sends the rest; so at most one request per search is left with the server, and a request backlog does not explain the pattern. What fits: ~20-30 s after start (fusion-only query 12-27 of a run, 15-25 s window) rust-analyzer finishes loading build scripts/proc macros and swaps its crate graph, invalidating the symbol index it primed, and the next `workspace/symbol` rebuilds it (>= 8.5 s alone, longer with the embedder and `rg` competing for the CPU); every search during the rebuild hits the budget. Today the reranked path's ~17 s per query hides this (only queries 1-2 are lost), so it is invisible to a `serve` user with the reranker on and visible to one with it off, in fast succession, or after R1/R6 cut reranking.
+- Scope: (1) confirm with N7's `warn!`/`debug!` traces and rust-analyzer's `experimental/serverStatus` notifications whether the dark window coincides with a status change (quiescent -> not quiescent -> quiescent); (2) fix: re-prime in the background when the server reports a reload (and after any `$/cancelRequest`-interrupted index build), so the index is rebuilt once off the query path, as N7 did for the first build; consider making the per-search symbol requests bounded by the *remaining* budget and pacing them so a slow server gets one, not eight; (3) report `lsp_budget_hit` per search in `notes` already; add the provider's last status to `Status`.
+- Accept: fake-LSP test that a server which signals a reload (or whose later symbol requests take longer than the budget once) is re-primed in the background and the next-but-one search gets LSP hits within budget; live: a fusion-only mined run at 0 s spacing has at most the five start-up budget hits (compare against `h1-mined-fusion`'s 20), and the reranked run is unchanged.
+- Risk: non-Rust servers have no `serverStatus`; keep the fix fail-open and provider-agnostic where it can be (time-based re-priming on a budget hit is the fallback).
 
 ### H1 - Rust test-file classification
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
+`done` (3f5861e, recorded cca6744; six filter tests; core identical, mined W/L/T 0/3/32 with all three losses on LSP budget hits, see E5) - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
 - Why: `lci-core/src/filter/source_role.rs` has test-name rules for Python, JS/TS, Go, Java, C/C++, C# but none for Rust, so `lci-core/src/filter/tests.rs` and `src/evaluate/tests.rs` are `source` and receive the production prior. Acceptance item 12 (production beats decoys) is undermined for Rust.
 - Scope: `is_test_file_name`: `.rs` stems `tests`, `test`, `test_*`, `*_test`, `*_tests`; tests in `lci-core/src/filter/tests.rs`; README role paragraph. Note in the item that inline `#[cfg(test)] mod tests` blocks cannot be path-classified (chunk-level role via C1's symbol metadata is the follow-up).
 - Accept: `cargo xtask test --suite Filter`; live `evaluate core.toml` shows the test-role query still passes and no self query regresses.
@@ -345,9 +454,10 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) | blocked(L1 decision) | L (split) | L1, L2 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
-| F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | done (F2a 8f56647+79138e4 semantic 2x; F2b 50fda8a+92a7060 per-file cap 2) | M | E3 |
-| F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
+| F1 | Re-justify the 0.004 production prior with a sweep | ready (replay after E0 for the fusion part; grid re-centred, see item) | S | E3, E7 preferred |
+| F2 | Weighted RRF per channel, per-file cap (definition boost split off as F2d) | done (F2a 8f56647+79138e4 semantic 2x; F2b 50fda8a+92a7060 per-file cap 2; fusion-only evidence to be re-checked by E7 replay) | M | E3 |
+| F2d | Definition boost in fusion (LSP symbol kinds now; C1 `kind` later) | proposed (new 2026-10-10) | S | E7, C1 preferred |
+| F3 | Query-type routing (identifier / prose / issue-like) | blocked(L3, R2, E6) | M | L3, R2, E6 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
 | S1 | Per-file incremental table writes (delete + add or `merge_insert`), lancedb bump | ready | M | - |
@@ -385,7 +495,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 
 - Result (2031ffe; frozen base b78754f vs new, same index; `compare` 95% paired-bootstrap CIs; `test-results/l2-*`): grep-only mined MRR 0.389 -> 0.749 [+0.21, +0.50] and hit@1 0.229 -> 0.629; grep-only core nDCG@10 +0.18 (significant); fusion (reranker off) mined MRR +0.040 (n.s.), core one query 1 -> 2; production reranked mined vs `r0-mined-rerank-on`: MRR -0.006, nDCG@10 +0.018, hit@1 equal (all n.s.), with reranking p50 32.7 -> 16.8 s and total p50 34.0 -> 17.5 s (shorter, focused chunks reach the reranker); lexical p50 ~250 ms. A first variant (1+ln(tf), no length normalisation) regressed two core queries (long test/xtask chunks) and ran at ~520 ms p50; BM25 normalisation, the review's stop-list trim and the latency fixes were added in one continuation, so the mined set was consulted twice. Follow-ups: one hand-computed constant in the BM25 test; E3 arm table should be re-run with fusion now that lexical changed (F2 next).
 ### L3 - Anchor extraction for issue-like queries
-`ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
+`ready` (second triage 2026-10-10: the mined set has no issue-like text -- subjects average 10-33 words -- so evaluate on E2b's `long-subject` tag and on a hand-made issue/stack-trace pair added to `core.toml`'s optional queries; the lexical term list is replayable only by a live run, since anchors change the `rg` query) - S - deps: E3 (done), E2b preferred - skill: `lci-retrieval-evaluation`
 - Why: "Reformulate, Retrieve, Localize" improved first-file ranking 35% by pulling identifiers/snippets out of bug reports before lexical retrieval (https://arxiv.org/abs/2512.07022); LLM rewriting hurts because it drops anchors (CORE-Bench https://arxiv.org/abs/2606.11864); "dense expands, sparse anchors" (https://arxiv.org/abs/2608.15851). LCI must not call an LLM, so the extractor is deterministic. zvec-grep lets the agent pass its own `fts` keyword list (https://github.com/zvec-ai/zvec-grep).
 - Scope: `lci-core/src/lexical.rs` (or new `lci-core/src/query.rs`): `anchors(query)` for queries with >= 25 words or stack-trace/newline markers: paths (`[\w./-]+\.\w{1,5}(:\d+)?`), `a::b`/`a.b` chains, camel/snake identifiers, quoted strings, error codes (`E\d{4}`, `0x...`); anchors go to `rg` and LSP symbol queries (caps 12 / 8), full text to the embedder. New optional `lexical_terms: Option<Vec<String>>` on `search_code` (MCP `SearchArgs` in `src/server.rs`, REST, CLI `--lexical-term`) overriding extraction; reported in `filters`/report as `lexical_terms_effective`.
 - Accept: unit tests on a synthetic issue text and a stack trace; mock search test that supplied terms reach the fake `rg` invocation (or the term list); live E3 on an issue-like subset of the mined set (PR-body-sized subjects).
@@ -414,14 +524,14 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): the embedder sees raw `c.code` (`src/app/indexing.rs` ~193) with no path, language or enclosing symbol; gold files linked to a query only by their path (test support files) are unreachable semantically. A C2-lite header `// {path} | {language}` needs no C1 and one re-embed in a scratch data_dir; gate on no keyword-stratum loss and `core.toml` hit@1 >= 0.818. Anthropic's contextual retrieval reports -35% failures, but with LLM-written context, so expect less.
 
 ### F1 - Re-justify the 0.004 production prior
-`ready` - S, live - deps: E3 - skill: `lci-retrieval-evaluation`
-- Why: with k=60 a rank-1 hit is worth 1/61 = 0.0164, so 0.004 equals about 20 rank positions in one channel; it mostly decides which 24 candidates reach the reranker. de4er00's source prior cut "how do I" recall@5 from 0.75 to 0.50 (https://github.com/de4er00/code-rag-mcp). It has never been swept.
-- Scope: expose `source_role_prior: f32` (default 0.004) in config and `src/store.rs::source_role_prior`; sweep {0, 0.001, 0.002, 0.004, 0.008} with reranker on and off via E3 on `core.toml` + mined set, per stratum.
+`ready` (replay after E0; second triage 2026-10-10: the prior is added unscaled after the weights, so F2a halved its effect relative to a semantic rank-1 (2/61 = 0.0328 now vs 0.0164) while leaving it unchanged against lexical/LSP; H1 also moved this repo's Rust test files under it. Re-centre the grid on the new scale and let E7 replay the fusion-only part from E0's channel candidates; only the reranked confirm of the chosen value needs the GPU) - S, live confirm only - deps: E3 (done), E7 preferred - skill: `lci-retrieval-evaluation`
+- Why: with k=60 a rank-1 hit is worth 1/61 = 0.0164 in a weight-1 channel (0.0328 in the semantic channel since F2a), so 0.004 equals about 20 rank positions in one channel; it mostly decides which 24 candidates reach the reranker. de4er00's source prior cut "how do I" recall@5 from 0.75 to 0.50 (https://github.com/de4er00/code-rag-mcp). It has never been swept.
+- Scope: expose `source_role_prior: f32` (default 0.004) in config and `src/store.rs::source_role_prior`; sweep {0, 0.002, 0.004, 0.008, 0.016} (0.008 preserves the pre-F2a ratio to the semantic channel) with reranker on and off: fusion-only by E7 replay on `core.toml` + mined dumps, per stratum; reranked live only for the winner.
 - Accept: table in this entry and the commit; change the default only on a non-regressing win; README "small transparent prior" sentence updated with the measured rank-equivalent.
 - Risk: F3 may later make the prior query-kind dependent; keep the scalar config.
 
 ### F2 - Weighted RRF, definition boost, per-file cap
-`ready`, next ranking item (triage 2026-10-10: the post-L2 arm table under E3 is the starting evidence; on the mined set fusion trails semantic-only at the top, hit@1 0.657 vs 0.771, while leading on nDCG@10, 0.571 vs 0.517, so a lower lexical or LSP weight is the first cell to try) - M - deps: E3 (done) - skill: `lci-retrieval-evaluation`
+`done` (F2a `8f56647`+`79138e4`, F2b `50fda8a`+`92a7060`; the `definition_boost` part of the scope was not built and is F2d. Second triage 2026-10-10: both fusion-only decisions compared arms with unequal LSP coverage (E5), so E7 must replay them on one dump before the fusion-only gains are quoted again; the reranked pairs were clean and production quality is unchanged at hit@1/MRR, better at nDCG@10/recall) - M - deps: E3 (done) - skill: `lci-retrieval-evaluation`
 - Why: RRF is sensitive to its parameters and a tuned weighted combination beats flat RRF (Bruch et al., TOIS 2023 https://arxiv.org/abs/2210.11934); Semble's post-fusion signals lifted BM25 from 0.675 to 0.834 nDCG@10, mostly from definition boosts, adaptive lexical weight and per-file coherence (https://github.com/MinishLab/semble/blob/HEAD/benchmarks/README.md); de4er00 caps two chunks per file.
 - Scope: `[fusion]` config: `semantic_weight`, `lexical_weight`, `lsp_weight` (default 1.0), `definition_boost` (default 0; applies when the chunk's C1 `kind` is a declaration or an LSP symbol kind in {Class, Struct, Interface, Enum, Function, Method, Trait}), `max_chunks_per_file` (default 0 = unlimited; applied when building the rerank shortlist, refilling from the next candidates). `fuse_hits` in `src/app/search.rs`; weights kept visible in `fusion_score` only (contract: distinct scores).
 - Accept: unit tests on hand-built channel lists (search.rs now has a `tests` module); live E3 sweep of weights {0.5, 1, 2} per channel and cap {0, 2} on the mined set; defaults change only on a win.
@@ -439,15 +549,20 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
   | mined reranked, w 2.0 | +0.002 [-0.065, +0.065] | -0.021 (n.s.) | 0.743 -> 0.743 | 0.611 -> 0.593 |
 
   Decision: every pre-registered check passed for 2.0, so the default became `semantic_weight = 2.0` (79138e4). Production (reranked) quality is unchanged; the reranker-off/failure path gains. The weight-1.0 arm reproduced `n7b-mined-fusion` exactly (W/L/T 0/0/35).
-- F2b next (in progress): `max_chunks_per_file` on the fused shortlist, pre-registered grid {unlimited, 2}, same decision protocol.
+- F2b (done, `50fda8a`+`92a7060`): `max_chunks_per_file` on the fused shortlist, pre-registered grid {unlimited, 2}, same decision protocol; results below.
 - F2b result (2026-10-10; frozen build of 50fda8a; pre-registered {0, 2}; `test-results/f2b-*`): fusion-only mined nDCG@10 +0.049 [+0.026, +0.077] (both halves significant), MRR +0.037, recall@8 0.558 -> 0.608; core nDCG@10 0.710 -> 0.878 (significant), recall@3 0.682 -> 0.955, first ranks unchanged; reranked mined nDCG@10 +0.046 [+0.002, +0.095], recall@8 0.600 -> 0.660, MRR -0.023 and hit@1 -0.057 (n.s., W/L/T 2/4/29). Default became 2 (92a7060). Caveat: reranked odd half MRR -0.089 [-0.185, -0.002] -- capping before the reranker can push a file's best (third) chunk out of the 24-chunk shortlist; F2c tests capping after reranking (replay with E0).
 
 ### F2c - Per-file cap after reranking
-`ready` (best done as an E0 replay) - S - deps: E0 - skill: `lci-retrieval-evaluation`
-- Why: F2b's cap improves recall and nDCG everywhere but, applied before the reranker, cost reranked MRR on half the mined set. Capping the reranked output instead (and the fusion order only when the reranker is off or fails) keeps every chunk eligible for the reranker's top-1 while still diversifying the returned files.
-- Scope: a `cap_stage = "shortlist" | "results"` choice (or move the cap) in `src/app/search.rs`; decide with an E0 replay on the reranked mined/core runs (reranker scores are per pair, so moving the cap is replayable exactly), then one live confirm. Same decision protocol as F2a/F2b.
+`ready`, next up 5 (replay after E0; second triage 2026-10-10: the replay needs the dump of a `max_chunks_per_file = 0` run, because under cap 2 the chunks demoted out of the 24 were never reranked and have no score; the cap-0 dump reranks the uncapped 24, from which "cap after" is exact and "cap before" is exact for the 24 minus the refilled tail) - S - deps: E0, E7 - skill: `lci-retrieval-evaluation`
+- Why: F2b's cap improves recall and nDCG everywhere but, applied before the reranker, cost reranked MRR on half the mined set (odd half -0.089 [-0.185, -0.002]; full set -0.023 n.s., hit@1 0.743 -> 0.686). Capping the reranked output instead (and the fusion order only when the reranker is off or fails) keeps every chunk eligible for the reranker's top-1 while still diversifying the returned files.
+- Scope: a `cap_stage = "shortlist" | "results"` choice (or move the cap) in `src/app/search.rs`; decide with an E7 replay on E0's cap-0 reranked mined/core dumps, then one live confirm paired against `f2b-mined-reranked-cap2` (same binary lineage, E5 exclusion on). Same decision protocol as F2a/F2b. If the reranker-off path should keep the shortlist cap (it had the clean fusion-only gains), the two stages are independent switches.
+### F2d - Definition boost
+`proposed` (new in the second 2026-10-10 triage; the half of F2's scope that was not built) - S - deps: E7 (replayable: an LSP location's `SymbolKind` is in the dump), C1 preferred for chunks the LSP did not return - skill: `lci-retrieval-evaluation`
+- Why: F2's evidence (Semble's definition boosts, see F2) was never tested here. LSP `workspace/symbol` answers already carry a kind, so a boost for {Class, Struct, Interface, Enum, Function, Method, Trait} needs no C1; C1's `kind` extends it to chunks the LSP did not return.
+- Scope: `[fusion] definition_boost` (default 0) added to `fusion_score` for a chunk whose LSP location kind is a declaration (and, after C1, whose chunk `kind` is); E7 replay on the E0 dumps for {0, 0.004, 0.008}, then one live confirm; default changes only on a win under the F2a protocol.
+
 ### F3 - Query-type routing
-`blocked(F2, L3, R2)` - M - deps: F2, L3, R2 - skill: `lci-retrieval-evaluation`
+`blocked(L3, R2, E6)` (F2 done; E6 added in the second 2026-10-10 triage: per-kind presets cannot be evaluated without an identifier stratum) - M - deps: L3, R2, E6 - skill: `lci-retrieval-evaluation`
 - Why: BM25 is best for code-to-code/identifier queries and dense for NL (JetBrains https://arxiv.org/abs/2510.20609); keyword queries collapse dense models (CoREB); Semble raises lexical weight for symbol-like queries. Fixed per-channel depths "may not transfer across changing queries" (https://arxiv.org/abs/2609.15143).
 - Scope: `lci-core/src/query.rs`: `QueryKind { Identifier, Prose, IssueLike }` by rules (single identifier-like token; >= 25 words or trace markers; else prose); per-kind presets in `[fusion.<kind>]` overriding F2 weights, candidate depth (`semantic/lexical/lsp_candidate_count`), R2 gate, and M1 instruction; `query_kind` reported in `SearchReport`.
 - Accept: unit tests for the classifier; live E3 per stratum (identifier vs prose vs issue-like) before/after; README.
@@ -483,7 +598,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: `destructive`; never delete a table whose workspace exists; dry-run is the default.
 
 ### S4 - Stop loading every chunk's code per search
-`ready` - M - deps: none
+`ready` (second triage 2026-10-10: `fusion_ms` is 1 ms and LanceDB 55-70 ms on this repo, so there is nothing to measure here until a larger workspace is evaluated; pick it with such a workspace, not before) - M - deps: none
 - Why: `Store::chunks` loads every row including `code` on every search, and `map_lexical_matches`/`map_lsp_locations` do a linear `find` per match (O(matches x chunks)). Fine at this repo's size; the first mid-size workspace will notice.
 - Scope: `Store::chunk_locations` (path, language, lines, hash, role; no code) + `Store::codes_for(hashes)`; per-file sorted interval index for channel mapping (binary search); load `code` only for the fused shortlist and final results; `Hit` construction unchanged for callers.
 - Accept: existing suites pass; a timing note in the commit (fusion_ms and total before/after on this repo); the lexical/LSP mapping tests in `tests/cases/indexing.rs` unchanged.
@@ -511,7 +626,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: the retry-once-with-fresh-process rule must clear the open set.
 
 ### N3 - LSP shutdown, idle eviction, registry-derived status
-`ready` - S - deps: none - skill: `lci-lsp-adapter`
+`ready` (second triage 2026-10-10: build on N7's `Session`/`Manager` in `lci-core/src/lsp.rs` -- sessions are now held by the manager on a detached start task, so shutdown on drop and idle eviction have one owner to hook; also home for N7's follow-up "shorter quiescence wait now that priming exists") - S - deps: N7 (done) - skill: `lci-lsp-adapter`
 - Why: processes are only `kill_on_drop`; no `shutdown`/`exit` handshake; servers live as long as the service (many workspaces = many servers). `Status` in `src/app/indexing.rs` hard-codes seven `*_analyzer_running` booleans. codesearch evicts idle watchers/servers (https://github.com/flupkede/codesearch); Claude Code's LSP config has `shutdownTimeout` (https://code.claude.com/docs/en/plugins-reference).
 - Scope: `shutdown` request + `exit` notification bounded to 2 s on session drop and on `serve` Ctrl+C; `lsp_idle_minutes` (default 30, 0 = never) eviction task; `Status.analyzers_running: BTreeMap<String, bool>` derived from `Manager::adapters()` (keep the old fields one release for REST/MCP consumers, mark deprecated in README).
 - Accept: fake LSP sees `shutdown` then `exit`; eviction test with a 1-second idle setting; `cargo xtask acceptance <lang>-recovery` still passes.
@@ -537,7 +652,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | H2 | Documentation sync: README docs index links this file and the evaluation workflow; two `compare` README notes from the E3a review | ready (edited 2026-10-10; AGENTS/BM25 parts landed) | XS | - |
 
 ### N4 - Project-root discovery and priming
-`ready` - M - deps: N2 - skill: `lci-lsp-adapter`
+`ready` (second triage 2026-10-10: N7 already primes every started server with one `workspace/symbol` and dedupes starts per (provider, workspace); what remains here is per-root sessions, the representative `didOpen` for TS/Python, and N7's follow-up of priming at `index`/`serve` start so a workspace's first queries also get LSP hits) - M - deps: N2, N7 (done) - skill: `lci-lsp-adapter`
 - Why: README documents that `search_symbols` for TypeScript/Python sees only files already opened because LCI never writes `tsconfig.json`/`pyrightconfig.json`. OpenCode resolves each server's `NearestRoot` (pyproject/pyrightconfig/setup.cfg; `go.work` before `go.mod`; the project's own `tsserver.js`) and starts servers per root (https://github.com/anomalyco/opencode/blob/HEAD/packages/opencode/src/lsp/server.ts). Serena's 30 GB pyright blow-up came from servers ignoring its ignore lists (https://github.com/oraios/serena/issues/944).
 - Scope: `LspAdapter::project_root(workspace, file) -> PathBuf` per adapter (TS: nearest `tsconfig.json`/`jsconfig.json`/`package.json`; Python: `pyproject.toml`/`pyrightconfig.json`/`setup.cfg`/`setup.py`; Go: `go.work` then `go.mod`); sessions keyed by (provider, root); on spawn, `didOpen` one representative indexed file per root (nearest to the root) so `workspace/symbol` has project context; pass LCI's ignore set as `exclude` in pyright's `didChangeConfiguration` and tsserver's `initializationOptions` where supported. Never write into the repo.
 - Accept: unit tests for root discovery; extend `cargo xtask acceptance typescript-lsp` and `python-lsp` to assert `search_symbols` finds a symbol with no prior `find_definition`; README limitation paragraph rewritten.
@@ -658,7 +773,7 @@ Evidence for the tier (restated so the file stays self-contained):
 | --- | --- | --- | --- | --- |
 | I-1 | Is shelling out to `rg` worth keeping over in-process grep crates, LanceDB FTS, or Tantivy? | L1's four arms on this repo + E2 set, lexical-only | lexical-only nDCG@10/hit@3 per stratum, p50/p95, index size/build time, new crates | see L1 |
 | I-2 | What makes reranking cost 35-54 s here: candidate count, document bytes, or model compute on the iGPU? | Time `POST /rerank` directly (curl) with 1/6/12/24 docs x 512/2048/4096 bytes, warm | wall time per call | Answered (2026-10-10, R0 vLLM logs over 44 reranks and V1 bench): compute-bound at ~290 prompt tokens/s, `rerank_s ~= 0.4 + tokens / 290` within ~10%; L2 confirmed it by halving tokens and time (32.7 -> 16.8 s p50). Tokens (window x bytes) are the lever: R1 |
-| I-3 | Which reranker configuration minimizes p50 without a significant hit@3/MRR loss? | R1 grid + R3 vote + R4 model, via E3 | p50 `reranking_ms`, hit@3, MRR with CI | cheapest cell within the CI of the best |
+| I-3 | Which reranker configuration minimizes p50 without a significant hit@3/MRR loss? | R1 window + R3 vote/margin + R6 gate by E7 replay on E0 dumps; R4 model and R5 instruction live, after R1 | p50 `reranking_ms` (live, cost model 0.4 s + tokens/290), hit@3, MRR with CI | cheapest cell within the CI of the best |
 | I-4 | Does the 4B reranker add anything over the 4B embedder on this corpus? | E3 reranker on/off, per stratum | nDCG@10, MRR, hit@1 | Answered for the whole set (2026-10-10, R0 + L2): yes on the mined set (reranked vs fusion after L2: hit@1 0.743 vs 0.657, MRR 0.808 vs 0.746, nDCG@10 0.624 vs 0.571; pre-L2 CI-less deltas +5.7 hit@1, +11.4 hit@3); on core it is within noise (one query up, one down). Open per stratum: keyword-agnostic n=8 is noise; the per-kind default question moves to F3 |
 | I-5 | Does the 0.004 prior help or hurt per query kind? | F1 sweep per stratum | hit@3, disfavored-before-expected | per-kind value via F3 or a single lower constant |
 | I-6 | Does evaluating mined queries at HEAD (not the parent commit) bias results? | For 50 mined commits, create a `git worktree` at the parent, index into a disposable data dir, compare | delta in hit@3/MRR vs HEAD evaluation | if bias > 0.05 absolute, extend E2 with a `--at-parent` mode |
