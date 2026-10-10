@@ -76,7 +76,6 @@ Items removed by a triage pass (see the autonomous-improvement skill), with the 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
-- L2 (2026-10-10): rarity-weighted lexical terms, identifier splitting, IDF chunk scores; plan in the session scratchpad (`plan-l2.md`).
 
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
@@ -296,13 +295,13 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | --- | --- | --- | --- | --- |
 | L0 | Engine-independent lexical fixes (no canonicalize per line, interval mapping, scanner-aligned rg flags, timeout) | ready | S | - |
 | L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research | M | E2, E3 |
-| L2 | IDF weighting and identifier splitting in the existing `rg` channel | in-progress (2026-10-10) | S | E3 |
+| L2 | IDF weighting and identifier splitting in the existing `rg` channel | done (2031ffe: BM25 over rare terms; production search p50 34 -> 17.5 s) | S | E3 |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` | ready | S | E3 |
 | L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) | blocked(L1 decision) | L (split) | L1, L2 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | ready (after L2; E3 arms show channel weights matter) | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | ready, NEXT ranking item (re-run E3 arms first: lexical changed in L2) | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
@@ -331,12 +330,13 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Accept: a results table and the decision written into L4's entry (and into Investigations I-1); spike code either deleted or kept behind the feature flag with a comment.
 
 ### L2 - IDF weighting and identifier splitting in the `rg` channel
-`ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
+`done` (2031ffe, 2026-10-10) - S - deps: E3 - skill: `lci-retrieval-evaluation`
 - Why: cheap, engine-independent improvement (Windsurf weights terms by rarity https://devin.ai/blog/remote-indexing-multirepo-announcement; splitting identifiers cuts code vocabulary 7-10x https://arxiv.org/pdf/1904.01873). `lexical::terms` keeps <= 12 lowercase whole tokens and never splits `parseConfig` into `parse`/`config`.
 - Scope: `lci-core/src/lexical.rs`: `terms()` emits sub-tokens of camelCase/snake_case identifiers plus the original (original first, cap stays 12); `src/app/search.rs::map_lexical_matches`: per-term document frequency = files with >= 1 match (from `rg --json` paths), `idf = ln((N - df + 0.5)/(df + 0.5) + 1)` with N = indexed file count, chunk score = sum over matched terms of `idf * (1 + ln(matches_in_chunk))`; new `lexical_score: Option<f32>` on `Hit` (`lexical_match_count` kept). To know which term matched which line, run one `rg` per term group or parse `submatches` from the JSON event (preferred, already in the output).
 - Accept: unit tests for splitting and scoring; `cargo xtask test --suite Indexing`; live E3 lexical-only comparison on `core.toml` + mined set; accept on non-regression of hit@3/MRR and improved lexical-only nDCG.
 - Risk: keep `rg`'s `--fixed-strings`; sub-tokens shorter than 3 chars are dropped (existing rule).
 
+- Result (2031ffe; frozen base b78754f vs new, same index; `compare` 95% paired-bootstrap CIs; `test-results/l2-*`): grep-only mined MRR 0.389 -> 0.749 [+0.21, +0.50] and hit@1 0.229 -> 0.629; grep-only core nDCG@10 +0.18 (significant); fusion (reranker off) mined MRR +0.040 (n.s.), core one query 1 -> 2; production reranked mined vs `r0-mined-rerank-on`: MRR -0.006, nDCG@10 +0.018, hit@1 equal (all n.s.), with reranking p50 32.7 -> 16.8 s and total p50 34.0 -> 17.5 s (shorter, focused chunks reach the reranker); lexical p50 ~250 ms. A first variant (1+ln(tf), no length normalisation) regressed two core queries (long test/xtask chunks) and ran at ~520 ms p50; BM25 normalisation, the review's stop-list trim and the latency fixes were added in one continuation, so the mined set was consulted twice. Follow-ups: one hand-computed constant in the BM25 test; E3 arm table should be re-run with fusion now that lexical changed (F2 next).
 ### L3 - Anchor extraction for issue-like queries
 `ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
 - Why: "Reformulate, Retrieve, Localize" improved first-file ranking 35% by pulling identifiers/snippets out of bug reports before lexical retrieval (https://arxiv.org/abs/2512.07022); LLM rewriting hurts because it drops anchors (CORE-Bench https://arxiv.org/abs/2606.11864); "dense expands, sparse anchors" (https://arxiv.org/abs/2608.15851). LCI must not call an LLM, so the extractor is deterministic. zvec-grep lets the agent pass its own `fts` keyword list (https://github.com/zvec-ai/zvec-grep).
