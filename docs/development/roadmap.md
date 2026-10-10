@@ -170,7 +170,6 @@ starts; remove it when the slice is committed.
     - R3: vote weight 1.0 / 2.0 vs replace: mined MRR -0.013 / +0.006, nDCG@10 -0.026 / -0.024 (n.s., W/L/T 8/8 and 8/7): no gain, not adopted.
     - The earlier W40-dump comparisons against B are void (B refused 11/35 mined, 10/11 core there).
   - Caveat: the dumps predate E2b's mine.rs leakage fix; arms share the dump, so relative comparisons hold, but absolute metrics include the leakage. Re-dump after E2b.
-- V5 (in-progress 2026-10-10, owner-directed): production reranker on llama.cpp ROCm; gate pre-registered in its section (dump64 on llama.cpp, replay B vs the vLLM dump64 B).
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
@@ -217,7 +216,7 @@ R5, S5, R4, C1.
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
 | V3 | In-process llama.cpp (`llama-cpp-2`, ROCm or Vulkan) behind an `http` / `in-process` backend switch | blocked(R1: decide once the rerank window is set; V1 measured the serving ceiling at ~1.3x) | M | V1, R1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
-| V5 | Production reranker on llama.cpp ROCm (port 8767), embedder stays on vLLM | in-progress (2026-10-10, owner-directed) | S | V1 |
+| V5 | Production reranker on llama.cpp ROCm (port 8767), embedder stays on vLLM | done (2026-10-10: kept; quality equal or better, 1.33x at window 24 without unified KV) | S | V1 |
 | V6 | Code-tuned 4B reranker `hq-bench/coreb-code-reranker` (Apache-2.0, merged LoRA of Qwen3-Reranker-4B) as a drop-in | ready (download started 2026-10-10 under the owner's model approval, size cap lifted) | S | V5 |
 | V7 | NPU vs iGPU contention: does an NPU load slow iGPU reranking (and the reverse) on this 4-30 W handheld? | ready (owner question 2026-10-10) | S | V5 |
 | E0 | Dump every channel candidate, the fused/capped order and every reranker score, for offline replay | done (5c6a7ef dump; replay in E7) | S | E2b preferred |
@@ -292,10 +291,18 @@ R5, S5, R4, C1.
 - Scope: behind the V3 backend switch (or standalone if V3 is rejected); parity vs the HF fp32 model (Spearman >= 0.99, same top 3), then an E3 comparison.
 
 ### V5 - Production reranker on llama.cpp (owner-directed)
-`in-progress (2026-10-10)` - S, live, config-only - deps: V1 (done) - skill: `lci-retrieval-evaluation`
+`done` (2026-10-10, kept) - S, live, config-only - deps: V1 (done) - skill: `lci-retrieval-evaluation`
 - Why: the owner asked (2026-10-10) to run each model on its faster server. V1 measured llama.cpp ROCm 1.33x faster than vLLM for the 4B reranker and slower for the embedder, and left one question open: llama.cpp's scores are much sharper (irrelevant ~0.0001 vs vLLM ~0.07-0.20) while the top 3 agree. An `evaluate` run against it settles whether that matters.
 - Scope: no code. Serving lives outside the repo in `C:\Users\micro\lci-serving` (`start-reranker-8767.cmd`: lemonade-sdk b1342 ROCm build, V1's converted Qwen3-Reranker-4B Q8_0 with LCI's code instruction, `--rerank --alias qwen3-reranker-4b -ngl 99 -fa on -c 24576 --parallel 8 --kv-unified -b 4096 -ub 4096`, bound to 127.0.0.1:8767). The WSL vLLM reranker from `vllm.txt` is stopped; the embedder stays on vLLM 8766.
 - Gate (pre-registered 2026-10-10 before any run): dump mined and core at window 64 / cap 0 / plain weights with the same frozen 6d4110f binary and config as `e0-{mined,core}-dump64.json` (the vLLM dumps), then replay B (window 24, cap 2 shortlist, replace) on both and `compare` vLLM-B vs llama-B. Keep llama.cpp if the mined MRR and nDCG@10 CIs contain 0 or improve, no core query loses its first expected rank, and measured reranking p50 at window 64 is lower than vLLM's (mined 52.1 s in `e0-mined-dump64.json`; the 33.8 s first written here was the window-40 dump, corrected before any llama.cpp result existed). Report per-arm LSP coverage and how many queries have identical top-24 shortlists in both dumps (differences outside the shortlist are not the reranker's doing). On a fail, restore the vLLM reranker and report to the owner. Also replay window 12 on the llama dump under E7's R1 rule.
+
+- RESULT (2026-10-10; dumps `test-results/v5-{mined,core}-dump64-llama.json`, replays and compares in the session scratchpad `v5/`):
+  - Quality, replay B (window 24, cap 2) llama.cpp vs vLLM: mined MRR +0.105 [+0.036, +0.189], nDCG@10 +0.054 [+0.017, +0.101], hit@1 +0.143, all significant, W/L/T 7/0/28; positive on both halves (even nDCG@10 +0.048 significant, odd MRR +0.124 and nDCG@10 +0.059 significant). Core MRR +0.061 (n.s.), W/L/T 2/1/8; no core query lost a first rank (the one loss moved from rank 3 to 4).
+  - Confound: files changed during the run (M1 edits and roadmap commits), so 8 mined queries refreshed the index (2 in the vLLM run) and only 20/35 mined and 3/11 core queries had identical top-24 fused pools. On identical pools only (pure reranker effect): mined W/L/T 2/0/18, core 0/1/2. Lesson recorded in the evaluation workflow: freeze the evaluated tree.
+  - Latency: the run used `--kv-unified`, which is 11% slower (V1 payload 52.2 s), and window-64 reranking p50 came out mined 56.0 vs 52.1 s, core 48.7 vs 51.7 s, so the pre-registered window-64 latency check failed for that configuration. Without unified KV (`-c 32768 --parallel 8 --no-kv-unified`, 4096 tokens per slot) the V1 payload takes 47.1 s vs vLLM's 62.8 s (1.33x, V1 reproduced, scores identical, Spearman 1.000). To be confirmed in situ by V6's live window-24 baseline arm.
+  - RAM: llama-server holds 8.4 GB idle and 11.7 GB after a 24-document rerank, not less than the vLLM reranker (~8.5 GB of `vmmemWSL`); its default 8 GB host prompt cache (`--cache-ram`) grew it to 19 GB within 10 minutes and is now off. V1's "~4 GB less RAM" did not hold.
+  - R1 on llama.cpp scores, window 12 vs 24: mined MRR +0.021, nDCG@10 -0.029 [-0.064, +0.001] (n.s.), core identical (0/0/11); but the even (selection) half shows nDCG@10 -0.046, significant. Window 12 stays unadopted until the live confirm.
+  - Decision: keep llama.cpp on 8767 (owner-directed; quality equal or better, faster at the production window). Start script `C:\Users\micro\lci-serving\start-reranker-8767.cmd`.
 
 ### V6 - Code-tuned 4B reranker (CoREB)
 `ready` - S, live - deps: V5 - skill: `lci-retrieval-evaluation`
@@ -496,7 +503,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | F2 | Weighted RRF per channel, per-file cap (definition boost split off as F2d) | done (F2a weights 8f56647, default 2.0 reverted to 1.0 in bb6589d after exact replay; F2b cap 2 default 92a7060, confirmed by replay) | M | E3 |
 | F2d | Definition boost in fusion (LSP symbol kinds now; C1 `kind` later) | proposed (new 2026-10-10) | S | E7, C1 preferred |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(L3, R2, E6) | M | L3, R2, E6 |
-| M1 | Configurable embedding query and document templates (extended 2026-10-10 for new embedders) | in-progress (2026-10-10) | S | E3 |
+| M1 | Configurable embedding query and document templates (extended 2026-10-10 for new embedders) | done (2026-10-10, mechanism; the instruction experiments stay open) | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
 | S1 | Per-file incremental table writes (delete + add or `merge_insert`), lancedb bump | ready | M | - |
 | S2 | `optimize()` / version cleanup and `gc` for orphaned workspaces and manifests | ready | M | S1 preferred |
@@ -608,7 +615,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: presets must default to current behaviour so the change is opt-in until measured.
 
 ### M1 - Configurable, task-specific query instructions
-`in-progress (2026-10-10)`, extended: also an `embedding_document_template` (`{path}`, `{code}`), because EmbeddingGemma 2 and bge-code-v1 (M6) need document and query formats LCI cannot express; a non-default document template changes `embedding_identity` (re-embed), the default keeps today's identity - S - deps: E3 - skill: `lci-retrieval-evaluation`
+`done` (2026-10-10, mechanism: `embedding_query_template` and `embedding_document_template`; the live instruction comparison in Accept is still open), extended: also an `embedding_document_template` (`{path}`, `{code}`), because new embedders (bge-code-v1 in M6, and models with title/text document formats) need query and document formats LCI cannot express; a non-default document template changes `embedding_identity` (re-embed), the default keeps today's identity - S - deps: E3 - skill: `lci-retrieval-evaluation`
 - Why: the Qwen3-Embedding card reports a 1-5% retrieval loss without a query instruction and recommends task-specific English instructions (https://huggingface.co/Qwen/Qwen3-Embedding-4B). LCI has one hard-coded `QUERY_INSTRUCTION` (`lci-core/src/models.rs`).
 - Scope: `query_instruction: String` (default = current text) in config; optional per-kind overrides consumed by F3 later; documents never get an instruction (unchanged). README step 6.
 - Accept: unit test of the formatted query; live E3 with two candidate instructions ("Given a bug report or feature request, retrieve the code that must be changed" for issue-like; "Given an identifier or API name, retrieve its definition and usages" for identifiers) on the mined strata.
@@ -790,7 +797,7 @@ acceptance criteria before it is picked, and each needs the enlarged evaluation
 | X4 | Git-aware channels: `changes_since(ref)`, commit-message channel mapped to touched files | research | M | E2 |
 | M4 | Matryoshka dimension truncation (`embedding_dimensions`) and int8/binary storage with rescoring | research | M | E3 |
 | M5 | Research bets: Qwen3-Embedding-8B trial (approved 2026-10-10: the owner lifted the size cap; already cached; Q8_0/Q6_K GGUF ~8/6 GB to fit the 4B's RAM), LoRA fine-tune on the user's own commit pairs, late chunking | research (8B part ready) | L | E2 |
-| M6 | New embedder trials: EmbeddingGemma 2 (270M, Apache-2.0, 2026-09-14, multimodal), bge-code-v1 (1.5B, Apache-2.0), Qwen3-Embedding-8B and 0.6B as bounds; semantic-channel recall from fusion-only dumps first, reranked `evaluate` for survivors | ready (after M1) | M | M1, E0 |
+| M6 | New embedder trials: bge-code-v1 (1.5B, Apache-2.0), Qwen3-Embedding-8B and 0.6B as bounds (the owner declined the Gemma family on 2026-10-10, EmbeddingGemma 2 included, on its code scores); semantic-channel recall from fusion-only dumps first, reranked `evaluate` for survivors | ready (after M1) | M | M1, E0 |
 | A5 | Availability and safety extras: lexical results while the first index builds, secret redaction on returned text, agent-supplied `annotate` summaries keyed by chunk hash, optional bearer token on the loopback HTTP surface | research | M each | A1 |
 | P1 | Packaging: cargo-dist installers (shell, PowerShell, MSI, Homebrew) and `service install|uninstall|start|stop` via the `service-manager` crate | research | M + M | - |
 
@@ -814,6 +821,12 @@ From the new-niches explorer (25 ideas with value/effort guesstimates; full note
 - Top 8 by value per effort and fit: NI-15 "why this result" provenance and focus lines (S); NI-24 `find_similar` reuse-before-write over the existing vector index (S); NI-25 mask-and-measure evaluation strata for the semantic channel (S); NI-04 test-impact finder `find_tests` (M; precedent: predictive test selection); NI-16 anytime search: return fusion in ~0.4 s and refine with the reranker afterwards, plus a rerank cache (M); NI-23 relevance feedback mined from local agent transcripts (M, owner: transcript mining); NI-02 Unity PackageCache / engine-reference scope (trial S, no code); NI-09 git co-change channel (M, owner: reading git history; local check: an earlier-history co-change top-3 held a co-touched file 46% of the time).
 - Themes: A (conservative) "the fast, measured default" -- NI-16, NI-15, a context packer after A1, a session seen-set, NI-23/NI-25 evaluations; no boundary change. B (moderate) "change-aware retrieval" -- git history as a fail-open fourth signal (NI-09, commit-message expansion, NI-04, then a `review_context` tool). C (bold) "project-native intelligence, Unity first" -- GUID asset-reference table, package/engine scope, Unity queries mined from real sessions; go/no-go after a 2-day trial; alternative bold bet: transcript flywheel -> learned fusion -> distilled small reranker.
 - Owner decisions the themes need: reading git history; non-code families (assets, Markdown, SQL, notebooks) and the language acceptance bar for them; replacing "never tune on the mined set" with a train/test-by-repo protocol (for learned fusion); tool-surface growth; local transcript mining; a ~0.6 GB late-interaction model download (LateOn-Code; vendor claims unverified, LanceDB multivector support in Rust unverified).
+
+- NPU complements (owner question 2026-10-10; FastFlowLM serves Apache/MIT chat models such as Qwen3 0.6-8B, Qwen3.5, Phi-4-mini, gpt-oss-20b on the NPU; its embedding path is reported broken and it has no rerank path; all of these depend on V7 showing little NPU/iGPU contention):
+  - NPU-1 chunk enrichment at index time: a small LLM (`qwen3:1.7b`, ~2 s per chunk, ~70 min for this repo's first pass, then incremental) writes a one-to-two-sentence "what this code does" note per chunk for BM25 and/or the embedded text (contextual retrieval). Targets description-style queries with no shared keywords. Cheap probe first: notes for the mined queries' gold chunks and their competitors, added to the lexical channel offline, then replay. Effort M.
+  - NPU-2 query expansion for the lexical channel (likely identifiers/keywords), run in parallel with query embedding and LSP; +1-2 s per search unless fully overlapped. Effort S-M.
+  - NPU-3 query-type routing (identifier / description / bug report) as a 1-token prefill, to pick M1 query instructions, fusion weights or R6 reranker gating. Effort S; heuristics may match it.
+  - Ported models (a small cross-encoder cascade stage, a code embedder) stay parked: the owner said no porting yet. Guesstimate for porting Qwen3-Reranker-4B: 0.8-1.3x the iGPU at 30 W (perhaps 1.3-2x at 15 W), 3-5 days, ~40-50% success.
 
 ## Investigations (open questions, with how to answer them)
 
