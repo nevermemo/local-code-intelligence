@@ -87,9 +87,9 @@ impl Default for ChannelsConfig {
 /// Each channel contributes `weight / (rrf_k + rank)` for a chunk it returned,
 /// and a chunk several channels returned sums those contributions. The
 /// source-role prior is added afterwards and is never scaled by a weight.
-/// `semantic_weight` defaults to `2.0` and the other two to `1.0`; setting all
-/// three to `1.0` (`FusionConfig::UNIT`) is plain unweighted RRF. `rrf_k` stays
-/// a top-level key.
+/// All three weights default to `1.0`, which is plain unweighted RRF;
+/// `FusionConfig::UNIT` is those weights with no per-file cap. `rrf_k` stays a
+/// top-level key.
 ///
 /// A weight must be finite and greater than zero. Turning a channel off is the
 /// job of `[channels]` (which also skips the channel's work); a zero weight
@@ -131,8 +131,8 @@ impl FusionConfig {
     pub const MAX_CHUNKS_PER_FILE_LIMIT: u32 = 100;
 
     /// Plain unweighted RRF: every channel weighs `1.0`, and no per-file cap
-    /// (`max_chunks_per_file = 0`). This is not the default: the default
-    /// weighs the semantic channel `2.0` and caps a file at two chunks.
+    /// (`max_chunks_per_file = 0`). This is not the default: the default has
+    /// the same weights but caps a file at two chunks.
     pub const UNIT: Self = Self {
         semantic_weight: 1.0,
         lexical_weight: 1.0,
@@ -142,13 +142,13 @@ impl FusionConfig {
 }
 
 impl Default for FusionConfig {
-    /// `semantic_weight = 2.0` (roadmap F2a: fusion-only mined-set MRR +0.059,
-    /// CI [+0.012, +0.118], held-out halves agree, core ranks unchanged,
-    /// reranked confirm n.s.); lexical and LSP stay at `1.0`.
-    /// `max_chunks_per_file = 2` (roadmap F2b, see the field).
+    /// Plain RRF weights (all `1.0`) with a two-chunk file cap
+    /// (`max_chunks_per_file = 2`, roadmap F2b, see the field). A semantic
+    /// weight of `2.0` was the default for a while (roadmap F2a); the flip was
+    /// reverted after an exact offline replay with the LSP channel present
+    /// found no significant effect, so plain RRF is the simpler default.
     fn default() -> Self {
         Self {
-            semantic_weight: 2.0,
             max_chunks_per_file: 2,
             ..Self::UNIT
         }
@@ -219,9 +219,8 @@ pub struct Config {
     pub index: IndexConfig,
     /// Query-time channel and reranker switches; all enabled by default.
     pub channels: ChannelsConfig,
-    /// Per-channel Reciprocal Rank Fusion weights; `semantic_weight = 2.0`,
-    /// `lexical_weight = lsp_weight = 1.0` by default (all `1.0` is plain RRF).
-    /// Also `max_chunks_per_file` (default `2`; `0` is unlimited).
+    /// Per-channel Reciprocal Rank Fusion weights; all `1.0` (plain RRF) by
+    /// default. Also `max_chunks_per_file` (default `2`; `0` is unlimited).
     pub fusion: FusionConfig,
 }
 
@@ -1020,16 +1019,16 @@ mod tests {
     }
 
     #[test]
-    fn fusion_defaults_to_semantic_weight_two_and_a_two_chunk_file_cap() {
+    fn fusion_defaults_to_plain_rrf_weights_and_a_two_chunk_file_cap() {
         let expected = FusionConfig {
-            semantic_weight: 2.0,
+            semantic_weight: 1.0,
             lexical_weight: 1.0,
             lsp_weight: 1.0,
             max_chunks_per_file: 2,
         };
         // The default, a file without the section, and an empty section all
-        // mean semantic_weight 2.0 with lexical and LSP at 1.0, and at most
-        // two chunks of one file ahead of the other files.
+        // mean plain RRF weights (every channel at 1.0), and at most two
+        // chunks of one file ahead of the other files.
         let config = Config::default();
         config.validate().unwrap();
         assert_eq!(config.fusion, expected);
@@ -1041,42 +1040,44 @@ mod tests {
         empty.validate().unwrap();
         assert_eq!(empty.fusion, expected);
 
-        // Plain unweighted RRF with no file cap (`UNIT`) is two explicit lines
-        // away, and is not the default; each line alone changes only its own
-        // setting.
+        // Plain unweighted RRF with no file cap (`UNIT`) differs from the
+        // default only in the cap, so it is one explicit line away. Naming the
+        // default weight changes nothing, and weighting the semantic channel
+        // 2x (the briefly shipped F2a default) is an explicit opt-in that
+        // leaves the cap alone.
         assert_ne!(FusionConfig::default(), FusionConfig::UNIT);
-        assert_eq!(FusionConfig::UNIT.max_chunks_per_file, 0);
-        let plain: Config = toml::from_str(&format!(
-            "{}[fusion]\nsemantic_weight = 1.0\nmax_chunks_per_file = 0\n",
-            base_toml()
-        ))
-        .unwrap();
-        plain.validate().unwrap();
-        assert_eq!(plain.fusion, FusionConfig::UNIT);
-        let unweighted: Config =
-            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.0\n", base_toml())).unwrap();
         assert_eq!(
-            unweighted.fusion,
+            FusionConfig::default(),
             FusionConfig {
                 max_chunks_per_file: 2,
                 ..FusionConfig::UNIT
             }
         );
-        let uncapped: Config = toml::from_str(&format!(
+        assert_eq!(FusionConfig::UNIT.max_chunks_per_file, 0);
+        let plain: Config = toml::from_str(&format!(
             "{}[fusion]\nmax_chunks_per_file = 0\n",
             base_toml()
         ))
         .unwrap();
+        plain.validate().unwrap();
+        assert_eq!(plain.fusion, FusionConfig::UNIT);
+        let named: Config =
+            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.0\n", base_toml())).unwrap();
+        named.validate().unwrap();
+        assert_eq!(named.fusion, expected);
+        let semantic_two: Config =
+            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 2.0\n", base_toml())).unwrap();
+        semantic_two.validate().unwrap();
         assert_eq!(
-            uncapped.fusion,
+            semantic_two.fusion,
             FusionConfig {
-                max_chunks_per_file: 0,
+                semantic_weight: 2.0,
                 ..expected
             }
         );
 
         // A section overrides only the weights it names; the rest keep their
-        // defaults, including the semantic weight of 2.0.
+        // defaults, including the cap of two.
         let partial: Config =
             toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.5\n", base_toml())).unwrap();
         partial.validate().unwrap();

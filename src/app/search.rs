@@ -1029,9 +1029,10 @@ impl App {
     /// Fusion, keyed by file path, start line, and content hash so the same
     /// chunk reached through multiple channels contributes once with a summed
     /// score. A channel contributes `weight / (rrf_k + rank)`; weights of
-    /// `1.0` (`FusionConfig::UNIT`) are plain RRF, and the configured default
-    /// doubles the semantic term. The source-role prior is added last and is
-    /// never scaled by a weight. The result is in no particular order.
+    /// `1.0` are plain RRF, which is the configured default (the default's
+    /// per-file cap is applied later and does not enter the score). The
+    /// source-role prior is added last and is never scaled by a weight. The
+    /// result is in no particular order.
     fn fuse_hits(
         rrf_k: f32,
         weights: &FusionConfig,
@@ -1340,10 +1341,31 @@ mod tests {
                 );
             }
 
-            // The default is not plain RRF: it doubles only the semantic term
-            // (semantic-only b.rs) and leaves a lexical-only chunk (c.rs)
-            // exactly as plain RRF scores it.
-            let weighted = fuse(rrf_k, &FusionConfig::default(), &rows);
+            // The default weights are plain RRF too, so the default scores
+            // every chunk bit for bit as `UNIT` does (its file cap acts after
+            // fusion and does not enter the score).
+            let by_default = fuse(rrf_k, &FusionConfig::default(), &rows);
+            assert_eq!(paths(&by_default), paths(&fused), "rrf_k {rrf_k}");
+            for (a, b) in by_default.iter().zip(&fused) {
+                assert_eq!(
+                    a.fusion_score.to_bits(),
+                    b.fusion_score.to_bits(),
+                    "{} at rrf_k {rrf_k}",
+                    a.chunk.relative_file_path
+                );
+            }
+
+            // Weighting the semantic channel 2x is an explicit choice: it
+            // doubles only the semantic term (semantic-only b.rs) and leaves a
+            // lexical-only chunk (c.rs) exactly as plain RRF scores it.
+            let weighted = fuse(
+                rrf_k,
+                &FusionConfig {
+                    semantic_weight: 2.0,
+                    ..FusionConfig::UNIT
+                },
+                &rows,
+            );
             assert_eq!(
                 by_path(&weighted, "b.rs").fusion_score.to_bits(),
                 expected_score(rrf_k, &[(2.0, 2)], source_role_prior(Source)).to_bits(),
@@ -1381,10 +1403,11 @@ mod tests {
             &rows,
         );
         assert_eq!(paths(&doubled), ["z.rs", "x.rs", "y.rs"]);
-        // semantic_weight = 2.0 with the other two at 1.0 is the default.
+        // Doubling is an explicit choice: the default weights are plain RRF
+        // and fuse exactly as `unit` does.
         let by_default = fuse(RRF_K, &FusionConfig::default(), &rows);
-        assert_eq!(paths(&by_default), paths(&doubled));
-        for (a, b) in by_default.iter().zip(&doubled) {
+        assert_eq!(paths(&by_default), paths(&unit));
+        for (a, b) in by_default.iter().zip(&unit) {
             assert_eq!(a.fusion_score.to_bits(), b.fusion_score.to_bits());
         }
 

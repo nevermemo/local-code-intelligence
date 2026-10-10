@@ -1772,7 +1772,8 @@ const D1: Spec = spec("d.rs", 1, None, Some(4), SourceRole::Test, 0.1, 600);
 /// Deliberately not in fused order: the builder sorts.
 const SIX: [Spec; 6] = [D1, A40, B1, A1, C1, A20];
 
-/// The arm of a dump with the default weights and a 1 KiB document budget.
+/// The arm of a dump with a semantic weight of 2.0 (not the default, so a
+/// replay override of it is visible) and a 1 KiB document budget.
 fn dump_arm(window: usize, k: usize, cap: u32, mode: RerankMode) -> CandidateArm {
     CandidateArm {
         rrf_k: 60.0,
