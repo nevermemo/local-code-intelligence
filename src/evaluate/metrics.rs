@@ -544,12 +544,14 @@ fn mean_metric(executed: &[&QueryReport], value: impl Fn(&QueryMetrics) -> f64) 
     })
 }
 
-/// Median and nearest-rank p95 of a non-empty series.
+/// Median, nearest-rank p95, maximum and sample count of a non-empty series.
 fn latency_percentiles(values: impl Iterator<Item = f64>) -> LatencyPercentiles {
     let values: Vec<f64> = values.collect();
     LatencyPercentiles {
         p50: median(&values),
         p95: percentile(&values, 0.95),
+        max: values.iter().copied().fold(f64::MIN, f64::max),
+        n: values.len(),
     }
 }
 

@@ -836,14 +836,14 @@ fn refreshed_incrementally_is_counted_so_lifecycle_counts_sum_to_executed() {
 fn stage_latency_percentiles_on_a_known_set() {
     // Four queries; each stage gets its own series so a mixed-up field would
     // show. Sorted series and the expected statistics (median, nearest-rank
-    // p95 = 4th value):
-    //   embedding  10 20 30 40       p50 25   p95 40
-    //   lancedb     1  2  3  5       p50 2.5  p95 5
-    //   lexical     7  7  7  9       p50 7    p95 9
-    //   lsp         0  0  0  0       p50 0    p95 0
-    //   fusion      4  6  8 12       p50 7    p95 12
-    //   reranking 100 200 300 400    p50 250  p95 400
-    //   total     150 250 350 500    p50 300  p95 500
+    // p95 = 4th value, max = 4th value, n = 4):
+    //   embedding  10 20 30 40       p50 25   p95 40   max 40
+    //   lancedb     1  2  3  5       p50 2.5  p95 5    max 5
+    //   lexical     7  7  7  9       p50 7    p95 9    max 9
+    //   lsp         0  0  0  0       p50 0    p95 0    max 0
+    //   fusion      4  6  8 12       p50 7    p95 12   max 12
+    //   reranking 100 200 300 400    p50 250  p95 400  max 400
+    //   total     150 250 350 500    p50 300  p95 500  max 500
     let series = [
         (30.0, 5.0, 7.0, 0.0, 8.0, 400.0, 500.0),
         (10.0, 1.0, 7.0, 0.0, 4.0, 100.0, 150.0),
@@ -875,17 +875,19 @@ fn stage_latency_percentiles_on_a_known_set() {
         .collect();
     let report = aggregate(&reports);
     let stages = report.stage_latency.expect("stage latency");
-    let check = |stage: LatencyPercentiles, p50: f64, p95: f64| {
+    let check = |stage: LatencyPercentiles, p50: f64, p95: f64, max: f64| {
         assert_close(stage.p50, p50);
         assert_close(stage.p95, p95);
+        assert_close(stage.max, max);
+        assert_eq!(stage.n, 4);
     };
-    check(stages.query_embedding_ms, 25.0, 40.0);
-    check(stages.lancedb_search_ms, 2.5, 5.0);
-    check(stages.lexical_search_ms, 7.0, 9.0);
-    check(stages.lsp_search_ms, 0.0, 0.0);
-    check(stages.fusion_ms, 7.0, 12.0);
-    check(stages.reranking_ms, 250.0, 400.0);
-    check(stages.total_ms, 300.0, 500.0);
+    check(stages.query_embedding_ms, 25.0, 40.0, 40.0);
+    check(stages.lancedb_search_ms, 2.5, 5.0, 5.0);
+    check(stages.lexical_search_ms, 7.0, 9.0, 9.0);
+    check(stages.lsp_search_ms, 0.0, 0.0, 0.0);
+    check(stages.fusion_ms, 7.0, 12.0, 12.0);
+    check(stages.reranking_ms, 250.0, 400.0, 400.0);
+    check(stages.total_ms, 300.0, 500.0, 500.0);
     // The total stage uses the same statistics as the existing fields.
     assert_eq!(report.median_latency_ms, Some(stages.total_ms.p50));
     assert_eq!(report.p95_latency_ms, Some(stages.total_ms.p95));
@@ -903,6 +905,64 @@ fn stage_latency_percentiles_on_a_known_set() {
     );
     assert_eq!(aggregate(&[no_timings]).stage_latency, None);
     assert_eq!(aggregate(&[]).stage_latency, None);
+}
+
+fn timed_report(stage_timings: EvalTimings) -> QueryReport {
+    QueryReport::new(
+        query_with(&["src/missing.rs"]),
+        Vec::new(),
+        false,
+        None,
+        None,
+        Some(stage_timings),
+        None,
+        None,
+    )
+}
+
+#[test]
+fn max_latency_shows_the_outlier_that_nearest_rank_p95_hides() {
+    // 25 queries: 24 at 100 ms and one 30 s outlier. Nearest-rank p95 is rank
+    // ceil(0.95 * 25) = ceil(23.75) = 24, the last 100, so only `max` sees it.
+    let mut reports: Vec<QueryReport> = (0..24).map(|_| timed_report(timings(100.0))).collect();
+    reports.push(timed_report(timings(30_000.0)));
+    let report = aggregate(&reports);
+
+    let total = report.stage_latency.expect("stage latency").total_ms;
+    assert_close(total.p50, 100.0);
+    assert_close(total.p95, 100.0);
+    assert_close(total.max, 30_000.0);
+    assert_eq!(total.n, 25);
+    assert_eq!(report.p95_latency_ms, Some(100.0));
+
+    // A stage that never varies still reports its own max and n.
+    let fusion = report.stage_latency.expect("stage latency").fusion_ms;
+    assert_close(fusion.max, 0.0);
+    assert_eq!(fusion.n, 25);
+}
+
+#[test]
+fn stage_latency_written_before_max_and_n_still_loads_with_zeros() {
+    let report = aggregate(&[
+        timed_report(timings(10.0)),
+        timed_report(timings(30.0)),
+        timed_report(timings(20.0)),
+    ]);
+    let mut value = serde_json::to_value(&report).unwrap();
+    let stages = value["stage_latency"].as_object_mut().unwrap();
+    assert_eq!(stages.len(), 7);
+    for stage in stages.values_mut() {
+        let stage = stage.as_object_mut().unwrap();
+        assert!(stage.remove("max").is_some(), "max is serialized");
+        assert!(stage.remove("n").is_some(), "n is serialized");
+    }
+
+    let back: AggregateReport = serde_json::from_value(value).unwrap();
+    let total = back.stage_latency.expect("stage latency").total_ms;
+    assert_close(total.p50, 20.0);
+    assert_close(total.p95, 30.0);
+    assert_eq!((total.max, total.n), (0.0, 0));
+    assert_eq!(back.median_latency_ms, Some(20.0));
 }
 
 #[test]
@@ -1317,21 +1377,46 @@ fn a_known_shift_gives_the_hand_computed_deltas_and_win_loss_tie_counts() {
 
 #[test]
 fn a_consistent_improvement_is_significant_and_a_consistent_loss_is_too() {
+    // Eight different positive gains (sum 0.68, mean 0.085) over baseline
+    // reciprocal ranks 0.0, 0.1, ... 0.7, so the highest candidate is 0.85. The
+    // bootstrap interval is therefore not a point: it is a percentile interval
+    // of resampled means, each of which lies in [0.03, 0.15] (the smallest and
+    // largest gain), so `ci_low > 0` is guaranteed while the interval still has
+    // width and brackets the mean.
+    let gains = [0.03, 0.05, 0.08, 0.10, 0.12, 0.06, 0.09, 0.15];
     let baseline: Vec<QueryReport> = (0..8)
-        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index)))
+        .map(|index| rr_only(&format!("q{index}"), 0.1 * f64::from(index)))
         .collect();
-    let better: Vec<QueryReport> = (0..8)
-        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index) + 0.0625))
+    let better: Vec<QueryReport> = gains
+        .iter()
+        .enumerate()
+        .map(|(index, gain)| rr_only(&format!("q{index}"), 0.1 * index as f64 + gain))
         .collect();
 
     let up = default_compare(&baseline, &better).overall.unwrap();
     assert_eq!((up.wins, up.losses, up.ties), (8, 0, 0));
-    assert!(up.mrr.ci_low > 0.0, "{:?}", up.mrr);
+    assert_close(up.mrr.mean_delta, 0.085);
+    assert!(
+        0.03 <= up.mrr.ci_low
+            && up.mrr.ci_low < up.mrr.mean_delta
+            && up.mrr.mean_delta < up.mrr.ci_high
+            && up.mrr.ci_high <= 0.15,
+        "{:?}",
+        up.mrr
+    );
     assert!(up.mrr.significant);
 
     let down = default_compare(&better, &baseline).overall.unwrap();
     assert_eq!((down.wins, down.losses, down.ties), (0, 8, 0));
-    assert!(down.mrr.ci_high < 0.0, "{:?}", down.mrr);
+    assert_close(down.mrr.mean_delta, -0.085);
+    assert!(
+        -0.15 <= down.mrr.ci_low
+            && down.mrr.ci_low < down.mrr.mean_delta
+            && down.mrr.mean_delta < down.mrr.ci_high
+            && down.mrr.ci_high <= -0.03,
+        "{:?}",
+        down.mrr
+    );
     assert!(down.mrr.significant);
 }
 

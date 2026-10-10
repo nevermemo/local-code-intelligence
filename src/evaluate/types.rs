@@ -373,14 +373,23 @@ impl QueryReport {
 // Aggregate report
 // ---------------------------------------------------------------------------
 
-/// Median and nearest-rank 95th percentile of one latency series, in
-/// milliseconds.
+/// Median, nearest-rank 95th percentile, maximum and sample count of one
+/// latency series, in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LatencyPercentiles {
     /// Median (mean of the two middle values for even sample counts).
     pub p50: f64,
-    /// Nearest-rank 95th percentile.
+    /// Nearest-rank 95th percentile. Below 20 samples this is the maximum
+    /// itself and for 20 to 39 it is the second-highest value, so a single
+    /// outlier can hide; read `max` for the worst query.
     pub p95: f64,
+    /// Largest sample. Reports written before this field existed load as 0.
+    #[serde(default)]
+    pub max: f64,
+    /// Number of samples (queries with timings). Reports written before this
+    /// field existed load as 0.
+    #[serde(default)]
+    pub n: usize,
 }
 
 /// [`LatencyPercentiles`] for every [`EvalTimings`] field; each key mirrors
@@ -462,9 +471,9 @@ pub struct AggregateReport {
     /// 95th percentile (nearest-rank) total latency in milliseconds;
     /// `None` when there are no samples.
     pub p95_latency_ms: Option<f64>,
-    /// Per-stage p50/p95 latency over evaluated queries with timings, using
-    /// the same median and nearest-rank percentile as the total-latency
-    /// fields; `None` when there are no samples.
+    /// Per-stage p50/p95/max latency and sample count over evaluated queries
+    /// with timings, using the same median and nearest-rank percentile as
+    /// the total-latency fields; `None` when there are no samples.
     #[serde(default)]
     pub stage_latency: Option<StageLatency>,
     /// Evaluated queries whose report carried a warning (degraded

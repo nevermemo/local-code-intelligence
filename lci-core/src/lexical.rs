@@ -953,6 +953,19 @@ mod tests {
         assert!((scored[1].score - idf).abs() < 1e-9);
         assert!(scored[0].score > scored[1].score && scored[0].score < 3.0 * scored[1].score);
         assert_eq!(scored[0].credited_lines, 3);
+        // Hand-computed: idf = ln 3.6 = 1.280934, and at average length the
+        // length norm is 1, so 3 lines score 1.280934 * 3 * 2.2 / (3 + 1.2)
+        // = 2.0129 against 1.2809 for one line.
+        assert!(
+            (scored[0].score - 2.0129).abs() < 1e-4,
+            "{}",
+            scored[0].score
+        );
+        assert!(
+            (scored[1].score - 1.2809).abs() < 1e-4,
+            "{}",
+            scored[1].score
+        );
     }
 
     #[test]
@@ -970,6 +983,25 @@ mod tests {
         assert!((scored[0].score - bm25_term_score(idf, 2, 8.0, average)).abs() < 1e-9);
         assert!((scored[1].score - bm25_term_score(idf, 2, 400.0, average)).abs() < 1e-9);
         assert!(scored[0].score > scored[1].score);
+        // Hand-computed, independent of `bm25_term_score` (k1 = 1.2, b = 0.75):
+        // df 2 of 8 gives idf = ln(6.5 / 2.5 + 1) = ln 3.6 = 1.280934, and the
+        // average length is 648 / 8 = 81.
+        //   chunk 1: tf 2, length 8:  norm = 0.25 + 0.75 * 8 / 81   = 0.324074
+        //            1.280934 * 2 * 2.2 / (2 + 1.2 * 0.324074)      = 2.3593
+        //   chunk 0: tf 2, length 400: norm = 0.25 + 0.75 * 400 / 81 = 3.953704
+        //            1.280934 * 2 * 2.2 / (2 + 1.2 * 3.953704)      = 0.83567
+        assert!((idf - 1.280_934).abs() < 1e-6);
+        assert!((average - 81.0).abs() < 1e-12);
+        assert!(
+            (scored[0].score - 2.3593).abs() < 1e-4,
+            "{}",
+            scored[0].score
+        );
+        assert!(
+            (scored[1].score - 0.83567).abs() < 1e-4,
+            "{}",
+            scored[1].score
+        );
         // Equal lengths and counts score equally (ties go to the lower index).
         let even = score_chunks(1, 8, &[40; 8], &lines);
         assert!((even[0].score - even[1].score).abs() < 1e-12);
