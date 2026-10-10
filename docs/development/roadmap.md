@@ -319,6 +319,11 @@ R5, S5, R4, C1.
 
 - Channel ablation on the same frozen tree (2026-10-10, prompted by the grand-vision digest's "test whether the vector channel earns its place"): fusion only (exact replays of arm 0 with the reranker off), all channels mined MRR 0.781 / nDCG@10 0.583, core MRR 0.875; without vectors mined nDCG@10 -0.075 and core MRR -0.160 (both significant); without lexical or without LSP no significant change (core without LSP +0.080, n.s.). Reranked live without vectors: mined MRR -0.070 (CI [-0.153, 0.000]), W/L/T 1/5/29; core +0.063 (n.s.). The embedder is the channel LCI can least afford to lose, most of all on a no-reranker fast path.
 
+### M6 - New embedder trials
+`in-progress (2026-10-10)` - M - deps: M1 (done), E0 - skill: `lci-retrieval-evaluation`
+- Why: the embedder survey (`research_notes/explore-models-embedders.md`) found the field flat at the top; the owner asked whether an NPU-hosted small embedder is viable, and the channel ablation shows vectors matter most on the fast end. The 0.6B lower bound says how much a small embedder costs LCI end to end.
+- Pre-registered (2026-10-10, before running): Qwen3-Embedding-0.6B served by vLLM on 8766 with the `vllm.txt` flags (4B embedder stopped for the run, restored after; two-model rule kept), its own data_dir, the frozen tree indexed once, production retrieval settings, live reranked arm with `--dump-candidates`, then fusion-only replays. Compare with arm 0 (4B) both reranked and fusion-only. Report index time and RAM. Adoption as a default needs non-inferiority on mined and core with no core first-rank loss (as R4); otherwise it is recorded as the cost of a small embedder for the LCI-map design.
+
 ### V7 - NPU vs iGPU contention measurement
 `ready` (owner question 2026-10-10) - S, live, no code - deps: V5 - skill: `lci-retrieval-evaluation`
 - Why: the NPU is no faster than the iGPU for 4B models (V1 research), but running one model there could stop embedder and reranker from competing. On a handheld with one 4-30 W budget and shared LPDDR5X they may slow each other anyway; measure before porting anything.
@@ -808,7 +813,7 @@ acceptance criteria before it is picked, and each needs the enlarged evaluation
 | X4 | Git-aware channels: `changes_since(ref)`, commit-message channel mapped to touched files | research | M | E2 |
 | M4 | Matryoshka dimension truncation (`embedding_dimensions`) and int8/binary storage with rescoring | research | M | E3 |
 | M5 | Research bets: Qwen3-Embedding-8B trial (approved 2026-10-10: the owner lifted the size cap; already cached; Q8_0/Q6_K GGUF ~8/6 GB to fit the 4B's RAM), LoRA fine-tune on the user's own commit pairs, late chunking | research (8B part ready) | L | E2 |
-| M6 | New embedder trials: bge-code-v1 (1.5B, Apache-2.0), Qwen3-Embedding-8B and 0.6B as bounds (the owner declined the Gemma family on 2026-10-10, EmbeddingGemma 2 included, on its code scores); semantic-channel recall from fusion-only dumps first, reranked `evaluate` for survivors | ready (after M1) | M | M1, E0 |
+| M6 | New embedder trials: bge-code-v1 (1.5B, Apache-2.0), Qwen3-Embedding-8B and 0.6B as bounds (the owner declined the Gemma family on 2026-10-10, EmbeddingGemma 2 included, on its code scores); semantic-channel recall from fusion-only dumps first, reranked `evaluate` for survivors | in-progress (2026-10-10: 0.6B lower bound first) | M | M1, E0 |
 | A5 | Availability and safety extras: lexical results while the first index builds, secret redaction on returned text, agent-supplied `annotate` summaries keyed by chunk hash, optional bearer token on the loopback HTTP surface | research | M each | A1 |
 | P1 | Packaging: cargo-dist installers (shell, PowerShell, MSI, Homebrew) and `service install|uninstall|start|stop` via the `service-manager` crate | research | M + M | - |
 
