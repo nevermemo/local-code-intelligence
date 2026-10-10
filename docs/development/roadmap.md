@@ -67,10 +67,18 @@ before it is picked).
 | `438670d` | Cross-process index lock `<data_dir>/index.lock` (`lock_data_dir_for_indexing`) | Verified: CLI + server could commit one workspace concurrently. Live: CLI waited ~6 min for the server's 1224-chunk commit, then proceeded |
 | `fa0f262` | AGENTS.md/CLAUDE.md/skills rewritten for unattended runs; new `lci-autonomous-improvement` skill; AGENTS.md freshness drift fixed (closes H2's AGENTS part) | Owner's autonomous mandate |
 
+## Dropped
+
+Items removed by a triage pass (see the autonomous-improvement skill), with the reason. None yet.
+
 ## In progress
 
-Nothing. Mark an item `in-progress (<date>)` here and in its table row when
-a slice starts; remove it when the slice is committed.
+Mark an item `in-progress (<date>)` here and in its table row when a slice
+starts; remove it when the slice is committed.
+
+- R0 (2026-10-10): rerank-on/off evaluation of `evaluations/mined/self.toml`
+  running (`test-results/r0-mined-rerank-{on,off}.json`).
+- V1 (2026-10-10): files downloaded and converted; benchmarks run after R0.
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 (LSP document lifecycle) and H1 (Rust `tests.rs` role).
@@ -90,7 +98,9 @@ first.
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | R0 | Fusion-only baseline: does the reranker help at all on core.toml? | measured (needs E2 + owner decision) | S | - |
-| V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | needs-approval(downloads) | S | - |
+| V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | in-progress (2026-10-10) | S | - |
+| V3 | In-process llama.cpp (`llama-cpp-2`, Vulkan) behind an `http` / `in-process` backend switch | proposed (after V1) | M | V1 |
+| V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
@@ -113,11 +123,23 @@ first.
 - Result (2026-10-10, binary at `43d56d9`, same index, sequential runs; reports `test-results/core-eval-cap-4096.json` vs `test-results/r0-core-rerank-off.json`): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955; fusion-only hit@1 0.909 / hit@3 1.0 / MRR 0.939. Per query the reranker fixed one (readiness: fusion rank 3 -> 1) and broke one (language registry: 1 -> 2); the other nine were rank 1 either way. Reranking cost 18-46 s per query (median ~25 s) while everything else took ~0.8-1.3 s warm. Verdict: no measurable quality gain from the reranker on this set at ~25x latency; not enough queries to change the default. Re-run on the E2 mined set; if it holds, propose to the owner a faster default (reranker opt-in, R2-style skipping, or R3 vote mode).
 
 ### V1 - Native-Windows llama.cpp serving trial (owner-requested hardware investigation)
-`needs-approval(download llama.cpp Windows build + Qwen3 GGUFs)` - S, live, config-only - deps: none
+`in-progress (2026-10-10)` (approved and downloaded: llama.cpp b11539 Vulkan, lemonade-sdk b1342 ROCm gfx1150, Qwen3-Embedding-4B Q8_0, Qwen3-Reranker-4B converted to Q8_0 with LCI's code instruction and vLLM's prompt suffix patched into the converter, ggml-org Qwen3-Reranker-0.6B Q8_0; FastFlowLM 1.0.7 portable zip for V2) - S, live, config-only - deps: none
 - Why (NPU research, 2026-10-10, sources in the session's npu-research notes): the owner asked to use the Ryzen AI 9 HX 370's XDNA 2 NPU. Findings: no Windows NPU runtime serves reranking (FastFlowLM 1.0.7 exposes chat/embeddings/transcription only; Lemonade 2026.41.1 forwards `/v1/rerank` to llama.cpp on GPU/CPU; OGA is generation-only); the only NPU-ready embedder is EmbeddingGemma-300M (MTEB ~68 vs Qwen3-Embedding-4B ~74.6, int4, 2048-token max, forces a re-index); vendor NPU prefill for a 4B model is ~510-615 tok/s. Today's WSL2 + ROCm vLLM bf16 path reaches only ~290 tok/s (~2.3 TFLOPS) -- a software inefficiency: independent llama.cpp numbers on the 890M imply ~500-670 tok/s for a 4B model (Vulkan or ROCm), halving rerank time (~25-30 s -> ~13-17 s) and cutting model RAM ~17 GB -> ~9 GB. llama-server's `/rerank` already returns LCI's `{results:[{index, relevance_score}]}` and serves `/v1/models`, so no LCI code change is needed.
 - Scope: no code. Owner-approved downloads: llama.cpp Windows Vulkan build (ggml-org release zip, ~32 MB, MIT) and optionally the lemonade-sdk llamacpp-rocm gfx1150 build (~93 MB, MIT); `Qwen/Qwen3-Embedding-4B-GGUF` Q8_0 (~4.3 GB, Apache-2.0); a Qwen3-Reranker-4B GGUF converted from the cached HF weights with a current `convert_hf_to_gguf.py` (verify `pooling_type=RANK` and the rerank template -- older conversions return near-zero scores; `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` is a known-good reference). Serve on scratch ports (e.g. 8770/8771) with `--embedding --pooling last` and `--reranking --pooling rank`; point a scratch config with its own data_dir at them; never run more than two model processes (stop the WSL reranker first if needed).
 - Accept: fixed-payload benchmark (24 docs / ~8.5k tokens rerank, median of 5; 64-chunk embedding in batches of 8) and an `evaluate core.toml` quality check. Go if rerank median <= ~60% of the WSL baseline and metrics within noise; then propose to the owner moving production serving to llama.cpp (re-point 8766/8767 to keep `embedding_identity`, or accept one re-embed).
 - Optional NPU measurement (V2, needs approval: FastFlowLM installer ~30 MB, MIT): EmbeddingGemma throughput on the NPU and NPU/iGPU power interference on this 4-30 W handheld; expected to fail the quality gate, so measurement only. A Qwen3-Reranker-4B NPU port via Ryzen AI 1.8 OGA is a 2-4 day speculative spike (custom head, AMD login/EULA) -- parked unless V1 falls short.
+
+### V3 - In-process llama.cpp backend
+`proposed` (decide after V1) - M - deps: V1 - skill: `lci-retrieval-evaluation`
+- Why (vLLM-alternatives explorer, 2026-10-10, full notes in the session scratchpad `explore-vllm-alternatives.md`): the owner slightly prefers models running inside LCI, with HTTP serving kept for models that need a serving tool. Among serving tools nothing beats llama.cpp here: TEI has no Windows build and Instinct-only ROCm, Infinity is stale and cross-encoder only, Ollama has no merged rerank endpoint, LM Studio/LocalAI lack Qwen3 rerank, and SGLang is Linux/gfx1151 with vLLM's GEMM stack. llama.cpp on Windows Vulkan reaches ~6.5-7 TFLOPS of prefill on this GPU class (llama.cpp discussion 10879) vs vLLM's ~2.2. The only in-process crate that runs every model LCI uses (Qwen3 embedders with last-token pooling, Qwen3 rerankers with the yes/no head, plus cross-encoders) on the 890M is `llama-cpp-2` (Vulkan; the HIP route needs the HIP SDK and DLLs). candle/mistral.rs lack Qwen3 rerank and run CPU-only here; `ort` covers small ONNX models only.
+- Scope: `embedding_backend` / `reranker_backend = "http" | "in-process"` per model; `Models` (`lci-core/src/models.rs`) becomes an enum over the HTTP client and a local engine behind a cargo feature `local-models`; a local init or call failure falls back to the configured URLs (fail-open stays); a query-priority queue for the single GPU; `embedding_identity` becomes backend-aware. The rerank template must carry LCI's code instruction or scores will not match vLLM. Extra in-process win: share the system+instruction+query KV prefix across the 24 documents with `kv_cache_seq_cp` (llama-server recomputes it per document because rerank is a stateless task), ~25% less rerank compute. Stepping stone: `serve` spawns and supervises `llama-server`.
+- Accept: parity on 50 real 24-document payloads (Spearman >= 0.99, top-1 agreement >= 98%, embedding cosine >= 0.999 vs the HTTP backend), `evaluate` core + mined within noise; adopt only if >= 1.3x faster than llama-server.
+- Risk: build complexity (CMake, MSVC, glslc are present on this machine), a model crash takes LCI down with it, GPU contention between indexing and queries, and crate version churn.
+
+### V4 - In-process small cross-encoder reranker
+`proposed` - S - deps: R4 (only if a small reranker earns a place) - skill: `lci-retrieval-evaluation`
+- Why: `gte-reranker-modernbert-base` (149M, Apache-2.0) is the only small reranker whose code score is not below its first stage (see R4); its official `onnx/model_fp16.onnx` (~300 MB) runs in-process through `ort` with DirectML, estimated 1-3 s for 24 documents, for a cascade (R4) or a vote (R3) while the 4B models stay on HTTP. No 890M DirectML number exists yet.
+- Scope: behind the V3 backend switch (or standalone if V3 is rejected); parity vs the HF fp32 model (Spearman >= 0.99, same top 3), then an E3 comparison.
 
 ### E0 - Candidate and score dump for offline replay
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation`
