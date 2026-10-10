@@ -1,5 +1,6 @@
 //! Hybrid retrieval: index freshness, semantic/lexical/LSP fan-out,
-//! Reciprocal Rank Fusion, and reranking.
+//! Reciprocal Rank Fusion, and reranking. Each channel and the reranker can
+//! be switched off for a search with the `[channels]` configuration.
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     store::{Hit, Snapshot, Store},
     workspace::Workspace,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -139,33 +140,47 @@ impl App {
         }
         let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
         all_chunks.retain(|hit| hit_matches(&filters, hit));
-        let indexed_languages: HashSet<&str> = all_chunks
-            .iter()
-            .map(|hit| hit.chunk.language.as_str())
-            .collect();
+        // `[channels]` switches. A deliberately disabled channel is skipped
+        // outright: no work, a zero timing, and no "unavailable" warning.
+        let channels = self.config.channels;
         let mut applicable_adapters: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
-        for language in indexed_languages {
-            for adapter in self.analyzer.adapters_for_language(language) {
-                if adapter.enabled() {
-                    applicable_adapters
-                        .entry(adapter.provider())
-                        .or_insert_with(|| Arc::clone(adapter));
+        if channels.lsp {
+            let indexed_languages: HashSet<&str> = all_chunks
+                .iter()
+                .map(|hit| hit.chunk.language.as_str())
+                .collect();
+            for language in indexed_languages {
+                for adapter in self.analyzer.adapters_for_language(language) {
+                    if adapter.enabled() {
+                        applicable_adapters
+                            .entry(adapter.provider())
+                            .or_insert_with(|| Arc::clone(adapter));
+                    }
                 }
             }
         }
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
+                if !channels.semantic {
+                    return None;
+                }
                 let timer = Instant::now();
-                (self.models.query(query).await, ms(timer))
+                Some((self.models.query(query).await, ms(timer)))
             },
             async {
+                if !channels.lexical {
+                    return None;
+                }
                 let timer = Instant::now();
-                (
+                Some((
                     lexical::search(&self.config.ripgrep_path, &report.workspace.path, query).await,
                     ms(timer),
-                )
+                ))
             },
             async {
+                if !channels.lsp {
+                    return ((Vec::new(), Vec::new()), 0.0);
+                }
                 let timer = Instant::now();
                 if applicable_adapters.is_empty() {
                     return ((Vec::new(), Vec::new()), ms(timer));
@@ -206,12 +221,13 @@ impl App {
                 ((found, failures), ms(timer))
             },
         );
-        let (query_vector, query_ms) = query_result;
-        let (lexical_matches, lexical_ms) = lexical_result;
         let ((lsp_locations, lsp_failures), lsp_ms) = lsp_result;
-        report.timings.query_embedding_ms = query_ms;
-        report.timings.lexical_search_ms = lexical_ms;
         report.timings.lsp_search_ms = lsp_ms;
+        // The LSP channel "ran" when it was enabled, at least one provider
+        // applied to the indexed languages, and not every provider failed.
+        let mut lexical_or_lsp_ran = channels.lsp
+            && !applicable_adapters.is_empty()
+            && lsp_failures.len() < applicable_adapters.len();
         if !lsp_failures.is_empty() {
             let message = format!(
                 "Optional LSP provider unavailable: {}",
@@ -224,72 +240,94 @@ impl App {
                     .map_or(message.clone(), |w| format!("{w}; {message}")),
             );
         }
-        let semantic_timer = Instant::now();
-        let semantic = match query_vector {
-            Ok(vector) => match Store::search(
-                &snapshot,
-                &report.workspace,
-                &vector,
-                self.config.semantic_candidate_count,
-                &filters,
-            )
-            .await
-            {
-                Ok(hits) => hits,
+        let semantic = match query_result {
+            // Disabled: the query was never embedded and the index is not
+            // searched; both timings stay zero.
+            None => vec![],
+            Some((query_vector, query_ms)) => {
+                report.timings.query_embedding_ms = query_ms;
+                let semantic_timer = Instant::now();
+                let hits = match query_vector {
+                    Ok(vector) => match Store::search(
+                        &snapshot,
+                        &report.workspace,
+                        &vector,
+                        self.config.semantic_candidate_count,
+                        &filters,
+                    )
+                    .await
+                    {
+                        Ok(hits) => hits,
+                        Err(error) => {
+                            let message = format!("Semantic retrieval unavailable: {error:#}");
+                            report.warning = Some(
+                                report
+                                    .warning
+                                    .take()
+                                    .map_or(message.clone(), |w| format!("{w}; {message}")),
+                            );
+                            vec![]
+                        }
+                    },
+                    Err(error) => {
+                        let message = format!(
+                            "Query embedding unavailable; results from the other enabled channels used: {error:#}"
+                        );
+                        report.warning = Some(
+                            report
+                                .warning
+                                .take()
+                                .map_or(message.clone(), |w| format!("{w}; {message}")),
+                        );
+                        vec![]
+                    }
+                };
+                report.timings.lancedb_search_ms = ms(semantic_timer);
+                hits
+            }
+        };
+        let mut lexical_hits = Vec::new();
+        if let Some((lexical_matches, lexical_ms)) = lexical_result {
+            report.timings.lexical_search_ms = lexical_ms;
+            match lexical_matches {
+                Ok(matches) => {
+                    lexical_or_lsp_ran = true;
+                    lexical_hits = Self::map_lexical_matches(
+                        &all_chunks,
+                        matches,
+                        self.config.lexical_candidate_count,
+                    );
+                }
                 Err(error) => {
-                    let message = format!("Semantic retrieval unavailable: {error:#}");
+                    let message = format!("Lexical retrieval unavailable: {error:#}");
                     report.warning = Some(
                         report
                             .warning
                             .take()
                             .map_or(message.clone(), |w| format!("{w}; {message}")),
                     );
-                    vec![]
                 }
-            },
-            Err(error) => {
-                let message =
-                    format!("Query embedding unavailable; lexical results used: {error:#}");
-                report.warning = Some(
-                    report
-                        .warning
-                        .take()
-                        .map_or(message.clone(), |w| format!("{w}; {message}")),
-                );
-                vec![]
-            }
-        };
-        report.timings.lancedb_search_ms = ms(semantic_timer);
-        let mut lexical_hits = Vec::new();
-        match lexical_matches {
-            Ok(matches) => {
-                lexical_hits = Self::map_lexical_matches(
-                    &all_chunks,
-                    matches,
-                    self.config.lexical_candidate_count,
-                );
-            }
-            Err(error) => {
-                let message = format!("Lexical retrieval unavailable: {error:#}");
-                report.warning = Some(
-                    report
-                        .warning
-                        .take()
-                        .map_or(message.clone(), |w| format!("{w}; {message}")),
-                );
             }
         }
         let lsp_hits =
             Self::map_lsp_locations(&all_chunks, lsp_locations, self.config.lsp_candidate_count);
         if semantic.is_empty() && lexical_hits.is_empty() && lsp_hits.is_empty() {
-            if filtering_requested {
+            // With the semantic channel off, an enabled lexical or LSP
+            // channel that ran without failing and matched nothing is an
+            // ordinary answer (a literal or symbol search with no hit). If
+            // every enabled channel failed (or none could run) that stays an
+            // error. With the semantic channel on, an empty result means it
+            // failed, because it nearly always returns candidates.
+            if filtering_requested || (!channels.semantic && lexical_or_lsp_ran) {
                 report.timings.total_ms = ms(total);
                 return Ok(report);
             }
-            ensure!(
-                false,
-                "semantic, lexical, and LSP retrieval all failed or returned no candidates"
-            );
+            match report.warning.as_deref() {
+                Some(warning) => bail!(
+                    "every enabled retrieval channel failed or returned no candidates ({warning})"
+                ),
+                None => bail!("every enabled retrieval channel failed or returned no candidates"),
+            }
         }
         let fusion_timer = Instant::now();
         let mut hits = self.fuse_hits(semantic, lexical_hits, lsp_hits);
@@ -304,9 +342,15 @@ impl App {
         report.timings.fusion_ms = ms(fusion_timer);
         report.candidate_count = hits.len();
         if !hits.is_empty() {
-            let timer = Instant::now();
-            self.rerank_into_report(query, hits, k, &mut report).await;
-            report.timings.reranking_ms = ms(timer);
+            if channels.reranker {
+                let timer = Instant::now();
+                self.rerank_into_report(query, hits, k, &mut report).await;
+                report.timings.reranking_ms = ms(timer);
+            } else {
+                // Deliberately disabled: fusion order, `reranked = false`, no
+                // request, no warning, and a zero reranking time.
+                report.results = hits.into_iter().take(k).collect();
+            }
         }
         report.results.retain(|hit| hit_matches(&filters, hit));
         report.timings.total_ms = ms(total);

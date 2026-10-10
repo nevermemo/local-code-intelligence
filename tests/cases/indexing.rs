@@ -1308,3 +1308,433 @@ async fn index_commits_wait_for_another_process_holding_the_data_dir_lock() {
     other.unlock().unwrap();
     task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// `[channels]` switches: each one turns off exactly one retrieval channel (or
+// the reranker) for a search, with no work, no timing, and no warning.
+// ---------------------------------------------------------------------------
+
+/// The channels that contributed to any returned hit.
+fn channels_seen(
+    report: &local_code_intelligence::app::SearchReport,
+) -> std::collections::BTreeSet<String> {
+    report
+        .results
+        .iter()
+        .flat_map(|hit| hit.retrieval_channels.iter().cloned())
+        .collect()
+}
+
+fn channel_set(names: &[&str]) -> std::collections::BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+/// A C# workspace in which the fake language server's canned `Calculator`
+/// symbol (file `src/Calculator.cs`, zero-based line 2) lands inside the
+/// indexed class chunk, so all three retrieval channels return candidates.
+fn write_channel_workspace(root: &Path) {
+    write(
+        root,
+        "src/Calculator.cs",
+        "namespace Acceptance;\n\npublic sealed class Calculator\n{\n    public int Add(int a, int b) => a + b;\n}\n",
+    );
+}
+
+fn fake_csharp_lsp(state: &Path) -> local_code_intelligence::config::CSharpLspConfig {
+    local_code_intelligence::config::CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: vec![
+            "--mode".to_owned(),
+            "workspace-symbols".to_owned(),
+            "--state".to_owned(),
+            state.to_string_lossy().into_owned(),
+        ],
+        disabled: false,
+    }
+}
+
+#[tokio::test]
+async fn default_channels_keep_every_channel_and_the_reranker_on() {
+    let (temp, mut config, fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-default");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-default");
+    config.lsp_timeout_seconds = 10;
+    config.csharp = fake_csharp_lsp(&state);
+    assert_eq!(
+        config.channels,
+        local_code_intelligence::config::ChannelsConfig::default()
+    );
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let queries_before = fake.queries.load(Ordering::SeqCst);
+    let reranks_before = fake.rerank_requests.load(Ordering::SeqCst);
+
+    let report = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        channels_seen(&report),
+        channel_set(&["semantic", "lexical", "lsp"]),
+        "{:?}",
+        report.warning
+    );
+    assert!(report.reranked, "{:?}", report.warning);
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    assert_eq!(fake.queries.load(Ordering::SeqCst) - queries_before, 1);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst) - reranks_before,
+        1
+    );
+    let timings = &report.timings;
+    assert!(timings.query_embedding_ms > 0.0);
+    assert!(timings.lancedb_search_ms > 0.0);
+    assert!(timings.lexical_search_ms > 0.0);
+    assert!(timings.lsp_search_ms > 0.0);
+    assert!(timings.reranking_ms > 0.0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn each_channel_switch_removes_exactly_that_channel() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-toggle");
+    write_channel_workspace(&workspace);
+    let state_root = temp.path().join("lsp-state");
+
+    // Every variant disables one channel and also breaks it, so a search that
+    // still reached the channel would warn or fail instead of passing.
+    struct Variant {
+        name: &'static str,
+        expected: &'static [&'static str],
+        reranked: bool,
+    }
+    let variants = [
+        Variant {
+            name: "semantic",
+            expected: &["lexical", "lsp"],
+            reranked: true,
+        },
+        Variant {
+            name: "lexical",
+            expected: &["semantic", "lsp"],
+            reranked: true,
+        },
+        Variant {
+            name: "lsp",
+            expected: &["semantic", "lexical"],
+            reranked: true,
+        },
+        Variant {
+            name: "reranker",
+            expected: &["semantic", "lexical", "lsp"],
+            reranked: false,
+        },
+    ];
+
+    // Index once with the defaults; every variant reuses the same index.
+    let mut indexing = config.clone();
+    indexing.lsp_timeout_seconds = 10;
+    indexing.csharp = fake_csharp_lsp(&state_root.join("indexing"));
+    let indexer = App::open(indexing).await.unwrap();
+    indexer.index(&workspace).await.unwrap();
+    drop(indexer);
+
+    for variant in variants {
+        let name = variant.name;
+        let mut variant_config = config.clone();
+        variant_config.lsp_timeout_seconds = 10;
+        let state = state_root.join(name);
+        variant_config.csharp = fake_csharp_lsp(&state);
+        match name {
+            "semantic" => variant_config.channels.semantic = false,
+            "lexical" => {
+                variant_config.channels.lexical = false;
+                variant_config.ripgrep_path = "definitely-missing-ripgrep".into();
+            }
+            "lsp" => variant_config.channels.lsp = false,
+            "reranker" => variant_config.channels.reranker = false,
+            _ => unreachable!(),
+        }
+        let app = App::open(variant_config).await.unwrap();
+        fake.embed_fails.store(name == "semantic", Ordering::SeqCst);
+        fake.rerank_fails
+            .store(name == "reranker", Ordering::SeqCst);
+        let queries_before = fake.queries.load(Ordering::SeqCst);
+        let reranks_before = fake.rerank_requests.load(Ordering::SeqCst);
+
+        let report = app
+            .search(&workspace, "Calculator", Some(10))
+            .await
+            .unwrap();
+        fake.embed_fails.store(false, Ordering::SeqCst);
+        fake.rerank_fails.store(false, Ordering::SeqCst);
+
+        assert_eq!(
+            channels_seen(&report),
+            channel_set(variant.expected),
+            "{name}: {:?}",
+            report.warning
+        );
+        assert!(!report.results.is_empty(), "{name}");
+        assert_eq!(report.reranked, variant.reranked, "{name}");
+        assert!(
+            report.warning.is_none(),
+            "{name}: a deliberately disabled channel must not warn: {:?}",
+            report.warning
+        );
+        assert_eq!(
+            fake.queries.load(Ordering::SeqCst) - queries_before,
+            usize::from(name != "semantic"),
+            "{name}: query embeddings"
+        );
+        assert_eq!(
+            fake.rerank_requests.load(Ordering::SeqCst) - reranks_before,
+            usize::from(name != "reranker"),
+            "{name}: rerank requests"
+        );
+        let timings = &report.timings;
+        assert_eq!(
+            timings.query_embedding_ms == 0.0 && timings.lancedb_search_ms == 0.0,
+            name == "semantic",
+            "{name}: semantic timings"
+        );
+        assert_eq!(
+            timings.lexical_search_ms == 0.0,
+            name == "lexical",
+            "{name}: lexical timing"
+        );
+        assert_eq!(
+            timings.lsp_search_ms == 0.0,
+            name == "lsp",
+            "{name}: lsp timing"
+        );
+        assert_eq!(
+            timings.reranking_ms == 0.0,
+            name == "reranker",
+            "{name}: reranking timing"
+        );
+        for hit in &report.results {
+            if name == "semantic" {
+                assert!(hit.semantic_rank.is_none() && hit.semantic_score.is_none());
+            }
+            if name == "lexical" {
+                assert!(hit.lexical_rank.is_none() && hit.lexical_match_count == 0);
+            }
+            if name == "lsp" {
+                assert!(hit.lsp_rank.is_none());
+            }
+            if name == "reranker" {
+                assert!(hit.reranker_score.is_none());
+            }
+        }
+        // The disabled language-server channel never even starts the server.
+        assert_eq!(
+            state.join("spawn_count.txt").exists(),
+            name != "lsp",
+            "{name}: language-server process"
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_grep_only_arm_runs_lexical_search_alone_and_leaves_indexing_untouched() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.lsp = false;
+    config.channels.reranker = false;
+    let workspace = temp.path().join("grep-only");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    // Toggles are query-time only: the first search still creates the index
+    // and embeds every chunk, but never embeds a query or reranks.
+    let first = app.search(&workspace, "translator", Some(5)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(
+        fake.documents.load(Ordering::SeqCst) > 0,
+        "indexing still embeds chunks"
+    );
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), 0);
+    assert!(!first.reranked);
+    assert!(first.warning.is_none(), "{:?}", first.warning);
+    assert!(!first.results.is_empty());
+    assert!(
+        first
+            .results
+            .iter()
+            .all(|hit| hit.retrieval_channels == vec!["lexical".to_owned()]),
+        "{:?}",
+        channels_seen(&first)
+    );
+    assert!(first.results[0].chunk.code.contains("translator"));
+    assert!(first.results.iter().all(|hit| hit.fusion_score > 0.0));
+    assert_eq!(first.timings.query_embedding_ms, 0.0);
+    assert_eq!(first.timings.lancedb_search_ms, 0.0);
+    assert_eq!(first.timings.lsp_search_ms, 0.0);
+    assert_eq!(first.timings.reranking_ms, 0.0);
+    assert!(first.timings.lexical_search_ms > 0.0);
+
+    // With the embedding and reranking services down, nothing changes: the
+    // arm never depends on them at query time.
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    fake.rerank_fails.store(true, Ordering::SeqCst);
+    let second = app.search(&workspace, "translator", Some(5)).await.unwrap();
+    assert!(second.warning.is_none(), "{:?}", second.warning);
+    assert_eq!(channels_seen(&second), channel_set(&["lexical"]));
+
+    // A query that matches no line is an empty answer, not a failure of
+    // every channel.
+    let none = app
+        .search(&workspace, "zzzzqqqqnotpresent", Some(5))
+        .await
+        .unwrap();
+    assert!(none.results.is_empty());
+    assert!(none.warning.is_none(), "{:?}", none.warning);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_search_still_fails_when_every_enabled_channel_fails() {
+    // The semantic channel alone: if the embedding service is down there is
+    // nothing to fall back on, so this stays an error as it always was.
+    let (temp, mut config, fake, task) = fixture().await;
+    config.channels.lexical = false;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("semantic-only");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let error = app
+        .search(&workspace, "translator", Some(2))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("every enabled retrieval channel failed"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("Query embedding unavailable; results from the other"),
+        "the error carries the channel warning: {error:#}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn with_semantic_off_a_clean_miss_is_empty_but_failed_channels_are_an_error() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.reranker = false;
+    config.lsp_timeout_seconds = 10;
+    let workspace = temp.path().join("semantic-off-failures");
+    write_channel_workspace(&workspace);
+    let missing_rg = "definitely-missing-ripgrep";
+
+    // Lexical search alone, ripgrep healthy, nothing matches: an ordinary
+    // empty answer with no warning.
+    let mut lexical_only = config.clone();
+    lexical_only.channels.lsp = false;
+    let app = App::open(lexical_only).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let miss = app
+        .search(&workspace, "zzzzqqqqnotpresent", Some(5))
+        .await
+        .unwrap();
+    assert!(miss.results.is_empty());
+    assert!(miss.warning.is_none(), "{:?}", miss.warning);
+    drop(app);
+
+    // Lexical search alone with ripgrep missing: the only enabled channel
+    // failed, so the search fails and says why.
+    let mut lexical_broken = config.clone();
+    lexical_broken.channels.lsp = false;
+    lexical_broken.ripgrep_path = missing_rg.into();
+    let app = App::open(lexical_broken).await.unwrap();
+    let error = app
+        .search(&workspace, "Calculator", Some(5))
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("every enabled retrieval channel failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Lexical retrieval unavailable"),
+        "{message}"
+    );
+    drop(app);
+
+    // Language-server search alone with the only provider failing: also an
+    // error.
+    let mut lsp_broken = config.clone();
+    lsp_broken.channels.lexical = false;
+    lsp_broken.csharp = fake_csharp_lsp(&temp.path().join("lsp-state-broken"));
+    lsp_broken.csharp.path = Some("definitely-missing-csharp-ls".into());
+    let app = App::open(lsp_broken).await.unwrap();
+    let error = app
+        .search(&workspace, "Calculator", Some(5))
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("every enabled retrieval channel failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Optional LSP provider unavailable"),
+        "{message}"
+    );
+    drop(app);
+
+    // Lexical search failing while a healthy language server runs and finds
+    // nothing in the index: a channel ran fine, so the result is empty (with
+    // the lexical warning) rather than an error.
+    let state = temp.path().join("lsp-state-healthy");
+    let mut lsp_healthy = config.clone();
+    lsp_healthy.ripgrep_path = missing_rg.into();
+    lsp_healthy.csharp = fake_csharp_lsp(&state);
+    // The canned symbol points at a file the index does not contain.
+    lsp_healthy
+        .csharp
+        .args
+        .extend(["--primary-file".to_owned(), "src/Other.cs".to_owned()]);
+    let app = App::open(lsp_healthy).await.unwrap();
+    let empty = app.search(&workspace, "Calculator", Some(5)).await.unwrap();
+    assert!(state.join("spawn_count.txt").exists());
+    assert!(empty.results.is_empty());
+    let warning = empty.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("Lexical retrieval unavailable"),
+        "{warning}"
+    );
+    assert!(!warning.contains("Optional LSP provider"), "{warning}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_configuration_with_no_retrieval_channel_is_rejected_when_the_app_opens() {
+    let (_temp, mut config, _fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.lexical = false;
+    config.channels.lsp = false;
+    // The reranker alone is not a retrieval channel.
+    config.channels.reranker = true;
+    let error = App::open(config).await.err().expect("must be rejected");
+    assert!(
+        format!("{error:#}").contains("at least one of semantic, lexical, and lsp"),
+        "{error:#}"
+    );
+    task.abort();
+}

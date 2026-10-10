@@ -41,6 +41,47 @@ impl Default for IndexConfig {
     }
 }
 
+/// Query-time switches for the retrieval channels and the reranker, so a
+/// search can run as a controlled ablation (for example the grep-only
+/// baseline: `semantic = false`, `lsp = false`, `reranker = false`). They are
+/// production configuration, not evaluation data.
+///
+/// A disabled channel is skipped entirely: it contributes no candidates,
+/// does no work (`semantic = false` never embeds the query), reports a zero
+/// timing, and raises no "unavailable" warning, because turning it off is a
+/// choice rather than a failure. A disabled reranker returns the fusion order
+/// with `reranked = false`, sends no request, and warns about nothing.
+///
+/// The switches affect searches only. Indexing always embeds and stores every
+/// chunk, so the index stays valid when a switch is flipped back on, and the
+/// readiness report (`/ready`, `service_status`) still probes the embedding
+/// service even with `semantic = false`, because indexing needs it. At least
+/// one of `semantic`, `lexical`, and `lsp` must stay enabled; validation
+/// rejects a configuration that disables all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelsConfig {
+    /// Embed the query and search the vector index.
+    pub semantic: bool,
+    /// Search with ripgrep.
+    pub lexical: bool,
+    /// Ask the enabled language servers for workspace symbols.
+    pub lsp: bool,
+    /// Rerank the fused shortlist with the reranking service.
+    pub reranker: bool,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            semantic: true,
+            lexical: true,
+            lsp: true,
+            reranker: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -96,6 +137,8 @@ pub struct Config {
     /// unaffected.
     pub clangd: ClangdLspConfig,
     pub index: IndexConfig,
+    /// Query-time channel and reranker switches; all enabled by default.
+    pub channels: ChannelsConfig,
 }
 
 /// Optional C# language-server (csharp-ls) configuration.
@@ -382,6 +425,7 @@ impl Default for Config {
             java: JavaLspConfig::default(),
             clangd: ClangdLspConfig::default(),
             index: IndexConfig::default(),
+            channels: ChannelsConfig::default(),
         }
     }
 }
@@ -475,6 +519,10 @@ impl Config {
                 "clangd.path must be nonempty when set; omit it or set clangd.disabled = true to keep C/C++ navigation disabled"
             );
         }
+        ensure!(
+            self.channels.semantic || self.channels.lexical || self.channels.lsp,
+            "channels: at least one of semantic, lexical, and lsp must be enabled; a search with no retrieval channel can return nothing"
+        );
         ensure!(
             (1..=40).contains(&self.default_top_k),
             "default_top_k must be 1..=40"
@@ -707,5 +755,119 @@ mod tests {
         let config: Config = toml::from_str(&toml_text).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("clangd.path"));
+    }
+
+    #[test]
+    fn default_channels_are_all_enabled() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert_eq!(
+            config.channels,
+            ChannelsConfig {
+                semantic: true,
+                lexical: true,
+                lsp: true,
+                reranker: true,
+            }
+        );
+        assert_eq!(ChannelsConfig::default(), config.channels);
+    }
+
+    #[test]
+    fn config_without_a_channels_section_keeps_every_channel_enabled() {
+        // Existing configuration files predate `[channels]` and must load
+        // unchanged, with the behavior they always had.
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.channels, ChannelsConfig::default());
+    }
+
+    #[test]
+    fn channels_section_overrides_only_the_named_switches() {
+        let toml_text = format!("{}[channels]\nreranker = false\n", base_toml());
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert!(config.channels.semantic);
+        assert!(config.channels.lexical);
+        assert!(config.channels.lsp);
+        assert!(!config.channels.reranker);
+    }
+
+    #[test]
+    fn grep_only_arm_is_a_valid_configuration() {
+        let toml_text = format!(
+            "{}[channels]\nsemantic = false\nlsp = false\nreranker = false\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.channels,
+            ChannelsConfig {
+                semantic: false,
+                lexical: true,
+                lsp: false,
+                reranker: false,
+            }
+        );
+    }
+
+    #[test]
+    fn channels_round_trip_through_toml() {
+        let config = Config {
+            data_dir: std::env::temp_dir(),
+            channels: ChannelsConfig {
+                semantic: false,
+                lexical: true,
+                lsp: false,
+                reranker: false,
+            },
+            ..Config::default()
+        };
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[channels]"), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.channels, config.channels);
+    }
+
+    #[test]
+    fn disabling_every_retrieval_channel_is_rejected() {
+        // With semantic, lexical, and lsp all off no search can find
+        // anything; the reranker alone is not a retrieval channel.
+        let toml_text = format!(
+            "{}[channels]\nsemantic = false\nlexical = false\nlsp = false\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("channels"), "{error}");
+
+        // Any single retrieval channel is enough.
+        for (semantic, lexical, lsp) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                channels: ChannelsConfig {
+                    semantic,
+                    lexical,
+                    lsp,
+                    reranker: false,
+                },
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_channels_field_is_rejected() {
+        // `deny_unknown_fields` catches a misspelled switch instead of
+        // silently leaving the channel enabled.
+        let toml_text = format!("{}[channels]\nsemantics = false\n", base_toml());
+        assert!(toml::from_str::<Config>(&toml_text).is_err());
     }
 }

@@ -84,6 +84,27 @@ lsp_candidate_count = 40
 # args = []
 # disabled = false
 
+# Query-time switches for the retrieval channels and the reranker; all default
+# to true, and a file without this section behaves exactly as before. A
+# disabled channel is skipped outright: no candidates, no work (semantic =
+# false never embeds the query; lsp = false never starts a language server), a
+# zero timing, and no "unavailable" warning, because turning it off is a
+# choice, not a failure. A disabled reranker returns the fusion order with
+# reranked = false, sends no request, and adds no warning. At least one of
+# semantic, lexical, and lsp must stay enabled, or the configuration is
+# rejected at startup.
+# The switches affect searches only. Indexing always embeds and stores every
+# chunk, so flipping one never needs a reindex, and /ready and service_status
+# keep probing the embedding service even with semantic = false, because
+# indexing still needs it.
+# Grep-only baseline for an evaluation arm (ripgrep matches mapped onto
+# chunks, nothing else): semantic = false, lsp = false, reranker = false.
+[channels]
+semantic = true
+lexical = true
+lsp = true
+reranker = true
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

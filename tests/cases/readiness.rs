@@ -115,3 +115,43 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
     models_task.abort();
     drop(temp);
 }
+
+#[tokio::test]
+async fn readiness_still_probes_the_embedding_service_when_semantic_search_is_off() {
+    // `[channels].semantic = false` only skips query embedding. Indexing
+    // still embeds every chunk, so the embedding service stays a required
+    // dependency and an unreachable one still makes the service not ready.
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: temp.path().join("data"),
+        embedding_url: "http://127.0.0.1:1/v1".into(),
+        reranker_url: "http://127.0.0.1:1/rerank".into(),
+        readiness_timeout_seconds: 1,
+        ..Config::default()
+    };
+    config.channels.semantic = false;
+    config.channels.reranker = false;
+    let app = App::open(config).await.unwrap();
+    let status = serde_json::to_value(app.service_status().await).unwrap();
+    assert_eq!(status["ready"], false);
+    assert_eq!(status["can_create_semantic_index"], false);
+    for name in ["embedding_endpoint_reachable", "embedding_model_listed"] {
+        let component = status["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is still reported"));
+        assert_eq!(component["required"], true, "{name}");
+        assert_eq!(component["ready"], false, "{name}");
+    }
+
+    // A healthy embedding service keeps the service ready with semantic off.
+    let (_temp, mut config, _fake, models_task) = fixture().await;
+    config.channels.semantic = false;
+    let app = App::open(config).await.unwrap();
+    let status = serde_json::to_value(app.service_status().await).unwrap();
+    assert_eq!(status["ready"], true);
+    assert_eq!(status["can_create_semantic_index"], true);
+    models_task.abort();
+}
