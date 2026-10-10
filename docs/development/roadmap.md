@@ -90,15 +90,17 @@ first.
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | R0 | Fusion-only baseline: does the reranker help at all on core.toml? | measured (needs E2 + owner decision) | S | - |
+| V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | needs-approval(downloads) | S | - |
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
-| E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | ready | S | - |
-| E2 | Git-mined query set generator with keyword / keyword-agnostic strata | ready | M | E1 |
+| E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
+| E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
 | E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | ready | M | E1 |
 | R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
 | R3 | Reranker as a weighted RRF vote instead of a replacement | ready | S | E3 |
 | R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
+| R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
@@ -110,6 +112,13 @@ first.
 - Risk: 11 queries cannot detect small differences; this is a go/no-go signal, not a final verdict.
 - Result (2026-10-10, binary at `43d56d9`, same index, sequential runs; reports `test-results/core-eval-cap-4096.json` vs `test-results/r0-core-rerank-off.json`): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955; fusion-only hit@1 0.909 / hit@3 1.0 / MRR 0.939. Per query the reranker fixed one (readiness: fusion rank 3 -> 1) and broke one (language registry: 1 -> 2); the other nine were rank 1 either way. Reranking cost 18-46 s per query (median ~25 s) while everything else took ~0.8-1.3 s warm. Verdict: no measurable quality gain from the reranker on this set at ~25x latency; not enough queries to change the default. Re-run on the E2 mined set; if it holds, propose to the owner a faster default (reranker opt-in, R2-style skipping, or R3 vote mode).
 
+### V1 - Native-Windows llama.cpp serving trial (owner-requested hardware investigation)
+`needs-approval(download llama.cpp Windows build + Qwen3 GGUFs)` - S, live, config-only - deps: none
+- Why (NPU research, 2026-10-10, sources in the session's npu-research notes): the owner asked to use the Ryzen AI 9 HX 370's XDNA 2 NPU. Findings: no Windows NPU runtime serves reranking (FastFlowLM 1.0.7 exposes chat/embeddings/transcription only; Lemonade 2026.41.1 forwards `/v1/rerank` to llama.cpp on GPU/CPU; OGA is generation-only); the only NPU-ready embedder is EmbeddingGemma-300M (MTEB ~68 vs Qwen3-Embedding-4B ~74.6, int4, 2048-token max, forces a re-index); vendor NPU prefill for a 4B model is ~510-615 tok/s. Today's WSL2 + ROCm vLLM bf16 path reaches only ~290 tok/s (~2.3 TFLOPS) -- a software inefficiency: independent llama.cpp numbers on the 890M imply ~500-670 tok/s for a 4B model (Vulkan or ROCm), halving rerank time (~25-30 s -> ~13-17 s) and cutting model RAM ~17 GB -> ~9 GB. llama-server's `/rerank` already returns LCI's `{results:[{index, relevance_score}]}` and serves `/v1/models`, so no LCI code change is needed.
+- Scope: no code. Owner-approved downloads: llama.cpp Windows Vulkan build (ggml-org release zip, ~32 MB, MIT) and optionally the lemonade-sdk llamacpp-rocm gfx1150 build (~93 MB, MIT); `Qwen/Qwen3-Embedding-4B-GGUF` Q8_0 (~4.3 GB, Apache-2.0); a Qwen3-Reranker-4B GGUF converted from the cached HF weights with a current `convert_hf_to_gguf.py` (verify `pooling_type=RANK` and the rerank template -- older conversions return near-zero scores; `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` is a known-good reference). Serve on scratch ports (e.g. 8770/8771) with `--embedding --pooling last` and `--reranking --pooling rank`; point a scratch config with its own data_dir at them; never run more than two model processes (stop the WSL reranker first if needed).
+- Accept: fixed-payload benchmark (24 docs / ~8.5k tokens rerank, median of 5; 64-chunk embedding in batches of 8) and an `evaluate core.toml` quality check. Go if rerank median <= ~60% of the WSL baseline and metrics within noise; then propose to the owner moving production serving to llama.cpp (re-point 8766/8767 to keep `embedding_identity`, or accept one re-embed).
+- Optional NPU measurement (V2, needs approval: FastFlowLM installer ~30 MB, MIT): EmbeddingGemma throughput on the NPU and NPU/iGPU power interference on this 4-30 W handheld; expected to fail the quality gate, so measurement only. A Qwen3-Reranker-4B NPU port via Ryzen AI 1.8 OGA is a 2-4 day speculative spike (custom head, AMD login/EULA) -- parked unless V1 falls short.
+
 ### E0 - Candidate and score dump for offline replay
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation`
 - Why: every reranker strategy question (12 vs 24 candidates, vote-into-RRF, confident skip, progressive early exit, score caching) can be answered offline at zero GPU cost if the evaluator records, per query, all reranker candidates with path, start line, channel ranks, fused score/rank, source role, document bytes sent, and reranker score. Today only the top-k results are kept.
@@ -118,14 +127,14 @@ first.
 - Risk: keep it out of default responses (token budget for agents).
 
 ### E1 - Richer evaluation metrics
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation`
+`done` (2a0b9ad) - S - deps: none - skill: `lci-retrieval-evaluation`
 - Why: the harness reports hit@k and MRR only. The literature LCI will compare against reports nDCG@10, Recall@k and file-level Acc@5/10 (LocBench https://aclanthology.org/2025.acl-long.426.pdf, CORE-Bench https://arxiv.org/abs/2606.11864, Long Code Arena https://huggingface.co/datasets/JetBrains-Research/lca-bug-localization). Aggregate latency is total-only, but the question is always "how much of it is reranking". The aggregate has no `refreshed_incrementally` counter, so created+reused+waited does not sum to executed.
 - Scope: `src/evaluate/types.rs` (`QueryMetrics` gains `ndcg_at_10`, `recall_at_k` for multi-path gold, `file_acc_at_5/10` keyed on distinct files; `AggregateReport` gains means of those, `index_refreshed`, and per-stage p50/p95 for every `EvalTimings` field), `src/evaluate/metrics.rs`, `src/evaluate/tests.rs`, README "Retrieval evaluation" paragraph. Graded gain: an `expected_paths` match = 2, a `preferred_paths` match = 1.
 - Accept: unit tests with hand-computed nDCG/Recall values and an all-miss case; `cargo xtask test --suite Evaluation` passes; one live `evaluate` run against `core.toml` emits the new fields (numbers in the commit message).
 - Risk: none to ranking; evaluation only. Keep metric code pure (no App access).
 
 ### E2 - Git-mined query set
-`ready` - M - deps: E1 - skill: `lci-retrieval-evaluation`
+`done` (7daed93: 35 queries, 27 keyword / 8 keyword-agnostic; renames chased to HEAD; noise and identifier rules in the generated header) - M - deps: E1 - skill: `lci-retrieval-evaluation`
 - Why: gold labels for repository-level retrieval come from merged changes: commit/PR text as the query, touched files as relevance (Gandhi et al. https://arxiv.org/abs/2502.07067; voyage-code-4's agentic suite https://blog.voyageai.com/2026/08/13/voyage-code-4/). Hundreds of labelled queries per repo at zero annotation cost. Benchmarks are "saturated with keyword references" (LogicLoc https://arxiv.org/abs/2604.16021), so a stratum whose queries do not name the changed files is needed to measure the semantic channel honestly.
 - Scope: new `xtask/src/mine.rs` + `cargo xtask mine-queries --repo <path> --key <workspace-key> --out evaluations/mined/<key>.toml --max 300` using `git log --no-merges --name-status --format=...` through `std::process` (no new crates). Rules: skip merges/reverts, lockfiles, vendored paths, commits touching >10 or 0 supported-extension files, subjects under 4 words; `expected_paths` = touched files that still exist at HEAD (document that evaluation runs at HEAD, an approximation; see Investigations I-6 for the parent-commit variant). Add optional `tags: Vec<String>` to `EvalQuery` (`src/evaluate/types.rs`) and per-tag aggregates; tag each query `keyword` (subject contains a touched file stem or an identifier from the diff header) or `keyword-agnostic`. Commit a mined set for `self` (this repo).
 - Accept: unit tests for the filters and tagging on synthetic log output; the committed `evaluations/mined/self.toml` validates with `evaluate` (expected paths exist); README documents the command and the HEAD approximation; `.lciignore` unaffected (evaluations are TOML, not indexed).
@@ -144,6 +153,8 @@ first.
 - Scope: config-only runs of `evaluate` over `core.toml` (and `evaluations/mined/self.toml` if E2 landed) for `rerank_candidate_count` in {12, 24, 48} x `rerank_document_max_bytes` in {1024, 2048, 4096}, plus one reranker-off arm. Record p50/p95 `reranking_ms`, hit@1/3, MRR. Change the defaults in `lci-core/src/config.rs`, `config.example.toml`, README only if a cell dominates.
 - Accept: a results table in the commit message and in this item; decision rule: pick the cheapest cell whose hit@3 and MRR are within the E3 CI (or, before E3, within 0.03 absolute) of the best cell.
 - Risk: a 48-candidate cell may exceed vLLM's batch limits; treat 4xx as a data point, not a bug.
+- Explorer (2026-10-10, reranker-gating): on the clean core pair (`core-eval-cap-4096` vs `r0-core-rerank-off`) the reranker's top-1 always came from fusion rank <= 5 (1,3,1,2,1,1,1,1,5,3,1); its only win (q9 readiness, fusion 3 -> 1, score gap 0.226) and only loss (q1, 1 -> 2, gap 0.002) both sit inside fusion top 5. Add windows {6, 8} to the grid; the cost model (0.4 s + W x ~354 tokens / 290 tok/s) predicts ~10 s at W=8 vs ~25 s at 24. Prerequisite code change: today `hits.truncate` (`src/app/search.rs` ~303) couples the candidate pool to the window and `rerank_into_report` (~568-598) keeps only `k` reranked hits, so W < top_k would shorten results; append the remaining fusion-order hits after the reranked window. Measure nDCG@10 and recall@10 as well as hit@1/MRR: in 7/11 core queries the reranked top 3 contains a chunk from outside fusion top 8.
+- Measurement caveat (V1 bench, 2026-10-10): vLLM's prefix cache makes an identical rerank request ~10x cheaper on repeat (24 x 4 KB: 3.4 s cached). Sequential evaluation arms that rerank the same chunks can partly reuse cache; run arms in an order that cannot benefit (largest cap last) or restart the reranker between arms, and never repeat an identical query in a timing run.
 
 ### R2 - Skip reranking on an exact symbol-definition hit
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation`
@@ -158,10 +169,18 @@ first.
 - Scope: `rerank_mode = "replace" | "vote"` and `rerank_vote_weight` (default 1.0) in config; in `rerank_into_report` (`src/app/search.rs`) `vote` adds `weight / (rrf_k + rerank_rank)` to `fusion_score` and re-sorts; `reranker_score` stays visible. Default remains `replace` until E3 says otherwise.
 - Accept: unit test on a hand-built hit list; live E3 comparison replace vs vote on `core.toml` + mined set; flip the default only on a non-regressing win.
 - Risk: keep `fusion_score` and `reranker_score` distinct (retrieval contract).
+- Explorer (2026-10-10): a rank-only vote cannot separate the core win (q9: fusion 3 -> reranker 1) from the loss (q1: fusion 1 -> reranker 2); only the reranker score gap does (0.226 vs 0.002). Add a third arm, `margin`: take the reranker's order only where its top score beats the fusion top-1's reranker score by >= ~0.05. n=2 and the q9 gap shrinks to 0.023 at larger caps, so this needs the mined set before any default changes.
+
+### R6 - Rerank only contested queries
+`blocked` (E0: reports must carry channel ranks before the gate can be replayed offline) - S - deps: E0, R1 - skill: `lci-retrieval-evaluation`
+- Why: explorer (2026-10-10): in all 12 live fixture searches (`test-results/multilingual-search-*.json`) the fused top-1 was in 2+ channels with semantic and lexical rank <= 2, and the reranker agreed every time. The RRF score ratio did not discriminate (1.12-2.68). The core q9 win had a test/test/source top 3 and would still be reranked.
+- Scope: after fusion (`src/app/search.rs` ~303), skip reranking when the top-1 hit has `retrieval_channels.len() >= 2`, `semantic_rank <= 2` and `lexical_rank <= 2`, and the top 3 do not mix source roles (unless the query mentions tests). Report `rerank_skipped: "uncontested"` (shared field with R2). Config switch, default off until measured.
+- Accept: offline replay over E0-enriched core + mined reports: no reranker win lost and >= 30% of queries skipped; then a live paired run.
+- Risk: the skip rate on prose queries is unknown; identifier queries (R2) are not in either evaluation set yet.
 
 ### R4 - Trial Qwen3-Reranker-0.6B
 - Downloaded with the owner's approval (2026-10-10, WSL `~/.cache/huggingface/hub`): `Qwen/Qwen3-Reranker-0.6B` (1.2 GB, Apache-2.0), `Alibaba-NLP/gte-reranker-modernbert-base` (575 MB, Apache-2.0), `Qwen/Qwen3-Embedding-0.6B` (1.2 GB, Apache-2.0, for M-items). Already cached: Qwen3-Embedding-4B, Qwen3-Embedding-8B, Qwen3-Reranker-4B. The owner allows a candidate to take the RAM of the model it would replace (stop the 4B reranker, serve the candidate on 8767, restore the `vllm.txt` setup afterwards; never more than two model processes). An NPU/native-Windows serving investigation (owner request) runs first and may change where these models are served.
-`needs-approval(download Qwen/Qwen3-Reranker-0.6B, Apache-2.0, ~0.6B params, ~1.2 GB bf16, https://huggingface.co/Qwen/Qwen3-Reranker-0.6B)` - S - deps: E3
+`ready` (downloaded 2026-10-10) - S - deps: E3
 - Why: a third-party L4 measurement puts the 0.6B at 65 ms p50 vs 580 ms for the 4B (https://superlinked.com/blog/qwen3-embedding-reranker-guide); on an iGPU the ratio should be similar. MTEB-Code drops 81.20 -> 73.42 (https://arxiv.org/abs/2506.05176), but that was over a weak retriever; over LCI's 4B embedder the loss may be small and the latency gain decisive.
 - Scope: no code. Owner approves and serves the model on 8767 under a distinct `reranker_model` name; run E3 comparison (4B vs 0.6B vs off) on `core.toml` + mined set; document the recommended profile in README/`config.example.toml`.
 - Accept: comparison table in the commit; decision rule as R1 (cheapest within CI).
