@@ -113,6 +113,20 @@ lexical = true
 lsp = true
 reranker = true
 
+# Per-channel weights for Reciprocal Rank Fusion. A channel adds
+# weight / (rrf_k + rank) for each chunk it returns, and a chunk several
+# channels return sums those terms; the source-role prior is added afterwards
+# and is never scaled. The weights default to 1.0, which is plain RRF, and a
+# file without this section ranks and scores exactly as before. Each weight
+# must be finite and greater than zero: a zero weight is rejected at startup,
+# because turning a channel off is what [channels] is for. The weights show up
+# only in fusion_score; channel ranks and scores, and the reranker's input,
+# are unchanged. rrf_k stays a top-level key.
+[fusion]
+semantic_weight = 1.0
+lexical_weight = 1.0
+lsp_weight = 1.0
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

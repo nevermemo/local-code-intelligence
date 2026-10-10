@@ -4,7 +4,7 @@
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
-    config::IndexFreshness,
+    config::{FusionConfig, IndexFreshness},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest},
     lexical,
     lsp::adapter::LspAdapter,
@@ -401,7 +401,13 @@ impl App {
             );
         }
         let fusion_timer = Instant::now();
-        let mut hits = self.fuse_hits(semantic, lexical_hits, lsp_hits);
+        let mut hits = Self::fuse_hits(
+            self.config.rrf_k,
+            &self.config.fusion,
+            semantic,
+            lexical_hits,
+            lsp_hits,
+        );
         hits.retain(|hit| hit_matches(&filters, hit));
         hits.sort_by(|a, b| {
             b.fusion_score
@@ -711,21 +717,23 @@ impl App {
         lsp_hits
     }
 
-    /// Combines the three retrieval channels with Reciprocal Rank Fusion,
-    /// keyed by file path, start line, and content hash so the same chunk
-    /// reached through multiple channels contributes once with a summed
-    /// score.
+    /// Combines the three retrieval channels with weighted Reciprocal Rank
+    /// Fusion, keyed by file path, start line, and content hash so the same
+    /// chunk reached through multiple channels contributes once with a summed
+    /// score. A channel contributes `weight / (rrf_k + rank)`; the default
+    /// weights of `1.0` are plain RRF. The source-role prior is added last
+    /// and is never scaled by a weight. The result is in no particular order.
     fn fuse_hits(
-        &self,
+        rrf_k: f32,
+        weights: &FusionConfig,
         semantic: Vec<Hit>,
         lexical_hits: Vec<Hit>,
         lsp_hits: Vec<Hit>,
     ) -> Vec<Hit> {
-        let rrf_k = self.config.rrf_k;
         let mut fused = HashMap::<(String, u32, String), Hit>::new();
         for mut hit in semantic {
             let rank = hit.semantic_rank.unwrap();
-            hit.fusion_score += 1.0 / (rrf_k + rank as f32);
+            hit.fusion_score += weights.semantic_weight / (rrf_k + rank as f32);
             fused.insert(
                 (
                     hit.chunk.relative_file_path.clone(),
@@ -742,7 +750,7 @@ impl App {
                 hit.chunk.content_hash.clone(),
             );
             let lexical_rank = hit.lexical_rank.unwrap();
-            let contribution = 1.0 / (rrf_k + lexical_rank as f32);
+            let contribution = weights.lexical_weight / (rrf_k + lexical_rank as f32);
             if let Some(existing) = fused.get_mut(&key) {
                 existing.lexical_rank = hit.lexical_rank;
                 existing.lexical_match_count = hit.lexical_match_count;
@@ -762,7 +770,7 @@ impl App {
                 hit.chunk.content_hash.clone(),
             );
             let lsp_rank = hit.lsp_rank.unwrap();
-            let contribution = 1.0 / (rrf_k + lsp_rank as f32);
+            let contribution = weights.lsp_weight / (rrf_k + lsp_rank as f32);
             if let Some(existing) = fused.get_mut(&key) {
                 existing.lsp_rank = hit.lsp_rank;
                 existing.fusion_score += contribution;
@@ -834,7 +842,15 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::head_within;
+    use super::{App, head_within};
+    use crate::{
+        chunk::Chunk,
+        config::FusionConfig,
+        filter::SourceRole,
+        store::{Hit, source_role_prior},
+    };
+
+    const RRF_K: f32 = 60.0;
 
     #[test]
     fn head_within_keeps_short_text_and_cuts_on_a_char_boundary() {
@@ -843,5 +859,314 @@ mod tests {
         // "é" is two bytes; a cut inside it backs off to the boundary.
         assert_eq!(head_within("caé", 3), "ca");
         assert_eq!(head_within("caé", 4), "caé");
+    }
+
+    /// A chunk as `Store::chunks` hands it to a channel: no channel has
+    /// returned it yet, so it carries no rank, score, or channel name.
+    fn hit(path: &str, start_line: u32, role: SourceRole) -> Hit {
+        Hit {
+            file_path: format!("/workspace/{path}"),
+            chunk: Chunk {
+                relative_file_path: path.into(),
+                language: "rust".into(),
+                start_line,
+                end_line: start_line + 9,
+                code: format!("fn at_{start_line}() {{}}"),
+                content_hash: format!("{path}:{start_line}"),
+            },
+            semantic_score: None,
+            semantic_rank: None,
+            lexical_rank: None,
+            lexical_match_count: 0,
+            lexical_score: None,
+            lsp_rank: None,
+            fusion_score: 0.0,
+            retrieval_channels: vec![],
+            reranker_score: None,
+            source_role: role,
+            source_role_prior: source_role_prior(role),
+        }
+    }
+
+    fn semantic_at(mut hit: Hit, rank: usize) -> Hit {
+        hit.semantic_rank = Some(rank);
+        hit.semantic_score = Some(1.0 - rank as f32 / 100.0);
+        hit.retrieval_channels.push("semantic".into());
+        hit
+    }
+
+    fn lexical_at(mut hit: Hit, rank: usize) -> Hit {
+        hit.lexical_rank = Some(rank);
+        hit.lexical_match_count = 3;
+        hit.lexical_score = Some(5.0 / rank as f32);
+        hit.retrieval_channels.push("lexical".into());
+        hit
+    }
+
+    fn lsp_at(mut hit: Hit, rank: usize) -> Hit {
+        hit.lsp_rank = Some(rank);
+        hit.retrieval_channels.push("lsp".into());
+        hit
+    }
+
+    /// One chunk and the rank each channel gave it (`None`: not returned).
+    #[derive(Clone, Copy)]
+    struct Row {
+        path: &'static str,
+        role: SourceRole,
+        semantic: Option<usize>,
+        lexical: Option<usize>,
+        lsp: Option<usize>,
+    }
+
+    const fn row(
+        path: &'static str,
+        role: SourceRole,
+        semantic: Option<usize>,
+        lexical: Option<usize>,
+        lsp: Option<usize>,
+    ) -> Row {
+        Row {
+            path,
+            role,
+            semantic,
+            lexical,
+            lsp,
+        }
+    }
+
+    /// The three channel inputs fusion receives, each ordered by rank.
+    fn channels(rows: &[Row]) -> (Vec<Hit>, Vec<Hit>, Vec<Hit>) {
+        let build = |rank_of: fn(&Row) -> Option<usize>, tag: fn(Hit, usize) -> Hit| {
+            let mut ranked: Vec<(usize, Hit)> = rows
+                .iter()
+                .filter_map(|row| {
+                    rank_of(row).map(|rank| (rank, tag(hit(row.path, 1, row.role), rank)))
+                })
+                .collect();
+            ranked.sort_by_key(|(rank, _)| *rank);
+            ranked.into_iter().map(|(_, hit)| hit).collect::<Vec<_>>()
+        };
+        (
+            build(|row| row.semantic, semantic_at),
+            build(|row| row.lexical, lexical_at),
+            build(|row| row.lsp, lsp_at),
+        )
+    }
+
+    /// Fuses the rows and orders the result the way `search` does.
+    fn fuse(rrf_k: f32, weights: &FusionConfig, rows: &[Row]) -> Vec<Hit> {
+        let (semantic, lexical, lsp) = channels(rows);
+        let mut hits = App::fuse_hits(rrf_k, weights, semantic, lexical, lsp);
+        hits.sort_by(|a, b| {
+            b.fusion_score
+                .total_cmp(&a.fusion_score)
+                .then_with(|| a.chunk.relative_file_path.cmp(&b.chunk.relative_file_path))
+                .then(a.chunk.start_line.cmp(&b.chunk.start_line))
+        });
+        hits
+    }
+
+    fn paths(hits: &[Hit]) -> Vec<&str> {
+        hits.iter()
+            .map(|hit| hit.chunk.relative_file_path.as_str())
+            .collect()
+    }
+
+    fn by_path<'a>(hits: &'a [Hit], path: &str) -> &'a Hit {
+        hits.iter()
+            .find(|hit| hit.chunk.relative_file_path == path)
+            .unwrap_or_else(|| panic!("{path} was not fused"))
+    }
+
+    /// Weighted RRF written out term by term, in the order fusion adds them
+    /// (semantic, lexical, LSP) and with the prior added last.
+    fn expected_score(rrf_k: f32, parts: &[(f32, usize)], prior: f32) -> f32 {
+        let mut score = 0.0_f32;
+        for (weight, rank) in parts {
+            score += weight / (rrf_k + *rank as f32);
+        }
+        score + prior
+    }
+
+    #[test]
+    fn unit_weights_match_plain_rrf() {
+        use SourceRole::{Source, Test};
+        let rows = [
+            row("a.rs", Source, Some(1), Some(3), None),
+            row("b.rs", Source, Some(2), None, None),
+            row("c.rs", Source, None, Some(1), None),
+            row("d.rs", Source, Some(3), Some(2), Some(1)),
+            row("e.rs", Source, None, None, Some(2)),
+            row("tests/f.rs", Test, Some(4), None, Some(3)),
+            row("g.rs", Source, Some(5), Some(7), None),
+            row("h.rs", Source, None, Some(4), Some(4)),
+        ];
+        for rrf_k in [RRF_K, 7.5, 1.0] {
+            // Plain RRF exactly as it was before channel weights existed: a
+            // literal `1.0 / (rrf_k + rank)` per channel, then the prior.
+            let mut expected: Vec<(&str, f32)> = rows
+                .iter()
+                .map(|row| {
+                    let mut score = 0.0_f32;
+                    for rank in [row.semantic, row.lexical, row.lsp].into_iter().flatten() {
+                        score += 1.0 / (rrf_k + rank as f32);
+                    }
+                    (row.path, score + source_role_prior(row.role))
+                })
+                .collect();
+            expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+            let fused = fuse(rrf_k, &FusionConfig::default(), &rows);
+            assert_eq!(fused.len(), rows.len(), "rrf_k {rrf_k}");
+            for (hit, (path, score)) in fused.iter().zip(&expected) {
+                assert_eq!(hit.chunk.relative_file_path, *path, "order, rrf_k {rrf_k}");
+                assert_eq!(
+                    hit.fusion_score.to_bits(),
+                    score.to_bits(),
+                    "{path} at rrf_k {rrf_k}: {} vs {score}",
+                    hit.fusion_score
+                );
+            }
+
+            // Spelling the unit weights out changes nothing either.
+            let explicit = FusionConfig {
+                semantic_weight: 1.0,
+                lexical_weight: 1.0,
+                lsp_weight: 1.0,
+            };
+            let again = fuse(rrf_k, &explicit, &rows);
+            assert_eq!(paths(&again), paths(&fused));
+            for (a, b) in again.iter().zip(&fused) {
+                assert_eq!(a.fusion_score.to_bits(), b.fusion_score.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_weight_two_promotes_semantic_only_rank_one_over_two_channel_agreement() {
+        use SourceRole::Source;
+        let rows = [
+            // Semantic's single best hit, which no other channel found.
+            row("x.rs", Source, Some(1), None, None),
+            // Lexical and LSP agree on it; semantic did not return it.
+            row("y.rs", Source, None, Some(1), Some(3)),
+            // A semantic and lexical agreement, to show only the semantic term
+            // of a mixed chunk is scaled.
+            row("z.rs", Source, Some(2), Some(2), None),
+        ];
+        let unit = fuse(RRF_K, &FusionConfig::default(), &rows);
+        assert_eq!(paths(&unit), ["y.rs", "z.rs", "x.rs"]);
+
+        let doubled = fuse(
+            RRF_K,
+            &FusionConfig {
+                semantic_weight: 2.0,
+                ..FusionConfig::default()
+            },
+            &rows,
+        );
+        assert_eq!(paths(&doubled), ["z.rs", "x.rs", "y.rs"]);
+
+        let prior = source_role_prior(Source);
+        // Only the semantic contributions double.
+        assert_eq!(
+            by_path(&doubled, "x.rs").fusion_score.to_bits(),
+            expected_score(RRF_K, &[(2.0, 1)], prior).to_bits()
+        );
+        assert_eq!(
+            by_path(&doubled, "z.rs").fusion_score.to_bits(),
+            expected_score(RRF_K, &[(2.0, 2), (1.0, 2)], prior).to_bits()
+        );
+        // A chunk the semantic channel never returned is untouched.
+        assert_eq!(
+            by_path(&doubled, "y.rs").fusion_score.to_bits(),
+            by_path(&unit, "y.rs").fusion_score.to_bits()
+        );
+        // The weights do not touch ranks or the channel list.
+        let x = by_path(&doubled, "x.rs");
+        assert_eq!(x.semantic_rank, Some(1));
+        assert_eq!(x.retrieval_channels, ["semantic"]);
+    }
+
+    #[test]
+    fn prior_is_added_after_weighting() {
+        use SourceRole::{Source, Test};
+        assert_eq!(source_role_prior(Source), 0.004);
+        assert_eq!(source_role_prior(Test), 0.0);
+
+        let rows = [
+            row("src.rs", Source, Some(1), None, None),
+            row("tests/t.rs", Test, Some(1), None, None),
+            row("all.rs", Source, Some(1), Some(1), Some(1)),
+        ];
+        let weights = FusionConfig {
+            semantic_weight: 3.0,
+            lexical_weight: 0.5,
+            lsp_weight: 4.0,
+        };
+        let fused = fuse(RRF_K, &weights, &rows);
+
+        let source = by_path(&fused, "src.rs");
+        let test = by_path(&fused, "tests/t.rs");
+        // The prior is the one thing added on top of the weighted terms ...
+        assert_eq!(
+            source.fusion_score.to_bits(),
+            expected_score(RRF_K, &[(3.0, 1)], 0.004).to_bits()
+        );
+        assert_eq!(
+            test.fusion_score.to_bits(),
+            expected_score(RRF_K, &[(3.0, 1)], 0.0).to_bits()
+        );
+        // ... and it is not multiplied by the weight (3 * (1/61 + 0.004)).
+        assert_ne!(
+            source.fusion_score.to_bits(),
+            (3.0 * (1.0 / (RRF_K + 1.0) + 0.004)).to_bits()
+        );
+        assert!((source.fusion_score - test.fusion_score - 0.004).abs() < 1e-6);
+        assert_eq!(source.source_role_prior, 0.004);
+        assert_eq!(test.source_role_prior, 0.0);
+
+        // Three channels, three different weights, one prior.
+        assert_eq!(
+            by_path(&fused, "all.rs").fusion_score.to_bits(),
+            expected_score(RRF_K, &[(3.0, 1), (0.5, 1), (4.0, 1)], 0.004).to_bits()
+        );
+    }
+
+    #[test]
+    fn lexical_fields_copied_on_merge() {
+        use SourceRole::Source;
+        let base = hit("merged.rs", 1, Source);
+        let semantic = vec![semantic_at(base.clone(), 4)];
+        let mut lexical_hit = lexical_at(base.clone(), 2);
+        lexical_hit.lexical_match_count = 7;
+        lexical_hit.lexical_score = Some(3.5);
+        let lexical = vec![lexical_hit];
+        let lsp = vec![lsp_at(base, 5)];
+
+        let fused = App::fuse_hits(RRF_K, &FusionConfig::default(), semantic, lexical, lsp);
+        assert_eq!(fused.len(), 1, "one chunk reached through three channels");
+        let merged = &fused[0];
+        assert_eq!(merged.semantic_rank, Some(4));
+        assert_eq!(merged.semantic_score, Some(1.0 - 4.0 / 100.0));
+        assert_eq!(merged.lexical_rank, Some(2));
+        assert_eq!(merged.lexical_match_count, 7);
+        assert_eq!(merged.lexical_score, Some(3.5));
+        assert_eq!(merged.lsp_rank, Some(5));
+        assert_eq!(merged.retrieval_channels, ["semantic", "lexical", "lsp"]);
+        assert_eq!(
+            merged.fusion_score.to_bits(),
+            expected_score(RRF_K, &[(1.0, 4), (1.0, 2), (1.0, 5)], 0.004).to_bits()
+        );
+
+        // A chunk only the lexical channel returned keeps its own fields.
+        let alone = lexical_at(hit("alone.rs", 1, Source), 1);
+        let fused = App::fuse_hits(RRF_K, &FusionConfig::default(), vec![], vec![alone], vec![]);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].lexical_rank, Some(1));
+        assert_eq!(fused[0].lexical_match_count, 3);
+        assert_eq!(fused[0].lexical_score, Some(5.0));
+        assert_eq!(fused[0].retrieval_channels, ["lexical"]);
     }
 }

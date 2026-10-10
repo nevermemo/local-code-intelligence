@@ -82,6 +82,42 @@ impl Default for ChannelsConfig {
     }
 }
 
+/// Per-channel weights for Reciprocal Rank Fusion.
+///
+/// Each channel contributes `weight / (rrf_k + rank)` for a chunk it returned,
+/// and a chunk several channels returned sums those contributions. The
+/// source-role prior is added afterwards and is never scaled by a weight. All
+/// weights default to `1.0`, which is plain RRF: a file without a `[fusion]`
+/// section ranks and scores exactly as before. `rrf_k` stays a top-level key.
+///
+/// A weight must be finite and greater than zero. Turning a channel off is the
+/// job of `[channels]` (which also skips the channel's work); a zero weight
+/// would only hide it from the score while still paying for it, so validation
+/// rejects it.
+///
+/// The weights are visible only through `fusion_score`; channel ranks, scores,
+/// and the reranker's input are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FusionConfig {
+    /// Weight of the semantic (vector) channel's reciprocal-rank contribution.
+    pub semantic_weight: f32,
+    /// Weight of the lexical (ripgrep) channel's reciprocal-rank contribution.
+    pub lexical_weight: f32,
+    /// Weight of the language-server channel's reciprocal-rank contribution.
+    pub lsp_weight: f32,
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            semantic_weight: 1.0,
+            lexical_weight: 1.0,
+            lsp_weight: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -146,6 +182,9 @@ pub struct Config {
     pub index: IndexConfig,
     /// Query-time channel and reranker switches; all enabled by default.
     pub channels: ChannelsConfig,
+    /// Per-channel Reciprocal Rank Fusion weights; all `1.0` (plain RRF) by
+    /// default.
+    pub fusion: FusionConfig,
 }
 
 /// Optional C# language-server (csharp-ls) configuration.
@@ -434,6 +473,7 @@ impl Default for Config {
             clangd: ClangdLspConfig::default(),
             index: IndexConfig::default(),
             channels: ChannelsConfig::default(),
+            fusion: FusionConfig::default(),
         }
     }
 }
@@ -464,6 +504,16 @@ impl Config {
             self.rrf_k.is_finite() && self.rrf_k > 0.0,
             "rrf_k must be positive"
         );
+        for (name, weight) in [
+            ("semantic_weight", self.fusion.semantic_weight),
+            ("lexical_weight", self.fusion.lexical_weight),
+            ("lsp_weight", self.fusion.lsp_weight),
+        ] {
+            ensure!(
+                weight.is_finite() && weight > 0.0,
+                "fusion.{name} must be a finite number greater than zero (got {weight}); to turn a channel off use [channels], not a zero weight"
+            );
+        }
         ensure!(
             self.watch_poll_milliseconds > 0 && self.watch_debounce_milliseconds > 0,
             "watch intervals must be positive"
@@ -923,5 +973,91 @@ mod tests {
         // silently leaving the channel enabled.
         let toml_text = format!("{}[channels]\nsemantics = false\n", base_toml());
         assert!(toml::from_str::<Config>(&toml_text).is_err());
+    }
+
+    #[test]
+    fn fusion_defaults_to_unit_weights() {
+        let unit = FusionConfig {
+            semantic_weight: 1.0,
+            lexical_weight: 1.0,
+            lsp_weight: 1.0,
+        };
+        // The default, a file without the section, and an empty section all
+        // mean plain RRF.
+        let config = Config::default();
+        config.validate().unwrap();
+        assert_eq!(config.fusion, unit);
+        assert_eq!(FusionConfig::default(), unit);
+        let absent: Config = toml::from_str(&base_toml()).unwrap();
+        absent.validate().unwrap();
+        assert_eq!(absent.fusion, unit);
+        let empty: Config = toml::from_str(&format!("{}[fusion]\n", base_toml())).unwrap();
+        empty.validate().unwrap();
+        assert_eq!(empty.fusion, unit);
+
+        // A section overrides only the weights it names.
+        let partial: Config =
+            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.5\n", base_toml())).unwrap();
+        partial.validate().unwrap();
+        assert_eq!(
+            partial.fusion,
+            FusionConfig {
+                semantic_weight: 1.5,
+                ..unit
+            }
+        );
+
+        // The weights round-trip through TOML.
+        let reloaded: Config = toml::from_str(&toml::to_string(&partial).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.fusion, partial.fusion);
+
+        // `deny_unknown_fields` catches a misspelled weight.
+        let misspelled = format!("{}[fusion]\nsemantics_weight = 2.0\n", base_toml());
+        assert!(toml::from_str::<Config>(&misspelled).is_err());
+    }
+
+    #[test]
+    fn fusion_rejects_zero_or_nan_weight() {
+        for (key, setter) in [
+            (
+                "semantic_weight",
+                (|f: &mut FusionConfig, w: f32| f.semantic_weight = w)
+                    as fn(&mut FusionConfig, f32),
+            ),
+            ("lexical_weight", |f, w| f.lexical_weight = w),
+            ("lsp_weight", |f, w| f.lsp_weight = w),
+        ] {
+            for bad in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut config = Config {
+                    data_dir: std::env::temp_dir(),
+                    ..Config::default()
+                };
+                setter(&mut config.fusion, bad);
+                let error = config.validate().unwrap_err().to_string();
+                assert!(
+                    error.contains(&format!("fusion.{key}")),
+                    "{key}={bad}: {error}"
+                );
+                assert!(error.contains("[channels]"), "{key}={bad}: {error}");
+            }
+            // A small positive and a large finite weight are both fine.
+            for good in [f32::MIN_POSITIVE, 0.5, 1.0, 2.0, 1000.0] {
+                let mut config = Config {
+                    data_dir: std::env::temp_dir(),
+                    ..Config::default()
+                };
+                setter(&mut config.fusion, good);
+                config.validate().unwrap();
+            }
+        }
+
+        // The check runs at load time, from the file.
+        for value in ["0", "0.0", "-2.0", "nan", "inf"] {
+            let toml_text = format!("{}[fusion]\nlexical_weight = {value}\n", base_toml());
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("fusion.lexical_weight"), "{value}: {error}");
+        }
     }
 }
