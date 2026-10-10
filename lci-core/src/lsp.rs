@@ -15,8 +15,9 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 pub mod adapter;
 pub mod clangd;
@@ -69,6 +70,162 @@ impl GenericClient {
     }
 }
 
+/// The query of the priming request sent once a server has started: a single
+/// common letter in the same `<term>#` form a search sends.
+///
+/// The request exists only to make the server build the symbol index its
+/// first real `workspace/symbol` would otherwise build, which on a large
+/// Rust workspace is 8-30 s of work that a search cannot afford to wait for
+/// or to have cancelled (rust-analyzer 1.98 builds it on either query form).
+/// It is not an empty string because servers differ in what they do with
+/// one: some answer it without touching the index, others return every
+/// symbol they have. A single common letter has a small answer on every
+/// server yet still exercises the index; the `#` suffix keeps the form that
+/// searches use (rust-analyzer reads it as "all symbols", other servers see
+/// one more ordinary character).
+const PRIMING_QUERY: &str = "e#";
+
+fn workspace_symbol_params(query: &str) -> Value {
+    json!({"query": query, "searchScope":"workspace", "searchKind":"allSymbols"})
+}
+
+type SessionKey = (String, String);
+
+/// What one server start produced: the ready client, or the rendered cause of
+/// the failure (shared by every caller that waited on the same start).
+type StartOutcome = Result<Arc<GenericClient>, String>;
+
+/// One (provider, workspace) language-server session, from the moment its
+/// start is requested until it is discarded.
+///
+/// The start (process spawn, `initialize`, and the adapter's warm-up wait --
+/// rust-analyzer waits up to ~10 s for its first indexing pass) runs on a
+/// detached task, never inside the future of whichever caller asked first:
+///
+/// - concurrent callers for the same key share the one start instead of each
+///   spawning a server;
+/// - a caller that goes away (a search past its latency budget) does not
+///   cancel the start, so the server keeps warming for the next search.
+///   Dropping a start mid-way would kill the child (`kill_on_drop`) and throw
+///   the warm-up away;
+/// - the finished client is owned by the session (the watch channel's value),
+///   not by any request future, so it lives until the session is discarded or
+///   the [`Manager`] is dropped. Dropping the manager drops the last
+///   receiver, which ends a still-running start (or priming) and kills its
+///   child.
+///
+/// Once the start succeeds the same task *primes* the server (see
+/// [`PRIMING_QUERY`]): one `workspace/symbol` request that makes the server
+/// build the symbol index its first real query would otherwise build. Priming
+/// is never cancelled by a caller's budget, and only `workspace/symbol`
+/// callers wait for it ([`Session::primed`]); definition and references are
+/// served as soon as the start succeeds.
+struct Session {
+    start: watch::Receiver<Option<StartOutcome>>,
+    /// Flips to `true` when priming has settled, whether it succeeded or
+    /// not. Never flips if the start failed.
+    primed: watch::Receiver<bool>,
+}
+
+impl Session {
+    fn begin(adapter: Arc<dyn LspAdapter>, workspace: Workspace) -> Arc<Self> {
+        let (sender, start) = watch::channel(None);
+        let (primed_sender, primed) = watch::channel(false);
+        tokio::spawn(async move {
+            let provider = adapter.provider();
+            let started = Instant::now();
+            let outcome = tokio::select! {
+                outcome = GenericClient::spawn(&adapter, &workspace) => outcome,
+                // Every receiver is gone: the manager was dropped.
+                () = sender.closed() => return,
+            };
+            let client = match &outcome {
+                Ok(client) => {
+                    tracing::debug!(
+                        provider,
+                        workspace = %workspace.path.display(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "language server session ready"
+                    );
+                    Some(Arc::clone(client))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        provider,
+                        workspace = %workspace.path.display(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %format!("{error:#}"),
+                        "language server failed to start"
+                    );
+                    None
+                }
+            };
+            sender.send_replace(Some(outcome.map_err(|error| format!("{error:#}"))));
+            let Some(client) = client else { return };
+
+            let priming = Instant::now();
+            let primed_result = tokio::select! {
+                result = client.request("workspace/symbol", workspace_symbol_params(PRIMING_QUERY)) => result,
+                () = sender.closed() => return,
+            };
+            match primed_result {
+                Ok(_) => tracing::debug!(
+                    provider,
+                    workspace = %workspace.path.display(),
+                    elapsed_ms = priming.elapsed().as_millis() as u64,
+                    "language server primed"
+                ),
+                Err(error) => tracing::warn!(
+                    provider,
+                    workspace = %workspace.path.display(),
+                    elapsed_ms = priming.elapsed().as_millis() as u64,
+                    error = %format!("{error:#}"),
+                    "priming workspace/symbol request failed; searches will pay for the index build"
+                ),
+            }
+            primed_sender.send_replace(true);
+        });
+        Arc::new(Self { start, primed })
+    }
+
+    /// Waits for the start to finish (not for priming). Cancel-safe:
+    /// dropping this future only stops waiting.
+    async fn client(&self) -> Result<Arc<GenericClient>> {
+        let mut start = self.start.clone();
+        let outcome = start
+            .wait_for(Option::is_some)
+            .await
+            .map(|started| started.clone())
+            .map_err(|_| anyhow!("language server start ended unexpectedly"))?;
+        match outcome {
+            Some(Ok(client)) => Ok(client),
+            Some(Err(message)) => Err(anyhow!(message)),
+            None => unreachable!("wait_for returned before the start finished"),
+        }
+    }
+
+    /// Waits for priming to settle. Cancel-safe, like [`Self::client`].
+    async fn primed(&self) -> Result<()> {
+        let mut primed = self.primed.clone();
+        primed
+            .wait_for(|settled| *settled)
+            .await
+            .map(|_| ())
+            .map_err(|_| anyhow!("language server priming ended unexpectedly"))
+    }
+
+    fn ready_client(&self) -> Option<Arc<GenericClient>> {
+        match &*self.start.borrow() {
+            Some(Ok(client)) => Some(Arc::clone(client)),
+            _ => None,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        matches!(&*self.start.borrow(), Some(Err(_)))
+    }
+}
+
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
 /// and C# (csharp-ls) are always constructed; TypeScript/JavaScript, Python,
 /// Go, and Java join the same registry as optional, individually
@@ -77,7 +234,7 @@ impl GenericClient {
 /// as a clear error from the caller.
 pub struct Manager {
     adapters: Vec<Arc<dyn LspAdapter>>,
-    sessions: Mutex<HashMap<(String, String), Arc<GenericClient>>>,
+    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
 }
 
 impl Manager {
@@ -111,42 +268,93 @@ impl Manager {
             .collect()
     }
 
-    fn session_key(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> (String, String) {
+    fn session_key(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> SessionKey {
         (adapter.provider().to_string(), workspace.id.clone())
     }
 
+    /// The session for this (provider, workspace), starting it if there is
+    /// none. At most one start is ever in flight per key: concurrent callers
+    /// get the same session. A session whose start already failed is replaced
+    /// (a failure is reported to the callers that waited on it, never cached
+    /// for later ones).
+    async fn session(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Arc<Session> {
+        let key = Self::session_key(adapter, workspace);
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(&key)
+            && !existing.failed()
+        {
+            return Arc::clone(existing);
+        }
+        let session = Session::begin(Arc::clone(adapter), workspace.clone());
+        sessions.insert(key, Arc::clone(&session));
+        session
+    }
+
+    /// Waits for the session's client, and for priming too when
+    /// `after_priming` (only `workspace/symbol` callers: the index priming
+    /// builds is exactly what their request needs, and sending it earlier
+    /// would race the priming request). The returned session identifies which
+    /// session to [`Self::discard`] if the client then fails.
     async fn client(
         &self,
         adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
-    ) -> Result<Arc<GenericClient>> {
-        let key = Self::session_key(adapter, workspace);
-        if let Some(client) = self.sessions.lock().await.get(&key).cloned() {
-            return Ok(client);
+        after_priming: bool,
+    ) -> Result<(Arc<Session>, Arc<GenericClient>)> {
+        let session = self.session(adapter, workspace).await;
+        let client = session.client().await?;
+        if after_priming {
+            session.primed().await?;
         }
-        let client = GenericClient::spawn(adapter, workspace).await?;
-        self.sessions.lock().await.insert(key, client.clone());
-        Ok(client)
+        Ok((session, client))
+    }
+
+    /// Forgets a failed session so the next caller starts a fresh server.
+    /// Only that exact session is removed: with concurrent callers, a second
+    /// one reporting the same failure must not remove the replacement the
+    /// first one already started.
+    async fn discard(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        failed: &Arc<Session>,
+    ) {
+        let key = Self::session_key(adapter, workspace);
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, failed))
+        {
+            sessions.remove(&key);
+        }
     }
 
     /// A request with no per-file preparation step: spawn-or-reuse a client,
     /// and on any failure discard the session and retry once with a fresh
     /// client (never a retry loop).
+    ///
+    /// `after_priming` is true for `workspace/symbol` only (see
+    /// [`Self::client`]).
+    ///
+    /// Cancel-safe: a caller that stops waiting (a search past its latency
+    /// budget) drops only its own wait. The session stays in the registry and
+    /// keeps starting or warming for the next caller.
     async fn request(
         &self,
         adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
         method: &str,
         params: Value,
+        after_priming: bool,
     ) -> Result<Value> {
-        let key = Self::session_key(adapter, workspace);
-        let client = self.client(adapter, workspace).await?;
+        let (session, client) = self.client(adapter, workspace, after_priming).await?;
         match client.request(method, params.clone()).await {
             Ok(value) => Ok(value),
             Err(first) => {
-                self.sessions.lock().await.remove(&key);
-                let client = self
-                    .client(adapter, workspace)
+                Self::warn_restart(adapter, workspace, method, &first);
+                self.discard(adapter, workspace, &session).await;
+                let (_, client) = self
+                    .client(adapter, workspace, after_priming)
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 client.request(method, params).await
@@ -166,20 +374,31 @@ impl Manager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        let key = Self::session_key(adapter, workspace);
         let attempt = async {
-            let client = self.client(adapter, workspace).await?;
-            adapter
-                .before_position_request(&client.rpc, file, relative)
-                .await?;
-            client.request(method, params.clone()).await
+            let (session, client) = match self.client(adapter, workspace, false).await {
+                Ok(started) => started,
+                // The start itself failed: nothing to discard, the failed
+                // session is replaced by the retry below.
+                Err(error) => return Err((None, error)),
+            };
+            let result = async {
+                adapter
+                    .before_position_request(&client.rpc, file, relative)
+                    .await?;
+                client.request(method, params.clone()).await
+            }
+            .await;
+            result.map_err(|error| (Some(session), error))
         };
         match attempt.await {
             Ok(value) => Ok(value),
-            Err(first) => {
-                self.sessions.lock().await.remove(&key);
-                let client = self
-                    .client(adapter, workspace)
+            Err((session, first)) => {
+                Self::warn_restart(adapter, workspace, method, &first);
+                if let Some(session) = session {
+                    self.discard(adapter, workspace, &session).await;
+                }
+                let (_, client) = self
+                    .client(adapter, workspace, false)
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 adapter
@@ -188,6 +407,24 @@ impl Manager {
                 client.request(method, params).await
             }
         }
+    }
+
+    /// A request failure throws away a warmed-up server, and the retry pays
+    /// the whole start (and warm-up) again, so it is worth a log line: it is
+    /// the likeliest cause of a sudden multi-second search.
+    fn warn_restart(
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        method: &str,
+        error: &anyhow::Error,
+    ) {
+        tracing::warn!(
+            provider = adapter.provider(),
+            workspace = %workspace.path.display(),
+            method,
+            error = %format!("{error:#}"),
+            "language server request failed; discarding the session and restarting once"
+        );
     }
 
     pub async fn symbols(
@@ -201,7 +438,8 @@ impl Manager {
                 adapter,
                 workspace,
                 "workspace/symbol",
-                json!({"query": query, "searchScope":"workspace", "searchKind":"allSymbols"}),
+                workspace_symbol_params(query),
+                true,
             )
             .await?;
         locations_for(value, workspace, adapter.provider())
@@ -265,11 +503,15 @@ impl Manager {
         locations_for(value, workspace, adapter.provider())
     }
 
+    /// Whether a started, ready session exists for this provider and
+    /// workspace. A session still starting (or warming up) is not running
+    /// yet.
     pub async fn running(&self, provider: &str, workspace_id: &str) -> bool {
         self.sessions
             .lock()
             .await
-            .contains_key(&(provider.to_string(), workspace_id.to_string()))
+            .get(&(provider.to_string(), workspace_id.to_string()))
+            .is_some_and(|session| session.ready_client().is_some())
     }
 }
 

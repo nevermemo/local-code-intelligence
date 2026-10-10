@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Default, Serialize)]
@@ -43,7 +43,15 @@ pub struct SearchReport {
     pub query: String,
     pub candidate_count: usize,
     pub reranked: bool,
+    /// A channel failed or the search fell back (see the retrieval
+    /// contracts); counted as a fallback by the evaluation harness.
     pub warning: Option<String>,
+    /// Informational remarks about work skipped on purpose where nothing
+    /// failed, for example a language server that is still starting and was
+    /// not waited for (`lsp_search_budget_ms`). Absent from the JSON when
+    /// empty, and never counted as a fallback.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub timings: Timings,
     pub results: Vec<Hit>,
     pub index: SearchIndexLifecycle,
@@ -69,6 +77,17 @@ fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
         &hit.chunk.relative_file_path,
         hit.source_role,
     )
+}
+
+/// What the language-server channel of one search produced.
+#[derive(Default)]
+struct LspChannel {
+    locations: Vec<crate::lsp::Location>,
+    /// One `provider: cause` entry for each provider that failed.
+    failures: Vec<String>,
+    /// Providers that did not answer within `lsp_search_budget_ms`.
+    over_budget: Vec<&'static str>,
+    elapsed_ms: f64,
 }
 
 /// Outcome of resolving which index snapshot a search should read: the
@@ -126,6 +145,7 @@ impl App {
             candidate_count: 0,
             reranked: false,
             warning: resolution.warning,
+            notes: Vec::new(),
             timings: Timings::default(),
             results: vec![],
             index: SearchIndexLifecycle {
@@ -159,6 +179,7 @@ impl App {
                 }
             }
         }
+        let lsp_budget = Duration::from_millis(self.config.lsp_search_budget_ms);
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
                 if !channels.semantic {
@@ -179,14 +200,15 @@ impl App {
             },
             async {
                 if !channels.lsp {
-                    return ((Vec::new(), Vec::new()), 0.0);
+                    return LspChannel::default();
                 }
                 let timer = Instant::now();
                 if applicable_adapters.is_empty() {
-                    return ((Vec::new(), Vec::new()), ms(timer));
+                    return LspChannel {
+                        elapsed_ms: ms(timer),
+                        ..LspChannel::default()
+                    };
                 }
-                let mut found = Vec::new();
-                let mut failures = Vec::new();
                 let mut symbol_queries = Vec::new();
                 for term in lexical::terms(query) {
                     if term.ends_with('s') && term.len() > 4 {
@@ -195,39 +217,81 @@ impl App {
                     symbol_queries.push(format!("{term}#"));
                 }
                 symbol_queries.dedup();
-                // A provider that failed (after its own fresh-process retry)
-                // is skipped for the remaining terms of this search, so a
-                // missing or broken server costs one failure, not one per
-                // symbol query.
-                let mut failed_providers = HashSet::new();
-                for term in symbol_queries.into_iter().take(8) {
-                    for adapter in applicable_adapters.values() {
-                        if failed_providers.contains(adapter.provider()) {
-                            continue;
-                        }
-                        match self
-                            .analyzer
-                            .symbols(adapter, &report.workspace, &term)
-                            .await
-                        {
-                            Ok(mut locations) => found.append(&mut locations),
-                            Err(error) => {
-                                failed_providers.insert(adapter.provider());
-                                failures.push(format!("{}: {error:#}", adapter.provider()))
-                            }
+                symbol_queries.truncate(8);
+                // The providers run side by side, each under the same wall
+                // clock budget, so one that is still starting cannot starve
+                // the others. Past the budget the provider's future is
+                // dropped, which only stops this search waiting: its session
+                // lives in the manager and keeps starting and warming for the
+                // next search. Answers gathered before the budget ran out are
+                // kept.
+                let mut providers: Vec<&Arc<dyn LspAdapter>> =
+                    applicable_adapters.values().collect();
+                providers.sort_by_key(|adapter| adapter.provider());
+                let (workspace, queries) = (&report.workspace, &symbol_queries);
+                let answers =
+                    futures::future::join_all(providers.into_iter().map(|adapter| async move {
+                        let gathered = std::sync::Mutex::new(Vec::new());
+                        let answer = tokio::time::timeout(
+                            lsp_budget,
+                            self.provider_symbols(adapter, workspace, queries, &gathered),
+                        )
+                        .await;
+                        let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
+                        (adapter.provider(), gathered, answer)
+                    }))
+                    .await;
+                let mut channel = LspChannel::default();
+                let mut per_provider = Vec::new();
+                for (provider, gathered, answer) in answers {
+                    per_provider.push(gathered);
+                    match answer {
+                        Ok(failure) => channel.failures.extend(failure),
+                        Err(_) => {
+                            tracing::debug!(
+                                provider,
+                                budget_ms = self.config.lsp_search_budget_ms,
+                                "language server did not answer within the search budget"
+                            );
+                            channel.over_budget.push(provider);
                         }
                     }
                 }
-                ((found, failures), ms(timer))
+                // Merge query by query across providers, as one sequential
+                // pass would: first-seen order decides the LSP rank.
+                for index in 0..symbol_queries.len() {
+                    for locations in &mut per_provider {
+                        if let Some(found) = locations.get_mut(index) {
+                            channel.locations.append(found);
+                        }
+                    }
+                }
+                channel.elapsed_ms = ms(timer);
+                channel
             },
         );
-        let ((lsp_locations, lsp_failures), lsp_ms) = lsp_result;
-        report.timings.lsp_search_ms = lsp_ms;
+        let lsp_locations = lsp_result.locations;
+        let lsp_failures = lsp_result.failures;
+        report.timings.lsp_search_ms = lsp_result.elapsed_ms;
         // The LSP channel "ran" when it was enabled, at least one provider
-        // applied to the indexed languages, and not every provider failed.
+        // applied to the indexed languages, and not every provider failed. A
+        // provider past its budget did not fail (its server is only still
+        // starting), so a search with that channel alone is a clean miss with
+        // a note, not an error.
         let mut lexical_or_lsp_ran = channels.lsp
             && !applicable_adapters.is_empty()
             && lsp_failures.len() < applicable_adapters.len();
+        if !lsp_result.over_budget.is_empty() {
+            // Not a warning: nothing failed, the server is just not ready
+            // yet. A warning would also count the search as a fallback.
+            report.notes.push(format!(
+                "LSP still starting or slow; symbol results from {} are missing or incomplete \
+                 for this search (lsp_search_budget_ms = {}). The server keeps starting in the \
+                 background.",
+                lsp_result.over_budget.join(", "),
+                self.config.lsp_search_budget_ms
+            ));
+        }
         if !lsp_failures.is_empty() {
             let message = format!(
                 "Optional LSP provider unavailable: {}",
@@ -322,12 +386,19 @@ impl App {
                 report.timings.total_ms = ms(total);
                 return Ok(report);
             }
-            match report.warning.as_deref() {
-                Some(warning) => bail!(
-                    "every enabled retrieval channel failed or returned no candidates ({warning})"
-                ),
-                None => bail!("every enabled retrieval channel failed or returned no candidates"),
+            let detail: Vec<&str> = report
+                .warning
+                .iter()
+                .chain(report.notes.iter())
+                .map(String::as_str)
+                .collect();
+            if detail.is_empty() {
+                bail!("every enabled retrieval channel failed or returned no candidates");
             }
+            bail!(
+                "every enabled retrieval channel failed or returned no candidates ({})",
+                detail.join("; ")
+            );
         }
         let fusion_timer = Instant::now();
         let mut hits = self.fuse_hits(semantic, lexical_hits, lsp_hits);
@@ -358,6 +429,7 @@ impl App {
             query_embedding_ms = report.timings.query_embedding_ms,
             lancedb_search_ms = report.timings.lancedb_search_ms,
             lexical_search_ms = report.timings.lexical_search_ms,
+            lsp_search_ms = report.timings.lsp_search_ms,
             fusion_ms = report.timings.fusion_ms,
             reranking_ms = report.timings.reranking_ms,
             total_ms = report.timings.total_ms,
@@ -572,6 +644,39 @@ impl App {
             lexical_hits.push(hit);
         }
         lexical_hits
+    }
+
+    /// One provider's `workspace/symbol` answers, one list per symbol query
+    /// in query order, pushed onto `gathered` as they arrive so that the
+    /// caller keeps them even when it drops this future at the search budget.
+    /// A provider that failed (after its own fresh-process retry) is skipped
+    /// for the remaining queries of this search, so a missing or broken
+    /// server costs one failure, not one per symbol query; the answers
+    /// gathered before the failure are kept. Returns that failure, if any.
+    ///
+    /// Cancel-safe: dropping this future must (and does) leave the
+    /// provider's session untouched.
+    async fn provider_symbols(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        symbol_queries: &[String],
+        gathered: &std::sync::Mutex<Vec<Vec<crate::lsp::Location>>>,
+    ) -> Option<String> {
+        for symbol_query in symbol_queries {
+            match self
+                .analyzer
+                .symbols(adapter, workspace, symbol_query)
+                .await
+            {
+                Ok(locations) => gathered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(locations),
+                Err(error) => return Some(format!("{}: {error:#}", adapter.provider())),
+            }
+        }
+        None
     }
 
     /// Maps LSP `workspace/symbol` locations onto the same-language chunks

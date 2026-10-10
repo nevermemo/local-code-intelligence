@@ -113,6 +113,13 @@ pub struct Config {
     pub rust_analyzer_path: String,
     pub lsp_timeout_seconds: u64,
     pub lsp_candidate_count: usize,
+    /// Most milliseconds one search waits for the language-server channel.
+    /// A server that is still starting (rust-analyzer needs ~10 s to index
+    /// a large workspace) or slow to answer costs a search at most this long;
+    /// the search then returns without symbol candidates and notes it, and the
+    /// server keeps starting in the background for later searches. Separate
+    /// from `lsp_timeout_seconds`, which bounds one request to a hung server.
+    pub lsp_search_budget_ms: u64,
     /// Optional C# language-server (csharp-ls) settings. Absent or empty
     /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
     pub csharp: CSharpLspConfig,
@@ -418,6 +425,7 @@ impl Default for Config {
             rust_analyzer_path: "rust-analyzer".into(),
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
+            lsp_search_budget_ms: 1500,
             csharp: CSharpLspConfig::default(),
             typescript: TypeScriptLspConfig::default(),
             python: PythonLspConfig::default(),
@@ -467,6 +475,10 @@ impl Config {
         ensure!(
             !self.rust_analyzer_path.trim().is_empty() && self.lsp_timeout_seconds > 0,
             "rust-analyzer path must be nonempty and LSP timeout must be positive"
+        );
+        ensure!(
+            (100..=60_000).contains(&self.lsp_search_budget_ms),
+            "lsp_search_budget_ms must be 100..=60000"
         );
         // An explicitly configured but empty C#/TypeScript/Python path is
         // malformed: it must be rejected rather than silently counting as
@@ -602,6 +614,48 @@ mod tests {
         assert_eq!(config.lsp_timeout_seconds, 60);
         assert_eq!(config.lsp_candidate_count, 40);
         assert!(!config.csharp.enabled());
+    }
+
+    #[test]
+    fn lsp_search_budget_defaults_to_one_and_a_half_seconds_and_round_trips() {
+        // A file without the key keeps the default.
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.lsp_search_budget_ms, 1500);
+        assert_eq!(Config::default().lsp_search_budget_ms, 1500);
+
+        let configured: Config =
+            toml::from_str(&format!("{}lsp_search_budget_ms = 4000\n", base_toml())).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.lsp_search_budget_ms, 4000);
+
+        let reloaded: Config = toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.lsp_search_budget_ms, 4000);
+    }
+
+    #[test]
+    fn lsp_search_budget_outside_its_range_is_rejected() {
+        for budget in [0, 99, 60_001] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                lsp_search_budget_ms: budget,
+                ..Config::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("lsp_search_budget_ms"),
+                "{budget}: {error}"
+            );
+        }
+        for budget in [100, 1500, 60_000] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                lsp_search_budget_ms: budget,
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
     }
 
     #[test]

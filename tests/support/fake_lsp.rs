@@ -44,6 +44,16 @@ pub struct FakeLspConfig {
     /// Workspace-relative path used to build the secondary canned location
     /// (the second `references` result, the call site).
     pub secondary_file: String,
+    /// Milliseconds to sleep before answering `initialize`, in every
+    /// scenario: a language server that is slow to start (`--initialize-delay-ms`).
+    pub initialize_delay_ms: u64,
+    /// Milliseconds to sleep before answering the FIRST `workspace/symbol`
+    /// request of the process (`--first-symbol-delay-ms`): the request LCI
+    /// sends to prime a server, like rust-analyzer building its symbol index.
+    pub first_symbol_delay_ms: u64,
+    /// Milliseconds to sleep before answering every LATER `workspace/symbol`
+    /// request (`--symbol-delay-ms`).
+    pub symbol_delay_ms: u64,
 }
 
 pub fn run_from_env() -> io::Result<()> {
@@ -86,6 +96,15 @@ pub fn run_from_env() -> io::Result<()> {
         cli_arg(&cli, "--primary-file").unwrap_or_else(|| "src/Calculator.cs".to_string());
     let secondary_file =
         cli_arg(&cli, "--secondary-file").unwrap_or_else(|| "src/CallSite.cs".to_string());
+    let initialize_delay_ms = cli_arg(&cli, "--initialize-delay-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let first_symbol_delay_ms = cli_arg(&cli, "--first-symbol-delay-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let symbol_delay_ms = cli_arg(&cli, "--symbol-delay-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let config = FakeLspConfig {
         scenario,
         state_dir: state_path,
@@ -93,6 +112,9 @@ pub fn run_from_env() -> io::Result<()> {
         exit_code: None,
         primary_file,
         secondary_file,
+        initialize_delay_ms,
+        first_symbol_delay_ms,
+        symbol_delay_ms,
     };
     run_server(config)
 }
@@ -125,6 +147,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         fs::write(&spawn_file, spawn_count.to_string())?;
     }
 
+    let mut symbol_requests = 0u64;
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
 
@@ -169,6 +192,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             // request itself to time out (the intended fail-open trigger).
             if matches!(config.scenario, FakeScenario::Timeout) {
                 thread::sleep(Duration::from_secs(2));
+            }
+            if config.initialize_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(config.initialize_delay_ms));
             }
             if let Some(id) = id {
                 write_message(&mut stdout, &json_response(id, json!({"capabilities": {}})))?;
@@ -232,6 +258,15 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     | FakeScenario::RestartSuccess,
                     Some("workspace/symbol"),
                 ) => {
+                    symbol_requests += 1;
+                    let delay_ms = if symbol_requests == 1 {
+                        config.first_symbol_delay_ms
+                    } else {
+                        config.symbol_delay_ms
+                    };
+                    if delay_ms > 0 {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
                     if let Some(id) = id {
                         write_message(
                             &mut stdout,

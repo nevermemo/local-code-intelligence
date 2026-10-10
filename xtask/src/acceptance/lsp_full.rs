@@ -375,8 +375,14 @@ async fn run_inner(
     let fixture_dir = fixture.dir.to_string_lossy().into_owned();
 
     evidence.stage("construct-config")?;
+    // `search` runs as a fresh one-shot process here, so its language server
+    // starts cold. Let a search wait as long as the server's own request
+    // timeout instead of the 1500 ms default, or the LSP channel is skipped
+    // (see `lsp_search_budget_ms`) and the assertions on it cannot hold.
+    let search_budget_ms = (u64::from(spec.lsp_timeout_seconds) * 1000).min(60_000);
     let mut extra_lines = vec![
         format!("lsp_timeout_seconds = {}", spec.lsp_timeout_seconds),
+        format!("lsp_search_budget_ms = {search_budget_ms}"),
         format!("[{}]", spec.config_section),
         format!("path = '{}'", server.to_string_lossy().replace('\\', "/")),
     ];

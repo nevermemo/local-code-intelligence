@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -158,38 +158,51 @@ impl JsonRpcClient {
     /// or genuinely dead without the process exiting) still times out after
     /// exactly `timeout` of true silence, same as before. On timeout the
     /// pending entry is removed and an error is returned.
+    ///
+    /// Safe to drop mid-flight (a search that hits its latency budget does
+    /// exactly that): the request is then abandoned cleanly, with its pending
+    /// entry removed and a `$/cancelRequest` sent so the server can stop the
+    /// work, and the connection stays usable for the next caller.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
+        let mut abandoned = AbandonedRequest {
+            id,
+            pending: Arc::clone(&self.pending),
+            stdin: Arc::clone(&self.stdin),
+            armed: true,
+        };
         if let Err(error) = self
             .write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await
         {
             self.pending.lock().await.remove(&id);
-            return Err(error);
+            abandoned.armed = false;
+            // A failed write means the server closed its input: it exited.
+            return Err(error.context(format!("{} exited or closed its input", self.label)));
         }
 
         let started = Instant::now();
         tokio::pin!(receiver);
-        loop {
+        let outcome = loop {
             let last_activity = *self.last_activity.lock().unwrap();
             let deadline = last_activity.max(started) + self.timeout;
             let now = Instant::now();
             if now >= deadline {
                 self.pending.lock().await.remove(&id);
-                bail!(
+                break Err(anyhow::anyhow!(
                     "{} request timed out after {} seconds of inactivity",
                     self.label,
                     self.timeout.as_secs()
-                );
+                ));
             }
             tokio::select! {
                 result = &mut receiver => {
-                    return match result {
+                    break match result {
                         Ok(Ok(value)) => Ok(value),
-                        Ok(Err(message)) => bail!(message),
-                        Err(_) => bail!("{} response channel closed", self.label),
+                        Ok(Err(message)) => Err(anyhow::anyhow!(message)),
+                        Err(_) => Err(anyhow::anyhow!("{} response channel closed", self.label)),
                     };
                 }
                 _ = tokio::time::sleep(deadline - now) => {
@@ -199,7 +212,9 @@ impl JsonRpcClient {
                     // catches it immediately.
                 }
             }
-        }
+        };
+        abandoned.armed = false;
+        outcome
     }
 
     /// Returns `true` if the readiness predicate has matched a notification.
@@ -220,21 +235,67 @@ impl JsonRpcClient {
         self.timeout
     }
 
+    /// Writes one message on a detached task. A caller that is dropped while
+    /// waiting (a search past its latency budget) must not leave half a frame
+    /// on the pipe, which would desynchronize the stream for every later
+    /// caller; the spawned write always runs to completion.
     async fn write(&self, value: &Value) -> Result<()> {
-        write_framed(&self.stdin, value).await
+        let stdin = Arc::clone(&self.stdin);
+        let value = value.clone();
+        tokio::spawn(async move { write_framed(&stdin, &value).await })
+            .await
+            .context("language-server write task ended unexpectedly")?
     }
 }
 
-/// Writes one Content-Length-framed JSON-RPC message. Shared by the client's
-/// own outgoing requests/notifications and the reader task's automatic
-/// responses to server-initiated requests (both write to the same stdin).
+/// Sent for a request whose caller went away before the response arrived:
+/// drops the pending entry (a response that still comes is ignored) and tells
+/// the server to stop working on it.
+struct AbandonedRequest {
+    id: u64,
+    pending: Pending,
+    stdin: Arc<Mutex<ChildStdin>>,
+    /// Cleared once the request completed or failed on its own.
+    armed: bool,
+}
+
+impl Drop for AbandonedRequest {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Dropped outside a runtime (shutdown): nothing left to clean up.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (id, pending, stdin) = (self.id, Arc::clone(&self.pending), Arc::clone(&self.stdin));
+        // The caller may be dropped while its own request is still being
+        // written (that write runs on a detached task), so this cancel can
+        // reach the server's stdin before the request it names. That is
+        // harmless: the server ignores a cancel for an id it has not seen,
+        // runs the request, and the late response finds no pending entry.
+        runtime.spawn(async move {
+            pending.lock().await.remove(&id);
+            let cancel = json!({
+                "jsonrpc": "2.0",
+                "method": "$/cancelRequest",
+                "params": { "id": id },
+            });
+            let _ = write_framed(&stdin, &cancel).await;
+        });
+    }
+}
+
+/// Writes one Content-Length-framed JSON-RPC message as a single buffer.
+/// Shared by the client's own outgoing requests/notifications and the reader
+/// task's automatic responses to server-initiated requests (both write to the
+/// same stdin).
 async fn write_framed(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<()> {
     let body = serde_json::to_vec(value)?;
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(&body);
     let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-        .await?;
-    stdin.write_all(&body).await?;
+    stdin.write_all(&frame).await?;
     stdin.flush().await?;
     Ok(())
 }

@@ -369,6 +369,135 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
     }
 }
 
+/// A C# fixture whose fake server takes `delay_ms` to answer `initialize`,
+/// with a request timeout long enough that the delay is never a failure.
+fn fake_slow_start_csharp_fixture(
+    temp: &tempfile::TempDir,
+    mode: &str,
+    delay_ms: u64,
+) -> (Config, Workspace, std::path::PathBuf) {
+    let (mut config, workspace, state) = fake_csharp_fixture(temp, mode);
+    config.lsp_timeout_seconds = 10;
+    config
+        .csharp
+        .args
+        .extend(["--initialize-delay-ms".to_owned(), delay_ms.to_string()]);
+    (config, workspace, state)
+}
+
+#[tokio::test]
+async fn concurrent_requests_share_one_language_server_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) =
+        fake_slow_start_csharp_fixture(&temp, "workspace-symbols", 500);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let (first, second, third, fourth, fifth) = tokio::join!(
+        manager.symbols(&adapter, &workspace, "Calculator"),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+    );
+    for results in [first, second, third, fourth, fifth] {
+        assert_eq!(results.unwrap()[0].name.as_deref(), Some("Calculator"));
+    }
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "five callers that arrived while the server was starting must share that one start"
+    );
+}
+
+/// A caller that gives up while the server is still starting (a search past
+/// its latency budget) must not take the start down with it: the next caller
+/// finds the same server finishing, instead of a killed child and a second
+/// spawn.
+#[tokio::test]
+async fn a_caller_that_stops_waiting_does_not_kill_the_starting_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) =
+        fake_slow_start_csharp_fixture(&temp, "workspace-symbols", 800);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(150),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the first caller must give up while the server is still starting"
+    );
+    assert!(
+        !manager.running("csharp-ls", &workspace.id).await,
+        "a server that has not finished starting is not running yet"
+    );
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "the abandoned start must finish, not be killed and respawned"
+    );
+}
+
+/// Abandoning an in-flight request (rather than a start) leaves the session
+/// and the protocol stream intact: the server's late answer to the dropped
+/// request is ignored and the next request is answered normally on the same
+/// process.
+#[tokio::test]
+async fn an_abandoned_request_leaves_the_session_usable() {
+    let temp = tempfile::tempdir().unwrap();
+    // Every `workspace/symbol` after the priming one takes a second.
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 10;
+    config
+        .csharp
+        .args
+        .extend(["--symbol-delay-ms".to_owned(), "1000".to_owned()]);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    // Stop waiting 300 ms after the server is up (and primed), i.e. while the
+    // slow request is in flight. The call is dropped at the end of the block.
+    let finished = {
+        let call = manager.symbols(&adapter, &workspace, "Calculator");
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => Some(result),
+            () = async {
+                while !manager.running("csharp-ls", &workspace.id).await {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            } => None,
+        }
+    };
+    assert!(finished.is_none(), "the slow request must outlast the wait");
+    assert!(
+        manager.running("csharp-ls", &workspace.id).await,
+        "dropping a request must not discard the session"
+    );
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    // initialize, initialized, the priming request, the abandoned request,
+    // its `$/cancelRequest`, and the retry.
+    assert_eq!(state_count(&state, "request_count.txt"), 6);
+}
+
 #[tokio::test]
 async fn fake_typescript_lsp_maps_symbols_definitions_and_references() {
     for (mode, operation) in [
@@ -571,6 +700,9 @@ async fn csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation() {
         "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n",
     );
     config.lsp_timeout_seconds = 1;
+    // The server's own timeout is what this test exercises; keep the search
+    // budget out of its way.
+    config.lsp_search_budget_ms = 30_000;
     config.csharp = CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: vec![

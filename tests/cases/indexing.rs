@@ -1360,6 +1360,11 @@ async fn default_channels_keep_every_channel_and_the_reranker_on() {
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-default");
     config.lsp_timeout_seconds = 10;
+    // A fake server start (a debug-build process spawn under parallel tests)
+    // can take longer than the 1500 ms default budget. These tests are about
+    // channels, not the budget, so the budget must not be what they measure.
+    // The other tests below that set 30 s do so for the same reason.
+    config.lsp_search_budget_ms = 30_000;
     config.csharp = fake_csharp_lsp(&state);
     assert_eq!(
         config.channels,
@@ -1393,6 +1398,279 @@ async fn default_channels_keep_every_channel_and_the_reranker_on() {
     assert!(timings.lexical_search_ms > 0.0);
     assert!(timings.lsp_search_ms > 0.0);
     assert!(timings.reranking_ms > 0.0);
+    task.abort();
+}
+
+fn fake_slow_start_csharp_lsp(
+    state: &Path,
+    initialize_delay_ms: u64,
+) -> local_code_intelligence::config::CSharpLspConfig {
+    let mut csharp = fake_csharp_lsp(state);
+    csharp.args.extend([
+        "--initialize-delay-ms".to_owned(),
+        initialize_delay_ms.to_string(),
+    ]);
+    csharp
+}
+
+fn spawn_count(state: &Path) -> u64 {
+    std::fs::read_to_string(state.join("spawn_count.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Searches until one finishes without the "language server still starting"
+/// note, i.e. until the server is up and primed. Bounded at about 20 s.
+async fn search_until_the_language_server_answers(
+    app: &App,
+    workspace: &Path,
+    query: &str,
+) -> local_code_intelligence::app::SearchReport {
+    for _ in 0..100 {
+        let report = app.search(workspace, query, Some(10)).await.unwrap();
+        if report.notes.is_empty() {
+            return report;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the language server never finished starting");
+}
+
+#[tokio::test]
+async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-cold");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-cold");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 200;
+    // The server needs 1.5 s to answer `initialize`, far past the budget.
+    config.csharp = fake_slow_start_csharp_lsp(&state, 1500);
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let cold = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    assert!(
+        (150.0..1200.0).contains(&cold.timings.lsp_search_ms),
+        "the LSP channel waited {} ms: capped by the 200 ms budget, not the 1500 ms start",
+        cold.timings.lsp_search_ms
+    );
+    assert!(!cold.results.is_empty());
+    assert!(
+        !channels_seen(&cold).contains("lsp"),
+        "{:?}",
+        channels_seen(&cold)
+    );
+    assert!(
+        channels_seen(&cold).contains("semantic") && channels_seen(&cold).contains("lexical"),
+        "the other channels still answer: {:?}",
+        channels_seen(&cold)
+    );
+    // An unready server is a note, not a failure: no warning (the evaluation
+    // harness counts warnings as fallbacks), and the search succeeds.
+    assert!(cold.warning.is_none(), "{:?}", cold.warning);
+    assert_eq!(cold.notes.len(), 1, "{:?}", cold.notes);
+    assert!(
+        cold.notes[0].contains("LSP still starting") && cold.notes[0].contains("csharp-ls"),
+        "{:?}",
+        cold.notes
+    );
+    assert!(
+        serde_json::to_value(&cold).unwrap()["notes"].is_array(),
+        "the note reaches the JSON report"
+    );
+    assert!(cold.reranked, "{:?}", cold.warning);
+
+    // Giving up on the server did not discard it: the very same process
+    // finishes starting (and priming), and a later search uses it.
+    let warm = search_until_the_language_server_answers(&app, &workspace, "Calculator").await;
+    assert_eq!(
+        channels_seen(&warm),
+        channel_set(&["semantic", "lexical", "lsp"]),
+        "{:?} {:?}",
+        warm.warning,
+        warm.notes
+    );
+    assert!(warm.warning.is_none(), "{:?}", warm.warning);
+    assert!(warm.notes.is_empty(), "{:?}", warm.notes);
+    assert!(
+        serde_json::to_value(&warm).unwrap().get("notes").is_none(),
+        "a search with nothing to note leaves the field out"
+    );
+    assert_eq!(
+        spawn_count(&state),
+        1,
+        "one server served both searches: the first search did not kill it"
+    );
+    task.abort();
+}
+
+/// The first `workspace/symbol` of a real server (rust-analyzer building its
+/// symbol index) can take longer than any search budget. The server primes
+/// itself with that request in the background; searches in the meantime get
+/// the budget note instead of cancelling it, and later ones hit the primed
+/// server.
+#[tokio::test]
+async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_primed_server() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-priming");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-priming");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 200;
+    config.csharp = fake_csharp_lsp(&state);
+    config
+        .csharp
+        .args
+        .extend(["--first-symbol-delay-ms".to_owned(), "2000".to_owned()]);
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    // The server starts at once; its priming request takes 2 s.
+    for attempt in 0..2 {
+        let early = app
+            .search(&workspace, "Calculator", Some(10))
+            .await
+            .unwrap();
+        assert!(early.warning.is_none(), "{:?}", early.warning);
+        assert_eq!(early.notes.len(), 1, "search {attempt}: {:?}", early.notes);
+        assert!(
+            !channels_seen(&early).contains("lsp"),
+            "search {attempt} ran during priming"
+        );
+        assert!(
+            early.timings.lsp_search_ms < 1200.0,
+            "search {attempt} waited {} ms for priming instead of its 200 ms budget",
+            early.timings.lsp_search_ms
+        );
+    }
+
+    let primed = search_until_the_language_server_answers(&app, &workspace, "Calculator").await;
+    assert_eq!(
+        channels_seen(&primed),
+        channel_set(&["semantic", "lexical", "lsp"]),
+        "{:?} {:?}",
+        primed.warning,
+        primed.notes
+    );
+    assert!(primed.warning.is_none(), "{:?}", primed.warning);
+    assert!(
+        primed.timings.lsp_search_ms < 200.0,
+        "a primed server answers inside the budget: {} ms",
+        primed.timings.lsp_search_ms
+    );
+    assert_eq!(spawn_count(&state), 1, "priming reuses the one server");
+    task.abort();
+}
+
+/// With the language-server channel alone, a server that is still starting
+/// is a clean miss with a note: it did not fail, and the search has nothing
+/// else to answer with.
+#[tokio::test]
+async fn a_cold_language_server_alone_is_a_clean_miss_with_a_note_not_an_error() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.semantic = false;
+    config.channels.lexical = false;
+    config.channels.reranker = false;
+    let workspace = temp.path().join("channels-lsp-only-cold");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-lsp-only-cold");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 200;
+    config.csharp = fake_slow_start_csharp_lsp(&state, 1500);
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let cold = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .expect("a server that is only starting is not a failed channel");
+    assert!(cold.results.is_empty());
+    assert!(cold.warning.is_none(), "{:?}", cold.warning);
+    assert_eq!(cold.notes.len(), 1, "{:?}", cold.notes);
+    assert!(
+        cold.notes[0].contains("LSP still starting"),
+        "{:?}",
+        cold.notes
+    );
+
+    // Once it is up, the same search finds the symbol.
+    let warm = search_until_the_language_server_answers(&app, &workspace, "Calculator").await;
+    assert_eq!(channels_seen(&warm), channel_set(&["lsp"]));
+    task.abort();
+}
+
+/// A provider that answers some of a search's symbol queries before the
+/// budget runs out keeps those answers; only the rest is lost.
+#[tokio::test]
+async fn answers_gathered_before_the_budget_ran_out_are_kept() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-partial");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-partial");
+    config.lsp_timeout_seconds = 10;
+    // Four terms make four symbol queries of 500 ms each: the first ones fit
+    // the budget (together with the server's start), all four cannot.
+    config.lsp_search_budget_ms = 1800;
+    config.csharp = fake_csharp_lsp(&state);
+    config
+        .csharp
+        .args
+        .extend(["--symbol-delay-ms".to_owned(), "500".to_owned()]);
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .search(&workspace, "calculator alpha beta gamma", Some(10))
+        .await
+        .unwrap();
+    assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+    assert!(
+        channels_seen(&report).contains("lsp"),
+        "the symbols answered before the budget expired are kept: {:?} {:?}",
+        channels_seen(&report),
+        report.warning
+    );
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_searches_start_one_language_server() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("channels-concurrent");
+    write_channel_workspace(&workspace);
+    let state = temp.path().join("lsp-state-concurrent");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 30_000;
+    config.csharp = fake_slow_start_csharp_lsp(&state, 500);
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let (first, second, third) = tokio::join!(
+        app.search(&workspace, "Calculator", Some(10)),
+        app.search(&workspace, "Calculator", Some(10)),
+        app.search(&workspace, "Calculator", Some(10)),
+    );
+    for report in [first.unwrap(), second.unwrap(), third.unwrap()] {
+        assert!(
+            channels_seen(&report).contains("lsp"),
+            "{:?} {:?}",
+            report.warning,
+            report.notes
+        );
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+    }
+    assert_eq!(
+        spawn_count(&state),
+        1,
+        "searches that arrived while the server was starting share that start"
+    );
     task.abort();
 }
 
@@ -1445,6 +1723,7 @@ async fn each_channel_switch_removes_exactly_that_channel() {
         let name = variant.name;
         let mut variant_config = config.clone();
         variant_config.lsp_timeout_seconds = 10;
+        variant_config.lsp_search_budget_ms = 30_000;
         let state = state_root.join(name);
         variant_config.csharp = fake_csharp_lsp(&state);
         match name {
@@ -1775,6 +2054,7 @@ async fn with_semantic_off_a_clean_miss_is_empty_but_failed_channels_are_an_erro
     config.channels.semantic = false;
     config.channels.reranker = false;
     config.lsp_timeout_seconds = 10;
+    config.lsp_search_budget_ms = 30_000;
     let workspace = temp.path().join("semantic-off-failures");
     write_channel_workspace(&workspace);
     let missing_rg = "definitely-missing-ripgrep";

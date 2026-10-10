@@ -10,7 +10,10 @@ use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 pub const LANGUAGE_IDENTIFIER: &str = "rust";
 
@@ -84,8 +87,24 @@ impl LspAdapter for RustServer {
             // the capability is advertised. Give crate discovery a bounded
             // head start, then rely on normal request timeouts and restart
             // recovery.
+            //
+            // This runs inside the session's detached start, never on a
+            // search's own future: a search waits for it only up to its
+            // `lsp_search_budget_ms`, and the wait carries on afterwards.
             let readiness_wait = self.timeout.min(Duration::from_secs(10));
-            let _ = rpc.wait_ready(readiness_wait).await;
+            let started = Instant::now();
+            if rpc.wait_ready(readiness_wait).await {
+                tracing::debug!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "rust-analyzer reported quiescence"
+                );
+            } else {
+                tracing::warn!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "rust-analyzer did not report quiescence within the readiness wait; \
+                     continuing, workspace symbols may be incomplete until indexing finishes"
+                );
+            }
         }
         Ok(())
     }
