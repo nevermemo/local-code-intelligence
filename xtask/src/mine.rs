@@ -19,6 +19,16 @@
 //!   changed or quotes an identifier, so every query is tagged `keyword` or
 //!   `keyword-agnostic` and the report stratifies on that tag.
 //!
+//! Two more tag axes let the report separate queries a miss says little about.
+//! `gold-drift` marks a commit with more than half of its changed lines (added
+//! plus deleted, from `git log --numstat`) in files that are not gold:
+//! unsupported or excluded files, deleted files, and files gone from `HEAD`
+//! even after later renames. The gold is then a minority of the change, so a
+//! miss may not be a retrieval failure. A pure move counts on both sides of the
+//! rename. `short-query` and `long-query` mark query text of fewer than
+//! [`SHORT_QUERY_MAX_WORDS`] words and of [`LONG_QUERY_MIN_WORDS`] words or
+//! more.
+//!
 //! The result is evaluation data, never ranking input: it is generated, not
 //! hand-edited, and must not be used to tune retrieval.
 //!
@@ -57,6 +67,15 @@ const MINED_TOP_K: usize = 10;
 
 const TAG_KEYWORD: &str = "keyword";
 const TAG_KEYWORD_AGNOSTIC: &str = "keyword-agnostic";
+const TAG_GOLD_DRIFT: &str = "gold-drift";
+const TAG_SHORT_QUERY: &str = "short-query";
+const TAG_LONG_QUERY: &str = "long-query";
+
+/// Query text with fewer words than this (exclusive bound) is `short-query`.
+/// Words are counted on the text sent to search, like [`MIN_SUBJECT_WORDS`].
+const SHORT_QUERY_MAX_WORDS: usize = 8;
+/// Query text with at least this many words is `long-query`.
+const LONG_QUERY_MIN_WORDS: usize = 25;
 
 /// Directory names whose contents are vendored, generated or build output.
 const EXCLUDED_DIRS: &[&str] = &[
@@ -139,6 +158,9 @@ const TRAILER_KEYS: &[&str] = &[
 /// `git log` pretty format: record separator, hash, subject and body, each
 /// field closed by a unit separator. `--name-status` lines follow the format.
 const LOG_FORMAT: &str = "--format=%x1e%H%x1f%s%x1f%b%x1f";
+/// The same for the `--numstat` call, which needs only the hash: git drops
+/// `--numstat` output when `--name-status` is also given.
+const NUMSTAT_FORMAT: &str = "--format=%x1e%H%x1f";
 const RECORD_SEPARATOR: char = '\u{1e}';
 const FIELD_SEPARATOR: char = '\u{1f}';
 
@@ -171,6 +193,9 @@ struct Commit {
     subject: String,
     body: String,
     changes: Vec<Change>,
+    /// Lines added plus deleted per path (see [`parse_numstat`]). Empty when
+    /// the commit has no line data, which never flags `gold-drift`.
+    lines: BTreeMap<String, u64>,
 }
 
 /// Parse the output of `git log --name-status` with [`LOG_FORMAT`].
@@ -193,9 +218,61 @@ fn parse_log(raw: &str) -> Vec<Commit> {
                 subject: subject.to_owned(),
                 body: body.replace("\r\n", "\n"),
                 changes: status_lines.lines().filter_map(parse_change).collect(),
+                lines: BTreeMap::new(),
             })
         })
         .collect()
+}
+
+/// Parse the output of `git log --numstat --no-renames` with
+/// [`NUMSTAT_FORMAT`] into the lines added plus deleted per path, by commit
+/// hash. `--no-renames` lists a move as a delete and an add, so both of its
+/// paths appear (the brace form `{src => lci-core/src}/x.rs` never does). A
+/// binary file (`-\t-`) counts 0, and paths git quotes are skipped, as in
+/// [`parse_change`].
+fn parse_numstat(raw: &str) -> BTreeMap<String, BTreeMap<String, u64>> {
+    raw.split(RECORD_SEPARATOR)
+        .filter_map(|record| {
+            let (hash, numstat_lines) = record.split_once(FIELD_SEPARATOR)?;
+            let hash = hash.trim();
+            if hash.is_empty() {
+                return None;
+            }
+            let mut lines = BTreeMap::new();
+            for (path, count) in numstat_lines.lines().filter_map(parse_numstat_line) {
+                *lines.entry(path).or_insert(0) += count;
+            }
+            Some((hash.to_owned(), lines))
+        })
+        .collect()
+}
+
+fn parse_numstat_line(line: &str) -> Option<(String, u64)> {
+    let mut columns = line.trim_end_matches('\r').splitn(3, '\t');
+    let count = |column: &str| match column {
+        "-" => Some(0),
+        digits => digits.parse::<u64>().ok(),
+    };
+    let added = count(columns.next()?)?;
+    let deleted = count(columns.next()?)?;
+    let path = columns.next()?;
+    if path.is_empty() || path.starts_with('"') {
+        return None;
+    }
+    Some((path.to_owned(), added + deleted))
+}
+
+/// The lines a change touched: its path's count, plus for a rename the count
+/// of the path it came from, because `--no-renames` reports a move as a
+/// delete of the old path and an add of the new one. A copy leaves its source
+/// where it is, so only the copy's own lines count.
+fn change_churn(lines: &BTreeMap<String, u64>, change: &Change) -> u64 {
+    let count = |path: &str| lines.get(path).copied().unwrap_or(0);
+    let moved_from = match (change.status, &change.renamed_from) {
+        ('R', Some(from)) => count(from),
+        _ => 0,
+    };
+    count(&change.path) + moved_from
 }
 
 fn parse_change(line: &str) -> Option<Change> {
@@ -554,7 +631,9 @@ struct MinedQuery {
     subject: String,
     query: String,
     expected_paths: Vec<String>,
-    tag: &'static str,
+    /// The keyword tag first, then `gold-drift` and the length tag when they
+    /// apply, in that order.
+    tags: Vec<&'static str>,
 }
 
 /// Why a commit did not become a query.
@@ -659,14 +738,19 @@ fn mine_commit(
     if touched.len() > MAX_TOUCHED_FILES {
         return Err(Skip::TooManyFiles);
     }
-    // A path the commit deleted is not a result even if a later commit
-    // recreated it: the file at HEAD is not the one this commit touched. A
-    // path a later commit moved is looked for under its new name.
-    let expected_paths: Vec<String> = eligible
+    // The gold path of a change, if it has one. A path the commit deleted is
+    // not a result even if a later commit recreated it: the file at HEAD is
+    // not the one this commit touched. A path a later commit moved is looked
+    // for under its new name.
+    let gold_path = |change: &Change| -> Option<String> {
+        (is_eligible_path(&change.path) && change.status != 'D')
+            .then(|| chase_renames(&change.path, later_renames))
+            .filter(|path| is_eligible_path(path) && head_files.contains(path))
+    };
+    let expected_paths: Vec<String> = commit
+        .changes
         .iter()
-        .filter(|change| change.status != 'D')
-        .map(|change| chase_renames(&change.path, later_renames))
-        .filter(|path| is_eligible_path(path) && head_files.contains(path))
+        .filter_map(gold_path)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -674,18 +758,44 @@ fn mine_commit(
         return Err(Skip::NotAtHead);
     }
 
+    // Every change that is not gold is drift away from the gold, including
+    // the unsupported files (documentation, lockfiles) the file cap ignores.
+    let (mut gold_churn, mut drift_churn) = (0, 0);
+    for change in &commit.changes {
+        let churn = change_churn(&commit.lines, change);
+        if gold_path(change).is_some() {
+            gold_churn += churn;
+        } else {
+            drift_churn += churn;
+        }
+    }
+
     let query = query_text(&commit.subject, &commit.body);
-    let tag = if names_a_touched_file(&query, &touched) || has_identifier_shape(&query) {
-        TAG_KEYWORD
-    } else {
-        TAG_KEYWORD_AGNOSTIC
-    };
+    let mut tags = vec![
+        if names_a_touched_file(&query, &touched) || has_identifier_shape(&query) {
+            TAG_KEYWORD
+        } else {
+            TAG_KEYWORD_AGNOSTIC
+        },
+    ];
+    // Strictly more than half of the churn: the 50% bound was fixed in the
+    // roadmap before any set was tagged, so an exact tie is not drift.
+    if drift_churn > gold_churn {
+        tags.push(TAG_GOLD_DRIFT);
+    }
+    // Words of the text sent to search, so an appended body paragraph counts
+    // and a stripped `(#12)` does not.
+    match query.split_whitespace().count() {
+        words if words < SHORT_QUERY_MAX_WORDS => tags.push(TAG_SHORT_QUERY),
+        words if words >= LONG_QUERY_MIN_WORDS => tags.push(TAG_LONG_QUERY),
+        _ => {}
+    }
     Ok(MinedQuery {
         commit: commit.hash.clone(),
         subject: subject.to_owned(),
         query,
         expected_paths,
-        tag,
+        tags,
     })
 }
 
@@ -782,9 +892,15 @@ fn render_toml(key: &str, head: &str, max: usize, queries: &[MinedQuery]) -> Str
          # in any spelling) or contains a code-identifier-shaped token (snake_case,\n\
          # `::`, `--flag`, `/` between lowercase letters or digits, `.` between word\n\
          # characters, camelCase or PascalCase; common proper nouns like JavaScript\n\
-         # do not count); `keyword-agnostic` means it does neither. The report breaks\n\
-         # the metrics out per tag. `top_k = {MINED_TOP_K}` keeps the @10 metrics from\n\
-         # being window-bound.\n\
+         # do not count); `keyword-agnostic` means it does neither. `gold-drift` means\n\
+         # more than half of the commit's changed lines (added plus deleted; a pure\n\
+         # move counts on both sides) are in files that are not gold: unsupported or\n\
+         # excluded files, deleted files, and files gone from HEAD even after later\n\
+         # renames, so a miss may not be a retrieval failure. `short-query` means the\n\
+         # query text has fewer than {SHORT_QUERY_MAX_WORDS} words and `long-query` that it has\n\
+         # {LONG_QUERY_MIN_WORDS} or more (query-text words, so an appended body paragraph counts).\n\
+         # The report breaks the metrics out per tag. `top_k = {MINED_TOP_K}` keeps the\n\
+         # @10 metrics from being window-bound.\n\
          # The checked-in hand-written set stays evaluations/core.toml.\n",
         toml_string(key)
     );
@@ -802,7 +918,7 @@ fn render_toml(key: &str, head: &str, max: usize, queries: &[MinedQuery]) -> Str
             toml_string(key),
             toml_string(&query.query),
             toml_array(&query.expected_paths),
-            toml_array([query.tag]),
+            toml_array(&query.tags),
         );
     }
     out
@@ -867,7 +983,38 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
             "HEAD",
         ],
     )?;
-    let commits = parse_log(&log);
+    // Line counts need a second call: git drops `--numstat` output when
+    // `--name-status` is present. `--no-renames` keeps the paths plain.
+    let numstat = git(
+        &repo,
+        &[
+            "-c",
+            "core.quotepath=off",
+            "log",
+            "--no-merges",
+            "--numstat",
+            "--no-renames",
+            "--no-color",
+            "--no-show-signature",
+            "--encoding=UTF-8",
+            NUMSTAT_FORMAT,
+            "HEAD",
+        ],
+    )?;
+    let mut lines = parse_numstat(&numstat);
+    let mut commits = parse_log(&log);
+    for commit in &mut commits {
+        // The numstat log prints a record for every commit, even one with no
+        // files; a missing record means the two logs disagree (e.g. HEAD moved
+        // between them), and that commit can never be flagged `gold-drift`.
+        match lines.remove(&commit.hash) {
+            Some(commit_lines) => commit.lines = commit_lines,
+            None => eprintln!(
+                "warning: no line counts for commit {}; it cannot be tagged {TAG_GOLD_DRIFT}",
+                commit.hash
+            ),
+        }
+    }
     let mined = mine(&commits, &head_files, max);
     ensure!(
         !mined.queries.is_empty(),
@@ -887,16 +1034,20 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
         mined
             .queries
             .iter()
-            .filter(|query| query.tag == tag)
+            .filter(|query| query.tags.contains(&tag))
             .count()
     };
     println!(
-        "Wrote {} queries to {} (HEAD {}): {} {TAG_KEYWORD}, {} {TAG_KEYWORD_AGNOSTIC}.",
+        "Wrote {} queries to {} (HEAD {}): {} {TAG_KEYWORD}, {} {TAG_KEYWORD_AGNOSTIC}; \
+         {} {TAG_GOLD_DRIFT}, {} {TAG_SHORT_QUERY}, {} {TAG_LONG_QUERY}.",
         mined.queries.len(),
         out.display(),
         short_hash(&head),
         count(TAG_KEYWORD),
         count(TAG_KEYWORD_AGNOSTIC),
+        count(TAG_GOLD_DRIFT),
+        count(TAG_SHORT_QUERY),
+        count(TAG_LONG_QUERY),
     );
     println!(
         "Scanned {} of {} non-merge commits; skipped:",
@@ -949,6 +1100,18 @@ mod tests {
                 .iter()
                 .map(|(status, path)| change(*status, path))
                 .collect(),
+            lines: BTreeMap::new(),
+        }
+    }
+
+    /// `commit` with the `--numstat` line counts of the given paths.
+    fn with_lines(commit: Commit, lines: &[(&str, u64)]) -> Commit {
+        Commit {
+            lines: lines
+                .iter()
+                .map(|(path, count)| ((*path).to_owned(), *count))
+                .collect(),
+            ..commit
         }
     }
 
@@ -995,6 +1158,66 @@ mod tests {
         assert_eq!(commits[1].body, "");
         assert_eq!(commits[1].changes, vec![change('M', "README.md")]);
         assert!(commits[2].changes.is_empty());
+    }
+
+    #[test]
+    fn parses_numstat_log_output() {
+        let raw = format!(
+            "{rs}aaaa{us}\n\n12\t3\tsrc/metric.rs\n-\t-\tassets/logo.png\n\
+             4\t5\t\"src/we\\\"ird.rs\"\n0\t323\tsrc/lexical.rs\r\n\
+             {rs}bbbb{us}\n\n323\t0\tlci-core/src/lexical.rs\n0\t323\tsrc/lexical.rs\r\n\
+             {rs}cccc{us}\n",
+            rs = RECORD_SEPARATOR,
+            us = FIELD_SEPARATOR,
+        );
+        let numstat = parse_numstat(&raw);
+        assert_eq!(numstat.len(), 3);
+
+        // Lines added plus deleted; a binary file is present but counts 0; a
+        // quoted path is dropped; a CRLF line ending is tolerated.
+        assert_eq!(
+            numstat["aaaa"],
+            BTreeMap::from([
+                ("assets/logo.png".to_owned(), 0),
+                ("src/lexical.rs".to_owned(), 323),
+                ("src/metric.rs".to_owned(), 15),
+            ])
+        );
+        // `--no-renames` reports a move as an add and a delete: both paths.
+        assert_eq!(
+            numstat["bbbb"],
+            BTreeMap::from([
+                ("lci-core/src/lexical.rs".to_owned(), 323),
+                ("src/lexical.rs".to_owned(), 323),
+            ])
+        );
+        assert!(numstat["cccc"].is_empty());
+    }
+
+    #[test]
+    fn a_rename_joins_the_lines_of_both_its_paths() {
+        let lines = BTreeMap::from([
+            ("src/old.rs".to_owned(), 7),
+            ("lci-core/src/new.rs".to_owned(), 40),
+            ("src/template.rs".to_owned(), 100),
+            ("src/copy.rs".to_owned(), 9),
+            ("src/edited.rs".to_owned(), 3),
+        ]);
+        // A move is a delete of the old path plus an add of the new one.
+        assert_eq!(
+            change_churn(&lines, &moved('R', "src/old.rs", "lci-core/src/new.rs")),
+            47
+        );
+        // A copy leaves its source in place: only the copy's own lines count.
+        assert_eq!(
+            change_churn(&lines, &moved('C', "src/template.rs", "src/copy.rs")),
+            9
+        );
+        assert_eq!(change_churn(&lines, &change('M', "src/edited.rs")), 3);
+        // A path with no line data (git printed it quoted, or the commit has
+        // none) contributes nothing.
+        assert_eq!(change_churn(&lines, &change('M', "src/unknown.rs")), 0);
+        assert_eq!(change_churn(&BTreeMap::new(), &change('M', "src/a.rs")), 0);
     }
 
     // -- filters ------------------------------------------------------------
@@ -1602,7 +1825,7 @@ mod tests {
         let tag = |subject: &str, body: &str| {
             mine_commit(&commit(subject, body, &[('M', "src/app/search.rs")]), &tree)
                 .unwrap()
-                .tag
+                .tags[0]
         };
         // None of these name search.rs; the identifier alone is lexical.
         for subject in [
@@ -1643,7 +1866,7 @@ mod tests {
             &tree,
         )
         .unwrap();
-        assert_eq!(keyword.tag, "keyword");
+        assert_eq!(keyword.tags[0], "keyword");
 
         let agnostic = mine_commit(
             &commit(
@@ -1654,7 +1877,7 @@ mod tests {
             &tree,
         )
         .unwrap();
-        assert_eq!(agnostic.tag, "keyword-agnostic");
+        assert_eq!(agnostic.tags[0], "keyword-agnostic");
 
         // The tag looks at the text sent to search, so a file named only in the
         // appended body paragraph still makes the query a keyword query.
@@ -1667,7 +1890,7 @@ mod tests {
             &tree,
         )
         .unwrap();
-        assert_eq!(via_body.tag, "keyword");
+        assert_eq!(via_body.tags[0], "keyword");
 
         // A deleted touched file still counts as named.
         let deleted = mine_commit(
@@ -1679,8 +1902,162 @@ mod tests {
             &tree,
         )
         .unwrap();
-        assert_eq!(deleted.tag, "keyword");
+        assert_eq!(deleted.tags[0], "keyword");
         assert_eq!(deleted.expected_paths, ["src/metrics.rs"]);
+    }
+
+    /// Nine words, no file name or identifier shape: keyword-agnostic and
+    /// neither short nor long, so only the tag under test shows up.
+    const MID_SUBJECT: &str = "Make results appear faster for very large indexed workspaces";
+
+    /// The tags of a commit that changes `changes` (status, path, lines)
+    /// while `tree` is the tree at HEAD.
+    fn tags_of(changes: &[(char, &str, u64)], tree: &[&str]) -> Vec<&'static str> {
+        let paths: Vec<(char, &str)> = changes
+            .iter()
+            .map(|&(status, path, _)| (status, path))
+            .collect();
+        let lines: Vec<(&str, u64)> = changes.iter().map(|&(_, path, n)| (path, n)).collect();
+        let commit = with_lines(commit(MID_SUBJECT, "", &paths), &lines);
+        mine_commit(&commit, &head(tree)).unwrap().tags
+    }
+
+    #[test]
+    fn flags_gold_drift_when_most_churn_is_in_dropped_or_unsupported_files() {
+        let tree = ["src/a.rs"];
+        let flagged = vec![TAG_KEYWORD_AGNOSTIC, TAG_GOLD_DRIFT];
+        let plain = vec![TAG_KEYWORD_AGNOSTIC];
+
+        // Unsupported files: documentation and a lockfile outweigh the gold.
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 10), ('M', "docs/guide.md", 30)], &tree),
+            flagged
+        );
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 10), ('M', "Cargo.lock", 30)], &tree),
+            flagged
+        );
+        // Excluded paths are unsupported too, even with a supported extension.
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 10), ('M', "vendor/x/y.go", 30)], &tree),
+            flagged
+        );
+        // A deleted source file is dropped gold.
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 10), ('D', "src/gone.rs", 30)], &tree),
+            flagged
+        );
+        // So is an eligible file that is not at HEAD (a split with no
+        // detected rename looks like this).
+        assert_eq!(
+            tags_of(
+                &[('M', "src/a.rs", 10), ('M', "src/vanished.rs", 30)],
+                &tree
+            ),
+            flagged
+        );
+
+        // Gold is the majority.
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 40), ('M', "README.md", 10)], &tree),
+            plain
+        );
+        // Exactly half is not "more than half".
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 20), ('M', "README.md", 20)], &tree),
+            plain
+        );
+        // Without line data (nothing printed, or only binary files) there is
+        // no drift to measure.
+        assert_eq!(
+            tags_of(&[('M', "src/a.rs", 0), ('M', "README.md", 0)], &tree),
+            plain
+        );
+        let no_data = commit(MID_SUBJECT, "", &[('M', "src/a.rs"), ('M', "README.md")]);
+        assert_eq!(mine_commit(&no_data, &head(&tree)).unwrap().tags, plain);
+    }
+
+    #[test]
+    fn a_file_kept_through_a_later_rename_is_not_drift() {
+        let tree = head(&["lci-core/src/lsp.rs", "src/other.rs"]);
+        let moves = [rename("src/lsp.rs", "lci-core/src/lsp.rs")];
+        let edit = with_lines(
+            commit(
+                MID_SUBJECT,
+                "",
+                &[('M', "src/lsp.rs"), ('M', "src/other.rs")],
+            ),
+            &[("src/lsp.rs", 30), ("src/other.rs", 20)],
+        );
+        // Chased to its new name, `src/lsp.rs` is gold, not drift.
+        let chased = super::mine_commit(&edit, &tree, &moves).unwrap();
+        assert_eq!(
+            chased.expected_paths,
+            ["lci-core/src/lsp.rs", "src/other.rs"]
+        );
+        assert_eq!(chased.tags, [TAG_KEYWORD_AGNOSTIC]);
+        // Without the later move the same 30 lines are in a file gone from
+        // HEAD, which outweighs the 20 that survived.
+        let unchased = mine_commit(&edit, &tree).unwrap();
+        assert_eq!(unchased.expected_paths, ["src/other.rs"]);
+        assert_eq!(unchased.tags, [TAG_KEYWORD_AGNOSTIC, TAG_GOLD_DRIFT]);
+
+        // A commit that itself moves a file that survives is all gold: the
+        // delete and the add of a pure move both count on the gold side.
+        let pure_move = with_lines(
+            Commit {
+                changes: vec![moved('R', "src/old_home.rs", "src/new_home.rs")],
+                ..commit(MID_SUBJECT, "", &[])
+            },
+            &[("src/old_home.rs", 50), ("src/new_home.rs", 50)],
+        );
+        let moved_tree = head(&["src/new_home.rs"]);
+        // The new path's stem is distinctive but absent from the subject.
+        let mined = mine_commit(&pure_move, &moved_tree).unwrap();
+        assert_eq!(mined.expected_paths, ["src/new_home.rs"]);
+        assert_eq!(mined.tags, [TAG_KEYWORD_AGNOSTIC]);
+    }
+
+    #[test]
+    fn tags_query_length_on_the_text_sent_to_search() {
+        let tree = head(&["src/a.rs"]);
+        let tags = |subject: &str, body: &str| {
+            mine_commit(&commit(subject, body, &[('M', "src/a.rs")]), &tree)
+                .unwrap()
+                .tags
+        };
+        let words = |count: usize| {
+            (0..count)
+                .map(|index| format!("word{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let agnostic = vec![TAG_KEYWORD_AGNOSTIC];
+        let short = vec![TAG_KEYWORD_AGNOSTIC, TAG_SHORT_QUERY];
+        let long = vec![TAG_KEYWORD_AGNOSTIC, TAG_LONG_QUERY];
+
+        // Short is fewer than 8 words, long is 25 or more; between is neither.
+        assert_eq!(tags(&words(7), ""), short);
+        assert_eq!(tags(&words(8), ""), agnostic);
+        assert_eq!(tags(&words(24), ""), agnostic);
+        assert_eq!(tags(&words(25), ""), long);
+
+        // The appended body paragraph counts: a 5-word subject is short, and
+        // the same subject with 22 new words of body is 27 words of query.
+        let paragraph: String = (0..22).map(|index| format!("extra{index} ")).collect();
+        assert_eq!(tags(&words(5), ""), short);
+        assert_eq!(tags(&words(5), &paragraph), long);
+        // A body that lifts it to 8 words only leaves the short band.
+        assert_eq!(tags(&words(5), "extra0 extra1 extra2"), agnostic);
+
+        // A pull-request reference is stripped before the text is sent, so it
+        // does not count toward the length.
+        assert_eq!(tags(&format!("{} (#12)", words(7)), ""), short);
+        assert_eq!(tags(&format!("{} (#12)", words(24)), ""), agnostic);
+
+        // The keyword tag is always first, whatever follows it.
+        let keyword = tags("Expose list_indexed_files to the agent", "");
+        assert_eq!(keyword, [TAG_KEYWORD, TAG_SHORT_QUERY]);
     }
 
     // -- paths ----------------------------------------------------------------
@@ -1756,14 +2133,14 @@ mod tests {
                 subject: "Speed up search".to_owned(),
                 query: "Speed up \"search\" for big repos".to_owned(),
                 expected_paths: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()],
-                tag: "keyword",
+                tags: vec!["keyword", "gold-drift", "short-query"],
             },
             MinedQuery {
                 commit: "fedcba9876543210".to_owned(),
                 subject: "Make results faster".to_owned(),
                 query: "Make results faster".to_owned(),
                 expected_paths: vec!["src/c.rs".to_owned()],
-                tag: "keyword-agnostic",
+                tags: vec!["keyword-agnostic"],
             },
         ];
         let toml = render_toml("self", "deadbeef", 300, &queries);
@@ -1775,11 +2152,22 @@ mod tests {
         assert!(toml.contains("formatting, lint or typo commits are skipped"));
         assert!(toml.contains("through later renames"));
         assert!(toml.contains("code-identifier-shaped token"));
+        for phrase in [
+            "`gold-drift` means",
+            "`short-query` means",
+            "`long-query` that",
+            "fewer than 8 words",
+            "# 25 or more (query-text words",
+            "a pure\n# move counts on both sides",
+        ] {
+            assert!(toml.contains(phrase), "{phrase}");
+        }
         assert!(toml.contains("[[workspaces]]\nkey = \"self\"\nrequired = true\n"));
         assert!(toml.contains(
             "\n# 0123456 Speed up search\n[[queries]]\nworkspace = \"self\"\n\
              query = \"Speed up \\\"search\\\" for big repos\"\ntop_k = 10\n\
-             expected_paths = [\"src/a.rs\", \"src/b.rs\"]\ntags = [\"keyword\"]\n"
+             expected_paths = [\"src/a.rs\", \"src/b.rs\"]\n\
+             tags = [\"keyword\", \"gold-drift\", \"short-query\"]\n"
         ));
         assert!(toml.contains(
             "\n# fedcba9 Make results faster\n[[queries]]\nworkspace = \"self\"\n\

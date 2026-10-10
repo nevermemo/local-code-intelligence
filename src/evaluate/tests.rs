@@ -1227,10 +1227,28 @@ fn checked_in_definitions_load_and_validate() {
                  with `cargo xtask mine-queries --repo . --key self --out evaluations/mined/self.toml`"
             );
         }
-        assert_eq!(query.tags.len(), 1, "{}", query.query);
+        // The keyword tag comes first; `gold-drift` and one length tag may
+        // follow, each at most once.
+        assert!(!query.tags.is_empty(), "{}", query.query);
         assert!(
             ["keyword", "keyword-agnostic"].contains(&query.tags[0].as_str()),
             "{}",
+            query.query
+        );
+        let extra = &query.tags[1..];
+        for tag in extra {
+            assert!(
+                ["gold-drift", "short-query", "long-query"].contains(&tag.as_str()),
+                "unknown tag {tag}: {}",
+                query.query
+            );
+        }
+        let distinct: std::collections::BTreeSet<&String> = extra.iter().collect();
+        assert_eq!(distinct.len(), extra.len(), "{}", query.query);
+        let has = |name: &str| extra.iter().any(|tag| tag.as_str() == name);
+        assert!(
+            !(has("short-query") && has("long-query")),
+            "short and long are exclusive: {}",
             query.query
         );
     }

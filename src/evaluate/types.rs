@@ -70,8 +70,9 @@ pub struct EvalQuery {
     pub required_snippet: Option<String>,
     /// Free-form labels that stratify the aggregate: the report carries one
     /// [`TagAggregate`] per distinct tag. Generated query sets use
-    /// `keyword` and `keyword-agnostic`. Tags never affect search or the
-    /// per-query metrics.
+    /// `keyword` or `keyword-agnostic`, optionally followed by `gold-drift`
+    /// and one of `short-query` / `long-query`. Tags never affect search or
+    /// the per-query metrics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
