@@ -86,9 +86,10 @@ impl Default for ChannelsConfig {
 ///
 /// Each channel contributes `weight / (rrf_k + rank)` for a chunk it returned,
 /// and a chunk several channels returned sums those contributions. The
-/// source-role prior is added afterwards and is never scaled by a weight. All
-/// weights default to `1.0`, which is plain RRF: a file without a `[fusion]`
-/// section ranks and scores exactly as before. `rrf_k` stays a top-level key.
+/// source-role prior is added afterwards and is never scaled by a weight.
+/// `semantic_weight` defaults to `2.0` and the other two to `1.0`; setting all
+/// three to `1.0` (`FusionConfig::UNIT`) is plain unweighted RRF. `rrf_k` stays
+/// a top-level key.
 ///
 /// A weight must be finite and greater than zero. Turning a channel off is the
 /// job of `[channels]` (which also skips the channel's work); a zero weight
@@ -108,12 +109,23 @@ pub struct FusionConfig {
     pub lsp_weight: f32,
 }
 
+impl FusionConfig {
+    /// Plain unweighted RRF: every channel weighs `1.0`.
+    pub const UNIT: Self = Self {
+        semantic_weight: 1.0,
+        lexical_weight: 1.0,
+        lsp_weight: 1.0,
+    };
+}
+
 impl Default for FusionConfig {
+    /// `semantic_weight = 2.0` (roadmap F2a: fusion-only mined-set MRR +0.059,
+    /// CI [+0.012, +0.118], held-out halves agree, core ranks unchanged,
+    /// reranked confirm n.s.); lexical and LSP stay at `1.0`.
     fn default() -> Self {
         Self {
-            semantic_weight: 1.0,
-            lexical_weight: 1.0,
-            lsp_weight: 1.0,
+            semantic_weight: 2.0,
+            ..Self::UNIT
         }
     }
 }
@@ -182,8 +194,8 @@ pub struct Config {
     pub index: IndexConfig,
     /// Query-time channel and reranker switches; all enabled by default.
     pub channels: ChannelsConfig,
-    /// Per-channel Reciprocal Rank Fusion weights; all `1.0` (plain RRF) by
-    /// default.
+    /// Per-channel Reciprocal Rank Fusion weights; `semantic_weight = 2.0`,
+    /// `lexical_weight = lsp_weight = 1.0` by default (all `1.0` is plain RRF).
     pub fusion: FusionConfig,
 }
 
@@ -976,26 +988,35 @@ mod tests {
     }
 
     #[test]
-    fn fusion_defaults_to_unit_weights() {
-        let unit = FusionConfig {
-            semantic_weight: 1.0,
+    fn fusion_defaults_to_semantic_weight_two() {
+        let expected = FusionConfig {
+            semantic_weight: 2.0,
             lexical_weight: 1.0,
             lsp_weight: 1.0,
         };
         // The default, a file without the section, and an empty section all
-        // mean plain RRF.
+        // mean semantic_weight 2.0 with lexical and LSP at 1.0.
         let config = Config::default();
         config.validate().unwrap();
-        assert_eq!(config.fusion, unit);
-        assert_eq!(FusionConfig::default(), unit);
+        assert_eq!(config.fusion, expected);
+        assert_eq!(FusionConfig::default(), expected);
         let absent: Config = toml::from_str(&base_toml()).unwrap();
         absent.validate().unwrap();
-        assert_eq!(absent.fusion, unit);
+        assert_eq!(absent.fusion, expected);
         let empty: Config = toml::from_str(&format!("{}[fusion]\n", base_toml())).unwrap();
         empty.validate().unwrap();
-        assert_eq!(empty.fusion, unit);
+        assert_eq!(empty.fusion, expected);
 
-        // A section overrides only the weights it names.
+        // Plain unweighted RRF is one explicit line away, and is not the
+        // default.
+        assert_ne!(FusionConfig::default(), FusionConfig::UNIT);
+        let plain: Config =
+            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.0\n", base_toml())).unwrap();
+        plain.validate().unwrap();
+        assert_eq!(plain.fusion, FusionConfig::UNIT);
+
+        // A section overrides only the weights it names; the rest keep their
+        // defaults, including the semantic weight of 2.0.
         let partial: Config =
             toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.5\n", base_toml())).unwrap();
         partial.validate().unwrap();
@@ -1003,7 +1024,17 @@ mod tests {
             partial.fusion,
             FusionConfig {
                 semantic_weight: 1.5,
-                ..unit
+                ..FusionConfig::UNIT
+            }
+        );
+        let lexical_only: Config =
+            toml::from_str(&format!("{}[fusion]\nlexical_weight = 3.0\n", base_toml())).unwrap();
+        lexical_only.validate().unwrap();
+        assert_eq!(
+            lexical_only.fusion,
+            FusionConfig {
+                lexical_weight: 3.0,
+                ..expected
             }
         );
 

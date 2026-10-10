@@ -720,9 +720,10 @@ impl App {
     /// Combines the three retrieval channels with weighted Reciprocal Rank
     /// Fusion, keyed by file path, start line, and content hash so the same
     /// chunk reached through multiple channels contributes once with a summed
-    /// score. A channel contributes `weight / (rrf_k + rank)`; the default
-    /// weights of `1.0` are plain RRF. The source-role prior is added last
-    /// and is never scaled by a weight. The result is in no particular order.
+    /// score. A channel contributes `weight / (rrf_k + rank)`; weights of
+    /// `1.0` (`FusionConfig::UNIT`) are plain RRF, and the configured default
+    /// doubles the semantic term. The source-role prior is added last and is
+    /// never scaled by a weight. The result is in no particular order.
     fn fuse_hits(
         rrf_k: f32,
         weights: &FusionConfig,
@@ -1017,7 +1018,7 @@ mod tests {
                 .collect();
             expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
-            let fused = fuse(rrf_k, &FusionConfig::default(), &rows);
+            let fused = fuse(rrf_k, &FusionConfig::UNIT, &rows);
             assert_eq!(fused.len(), rows.len(), "rrf_k {rrf_k}");
             for (hit, (path, score)) in fused.iter().zip(&expected) {
                 assert_eq!(hit.chunk.relative_file_path, *path, "order, rrf_k {rrf_k}");
@@ -1029,17 +1030,20 @@ mod tests {
                 );
             }
 
-            // Spelling the unit weights out changes nothing either.
-            let explicit = FusionConfig {
-                semantic_weight: 1.0,
-                lexical_weight: 1.0,
-                lsp_weight: 1.0,
-            };
-            let again = fuse(rrf_k, &explicit, &rows);
-            assert_eq!(paths(&again), paths(&fused));
-            for (a, b) in again.iter().zip(&fused) {
-                assert_eq!(a.fusion_score.to_bits(), b.fusion_score.to_bits());
-            }
+            // The default is not plain RRF: it doubles only the semantic term
+            // (semantic-only b.rs) and leaves a lexical-only chunk (c.rs)
+            // exactly as plain RRF scores it.
+            let weighted = fuse(rrf_k, &FusionConfig::default(), &rows);
+            assert_eq!(
+                by_path(&weighted, "b.rs").fusion_score.to_bits(),
+                expected_score(rrf_k, &[(2.0, 2)], source_role_prior(Source)).to_bits(),
+                "rrf_k {rrf_k}"
+            );
+            assert_eq!(
+                by_path(&weighted, "c.rs").fusion_score.to_bits(),
+                by_path(&fused, "c.rs").fusion_score.to_bits(),
+                "rrf_k {rrf_k}"
+            );
         }
     }
 
@@ -1055,18 +1059,24 @@ mod tests {
             // of a mixed chunk is scaled.
             row("z.rs", Source, Some(2), Some(2), None),
         ];
-        let unit = fuse(RRF_K, &FusionConfig::default(), &rows);
+        let unit = fuse(RRF_K, &FusionConfig::UNIT, &rows);
         assert_eq!(paths(&unit), ["y.rs", "z.rs", "x.rs"]);
 
         let doubled = fuse(
             RRF_K,
             &FusionConfig {
                 semantic_weight: 2.0,
-                ..FusionConfig::default()
+                ..FusionConfig::UNIT
             },
             &rows,
         );
         assert_eq!(paths(&doubled), ["z.rs", "x.rs", "y.rs"]);
+        // semantic_weight = 2.0 with the other two at 1.0 is the default.
+        let by_default = fuse(RRF_K, &FusionConfig::default(), &rows);
+        assert_eq!(paths(&by_default), paths(&doubled));
+        for (a, b) in by_default.iter().zip(&doubled) {
+            assert_eq!(a.fusion_score.to_bits(), b.fusion_score.to_bits());
+        }
 
         let prior = source_role_prior(Source);
         // Only the semantic contributions double.
@@ -1145,7 +1155,7 @@ mod tests {
         let lexical = vec![lexical_hit];
         let lsp = vec![lsp_at(base, 5)];
 
-        let fused = App::fuse_hits(RRF_K, &FusionConfig::default(), semantic, lexical, lsp);
+        let fused = App::fuse_hits(RRF_K, &FusionConfig::UNIT, semantic, lexical, lsp);
         assert_eq!(fused.len(), 1, "one chunk reached through three channels");
         let merged = &fused[0];
         assert_eq!(merged.semantic_rank, Some(4));
@@ -1162,7 +1172,7 @@ mod tests {
 
         // A chunk only the lexical channel returned keeps its own fields.
         let alone = lexical_at(hit("alone.rs", 1, Source), 1);
-        let fused = App::fuse_hits(RRF_K, &FusionConfig::default(), vec![], vec![alone], vec![]);
+        let fused = App::fuse_hits(RRF_K, &FusionConfig::UNIT, vec![], vec![alone], vec![]);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].lexical_rank, Some(1));
         assert_eq!(fused[0].lexical_match_count, 3);
