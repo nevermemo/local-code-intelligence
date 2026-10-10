@@ -61,6 +61,16 @@ Every five slices, and at the start of every roadmap renewal, revisit what did n
 3. Removing or rewriting a test is allowed only when the review shows the test itself is wrong or obsolete (it asserts behavior the product no longer has, or duplicates another test), never to get a failing slice through. Record the reason in the commit body.
 4. Record every decision in the roadmap: retried and edited items get a new status and a note; removed items move to a "Dropped" list with the reason, so the history stays readable.
 
+## Measure, decide, sanity-check
+
+Measurements guide opinions and opinions guide measurements. Keep the two alternating instead of letting either run alone:
+
+- **Measure the premise first.** Before a large design or ideation effort (more than about twenty agents or a day of work), name the measurement that would show its premise is wrong, and run that measurement first when it is cheaper than the effort. A design built on an unmeasured premise is a hypothesis, not a plan.
+- **Falsify cheaply.** Prefer small tests with a pre-registered threshold and kill rule over generating and scoring many ideas. Model-assigned scores drift upward and do not replace a measurement; use them to choose what to measure next.
+- **Measure what users get.** Retrieval metrics are proxies. When a decision depends on whether agents benefit, measure agent outcomes (success, tool calls, tokens, wall time) with the agent's native tools in every arm.
+- **Sanity checks at phase boundaries:** at every roadmap renewal, before a multi-day effort starts, after a surprising result, and whenever the human asks. A fresh reviewer with no stake (the stronger model, read-only, web research allowed for prior art) answers: is the goal still sound; what is measured and what is assumed; does this already exist elsewhere; what single measurement would change the decision; continue, narrow, pivot or stop. Record the verdict and the decision in the roadmap.
+- **Build in pause points.** Split long multi-agent runs into segments that pass their state through files, so a sanity check or a usage check can stop or re-pace the run between segments without losing work.
+
 ## Token efficiency
 
 Long runs are budget-bound; spend tokens on decisions, not on re-reading.
@@ -127,4 +137,5 @@ State lives in three places, not in your memory: `docs/development/roadmap.md` (
 - Two implementers on the shared registry, scanner, manifest, or `app` modules at once.
 - Starting, stopping, or probing model services without permission; any blanket process kill.
 - Treating a one-query win as evidence; treating a one-query change on an eleven-query set as signal.
+- Designing on top of an unmeasured premise because the measurement is harder than another round of ideas.
 - Reporting "tests pass" without counts, or "evaluated" without the report name and the baseline it was compared with.
