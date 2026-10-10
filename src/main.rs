@@ -1,7 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use local_code_intelligence::{app::App, config::Config, evaluate, server};
-use std::{path::PathBuf, sync::Arc};
+use local_code_intelligence::{
+    app::App,
+    config::Config,
+    evaluate::{self, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED},
+    server,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +58,34 @@ enum Command {
         workspaces: Vec<String>,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Compare this run against an earlier evaluation report: embeds a
+        /// `comparison` field in the output and prints the summary to stderr.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Bootstrap seed for the `--baseline` comparison.
+        #[arg(long, requires = "baseline")]
+        seed: Option<u64>,
+        /// Bootstrap resamples for the `--baseline` comparison.
+        #[arg(long, requires = "baseline", value_parser = parse_resamples)]
+        resamples: Option<usize>,
+    },
+    /// Compare two saved evaluation reports query by query. Works offline: it
+    /// needs no services, configuration, or index. A regression is not an
+    /// error; the exit code is nonzero only when a report cannot be read.
+    Compare {
+        /// Report of the run to compare against.
+        baseline: PathBuf,
+        /// Report of the run being judged.
+        candidate: PathBuf,
+        /// Also write the full JSON comparison report to this file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Seed of the paired bootstrap.
+        #[arg(long, default_value_t = DEFAULT_SEED)]
+        seed: u64,
+        /// Number of bootstrap resamples.
+        #[arg(long, default_value_t = DEFAULT_RESAMPLES, value_parser = parse_resamples)]
+        resamples: usize,
     },
     Symbols {
         workspace: PathBuf,
@@ -71,6 +107,31 @@ enum Command {
     },
 }
 
+fn parse_resamples(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(count) => Ok(count),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// `compare`: read two saved reports, print the summary, optionally write the
+/// JSON report. Runs without opening the application.
+fn run_compare(
+    baseline: &Path,
+    candidate: &Path,
+    output: Option<&Path>,
+    options: &CompareOptions,
+) -> Result<()> {
+    let comparison = evaluate::compare_files(baseline, candidate, options)?;
+    print!("{}", comparison.render_summary());
+    if let Some(path) = output {
+        let json = serde_json::to_string_pretty(&comparison)?;
+        std::fs::write(path, format!("{json}\n"))?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -81,10 +142,35 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Serve { port: 8768 });
+    if let Command::Compare {
+        baseline,
+        candidate,
+        output,
+        seed,
+        resamples,
+    } = command
+    {
+        return run_compare(
+            &baseline,
+            &candidate,
+            output.as_deref(),
+            &CompareOptions { seed, resamples },
+        );
+    }
+    // Read the baseline report before opening the application, so an
+    // unreadable path fails now rather than after a long evaluation.
+    let baseline_report = match &command {
+        Command::Evaluate {
+            baseline: Some(path),
+            ..
+        } => Some((path.clone(), evaluate::load_report(path)?)),
+        _ => None,
+    };
     let app = Arc::new(App::open(Config::load(cli.config.as_deref())?).await?);
     let mut evaluation_failed = false;
     let mut output_path = None;
-    let output = match cli.command.unwrap_or(Command::Serve { port: 8768 }) {
+    let output = match command {
         Command::Index { workspace } => serde_json::to_value(app.index(&workspace).await?)?,
         Command::Status { workspace } => serde_json::to_value(app.status(&workspace).await?)?,
         Command::ListFiles { workspace } => {
@@ -116,14 +202,31 @@ async fn main() -> Result<()> {
             definition,
             workspaces,
             output,
+            baseline: _,
+            seed,
+            resamples,
         } => {
             let definition = evaluate::load_definition(&definition)?;
             let workspaces = evaluate::parse_workspace_mappings(&workspaces)?;
             let report = evaluate::run_evaluation(&app, &definition, &workspaces).await?;
             evaluation_failed = evaluate::has_failures(&report);
             output_path = output;
-            serde_json::to_value(report)?
+            let comparison = baseline_report.map(|(path, baseline)| {
+                let options = CompareOptions {
+                    seed: seed.unwrap_or(DEFAULT_SEED),
+                    resamples: resamples.unwrap_or(DEFAULT_RESAMPLES),
+                };
+                let mut comparison = evaluate::compare(&baseline, &report, &options);
+                comparison.baseline_source = Some(path.display().to_string());
+                comparison
+            });
+            if let Some(comparison) = &comparison {
+                // Stderr, so a report on stdout stays valid JSON.
+                eprint!("{}", comparison.render_summary());
+            }
+            evaluate::report_with_comparison(&report, comparison.as_ref())?
         }
+        Command::Compare { .. } => unreachable!("compare returns before the application opens"),
         Command::Symbols { workspace, query } => {
             serde_json::to_value(app.symbols(&workspace, &query).await?)?
         }

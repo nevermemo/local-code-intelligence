@@ -1172,3 +1172,462 @@ fn checked_in_definitions_load_and_validate() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Paired comparison
+// ---------------------------------------------------------------------------
+
+fn compare_query(workspace: &str, text: &str, tags: &[&str]) -> EvalQuery {
+    EvalQuery {
+        query: text.to_owned(),
+        workspace: workspace.to_owned(),
+        tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        ..query_with(&[])
+    }
+}
+
+/// An executed query report with hand-set metrics, so each test states its
+/// own numbers instead of deriving them from evidence.
+fn scored(
+    workspace: &str,
+    text: &str,
+    tags: &[&str],
+    reciprocal_rank: f64,
+    ndcg_at_10: f64,
+    hit_at_1: bool,
+) -> QueryReport {
+    let mut report = QueryReport::failed(compare_query(workspace, text, tags), String::new());
+    report.metrics.reciprocal_rank = reciprocal_rank;
+    report.metrics.ndcg_at_10 = ndcg_at_10;
+    report.metrics.hit_at_1 = hit_at_1;
+    report
+}
+
+/// A query in workspace `ws` whose three metrics all follow one value.
+fn rr_only(text: &str, reciprocal_rank: f64) -> QueryReport {
+    scored(
+        "ws",
+        text,
+        &[],
+        reciprocal_rank,
+        reciprocal_rank,
+        reciprocal_rank == 1.0,
+    )
+}
+
+fn skipped_query(workspace: &str, text: &str) -> QueryReport {
+    QueryReport::skipped(
+        compare_query(workspace, text, &[]),
+        "optional workspace not provided".to_owned(),
+    )
+}
+
+fn default_compare(baseline: &[QueryReport], candidate: &[QueryReport]) -> ComparisonReport {
+    compare(
+        &aggregate(baseline),
+        &aggregate(candidate),
+        &CompareOptions::default(),
+    )
+}
+
+fn key(workspace: &str, query: &str) -> QueryKey {
+    QueryKey {
+        workspace: workspace.to_owned(),
+        query: query.to_owned(),
+    }
+}
+
+#[test]
+fn comparing_identical_reports_gives_all_ties_and_a_zero_interval() {
+    let reports = vec![
+        rr_only("q1", 1.0),
+        rr_only("q2", 0.5),
+        rr_only("q3", 1.0 / 3.0),
+        rr_only("q4", 0.0),
+    ];
+    let comparison = default_compare(&reports, &reports);
+
+    assert_eq!(comparison.paired, 4);
+    assert_eq!(comparison.pairs.len(), 4);
+    assert_eq!(comparison.unpaired_baseline, 0);
+    assert_eq!(comparison.unpaired_candidate, 0);
+    assert_eq!(comparison.skipped_pairs, 0);
+    let overall = comparison.overall.expect("four pairs");
+    assert_eq!(
+        (overall.wins, overall.losses, overall.ties),
+        (0, 0, 4),
+        "identical reports tie on every query"
+    );
+    for metric in [overall.mrr, overall.ndcg_at_10, overall.hit_at_1] {
+        assert_eq!(metric.mean_delta, 0.0);
+        assert_eq!((metric.ci_low, metric.ci_high), (0.0, 0.0));
+        assert_eq!(metric.baseline_mean, metric.candidate_mean);
+        assert!(!metric.significant, "a zero interval contains zero");
+    }
+}
+
+#[test]
+fn a_known_shift_gives_the_hand_computed_deltas_and_win_loss_tie_counts() {
+    // Reciprocal-rank deltas: +0.5, +0.5, -0.5, 0.
+    let baseline = vec![
+        scored("ws", "q1", &[], 0.5, 0.4, false),
+        scored("ws", "q2", &[], 0.5, 0.4, false),
+        scored("ws", "q3", &[], 1.0, 0.8, true),
+        scored("ws", "q4", &[], 0.0, 0.0, false),
+    ];
+    let candidate = vec![
+        scored("ws", "q1", &[], 1.0, 0.8, true),
+        scored("ws", "q2", &[], 1.0, 0.8, true),
+        scored("ws", "q3", &[], 0.5, 0.4, false),
+        scored("ws", "q4", &[], 0.0, 0.0, false),
+    ];
+    let comparison = default_compare(&baseline, &candidate);
+    let overall = comparison.overall.expect("four pairs");
+
+    assert_eq!((overall.wins, overall.losses, overall.ties), (2, 1, 1));
+    assert_eq!(overall.pairs, 4);
+    assert_close(overall.mrr.baseline_mean, 0.5);
+    assert_close(overall.mrr.candidate_mean, 0.625);
+    assert_close(overall.mrr.mean_delta, 0.125);
+    assert_close(overall.ndcg_at_10.baseline_mean, 0.4);
+    assert_close(overall.ndcg_at_10.candidate_mean, 0.5);
+    assert_close(overall.ndcg_at_10.mean_delta, 0.1);
+    assert_close(overall.hit_at_1.baseline_mean, 0.25);
+    assert_close(overall.hit_at_1.candidate_mean, 0.5);
+    assert_close(overall.hit_at_1.mean_delta, 0.25);
+    for metric in [overall.mrr, overall.ndcg_at_10, overall.hit_at_1] {
+        assert!(metric.ci_low <= metric.mean_delta && metric.mean_delta <= metric.ci_high);
+    }
+    // Two wins, one loss and one tie are not enough to rule out zero.
+    assert!(overall.mrr.ci_low < 0.0 && overall.mrr.ci_high > 0.0);
+    assert!(!overall.mrr.significant);
+
+    let first = &comparison.pairs[0];
+    assert_eq!(
+        (first.workspace.as_str(), first.query.as_str()),
+        ("ws", "q1")
+    );
+    assert_close(first.baseline.reciprocal_rank, 0.5);
+    assert_close(first.candidate.reciprocal_rank, 1.0);
+    assert_close(first.delta.reciprocal_rank, 0.5);
+    assert_close(first.delta.ndcg_at_10, 0.4);
+    assert_close(first.delta.hit_at_1, 1.0);
+    assert_close(comparison.pairs[2].delta.hit_at_1, -1.0);
+}
+
+#[test]
+fn a_consistent_improvement_is_significant_and_a_consistent_loss_is_too() {
+    let baseline: Vec<QueryReport> = (0..8)
+        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index)))
+        .collect();
+    let better: Vec<QueryReport> = (0..8)
+        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index) + 0.0625))
+        .collect();
+
+    let up = default_compare(&baseline, &better).overall.unwrap();
+    assert_eq!((up.wins, up.losses, up.ties), (8, 0, 0));
+    assert!(up.mrr.ci_low > 0.0, "{:?}", up.mrr);
+    assert!(up.mrr.significant);
+
+    let down = default_compare(&better, &baseline).overall.unwrap();
+    assert_eq!((down.wins, down.losses, down.ties), (0, 8, 0));
+    assert!(down.mrr.ci_high < 0.0, "{:?}", down.mrr);
+    assert!(down.mrr.significant);
+}
+
+#[test]
+fn the_interval_of_a_constant_delta_is_that_delta() {
+    let baseline: Vec<QueryReport> = (0..7)
+        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index)))
+        .collect();
+    let candidate: Vec<QueryReport> = (0..7)
+        .map(|index| rr_only(&format!("q{index}"), 0.125 * f64::from(index) + 0.25))
+        .collect();
+    let mrr = default_compare(&baseline, &candidate).overall.unwrap().mrr;
+
+    assert_close(mrr.mean_delta, 0.25);
+    assert_close(mrr.ci_low, 0.25);
+    assert_close(mrr.ci_high, 0.25);
+    assert!(mrr.significant);
+
+    assert_eq!(
+        paired_bootstrap_ci(&[0.25; 7], 10_000, 99),
+        Some((0.25, 0.25))
+    );
+    assert_eq!(paired_bootstrap_ci(&[], 10_000, 99), None);
+}
+
+#[test]
+fn the_interval_is_reproducible_for_a_seed_and_moves_with_it() {
+    // Twelve distinct reciprocal ranks on the baseline side, rotated on the
+    // candidate side, so the twelve deltas are all different.
+    let ranks: Vec<f64> = (1..=12).map(|rank| 1.0 / f64::from(rank)).collect();
+    let baseline: Vec<QueryReport> = ranks
+        .iter()
+        .enumerate()
+        .map(|(index, rr)| rr_only(&format!("q{index}"), *rr))
+        .collect();
+    let candidate: Vec<QueryReport> = ranks
+        .iter()
+        .cycle()
+        .skip(5)
+        .take(12)
+        .enumerate()
+        .map(|(index, rr)| rr_only(&format!("q{index}"), *rr))
+        .collect();
+    let run = |seed| {
+        compare(
+            &aggregate(&baseline),
+            &aggregate(&candidate),
+            &CompareOptions {
+                seed,
+                resamples: DEFAULT_RESAMPLES,
+            },
+        )
+    };
+
+    let first = run(7);
+    assert_eq!(first, run(7), "the same seed must reproduce the report");
+    assert_eq!(first.seed, 7);
+    assert_eq!(first.resamples, 10_000);
+
+    let other = run(8);
+    let (a, b) = (first.overall.unwrap().mrr, other.overall.unwrap().mrr);
+    assert_eq!(a.mean_delta, b.mean_delta, "the point estimate has no seed");
+    assert_ne!(
+        (a.ci_low, a.ci_high),
+        (b.ci_low, b.ci_high),
+        "a different seed resamples differently"
+    );
+
+    let by_default = default_compare(&baseline, &candidate);
+    assert_eq!(by_default.seed, DEFAULT_SEED);
+    assert_eq!(by_default.resamples, DEFAULT_RESAMPLES);
+    assert_eq!(by_default, default_compare(&baseline, &candidate));
+}
+
+#[test]
+fn unpaired_and_skipped_queries_are_counted_and_listed_never_dropped() {
+    let baseline = vec![
+        rr_only("a", 1.0),
+        rr_only("b", 0.5),
+        skipped_query("ws", "c"),
+        rr_only("d", 1.0),
+        skipped_query("ws", "g"),
+        scored("other", "a", &[], 1.0, 1.0, true),
+        rr_only("dup", 1.0),
+        rr_only("dup", 0.5),
+    ];
+    let candidate = vec![
+        rr_only("a", 1.0),
+        rr_only("b", 1.0),
+        rr_only("c", 1.0),
+        rr_only("e", 1.0),
+        skipped_query("ws", "g"),
+        rr_only("dup", 0.5),
+    ];
+    let comparison = default_compare(&baseline, &candidate);
+
+    // a, b and the first `dup` pair; the second `dup` has no counterpart.
+    assert_eq!(comparison.paired, 3);
+    let paired: Vec<&str> = comparison
+        .pairs
+        .iter()
+        .map(|pair| pair.query.as_str())
+        .collect();
+    assert_eq!(paired, ["a", "b", "dup"]);
+    let dup = &comparison.pairs[2];
+    assert_close(dup.baseline.reciprocal_rank, 1.0);
+    assert_close(dup.candidate.reciprocal_rank, 0.5);
+
+    // c is skipped in the baseline, g on both sides: neither is paired.
+    assert_eq!(comparison.skipped_pairs, 2);
+    assert_eq!(comparison.skipped_baseline, 2);
+    assert_eq!(comparison.skipped_candidate, 1);
+
+    // The same text in another workspace is a different query.
+    assert_eq!(comparison.unpaired_baseline, 3);
+    assert_eq!(
+        comparison.unpaired_baseline_queries,
+        [key("ws", "d"), key("other", "a"), key("ws", "dup")]
+    );
+    assert_eq!(comparison.unpaired_candidate, 1);
+    assert_eq!(comparison.unpaired_candidate_queries, [key("ws", "e")]);
+
+    // Only the three pairs feed the statistics.
+    let overall = comparison.overall.unwrap();
+    assert_eq!(overall.pairs, 3);
+    assert_eq!((overall.wins, overall.losses, overall.ties), (1, 1, 1));
+
+    let summary = comparison.render_summary();
+    assert!(
+        summary.contains("unpaired: baseline 3, candidate 1"),
+        "{summary}"
+    );
+    assert!(summary.contains("skipped on either side: 2"), "{summary}");
+}
+
+#[test]
+fn pairs_are_grouped_by_tag_with_their_own_counts_and_intervals() {
+    let baseline = vec![
+        scored("ws", "q1", &["keyword"], 0.5, 0.5, false),
+        scored("ws", "q2", &["keyword", "hard"], 1.0, 1.0, true),
+        scored("ws", "q3", &[], 0.0, 0.0, false),
+        scored("ws", "q4", &[], 0.0, 0.0, false),
+        scored("ws", "q5", &["ghost"], 1.0, 1.0, true),
+    ];
+    let candidate = vec![
+        scored("ws", "q1", &["keyword"], 1.0, 1.0, true),
+        scored("ws", "q2", &["keyword", "hard"], 0.5, 0.5, false),
+        // The candidate report is the only one tagging q3.
+        scored("ws", "q3", &["hard"], 0.0, 0.0, false),
+        scored("ws", "q4", &[], 1.0, 1.0, true),
+        // q5 is skipped in the candidate, so the tag has no pair left.
+        skipped_query("ws", "q5"),
+    ];
+    let comparison = default_compare(&baseline, &candidate);
+
+    let overall = comparison.overall.unwrap();
+    assert_eq!(overall.pairs, 4);
+    assert_eq!((overall.wins, overall.losses, overall.ties), (2, 1, 1));
+
+    let tags: Vec<&str> = comparison.by_tag.keys().map(String::as_str).collect();
+    assert_eq!(tags, ["hard", "keyword"], "no group for untagged or ghost");
+
+    let keyword = comparison.by_tag["keyword"];
+    assert_eq!(keyword.pairs, 2);
+    assert_eq!((keyword.wins, keyword.losses, keyword.ties), (1, 1, 0));
+    assert_close(keyword.mrr.mean_delta, 0.0);
+    // Deltas {+0.5, -0.5}: the resampled means are -0.5, 0 or +0.5, with the
+    // two tails at a quarter each.
+    assert_close(keyword.mrr.ci_low, -0.5);
+    assert_close(keyword.mrr.ci_high, 0.5);
+    assert!(!keyword.mrr.significant);
+
+    let hard = comparison.by_tag["hard"];
+    assert_eq!(hard.pairs, 2);
+    assert_eq!((hard.wins, hard.losses, hard.ties), (0, 1, 1));
+    assert_close(hard.mrr.baseline_mean, 0.5);
+    assert_close(hard.mrr.candidate_mean, 0.25);
+    assert_close(hard.mrr.mean_delta, -0.25);
+    assert_close(hard.mrr.ci_low, -0.5);
+    assert_close(hard.mrr.ci_high, 0.0);
+
+    let pair = |query: &str| {
+        comparison
+            .pairs
+            .iter()
+            .find(|pair| pair.query == query)
+            .unwrap()
+    };
+    assert_eq!(pair("q3").tags, ["hard"]);
+    assert_eq!(pair("q2").tags, ["hard", "keyword"], "tags are sorted");
+
+    let summary = comparison.render_summary();
+    assert!(summary.contains("tag keyword"), "{summary}");
+    assert!(summary.contains("tag hard"), "{summary}");
+}
+
+#[test]
+fn untagged_comparisons_omit_by_tag_and_empty_ones_have_no_overall() {
+    let reports = vec![rr_only("q1", 1.0)];
+    let comparison = default_compare(&reports, &reports);
+    assert!(comparison.by_tag.is_empty());
+    let json = serde_json::to_value(&comparison).unwrap();
+    assert!(json.get("by_tag").is_none());
+    assert_eq!(json["overall"]["mrr"]["significant"], false);
+    assert_eq!(json["paired"], 1);
+
+    let empty = default_compare(&[], &[]);
+    assert_eq!(empty.paired, 0);
+    assert!(empty.overall.is_none());
+    assert!(empty.render_summary().contains("no comparable pairs"));
+    let no_overlap = default_compare(&[rr_only("a", 1.0)], &[rr_only("b", 1.0)]);
+    assert!(no_overlap.overall.is_none());
+    assert_eq!(no_overlap.unpaired_baseline, 1);
+    assert_eq!(no_overlap.unpaired_candidate, 1);
+}
+
+#[test]
+fn the_summary_names_each_metric_with_its_interval_and_win_loss_tie() {
+    let baseline = vec![rr_only("q1", 0.5), rr_only("q2", 0.25)];
+    let candidate = vec![rr_only("q1", 1.0), rr_only("q2", 0.25)];
+    let summary = default_compare(&baseline, &candidate).render_summary();
+
+    for needle in [
+        "MRR",
+        "nDCG@10",
+        "hit@1",
+        "baseline",
+        "candidate",
+        "95% CI",
+        "reciprocal rank W/L/T: 1/0/1 over 2 pairs",
+        "10000 resamples",
+        "+0.2500",
+    ] {
+        assert!(summary.contains(needle), "missing {needle:?} in\n{summary}");
+    }
+}
+
+#[test]
+fn reports_load_from_disk_including_ones_that_embed_a_comparison() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline_report = aggregate(&[rr_only("q1", 0.5), rr_only("q2", 1.0)]);
+    let baseline_path = temp.path().join("baseline.json");
+    // A PowerShell redirect writes a byte-order mark.
+    std::fs::write(
+        &baseline_path,
+        format!(
+            "\u{feff}{}",
+            serde_json::to_string_pretty(&baseline_report).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let candidate_report = aggregate(&[rr_only("q1", 1.0), rr_only("q2", 1.0)]);
+    let embedded = report_with_comparison(
+        &candidate_report,
+        Some(&compare(
+            &baseline_report,
+            &candidate_report,
+            &CompareOptions::default(),
+        )),
+    )
+    .unwrap();
+    assert_eq!(embedded["comparison"]["paired"], 2);
+    assert!(report_with_comparison(&candidate_report, None).unwrap()["comparison"].is_null());
+    let candidate_path = temp.path().join("candidate.json");
+    std::fs::write(&candidate_path, embedded.to_string()).unwrap();
+
+    let loaded = load_report(&baseline_path).unwrap();
+    assert_eq!(loaded.queries.len(), 2);
+
+    let comparison =
+        compare_files(&baseline_path, &candidate_path, &CompareOptions::default()).unwrap();
+    assert_eq!(comparison.paired, 2);
+    assert_eq!(
+        comparison.baseline_source.as_deref(),
+        Some(baseline_path.display().to_string().as_str())
+    );
+    assert_eq!(
+        comparison.candidate_source.as_deref(),
+        Some(candidate_path.display().to_string().as_str())
+    );
+    let overall = comparison.overall.unwrap();
+    assert_eq!((overall.wins, overall.losses, overall.ties), (1, 0, 1));
+
+    let missing = temp.path().join("missing.json");
+    let error = load_report(&missing).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("failed to read evaluation report"),
+        "{error:#}"
+    );
+    let garbage = temp.path().join("garbage.json");
+    std::fs::write(&garbage, "not json").unwrap();
+    let error = load_report(&garbage).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("failed to parse evaluation report"),
+        "{error:#}"
+    );
+    assert!(compare_files(&baseline_path, &garbage, &CompareOptions::default()).is_err());
+}

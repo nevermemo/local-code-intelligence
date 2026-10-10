@@ -122,3 +122,78 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
     };
     assert!(definition.workspaces[0].required);
 }
+
+#[test]
+fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let write_report = |name: &str, ranks: &[(&str, f64)]| {
+        let reports: Vec<QueryReport> = ranks
+            .iter()
+            .map(|(text, reciprocal_rank)| {
+                let mut query = evaluation_query();
+                query.query = (*text).to_owned();
+                let mut report = QueryReport::failed(query, String::new());
+                report.metrics.reciprocal_rank = *reciprocal_rank;
+                report.metrics.hit_at_1 = *reciprocal_rank == 1.0;
+                report
+            })
+            .collect();
+        std::fs::write(
+            temp.path().join(name),
+            serde_json::to_string(&aggregate(&reports)).unwrap(),
+        )
+        .unwrap();
+    };
+    write_report("base.json", &[("alpha", 1.0), ("beta", 0.5)]);
+    write_report("regressed.json", &[("alpha", 0.5), ("beta", 0.25)]);
+    let binary = env!("CARGO_BIN_EXE_local-code-intelligence");
+
+    // The configuration named here does not exist: `compare` must not load
+    // it, open an index, or contact a service.
+    let output = std::process::Command::new(binary)
+        .current_dir(temp.path())
+        .args([
+            "--config",
+            "no-such-config.toml",
+            "compare",
+            "base.json",
+            "regressed.json",
+            "--output",
+            "comparison.json",
+            "--seed",
+            "3",
+            "--resamples",
+            "500",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a regression is not an error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("MRR"), "{stdout}");
+    assert!(stdout.contains("W/L/T: 0/2/0"), "{stdout}");
+
+    let json: Value = serde_json::from_str(
+        &std::fs::read_to_string(temp.path().join("comparison.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["paired"], 2);
+    assert_eq!(json["seed"], 3);
+    assert_eq!(json["resamples"], 500);
+    assert!(json["overall"]["mrr"]["mean_delta"].as_f64().unwrap() < 0.0);
+
+    let unreadable = std::process::Command::new(binary)
+        .current_dir(temp.path())
+        .args(["compare", "base.json", "absent.json"])
+        .output()
+        .unwrap();
+    assert!(!unreadable.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreadable.stderr).contains("absent.json"),
+        "{}",
+        String::from_utf8_lossy(&unreadable.stderr)
+    );
+}
