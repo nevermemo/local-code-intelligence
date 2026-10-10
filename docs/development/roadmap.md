@@ -18,11 +18,12 @@ not committed, so the evidence each item needs is restated here with URLs.
    `lci-lsp-adapter`; grammar/extension work uses `lci-language-adapter`.
 4. Ranking, fusion, reranker, document-format, instruction, and candidate-count
    changes need a before/after evaluation (the retrieval contract requires it):
-   run `evaluate ./evaluations/core.toml --workspace self=$PWD` (and the mined
-   set from E2 once it exists) before and after, keep the JSON under
-   `test-results/` (never committed), and put the headline numbers (hit@1,
-   hit@3, MRR, nDCG@10 when available, p50 total and p50 reranking) in the commit
-   message and in this file's item entry.
+   run `evaluate ./evaluations/core.toml --workspace self=$PWD` and
+   `evaluate ./evaluations/mined/self.toml --workspace self=$PWD` before and
+   after (frozen binaries, `compare` or `--baseline` for the CI), keep the JSON
+   under `test-results/` (never committed), and put the headline numbers
+   (hit@1, hit@3, MRR, nDCG@10, p50 total and p50 reranking, CI of the delta)
+   in the commit message and in this file's item entry.
 5. Update this file in the same commit as the work: move the item to the Done
    table with its commit hash, set a successor's status to `ready` if its
    dependency was the only blocker, and append newly discovered work as new IDs.
@@ -40,19 +41,19 @@ another agent) | `ready` (deps met, can start now) | `blocked(reason)` |
 Size: S = under half a day, M = about a day, L = more than a day (must be split
 before it is picked).
 
-## Snapshot: where things stand (verified 2026-10-10, branch `fix/verified-bugs`, HEAD `fa0f262`)
+## Snapshot: where things stand (verified 2026-10-10 triage pass, branch `fix/verified-bugs`, HEAD `17fbeea`)
 
 | Fact | Value |
 | --- | --- |
-| Pipeline | Tree-sitter chunks (11 languages, 12 extensions) -> Qwen3-Embedding-4B vectors in embedded LanceDB -> query fans out to LanceDB cosine (40) + `rg` subprocess (40, ranked by matching-line count) + LSP `workspace/symbol` (40, first-seen order) -> RRF k=60 + 0.004 production-source prior -> top 24 to Qwen3-Reranker-4B (fail-open) -> top_k (default 8, max 40) |
+| Pipeline | Tree-sitter chunks (11 languages, 12 extensions) -> Qwen3-Embedding-4B vectors in embedded LanceDB -> query fans out to LanceDB cosine (40) + `rg` subprocess (40; since L2 `2031ffe` terms are camel/snake-split with a stop list, cut at 25% document frequency, the 12 rarest kept, chunks scored by BM25 k1=1.2 b=0.75 over credited lines) + LSP `workspace/symbol` (40, first-seen order) -> RRF k=60 + 0.004 production-source prior -> top 24 to Qwen3-Reranker-4B (fail-open; unreachable reranker skipped for 30 s, R7) -> top_k (default 8, max 40). `[channels]` toggles (E3) switch any arm off for evaluation |
 | Pins | `lancedb =0.38.0` (crates.io latest 0.40.0, 2026-10-07), `rmcp =3.2.0` (latest 3.5.1, 2026-10-05; 3.5.0 implements the 2026-07-28 stateless spec), `tree-sitter 0.25`, no `notify`, no `tantivy` |
-| Measured on the owner's machine (AMD iGPU gfx1150, vLLM via WSL ROCm, both models bf16, max-model-len 8192) | search 45-65 s on this repo, of which reranking 35-54 s, cold rust-analyzer ~10 s, query embedding 0.5 s, LanceDB 60 ms, ripgrep 0.15 s |
-| `evaluations/core.toml` (11 required self queries, 3 optional GUST) | hit@1 0.818-0.909, hit@3 1.0, MRR 0.91-0.95, 0 fallbacks |
+| Measured on the owner's machine (AMD iGPU gfx1150, vLLM via WSL ROCm, both models bf16, max-model-len 8192) | mined set after L2 (`test-results/l2-mined-reranked-new2.json`): total p50 17.5 s / p95 29.6 s, reranking p50 16.8 s / p95 28.8 s (before L2: 34.0 / 32.7 s); fusion without the reranker p50 0.3-0.4 s; query embedding 0.2-0.5 s; LanceDB 55-70 ms; lexical channel ~250 ms p50; cold rust-analyzer ~10 s on each run's first query (`lsp_search_ms` p95 10.2 s in every evaluation run; N7 in progress); reranker unreachable: search median 0.64 s (R7) |
+| Evaluation sets | `evaluations/core.toml` (11 required self queries, 3 optional GUST): reranked hit@1 0.909 / hit@3 1.0 / MRR 0.955 (R0, `43d56d9`); fusion-only after L2 0.909 / 1.0 / 0.955, nDCG@10 0.727. `evaluations/mined/self.toml` (E2, 35 queries, 27 keyword / 8 keyword-agnostic): reranked after L2 hit@1 0.743 / hit@3 0.857 / MRR 0.808 / nDCG@10 0.624; semantic-only 0.771 / 0.886 / 0.829 / 0.517; fusion-only after L2 0.657 / 0.800 / 0.746 / 0.571 |
 | Chunk sizes in this repo | median ~200 B, p90 ~1.3 KB, p99 ~5 KB, max 17 KB (chunker targets 6,000 B groups, keeps declarations whole to 24,000 B) |
-| Storage | every commit overwrites the whole workspace table (`CreateTableMode::Overwrite`, `src/store.rs`); every search loads every chunk row including code (`Store::chunks`); no `optimize`, `cleanup_old_versions`, scalar index, FTS index, or vector index |
+| Storage | every commit overwrites the whole workspace table (`CreateTableMode::Overwrite`, `src/store.rs`); every search loads every chunk row including code (`Store::chunks`); no `optimize`, `cleanup_old_versions`, scalar index, FTS index, or vector index. L2 removed the O(matches x chunks) lexical mapping scan; `map_lsp_locations` (`src/app/search.rs` ~589) still scans linearly |
 | Freshness | `on-search` (default) re-reads and SHA-256-hashes every supported file at most every 10 s; `watch` polls every 2 s doing the same; `index_status` does it on every call; watch registrations die with the process |
-| LSP | 7 persistent adapters behind `LspAdapter`; `didOpen` with `version: 1` re-sent before every position request, never `didChange`/`didClose`/`shutdown`; TS/Python/Go/clangd sleep up to 3 s after `didOpen`; the same `term#` symbol syntax (rust-analyzer's) is sent to every provider |
-| Evaluation harness | hit@1/3/8, MRR, median/p95 total latency, fallback count, created/reused/waited counts; no nDCG, Recall@k, per-stage percentiles, paired comparison, strata, or `refreshed_incrementally` counter |
+| LSP | 7 persistent adapters behind `LspAdapter`; `didOpen` with `version: 1` re-sent before every position request, never `didChange`/`didClose`/`shutdown`; TS/Python/Go/clangd sleep up to 3 s after `didOpen`; the same `term#` symbol syntax (rust-analyzer's) is sent to every provider; rust-analyzer's 10 s quiescence wait always expires on the first query (N7) |
+| Evaluation harness | hit@1/3/8, MRR, nDCG@10, recall@k, file Acc@5/10, per-stage p50/p95, `index_refreshed` (E1); `tags` with per-stratum aggregates and `cargo xtask mine-queries` (E2); `[channels]` arm toggles and `compare` / `evaluate --baseline` with seeded paired-bootstrap 95% CIs (E3). Missing: per-stage max and n (E4), candidate/score dump (E0) |
 
 ## Done
 
@@ -66,17 +67,38 @@ before it is picked).
 | `3847b8c` | README `search_symbols` row and LSP timing wording fixed | Stale since LSP generalisation |
 | `438670d` | Cross-process index lock `<data_dir>/index.lock` (`lock_data_dir_for_indexing`) | Verified: CLI + server could commit one workspace concurrently. Live: CLI waited ~6 min for the server's 1224-chunk commit, then proceeded |
 | `fa0f262` | AGENTS.md/CLAUDE.md/skills rewritten for unattended runs; new `lci-autonomous-improvement` skill; AGENTS.md freshness drift fixed (closes H2's AGENTS part) | Owner's autonomous mandate |
+| `8ca42d6`, `f1fda78`, `4c8a4fc` | This roadmap; triage pass and delegated-dispute rule; compaction strategy in the autonomous-run skill | Durable state for unattended runs |
+| `2a0b9ad` | E1: nDCG@10, recall@k, file Acc@5/10, `index_refreshed`, per-stage p50/p95 in `evaluate` | Ranking items could not be judged on hit@k alone |
+| `7daed93` | E2: `cargo xtask mine-queries`; `evaluations/mined/self.toml` (35 queries, keyword / keyword-agnostic tags); per-tag aggregates | 11 hand-written queries moved hit@1 by 9 points each |
+| `1213ecc` | R7: one connect attempt for query-time rerank/embed, 30 s breaker (`ConnectBreaker`) | Unreachable reranker cost ~9.2 s per search; now 0.64 s median |
+| `fb5e4f9` | E3b: `[channels]` toggles (`semantic`, `lexical`, `lsp`, `reranker`) | Controlled arms without the `127.0.0.1:9` trick; grep-only / semantic-only / fusion baselines measured |
+| `66005e9` | E3a: `compare` subcommand and `evaluate --baseline` with seeded paired-bootstrap CIs | Every later ranking claim needs a CI, not two numbers |
+| `2031ffe` | L2: identifier splitting, stop list, document-frequency cut, BM25 chunk scoring in the `rg` channel; per-file canonicalize; per-path candidate mapping | Grep-only mined MRR 0.389 -> 0.749; reranked total p50 34.0 -> 17.5 s with quality unchanged |
+| (no code) | R0: keep the reranker on (mined set +5.7 hit@1, +11.4 hit@3 over fusion). V1: no switch to llama.cpp serving (best case 1.33x, below the 0.6x bar) | Decisions recorded in their items |
 
 ## Dropped
 
-Items removed by a triage pass (see the autonomous-improvement skill), with the reason. None yet.
+Items removed by a triage pass (see the autonomous-improvement skill), with the reason.
+
+| ID | Was | Dropped (date, reason) |
+| --- | --- | --- |
+| V2 | NPU measurement: FastFlowLM `Embedding-Gemma-300M-NPU2` throughput and NPU/iGPU power interference (`needs-approval(download, Gemma Terms of Use, ~300 MB)`) | 2026-10-10 triage. V1 settled the owner's NPU question: no Windows NPU runtime serves reranking, and the only NPU embedder (EmbeddingGemma-300M, MTEB ~68 vs ~74.6, 2048-token context) would force a re-index at lower quality, so V1 already expected it to fail the quality gate; a measurement-only run is not worth a licence acceptance. Revive on the owner's request by granting the download; the FastFlowLM 1.0.7 zip in the session scratchpad validated the XDNA2 stack (driver 32.0.20102.3930). |
 
 ## In progress
 
 Mark an item `in-progress (<date>)` here and in its table row when a slice
 starts; remove it when the slice is committed.
 
+- N7 - LSP cold-start budget and warm-up: `in-progress (2026-10-10)`, another
+  agent, files `lci-core/src/lsp*` and `src/app/search.rs`.
 
+Triage pass (2026-10-10, after five slices E1, E2, E3a/b, L2, R7; reviewer
+decisions, see each item): R1 edited (re-baseline on the L2 binary, windows
+{6, 8}); V3 edited (V1 cut its premise; blocked on R1); V2 dropped; L0 edited
+(L2 did half of it); R4, L1, M3, H2 edited (stale notes, deps met, downloads
+done); E3 arms annotated as pre-L2 with the post-L2 numbers added; F2
+unblocked (the arm re-run exists in L2's reports); I-2 and I-4 answered; T1
+added for test hygiene.
 
 Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 (LSP document lifecycle) and H1 (Rust `tests.rs` role).
@@ -85,34 +107,37 @@ Known remaining defects are scheduled as S5 (Windows long data_dir paths), N2
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
-The reranker is the only stage whose cost is user-visible (35-54 s of a 45-65 s
-search), and its benefit over a 4B retriever is unproven: Qwen3-Reranker-4B's
-81.20 MTEB-Code was measured reranking the 0.6B embedder's top 100 (75.41),
-while LCI's 4B embedder already scores 80.06 on that suite
-(https://arxiv.org/abs/2506.05176). Nothing about ranking can be decided with 11
-queries (each one moves hit@1 by 9 points), so the evaluation harness comes
-first.
+The reranker is the only stage whose cost is user-visible (16.8 s of a 17.5 s
+p50 search after L2; 35-54 s of 45-65 s before it). Its benefit over the 4B
+retriever was unproven when this tier was written (Qwen3-Reranker-4B's 81.20
+MTEB-Code was measured reranking the 0.6B embedder's top 100, 75.41, while
+LCI's 4B embedder scores 80.06, https://arxiv.org/abs/2506.05176); R0 has
+since measured a consistent gain on the mined set, so the reranker stays on
+and the work is cutting its cost (R1 window, R2/R6 skipping, R4 model).
+Nothing about ranking can be decided with 11 queries (each one moves hit@1 by
+9 points), so the evaluation harness (E1-E3, done) came first.
 
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | R0 | Fusion-only baseline: does the reranker help at all on core.toml? | done (2026-10-10: keep the reranker on) | S | - |
 | R7 | Reranker-down fast path: no 9 s of connect retries per search when the reranker is unreachable | done (1213ecc) | S | - |
 | V1 | Native-Windows llama.cpp serving on the 890M (embedder + reranker) vs WSL vLLM | done (2026-10-10: no switch; llama.cpp ROCm reranker 1.33x, embedder 0.83x) | S | - |
-| V3 | In-process llama.cpp (`llama-cpp-2`, Vulkan) behind an `http` / `in-process` backend switch | proposed (after V1) | M | V1 |
+| V3 | In-process llama.cpp (`llama-cpp-2`, ROCm or Vulkan) behind an `http` / `in-process` backend switch | blocked(R1: decide once the rerank window is set; V1 measured the serving ceiling at ~1.3x) | M | V1, R1 |
 | V4 | In-process ONNX (`ort` + DirectML) small cross-encoder reranker for a cascade/vote | proposed | S | R4 |
 | E0 | Dump every reranked candidate with fused rank and reranker score, for offline replay | ready | S | - |
 | E1 | nDCG@10, Recall@k, file Acc@k, per-stage p50/p95, `refreshed_incrementally` in the harness | done (2a0b9ad) | S | - |
 | E2 | Git-mined query set generator with keyword / keyword-agnostic strata | done (7daed93) | M | E1 |
 | E3 | Paired comparison (`--baseline`) and channel/reranker arm toggles incl. a grep-only baseline | done (fb5e4f9 toggles, 66005e9 compare) | M | E1 |
 | E2b | Mined-set hygiene: `gold-drift` flag and subject-length axis; strata on the clean subset | ready | S | E2 |
-| R1 | Reranker depth x document-size sweep; set defaults from data | ready (better after E3) | S | - |
+| R1 | Reranker window x document-size sweep; set defaults from data | ready (E3 done; re-baseline on the L2 binary, windows {6, 8, 12, 24}) | S | - |
 | R2 | Skip the reranker when an exact symbol-definition hit exists | ready | S | - |
 | R3 | Reranker as a weighted RRF vote instead of a replacement | ready | S | E3 |
 | R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
 | R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
-| N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | ready | S-M | - |
+| N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | in-progress (2026-10-10) | S-M | - |
 | E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | ready | XS | - |
+| T1 | Test hygiene follow-ups from the 2026-10-10 reviews (constant-delta CI test, BM25 constant) | ready | XS | - |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
@@ -138,8 +163,7 @@ first.
 - Why (NPU research, 2026-10-10, sources in the session's npu-research notes): the owner asked to use the Ryzen AI 9 HX 370's XDNA 2 NPU. Findings: no Windows NPU runtime serves reranking (FastFlowLM 1.0.7 exposes chat/embeddings/transcription only; Lemonade 2026.41.1 forwards `/v1/rerank` to llama.cpp on GPU/CPU; OGA is generation-only); the only NPU-ready embedder is EmbeddingGemma-300M (MTEB ~68 vs Qwen3-Embedding-4B ~74.6, int4, 2048-token max, forces a re-index); vendor NPU prefill for a 4B model is ~510-615 tok/s. Today's WSL2 + ROCm vLLM bf16 path reaches only ~290 tok/s (~2.3 TFLOPS) -- a software inefficiency: independent llama.cpp numbers on the 890M imply ~500-670 tok/s for a 4B model (Vulkan or ROCm), halving rerank time (~25-30 s -> ~13-17 s) and cutting model RAM ~17 GB -> ~9 GB. llama-server's `/rerank` already returns LCI's `{results:[{index, relevance_score}]}` and serves `/v1/models`, so no LCI code change is needed.
 - Scope: no code. Owner-approved downloads: llama.cpp Windows Vulkan build (ggml-org release zip, ~32 MB, MIT) and optionally the lemonade-sdk llamacpp-rocm gfx1150 build (~93 MB, MIT); `Qwen/Qwen3-Embedding-4B-GGUF` Q8_0 (~4.3 GB, Apache-2.0); a Qwen3-Reranker-4B GGUF converted from the cached HF weights with a current `convert_hf_to_gguf.py` (verify `pooling_type=RANK` and the rerank template -- older conversions return near-zero scores; `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` is a known-good reference). Serve on scratch ports (e.g. 8770/8771) with `--embedding --pooling last` and `--reranking --pooling rank`; point a scratch config with its own data_dir at them; never run more than two model processes (stop the WSL reranker first if needed).
 - Accept: fixed-payload benchmark (24 docs / ~8.5k tokens rerank, median of 5; 64-chunk embedding in batches of 8) and an `evaluate core.toml` quality check. Go if rerank median <= ~60% of the WSL baseline and metrics within noise; then propose to the owner moving production serving to llama.cpp (re-point 8766/8767 to keep `embedding_identity`, or accept one re-embed).
-- V2 status (2026-10-10): FastFlowLM 1.0.7 portable zip in the session scratchpad validates the NPU stack (XDNA2, driver 32.0.20102.3930). Its only NPU embedder, `FastFlowLM/Embedding-Gemma-300M-NPU2` (~300 MB, q4nx, 2048-token context), is under the Gemma Terms of Use, not Apache/MIT, so downloading it needs the owner's explicit acceptance: `needs-approval(download FastFlowLM/Embedding-Gemma-300M-NPU2, Gemma Terms of Use, ~300 MB)`.
-- Optional NPU measurement (V2, needs approval: FastFlowLM installer ~30 MB, MIT): EmbeddingGemma throughput on the NPU and NPU/iGPU power interference on this 4-30 W handheld; expected to fail the quality gate, so measurement only. A Qwen3-Reranker-4B NPU port via Ryzen AI 1.8 OGA is a 2-4 day speculative spike (custom head, AMD login/EULA) -- parked unless V1 falls short.
+- V2 (NPU embedder measurement): dropped in the 2026-10-10 triage pass, see Dropped. A Qwen3-Reranker-4B NPU port via Ryzen AI 1.8 OGA (2-4 day speculative spike, custom head, AMD login/EULA) stays parked.
 
 - Result (2026-10-10; fixed payload = 24 real LCI source chunks of <= 4096 bytes, ~31k prompt tokens per rerank, 8 of them as an embedding batch; per-run text markers so no server-side prefix-cache hits; median of 5 after a discarded warmup; nothing else running unless noted; script and JSON in the session scratchpad `v1/bench.py`, `v1/bench-*.json`):
 
@@ -154,10 +178,11 @@ first.
 - Verdict: no switch. The best case (llama.cpp ROCm reranker) is 1.33x faster, short of the <= 60% bar, and the llama.cpp embedder is slower (0.83x batch, 3.8x slower single query). The 890M sustains roughly 500-700 prompt tokens/s for a 4B model in any runtime here, so the latency lever is fewer reranker tokens (R1 window, R6 gating), not the server. Kept as an option: a llama.cpp ROCm reranker on 8767 with the vLLM embedder would save ~25% of rerank time and ~4 GB of RAM (Q8_0) -- owner's call. Measurement lesson recorded in R1: vLLM prefix caching makes repeated identical payloads ~10x cheaper.
 
 ### V3 - In-process llama.cpp backend
-`proposed` (decide after V1) - M - deps: V1 - skill: `lci-retrieval-evaluation`
-- Why (vLLM-alternatives explorer, 2026-10-10, full notes in the session scratchpad `explore-vllm-alternatives.md`): the owner slightly prefers models running inside LCI, with HTTP serving kept for models that need a serving tool. Among serving tools nothing beats llama.cpp here: TEI has no Windows build and Instinct-only ROCm, Infinity is stale and cross-encoder only, Ollama has no merged rerank endpoint, LM Studio/LocalAI lack Qwen3 rerank, and SGLang is Linux/gfx1151 with vLLM's GEMM stack. llama.cpp on Windows Vulkan reaches ~6.5-7 TFLOPS of prefill on this GPU class (llama.cpp discussion 10879) vs vLLM's ~2.2. The only in-process crate that runs every model LCI uses (Qwen3 embedders with last-token pooling, Qwen3 rerankers with the yes/no head, plus cross-encoders) on the 890M is `llama-cpp-2` (Vulkan; the HIP route needs the HIP SDK and DLLs). candle/mistral.rs lack Qwen3 rerank and run CPU-only here; `ort` covers small ONNX models only.
+`blocked(R1)` (triage 2026-10-10: V1 cut the premise; decide after R1 sets the rerank window) - M - deps: V1 (done), R1 - skill: `lci-retrieval-evaluation`
+- Triage note (2026-10-10): the original case rested on llama.cpp Vulkan reaching ~6.5-7 TFLOPS of prefill vs vLLM's ~2.2. V1 measured the opposite on this machine: llama.cpp Vulkan Q8_0 was slower than vLLM (67.5 vs 62.8 s per 24-document rerank) and the ROCm build 1.33x faster; the 890M sustains ~500-700 prompt tokens/s for a 4B model in every runtime tried. An in-process backend can therefore add at most the ROCm gain plus the KV-prefix sharing below (~25%), roughly 1.6x on reranking, and nothing on embedding (llama.cpp embedder 0.83x batch, 3.8x slower single query). If R1 settles on a window of 6-8 candidates (~5-7 s per rerank), the server stops being the lever and V3 should be dropped; if R1 keeps 24, revisit with the ROCm numbers as the baseline. The owner's preference for in-process models stands, so the item is kept, not dropped.
+- Why (vLLM-alternatives explorer, 2026-10-10, full notes in the session scratchpad `explore-vllm-alternatives.md`): the owner slightly prefers models running inside LCI, with HTTP serving kept for models that need a serving tool. Among serving tools nothing beats llama.cpp here: TEI has no Windows build and Instinct-only ROCm, Infinity is stale and cross-encoder only, Ollama has no merged rerank endpoint, LM Studio/LocalAI lack Qwen3 rerank, and SGLang is Linux/gfx1151 with vLLM's GEMM stack. The only in-process crate that runs every model LCI uses (Qwen3 embedders with last-token pooling, Qwen3 rerankers with the yes/no head, plus cross-encoders) on the 890M is `llama-cpp-2` (Vulkan; the HIP route needs the HIP SDK and DLLs, and V1 showed HIP/ROCm is the only build that beats vLLM here). candle/mistral.rs lack Qwen3 rerank and run CPU-only here; `ort` covers small ONNX models only.
 - Scope: `embedding_backend` / `reranker_backend = "http" | "in-process"` per model; `Models` (`lci-core/src/models.rs`) becomes an enum over the HTTP client and a local engine behind a cargo feature `local-models`; a local init or call failure falls back to the configured URLs (fail-open stays); a query-priority queue for the single GPU; `embedding_identity` becomes backend-aware. The rerank template must carry LCI's code instruction or scores will not match vLLM. Extra in-process win: share the system+instruction+query KV prefix across the 24 documents with `kv_cache_seq_cp` (llama-server recomputes it per document because rerank is a stateless task), ~25% less rerank compute. Stepping stone: `serve` spawns and supervises `llama-server`.
-- Accept: parity on 50 real 24-document payloads (Spearman >= 0.99, top-1 agreement >= 98%, embedding cosine >= 0.999 vs the HTTP backend), `evaluate` core + mined within noise; adopt only if >= 1.3x faster than llama-server.
+- Accept: parity on 50 real 24-document payloads (Spearman >= 0.99, top-1 agreement >= 98%, embedding cosine >= 0.999 vs the HTTP backend), `evaluate` core + mined within the `compare` CI; adopt only if reranking p50 is >= 1.3x faster than the production vLLM path at R1's chosen window (V1's llama-server ROCm figure, 47.2 s per 24 x 4 KB, is the reference for the server-side part).
 - Risk: build complexity (CMake, MSVC, glslc are present on this machine), a model crash takes LCI down with it, GPU contention between indexing and queries, and crate version churn.
 
 ### V4 - In-process small cross-encoder reranker
@@ -208,13 +233,15 @@ first.
   | mined | semantic only | 0.771 | 0.886 | 0.829 | 0.517 | 0.463 | 0.27 s |
   | mined | grep only | 0.114 | 0.457 | 0.325 | 0.276 | 0.356 | 0.67 s |
 
-  Reading: on the mined set semantic-only beats both fusion and the full reranked pipeline at the top (hit@1, MRR) at ~1/125 of the latency, while the reranked pipeline finds more of the gold files (nDCG@10, recall@8). Grep alone is weak, and adding it to fusion costs 11 points of hit@1 versus semantic alone, so the lexical channel currently injects noise into the top ranks (consistent with the agnostic-stratum diagnosis under L0: longest-term selection, substring matching, no IDF). Priorities follow: L2 (rarity-weighted terms) next, then F2 (channel weights), then re-run these arms; the reranker's measured gain over fusion may largely be repairing lexical noise. Caveat: the reranked rows come from earlier binaries; part (a)'s paired bootstrap will put CIs on these deltas.
+  Reading (pre-L2): on the mined set semantic-only beats both fusion and the full reranked pipeline at the top (hit@1, MRR) at ~1/125 of the latency, while the reranked pipeline finds more of the gold files (nDCG@10, recall@8). Grep alone is weak, and adding it to fusion costs 11 points of hit@1 versus semantic alone, so the lexical channel injected noise into the top ranks (longest-term selection, substring matching, no IDF). Caveat: the reranked rows come from earlier binaries.
 
-### R1 - Reranker depth and document-size sweep
-`ready` (use E3 for the comparison once available) - S, live - deps: none - skill: `lci-retrieval-evaluation`
-- Why: reranking is 35-54 s per search here. Already measured at 24 candidates (commit `43d56d9`): caps uncapped/8192/4096/2048 -> rerank median 29.1/27.4/25.1/22.5 s, quality within noise; 4096 chosen. The cost model from R0's evidence predicts 12 candidates at a 2048-byte cap would take ~8-12 s (estimate, not measured). Whether cost scales with candidates x bytes or is dominated by model load decides every later reranker item (Investigation I-2). Qwen's reranker gains were measured on top-100 shortlists; LCI uses 24.
-- Scope: config-only runs of `evaluate` over `core.toml` (and `evaluations/mined/self.toml` if E2 landed) for `rerank_candidate_count` in {12, 24, 48} x `rerank_document_max_bytes` in {1024, 2048, 4096}, plus one reranker-off arm. Record p50/p95 `reranking_ms`, hit@1/3, MRR. Change the defaults in `lci-core/src/config.rs`, `config.example.toml`, README only if a cell dominates.
-- Accept: a results table in the commit message and in this item; decision rule: pick the cheapest cell whose hit@3 and MRR are within the E3 CI (or, before E3, within 0.03 absolute) of the best cell.
+- Post-L2 arms (triage 2026-10-10; L2's own reports, binary `2031ffe`, same index; `test-results/l2-*-new2.json`; the semantic-only rows above are unaffected by L2 and were not re-run): core fusion hit@1 0.909 / MRR 0.955 / nDCG@10 0.727 (one query 1 -> 2); core grep-only 0.818 / 0.855 / 0.789 (was 0.636 / 0.715 / 0.608); mined fusion 0.657 / 0.746 / 0.571 (was 0.657 / 0.736 / 0.551); mined grep-only 0.629 / 0.749 / 0.499 (was 0.114 / 0.325 / 0.276); mined reranked 0.743 / 0.808 / 0.624 at 17.5 s p50 (was 0.743 / 0.814 / 0.606 at 34.0 s). Reading: grep-only is now a real channel, yet fusion still trails semantic-only at the top on the mined set (hit@1 0.657 vs 0.771, MRR 0.746 vs 0.829) and semantic-only trails fusion on nDCG@10 (0.517 vs 0.571). So the remaining gap is fusion weighting, not lexical quality: F2 can start from these reports without another arm run. Note for F2 and N7: fusion-only runs of the same binary differ by up to 0.06 MRR between runs (`e3-mined-fusion` 0.736 vs `l2-mined-fusion-base` 0.706), most plausibly because the LSP channel is missing on cold-start queries (`lsp_search_ms` p95 ~10.2 s); pair runs with `compare` and expect wider CIs until N7 lands.
+
+### R1 - Reranker window and document-size sweep
+`ready` (triage 2026-10-10: E3's `compare` is available; every earlier cell predates L2, so re-baseline first) - S, live - deps: none - skill: `lci-retrieval-evaluation`
+- Why: reranking is now 16.8 s p50 / 28.8 s p95 per search on the mined set (`l2-mined-reranked-new2`, down from 32.7 s because L2 sends shorter, focused chunks). The cap sweep at 24 candidates (commit `43d56d9`: uncapped/8192/4096/2048 -> rerank median 29.1/27.4/25.1/22.5 s, quality within noise, 4096 chosen) was measured on pre-L2 chunks and is stale as absolute numbers; the shape (cost ~ tokens) is confirmed by I-2 (compute-bound ~290 tok/s, `rerank_s ~= 0.4 + tokens / 290`), so the window is the lever. Qwen's reranker gains were measured on top-100 shortlists; LCI uses 24, and on core the reranker's top-1 always came from fusion rank <= 5 (explorer below).
+- Scope: (1) prerequisite code change (explorer below): decouple the reranked window from the result count so `rerank_candidate_count` < `top_k` appends the remaining fusion-order hits after the reranked window (`hits.truncate` ~303 and `rerank_into_report` ~568-598 in `src/app/search.rs`). (2) Config-only `evaluate` runs on `core.toml` and `evaluations/mined/self.toml` with the L2 binary: `rerank_candidate_count` in {6, 8, 12, 24} x `rerank_document_max_bytes` in {2048, 4096}, each compared to the 24 x 4096 cell with `compare`; the reranker-off arm already exists (`l2-*-fusion-new2`). Record p50/p95/max `reranking_ms` (E4 if landed), hit@1/3, MRR, nDCG@10, recall@8. Change the defaults in `lci-core/src/config.rs`, `config.example.toml`, README only if a cell dominates.
+- Accept: a results table in the commit message and in this item; decision rule: pick the cheapest cell whose MRR and nDCG@10 deltas against 24 x 4096 have a `compare` 95% CI that includes 0 on the mined set and no core query losing its first expected rank.
 - Risk: a 48-candidate cell may exceed vLLM's batch limits; treat 4xx as a data point, not a bug.
 - Explorer (2026-10-10, reranker-gating): on the clean core pair (`core-eval-cap-4096` vs `r0-core-rerank-off`) the reranker's top-1 always came from fusion rank <= 5 (1,3,1,2,1,1,1,1,5,3,1); its only win (q9 readiness, fusion 3 -> 1, score gap 0.226) and only loss (q1, 1 -> 2, gap 0.002) both sit inside fusion top 5. Add windows {6, 8} to the grid; the cost model (0.4 s + W x ~354 tokens / 290 tok/s) predicts ~10 s at W=8 vs ~25 s at 24. Prerequisite code change: today `hits.truncate` (`src/app/search.rs` ~303) couples the candidate pool to the window and `rerank_into_report` (~568-598) keeps only `k` reranked hits, so W < top_k would shorten results; append the remaining fusion-order hits after the reranked window. Measure nDCG@10 and recall@10 as well as hit@1/MRR: in 7/11 core queries the reranked top 3 contains a chunk from outside fusion top 8.
 - Measurement caveat (V1 bench, 2026-10-10): vLLM's prefix cache makes an identical rerank request ~10x cheaper on repeat (24 x 4 KB: 3.4 s cached). Sequential evaluation arms that rerank the same chunks can partly reuse cache; run arms in an order that cannot benefit (largest cap last) or restart the reranker between arms, and never repeat an identical query in a timing run.
@@ -242,13 +269,13 @@ first.
 - Risk: the skip rate on prose queries is unknown; identifier queries (R2) are not in either evaluation set yet.
 
 ### R4 - Trial Qwen3-Reranker-0.6B
-- Downloaded with the owner's approval (2026-10-10, WSL `~/.cache/huggingface/hub`): `Qwen/Qwen3-Reranker-0.6B` (1.2 GB, Apache-2.0), `Alibaba-NLP/gte-reranker-modernbert-base` (575 MB, Apache-2.0), `Qwen/Qwen3-Embedding-0.6B` (1.2 GB, Apache-2.0, for M-items). Already cached: Qwen3-Embedding-4B, Qwen3-Embedding-8B, Qwen3-Reranker-4B. The owner allows a candidate to take the RAM of the model it would replace (stop the 4B reranker, serve the candidate on 8767, restore the `vllm.txt` setup afterwards; never more than two model processes). An NPU/native-Windows serving investigation (owner request) runs first and may change where these models are served.
-`ready` (downloaded 2026-10-10) - S - deps: E3
+- Downloaded with the owner's approval (2026-10-10, WSL `~/.cache/huggingface/hub`): `Qwen/Qwen3-Reranker-0.6B` (1.2 GB, Apache-2.0), `Alibaba-NLP/gte-reranker-modernbert-base` (575 MB, Apache-2.0), `Qwen/Qwen3-Embedding-0.6B` (1.2 GB, Apache-2.0, for M-items). Already cached: Qwen3-Embedding-4B, Qwen3-Embedding-8B, Qwen3-Reranker-4B. The owner allows a candidate to take the RAM of the model it would replace (stop the 4B reranker, serve the candidate on 8767, restore the `vllm.txt` setup afterwards; never more than two model processes). V1 (done) kept production serving on WSL vLLM, so candidates are served there as planned.
+`ready` (downloaded 2026-10-10; E3 done; triage 2026-10-10: compare against the L2 binary's `l2-mined-reranked-new2` and `l2-*-fusion-new2`, and prefer running after R1 so the window is fixed first) - S - deps: E3 (done)
 - Why: a third-party L4 measurement puts the 0.6B at 65 ms p50 vs 580 ms for the 4B (https://superlinked.com/blog/qwen3-embedding-reranker-guide); on an iGPU the ratio should be similar. MTEB-Code drops 81.20 -> 73.42 (https://arxiv.org/abs/2506.05176), but that was over a weak retriever; over LCI's 4B embedder the loss may be small and the latency gain decisive.
 - Scope: no code. Owner approves and serves the model on 8767 under a distinct `reranker_model` name; run E3 comparison (4B vs 0.6B vs off) on `core.toml` + mined set; document the recommended profile in README/`config.example.toml`.
 - Accept: comparison table in the commit; decision rule as R1 (cheapest within CI).
 - Risk: model weights never enter the repo (validation matrix).
-- Caution (explorer, 2026-10-10): in Qwen's own table the 0.6B reranker (73.42 MTEB-Code) scores *below* the 0.6B first-stage retriever it reranks (75.41), so it may hurt rather than help. `Alibaba-NLP/gte-reranker-modernbert-base` (149M, Apache-2.0; needs approval: download, ~0.3 GB) is the only small reranker found whose code number (CoIR 79.99) is not below its first stage (79.31) -- one model-card table, protocol unspecified, vLLM ROCm support unverified. bge-reranker-v2-m3 (41.38) and jina-reranker-v2 (58.98, CC-BY-NC) are far below the retriever. A cascade (small model over 24, 4B over the top 8) is the alternative to an outright replacement. Run R0 first: if fusion alone matches, no reranker swap is needed.
+- Caution (explorer, 2026-10-10): in Qwen's own table the 0.6B reranker (73.42 MTEB-Code) scores *below* the 0.6B first-stage retriever it reranks (75.41), so it may hurt rather than help. `Alibaba-NLP/gte-reranker-modernbert-base` (149M, Apache-2.0; downloaded, see above) is the only small reranker found whose code number (CoIR 79.99) is not below its first stage (79.31) -- one model-card table, protocol unspecified, vLLM ROCm support unverified. bge-reranker-v2-m3 (41.38) and jina-reranker-v2 (58.98, CC-BY-NC) are far below the retriever. A cascade (small model over 24, 4B over the top 8) is the alternative to an outright replacement. R0 is done: fusion alone does not match on the mined set, so a cheaper reranker is still worth trying.
 
 ### R5 - Reranker query instruction
 `ready` - S - deps: E3 - skill: `lci-retrieval-evaluation`
@@ -258,7 +285,7 @@ first.
 - Risk: none; query-side only, no re-embedding.
 
 ### N7 - LSP cold-start budget and warm-up
-`ready` - S-M, live - deps: none (N4 priming builds on it) - skill: `lci-lsp-adapter`
+`in-progress (2026-10-10)` - S-M, live - deps: none (N4 priming builds on it) - skill: `lci-lsp-adapter`
 - Why (explorer, 2026-10-10, from per-query timings in `r0-mined-*`, `e3-mined-fusion`, `r7-core-rerank-off`): every run's first query pays ~10.1-10.4 s because `after_initialized` waits for rust-analyzer's `experimental/serverStatus` quiescent with a 10 s cap (`lci-core/src/lsp/rust.rs` ~87) that always expires; the 8 symbol requests then take ~0.2 s. A second spike of ~24.6-30.1 s hits once per run on the first query issued >= ~20 s after spawn (cause unconfirmed: a blocking first full `workspace/symbol`, or an error in `Manager::request` (`lci-core/src/lsp.rs` ~135-155) that kills and respawns and pays the 10 s wait again). `serve` shares one App, so real users pay both once per workspace per process and again after any LSP request error; the channel runs concurrently with embedding and rg but the join waits for it and it holds the workspace read lock.
 - Scope: (1) add `tracing::warn!` at the respawn path and the quiescence-timeout path to settle the cause; (2) dedupe spawns per (provider, workspace) in `Manager` (`OnceCell`; today `client()` can spawn twice and a dropped spawn is killed by `kill_on_drop`); (3) wrap the LSP channel in a per-query budget (`lsp_search_budget_ms`, default ~1500) that returns no LSP hits on expiry while the session keeps warming in the background (never discard it), reported as a warning-free `lsp_cold` flag or note; (4) do the long quiescence wait only off the query path.
 - Accept: fake-LSP tests (slow initialize -> search returns within the budget with no LSP hits, a later search gets them; no double spawn); live `evaluate` on core + mined: max per-query `lsp_search_ms` <= budget, hit rates unchanged (`compare` CI includes 0 or improves).
@@ -268,6 +295,15 @@ first.
 `ready` - XS - deps: none - skill: `lci-retrieval-evaluation`
 - Why: `stage_latency` p95 is nearest-rank (`src/evaluate/metrics.rs` ~595), so with 35 queries it is the second-highest value and a single 30 s outlier is invisible.
 - Scope: add `max` and `n` per stage next to p50/p95; README/evaluation-workflow mention.
+
+### T1 - Test hygiene follow-ups
+`ready` (triage 2026-10-10) - XS - deps: none - no live run
+- Why: the 2026-10-10 reviews of E3a and L2 left two test-honesty nits, and the triage pass swept the tree for `#[ignore]`, `should_panic` and timing-sensitive assertions. Findings: no `#[ignore]` and no `should_panic` anywhere; the timing assertions below are all backed by deterministic fakes with 2x-1000x margins and stay as they are.
+- Scope (fix):
+  - `src/evaluate/tests.rs:1319` `a_consistent_improvement_is_significant_and_a_consistent_loss_is_too`: every pair's delta is the constant +0.0625, so the bootstrap interval is a point and the test duplicates `the_interval_of_a_constant_delta_is_that_delta` (`:1339`). Vary the deltas with one sign (e.g. +0.03, +0.05, +0.08, +0.10, +0.12, +0.06, +0.09, +0.15) so `ci_low > 0` is checked with a non-degenerate interval, and assert `ci_low < mean_delta < ci_high`.
+  - `lci-core/src/lexical.rs:959` `a_short_chunk_beats_a_much_longer_chunk_with_the_same_term_counts` (`:970-971`) pins the expected scores through `bm25_term_score` itself, and `:943` `repeated_lines_raise_a_score_with_diminishing_returns` (`:951`) restates the formula inline; a bug in the formula passes both. Add one hand-computed constant: df 2 of 8 files gives `idf = ln(6.5 / 2.5 + 1) = ln 3.6 = 1.280934`; chunk 1 (tf 2, length 8, average length 648 / 8 = 81, `norm = 0.25 + 0.75 * 8 / 81 = 0.324074`) scores `1.280934 * 2 * 2.2 / (2 + 1.2 * 0.324074) = 2.3593`; assert `|scored[0].score - 2.3593| < 1e-4`.
+- Reviewed, no change: `lci-core/src/models.rs:429` (`< 500 ms` for a breaker skip that makes no connection) and `:451` (`< 5 s` for one refused connect vs ~9 s on the old retried path); `tests/cases/indexing.rs:1109` (`< 10 s` with a 1 s reranker timeout), `:1154` (`< 5 s`), `:1174` (`< 250 ms` for a skipped rerank), `:1292` (500 ms sleep while a held file lock blocks the commit); `tests/cases/navigation.rs:307` (lower bound `>= 1.5 s`, the fake sleeps 2 s); `tests/cases/watching.rs:25` (5 s deadline over a 2 s poll). Same-named tests in `lci-core/src/lsp/{csharp,clangd,go,java,python,typescript}.rs` (`empty_or_missing_path_is_not_enabled`, `language_id_matches_extension`, `server_can_be_represented_without_a_process`, `transport_*`) are per-adapter copies in separate modules, not duplicates.
+- Accept: `cargo test -p local-code-intelligence --lib evaluate::` and `cargo test -p lci-core --lib lexical::` pass; the commit body names the two tests and the hand computation.
 
 ### H1 - Rust test-file classification
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
@@ -293,15 +329,15 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 
 | ID | Title | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| L0 | Engine-independent lexical fixes (no canonicalize per line, interval mapping, scanner-aligned rg flags, timeout) | ready | S | - |
-| L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research | M | E2, E3 |
+| L0 | Engine-independent lexical fixes: scanner-aligned rg flags, timeout and stdout cap, newest bundled rg, interval index for LSP mapping, timing split (canonicalize and lexical mapping done in L2) | ready (edited 2026-10-10) | XS-S | - |
+| L1 | Lexical engine spike: `rg` subprocess vs in-process grep crates vs LanceDB FTS vs Tantivy | research (deps met; baseline is the L2 channel) | M | E2, E3 |
 | L2 | IDF weighting and identifier splitting in the existing `rg` channel | done (2031ffe: BM25 over rare terms; production search p50 34 -> 17.5 s) | S | E3 |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` | ready | S | E3 |
 | L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) | blocked(L1 decision) | L (split) | L1, L2 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed) | blocked(C1) | M | C1, E3 |
 | F1 | Re-justify the 0.004 production prior with a sweep | ready | S | E3 |
-| F2 | Weighted RRF per channel, definition boost, per-file cap | ready, NEXT ranking item (re-run E3 arms first: lexical changed in L2) | M | E3 |
+| F2 | Weighted RRF per channel, definition boost, per-file cap | ready, NEXT ranking item (post-L2 arms already exist: `test-results/l2-*-new2.json` plus the unchanged semantic-only arm; see E3) | M | E3 |
 | F3 | Query-type routing (identifier / prose / issue-like) | blocked(F2, L3, R2) | M | F2, L3, R2 |
 | M1 | Configurable, task-specific query instructions | ready | S | E3 |
 | N1 | Per-provider symbol-query syntax | ready | S | - |
@@ -314,7 +350,9 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | N3 | LSP `shutdown`/`exit`, idle eviction, registry-derived status | ready | S | - |
 
 ### L0 - Engine-independent lexical channel fixes
-`ready` - S - deps: none - skill: `lci-retrieval-evaluation` (latency only; no ranking change)
+`ready` (edited in the 2026-10-10 triage: L2 `2031ffe` already did the per-file `dunce::canonicalize` and replaced the O(matches x chunks) lexical mapping with per-path candidate selection, and its term selection by rarity with a stop list closes the explorer paragraph below; what remains is listed here) - XS-S - deps: none - skill: `lci-retrieval-evaluation` (latency and robustness only; no ranking change)
+- Remaining scope: `rg` flags aligned with the scanner (`--hidden --no-require-git --ignore-file .lciignore --no-config`, verified against the multilingual fixture); a timeout and stdout cap on the lexical channel (`lci-core/src/lexical.rs` ~488, today unbounded); pick the newest bundled VS Code `rg` by version rather than directory-name sort; a per-file sorted interval index for `map_lsp_locations` (`src/app/search.rs` ~589, still a linear `find` per location); split `lexical_search_ms` into spawn/search/credit/map or at least time the mapping.
+- Accept (remaining): unit tests for the interval mapping and the flag set; existing lexical/integration tests pass; a debug-binary `core.toml` run shows identical first-expected ranks (report names in the commit).
 - Why (explorer, 2026-10-10, measured on this repo): the `rg` subprocess itself is not the cost -- spawn ~48 ms + search 15-26 ms, and lexical runs in parallel with the ~470 ms query embedding (slowest branch in 1 of 135 recorded searches). The real costs sit around it: `dunce::canonicalize` per matching line (`lci-core/src/lexical.rs` ~207-211, ~85-120 us each, 15-260 ms per search) and an O(matches x chunks) scan in `map_lexical_matches` (`src/app/search.rs`, 24-380 ms release / 37-590 ms debug, outside every timer). Also: `rg` uses default ignore rules while the scanner uses `hidden(false)`, `require_git(false)` and `.lciignore`, so the file sets disagree in non-git workspaces; VS Code-bundled `rg` discovery picks the first build by directory-name sort, not the newest; no timeout or stdout cap. Ripgrep vs GNU grep (owner's question): rg 77 ms vs Git-for-Windows grep 140 ms median on the same 12-term search, and that grep silently returns zero hits for `-i -F` and for `-i` with several `-e` -- not a safe fallback.
 - Scope: emit relative paths from `rg` (no per-line canonicalize); an interval index (per-file sorted ranges + binary search) in `map_lexical_matches` and `map_lsp_locations`; `rg` flags aligned with the scanner (`--hidden --no-require-git --ignore-file .lciignore --no-config`); a timeout and stdout cap on the lexical channel; pick the newest bundled `rg` by version, not name; split `lexical_search_ms` into spawn/search/parse/map or at least time the mapping.
 - Accept: unit tests for the interval mapping and the path handling (incl. Windows separators); existing lexical/integration tests pass; a debug-binary `core.toml` run shows identical first-expected ranks and lower `lexical_search_ms`/total residual (report names in the commit).
@@ -322,7 +360,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Explorer (2026-10-10, keyword-agnostic stratum; per-query diagnosis in the session scratchpad): `lexical::terms()` keeps the 12 *longest* terms, so short decisive words are dropped ("idle", "retry", "lsp" in one query); matching is substring and ranking is matching-line count with no IDF, so generic verbs ("add" hit 45 of 78 files) pull C/Go test chunks into the reranker's 24 slots. Fold into L0/L2: choose terms by rarity (document frequency) instead of length, drop terms matching more than ~25% of files, and add generic English verbs to the stop list. Evaluate with the reranker off (fast since R7) on both strata and `core.toml`; never tune on mined paths.
 
 ### L1 - Lexical engine spike
-`research` - M - deps: E2, E3 - skill: `lci-retrieval-evaluation`
+`research` (deps met 2026-10-10; the baseline for the adoption rule is now the L2 channel: lexical-only nDCG@10 0.499 mined / 0.789 core, p50 ~250 ms, `test-results/l2-*-grep-new2.json`) - M - deps: E2 (done), E3 (done) - skill: `lci-retrieval-evaluation`
 - Explorer findings (2026-10-10): lancedb 0.38 already ships BM25 FTS with no new downloads -- `Table::create_index(&["code"], Index::FTS(InvertedIndexParams::code().split_identifiers(true).preserve_original(true)))` (camelCase/snake_case/digit splitting built in) and `QueryBase::full_text_search(FullTextSearchQuery::new(..))`, ordered by BM25 `_score`. But `Store::replace`'s table overwrite drops every index (lance-table manifest_build.rs:788), so FTS would be rebuilt per commit until S1/S2 land. Zero-download alternative: BM25 in memory over the chunks `Store::chunks` already loads (also fixes rg's live-file vs snapshot skew). Grep crates and Tantivy are not in Cargo.lock (downloads; the owner approved crates on 2026-10-10). Proxy quality signal: SQLite-FTS5 BM25 over this repo's 10 self queries gave MRR 0.875 vs 0.69 for line counts (proxy only). Adoption rule: lexical-only nDCG@10 +20% over L0+L2 on both strata, no full-pipeline regression, p50 lexical time no worse than L0, missing index degrades to rg with a warning.
 - Why: LCI ranks lexical hits by raw matching-line count with no IDF, so common tokens rank like rare identifiers (`src/app/search.rs::map_lexical_matches`). Peers use a ranked BM25 index: Tantivy (ck https://github.com/BeaconBay/ck, codesearch https://github.com/flupkede/codesearch, rutmir), SQLite FTS5, or LanceDB's own Lance-native BM25 index with tokenizer controls (https://docs.lancedb.com/indexing/fts-index; Tantivy support is being removed, https://github.com/lancedb/lancedb/issues/2998). Identifier-aware tokenization "largely eliminated" BM25's gap on CodeSearchNet-Go and a tuned IDF added +89% (https://arxiv.org/abs/2605.18561). ripgrep's own `grep-searcher`/`grep-regex`/`ignore` crates can run in-process (https://crates.io/crates/grep-searcher), removing `rg.exe` discovery and a process spawn per query. Nobody has measured these against each other on code; pick by data, not fashion.
 - Design: four arms over this repo's chunks and the E2 `self` query set, lexical channel only (E3 toggles): (a) current `rg` count ranking; (b) in-process `grep-searcher` + `ignore` with the same ranking (measures spawn cost and Windows-discovery removal only); (c) LanceDB FTS on `code` (+ a pre-split identifier column) with `stem=false`, `remove_stop_words=false`, `lower_case=true`, `max_token_length` >= 100, `with_position=false`; (d) Tantivy with a custom camelCase/snake_case tokenizer. Metrics: lexical-only nDCG@10 / hit@3 / MRR per stratum, p50/p95 query latency, index build time and on-disk size, number of new crates. Arms (b) and (d) live in `xtask` behind an optional cargo feature `lexical-bench` with optional deps; arm (c) is an `#[ignore]`d integration test in `tests/` (LanceDB is already a dependency). Nothing ships in the product from this item.
@@ -374,7 +412,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: F3 may later make the prior query-kind dependent; keep the scalar config.
 
 ### F2 - Weighted RRF, definition boost, per-file cap
-`ready` - M - deps: E3 - skill: `lci-retrieval-evaluation`
+`ready`, next ranking item (triage 2026-10-10: the post-L2 arm table under E3 is the starting evidence; on the mined set fusion trails semantic-only at the top, hit@1 0.657 vs 0.771, while leading on nDCG@10, 0.571 vs 0.517, so a lower lexical or LSP weight is the first cell to try) - M - deps: E3 (done) - skill: `lci-retrieval-evaluation`
 - Why: RRF is sensitive to its parameters and a tuned weighted combination beats flat RRF (Bruch et al., TOIS 2023 https://arxiv.org/abs/2210.11934); Semble's post-fusion signals lifted BM25 from 0.675 to 0.834 nDCG@10, mostly from definition boosts, adaptive lexical weight and per-file coherence (https://github.com/MinishLab/semble/blob/HEAD/benchmarks/README.md); de4er00 caps two chunks per file.
 - Scope: `[fusion]` config: `semantic_weight`, `lexical_weight`, `lsp_weight` (default 1.0), `definition_boost` (default 0; applies when the chunk's C1 `kind` is a declaration or an LSP symbol kind in {Class, Struct, Interface, Enum, Function, Method, Trait}), `max_chunks_per_file` (default 0 = unlimited; applied when building the rerank shortlist, refilling from the next candidates). `fuse_hits` in `src/app/search.rs`; weights kept visible in `fusion_score` only (contract: distinct scores).
 - Accept: unit tests on hand-built channel lists (search.rs now has a `tests` module); live E3 sweep of weights {0.5, 1, 2} per channel and cap {0, 2} on the mined set; defaults change only on a win.
@@ -465,10 +503,10 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | A3 | Upgrade rmcp 3.2.0 -> 3.5.1 (2026-07-28 stateless spec, back-compat) | ready | M | - |
 | A4 | `index_workspace` as an MCP Task with progress | blocked(A3) | M | A3 |
 | M2 | Model hygiene: swapped-model canary, reranker sanity probe, reference serving doc | ready | M | - |
-| M3 | Low-resource embedding profile with Qwen3-Embedding-0.6B | needs-approval(download) | S | E3 |
+| M3 | Low-resource embedding profile with Qwen3-Embedding-0.6B | ready (downloaded 2026-10-10 under R4's approval) | S | E3 |
 | C3 | Split declarations above ~8 KB with header carry | blocked(C1) | M | C1, E3 |
 | X1 | Extensions `.h`, `.cc/.cxx/.hh/.hxx`, `.mts/.cts`, `.mjs/.cjs` through the acceptance bar | ready | S each | - |
-| H2 | Documentation sync: README docs index links this file, stale rows, module-boundary sentence | ready | S | - |
+| H2 | Documentation sync: README docs index links this file and the evaluation workflow; two `compare` README notes from the E3a review | ready (edited 2026-10-10; AGENTS/BM25 parts landed) | XS | - |
 
 ### N4 - Project-root discovery and priming
 `ready` - M - deps: N2 - skill: `lci-lsp-adapter`
@@ -527,7 +565,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: the canary costs one embedding call per process start (cache it); never auto-reindex on mismatch, only report.
 
 ### M3 - Low-resource embedding profile
-`needs-approval(download Qwen/Qwen3-Embedding-0.6B, Apache-2.0, ~0.6B params, ~1.2 GB bf16, https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)` - S - deps: E3
+`ready` (triage 2026-10-10: `Qwen/Qwen3-Embedding-0.6B` is already in the WSL HF cache under the owner's 2026-10-10 approval, see R4; serving it means swapping the 4B embedder on 8766 for the run, within the two-model-process rule, and restoring `vllm.txt` afterwards) - S - deps: E3 (done)
 - Why: 4B models assume a GPU; MTEB-Code 75.41 (0.6B) vs 80.06 (4B) (https://arxiv.org/abs/2506.05176); on CORE-Bench the 4B and 8B are close, so 0.6B is the only meaningful cheaper tier among Qwen's. A documented CPU/low-VRAM profile widens who can run LCI.
 - Scope: `config.low-resource.example.toml` (0.6B embedder + R4's 0.6B reranker, separate `data_dir` because vectors are not comparable); E3 comparison vs the 4B profile on `core.toml` + mined set; README profile section. No code unless M4 (dimension truncation) is wanted at the same time.
 - Accept: comparison table; documented profile.
@@ -548,9 +586,9 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 - Risk: `.h` ambiguity; make the mapping a documented decision, not a heuristic.
 
 ### H2 - Documentation sync
-`ready` - S - deps: none (do after the in-progress diff lands)
-- Why: README's Documentation list does not mention this roadmap; the "There is no BM25 ..." module-boundary sentence and the `search_symbols` row need to track landed items; AGENTS.md freshness wording is being fixed by another agent (verify, do not duplicate).
-- Scope: README Documentation list (link `docs/development/roadmap.md`), any stale rows after the uncommitted README diff lands, `docs/architecture.md` one-line pointer; no behaviour change.
+`ready` (edited 2026-10-10: the AGENTS.md part landed in `fa0f262`, the BM25 sentence and `search_symbols` row in `2031ffe`/`3847b8c`; verified `grep -n roadmap README.md` is still empty) - XS - deps: none
+- Why: README's Documentation list (README ~24-28) does not mention this roadmap or the evaluation workflow; two E3a review notes are still open: README should say that an unwritable `compare --output` also exits nonzero, and that unpaired query keys are listed in sorted order (`66005e9` body).
+- Scope: README Documentation list (link `docs/development/roadmap.md` and `.agents/skills/lci-retrieval-evaluation/references/evaluation-workflow.md`), the two `compare` notes in the "Retrieval evaluation" paragraph, `docs/architecture.md` one-line pointer; no behaviour change.
 - Accept: `cargo xtask test --suite Full` (fmt only matters); a grep for "Rust/C#" and "Rust LSP" in README returns nothing stale.
 
 ---
@@ -591,9 +629,9 @@ Evidence for the tier (restated so the file stays self-contained):
 | ID | Question | Design | Metric | Decision rule |
 | --- | --- | --- | --- | --- |
 | I-1 | Is shelling out to `rg` worth keeping over in-process grep crates, LanceDB FTS, or Tantivy? | L1's four arms on this repo + E2 set, lexical-only | lexical-only nDCG@10/hit@3 per stratum, p50/p95, index size/build time, new crates | see L1 |
-| I-2 | What makes reranking cost 35-54 s here: candidate count, document bytes, or model compute on the iGPU? | Time `POST /rerank` directly (curl) with 1/6/12/24 docs x 512/2048/4096 bytes, warm | wall time per call | if time scales with docs x bytes, R1 caps are the lever; if flat, R4 (smaller model) or R2 (skip) is |
+| I-2 | What makes reranking cost 35-54 s here: candidate count, document bytes, or model compute on the iGPU? | Time `POST /rerank` directly (curl) with 1/6/12/24 docs x 512/2048/4096 bytes, warm | wall time per call | Answered (2026-10-10, R0 vLLM logs over 44 reranks and V1 bench): compute-bound at ~290 prompt tokens/s, `rerank_s ~= 0.4 + tokens / 290` within ~10%; L2 confirmed it by halving tokens and time (32.7 -> 16.8 s p50). Tokens (window x bytes) are the lever: R1 |
 | I-3 | Which reranker configuration minimizes p50 without a significant hit@3/MRR loss? | R1 grid + R3 vote + R4 model, via E3 | p50 `reranking_ms`, hit@3, MRR with CI | cheapest cell within the CI of the best |
-| I-4 | Does the 4B reranker add anything over the 4B embedder on this corpus? | E3 reranker on/off, per stratum | nDCG@10, MRR, hit@1 | if off is within CI, make `reranker` default off for identifier queries (F3) |
+| I-4 | Does the 4B reranker add anything over the 4B embedder on this corpus? | E3 reranker on/off, per stratum | nDCG@10, MRR, hit@1 | Answered for the whole set (2026-10-10, R0 + L2): yes on the mined set (reranked vs fusion after L2: hit@1 0.743 vs 0.657, MRR 0.808 vs 0.746, nDCG@10 0.624 vs 0.571; pre-L2 CI-less deltas +5.7 hit@1, +11.4 hit@3); on core it is within noise (one query up, one down). Open per stratum: keyword-agnostic n=8 is noise; the per-kind default question moves to F3 |
 | I-5 | Does the 0.004 prior help or hurt per query kind? | F1 sweep per stratum | hit@3, disfavored-before-expected | per-kind value via F3 or a single lower constant |
 | I-6 | Does evaluating mined queries at HEAD (not the parent commit) bias results? | For 50 mined commits, create a `git worktree` at the parent, index into a disposable data dir, compare | delta in hit@3/MRR vs HEAD evaluation | if bias > 0.05 absolute, extend E2 with a `--at-parent` mode |
 | I-7 | Do contextual headers help NL queries without hurting identifier queries? | C2 before/after per stratum | nDCG@10 per stratum | ship if NL improves and identifier is within CI |
