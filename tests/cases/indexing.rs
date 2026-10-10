@@ -432,6 +432,83 @@ async fn on_search_freshness_waits_for_a_concurrent_refresh_job() {
     task.abort();
 }
 
+/// Semantic score, by relative file path, of the chunks a search for
+/// "translator" returns. The fake embeds any text containing "translator" (the
+/// query included) as the same vector, so a chunk scores 1.0 exactly when the
+/// text embedded for it mentioned "translator".
+async fn translator_semantic_scores(
+    app: &App,
+    workspace: &Path,
+) -> std::collections::HashMap<String, f32> {
+    let found = app.search(workspace, "translator", Some(10)).await.unwrap();
+    found
+        .results
+        .iter()
+        .filter_map(|hit| Some((hit.chunk.relative_file_path.clone(), hit.semantic_score?)))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_path_document_template_embeds_per_path_and_reuses_unchanged_chunks() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.embedding_document_template = "title: {path} | text: {code}".into();
+    let workspace = temp.path().join("path-template");
+    // Neither file's code mentions "translator"; one file's path does.
+    write(&workspace, "lib.rs", "fn alpha() {}\n");
+    write(&workspace, "translator_notes.rs", "fn beta() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let first = app.index(&workspace).await.unwrap();
+    assert!(first.chunks >= 2);
+    assert_eq!(first.embedded_chunks, first.chunks);
+    assert_eq!(first.reused_chunks, 0);
+
+    // The documents were embedded from the template: only the path in the
+    // text can make translator_notes.rs match. (A `title:` document does not
+    // start with the query instruction, so the fake counts it as a document.)
+    let scores = translator_semantic_scores(&app, &workspace).await;
+    assert!(
+        (scores["translator_notes.rs"] - 1.0).abs() < 0.001,
+        "{scores:?}"
+    );
+    assert!(scores["lib.rs"] < 0.5, "{scores:?}");
+
+    // Unchanged files keep their vectors.
+    let documents_before = fake.documents.load(Ordering::SeqCst);
+    let second = app.index(&workspace).await.unwrap();
+    assert_eq!(second.chunks, first.chunks);
+    assert_eq!(second.embedded_chunks, 0);
+    assert_eq!(second.reused_chunks, second.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents_before);
+
+    // The same code under a new path is a new document: it is embedded
+    // again, not served the vector computed for the first path.
+    write(&workspace, "translator_copy.rs", "fn alpha() {}\n");
+    let third = app.index(&workspace).await.unwrap();
+    let copied = third.chunks - second.chunks;
+    assert!(copied > 0);
+    assert_eq!(third.embedded_chunks, copied);
+    assert_eq!(third.reused_chunks, second.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst) - documents_before,
+        copied
+    );
+    let scores = translator_semantic_scores(&app, &workspace).await;
+    assert!(
+        (scores["translator_copy.rs"] - 1.0).abs() < 0.001,
+        "{scores:?}"
+    );
+    assert!(
+        (scores["translator_notes.rs"] - 1.0).abs() < 0.001,
+        "{scores:?}"
+    );
+    assert!(scores["lib.rs"] < 0.5, "{scores:?}");
+
+    // Only the two searches above were classified as queries.
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
 #[tokio::test]
 async fn persistence_incremental_isolation_deletion_and_fail_open() {
     let (temp, mut config, fake, task) = fixture().await;

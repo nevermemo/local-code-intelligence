@@ -9,6 +9,33 @@ default_top_k = 8
 # Must be outside every workspace you index.
 # data_dir = 'C:\Users\you\AppData\Local\local-code-intelligence'
 embedding_batch_size = 8
+# Prompt formats for the embedding model. Models differ in what they expect (an
+# instruction prefix, a task label), so the text embedded for a query and for an
+# indexed chunk are both templates. The defaults below are the formats LCI used
+# before they were configurable (Qwen3-Embedding's query instruction, the bare
+# code for documents).
+#
+# embedding_query_template is the text embedded for a search query. {query} is
+# required. It shapes the query only, so changing it never re-embeds an index.
+embedding_query_template = "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}"
+# embedding_document_template is the text embedded for each indexed chunk.
+# {code} (the chunk's source) is required; {path} (its repository-relative file
+# path) is optional. Changing it changes the index's embedding identity, so
+# every chunk is re-embedded: the next index_workspace does it, and so does a
+# search under the default on-search freshness (under manual or watch a search
+# fails until you re-index). Without {path}, identical code is embedded once
+# and reused wherever it appears; with {path} the vector depends on the file
+# too, so identical code in different files, or a file moved to a new path, is
+# embedded per path.
+# Placeholders are filled in one pass: code that contains the text {path} is
+# embedded literally, and any other {text} in a template is kept as it is.
+embedding_document_template = "{code}"
+# EmbeddingGemma 2 (set both):
+# embedding_query_template = "task: code retrieval | query: {query}"
+# embedding_document_template = "title: {path} | text: {code}"
+# bge-code-v1 (set both; the document format is the bare code):
+# embedding_query_template = "<instruct>Given a question in text, retrieve relevant code that answers it.\n<query>{query}"
+# embedding_document_template = "{code}"
 embedding_timeout_seconds = 120
 reranker_timeout_seconds = 120
 # Bounded timeout for /ready and service_status dependency probes (1-30 seconds).

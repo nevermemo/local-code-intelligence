@@ -80,6 +80,24 @@ pub struct Snapshot {
     pub indexed_at: String,
 }
 
+/// The key under which a chunk's stored vector is cached between index passes
+/// (`Store::cached_vectors`) and looked up while indexing.
+///
+/// A vector depends only on the chunk's code unless the embedding document
+/// template mentions `{path}` (`uses_path`); then it also depends on the file,
+/// so the key adds the path and identical code in two files, or a file moved to
+/// a new path, is embedded afresh. Without `{path}` the key is the bare content
+/// hash, exactly as before the template existed, so existing indexes keep
+/// working. The separator (U+001F, a control character) cannot occur in a
+/// content hash, so the combined key is unambiguous.
+pub(crate) fn vector_key(uses_path: bool, content_hash: &str, path: &str) -> String {
+    if uses_path {
+        format!("{content_hash}\u{1f}{path}")
+    } else {
+        content_hash.to_owned()
+    }
+}
+
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
@@ -125,11 +143,22 @@ impl Store {
         }))
     }
 
-    pub async fn cached_vectors(snapshot: &Snapshot) -> Result<HashMap<String, Vec<f32>>> {
+    /// Every stored vector, keyed by `vector_key` (`uses_path` as the
+    /// caller's document template decides it), for reuse by the next index
+    /// pass. With `uses_path` the file path column is read as well.
+    pub async fn cached_vectors(
+        snapshot: &Snapshot,
+        uses_path: bool,
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        let columns: &[&str] = if uses_path {
+            &["content_hash", "relative_file_path", "vector"]
+        } else {
+            &["content_hash", "vector"]
+        };
         let batches = snapshot
             .table
             .query()
-            .select(Select::columns(&["content_hash", "vector"]))
+            .select(Select::columns(columns))
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -137,6 +166,11 @@ impl Store {
         let mut cache = HashMap::new();
         for batch in batches {
             let hashes = column::<StringArray>(&batch, "content_hash")?;
+            let paths = if uses_path {
+                Some(column::<StringArray>(&batch, "relative_file_path")?)
+            } else {
+                None
+            };
             let vectors = column::<FixedSizeListArray>(&batch, "vector")?;
             for i in 0..batch.num_rows() {
                 let value = vectors.value(i);
@@ -144,7 +178,11 @@ impl Store {
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .context("invalid vector values")?;
-                cache.insert(hashes.value(i).into(), vector.values().to_vec());
+                let path = paths.map_or("", |paths| paths.value(i));
+                cache.insert(
+                    vector_key(uses_path, hashes.value(i), path),
+                    vector.values().to_vec(),
+                );
             }
         }
         Ok(cache)
@@ -367,4 +405,32 @@ fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
         .as_any()
         .downcast_ref::<T>()
         .with_context(|| format!("invalid column {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "4f2a9c";
+
+    #[test]
+    fn without_path_the_key_is_the_bare_content_hash() {
+        assert_eq!(vector_key(false, HASH, "src/a.rs"), HASH);
+        // The path is ignored, so a chunk repeated across files shares one key.
+        assert_eq!(
+            vector_key(false, HASH, "src/a.rs"),
+            vector_key(false, HASH, "src/b.rs")
+        );
+    }
+
+    #[test]
+    fn with_path_the_key_tells_files_apart() {
+        let a = vector_key(true, HASH, "src/a.rs");
+        let b = vector_key(true, HASH, "src/b.rs");
+        assert_ne!(a, b);
+        assert_ne!(a, HASH);
+        assert_eq!(a, vector_key(true, HASH, "src/a.rs"));
+        // Another chunk of the same file has another key.
+        assert_ne!(a, vector_key(true, "0e11d7", "src/a.rs"));
+    }
 }

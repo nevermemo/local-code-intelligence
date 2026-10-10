@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, fill_template};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
@@ -6,6 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// What the default query template opens with: the default template
+/// (`config::DEFAULT_EMBEDDING_QUERY_TEMPLATE`) up to its `{query}`
+/// placeholder. The configured template is what `Models::query` uses; this
+/// is for callers (the fake model service in the tests) that need to tell a
+/// default-formatted query from a document.
 pub const QUERY_INSTRUCTION: &str = "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: ";
 
 #[derive(Clone)]
@@ -280,14 +285,19 @@ impl Models {
             .map(|v| v.context("missing embedding index"))
             .collect()
     }
+
+    /// The text embedded for `query`: `embedding_query_template` with its
+    /// `{query}` placeholder filled. The query is substituted as is, so a
+    /// query that mentions `{query}` stays literal.
+    fn query_text(&self, query: &str) -> String {
+        fill_template(&self.config.embedding_query_template, &[("query", query)])
+    }
+
     /// Embeds a search query. Query-time, so one attempt: neither a timeout
     /// nor a refused connection is retried.
     pub async fn query(&self, query: &str) -> Result<Vec<f32>> {
         Ok(self
-            .embed_with(
-                &[format!("{QUERY_INSTRUCTION}{query}")],
-                RetryPolicy::FailFast,
-            )
+            .embed_with(&[self.query_text(query)], RetryPolicy::FailFast)
             .await?
             .remove(0))
     }
@@ -370,6 +380,53 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         address
+    }
+
+    #[test]
+    fn the_default_query_template_is_the_former_hard_coded_instruction() {
+        assert_eq!(
+            crate::config::DEFAULT_EMBEDDING_QUERY_TEMPLATE,
+            format!("{QUERY_INSTRUCTION}{{query}}")
+        );
+        assert_eq!(
+            QUERY_INSTRUCTION,
+            "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: "
+        );
+        let models = Models::new(&Config::default()).unwrap();
+        assert_eq!(
+            models.query_text("find the parser"),
+            format!("{QUERY_INSTRUCTION}find the parser")
+        );
+    }
+
+    #[test]
+    fn a_custom_query_template_formats_the_query() {
+        let config = Config {
+            embedding_query_template: "task: code retrieval | query: {query}".into(),
+            ..Config::default()
+        };
+        let models = Models::new(&config).unwrap();
+        assert_eq!(
+            models.query_text("find the parser"),
+            "task: code retrieval | query: find the parser"
+        );
+        // The query is substituted as is and never re-scanned.
+        assert_eq!(
+            models.query_text("what is {query}?"),
+            "task: code retrieval | query: what is {query}?"
+        );
+
+        // A multi-line template, as the bge-code format uses.
+        let multi_line = Config {
+            embedding_query_template: "<instruct>Retrieve code.\n<query>{query}".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            Models::new(&multi_line)
+                .unwrap()
+                .query_text("find the parser"),
+            "<instruct>Retrieve code.\n<query>find the parser"
+        );
     }
 
     #[test]

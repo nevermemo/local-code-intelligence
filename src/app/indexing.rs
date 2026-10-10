@@ -3,9 +3,10 @@
 use super::{App, WorkspaceCoordination, ms};
 use crate::{
     chunk,
+    config::fill_template,
     manifest::{self, Manifest},
     models::{self, Models},
-    store::Store,
+    store::{Store, vector_key},
     workspace::Workspace,
 };
 use anyhow::{Context, Result, ensure};
@@ -42,6 +43,21 @@ pub struct IndexReport {
 /// Shortest prefix (in bytes) an oversized input is cut down to before
 /// giving up: below this, a rejection can't plausibly be about length.
 const MIN_EMBED_PREFIX_BYTES: usize = 512;
+
+/// The text embedded for `chunk`: `template` (`embedding_document_template`)
+/// with `{code}` replaced by the chunk's source and `{path}` by its
+/// repository-relative file path. The default template `{code}` yields the
+/// source unchanged. The oversized-input fallback below shortens this
+/// formatted text from its end, so a prefix from the template survives.
+fn document_text(template: &str, chunk: &chunk::Chunk) -> String {
+    fill_template(
+        template,
+        &[
+            ("code", chunk.code.as_str()),
+            ("path", chunk.relative_file_path.as_str()),
+        ],
+    )
+}
 
 /// Embeds one batch of document texts. When the service rejects the batch's
 /// input itself (HTTP 400/413/422 -- typically one chunk longer than the
@@ -174,23 +190,32 @@ impl App {
         let chunks = scan.chunks;
         let previous = self.store.snapshot(&workspace).await?;
         let identity = self.config.embedding_identity();
+        let template = &self.config.embedding_document_template;
+        // A template that embeds the file path makes a vector depend on the
+        // file as well as the code, so the vector cache is keyed by both.
+        let uses_path = template.contains("{path}");
+        let key_of =
+            |c: &chunk::Chunk| vector_key(uses_path, &c.content_hash, &c.relative_file_path);
         let mut cache = match &previous {
-            Some(s) if s.identity == identity => Store::cached_vectors(s).await?,
+            Some(s) if s.identity == identity => Store::cached_vectors(s, uses_path).await?,
             _ => HashMap::new(),
         };
         let reused_chunks = chunks
             .iter()
-            .filter(|c| cache.contains_key(&c.content_hash))
+            .filter(|&c| cache.contains_key(&key_of(c)))
             .count();
         let mut seen = HashSet::new();
         let missing: Vec<_> = chunks
             .iter()
-            .filter(|c| !cache.contains_key(&c.content_hash) && seen.insert(c.content_hash.clone()))
+            .filter(|&c| {
+                let key = key_of(c);
+                !cache.contains_key(&key) && seen.insert(key)
+            })
             .collect();
         let embedded_chunks = missing.len();
         let mut truncated_for_embedding = Vec::new();
         for (i, batch) in missing.chunks(self.config.embedding_batch_size).enumerate() {
-            let texts: Vec<_> = batch.iter().map(|c| c.code.clone()).collect();
+            let texts: Vec<_> = batch.iter().map(|c| document_text(template, c)).collect();
             let (vectors, shortened) = embed_isolating_oversized(&self.models, &texts)
                 .await
                 .with_context(|| {
@@ -203,18 +228,15 @@ impl App {
             for position in shortened {
                 let chunk = batch[position];
                 let location = format!("{}:{}", chunk.relative_file_path, chunk.start_line);
-                tracing::warn!(workspace_id = %workspace.id, chunk = %location, bytes = chunk.code.len(), "embedding service rejected the full chunk as too long; embedded a shortened prefix");
+                tracing::warn!(workspace_id = %workspace.id, chunk = %location, bytes = texts[position].len(), "embedding service rejected the full chunk as too long; embedded a shortened prefix");
                 truncated_for_embedding.push(location);
             }
-            for (c, vector) in batch.iter().zip(vectors) {
-                cache.insert(c.content_hash.clone(), vector);
+            for (&c, vector) in batch.iter().zip(vectors) {
+                cache.insert(key_of(c), vector);
             }
             tracing::info!(workspace_id = %workspace.id, completed = ((i+1)*self.config.embedding_batch_size).min(missing.len()), total = missing.len(), "embedding chunks");
         }
-        let vectors: Vec<_> = chunks
-            .iter()
-            .map(|c| cache[&c.content_hash].clone())
-            .collect();
+        let vectors: Vec<_> = chunks.iter().map(|c| cache[&key_of(c)].clone()).collect();
         let dimension = vectors
             .first()
             .map(Vec::len)
@@ -534,5 +556,45 @@ impl App {
             watched: false,
             already_in_requested_state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(path: &str, code: &str) -> chunk::Chunk {
+        chunk::Chunk {
+            relative_file_path: path.to_owned(),
+            language: "rust".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            code: code.to_owned(),
+            content_hash: "hash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_default_document_template_embeds_the_code_unchanged() {
+        let template = &crate::config::Config::default().embedding_document_template;
+        let source = "fn a() {}\n// {path} stays literal\n";
+        let text = document_text(template, &sample("src/a.rs", source));
+        assert_eq!(text, source);
+    }
+
+    #[test]
+    fn a_document_template_can_carry_the_file_path() {
+        let plain = sample("src/a.rs", "fn a() {}");
+        assert_eq!(
+            document_text("title: {path} | text: {code}", &plain),
+            "title: src/a.rs | text: fn a() {}"
+        );
+        // Code that mentions a placeholder is never expanded, and the
+        // template's own prefix is still in front of it.
+        let tricky = sample("src/a.rs", "let p = \"{path}\";");
+        assert_eq!(
+            document_text("{path}\n{code}", &tricky),
+            "src/a.rs\nlet p = \"{path}\";"
+        );
     }
 }

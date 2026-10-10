@@ -74,6 +74,8 @@ Defaults work with the services specified for this project. Copy `config.example
 | `data_dir` | OS-native local data dir + `local-code-intelligence`: `%LOCALAPPDATA%\local-code-intelligence` (Windows), `~/Library/Application Support/local-code-intelligence` (macOS), `$XDG_DATA_HOME` or `~/.local/share/local-code-intelligence` (Linux) |
 | `default_top_k` | 8 (allowed: 1–40) |
 | `embedding_batch_size` | 8 |
+| `embedding_query_template` | `Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}` (must contain `{query}`; shapes the query only, so changing it never re-embeds an index; e.g. EmbeddingGemma 2 wants `task: code retrieval \| query: {query}`) |
+| `embedding_document_template` | `{code}` (must contain `{code}`, the chunk's source; `{path}`, its repository-relative file path, is optional; a non-default value is part of the index's embedding identity, so changing it re-embeds every chunk; e.g. EmbeddingGemma 2 wants `title: {path} \| text: {code}`; with `{path}`, identical code in different files, or a file moved to a new path, is embedded per path instead of once) |
 | `embedding_timeout_seconds` | 120 per batch |
 | `reranker_timeout_seconds` | 120 |
 | `readiness_timeout_seconds` | 5 (allowed: 1–30) |

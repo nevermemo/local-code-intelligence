@@ -155,6 +155,15 @@ impl Default for FusionConfig {
     }
 }
 
+/// Default for [`Config::embedding_query_template`]: the instruction
+/// Qwen3-Embedding is trained with, then the query. It is
+/// `models::QUERY_INSTRUCTION` followed by `{query}` (a test pins that), so the
+/// default query text is byte-identical to the former hard-coded one.
+pub const DEFAULT_EMBEDDING_QUERY_TEMPLATE: &str = "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}";
+
+/// Default for [`Config::embedding_document_template`]: the chunk's code as is.
+pub const DEFAULT_EMBEDDING_DOCUMENT_TEMPLATE: &str = "{code}";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -165,6 +174,20 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub default_top_k: usize,
     pub embedding_batch_size: usize,
+    /// Text embedded for a search query, with `{query}` replaced by the query
+    /// (required). Embedding models differ in the prompt format they expect
+    /// (an instruction prefix, a task label), so this is configurable.
+    /// Query-side only: changing it never invalidates an existing index.
+    pub embedding_query_template: String,
+    /// Text embedded for each indexed chunk, with `{code}` replaced by the
+    /// chunk's source (required) and `{path}` by its repository-relative file
+    /// path (optional). The default embeds the bare code. Changing it
+    /// changes `embedding_identity`, so every chunk is re-embedded on the next
+    /// index or search. Without `{path}` a vector depends only on the chunk's
+    /// code, and identical code is embedded once and reused wherever it
+    /// appears. With `{path}` it depends on the file too, so identical code in
+    /// different files, or a file moved to a new path, is embedded per path.
+    pub embedding_document_template: String,
     pub embedding_timeout_seconds: u64,
     pub reranker_timeout_seconds: u64,
     pub readiness_timeout_seconds: u64,
@@ -487,6 +510,8 @@ impl Default for Config {
             data_dir: base.join("local-code-intelligence"),
             default_top_k: 8,
             embedding_batch_size: 8,
+            embedding_query_template: DEFAULT_EMBEDDING_QUERY_TEMPLATE.into(),
+            embedding_document_template: DEFAULT_EMBEDDING_DOCUMENT_TEMPLATE.into(),
             embedding_timeout_seconds: 120,
             reranker_timeout_seconds: 120,
             readiness_timeout_seconds: 5,
@@ -637,6 +662,16 @@ impl Config {
             "embedding_batch_size must be 1..=64"
         );
         ensure!(
+            self.embedding_query_template.contains("{query}"),
+            "embedding_query_template must contain the {{query}} placeholder (got {:?})",
+            self.embedding_query_template
+        );
+        ensure!(
+            self.embedding_document_template.contains("{code}"),
+            "embedding_document_template must contain the {{code}} placeholder (got {:?})",
+            self.embedding_document_template
+        );
+        ensure!(
             self.embedding_timeout_seconds > 0 && self.reranker_timeout_seconds > 0,
             "timeouts must be positive"
         );
@@ -662,14 +697,80 @@ impl Config {
         Ok(())
     }
 
+    /// What the stored vectors were computed with; an index whose identity
+    /// differs from this one is incompatible and is re-embedded. It names the
+    /// embedding service, model, and chunk format. A non-default
+    /// `embedding_document_template` appends `|doc=<hash>` (a stable 64-bit
+    /// FNV-1a of the template, 16 lowercase hex digits), because it changes
+    /// the embedded text; the default template adds nothing, so indexes built
+    /// before the template existed stay valid. `embedding_query_template` is
+    /// not part of it: it only shapes the query, never a stored vector.
     pub fn embedding_identity(&self) -> String {
-        format!(
+        let identity = format!(
             "{}|{}|{}",
             self.embedding_url.trim_end_matches('/'),
             self.embedding_model,
             crate::chunk::DOCUMENT_FORMAT_VERSION
-        )
+        );
+        if self.embedding_document_template == DEFAULT_EMBEDDING_DOCUMENT_TEMPLATE {
+            identity
+        } else {
+            format!(
+                "{identity}|doc={:016x}",
+                fnv1a_64(self.embedding_document_template.as_bytes())
+            )
+        }
     }
+}
+
+/// Fills the `{name}` placeholders of `template` from `values` in one
+/// left-to-right pass.
+///
+/// A `{name}` whose name is a key of `values` is replaced by the paired value.
+/// Substituted text is never scanned again, so a value that itself contains
+/// `{path}` (source code that mentions the placeholder) stays literal. All
+/// other text is copied unchanged: an unknown name, an unclosed `{`, a stray
+/// `}`. With nested braces such as `{{code}}` the inner `{code}` is
+/// substituted and the outer braces are kept.
+pub fn fill_template(template: &str, values: &[(&str, &str)]) -> String {
+    let values_len: usize = values.iter().map(|&(_, value)| value.len()).sum();
+    let mut out = String::with_capacity(template.len() + values_len);
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let filled = after.find('}').and_then(|close| {
+            let name = &after[..close];
+            let (_, value) = values.iter().find(|&&(key, _)| key == name)?;
+            Some((close, *value))
+        });
+        match filled {
+            Some((close, value)) => {
+                out.push_str(value);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 64-bit FNV-1a. Used instead of a `std` hasher because the result is stored
+/// in index metadata and must be identical across runs, platforms, and
+/// compiler releases.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -1228,5 +1329,239 @@ mod tests {
             let text = format!("{}[fusion]\nmax_chunks_per_file = {value}\n", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn embedding_templates_default_to_the_former_behavior() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert_eq!(
+            config.embedding_query_template,
+            DEFAULT_EMBEDDING_QUERY_TEMPLATE
+        );
+        assert_eq!(config.embedding_document_template, "{code}");
+
+        // A file without the keys keeps the defaults.
+        let absent: Config = toml::from_str(&base_toml()).unwrap();
+        absent.validate().unwrap();
+        assert_eq!(
+            absent.embedding_query_template,
+            config.embedding_query_template
+        );
+        assert_eq!(
+            absent.embedding_document_template,
+            config.embedding_document_template
+        );
+    }
+
+    #[test]
+    fn embedding_templates_load_from_toml_and_round_trip() {
+        let text = base_toml()
+            + "embedding_query_template = 'task: code retrieval | query: {query}'\n"
+            + "embedding_document_template = 'title: {path} | text: {code}'\n";
+        let config: Config = toml::from_str(&text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.embedding_query_template,
+            "task: code retrieval | query: {query}"
+        );
+        assert_eq!(
+            config.embedding_document_template,
+            "title: {path} | text: {code}"
+        );
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(
+            reloaded.embedding_query_template,
+            config.embedding_query_template
+        );
+        assert_eq!(
+            reloaded.embedding_document_template,
+            config.embedding_document_template
+        );
+
+        // A basic string can carry a newline escape, as the bge-code query
+        // format needs.
+        let bge = base_toml()
+            + "embedding_query_template = \"<instruct>Given a question in text, retrieve relevant code that answers it.\\n<query>{query}\"\n";
+        let config: Config = toml::from_str(&bge).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.embedding_query_template,
+            "<instruct>Given a question in text, retrieve relevant code that answers it.\n<query>{query}"
+        );
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.embedding_query_template,
+            config.embedding_query_template
+        );
+    }
+
+    #[test]
+    fn embedding_identity_ignores_the_default_document_template_and_the_query_template() {
+        let identity = Config::default().embedding_identity();
+        assert_eq!(
+            identity,
+            format!(
+                "http://localhost:8766/v1|qwen3-embedding-4b|{}",
+                crate::chunk::DOCUMENT_FORMAT_VERSION
+            ),
+            "the default identity must stay what it was before the templates existed"
+        );
+        assert!(!identity.contains("doc="), "{identity}");
+
+        // Naming the default document template explicitly changes nothing.
+        let named = Config {
+            embedding_document_template: "{code}".into(),
+            ..Config::default()
+        };
+        assert_eq!(named.embedding_identity(), identity);
+
+        // The query template only shapes the query, so it never invalidates
+        // a stored vector.
+        let query_only = Config {
+            embedding_query_template: "task: code retrieval | query: {query}".into(),
+            ..Config::default()
+        };
+        assert_eq!(query_only.embedding_identity(), identity);
+    }
+
+    #[test]
+    fn a_custom_document_template_changes_the_identity_deterministically() {
+        let identity = Config::default().embedding_identity();
+        let custom = Config {
+            embedding_document_template: "title: {path} | text: {code}".into(),
+            ..Config::default()
+        };
+        let custom_identity = custom.embedding_identity();
+        assert_ne!(custom_identity, identity);
+        // Pinned: the hash is stored in index metadata, so it must not drift.
+        assert_eq!(custom_identity, format!("{identity}|doc=d4e50e703f86cec4"));
+        assert_eq!(custom.embedding_identity(), custom_identity);
+        assert_eq!(custom.clone().embedding_identity(), custom_identity);
+
+        let other = Config {
+            embedding_document_template: "{path}\n{code}".into(),
+            ..Config::default()
+        };
+        let other_identity = other.embedding_identity();
+        assert_ne!(other_identity, custom_identity);
+        assert!(
+            other_identity.starts_with(&format!("{identity}|doc=")),
+            "{other_identity}"
+        );
+        let hash = other_identity.rsplit("doc=").next().unwrap();
+        assert_eq!(hash.len(), 16, "{other_identity}");
+        assert!(
+            hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{other_identity}"
+        );
+    }
+
+    #[test]
+    fn fnv1a_64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn embedding_templates_missing_their_placeholder_are_rejected() {
+        for bad in ["", "plain text", "{code}", "{ query }", "{{query"] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                embedding_query_template: bad.into(),
+                ..Config::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("embedding_query_template") && error.contains("{query}"),
+                "{bad:?}: {error}"
+            );
+        }
+        for bad in ["", "plain text", "{path}", "{ code }", "{{code"] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                embedding_document_template: bad.into(),
+                ..Config::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("embedding_document_template") && error.contains("{code}"),
+                "{bad:?}: {error}"
+            );
+        }
+
+        // Each template needs only its own placeholder.
+        for good in ["{query}", "Q: {query}", "{query}{query}"] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                embedding_query_template: good.into(),
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
+        for good in ["{code}", "{path}\n{code}", "title: {path} | text: {code}"] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                embedding_document_template: good.into(),
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
+
+        // The check runs at load time, from the file.
+        let text = base_toml() + "embedding_document_template = 'only text'\n";
+        let config: Config = toml::from_str(&text).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("embedding_document_template"), "{error}");
+    }
+
+    #[test]
+    fn fill_template_substitutes_every_placeholder_in_one_pass() {
+        let values = [("path", "src/lib.rs"), ("code", "let s = \"{path}\";")];
+        // Substituted text is never scanned again: the code mentions
+        // `{path}`, which stays literal whichever value is filled first.
+        let expected = "title: src/lib.rs | text: let s = \"{path}\";";
+        assert_eq!(
+            fill_template("title: {path} | text: {code}", &values),
+            expected
+        );
+        let reversed = [values[1], values[0]];
+        assert_eq!(
+            fill_template("title: {path} | text: {code}", &reversed),
+            expected
+        );
+
+        // A placeholder may repeat, and the template may be multi-line.
+        assert_eq!(fill_template("{code}{code}", &[("code", "x")]), "xx");
+        let values = [("path", "a.rs"), ("code", "fn a() {}")];
+        assert_eq!(
+            fill_template("{path}\n{code}\n", &values),
+            "a.rs\nfn a() {}\n"
+        );
+
+        // Text around the placeholders survives, including non-ASCII text.
+        assert_eq!(
+            fill_template("\u{3042}{code}\u{3044}", &[("code", "x")]),
+            "\u{3042}x\u{3044}"
+        );
+        assert_eq!(fill_template("plain", &[("code", "x")]), "plain");
+        assert_eq!(fill_template("", &[("code", "x")]), "");
+    }
+
+    #[test]
+    fn fill_template_leaves_unknown_and_unbalanced_braces_alone() {
+        let values = [("code", "X")];
+        // Unknown names, an empty name, and the wrong case are not
+        // placeholders.
+        assert_eq!(fill_template("{unknown} {}", &values), "{unknown} {}");
+        assert_eq!(fill_template("{Code} {query}", &values), "{Code} {query}");
+        // An unclosed `{` and a stray `}` are copied as they are.
+        assert_eq!(fill_template("{nope} {code", &values), "{nope} {code");
+        assert_eq!(fill_template("a } {code} {", &values), "a } X {");
+        // With doubled braces the inner placeholder still fills and the
+        // outer braces stay.
+        assert_eq!(fill_template("{{code}}", &values), "{X}");
     }
 }
