@@ -112,6 +112,8 @@ first.
 | R4 | Trial a smaller reranker (Qwen3-Reranker-0.6B or gte-reranker-modernbert-base) on port 8767 | ready (models downloaded 2026-10-10) | S | E3 |
 | R5 | Reranker query instruction | ready | S | E3 |
 | R6 | Rerank only contested queries (multi-channel agreement gate) | blocked (E0) | S | E0, R1 |
+| N7 | LSP cold-start: fail-open per-query budget + detached warm-up (10 s and ~25-30 s spikes) | ready | S-M | - |
+| E4 | Report max (and n) next to p50/p95 in `stage_latency`; nearest-rank p95 hides the worst query at n=35 | ready | XS | - |
 | H1 | Classify Rust test files (`tests.rs`, `test_*.rs`, `*_test(s).rs`) as `test` | ready | S | - |
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | ready | S | - |
 
@@ -255,6 +257,18 @@ first.
 - Scope: `reranker_query_prefix: String` (default empty) in config, prepended to `query` in `Models::rerank` (`lci-core/src/models.rs`). First verify how the deployed `/rerank` endpoint applies Qwen3's `<Instruct>/<Query>/<Document>` template (vLLM may already wrap it); record the finding. Candidate text: "Given a code search query, judge whether the code passage answers it".
 - Accept: unit test that the prefix is sent; live E3 comparison with/without; default only changes on a win.
 - Risk: none; query-side only, no re-embedding.
+
+### N7 - LSP cold-start budget and warm-up
+`ready` - S-M, live - deps: none (N4 priming builds on it) - skill: `lci-lsp-adapter`
+- Why (explorer, 2026-10-10, from per-query timings in `r0-mined-*`, `e3-mined-fusion`, `r7-core-rerank-off`): every run's first query pays ~10.1-10.4 s because `after_initialized` waits for rust-analyzer's `experimental/serverStatus` quiescent with a 10 s cap (`lci-core/src/lsp/rust.rs` ~87) that always expires; the 8 symbol requests then take ~0.2 s. A second spike of ~24.6-30.1 s hits once per run on the first query issued >= ~20 s after spawn (cause unconfirmed: a blocking first full `workspace/symbol`, or an error in `Manager::request` (`lci-core/src/lsp.rs` ~135-155) that kills and respawns and pays the 10 s wait again). `serve` shares one App, so real users pay both once per workspace per process and again after any LSP request error; the channel runs concurrently with embedding and rg but the join waits for it and it holds the workspace read lock.
+- Scope: (1) add `tracing::warn!` at the respawn path and the quiescence-timeout path to settle the cause; (2) dedupe spawns per (provider, workspace) in `Manager` (`OnceCell`; today `client()` can spawn twice and a dropped spawn is killed by `kill_on_drop`); (3) wrap the LSP channel in a per-query budget (`lsp_search_budget_ms`, default ~1500) that returns no LSP hits on expiry while the session keeps warming in the background (never discard it), reported as a warning-free `lsp_cold` flag or note; (4) do the long quiescence wait only off the query path.
+- Accept: fake-LSP tests (slow initialize -> search returns within the budget with no LSP hits, a later search gets them; no double spawn); live `evaluate` on core + mined: max per-query `lsp_search_ms` <= budget, hit rates unchanged (`compare` CI includes 0 or improves).
+- Risk: early queries lose LSP candidates (they effectively do today); keep fail-open semantics.
+
+### E4 - Max latency in the aggregate
+`ready` - XS - deps: none - skill: `lci-retrieval-evaluation`
+- Why: `stage_latency` p95 is nearest-rank (`src/evaluate/metrics.rs` ~595), so with 35 queries it is the second-highest value and a single 30 s outlier is invisible.
+- Scope: add `max` and `n` per stage next to p50/p95; README/evaluation-workflow mention.
 
 ### H1 - Rust test-file classification
 `ready` - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
