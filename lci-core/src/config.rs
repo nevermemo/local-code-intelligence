@@ -112,7 +112,10 @@ pub struct FusionConfig {
     pub lsp_weight: f32,
     /// Most chunks of one file that keep their place in the fused order before
     /// the rest of that file's chunks are demoted behind every other chunk
-    /// (`0..=100`, `0` = unlimited, the default). It runs after fusion
+    /// (`0..=100`, `0` = unlimited; default `2`, roadmap F2b: fusion-only
+    /// nDCG@10 +0.049 on the mined set, significant in both halves, and +0.168
+    /// on core, significant; reranked mined nDCG@10 +0.046, significant, MRR
+    /// -0.023, not significant). It runs after fusion
     /// ordering and before the list is cut to `rerank_candidate_count`, so the
     /// reranker's shortlist and the reranker-off and reranker-failure results
     /// fill with distinct files first, while `top_k` is still filled from the
@@ -127,7 +130,9 @@ impl FusionConfig {
     /// Largest accepted `max_chunks_per_file`.
     pub const MAX_CHUNKS_PER_FILE_LIMIT: u32 = 100;
 
-    /// Plain unweighted RRF: every channel weighs `1.0`, and no per-file cap.
+    /// Plain unweighted RRF: every channel weighs `1.0`, and no per-file cap
+    /// (`max_chunks_per_file = 0`). This is not the default: the default
+    /// weighs the semantic channel `2.0` and caps a file at two chunks.
     pub const UNIT: Self = Self {
         semantic_weight: 1.0,
         lexical_weight: 1.0,
@@ -139,11 +144,12 @@ impl FusionConfig {
 impl Default for FusionConfig {
     /// `semantic_weight = 2.0` (roadmap F2a: fusion-only mined-set MRR +0.059,
     /// CI [+0.012, +0.118], held-out halves agree, core ranks unchanged,
-    /// reranked confirm n.s.); lexical and LSP stay at `1.0`, and
-    /// `max_chunks_per_file` stays `0` (unlimited) until F2b is measured.
+    /// reranked confirm n.s.); lexical and LSP stay at `1.0`.
+    /// `max_chunks_per_file = 2` (roadmap F2b, see the field).
     fn default() -> Self {
         Self {
             semantic_weight: 2.0,
+            max_chunks_per_file: 2,
             ..Self::UNIT
         }
     }
@@ -215,7 +221,7 @@ pub struct Config {
     pub channels: ChannelsConfig,
     /// Per-channel Reciprocal Rank Fusion weights; `semantic_weight = 2.0`,
     /// `lexical_weight = lsp_weight = 1.0` by default (all `1.0` is plain RRF).
-    /// Also `max_chunks_per_file` (default `0`, unlimited).
+    /// Also `max_chunks_per_file` (default `2`; `0` is unlimited).
     pub fusion: FusionConfig,
 }
 
@@ -1014,15 +1020,16 @@ mod tests {
     }
 
     #[test]
-    fn fusion_defaults_to_semantic_weight_two() {
+    fn fusion_defaults_to_semantic_weight_two_and_a_two_chunk_file_cap() {
         let expected = FusionConfig {
             semantic_weight: 2.0,
             lexical_weight: 1.0,
             lsp_weight: 1.0,
-            max_chunks_per_file: 0,
+            max_chunks_per_file: 2,
         };
         // The default, a file without the section, and an empty section all
-        // mean semantic_weight 2.0 with lexical and LSP at 1.0.
+        // mean semantic_weight 2.0 with lexical and LSP at 1.0, and at most
+        // two chunks of one file ahead of the other files.
         let config = Config::default();
         config.validate().unwrap();
         assert_eq!(config.fusion, expected);
@@ -1034,13 +1041,39 @@ mod tests {
         empty.validate().unwrap();
         assert_eq!(empty.fusion, expected);
 
-        // Plain unweighted RRF is one explicit line away, and is not the
-        // default.
+        // Plain unweighted RRF with no file cap (`UNIT`) is two explicit lines
+        // away, and is not the default; each line alone changes only its own
+        // setting.
         assert_ne!(FusionConfig::default(), FusionConfig::UNIT);
-        let plain: Config =
-            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.0\n", base_toml())).unwrap();
+        assert_eq!(FusionConfig::UNIT.max_chunks_per_file, 0);
+        let plain: Config = toml::from_str(&format!(
+            "{}[fusion]\nsemantic_weight = 1.0\nmax_chunks_per_file = 0\n",
+            base_toml()
+        ))
+        .unwrap();
         plain.validate().unwrap();
         assert_eq!(plain.fusion, FusionConfig::UNIT);
+        let unweighted: Config =
+            toml::from_str(&format!("{}[fusion]\nsemantic_weight = 1.0\n", base_toml())).unwrap();
+        assert_eq!(
+            unweighted.fusion,
+            FusionConfig {
+                max_chunks_per_file: 2,
+                ..FusionConfig::UNIT
+            }
+        );
+        let uncapped: Config = toml::from_str(&format!(
+            "{}[fusion]\nmax_chunks_per_file = 0\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(
+            uncapped.fusion,
+            FusionConfig {
+                max_chunks_per_file: 0,
+                ..expected
+            }
+        );
 
         // A section overrides only the weights it names; the rest keep their
         // defaults, including the semantic weight of 2.0.
@@ -1051,6 +1084,7 @@ mod tests {
             partial.fusion,
             FusionConfig {
                 semantic_weight: 1.5,
+                max_chunks_per_file: 2,
                 ..FusionConfig::UNIT
             }
         );
@@ -1120,34 +1154,40 @@ mod tests {
     }
 
     #[test]
-    fn max_chunks_per_file_defaults_to_unlimited_and_is_range_checked() {
-        // Unlimited (0) is the default everywhere the section can be absent.
-        assert_eq!(Config::default().fusion.max_chunks_per_file, 0);
-        assert_eq!(FusionConfig::default().max_chunks_per_file, 0);
+    fn max_chunks_per_file_defaults_to_two_and_is_range_checked() {
+        // Two is the default everywhere the section or key can be absent;
+        // `UNIT` (plain RRF) is the uncapped, zero baseline.
+        assert_eq!(Config::default().fusion.max_chunks_per_file, 2);
+        assert_eq!(FusionConfig::default().max_chunks_per_file, 2);
         assert_eq!(FusionConfig::UNIT.max_chunks_per_file, 0);
         let absent: Config = toml::from_str(&base_toml()).unwrap();
-        assert_eq!(absent.fusion.max_chunks_per_file, 0);
+        assert_eq!(absent.fusion.max_chunks_per_file, 2);
         let empty: Config = toml::from_str(&format!("{}[fusion]\n", base_toml())).unwrap();
-        assert_eq!(empty.fusion.max_chunks_per_file, 0);
+        assert_eq!(empty.fusion.max_chunks_per_file, 2);
+        let weight_only: Config =
+            toml::from_str(&format!("{}[fusion]\nlsp_weight = 3.0\n", base_toml())).unwrap();
+        assert_eq!(weight_only.fusion.max_chunks_per_file, 2);
 
         // A value is read from the file, validated, and round-trips; it leaves
-        // the weights at their defaults.
-        let capped: Config = toml::from_str(&format!(
-            "{}[fusion]\nmax_chunks_per_file = 2\n",
-            base_toml()
-        ))
-        .unwrap();
-        capped.validate().unwrap();
-        assert_eq!(
-            capped.fusion,
-            FusionConfig {
-                max_chunks_per_file: 2,
-                ..FusionConfig::default()
-            }
-        );
-        let reloaded: Config = toml::from_str(&toml::to_string(&capped).unwrap()).unwrap();
-        reloaded.validate().unwrap();
-        assert_eq!(reloaded.fusion, capped.fusion);
+        // the weights at their defaults. 0 turns the cap off.
+        for value in [0, 1, 3, 100] {
+            let capped: Config = toml::from_str(&format!(
+                "{}[fusion]\nmax_chunks_per_file = {value}\n",
+                base_toml()
+            ))
+            .unwrap();
+            capped.validate().unwrap();
+            assert_eq!(
+                capped.fusion,
+                FusionConfig {
+                    max_chunks_per_file: value,
+                    ..FusionConfig::default()
+                }
+            );
+            let reloaded: Config = toml::from_str(&toml::to_string(&capped).unwrap()).unwrap();
+            reloaded.validate().unwrap();
+            assert_eq!(reloaded.fusion, capped.fusion, "{value}");
+        }
 
         // 0 and 100 are the ends of the accepted range.
         for good in [0, 1, 2, 100] {

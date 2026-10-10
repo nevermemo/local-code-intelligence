@@ -118,29 +118,33 @@ reranker = true
 # channels return sums those terms; the source-role prior is added afterwards
 # and is never scaled. semantic_weight defaults to 2.0 (measured on the mined
 # evaluation set, roadmap F2a); lexical_weight and lsp_weight default to 1.0.
-# A file without this section uses those defaults. Set all three to 1.0 for
-# plain unweighted RRF, for example for an evaluation arm that must match
-# earlier reports. Each weight must be finite and greater than zero: a zero
-# weight is rejected at startup, because turning a channel off is what
-# [channels] is for. The weights show up only in fusion_score; channel ranks
-# and scores, and the reranker's input, are unchanged. rrf_k stays a top-level
-# key.
+# A file without this section uses those defaults. Set all three to 1.0 and
+# max_chunks_per_file to 0 for plain unweighted RRF with no file cap, for
+# example for an evaluation arm that must match earlier reports. Each weight
+# must be finite and greater than zero: a zero weight is rejected at startup,
+# because turning a channel off is what [channels] is for. The weights show up
+# only in fusion_score; channel ranks and scores, and the reranker's input, are
+# unchanged. rrf_k stays a top-level key.
 #
-# max_chunks_per_file (0..=100, default 0 = unlimited, which leaves the fused
-# order exactly as it was) caps how many chunks of one file keep their place in
-# the fused order. A file's chunks beyond the cap are demoted, never dropped:
-# they move behind every other chunk, both groups keeping their fused order,
-# before the list is cut to rerank_candidate_count. The reranker's shortlist
-# (and, with the reranker off or failing, the results) therefore fill with
-# distinct files first, and top_k is still filled from the demoted chunks when
-# there are too few files. fusion_score is not rescaled, so a demoted chunk can
-# appear after a chunk with a lower fusion_score. The reranker's own output
-# order is not capped again. It stays 0 until measured (roadmap F2b).
+# max_chunks_per_file (0..=100, default 2; 0 = unlimited, which leaves the
+# fused order exactly as plain fusion gives it) caps how many chunks of one file
+# keep their place in the fused order. A file's chunks beyond the cap are
+# demoted, never dropped: they move behind every other chunk, both groups
+# keeping their fused order, before the list is cut to rerank_candidate_count.
+# The reranker's shortlist (and, with the reranker off or failing, the results)
+# therefore fill with distinct files first, and top_k is still filled from the
+# demoted chunks when there are too few files. fusion_score is not rescaled, so
+# a demoted chunk can appear after a chunk with a lower fusion_score. The
+# reranker's own output order is not capped again. The default of 2 was
+# measured on the mined evaluation set and core (roadmap F2b): fusion-only
+# nDCG@10 +0.049 on the mined set, significant in both halves, and +0.168 on
+# core, significant; reranked on the mined set nDCG@10 +0.046 (significant) and
+# MRR -0.023 (not significant).
 [fusion]
 semantic_weight = 2.0
 lexical_weight = 1.0
 lsp_weight = 1.0
-max_chunks_per_file = 0
+max_chunks_per_file = 2
 
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.

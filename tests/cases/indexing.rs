@@ -2269,6 +2269,22 @@ async fn the_per_file_cap_puts_distinct_files_first_in_results_and_the_reranker_
     assert_eq!(all_scores(&capped_all), all_scores(&uncapped_all));
     assert_eq!(all_scores(&everything), all_scores(&uncapped_all));
 
+    // The default configuration (no `max_chunks_per_file` override) is the
+    // cap-2 order, not the uncapped one.
+    assert_eq!(config.fusion.max_chunks_per_file, 2);
+    let mut default_config = config.clone();
+    default_config.channels.reranker = false;
+    let by_default = App::open(default_config)
+        .await
+        .unwrap()
+        .search(&workspace, "translator", Some(5))
+        .await
+        .unwrap();
+    let by_default_paths = paths(&by_default);
+    assert_eq!(by_default_paths[..2], [MANY, MANY]);
+    assert_eq!(distinct(&by_default_paths[2..4]), others);
+    assert_eq!(by_default_paths[4], MANY);
+
     // Reranker on with a 3-chunk shortlist: uncapped, the reranker is only
     // shown many.rs; capped, it is shown one chunk of each file.
     let requests_before = fake.rerank_requests.load(Ordering::SeqCst);
