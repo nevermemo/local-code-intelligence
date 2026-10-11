@@ -30,5 +30,23 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 
+# Language servers run in a Job Object so that ending one ends its whole
+# process tree (`lsp/job.rs`). 0.61 is the version already in Cargo.lock. Each
+# feature gates the module of the calls `job.rs` makes, and nothing else:
+# Foundation (HANDLE, INVALID_HANDLE_VALUE), Security (the SECURITY_ATTRIBUTES
+# type in CreateJobObjectW's signature), System_JobObjects (create, configure,
+# assign, terminate, query), System_Threading (CREATE_SUSPENDED, OpenThread,
+# ResumeThread, and IO_COUNTERS inside the job's limit struct),
+# System_Diagnostics_ToolHelp (the thread snapshot that finds the suspended
+# process's thread to resume).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"

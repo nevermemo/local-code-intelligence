@@ -1,7 +1,10 @@
+#[cfg(windows)]
+use crate::lsp::job;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
     sync::{
         Arc,
@@ -26,7 +29,56 @@ const KILL_REAP_BOUND: Duration = Duration::from_millis(500);
 
 type LastActivity = Arc<std::sync::Mutex<Instant>>;
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+/// A JSON-RPC error *response*: the server received the request and answered
+/// that it failed, with the `code` and `message` of the protocol's error
+/// object.
+///
+/// It is what [`JsonRpcClient::request`] returns, as the root cause of its
+/// `anyhow::Error`, for a well-formed error response, and for nothing else. A
+/// transport failure (the process exited, a pipe closed, the protocol reader
+/// stopped, the inactivity timeout passed) carries no `RpcError`, and neither
+/// does a protocol failure: an `error` member that is not an object with an
+/// integer `code` and a string `message`, which a server that speaks the
+/// protocol does not send. So a caller that must treat the two differently asks
+/// the error: `error.downcast_ref::<RpcError>()` is `Some` for a server that is
+/// alive and answering, `None` for one that is gone, silent or confused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl RpcError {
+    /// `ContentModified`: the content the request was computed on changed.
+    pub const CONTENT_MODIFIED: i64 = -32801;
+    /// `ServerCancelled`: the server cancelled a request it had accepted.
+    pub const SERVER_CANCELLED: i64 = -32802;
+    /// `RequestFailed`: a well-formed request failed.
+    pub const REQUEST_FAILED: i64 = -32803;
+    /// JSON-RPC's `InternalError`, which is also what rust-analyzer answers
+    /// for a file it has not loaded yet.
+    pub const INTERNAL_ERROR: i64 = -32603;
+
+    /// Reads a response's `error` member. `None` unless it is an object with an
+    /// integer `code` and a string `message`, as the protocol defines it:
+    /// anything else is not a server's answer to guess a code for.
+    fn from_response(error: &Value) -> Option<Self> {
+        Some(Self {
+            code: error.as_object()?.get("code")?.as_i64()?,
+            message: error.get("message")?.as_str()?.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "JSON-RPC error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 /// Configuration for spawning a JSON-RPC over stdio process.
 pub struct TransportConfig {
@@ -44,6 +96,10 @@ pub struct TransportConfig {
 /// JSON-RPC response correlation by ID, serialized writes, notification
 /// draining, stderr separation from stdout, and idle-bounded request
 /// timeouts (see [`request`](Self::request)).
+///
+/// On Windows the server and everything it starts live in a Job Object that
+/// the client owns (see `lsp/job.rs`): [`shutdown`](Self::shutdown) and
+/// dropping the client end the whole process tree, not only the direct child.
 ///
 /// The caller provides a readiness predicate at spawn time. The predicate is
 /// evaluated against each JSON-RPC notification (a message without an `id`
@@ -64,6 +120,10 @@ pub struct JsonRpcClient {
     /// wait by *inactivity* against this, not by total call duration: see
     /// `request`'s doc comment for why.
     last_activity: LastActivity,
+    /// The server's process tree. Closing it (dropping the client) kills every
+    /// process in it. `None` when the job could not be set up.
+    #[cfg(windows)]
+    job: Option<job::Job>,
 }
 
 impl JsonRpcClient {
@@ -75,15 +135,23 @@ impl JsonRpcClient {
         config: &TransportConfig,
         ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     ) -> Result<Arc<Self>> {
-        let mut child = Command::new(&config.executable)
+        let mut command = Command::new(&config.executable);
+        command
             .args(&config.args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        let job = job::prepare(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("start {}", config.executable))?;
+        // On error the early return drops `child`, which ends it.
+        #[cfg(windows)]
+        let job = job::adopt(job, &child)
+            .with_context(|| format!("start {}: run the suspended process", config.executable))?;
         let stdin = child
             .stdin
             .take()
@@ -123,7 +191,7 @@ impl JsonRpcClient {
             }
             let mut pending = reader_pending.lock().await;
             for (_, sender) in pending.drain() {
-                let _ = sender.send(Err(format!("{label} exited")));
+                let _ = sender.send(Err(anyhow::anyhow!("{label} exited")));
             }
         });
         tokio::spawn(async move {
@@ -142,6 +210,8 @@ impl JsonRpcClient {
             ready,
             is_ready,
             last_activity,
+            #[cfg(windows)]
+            job,
         }))
     }
 
@@ -167,6 +237,10 @@ impl JsonRpcClient {
     /// or genuinely dead without the process exiting) still times out after
     /// exactly `timeout` of true silence, same as before. On timeout the
     /// pending entry is removed and an error is returned.
+    ///
+    /// An error *response* from the server comes back as an error whose root
+    /// cause is an [`RpcError`]; every other failure (a closed pipe, an exited
+    /// process, the timeout) does not carry one.
     ///
     /// Safe to drop mid-flight (a search that hits its latency budget does
     /// exactly that): the request is then abandoned cleanly, with its pending
@@ -210,7 +284,7 @@ impl JsonRpcClient {
                 result = &mut receiver => {
                     break match result {
                         Ok(Ok(value)) => Ok(value),
-                        Ok(Err(message)) => Err(anyhow::anyhow!(message)),
+                        Ok(Err(error)) => Err(error),
                         Err(_) => Err(anyhow::anyhow!("{} response channel closed", self.label)),
                     };
                 }
@@ -253,6 +327,10 @@ impl JsonRpcClient {
     /// the reaping is bounded by 500 ms). Returns `true` when the process
     /// ended on its own, `false` when it had to be killed.
     ///
+    /// On Windows the whole process tree ends with the server, whichever way
+    /// it ends: processes the server started and left behind are terminated
+    /// with its job.
+    ///
     /// Failures of the first two steps are ignored: the server may already
     /// be gone, and the goal is the same either way. The client is unusable
     /// afterwards. The child lock is held only inside the bounded wait and
@@ -268,16 +346,30 @@ impl JsonRpcClient {
         // and the pipe is full; do not let that hold the release.
         let _ = tokio::time::timeout(EXIT_WRITE_BOUND, self.notify("exit", Value::Null)).await;
         if let Ok(Ok(_)) = tokio::time::timeout(grace, self.wait_exit()).await {
+            // The server is gone; what it started and left running goes too.
+            self.terminate_tree();
             return true;
         }
         tracing::debug!(label = %self.label, "language server did not exit in time; killing it");
         // Do not leave the kill to `Drop`: another holder of this client (a
-        // request that is still in flight) may keep it alive.
+        // request that is still in flight) may keep it alive. The job goes
+        // first: it reaches the processes under the direct child, which
+        // `Child::kill` does not.
+        self.terminate_tree();
         let _ = tokio::time::timeout(KILL_REAP_BOUND, async {
             self.child.lock().await.kill().await
         })
         .await;
         false
+    }
+
+    /// Ends every process the server started, on Windows (a no-op elsewhere,
+    /// and when the server runs without a job object).
+    fn terminate_tree(&self) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
     }
 
     /// Waits for the child process to end. Cancel-safe: dropping it only
@@ -353,6 +445,9 @@ async fn write_framed(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<()> {
 
 impl Drop for JsonRpcClient {
     fn drop(&mut self) {
+        // Dropping the job after this closes it, which ends the tree too;
+        // doing it here keeps the order the same as `shutdown`'s kill.
+        self.terminate_tree();
         if let Ok(mut child) = self.child.try_lock() {
             let _ = child.start_kill();
         }
@@ -426,11 +521,104 @@ async fn read_messages(
             continue;
         };
         if let Some(sender) = pending.lock().await.remove(&id) {
-            let response = match message.get("error") {
-                Some(error) => Err(error.to_string()),
-                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            let _ = sender.send(response);
+            let _ = sender.send(response_outcome(&message));
         }
+    }
+}
+
+/// What a response to one of our requests says: its result, or its error as
+/// an [`RpcError`]. A response that is not an answer a caller can act on (an
+/// error member that is not an error object, or an error next to a result,
+/// which JSON-RPC forbids) is not an `RpcError`, so the session is treated
+/// like one whose transport failed (see `RpcError`). A `null` result next to
+/// an error is let through: it carries nothing that could be mistaken for an
+/// answer.
+fn response_outcome(message: &Value) -> Result<Value> {
+    match message.get("error") {
+        Some(error) => Err(match RpcError::from_response(error) {
+            Some(response) if message.get("result").is_none_or(Value::is_null) => {
+                anyhow::Error::new(response)
+            }
+            Some(_) => anyhow::anyhow!("malformed JSON-RPC response: both a result and an error"),
+            None => anyhow::anyhow!("malformed JSON-RPC error response: {error}"),
+        }),
+        None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_response_with_a_result_and_an_error_is_not_an_rpc_error() {
+        let error = json!({"code": -32801, "message": "content modified"});
+        let both = json!({"jsonrpc": "2.0", "id": 1, "result": [1], "error": error});
+        let failure = response_outcome(&both).unwrap_err();
+        assert!(failure.downcast_ref::<RpcError>().is_none(), "{failure}");
+        // A null result beside the error carries no answer.
+        for message in [
+            json!({"id": 1, "result": null, "error": error}),
+            json!({"id": 1, "error": error}),
+        ] {
+            let failure = response_outcome(&message).unwrap_err();
+            let typed = failure.downcast_ref::<RpcError>().expect("an RpcError");
+            assert_eq!(typed.code, RpcError::CONTENT_MODIFIED);
+        }
+        assert_eq!(
+            response_outcome(&json!({"id": 1, "result": {"k": 1}})).unwrap(),
+            json!({"k": 1})
+        );
+        assert_eq!(response_outcome(&json!({"id": 1})).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn an_error_object_keeps_its_code_and_message() {
+        let error =
+            RpcError::from_response(&json!({"code": -32801, "message": "content modified"}))
+                .unwrap();
+        assert_eq!(error.code, RpcError::CONTENT_MODIFIED);
+        assert_eq!(error.message, "content modified");
+        assert_eq!(error.to_string(), "JSON-RPC error -32801: content modified");
+        // Extra members (`data`) are allowed.
+        assert!(
+            RpcError::from_response(&json!({"code": 1, "message": "m", "data": {"k": 1}}))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_malformed_error_member_is_not_an_rpc_error() {
+        for malformed in [
+            json!(null),
+            json!("plain text"),
+            json!(7),
+            json!([1, 2]),
+            json!({"reason": "boom"}),
+            json!({"message": "no code"}),
+            json!({"code": 1}),
+            json!({"code": "1", "message": "string code"}),
+            json!({"code": 1.5, "message": "fractional code"}),
+            json!({"code": 1, "message": 5}),
+            json!({"code": null, "message": "null code"}),
+        ] {
+            assert!(RpcError::from_response(&malformed).is_none(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn only_an_error_response_carries_an_rpc_error() {
+        let response = anyhow::Error::new(
+            RpcError::from_response(&json!({"code": -32603, "message": "file not found"})).unwrap(),
+        )
+        .context("workspace/symbol");
+        // Context layers added by callers do not hide the root cause.
+        let found = response.downcast_ref::<RpcError>().unwrap();
+        assert_eq!(found.code, RpcError::INTERNAL_ERROR);
+        assert!(
+            anyhow::anyhow!("rust-analyzer exited")
+                .downcast_ref::<RpcError>()
+                .is_none()
+        );
     }
 }

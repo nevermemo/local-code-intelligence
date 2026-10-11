@@ -516,7 +516,9 @@ impl GoLspConfig {
 /// within seconds of being killed, with zero orphaned processes. Spawning
 /// `java` directly, like every other adapter here, avoids the multi-hop
 /// process tree entirely rather than trying to fix Windows job-object
-/// semantics.
+/// semantics. (The transport has since put every language server in a Job
+/// Object of its own on Windows, which would also contain such a chain, but
+/// `java` stays a direct child: the design needs no multi-hop tree.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JavaLspConfig {

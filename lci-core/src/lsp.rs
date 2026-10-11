@@ -2,8 +2,14 @@ use crate::{
     config::Config,
     language,
     lsp::{
-        adapter::LspAdapter, clangd::ClangdServer, csharp::CSharpServer, go::GoServer,
-        java::JavaServer, python::PythonServer, rust::RustServer, transport::JsonRpcClient,
+        adapter::LspAdapter,
+        clangd::ClangdServer,
+        csharp::CSharpServer,
+        go::GoServer,
+        java::JavaServer,
+        python::PythonServer,
+        rust::RustServer,
+        transport::{JsonRpcClient, RpcError},
         typescript::TypeScriptServer,
     },
     workspace::Workspace,
@@ -27,6 +33,8 @@ pub mod clangd;
 pub mod csharp;
 pub mod go;
 pub mod java;
+#[cfg(windows)]
+mod job;
 pub mod python;
 pub mod rust;
 pub mod transport;
@@ -103,6 +111,65 @@ type Sessions = Mutex<HashMap<SessionKey, Arc<Session>>>;
 /// server is killed, so releasing a session is bounded by about twice this
 /// (the `exit` write adds at most 200 ms, the kill is immediate).
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a request waits before each repeat on the same server, after the
+/// server answered it with a transient error response (see
+/// [`send_with_repeats`]). One entry per repeat, so this is also the most
+/// repeats: a short first wait for the usual case (the content changed under
+/// the request, and the server is ready again at once), a longer second one for
+/// a server that is still busy.
+const SAME_SERVER_RETRY_WAITS: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_millis(1500)];
+
+/// Bounds when a repeat on the same server may START, measured from the
+/// request's first error response: a repeat is not begun unless its wait fits in
+/// what is left of the window, and the time is checked again once the wait is
+/// over, because a timer can run late. It does not bound a repeat once it is
+/// sent: every request keeps its normal timeout (`lsp_timeout_seconds` of
+/// inactivity), so a call can take about this long plus the time its last repeat
+/// takes. When no repeat may start, the last error is returned to the caller
+/// and the session is kept.
+const SAME_SERVER_RETRY_WINDOW: Duration = Duration::from_secs(5);
+
+/// When a request may be repeated on the same server. Production uses
+/// [`SAME_SERVER_RETRY_WAITS`] and [`SAME_SERVER_RETRY_WINDOW`]; the tests use
+/// shorter values.
+#[derive(Clone, Copy)]
+struct RepeatPolicy {
+    waits: &'static [Duration],
+    window: Duration,
+}
+
+impl RepeatPolicy {
+    const SAME_SERVER: Self = Self {
+        waits: &SAME_SERVER_RETRY_WAITS,
+        window: SAME_SERVER_RETRY_WINDOW,
+    };
+
+    /// The wait before repeat number `repeats` (0 for the first), or `None`
+    /// when there is no such repeat or its wait does not fit in what is left of
+    /// the window, `since_first_error` after the first error response.
+    fn wait_before(&self, repeats: usize, since_first_error: Duration) -> Option<Duration> {
+        let wait = *self.waits.get(repeats)?;
+        (since_first_error + wait <= self.window).then_some(wait)
+    }
+
+    /// Whether a repeat whose wait is over may still start.
+    fn may_start(&self, since_first_error: Duration) -> bool {
+        since_first_error <= self.window
+    }
+}
+
+/// Whether a server's error response means "ask again", on any server: the
+/// protocol's `ContentModified`, `ServerCancelled` and `RequestFailed`. The
+/// adapter adds the errors that are transient only for its own server (see
+/// [`LspAdapter::is_loading_error`]).
+fn is_transient_code(code: i64) -> bool {
+    matches!(
+        code,
+        RpcError::CONTENT_MODIFIED | RpcError::SERVER_CANCELLED | RpcError::REQUEST_FAILED
+    )
+}
 
 /// What one server start produced: the ready client, or the rendered cause of
 /// the failure (shared by every caller that waited on the same start).
@@ -454,10 +521,20 @@ impl Manager {
         shut_down(removed).await.len()
     }
 
-    /// Forgets a failed session so the next caller starts a fresh server.
+    /// Forgets a failed session so the next caller starts a fresh server, and
+    /// stops the failed session's server on a task of its own: the same
+    /// bounded `shutdown`, `exit`, kill as a release (and, on Windows, the end
+    /// of the server's whole process tree). The task is detached so the
+    /// caller's retry starts its fresh server at once instead of after up to
+    /// about 4 s of shutdown; if the process is already gone it ends
+    /// immediately.
+    ///
     /// Only that exact session is removed: with concurrent callers, a second
     /// one reporting the same failure must not remove the replacement the
-    /// first one already started.
+    /// first one already started (and does not stop a server twice).
+    ///
+    /// Without the shutdown the dropped client would be the only thing ending
+    /// the server, and that reaches only the direct child.
     async fn discard(
         &self,
         adapter: &Arc<dyn LspAdapter>,
@@ -465,18 +542,28 @@ impl Manager {
         failed: &Arc<Session>,
     ) {
         let key = Self::session_key(adapter, workspace);
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, failed))
-        {
-            sessions.remove(&key);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, failed))
+            {
+                sessions.remove(&key)
+            } else {
+                None
+            }
+        };
+        if let Some(session) = removed {
+            tokio::spawn(session.shutdown(SHUTDOWN_GRACE));
         }
     }
 
     /// A request with no per-file preparation step: spawn-or-reuse a client,
-    /// and on any failure discard the session and retry once with a fresh
-    /// client (never a retry loop).
+    /// and on a transport failure (the server exited, closed a pipe, stopped
+    /// reading, went silent past the timeout, or sent an error response that is
+    /// not a well-formed error object) discard the session and retry once with
+    /// a fresh client (never a retry loop). A server that answers with an error
+    /// response is alive: see [`Self::send`].
     ///
     /// `after_priming` is true for `workspace/symbol` only (see
     /// [`Self::client`]).
@@ -493,8 +580,9 @@ impl Manager {
         after_priming: bool,
     ) -> Result<Value> {
         let (session, client) = self.client(adapter, workspace, after_priming).await?;
-        match client.request(method, params.clone()).await {
+        match Self::send(adapter, workspace, &client, method, &params).await {
             Ok(value) => Ok(value),
+            Err(first) if first.downcast_ref::<RpcError>().is_some() => Err(first),
             Err(first) => {
                 Self::warn_restart(adapter, workspace, method, &first);
                 self.discard(adapter, workspace, &session).await;
@@ -502,14 +590,38 @@ impl Manager {
                     .client(adapter, workspace, after_priming)
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
-                client.request(method, params).await
+                Self::send(adapter, workspace, &client, method, &params).await
             }
         }
     }
 
+    /// Sends one request on `client`, repeating it on the same server while the
+    /// server keeps answering with a transient error response (see
+    /// [`send_with_repeats`] for the rules). The caller tells an answer from a
+    /// transport failure by the [`RpcError`] in the error.
+    async fn send(
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        client: &GenericClient,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        send_with_repeats(
+            &RepeatPolicy::SAME_SERVER,
+            tokio::time::sleep,
+            adapter,
+            workspace,
+            method,
+            move || client.rpc.is_ready(),
+            move || client.request(method, params.clone()),
+        )
+        .await
+    }
+
     /// Same retry contract as [`Self::request`], but runs the adapter's
     /// `before_position_request` hook (e.g. TypeScript's `textDocument/
-    /// didOpen`) against the same client before every attempt.
+    /// didOpen`) against the client before the request on each client (the
+    /// repeats of [`Self::send`] on one server do not run it again).
     async fn position_request(
         &self,
         adapter: &Arc<dyn LspAdapter>,
@@ -530,13 +642,14 @@ impl Manager {
                 adapter
                     .before_position_request(&client.rpc, file, relative)
                     .await?;
-                client.request(method, params.clone()).await
+                Self::send(adapter, workspace, &client, method, &params).await
             }
             .await;
             result.map_err(|error| (Some(session), error))
         };
         match attempt.await {
             Ok(value) => Ok(value),
+            Err((_, first)) if first.downcast_ref::<RpcError>().is_some() => Err(first),
             Err((session, first)) => {
                 Self::warn_restart(adapter, workspace, method, &first);
                 if let Some(session) = session {
@@ -549,14 +662,16 @@ impl Manager {
                 adapter
                     .before_position_request(&client.rpc, file, relative)
                     .await?;
-                client.request(method, params).await
+                Self::send(adapter, workspace, &client, method, &params).await
             }
         }
     }
 
-    /// A request failure throws away a warmed-up server, and the retry pays
+    /// A transport failure throws away a warmed-up server, and the retry pays
     /// the whole start (and warm-up) again, so it is worth a log line: it is
-    /// the likeliest cause of a sudden multi-second search.
+    /// the likeliest cause of a sudden multi-second search. The error is not a
+    /// server's error response (those keep the session and are logged by
+    /// [`Self::send`]), so it carries no code; its text says what failed.
     fn warn_restart(
         adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
@@ -657,6 +772,105 @@ impl Manager {
             .await
             .get(&(provider.to_string(), workspace_id.to_string()))
             .is_some_and(|session| session.ready_client().is_some())
+    }
+}
+
+/// Runs `attempt` (one request on one server). A server that answers with a
+/// transient error response, one that says "ask again" (see
+/// [`is_transient_code`] and [`LspAdapter::is_loading_error`], the latter given
+/// `is_ready()`), gets the request again on the same server: after each of
+/// `policy.waits`, and only while the repeat can start within `policy.window` of
+/// the first error response (decided before the wait, so a wait that cannot fit
+/// is not slept, and again after it). `sleep` is `tokio::time::sleep`, a
+/// parameter so that a test can make the timer run late.
+///
+/// Any other error, or a transient one that outlasts the repeats, is returned
+/// as it came with the session left alone: a server that answers is not dead,
+/// and replacing a loading one with a freshly started (so equally loading) one
+/// only costs another cold start. A failure that is not an error response (the
+/// process exited, a pipe closed, the timeout) is returned at once, unrepeated:
+/// that is the caller's cue to restart the server.
+async fn send_with_repeats<A, S>(
+    policy: &RepeatPolicy,
+    sleep: impl Fn(Duration) -> S,
+    adapter: &Arc<dyn LspAdapter>,
+    workspace: &Workspace,
+    method: &str,
+    is_ready: impl Fn() -> bool,
+    mut attempt: impl FnMut() -> A,
+) -> Result<Value>
+where
+    A: Future<Output = Result<Value>>,
+    S: Future<Output = ()>,
+{
+    let mut first_error = None;
+    let mut repeats = 0;
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(response) = error.downcast_ref::<RpcError>() else {
+            return Err(error);
+        };
+        let first_error_at: Instant = *first_error.get_or_insert_with(Instant::now);
+        let transient =
+            is_transient_code(response.code) || adapter.is_loading_error(response, is_ready());
+        let wait = policy
+            .wait_before(repeats, first_error_at.elapsed())
+            .filter(|_| transient);
+        let Some(wait) = wait else {
+            log_final_answer(adapter, workspace, method, response, transient, repeats);
+            return Err(error);
+        };
+        tracing::debug!(
+            provider = adapter.provider(),
+            workspace = %workspace.path.display(),
+            method,
+            code = response.code,
+            message = %response.message,
+            wait_ms = wait.as_millis() as u64,
+            "language server answered with a transient error; repeating the request on the same session"
+        );
+        repeats += 1;
+        sleep(wait).await;
+        if !policy.may_start(first_error_at.elapsed()) {
+            log_final_answer(adapter, workspace, method, response, transient, repeats);
+            return Err(error);
+        }
+    }
+}
+
+/// Logs the error response that ends a request's repeats and is returned to
+/// the caller: a `warn` when it was transient (the server never got ready in
+/// time), otherwise a `debug` (an ordinary answer such as "No Project").
+fn log_final_answer(
+    adapter: &Arc<dyn LspAdapter>,
+    workspace: &Workspace,
+    method: &str,
+    response: &RpcError,
+    transient: bool,
+    repeats: usize,
+) {
+    if transient {
+        tracing::warn!(
+            provider = adapter.provider(),
+            workspace = %workspace.path.display(),
+            method,
+            code = response.code,
+            message = %response.message,
+            repeats,
+            "language server kept answering with a transient error; returning it and keeping the session"
+        );
+    } else {
+        tracing::debug!(
+            provider = adapter.provider(),
+            workspace = %workspace.path.display(),
+            method,
+            code = response.code,
+            message = %response.message,
+            "language server answered with an error; keeping the session"
+        );
     }
 }
 
@@ -795,6 +1009,7 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::transport::TransportConfig;
 
     #[test]
     fn normalizes_locations_and_location_links() {
@@ -822,5 +1037,172 @@ mod tests {
         assert_eq!(result[0].language.as_deref(), Some("rust"));
         assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
+    }
+
+    #[test]
+    fn only_the_protocols_transient_codes_are_repeated_on_any_server() {
+        for code in [-32801, -32802, -32803] {
+            assert!(is_transient_code(code), "{code}");
+        }
+        // Internal error (what rust-analyzer's "file not found" uses, which only
+        // its adapter treats as transient), invalid params, method not found,
+        // RequestCancelled, tsserver's "No Project" code, and a response with
+        // no usable code.
+        for code in [-32603, -32602, -32601, -32800, 1, 0] {
+            assert!(!is_transient_code(code), "{code}");
+        }
+    }
+
+    /// An adapter with no rules of its own: only the protocol's transient codes
+    /// are repeated.
+    struct NoRules;
+
+    impl LspAdapter for NoRules {
+        fn provider(&self) -> &'static str {
+            "test-server"
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "test_server_available"
+        }
+        fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
+            None
+        }
+        fn initialize_params(&self, _root: &std::path::Path) -> Option<Value> {
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    const FAST_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];
+
+    fn fast_policy(window: Duration) -> RepeatPolicy {
+        RepeatPolicy {
+            waits: &FAST_WAITS,
+            window,
+        }
+    }
+
+    /// Runs `send_with_repeats` against a server that answers every request
+    /// with an error response with `code` until attempt number `succeed_on`.
+    /// The timer runs `stretch` times slower than asked. Returns the outcome,
+    /// how many requests were sent and how many waits were started.
+    async fn ask(
+        policy: &RepeatPolicy,
+        stretch: u32,
+        code: i64,
+        succeed_on: usize,
+    ) -> (Result<Value>, usize, usize) {
+        let adapter: Arc<dyn LspAdapter> = Arc::new(NoRules);
+        let workspace = Workspace {
+            id: "test".into(),
+            path: PathBuf::from("workspace"),
+        };
+        let attempts = std::cell::Cell::new(0usize);
+        let waits = std::cell::Cell::new(0usize);
+        let result = send_with_repeats(
+            policy,
+            |wait| {
+                waits.set(waits.get() + 1);
+                tokio::time::sleep(wait * stretch)
+            },
+            &adapter,
+            &workspace,
+            "workspace/symbol",
+            || false,
+            || {
+                attempts.set(attempts.get() + 1);
+                let attempt = attempts.get();
+                async move {
+                    if attempt >= succeed_on {
+                        Ok(json!("answer"))
+                    } else {
+                        Err(anyhow::Error::new(RpcError {
+                            code,
+                            message: "boom".to_owned(),
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+        (result, attempts.get(), waits.get())
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_is_repeated_until_the_server_answers() {
+        let policy = fast_policy(Duration::from_secs(5));
+        let (result, attempts, _) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 3).await;
+        assert_eq!(result.unwrap(), json!("answer"));
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn the_repeats_stop_after_the_last_wait() {
+        let policy = fast_policy(Duration::from_secs(5));
+        let (result, attempts, _) = ask(&policy, 1, RpcError::SERVER_CANCELLED, 99).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RpcError>().map(|e| e.code),
+            Some(RpcError::SERVER_CANCELLED)
+        );
+        assert_eq!(attempts, 3, "the request and its two repeats");
+    }
+
+    #[tokio::test]
+    async fn an_error_that_is_not_transient_is_not_repeated() {
+        let policy = fast_policy(Duration::from_secs(5));
+        let (result, attempts, _) = ask(&policy, 1, -32602, 99).await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    /// The window decides before the wait: a repeat that cannot start inside
+    /// it is not even waited for.
+    #[tokio::test]
+    async fn a_repeat_whose_wait_does_not_fit_in_the_window_is_not_waited_for() {
+        const LONG_WAIT: [Duration; 1] = [Duration::from_millis(400)];
+        let policy = RepeatPolicy {
+            waits: &LONG_WAIT,
+            window: Duration::from_millis(50),
+        };
+        let (result, attempts, waits) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 2).await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 0, "the wait must not be started");
+    }
+
+    /// The window is checked again after the wait, because a timer can run
+    /// late: here the 10 ms wait fits when it is decided on, but the timer
+    /// returns after 60 ms, past the 50 ms window, so the repeat is not sent.
+    /// Without the second check the repeat would go out (2 requests, not 1).
+    #[tokio::test]
+    async fn the_window_is_checked_again_after_the_wait() {
+        let policy = fast_policy(Duration::from_millis(50));
+        let (result, attempts, _) = ask(&policy, 6, RpcError::CONTENT_MODIFIED, 99).await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts, 1,
+            "no repeat may start after the window has passed"
+        );
+    }
+
+    #[test]
+    fn the_repeat_waits_fit_inside_the_repeat_window() {
+        // The window is measured from the first error response, so the waits
+        // alone must not exhaust it: a server that answers at once would
+        // otherwise never get its last repeat.
+        let waits: Duration = SAME_SERVER_RETRY_WAITS.iter().sum();
+        assert!(waits < SAME_SERVER_RETRY_WINDOW, "{waits:?}");
     }
 }

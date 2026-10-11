@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process, str, thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,10 +68,79 @@ pub struct FakeLspConfig {
     /// kill ends it. While it runs it also rewrites `heartbeat.txt` in the
     /// state directory every 50 ms, which stops changing once it is dead.
     pub ignore_shutdown: bool,
+    /// An error response for `workspace/symbol` requests (`--symbol-error
+    /// CODE:MESSAGE`, with `--symbol-error-count N` to stop after N). The
+    /// first `workspace/symbol` request of the process is the priming one and
+    /// is always answered normally.
+    pub symbol_error: Option<InjectedError>,
+    /// An error response for `textDocument/definition` requests
+    /// (`--definition-error CODE:MESSAGE`, `--definition-error-count N`).
+    pub definition_error: Option<InjectedError>,
+    /// A raw `error` member sent as given for `workspace/symbol` requests after
+    /// the priming one, in the first process of a state directory only
+    /// (`--symbol-raw-error JSON`): a response whose `error` is not a
+    /// well-formed error object (`null`, no `code`, a string `code`, ...), which
+    /// the client must not mistake for a server's answer.
+    pub symbol_raw_error: Option<serde_json::Value>,
+    /// The process exits when the Nth `workspace/symbol` request arrives,
+    /// without answering it, but only in the first process of a state
+    /// directory (`--exit-on-symbol-request N`; 0 = never): a server that dies
+    /// while a request is in flight, replaced by a healthy one.
+    pub exit_on_symbol_request: u64,
+    /// Starts a descendant (`--spawn-grandchild`): a copy of this program in
+    /// sleeper mode, the way a `.cmd` shim's `node.exe` or a `rustup` proxy's
+    /// real binary is a child of the process the client spawned. Its heartbeat
+    /// is `sleeper_<N>.txt` in the state directory for the Nth process started,
+    /// and its process id is `sleeper_<N>.pid`.
+    pub spawn_grandchild: bool,
+    /// Sends the `custom/ready` notification after `initialized` in every
+    /// scenario (`--ready-notification`), the way `Initialized` always does:
+    /// for an adapter whose readiness predicate matches it.
+    pub ready_notification: bool,
+}
+
+/// An error response the fake sends instead of an answer: `code` and
+/// `message`, for the first `remaining` requests that reach it (all of them
+/// when `None`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectedError {
+    pub code: i64,
+    pub message: String,
+    pub remaining: Option<u64>,
+}
+
+impl InjectedError {
+    /// Reads `flag CODE:MESSAGE` and `count_flag N` from the command line.
+    fn from_cli(args: &[String], flag: &str, count_flag: &str) -> Option<Self> {
+        let spec = cli_arg(args, flag)?;
+        let (code, message) = spec.split_once(':')?;
+        Some(Self {
+            code: code.parse().ok()?,
+            message: message.to_owned(),
+            remaining: cli_arg(args, count_flag).and_then(|count| count.parse().ok()),
+        })
+    }
+
+    /// Whether this request gets the error, counting it against `remaining`.
+    fn take(&mut self) -> bool {
+        match &mut self.remaining {
+            None => true,
+            Some(0) => false,
+            Some(left) => {
+                *left -= 1;
+                true
+            }
+        }
+    }
 }
 
 pub fn run_from_env() -> io::Result<()> {
     let cli: Vec<String> = env::args().collect();
+    // Sleeper mode is not a language server at all: see `spawn_sleeper`.
+    if let Some(path) = cli_arg(&cli, "--sleeper") {
+        run_sleeper(Path::new(&path));
+        return Ok(());
+    }
     // CLI args take precedence over env vars so that integration tests can
     // drive the scenario without polluting the process-wide environment (which
     // would leak across tests and is `unsafe` in edition 2024). The existing
@@ -122,6 +191,9 @@ pub fn run_from_env() -> io::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let ignore_shutdown = cli.iter().any(|arg| arg == "--ignore-shutdown");
+    let exit_on_symbol_request = cli_arg(&cli, "--exit-on-symbol-request")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let config = FakeLspConfig {
         scenario,
         state_dir: state_path,
@@ -133,8 +205,75 @@ pub fn run_from_env() -> io::Result<()> {
         first_symbol_delay_ms,
         symbol_delay_ms,
         ignore_shutdown,
+        symbol_error: InjectedError::from_cli(&cli, "--symbol-error", "--symbol-error-count"),
+        definition_error: InjectedError::from_cli(
+            &cli,
+            "--definition-error",
+            "--definition-error-count",
+        ),
+        symbol_raw_error: cli_arg(&cli, "--symbol-raw-error")
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
+        exit_on_symbol_request,
+        spawn_grandchild: cli.iter().any(|arg| arg == "--spawn-grandchild"),
+        ready_notification: cli.iter().any(|arg| arg == "--ready-notification"),
     };
     run_server(config)
+}
+
+/// Overwrites `path` in place with fixed-width text, never truncating it:
+/// `fs::write` would leave an empty file behind if a kill landed between its
+/// truncate and its write.
+fn write_heartbeat(path: &Path, beat: u64) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
+        let _ = file.write_all(format!("{beat:020}").as_bytes());
+    }
+}
+
+/// Sleeper mode (`--sleeper FILE`): writes its process id to `FILE` with the
+/// extension `pid` (before the first heartbeat, so a test that sees the
+/// heartbeat can read it), then rewrites `FILE` every 50 ms. A test asks the
+/// operating system whether that process still runs. It ends on its own after
+/// two minutes, so a test that fails to end it does not leave it running for
+/// good.
+fn run_sleeper(path: &Path) {
+    let _ = fs::write(path.with_extension("pid"), process::id().to_string());
+    for beat in 1..=2400u64 {
+        write_heartbeat(path, beat);
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Starts this program in sleeper mode as a child of the fake server and
+/// returns once it has written its first heartbeat, so the test knows it ran
+/// before anything was done to end it. `ordinal` numbers the server process
+/// (its `spawn_count`) in the heartbeat file name. Like a real wrapper's
+/// descendant it inherits whatever handles it can, among them the server's
+/// pipes to the client.
+fn spawn_sleeper(state_dir: &Path, ordinal: u64) -> io::Result<()> {
+    let beat = state_dir.join(format!("sleeper_{ordinal}.txt"));
+    process::Command::new(env::current_exe()?)
+        .arg("--sleeper")
+        .arg(&beat)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    while !beat.exists() {
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the sleeper never wrote its heartbeat",
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 /// Appends one line (this process's id) to `name` in the state directory, so
@@ -189,23 +328,15 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             let mut beat = 0u64;
             loop {
                 beat += 1;
-                // Overwritten in place with fixed-width text, never
-                // truncated: `fs::write` would leave an empty file behind
-                // if the kill landed between its truncate and its write.
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(path.join("heartbeat.txt"))
-                {
-                    let _ = file.write_all(format!("{beat:020}").as_bytes());
-                }
+                write_heartbeat(&path.join("heartbeat.txt"), beat);
                 thread::sleep(Duration::from_millis(50));
             }
         });
     }
 
     let mut symbol_requests = 0u64;
+    let mut symbol_error = config.symbol_error.clone();
+    let mut definition_error = config.definition_error.clone();
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
 
@@ -270,10 +401,17 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 _ => {}
             }
         } else if method == Some("initialized") {
+            // Before anything below can end this process, so that a server
+            // that dies right away still leaves its descendant behind.
+            if config.spawn_grandchild
+                && let Some(path) = &config.state_dir
+            {
+                spawn_sleeper(path, spawn_count)?;
+            }
             // Accept the initialized notification. The Initialized scenario
             // additionally emits a ready notification (preserving existing
             // observable behavior).
-            if matches!(config.scenario, FakeScenario::Initialized) {
+            if config.ready_notification || matches!(config.scenario, FakeScenario::Initialized) {
                 write_message(
                     &mut stdout,
                     &json_notification("custom/ready", json!({"ready": true})),
@@ -331,6 +469,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     Some("workspace/symbol"),
                 ) => {
                     symbol_requests += 1;
+                    if symbol_requests == config.exit_on_symbol_request && spawn_count == 1 {
+                        process::exit(0);
+                    }
                     let delay_ms = if symbol_requests == 1 {
                         config.first_symbol_delay_ms
                     } else {
@@ -340,15 +481,33 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                         thread::sleep(Duration::from_millis(delay_ms));
                     }
                     if let Some(id) = id {
-                        write_message(
-                            &mut stdout,
-                            &json_response(
-                                id,
-                                json!([
-                                    {"name":"Calculator","kind":12,"location":{"uri":calc_uri,"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":16}}}}
-                                ]),
-                            ),
-                        )?;
+                        if symbol_requests > 1
+                            && spawn_count == 1
+                            && let Some(raw) = &config.symbol_raw_error
+                        {
+                            write_message(
+                                &mut stdout,
+                                &json!({"jsonrpc":"2.0","id":id,"error":raw}),
+                            )?;
+                        } else if symbol_requests > 1
+                            && let Some(error) = symbol_error.as_mut()
+                            && error.take()
+                        {
+                            write_message(
+                                &mut stdout,
+                                &json_error(id, error.code, &error.message),
+                            )?;
+                        } else {
+                            write_message(
+                                &mut stdout,
+                                &json_response(
+                                    id,
+                                    json!([
+                                        {"name":"Calculator","kind":12,"location":{"uri":calc_uri,"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":16}}}}
+                                    ]),
+                                ),
+                            )?;
+                        }
                     }
                 }
                 (FakeScenario::NoSymbols, Some("workspace/symbol")) => {
@@ -395,16 +554,25 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 }
                 (FakeScenario::Definition, Some("textDocument/definition")) => {
                     if let Some(id) = id {
-                        write_message(
-                            &mut stdout,
-                            &json_response(
-                                id,
-                                json!({
-                                    "uri": calc_uri,
-                                    "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
-                                }),
-                            ),
-                        )?;
+                        if let Some(error) = definition_error.as_mut()
+                            && error.take()
+                        {
+                            write_message(
+                                &mut stdout,
+                                &json_error(id, error.code, &error.message),
+                            )?;
+                        } else {
+                            write_message(
+                                &mut stdout,
+                                &json_response(
+                                    id,
+                                    json!({
+                                        "uri": calc_uri,
+                                        "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
+                                    }),
+                                ),
+                            )?;
+                        }
                     }
                 }
                 (FakeScenario::References, Some("textDocument/references")) => {
@@ -492,6 +660,10 @@ fn cli_arg(args: &[String], flag: &str) -> Option<String> {
 
 fn json_response(id: u64, result: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+}
+
+fn json_error(id: u64, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 
 fn json_notification(method: &str, params: serde_json::Value) -> serde_json::Value {

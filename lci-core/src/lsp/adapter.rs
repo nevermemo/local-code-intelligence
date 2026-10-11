@@ -4,7 +4,7 @@
 //! `false` and `transport_config`/`initialize_params` returning `None`, not
 //! by omitting the adapter.
 
-use crate::lsp::transport::{JsonRpcClient, TransportConfig};
+use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -44,6 +44,20 @@ pub trait LspAdapter: Send + Sync {
     /// predicate that never matches; readiness then relies on normal
     /// request timeouts.
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync>;
+
+    /// Whether `error`, a JSON-RPC error response, is how this server says it
+    /// is still loading, so that the same request is likely to succeed on the
+    /// same server a moment later. `ready` is whether the readiness predicate
+    /// (see [`ready_predicate`](Self::ready_predicate)) has matched yet.
+    ///
+    /// The manager already repeats a request for the error codes the protocol
+    /// defines as transient (`ContentModified`, `ServerCancelled`,
+    /// `RequestFailed`) on every server; this is for an error that is
+    /// transient only for one server, or only until it is ready. Default:
+    /// none.
+    fn is_loading_error(&self, _error: &RpcError, _ready: bool) -> bool {
+        false
+    }
 
     /// Run right after the `initialized` notification, before any request.
     /// Default no-op; pyright uses this to send an empty

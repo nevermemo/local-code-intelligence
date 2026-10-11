@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::lsp::adapter::LspAdapter;
-use crate::lsp::transport::{JsonRpcClient, TransportConfig};
+use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -81,6 +81,15 @@ impl LspAdapter for RustServer {
         })
     }
 
+    fn is_loading_error(&self, error: &RpcError, ready: bool) -> bool {
+        // While it loads the workspace, rust-analyzer answers a request for a
+        // file it has not seen yet with an internal error, "file not found:
+        // <path>" (observed on `textDocument/definition` right after the
+        // readiness wait expired). Once it has reported quiescence the same
+        // text means the file really is unknown to it.
+        !ready && error.code == RpcError::INTERNAL_ERROR && error.message.contains("file not found")
+    }
+
     async fn after_initialized(&self, rpc: &JsonRpcClient) -> Result<()> {
         if !rpc.is_ready() {
             // Some rust-analyzer builds do not emit serverStatus even when
@@ -107,5 +116,31 @@ impl LspAdapter for RustServer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(code: i64, message: &str) -> RpcError {
+        RpcError {
+            code,
+            message: message.to_owned(),
+        }
+    }
+
+    #[test]
+    fn file_not_found_is_a_loading_error_only_before_quiescence() {
+        let server = RustServer::new(&Config::default());
+        let not_found = error(-32603, r"file not found: C:\work\src\lib.rs");
+        assert!(server.is_loading_error(&not_found, false));
+        assert!(
+            !server.is_loading_error(&not_found, true),
+            "after quiescence the file is really unknown"
+        );
+        // Other errors, and the same code with other text, are real failures.
+        assert!(!server.is_loading_error(&error(-32603, "internal error"), false));
+        assert!(!server.is_loading_error(&error(-32602, "file not found: x"), false));
     }
 }

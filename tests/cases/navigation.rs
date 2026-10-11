@@ -1,7 +1,11 @@
 use super::*;
 use local_code_intelligence::{
     config::{CSharpLspConfig, ClangdLspConfig, PythonLspConfig, TypeScriptLspConfig},
-    lsp::{Manager, adapter::LspAdapter},
+    lsp::{
+        Location, Manager,
+        adapter::LspAdapter,
+        transport::{RpcError, TransportConfig},
+    },
     workspace::Workspace,
 };
 use std::sync::Arc;
@@ -376,6 +380,774 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
             "unexpected spawn count for {mode}"
         );
     }
+}
+
+/// `extra` as owned fake-server arguments, to append to a fixture's.
+fn fake_args(extra: &[&str]) -> Vec<String> {
+    extra.iter().map(|arg| (*arg).to_owned()).collect()
+}
+
+/// A server that answers a request with a transient error response
+/// (ContentModified, as rust-analyzer does while its workspace reloads) is
+/// alive and only not ready yet: the request is repeated on the same server
+/// after a short wait and succeeds, with no restart and no shutdown.
+#[tokio::test]
+async fn a_content_modified_answer_is_repeated_on_the_same_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.csharp.args.extend(fake_args(&[
+        "--symbol-error",
+        "-32801:content modified",
+        "--symbol-error-count",
+        "2",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let started = std::time::Instant::now();
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert!(
+        started.elapsed() >= Duration::from_millis(1900),
+        "the repeats wait 0.5 s and 1.5 s before asking again: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    // initialize, initialized, the priming request, the request, two repeats.
+    assert_eq!(state_count(&state, "request_count.txt"), 6);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// A server that never stops answering with a transient error must still be
+/// answered eventually: the error comes back after the bounded repeats, as the
+/// provider's error with its code, and the session is kept (the server is
+/// alive; a restart would only be as cold).
+#[tokio::test]
+async fn a_server_that_keeps_answering_a_transient_error_is_answered_with_it_and_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-error", "-32801:content modified"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let started = std::time::Instant::now();
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    // The repeats wait 2 s in all; a loose bound for the server start.
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the same-server repeats must be bounded, took {:?}",
+        started.elapsed()
+    );
+    let response = error
+        .downcast_ref::<RpcError>()
+        .expect("the server's own error response, not a transport failure");
+    assert_eq!(response.code, -32801);
+    assert_eq!(response.message, "content modified");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    // initialize, initialized, the priming request, the request, two repeats.
+    assert_eq!(state_count(&state, "request_count.txt"), 6);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// tsserver answers `workspace/symbol` with "No Project" for every call until
+/// a file is opened. That is an answer, not a dead server: each call returns
+/// the provider's error (the caller fails open across providers), nothing is
+/// repeated, and the server is never discarded or restarted.
+#[tokio::test]
+async fn an_error_response_that_is_not_transient_never_restarts_the_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_typescript_fixture(&temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 5;
+    config.typescript.args.extend(fake_args(&[
+        "--symbol-error",
+        "1:No Project. Please open a file first",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = typescript_adapter(&manager);
+
+    for _ in 0..3 {
+        let error = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("No Project"), "{error:#}");
+        assert_eq!(error.downcast_ref::<RpcError>().map(|e| e.code), Some(1));
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    // initialize, initialized, the priming request, one request per call.
+    assert_eq!(state_count(&state, "request_count.txt"), 6);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(
+        manager
+            .running("typescript-language-server", &workspace.id)
+            .await
+    );
+}
+
+/// Through the application: the TypeScript server answering "No Project" for
+/// every call does not fail `symbols` while another applicable server
+/// answered, and it is started once however many searches ask.
+#[tokio::test]
+async fn a_server_that_finds_no_project_does_not_fail_the_symbols_of_a_mixed_workspace() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    let mut config =
+        with_fake_csharp_and_typescript_servers(config, &state, "no-symbols", "workspace-symbols");
+    config
+        .typescript
+        .args
+        .extend(fake_args(&["--symbol-error", "1:No Project"]));
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    for _ in 0..2 {
+        let report = app
+            .symbols(&workspace, "NoSuchSymbolAnywhere")
+            .await
+            .expect("one server answered, so the call must not fail");
+        assert!(report.results.is_empty(), "{:?}", report.results);
+    }
+    assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
+    assert_eq!(state_count(&state.join("csharp"), "spawn_count.txt"), 1);
+    models_task.abort();
+}
+
+/// A server that dies while a request is in flight is a transport failure:
+/// the session is discarded and the request is served by one fresh server.
+#[tokio::test]
+async fn a_server_that_dies_mid_request_is_replaced_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    // The 2nd `workspace/symbol` of the first process (the request after
+    // the priming one) kills it.
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--exit-on-symbol-request", "2"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..2 {
+        let results = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap();
+        assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    }
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "one restart for the death, none for the call after it"
+    );
+}
+
+/// An `error` member that is not a well-formed error object (`null`, no
+/// `code`, a string `code`, no `message`, a bare string) is not an answer the
+/// client can act on: it is a protocol failure, handled like a transport
+/// failure. The session is discarded (its server is shut down) and the request
+/// is served once by a fresh server, instead of the garbage being taken for an
+/// error response with code 0 and the confused server being kept.
+#[tokio::test]
+async fn a_server_that_answers_with_a_malformed_error_is_replaced_once() {
+    for raw in [
+        "null",
+        r#"{"message":"no code"}"#,
+        r#"{"code":"1","message":"string code"}"#,
+        r#"{"code":1}"#,
+        r#""just text""#,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+        // The first process answers its 2nd `workspace/symbol` (the request
+        // after the priming one) with the raw `error` member; the replacement
+        // answers normally.
+        config
+            .csharp
+            .args
+            .extend(fake_args(&["--symbol-raw-error", raw]));
+        let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
+
+        let results = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{raw}: the replacement server must serve the request: {error:#}")
+            });
+        assert_eq!(results[0].name.as_deref(), Some("Calculator"), "{raw}");
+        assert_eq!(
+            state_count(&state, "spawn_count.txt"),
+            2,
+            "{raw}: one restart, not a kept session"
+        );
+        wait_until(
+            "the server that sent the malformed error to be shut down",
+            Duration::from_secs(15),
+            async || event_count(&state, "shutdown_seen.txt") >= 1,
+        )
+        .await;
+        assert!(manager.running("csharp-ls", &workspace.id).await, "{raw}");
+    }
+}
+
+/// A discarded server is stopped the way a released one is, through the
+/// protocol: it gets `shutdown` and `exit`. The server here is alive but stalls
+/// on a request, so the call fails by the inactivity timeout, which is a
+/// transport failure, and the first server is asked to shut down even though
+/// nobody calls `release`.
+#[tokio::test]
+async fn a_discarded_server_is_asked_to_shut_down() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_timeout_seconds = 2;
+    // Every `workspace/symbol` after the priming one stalls for 2.8 s: past
+    // the 2 s timeout, so the call fails, yet inside the 2 s the discard's
+    // shutdown waits for an answer, so the stalled server wakes up, reads the
+    // `shutdown` and `exit` queued behind its request, and ends.
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-delay-ms", "2800"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("timed out"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "the stalled server is replaced once, and the replacement stalls too"
+    );
+    wait_until(
+        "the discarded server to be shut down",
+        Duration::from_secs(15),
+        async || {
+            event_count(&state, "shutdown_seen.txt") >= 1
+                && event_count(&state, "exit_seen.txt") >= 1
+        },
+    )
+    .await;
+    // Only the first server was stopped; the replacement still serves the
+    // session.
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// What `textDocument/definition` on the fixture's call site returns.
+async fn call_site_definition(
+    manager: &Manager,
+    adapter: &Arc<dyn LspAdapter>,
+    workspace: &Workspace,
+) -> anyhow::Result<Vec<Location>> {
+    manager
+        .definition(
+            adapter,
+            workspace,
+            &workspace.path.join("src/CallSite.cs"),
+            "src/CallSite.cs",
+            1,
+            72,
+        )
+        .await
+}
+
+/// Wraps the C# adapter with rust-analyzer's loading rule and a readiness
+/// predicate that the fake's `custom/ready` notification satisfies, to test
+/// what the manager does with an adapter's [`LspAdapter::is_loading_error`].
+struct LoadingAwareAdapter(Arc<dyn LspAdapter>);
+
+impl LspAdapter for LoadingAwareAdapter {
+    fn provider(&self) -> &'static str {
+        self.0.provider()
+    }
+    fn languages(&self) -> &'static [&'static str] {
+        self.0.languages()
+    }
+    fn enabled(&self) -> bool {
+        self.0.enabled()
+    }
+    fn configured_command(&self) -> Option<String> {
+        self.0.configured_command()
+    }
+    fn readiness_component_name(&self) -> &'static str {
+        self.0.readiness_component_name()
+    }
+    fn transport_config(&self, root: &std::path::Path) -> Option<TransportConfig> {
+        self.0.transport_config(root)
+    }
+    fn initialize_params(&self, root: &std::path::Path) -> Option<Value> {
+        self.0.initialize_params(root)
+    }
+    fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        Box::new(|message| message.get("method").and_then(Value::as_str) == Some("custom/ready"))
+    }
+    fn is_loading_error(&self, error: &RpcError, ready: bool) -> bool {
+        !ready && error.code == RpcError::INTERNAL_ERROR && error.message.contains("file not found")
+    }
+}
+
+/// An error that only means "still loading" while the server is not ready
+/// (rust-analyzer's "file not found") is repeated on the same server until it
+/// loads, and returned at once after the server reports it is ready, when the
+/// same text means the file really is unknown. A server with no such rule
+/// (the plain C# adapter) gets the error back at once either way. The fake
+/// answers the error for the first N definition requests only, so a call that
+/// gets the error back was not repeated, and one that gets the definition was.
+#[tokio::test]
+async fn an_adapters_loading_error_is_repeated_only_until_the_server_is_ready() {
+    let not_found = "-32603:file not found: src/CallSite.cs";
+
+    // Not ready: two "file not found" answers, then the definition.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "definition");
+    config.csharp.args.extend(fake_args(&[
+        "--definition-error",
+        not_found,
+        "--definition-error-count",
+        "2",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter: Arc<dyn LspAdapter> = Arc::new(LoadingAwareAdapter(csharp_adapter(&manager)));
+    let started = std::time::Instant::now();
+    let results = call_site_definition(&manager, &adapter, &workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].relative_file_path.as_deref(),
+        Some("src/Calculator.cs")
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(1900),
+        "two repeats wait 0.5 s and 1.5 s: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    // Ready: the same error is the real answer, returned at once.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "definition");
+    config.csharp.args.extend(fake_args(&[
+        "--ready-notification",
+        "--definition-error",
+        not_found,
+        "--definition-error-count",
+        "1",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter: Arc<dyn LspAdapter> = Arc::new(LoadingAwareAdapter(csharp_adapter(&manager)));
+    let error = call_site_definition(&manager, &adapter, &workspace)
+        .await
+        .expect_err("a ready server's answer is not repeated");
+    assert!(format!("{error:#}").contains("file not found"), "{error:#}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    // No loading rule at all: the plain C# adapter returns it at once.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "definition");
+    config.csharp.args.extend(fake_args(&[
+        "--definition-error",
+        not_found,
+        "--definition-error-count",
+        "1",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    let error = call_site_definition(&manager, &adapter, &workspace)
+        .await
+        .expect_err("an error with no loading rule is not repeated");
+    assert!(format!("{error:#}").contains("file not found"), "{error:#}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+}
+
+/// The process id that the sleeper behind heartbeat file `beat` (a fake
+/// server's descendant, see `--spawn-grandchild` in `fake_lsp.rs`) wrote when
+/// it started.
+#[cfg(windows)]
+fn sleeper_pid(beat: &std::path::Path) -> u32 {
+    std::fs::read_to_string(beat.with_extension("pid"))
+        .expect("the sleeper writes its process id before its first heartbeat")
+        .trim()
+        .parse()
+        .expect("a process id")
+}
+
+/// Whether the operating system lists process `pid` as running. Asks
+/// `tasklist`, which prints one CSV row (`"image","pid",...`) per match and an
+/// information line when there is none. The program runs on the runtime
+/// (`tokio::process`) instead of blocking it, so the tasks that are stopping
+/// the servers keep going while a test polls.
+#[cfg(windows)]
+async fn process_is_running(pid: u32) -> bool {
+    let output = tokio::process::Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .await
+        .expect("tasklist runs");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Whether the operating system shows process `pid` as running. `ps -o stat=`
+/// prints its state, and nothing once the process is gone; one that has ended
+/// but is not yet reaped shows `Z` (zombie) and no longer runs. The program
+/// runs on the runtime (`tokio::process`), as the Windows variant does.
+#[cfg(not(windows))]
+async fn process_is_running(pid: u32) -> bool {
+    let output = tokio::process::Command::new("ps")
+        .args(["-o", "stat=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .await
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// Waits until process `pid` has ended, and fails with `what` after `deadline`.
+async fn wait_until_process_ends(what: &str, pid: u32, deadline: Duration) {
+    wait_until(what, deadline, async || !process_is_running(pid).await).await;
+}
+
+/// How long the operating system and `tasklist` get to show a process as ended
+/// once the call that stopped it has returned.
+#[cfg(windows)]
+const PROCESS_END_SLACK: Duration = Duration::from_secs(5);
+
+/// A language server is often not the process that does the work: a `.cmd`
+/// shim, a `rustup` proxy or a `node.exe` behind `cmd.exe` start it, and
+/// killing the direct child leaves the rest running. When a server is
+/// discarded after a transport failure, the processes it started end with it,
+/// not only the server itself. The first fake server (with its sleeper, the
+/// descendant) dies mid-request but leaves the sleeper behind; the discard's
+/// shutdown ends the sleeper, and the replacement's sleeper keeps running.
+#[cfg(windows)]
+#[tokio::test]
+async fn discarding_a_session_ends_the_processes_its_server_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_timeout_seconds = 2;
+    config.csharp.args.extend(fake_args(&[
+        "--spawn-grandchild",
+        "--exit-on-symbol-request",
+        "2",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    let (discarded, serving) = (
+        sleeper_pid(&state.join("sleeper_1.txt")),
+        sleeper_pid(&state.join("sleeper_2.txt")),
+    );
+
+    wait_until_process_ends(
+        "the process the discarded server started to end",
+        discarded,
+        PROCESS_END_SLACK,
+    )
+    .await;
+    assert!(
+        process_is_running(serving).await,
+        "the replacement server's process must not be touched"
+    );
+
+    manager.release(&workspace.id).await;
+    wait_until_process_ends(
+        "the released server's process to end",
+        serving,
+        PROCESS_END_SLACK,
+    )
+    .await;
+}
+
+/// Releasing a session ends the processes its server started, whether the
+/// server leaves on `exit` (they are still running then) or ignores `shutdown`
+/// and `exit` and is killed.
+#[cfg(windows)]
+#[tokio::test]
+async fn releasing_a_session_ends_the_processes_its_server_started() {
+    for extra in [&[][..], &["--ignore-shutdown"][..]] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+        config.csharp.args.push("--spawn-grandchild".to_owned());
+        config.csharp.args.extend(fake_args(extra));
+        let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
+        manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap();
+        let sleeper = sleeper_pid(&state.join("sleeper_1.txt"));
+        assert!(
+            process_is_running(sleeper).await,
+            "the server's process must run before the release ({extra:?})"
+        );
+
+        assert_eq!(manager.release(&workspace.id).await, vec!["csharp-ls"]);
+        wait_until_process_ends(
+            &format!("the process the released server started to end ({extra:?})"),
+            sleeper,
+            PROCESS_END_SLACK,
+        )
+        .await;
+    }
+}
+
+/// Dropping the manager (a service that exits without releasing) ends the
+/// processes the servers started too.
+#[cfg(windows)]
+#[tokio::test]
+async fn dropping_the_manager_ends_the_processes_its_servers_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.csharp.args.push("--spawn-grandchild".to_owned());
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    let sleeper = sleeper_pid(&state.join("sleeper_1.txt"));
+    assert!(process_is_running(sleeper).await);
+
+    drop(manager);
+    wait_until_process_ends(
+        "the process of a dropped manager's server to end",
+        sleeper,
+        PROCESS_END_SLACK,
+    )
+    .await;
+}
+
+/// How long a dropped manager's server gets to end. The kill is sent as the
+/// manager drops; this bounds only how long the operating system takes to show
+/// the process as gone, and the poll ends the wait as soon as it does.
+const DROP_KILL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Dropping the manager (a service that exits without releasing) ends the
+/// server it started, on every platform. The server is the fake's direct
+/// child, and its process id is the one it recorded on its first request.
+/// Several layers end it and any one is enough (the child's `kill_on_drop`, the
+/// client's own `Drop`, and on Windows the job's explicit terminate and its
+/// close), so removing one of them turns nothing red; removing all of them
+/// does. The processes a server starts in turn are the Windows test above.
+#[tokio::test]
+async fn dropping_the_manager_ends_the_server_it_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) = fake_csharp_release_fixture(&temp);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    let server: u32 = std::fs::read_to_string(state.join("pid.txt"))
+        .expect("the fake server records its process id on its first request")
+        .trim()
+        .parse()
+        .expect("a process id");
+    assert!(process_is_running(server).await, "the server is running");
+
+    drop(manager);
+    wait_until_process_ends(
+        "the server of a dropped manager to end",
+        server,
+        DROP_KILL_DEADLINE,
+    )
+    .await;
+}
+
+/// Starts `symbols` on its own task, the way a request in flight holds the
+/// session and client it was sent on.
+#[cfg(windows)]
+fn spawn_symbols_call(
+    manager: &Arc<Manager>,
+    adapter: &Arc<dyn LspAdapter>,
+    workspace: &Workspace,
+) -> tokio::task::JoinHandle<anyhow::Result<Vec<Location>>> {
+    let (manager, adapter, workspace) =
+        (Arc::clone(manager), Arc::clone(adapter), workspace.clone());
+    tokio::spawn(async move { manager.symbols(&adapter, &workspace, "Calculator").await })
+}
+
+/// Ends a holder test: stops the stalled call, drops the manager (the last
+/// holder of every client), and checks that no sleeper is left running.
+#[cfg(windows)]
+async fn finish_holder_test(
+    call: tokio::task::JoinHandle<anyhow::Result<Vec<Location>>>,
+    manager: Arc<Manager>,
+    state: &std::path::Path,
+) {
+    call.abort();
+    let _ = call.await;
+    drop(manager);
+    for ordinal in 1..=state_count(state, "spawn_count.txt") {
+        if let Ok(text) = std::fs::read_to_string(state.join(format!("sleeper_{ordinal}.pid"))) {
+            wait_until_process_ends(
+                &format!("sleeper {ordinal} to end once the manager is dropped"),
+                text.trim().parse().expect("a process id"),
+                PROCESS_END_SLACK,
+            )
+            .await;
+        }
+    }
+}
+
+/// The processes a server started end with the shutdown itself, not only when
+/// the last holder of its client lets go. A request in flight holds the client
+/// (and so the job object that closes on its drop) for as long as it waits,
+/// which is far longer than a shutdown takes; the unit under test is the
+/// shutdown's kill of the whole tree, which `Child::kill` alone does not do.
+///
+/// The fake stalls for a minute on the request after the priming one: it reads
+/// nothing, so it answers neither `shutdown` nor `exit` and is killed. The
+/// call, with a 20 s inactivity timeout, holds the client through the whole
+/// release and the wait after it. Without the shutdown's own tree kill the
+/// sleeper lives until that call lets go (20 s or more), which is longer than
+/// the wait below.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_released_server_loses_its_processes_while_a_request_still_holds_its_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_timeout_seconds = 20;
+    config.csharp.args.extend(fake_args(&[
+        "--spawn-grandchild",
+        "--symbol-delay-ms",
+        "60000",
+    ]));
+    let manager = Arc::new(Manager::new(&config));
+    let adapter = csharp_adapter(&manager);
+    let call = spawn_symbols_call(&manager, &adapter, &workspace);
+    // initialize, initialized, the priming request, and the stalled request.
+    wait_until(
+        "the stalled request to reach the server",
+        Duration::from_secs(15),
+        async || state_count_so_far(&state, "request_count.txt") >= 4,
+    )
+    .await;
+    let sleeper = sleeper_pid(&state.join("sleeper_1.txt"));
+    assert!(
+        process_is_running(sleeper).await,
+        "the server's process must run before the release"
+    );
+    assert!(!call.is_finished());
+
+    let started = std::time::Instant::now();
+    assert_eq!(manager.release(&workspace.id).await, vec!["csharp-ls"]);
+    let released_in = started.elapsed();
+    // About 4.2 s alone (2 s for the answer it never gives, 2 s for the exit it
+    // never makes), over 6 s once when the whole binary's tests ran together on
+    // a loaded machine. The upper bound only has to show that the release does
+    // not wait for the request that holds the client (20 s), so it leaves room.
+    assert!(
+        released_in >= local_code_intelligence::lsp::SHUTDOWN_GRACE
+            && released_in
+                < 2 * local_code_intelligence::lsp::SHUTDOWN_GRACE + Duration::from_secs(8),
+        "the release waits out the grace period for a server that never answers, and does not \
+         wait for the request that holds its client: {released_in:?}"
+    );
+    wait_until_process_ends(
+        "the process the released server started to end while a request still holds its client",
+        sleeper,
+        PROCESS_END_SLACK,
+    )
+    .await;
+    assert!(
+        !call.is_finished(),
+        "the request must still hold the client, or the job's drop could have ended the process"
+    );
+
+    finish_holder_test(call, manager, &state).await;
+}
+
+/// The same for a discard whose shutdown finds the server already gone (the
+/// cooperative branch of the shutdown, which also ends the tree). The first
+/// server dies on the request after the priming one, but its sleeper keeps the
+/// server's pipes open, so the request fails by the 6 s inactivity timeout
+/// rather than at once, and the session is discarded. The replacement stalls
+/// on the repeated request for 30 s, so the call holds the discarded session's
+/// client (a local of its retry) until its own 6 s timeout runs out, about
+/// 4 s after the discard's shutdown (a 2 s wait for the answer it never gets)
+/// has ended the tree.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_discarded_server_loses_its_processes_while_a_request_still_holds_its_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_timeout_seconds = 6;
+    config.csharp.args.extend(fake_args(&[
+        "--spawn-grandchild",
+        "--exit-on-symbol-request",
+        "2",
+        "--symbol-delay-ms",
+        "30000",
+    ]));
+    let manager = Arc::new(Manager::new(&config));
+    let adapter = csharp_adapter(&manager);
+    let call = spawn_symbols_call(&manager, &adapter, &workspace);
+    wait_until(
+        "the first server's sleeper to start",
+        Duration::from_secs(15),
+        async || state.join("sleeper_1.txt").exists(),
+    )
+    .await;
+    let discarded = sleeper_pid(&state.join("sleeper_1.txt"));
+    assert!(
+        process_is_running(discarded).await,
+        "the server's process must run before the discard"
+    );
+
+    // The first server's four messages, then the replacement's four, the last
+    // one the repeated request it stalls on.
+    wait_until(
+        "the repeated request to reach the replacement server",
+        Duration::from_secs(30),
+        async || state_count_so_far(&state, "request_count.txt") >= 8,
+    )
+    .await;
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    wait_until_process_ends(
+        "the process the discarded server started to end while a request still holds its client",
+        discarded,
+        Duration::from_secs(4),
+    )
+    .await;
+    assert!(
+        !call.is_finished(),
+        "the request must still hold the client, or the job's drop could have ended the process"
+    );
+    assert!(
+        process_is_running(sleeper_pid(&state.join("sleeper_2.txt"))).await,
+        "the replacement server's process must not be touched"
+    );
+
+    finish_holder_test(call, manager, &state).await;
 }
 
 /// A C# fixture whose fake server takes `delay_ms` to answer `initialize`,
@@ -981,9 +1753,9 @@ async fn symbols_warn_when_another_applicable_server_answered_with_an_error() {
         .await
         .expect("the TypeScript server answered, so the call must not fail");
     assert!(report.results.is_empty(), "{:?}", report.results);
-    // An error response discards the session like an exit does: csharp-ls is
-    // started, answers with the error, is restarted once, and fails again.
-    assert_eq!(state_count(&state.join("csharp"), "spawn_count.txt"), 2);
+    // An error response is an answer, not a dead server (N9): csharp-ls is
+    // started once, its session is kept, and the warning carries its error.
+    assert_eq!(state_count(&state.join("csharp"), "spawn_count.txt"), 1);
     assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(
