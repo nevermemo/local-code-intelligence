@@ -666,22 +666,30 @@ async fn the_evaluation_dump_adds_candidates_and_an_arm_and_changes_nothing_else
     task.abort();
 }
 
-#[tokio::test]
-async fn evaluate_dump_candidates_writes_the_dump_through_the_command_line_only_when_asked() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("dump-cli");
-    write_dump_workspace(&workspace);
-    let config_path = temp.path().join("config.toml");
+/// A configuration file for the command-line binary that matches
+/// [`dump_config`] and points at the fake model service of `config`; its data
+/// directory is `cli-data` under `dir`.
+fn write_dump_cli_config(dir: &Path, config: &Config) -> std::path::PathBuf {
+    let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
         format!(
             "data_dir = '{}'\nembedding_url = '{}'\nreranker_url = '{}'\nrerank_candidate_count = 4\nrerank_document_max_bytes = 256\n\n[channels]\nlsp = false\n\n[fusion]\nmax_chunks_per_file = 2\n",
-            temp.path().join("cli-data").display(),
+            dir.join("cli-data").display(),
             config.embedding_url,
             config.reranker_url,
         ),
     )
     .unwrap();
+    config_path
+}
+
+#[tokio::test]
+async fn evaluate_dump_candidates_writes_the_dump_through_the_command_line_only_when_asked() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("dump-cli");
+    write_dump_workspace(&workspace);
+    let config_path = write_dump_cli_config(temp.path(), &config);
     let definition_path = temp.path().join("definition.toml");
     std::fs::write(
         &definition_path,
@@ -756,6 +764,416 @@ async fn evaluate_dump_candidates_writes_the_dump_through_the_command_line_only_
     }
     assert_eq!(plain_query["evidence"], dumped_query["evidence"]);
     assert_eq!(plain_query["metrics"], dumped_query["metrics"]);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// `LCI_CANDIDATE_DUMP`: every search of a process appends its fused pool to a
+// file and returns what it would have returned without. The in-process tests
+// give the `App` the destination through `with_candidate_dump` rather than the
+// environment, which a multi-threaded test binary cannot set without
+// affecting every other test; the command-line test sets the real variable on
+// a child process only.
+// ---------------------------------------------------------------------------
+
+/// The report as JSON without what legitimately differs between two
+/// otherwise identical searches: the stage timings and the index wait. Unlike
+/// [`without_trace_and_timings`] it keeps any trace key.
+fn strip_timings(mut value: Value) -> Value {
+    let object = value.as_object_mut().unwrap();
+    object.remove("timings");
+    object["index"].as_object_mut().unwrap().remove("wait_ms");
+    value
+}
+
+fn without_timings(report: &SearchReport) -> Value {
+    strip_timings(serde_json::to_value(report).unwrap())
+}
+
+/// The keys of one dump line, as the preregistration names them.
+const DUMP_LINE_KEYS: [&str; 9] = [
+    "candidates",
+    "channels",
+    "filters",
+    "query",
+    "rerank_candidate_count",
+    "rerank_outcome",
+    "timings",
+    "ts",
+    "workspace_path",
+];
+
+fn dump_lines(path: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(
+        text.is_empty() || text.ends_with('\n'),
+        "the dump ends in a partial line"
+    );
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("every dump line is one JSON document"))
+        .collect()
+}
+
+fn assert_dump_line_shape(line: &Value) {
+    let mut keys: Vec<&str> = line
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, DUMP_LINE_KEYS);
+    assert!(line["ts"].as_f64().unwrap() > 1.5e9, "{}", line["ts"]);
+    for row in line["candidates"].as_array().unwrap() {
+        assert!(row["shortlisted"].is_boolean(), "{row}");
+    }
+}
+
+#[tokio::test]
+async fn a_candidate_dump_appends_the_whole_pool_of_one_search_and_changes_nothing_it_returns() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump-env");
+    write_dump_workspace(&workspace);
+    let logs = temp.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let dump_path = logs.join("candidates.jsonl");
+
+    // The reference: the same two searches without a dump.
+    let plain_app = App::open(config.clone())
+        .await
+        .unwrap()
+        .with_candidate_dump(None);
+    plain_app.index(&workspace).await.unwrap();
+    let plain = plain_app
+        .search(&workspace, "translator", Some(3))
+        .await
+        .unwrap();
+    let traced = search_traced(&plain_app, &workspace, FilterRequest::default(), true).await;
+    let pool = traced.candidates.clone().expect("the pool was traced");
+    drop(plain_app);
+    assert!(plain.reranked, "{:?}", plain.warning);
+    assert!(!dump_path.exists(), "no dump was asked for");
+
+    let app = App::open(config.clone())
+        .await
+        .unwrap()
+        .with_candidate_dump(Some(dump_path.clone()));
+    let report = app.search(&workspace, "translator", Some(3)).await.unwrap();
+
+    // The response is the undumped one: no trace in it, and nothing else
+    // different but the clocks.
+    let json = serde_json::to_value(&report).unwrap();
+    for key in ["candidates", "rerank_outcome"] {
+        assert!(json.get(key).is_none(), "the response has a {key} key");
+    }
+    assert!(report.candidates.is_none() && report.rerank_outcome.is_none());
+    assert_eq!(without_timings(&report), without_timings(&plain));
+
+    // Exactly one line, holding the pool the traced search saw.
+    let lines = dump_lines(&dump_path);
+    assert_eq!(lines.len(), 1, "one line per search");
+    let line = &lines[0];
+    assert_dump_line_shape(line);
+    assert_eq!(line["query"], "translator");
+    assert_eq!(
+        line["workspace_path"],
+        serde_json::to_value(&report.workspace.path).unwrap()
+    );
+    assert_eq!(
+        line["filters"],
+        serde_json::to_value(&report.filters).unwrap()
+    );
+    assert_eq!(
+        line["channels"],
+        serde_json::to_value(config.channels).unwrap()
+    );
+    assert_eq!(line["rerank_candidate_count"], 4);
+    assert_eq!(line["rerank_outcome"], "scored");
+    // The response's timings, to the last digit serde_json's number parser
+    // keeps (it may differ from the written f64 by one unit in the last place).
+    let response_timings = serde_json::to_value(&report.timings).unwrap();
+    let response_timings = response_timings.as_object().unwrap();
+    assert_eq!(
+        line["timings"].as_object().unwrap().len(),
+        response_timings.len()
+    );
+    for (stage, expected) in response_timings {
+        let dumped = line["timings"][stage].as_f64().unwrap();
+        assert!(
+            (dumped - expected.as_f64().unwrap()).abs() < 1e-9,
+            "the dumped {stage} is {dumped}, the response's is {expected}"
+        );
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!((now - line["ts"].as_f64().unwrap()).abs() < 120.0);
+
+    let dumped: Vec<CandidateTrace> = serde_json::from_value(line["candidates"].clone()).unwrap();
+    assert_eq!(dumped, pool);
+    assert_eq!(dumped.len(), 7, "every candidate of every channel");
+    assert_eq!(dumped.iter().filter(|row| row.shortlisted).count(), 4);
+    assert!(dumped.iter().all(|row| row.semantic_rank.is_some()));
+    assert!(dumped.iter().any(|row| row.lexical_rank.is_some()));
+    assert!(dumped.iter().any(|row| row.lexical_rank.is_none()));
+
+    // A second search appends; it never rewrites the first line.
+    let first_text = std::fs::read_to_string(&dump_path).unwrap();
+    app.search(&workspace, "translator_two", None)
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(&dump_path).unwrap();
+    assert!(text.starts_with(&first_text));
+    let lines = dump_lines(&dump_path);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["query"], "translator_two");
+    assert_dump_line_shape(&lines[1]);
+
+    // A caller that asks for the trace still gets it, and the dump is the same.
+    let both = search_traced(&app, &workspace, FilterRequest::default(), true).await;
+    assert_eq!(both.candidates.as_ref(), Some(&pool));
+    assert_eq!(both.rerank_outcome, Some(RerankOutcome::Scored));
+    let lines = dump_lines(&dump_path);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2]["candidates"], line["candidates"]);
+
+    // A search with nothing to rank still counts as a search.
+    let nothing = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(3),
+            FilterRequest {
+                languages: Some(vec!["python".to_owned()]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(nothing.results.is_empty() && nothing.candidates.is_none());
+    let lines = dump_lines(&dump_path);
+    assert_eq!(lines.len(), 4);
+    assert_dump_line_shape(&lines[3]);
+    assert_eq!(lines[3]["candidates"], json!([]));
+    assert_eq!(lines[3]["rerank_outcome"], "not_run");
+
+    // A search that fails appends nothing.
+    assert!(app.search(&workspace, "   ", Some(3)).await.is_err());
+    assert_eq!(dump_lines(&dump_path).len(), 4);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_candidate_dump_that_cannot_be_written_never_fails_the_search() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump-unwritable");
+    write_dump_workspace(&workspace);
+    let plain_app = App::open(config.clone())
+        .await
+        .unwrap()
+        .with_candidate_dump(None);
+    plain_app.index(&workspace).await.unwrap();
+    let plain = plain_app
+        .search(&workspace, "translator", Some(3))
+        .await
+        .unwrap();
+    drop(plain_app);
+
+    // A directory that does not exist (the dump never creates one), and a
+    // path that is a directory.
+    let missing_parent = temp.path().join("no-such-dir");
+    let unwritable = [
+        missing_parent.join("candidates.jsonl"),
+        temp.path().to_path_buf(),
+    ];
+    for path in unwritable {
+        let app = App::open(config.clone())
+            .await
+            .unwrap()
+            .with_candidate_dump(Some(path.clone()));
+        let report = app
+            .search(&workspace, "translator", Some(3))
+            .await
+            .unwrap_or_else(|error| panic!("the search failed over {}: {error:#}", path.display()));
+        assert!(report.reranked, "{:?}", report.warning);
+        assert!(report.candidates.is_none() && report.rerank_outcome.is_none());
+        assert_eq!(
+            without_timings(&report),
+            without_timings(&plain),
+            "{}",
+            path.display()
+        );
+    }
+    assert!(!missing_parent.exists(), "the dump created a directory");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_searches_append_one_whole_line_each() {
+    let (temp, config, _fake, task) = fixture().await;
+    let config = dump_config(config);
+    let workspace = temp.path().join("dump-concurrent");
+    write_dump_workspace(&workspace);
+    let dump_path = temp.path().join("concurrent.jsonl");
+    let app = App::open(config)
+        .await
+        .unwrap()
+        .with_candidate_dump(Some(dump_path.clone()));
+    app.index(&workspace).await.unwrap();
+    assert!(!dump_path.exists(), "indexing is not a search");
+
+    let queries: Vec<String> = (0..16).map(|n| format!("translator_{n}")).collect();
+    let reports = futures::future::join_all(
+        queries
+            .iter()
+            .map(|query| app.search(&workspace, query, Some(3))),
+    )
+    .await;
+    for report in reports {
+        report.unwrap();
+    }
+
+    let lines = dump_lines(&dump_path);
+    let mut dumped: Vec<&str> = lines
+        .iter()
+        .map(|line| line["query"].as_str().unwrap())
+        .collect();
+    dumped.sort_unstable();
+    let mut expected: Vec<&str> = queries.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    assert_eq!(dumped, expected, "one line per search");
+    for line in &lines {
+        assert_dump_line_shape(line);
+        assert_eq!(line["candidates"].as_array().unwrap().len(), 7);
+    }
+    task.abort();
+}
+
+/// Runs the command-line binary in `cwd`; the real `LCI_CANDIDATE_DUMP` is
+/// set on the child to `dump`, or removed from it when `None`, so what the
+/// developer's own shell exports cannot change the result.
+async fn run_cli(
+    config_path: &Path,
+    cwd: &Path,
+    args: Vec<String>,
+    dump: Option<std::path::PathBuf>,
+) -> std::process::Output {
+    let (config_path, cwd) = (config_path.to_owned(), cwd.to_owned());
+    // The fake model service runs on this runtime, so the command must not
+    // block it.
+    tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command
+            .current_dir(cwd)
+            .arg("--config")
+            .arg(config_path)
+            .args(args)
+            .env_remove("LCI_CANDIDATE_DUMP");
+        if let Some(path) = dump {
+            command.env("LCI_CANDIDATE_DUMP", path);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_candidate_dump_variable_makes_the_command_line_append_a_line_and_print_the_same_response()
+ {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("dump-env-cli");
+    write_dump_workspace(&workspace);
+    let config_path = write_dump_cli_config(temp.path(), &config);
+    let cwd = temp.path().join("cwd");
+    let logs = temp.path().join("logs");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&logs).unwrap();
+    let dump_path = logs.join("candidates.jsonl");
+    let search = |dump: Option<std::path::PathBuf>| {
+        let args = vec![
+            "search".to_owned(),
+            workspace.display().to_string(),
+            "translator".to_owned(),
+            "--top-k".to_owned(),
+            "3".to_owned(),
+        ];
+        let (config_path, cwd) = (config_path.clone(), cwd.clone());
+        async move {
+            let output = run_cli(&config_path, &cwd, args, dump).await;
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        }
+    };
+    run_cli(
+        &config_path,
+        &cwd,
+        vec!["index".to_owned(), workspace.display().to_string()],
+        None,
+    )
+    .await;
+
+    // Without the variable nothing is written: not to the working directory,
+    // not to the directory the dump would go to, not into the workspace.
+    let workspace_files = || {
+        let mut names: Vec<_> = std::fs::read_dir(workspace.join("src"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = workspace_files();
+    let plain = search(None).await;
+    assert!(plain["reranked"].as_bool().unwrap(), "{plain}");
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
+    assert_eq!(workspace_files(), before);
+
+    // With it: one line, and the same response.
+    let dumped = search(Some(dump_path.clone())).await;
+    for key in ["candidates", "rerank_outcome"] {
+        assert!(dumped.get(key).is_none(), "the response has a {key} key");
+    }
+    assert_eq!(strip_timings(dumped.clone()), strip_timings(plain.clone()));
+    let lines = dump_lines(&dump_path);
+    assert_eq!(lines.len(), 1);
+    assert_dump_line_shape(&lines[0]);
+    assert_eq!(lines[0]["query"], "translator");
+    assert_eq!(lines[0]["workspace_path"], plain["workspace"]["path"]);
+    assert_eq!(lines[0]["rerank_outcome"], "scored");
+    assert_eq!(lines[0]["rerank_candidate_count"], 4);
+    assert_eq!(lines[0]["candidates"].as_array().unwrap().len(), 7);
+    assert_eq!(lines[0]["timings"], dumped["timings"]);
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
+
+    // Another process appends to the same file.
+    search(Some(dump_path.clone())).await;
+    assert_eq!(dump_lines(&dump_path).len(), 2);
+
+    // A blank variable is the same as none.
+    let blank = run_cli(
+        &config_path,
+        &cwd,
+        vec![
+            "search".to_owned(),
+            workspace.display().to_string(),
+            "translator".to_owned(),
+        ],
+        Some(std::path::PathBuf::from("  ")),
+    )
+    .await;
+    assert!(blank.status.success());
+    assert_eq!(dump_lines(&dump_path).len(), 2);
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
     task.abort();
 }
 

@@ -4,7 +4,7 @@
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
-    config::{FusionConfig, IndexFreshness},
+    config::{ChannelsConfig, Config, FusionConfig, IndexFreshness},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest, SourceRole},
     lexical,
     lsp::adapter::LspAdapter,
@@ -15,9 +15,11 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    path::Path,
+    ffi::OsString,
+    io::Write,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Default, Serialize)]
@@ -58,9 +60,10 @@ pub struct SearchReport {
     pub filters: EffectiveFilterReport,
     /// Every candidate of the post-filter fused pool, best first, with the
     /// evidence needed to replay the search offline. Only present (and only
-    /// serialized) when the search ran with
+    /// serialized) when the caller asked for it with
     /// [`SearchOptions::trace_candidates`]; absent from every other search's
-    /// JSON.
+    /// JSON, including one that fed a candidate dump (see
+    /// [`CANDIDATE_DUMP_ENV`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<CandidateTrace>>,
     /// What happened to the reranker for this search. Present exactly when
@@ -77,6 +80,122 @@ pub struct SearchOptions {
     /// set it. Ranking, results, warnings, and the reported stage timings do
     /// not depend on it.
     pub trace_candidates: bool,
+}
+
+/// Names a file that every search of an [`App`] appends to, one JSON line
+/// each, with the whole fused candidate pool (see [`CandidateDumpLine`]).
+/// Read once, when the `App` is opened; unset or blank means no dump. The
+/// MCP, REST, and CLI responses are the same with it set or not.
+pub const CANDIDATE_DUMP_ENV: &str = "LCI_CANDIDATE_DUMP";
+
+/// The dump file named by the value of [`CANDIDATE_DUMP_ENV`]: `None` when
+/// the variable is unset or blank. Kept apart from the environment lookup so
+/// the interpretation is testable without touching the process environment.
+fn candidate_dump_path(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// The candidate dump the environment asks for. Called by [`App::open`].
+pub(super) fn candidate_dump_from_env() -> Option<PathBuf> {
+    candidate_dump_path(std::env::var_os(CANDIDATE_DUMP_ENV))
+}
+
+/// One line of the candidate dump file: a search, with the settings that
+/// shaped its pool and every candidate of that pool in fused order (the
+/// `evaluate --dump-candidates` rows, see [`CandidateTrace`]).
+#[derive(Serialize)]
+struct CandidateDumpLine<'a> {
+    /// Unix time in seconds, millisecond resolution, taken when the search
+    /// had finished.
+    ts: f64,
+    workspace_path: &'a Path,
+    query: &'a str,
+    filters: &'a EffectiveFilterReport,
+    channels: &'a ChannelsConfig,
+    rerank_candidate_count: usize,
+    rerank_outcome: Option<RerankOutcome>,
+    /// The timings the caller's report carries, unchanged.
+    timings: &'a Timings,
+    candidates: &'a [CandidateTrace],
+}
+
+/// Serializes the dump lines of all searches in this process, whichever `App`
+/// or file they belong to: a line is written under it as a single `write_all`
+/// to a file opened for appending, so concurrent searches cannot interleave
+/// their lines. (Another process appending to the same file relies on the
+/// operating system's append semantics.)
+static CANDIDATE_DUMP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Appends `line` (already newline-terminated) to `path`, creating the file
+/// but not its directory. The file is opened afresh each time, so one that the
+/// harness rotates or removes between searches is simply recreated.
+fn append_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
+    let _serialized = CANDIDATE_DUMP_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line)
+}
+
+/// Appends the finished, traced search `report` to the candidate dump
+/// `path` as one JSON line. Fail-open like every optional part of a search:
+/// a line that cannot be serialized or written is a warning in the log, never
+/// an error of the search.
+async fn append_candidate_dump(path: &Path, config: &Config, report: &SearchReport) {
+    let started = Instant::now();
+    let dumped_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+    let line = CandidateDumpLine {
+        ts: (dumped_at * 1000.0).round() / 1000.0,
+        workspace_path: &report.workspace.path,
+        query: &report.query,
+        filters: &report.filters,
+        channels: &config.channels,
+        rerank_candidate_count: config.rerank_candidate_count,
+        rerank_outcome: report.rerank_outcome,
+        timings: &report.timings,
+        candidates: report.candidates.as_deref().unwrap_or_default(),
+    };
+    let mut bytes = match serde_json::to_vec(&line) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "candidate dump line not serialized; the search is unaffected");
+            return;
+        }
+    };
+    // Compact JSON holds no raw newline (string contents are escaped), so
+    // this makes the whole record exactly one line.
+    bytes.push(b'\n');
+    let line_bytes = bytes.len();
+    let target = path.to_owned();
+    // The line is written before the search returns, so a caller that reads
+    // the file after a search sees it; the blocking write stays off the
+    // runtime's threads.
+    match tokio::task::spawn_blocking(move || append_line(&target, &bytes)).await {
+        // The dump runs after `total_ms` is fixed, so its cost is logged here
+        // rather than hidden in the caller's round trip.
+        Ok(Ok(())) => tracing::info!(
+            dump_ms = ms(started),
+            bytes = line_bytes,
+            "candidate dump appended"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "candidate dump not written; the search is unaffected"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "candidate dump task failed; the search is unaffected"
+        ),
+    }
 }
 
 /// How the reranker took part in one traced search.
@@ -382,7 +501,41 @@ impl App {
 
     /// [`Self::search_with_filters`] with options that observe the search
     /// without changing what it returns (see [`SearchOptions`]).
+    ///
+    /// When this `App` has a candidate dump (see [`CANDIDATE_DUMP_ENV`]),
+    /// every search that returns a report runs traced and appends one line to
+    /// the dump file; the trace is removed from the returned report unless
+    /// the caller asked for it, so the response is the one an undumped search
+    /// returns. A search that fails appends nothing, and neither a dump that
+    /// cannot be written nor one that cannot be serialized fails the search.
     pub async fn search_with_options(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        options: SearchOptions,
+    ) -> Result<SearchReport> {
+        let Some(dump) = self.candidate_dump.as_deref() else {
+            return self
+                .search_once(path, query, top_k, filter_request, options)
+                .await;
+        };
+        let mut traced = options;
+        traced.trace_candidates = true;
+        let mut report = self
+            .search_once(path, query, top_k, filter_request, traced)
+            .await?;
+        append_candidate_dump(dump, &self.config, &report).await;
+        if !options.trace_candidates {
+            report.candidates = None;
+            report.rerank_outcome = None;
+        }
+        Ok(report)
+    }
+
+    /// One search, with the trace `options` asks for.
+    async fn search_once(
         &self,
         path: &Path,
         query: &str,
@@ -738,7 +891,9 @@ impl App {
         }
         report.candidates = traced;
         report.results.retain(|hit| hit_matches(&filters, hit));
-        report.timings.total_ms = ms(total);
+        // Like `fusion_ms`, the total leaves out the trace recording, so the
+        // reported timings do not depend on whether candidates were traced.
+        report.timings.total_ms = ms(total) - trace_ms;
         tracing::info!(
             query_embedding_ms = report.timings.query_embedding_ms,
             lancedb_search_ms = report.timings.lancedb_search_ms,
@@ -1151,8 +1306,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CandidateTrace, RerankOutcome, cap_chunks_per_file, head_within, record_rerank_scores,
-        rerank_document, trace_candidates,
+        App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, head_within,
+        record_rerank_scores, rerank_document, trace_candidates,
     };
     use crate::{
         chunk::Chunk,
@@ -1160,9 +1315,21 @@ mod tests {
         filter::SourceRole,
         store::{Hit, source_role_prior},
     };
-    use std::collections::HashSet;
+    use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
+
+    #[test]
+    fn the_candidate_dump_is_off_unless_the_variable_names_a_file() {
+        assert_eq!(candidate_dump_path(None), None);
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(candidate_dump_path(Some(OsString::from(blank))), None);
+        }
+        assert_eq!(
+            candidate_dump_path(Some(OsString::from("logs/candidates-s1.jsonl"))),
+            Some(PathBuf::from("logs/candidates-s1.jsonl"))
+        );
+    }
 
     #[test]
     fn head_within_keeps_short_text_and_cuts_on_a_char_boundary() {

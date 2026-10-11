@@ -14,12 +14,13 @@ pub use indexing::{
 pub use navigation::NavigationReport;
 pub use readiness::{ReadinessComponent, ReadinessDegraded, ServiceStatus};
 pub use search::{
-    CandidateTrace, RerankOutcome, SearchIndexLifecycle, SearchOptions, SearchReport, Timings,
+    CANDIDATE_DUMP_ENV, CandidateTrace, RerankOutcome, SearchIndexLifecycle, SearchOptions,
+    SearchReport, Timings,
 };
 
 use crate::{config::Config, lsp, models::Models, store::Store};
 use anyhow::Result;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +49,9 @@ pub struct App {
     index_lock: Mutex<()>,
     watchers: Mutex<HashMap<String, CancellationToken>>,
     analyzer: lsp::Manager,
+    /// File every search appends its candidate dump line to (see
+    /// [`CANDIDATE_DUMP_ENV`]); `None` writes nothing.
+    candidate_dump: Option<PathBuf>,
 }
 
 impl App {
@@ -66,7 +70,19 @@ impl App {
             index_lock: Mutex::new(()),
             watchers: Mutex::new(HashMap::new()),
             analyzer,
+            candidate_dump: search::candidate_dump_from_env(),
         })
+    }
+
+    /// Replaces the candidate dump destination that [`Self::open`] took from
+    /// the `LCI_CANDIDATE_DUMP` environment variable: `Some(file)` appends
+    /// one line per search to `file`, `None` turns the dump off. For callers
+    /// (tests, embedders) that must not depend on, or change, the process
+    /// environment.
+    #[must_use]
+    pub fn with_candidate_dump(mut self, path: Option<PathBuf>) -> Self {
+        self.candidate_dump = path;
+        self
     }
 
     async fn lock(&self, id: &str) -> Arc<WorkspaceCoordination> {
