@@ -2661,3 +2661,472 @@ async fn the_per_file_cap_puts_distinct_files_first_in_results_and_the_reranker_
     );
     task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// `[search_profiles.<name>]`: named query-time overrides (channel switches and
+// the rerank window) that a search chooses by name. No name is the search the
+// application always ran.
+// ---------------------------------------------------------------------------
+
+/// The report as JSON without what differs between two otherwise identical
+/// searches: the stage timings and the index wait.
+fn json_without_clocks(report: &local_code_intelligence::app::SearchReport) -> Value {
+    let mut value = serde_json::to_value(report).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("timings");
+    object["index"].as_object_mut().unwrap().remove("wait_ms");
+    value
+}
+
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The lines of a candidate dump file, one JSON document each.
+fn dump_lines_of(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Seven chunks: five in `src/many.rs` that mention the query and one each in
+/// two files that do not.
+fn write_profile_workspace(root: &Path) {
+    write(
+        root,
+        "src/many.rs",
+        "fn translator_one() {}\nfn translator_two() {}\nfn translator_three() {}\nfn translator_four() {}\nfn translator_five() {}\n",
+    );
+    write(root, "src/second.rs", "fn second_file() {}\n");
+    write(root, "src/third.rs", "fn third_file() {}\n");
+}
+
+/// `fast` (reranker off), `deep` (a window of three), and `grep` (lexical
+/// only, no reranker), next to a top-level window of five and no language
+/// server.
+fn profiled_config(mut config: Config) -> Config {
+    use local_code_intelligence::config::SearchProfile;
+    config.channels.lsp = false;
+    config.rerank_candidate_count = 5;
+    config.search_profiles = std::collections::BTreeMap::from([
+        (
+            "fast".to_owned(),
+            SearchProfile {
+                reranker: Some(false),
+                ..SearchProfile::default()
+            },
+        ),
+        (
+            "deep".to_owned(),
+            SearchProfile {
+                rerank_candidate_count: Some(3),
+                ..SearchProfile::default()
+            },
+        ),
+        (
+            "grep".to_owned(),
+            SearchProfile {
+                semantic: Some(false),
+                reranker: Some(false),
+                ..SearchProfile::default()
+            },
+        ),
+    ]);
+    config
+}
+
+/// The proof that adding profiles changed nothing for a search that names
+/// none: the same JSON, key for key, as `search_with_filters` and
+/// `search_with_options`, which the evaluation runner still calls.
+#[tokio::test]
+async fn a_search_in_no_profile_matches_search_with_filters() {
+    use local_code_intelligence::{app::SearchOptions, filter::FilterRequest};
+
+    let (temp, config, _fake, task) = fixture().await;
+    let config = profiled_config(config);
+    let workspace = temp.path().join("profile-none");
+    write_profile_workspace(&workspace);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+
+    for filters in [
+        FilterRequest::default(),
+        FilterRequest {
+            languages: Some(vec!["rust".to_owned()]),
+            exclude_paths: Some(vec!["src/third.rs".to_owned()]),
+            ..FilterRequest::default()
+        },
+    ] {
+        let by_filters = app
+            .search_with_filters(&workspace, "translator", Some(3), filters.clone())
+            .await
+            .unwrap();
+        let by_none = app
+            .search_in_profile(&workspace, "translator", Some(3), filters.clone(), None)
+            .await
+            .unwrap();
+        let by_options = app
+            .search_with_options(
+                &workspace,
+                "translator",
+                Some(3),
+                filters,
+                SearchOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(by_filters.reranked, "{:?}", by_filters.warning);
+        assert!(by_filters.warning.is_none(), "{:?}", by_filters.warning);
+        assert!(by_none.search_profile.is_none() && by_options.search_profile.is_none());
+
+        let json = json_without_clocks(&by_filters);
+        assert_eq!(json_without_clocks(&by_none), json);
+        assert_eq!(json_without_clocks(&by_options), json);
+        // Not one key more than a search had before profiles existed.
+        assert_eq!(
+            sorted_keys(&json),
+            [
+                "candidate_count",
+                "filters",
+                "index",
+                "query",
+                "reranked",
+                "results",
+                "warning",
+                "workspace"
+            ]
+        );
+        assert!(
+            serde_json::to_value(&by_none)
+                .unwrap()
+                .get("search_profile")
+                .is_none()
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn profiles_switch_the_reranker_and_window_and_report_themselves() {
+    use local_code_intelligence::{app::SearchReport, filter::FilterRequest};
+
+    let (temp, config, fake, task) = fixture().await;
+    let config = profiled_config(config);
+    let workspace = temp.path().join("profile-switch");
+    write_profile_workspace(&workspace);
+    let dump_path = temp.path().join("profile-candidates.jsonl");
+    let app = App::open(config.clone())
+        .await
+        .unwrap()
+        .with_candidate_dump(Some(dump_path.clone()));
+    assert_eq!(app.index(&workspace).await.unwrap().chunks, 7);
+
+    async fn search(
+        app: &App,
+        workspace: &Path,
+        profile: Option<&str>,
+    ) -> anyhow::Result<SearchReport> {
+        app.search_in_profile(
+            workspace,
+            "translator",
+            Some(3),
+            FilterRequest::default(),
+            profile,
+        )
+        .await
+    }
+    let reranks = || fake.rerank_requests.load(Ordering::SeqCst);
+    let queries = || fake.queries.load(Ordering::SeqCst);
+
+    // No profile: the top-level window of five and a reranked answer.
+    let (reranks_before, queries_before) = (reranks(), queries());
+    let base = search(&app, &workspace, None).await.unwrap();
+    assert!(
+        base.reranked && base.warning.is_none(),
+        "{:?}",
+        base.warning
+    );
+    assert_eq!(base.search_profile, None);
+    assert_eq!(base.candidate_count, 5);
+    assert_eq!(reranks() - reranks_before, 1);
+    assert_eq!(queries() - queries_before, 1);
+
+    // `fast`: no reranker, so no request, no `reranked`, and no warning; the
+    // window and the retrieval channels are the top level's.
+    let (reranks_before, queries_before) = (reranks(), queries());
+    let fast = search(&app, &workspace, Some("fast")).await.unwrap();
+    assert!(!fast.reranked, "{:?}", fast.warning);
+    assert!(fast.warning.is_none(), "{:?}", fast.warning);
+    assert_eq!(fast.search_profile.as_deref(), Some("fast"));
+    assert_eq!(fast.candidate_count, 5);
+    assert_eq!(fast.results.len(), 3);
+    assert!(fast.results.iter().all(|hit| hit.reranker_score.is_none()));
+    assert_eq!(reranks(), reranks_before, "the reranker was not called");
+    assert_eq!(queries() - queries_before, 1);
+    assert_eq!(channels_seen(&fast), channel_set(&["semantic", "lexical"]));
+    assert_eq!(
+        serde_json::to_value(&fast).unwrap()["search_profile"],
+        "fast"
+    );
+
+    // `deep`: the reranker is shown three candidates, not five.
+    let reranks_before = reranks();
+    let deep = search(&app, &workspace, Some("deep")).await.unwrap();
+    assert!(deep.reranked, "{:?}", deep.warning);
+    assert_eq!(deep.search_profile.as_deref(), Some("deep"));
+    assert_eq!(deep.candidate_count, 3);
+    assert_eq!(reranks() - reranks_before, 1);
+
+    // `grep`: lexical only. The query is not embedded at all.
+    let (reranks_before, queries_before) = (reranks(), queries());
+    let grep = search(&app, &workspace, Some("grep")).await.unwrap();
+    assert_eq!(grep.search_profile.as_deref(), Some("grep"));
+    assert!(
+        !grep.reranked && grep.warning.is_none(),
+        "{:?}",
+        grep.warning
+    );
+    assert_eq!(channels_seen(&grep), channel_set(&["lexical"]));
+    assert_eq!(queries(), queries_before, "the query was not embedded");
+    assert_eq!(reranks(), reranks_before);
+    assert_eq!(grep.timings.query_embedding_ms, 0.0);
+
+    // An unknown name fails before any work, with the configured names.
+    let unindexed = temp.path().join("profile-unindexed");
+    write_profile_workspace(&unindexed);
+    let documents_before = fake.document_requests.load(Ordering::SeqCst);
+    let queries_before = queries();
+    for name in ["nope", "default", "", "Fast"] {
+        let error = search(&app, &unindexed, Some(name))
+            .await
+            .expect_err("an unconfigured profile is an error, not the default");
+        assert_eq!(
+            error.to_string(),
+            format!("unknown search profile {name:?}; configured: deep, fast, grep")
+        );
+    }
+    assert_eq!(
+        fake.document_requests.load(Ordering::SeqCst),
+        documents_before,
+        "the failed search did not index the workspace"
+    );
+    assert_eq!(queries(), queries_before);
+
+    // The candidate dump records what each search ran with. A search that
+    // named no profile left its line exactly as it was before profiles.
+    let lines = dump_lines_of(&dump_path);
+    assert_eq!(lines.len(), 4, "one line per successful search");
+    let plain_keys = [
+        "candidates",
+        "channels",
+        "filters",
+        "query",
+        "rerank_candidate_count",
+        "rerank_outcome",
+        "timings",
+        "ts",
+        "workspace_path",
+    ];
+    let profiled_keys = [
+        "candidates",
+        "channels",
+        "filters",
+        "query",
+        "rerank_candidate_count",
+        "rerank_outcome",
+        "search_profile",
+        "timings",
+        "ts",
+        "workspace_path",
+    ];
+    let channels = |semantic: bool, reranker: bool| json!({"semantic": semantic, "lexical": true, "lsp": false, "reranker": reranker});
+    assert_eq!(sorted_keys(&lines[0]), plain_keys);
+    assert_eq!(lines[0]["channels"], channels(true, true));
+    assert_eq!(lines[0]["rerank_candidate_count"], 5);
+    assert_eq!(lines[0]["rerank_outcome"], "scored");
+
+    assert_eq!(sorted_keys(&lines[1]), profiled_keys);
+    assert_eq!(lines[1]["search_profile"], "fast");
+    assert_eq!(lines[1]["channels"], channels(true, false));
+    assert_eq!(lines[1]["rerank_candidate_count"], 5);
+    assert_eq!(lines[1]["rerank_outcome"], "off");
+
+    assert_eq!(sorted_keys(&lines[2]), profiled_keys);
+    assert_eq!(lines[2]["search_profile"], "deep");
+    assert_eq!(lines[2]["channels"], channels(true, true));
+    assert_eq!(lines[2]["rerank_candidate_count"], 3);
+    assert_eq!(lines[2]["rerank_outcome"], "scored");
+    let shortlisted = lines[2]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["shortlisted"] == true)
+        .count();
+    assert_eq!(shortlisted, 3, "the dump marks the profile's window");
+
+    assert_eq!(sorted_keys(&lines[3]), profiled_keys);
+    assert_eq!(lines[3]["search_profile"], "grep");
+    assert_eq!(lines[3]["channels"], channels(false, false));
+    assert_eq!(lines[3]["rerank_outcome"], "off");
+    drop(app);
+
+    // A profile is the same search as the top-level configuration it
+    // stands for: nothing but its name differs.
+    async fn equivalent(config: Config, workspace: &Path) -> Value {
+        let app = App::open(config).await.unwrap().with_candidate_dump(None);
+        let report = search(&app, workspace, None).await.unwrap();
+        json_without_clocks(&report)
+    }
+    fn without_profile(report: &SearchReport) -> Value {
+        let mut value = json_without_clocks(report);
+        value.as_object_mut().unwrap().remove("search_profile");
+        value
+    }
+    let mut stands_for_fast = config.clone();
+    stands_for_fast.search_profiles.clear();
+    stands_for_fast.channels.reranker = false;
+    assert_eq!(
+        equivalent(stands_for_fast, &workspace).await,
+        without_profile(&fast)
+    );
+    let mut stands_for_deep = config.clone();
+    stands_for_deep.search_profiles.clear();
+    stands_for_deep.rerank_candidate_count = 3;
+    assert_eq!(
+        equivalent(stands_for_deep, &workspace).await,
+        without_profile(&deep)
+    );
+    let mut stands_for_grep = config.clone();
+    stands_for_grep.search_profiles.clear();
+    stands_for_grep.channels.semantic = false;
+    stands_for_grep.channels.reranker = false;
+    assert_eq!(
+        equivalent(stands_for_grep, &workspace).await,
+        without_profile(&grep)
+    );
+    let mut stands_for_none = config.clone();
+    stands_for_none.search_profiles.clear();
+    assert_eq!(
+        equivalent(stands_for_none, &workspace).await,
+        without_profile(&base)
+    );
+    task.abort();
+}
+
+/// Runs the command-line binary and returns its output, whatever its status.
+async fn run_search_cli(config_path: &Path, args: Vec<String>) -> std::process::Output {
+    let config_path = config_path.to_owned();
+    // The fake model service runs on this runtime, so the command must not
+    // block it.
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"))
+            .arg("--config")
+            .arg(config_path)
+            .args(args)
+            .env_remove("LCI_CANDIDATE_DUMP")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_command_line_search_takes_a_search_profile_and_names_the_configured_ones_when_it_is_unknown()
+ {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("profile-cli");
+    write_profile_workspace(&workspace);
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "data_dir = '{}'\nembedding_url = '{}'\nreranker_url = '{}'\nrerank_candidate_count = 5\n\n[channels]\nlsp = false\n\n[search_profiles.fast]\nreranker = false\n\n[search_profiles.deep]\nrerank_candidate_count = 3\n",
+            temp.path().join("cli-data").display(),
+            config.embedding_url,
+            config.reranker_url,
+        ),
+    )
+    .unwrap();
+    let workspace_arg = workspace.display().to_string();
+    let search = |extra: &[&str]| {
+        let mut args = vec![
+            "search".to_owned(),
+            workspace_arg.clone(),
+            "translator".to_owned(),
+            "--top-k".to_owned(),
+            "3".to_owned(),
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        run_search_cli(&config_path, args)
+    };
+    let index = run_search_cli(
+        &config_path,
+        vec!["index".to_owned(), workspace_arg.clone()],
+    )
+    .await;
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    // No flag: the response a search always had.
+    let reranks_before = fake.rerank_requests.load(Ordering::SeqCst);
+    let plain = search(&[]).await;
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
+    assert!(plain.get("search_profile").is_none(), "{plain}");
+    assert_eq!(plain["reranked"], true);
+    assert_eq!(plain["candidate_count"], 5);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst) - reranks_before,
+        1
+    );
+
+    // The flag: the profile applies and the response names it.
+    let reranks_before = fake.rerank_requests.load(Ordering::SeqCst);
+    let fast = search(&["--search-profile", "fast"]).await;
+    assert!(
+        fast.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fast.stderr)
+    );
+    let fast: Value = serde_json::from_slice(&fast.stdout).unwrap();
+    assert_eq!(fast["search_profile"], "fast");
+    assert_eq!(fast["reranked"], false);
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), reranks_before);
+    let deep = search(&["--search-profile", "deep"]).await;
+    assert!(
+        deep.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deep.stderr)
+    );
+    let deep: Value = serde_json::from_slice(&deep.stdout).unwrap();
+    assert_eq!(deep["search_profile"], "deep");
+    assert_eq!(deep["candidate_count"], 3);
+
+    // An unknown name is a failure that lists the configured names.
+    let unknown = search(&["--search-profile", "nope"]).await;
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.contains("unknown search profile \"nope\"; configured: deep, fast"),
+        "{stderr}"
+    );
+    assert!(unknown.stdout.is_empty());
+    task.abort();
+}

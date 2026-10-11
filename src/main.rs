@@ -54,6 +54,13 @@ enum Command {
         exclude_paths: Vec<String>,
         #[arg(long = "source-role")]
         source_roles: Vec<String>,
+        /// Run the search with this `[search_profiles.<name>]` of the
+        /// configuration applied over `[channels]` and
+        /// `rerank_candidate_count`. The response then carries
+        /// `search_profile`. An unknown name is an error that lists the
+        /// configured ones.
+        #[arg(long = "search-profile")]
+        search_profile: Option<String>,
     },
     Evaluate {
         definition: PathBuf,
@@ -335,8 +342,9 @@ async fn main() -> Result<()> {
             include_paths,
             exclude_paths,
             source_roles,
+            search_profile,
         } => serde_json::to_value(
-            app.search_with_filters(
+            app.search_in_profile(
                 &workspace,
                 &query,
                 top_k,
@@ -346,6 +354,7 @@ async fn main() -> Result<()> {
                     exclude_paths: (!exclude_paths.is_empty()).then_some(exclude_paths),
                     source_roles: (!source_roles.is_empty()).then_some(source_roles),
                 },
+                search_profile.as_deref(),
             )
             .await?,
         )?,

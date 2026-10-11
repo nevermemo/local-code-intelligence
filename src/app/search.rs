@@ -1,10 +1,12 @@
 //! Hybrid retrieval: index freshness, semantic/lexical/LSP fan-out,
 //! Reciprocal Rank Fusion, and reranking. Each channel and the reranker can
-//! be switched off for a search with the `[channels]` configuration.
+//! be switched off for a search with the `[channels]` configuration, and a
+//! named `[search_profiles.<name>]` can override those switches and the
+//! rerank window per search (see [`App::search_in_profile`]).
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
-    config::{ChannelsConfig, Config, FusionConfig, IndexFreshness},
+    config::{ChannelsConfig, FusionConfig, IndexFreshness, SearchSettings},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest, SourceRole},
     lexical,
     lsp::adapter::LspAdapter,
@@ -43,6 +45,11 @@ pub struct SearchIndexLifecycle {
 pub struct SearchReport {
     pub workspace: Workspace,
     pub query: String,
+    /// The `[search_profiles.<name>]` this search ran with. Absent from the
+    /// JSON for a search that named no profile, so that search's response is
+    /// the one it was before profiles existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_profile: Option<String>,
     pub candidate_count: usize,
     pub reranked: bool,
     /// A channel failed or the search fell back (see the retrieval
@@ -112,8 +119,16 @@ struct CandidateDumpLine<'a> {
     ts: f64,
     workspace_path: &'a Path,
     query: &'a str,
+    /// The search profile the search ran with. Left out of a line whose
+    /// search named none, which keeps its fields and bytes as they were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_profile: Option<&'a str>,
     filters: &'a EffectiveFilterReport,
+    /// The channels the search ran with: the profile's resolved switches
+    /// when it named one, else `[channels]`.
     channels: &'a ChannelsConfig,
+    /// The rerank window the search ran with (the profile's when it named
+    /// one, else `rerank_candidate_count`).
     rerank_candidate_count: usize,
     rerank_outcome: Option<RerankOutcome>,
     /// The timings the caller's report carries, unchanged.
@@ -143,10 +158,11 @@ fn append_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
 }
 
 /// Appends the finished, traced search `report` to the candidate dump
-/// `path` as one JSON line. Fail-open like every optional part of a search:
-/// a line that cannot be serialized or written is a warning in the log, never
-/// an error of the search.
-async fn append_candidate_dump(path: &Path, config: &Config, report: &SearchReport) {
+/// `path` as one JSON line, recording the `settings` the search ran with.
+/// Fail-open like every optional part of a search: a line that cannot be
+/// serialized or written is a warning in the log, never an error of the
+/// search.
+async fn append_candidate_dump(path: &Path, settings: &SearchSettings, report: &SearchReport) {
     let started = Instant::now();
     let dumped_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -155,9 +171,10 @@ async fn append_candidate_dump(path: &Path, config: &Config, report: &SearchRepo
         ts: (dumped_at * 1000.0).round() / 1000.0,
         workspace_path: &report.workspace.path,
         query: &report.query,
+        search_profile: settings.profile.as_deref(),
         filters: &report.filters,
-        channels: &config.channels,
-        rerank_candidate_count: config.rerank_candidate_count,
+        channels: &settings.channels,
+        rerank_candidate_count: settings.rerank_candidate_count,
         rerank_outcome: report.rerank_outcome,
         timings: &report.timings,
         candidates: report.candidates.as_deref().unwrap_or_default(),
@@ -209,8 +226,9 @@ pub enum RerankOutcome {
     /// not produce scores: the results are in fusion order, with a warning.
     /// No candidate has a `reranker_score`.
     Failed,
-    /// `[channels].reranker = false`: no request was made and the results
-    /// are in fusion order. No candidate has a `reranker_score`.
+    /// `[channels].reranker = false` (or a search profile that turned the
+    /// reranker off): no request was made and the results are in fusion
+    /// order. No candidate has a `reranker_score`.
     Off,
     /// There was nothing to rerank (no candidates), so the stage never ran.
     NotRun,
@@ -516,17 +534,66 @@ impl App {
         filter_request: FilterRequest,
         options: SearchOptions,
     ) -> Result<SearchReport> {
+        let settings = self.config.base_search_settings();
+        self.search_configured(path, query, top_k, filter_request, options, &settings)
+            .await
+    }
+
+    /// [`Self::search_with_filters`] run with the named
+    /// `[search_profiles.<name>]` applied over `[channels]` and
+    /// `rerank_candidate_count` (see [`crate::config::SearchProfile`]):
+    /// `profile = None` is exactly [`Self::search_with_filters`]. A profile
+    /// changes only which channels and the reranker run and how many fused
+    /// candidates the reranker orders, so every profile reads the same index
+    /// and the same fusion; the report names it in `search_profile`.
+    ///
+    /// A name that is not configured fails before any index work, with an
+    /// error that lists the configured names.
+    pub async fn search_in_profile(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        profile: Option<&str>,
+    ) -> Result<SearchReport> {
+        let settings = self.config.search_settings(profile)?;
+        self.search_configured(
+            path,
+            query,
+            top_k,
+            filter_request,
+            SearchOptions::default(),
+            &settings,
+        )
+        .await
+    }
+
+    /// The search behind [`Self::search_with_options`] and
+    /// [`Self::search_in_profile`], run with the resolved `settings` (the
+    /// query-time switches and the rerank window). Appends the candidate dump
+    /// line when this `App` has a dump, as [`Self::search_with_options`]
+    /// describes.
+    async fn search_configured(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        options: SearchOptions,
+        settings: &SearchSettings,
+    ) -> Result<SearchReport> {
         let Some(dump) = self.candidate_dump.as_deref() else {
             return self
-                .search_once(path, query, top_k, filter_request, options)
+                .search_once(path, query, top_k, filter_request, options, settings)
                 .await;
         };
         let mut traced = options;
         traced.trace_candidates = true;
         let mut report = self
-            .search_once(path, query, top_k, filter_request, traced)
+            .search_once(path, query, top_k, filter_request, traced, settings)
             .await?;
-        append_candidate_dump(dump, &self.config, &report).await;
+        append_candidate_dump(dump, settings, &report).await;
         if !options.trace_candidates {
             report.candidates = None;
             report.rerank_outcome = None;
@@ -534,7 +601,8 @@ impl App {
         Ok(report)
     }
 
-    /// One search, with the trace `options` asks for.
+    /// One search, with the trace `options` asks for and the query-time
+    /// `settings` it runs with.
     async fn search_once(
         &self,
         path: &Path,
@@ -542,6 +610,7 @@ impl App {
         top_k: Option<usize>,
         filter_request: FilterRequest,
         options: SearchOptions,
+        settings: &SearchSettings,
     ) -> Result<SearchReport> {
         let total = Instant::now();
         ensure!(!query.trim().is_empty(), "query must not be empty");
@@ -565,6 +634,7 @@ impl App {
         let mut report = SearchReport {
             workspace,
             query: query.into(),
+            search_profile: settings.profile.clone(),
             candidate_count: 0,
             reranked: false,
             warning: resolution.warning,
@@ -587,9 +657,10 @@ impl App {
         }
         let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
         all_chunks.retain(|hit| hit_matches(&filters, hit));
-        // `[channels]` switches. A deliberately disabled channel is skipped
-        // outright: no work, a zero timing, and no "unavailable" warning.
-        let channels = self.config.channels;
+        // `[channels]` switches, as a search profile may override them. A
+        // deliberately disabled channel is skipped outright: no work, a zero
+        // timing, and no "unavailable" warning.
+        let channels = settings.channels;
         let mut applicable_adapters: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
         if channels.lsp {
             let indexed_languages: HashSet<&str> = all_chunks
@@ -856,14 +927,14 @@ impl App {
             let rows = trace_candidates(
                 &hits,
                 self.config.fusion.max_chunks_per_file,
-                self.config.rerank_candidate_count,
+                settings.rerank_candidate_count,
                 self.config.rerank_document_max_bytes,
             );
             trace_ms = ms(timer);
             rows
         });
         hits = cap_chunks_per_file(hits, self.config.fusion.max_chunks_per_file);
-        hits.truncate(self.config.rerank_candidate_count);
+        hits.truncate(settings.rerank_candidate_count);
         report.timings.fusion_ms = ms(fusion_timer) - trace_ms;
         report.candidate_count = hits.len();
         if !hits.is_empty() {
@@ -903,6 +974,7 @@ impl App {
             reranking_ms = report.timings.reranking_ms,
             total_ms = report.timings.total_ms,
             reranked = report.reranked,
+            search_profile = report.search_profile.as_deref(),
             "retrieval complete"
         );
         Ok(report)

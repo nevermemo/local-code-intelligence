@@ -1,6 +1,9 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 /// Controls when a search request may trigger an automatic incremental
 /// refresh of a workspace's index. `on-search` is the default for coding
@@ -80,6 +83,67 @@ impl Default for ChannelsConfig {
             reranker: true,
         }
     }
+}
+
+/// One named set of query-time overrides, `[search_profiles.<name>]`, so a
+/// single process can serve the default search and, next to it, a faster or a
+/// deeper one chosen per request.
+///
+/// A profile overrides only the switches below; every key it leaves out keeps
+/// the top-level value (`[channels]`, `rerank_candidate_count`). Nothing that
+/// changes the index, the embedding identity, fusion, the candidate depths of
+/// the channels, the per-file cap, or `rerank_document_max_bytes` can be
+/// overridden, so every profile reads the same index and differs only in
+/// which channels run and how many fused candidates the reranker orders. A
+/// search that names no profile uses the top-level values unchanged.
+///
+/// Like the top-level values, each profile must leave at least one of
+/// `semantic`, `lexical`, and `lsp` enabled and keep `rerank_candidate_count`
+/// in `1..=200`; validation checks the resolved settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchProfile {
+    /// Override of `[channels].semantic`.
+    pub semantic: Option<bool>,
+    /// Override of `[channels].lexical`.
+    pub lexical: Option<bool>,
+    /// Override of `[channels].lsp`.
+    pub lsp: Option<bool>,
+    /// Override of `[channels].reranker`.
+    pub reranker: Option<bool>,
+    /// Override of the top-level `rerank_candidate_count`.
+    pub rerank_candidate_count: Option<usize>,
+}
+
+/// The query-time settings one search runs with: the top-level values, or
+/// those with a [`SearchProfile`]'s overrides applied. Resolved by
+/// [`Config::search_settings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSettings {
+    /// The profile these settings came from; `None` for the top-level values.
+    pub profile: Option<String>,
+    /// Which retrieval channels and the reranker run.
+    pub channels: ChannelsConfig,
+    /// How many fused candidates the reranker orders (and a traced search
+    /// marks as shortlisted).
+    pub rerank_candidate_count: usize,
+}
+
+/// Longest accepted search profile name, in characters.
+pub const SEARCH_PROFILE_NAME_MAX_LEN: usize = 32;
+
+/// Whether `name` is usable as a search profile name: 1 to
+/// [`SEARCH_PROFILE_NAME_MAX_LEN`] ASCII letters, digits, `_` and `-`,
+/// starting with a letter or digit, so it can stand in a URL path segment
+/// unescaped. `default` is reserved for the unprofiled search.
+fn is_valid_search_profile_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name.len() <= SEARCH_PROFILE_NAME_MAX_LEN
+        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name != "default"
 }
 
 /// Per-channel weights for Reciprocal Rank Fusion.
@@ -253,6 +317,11 @@ pub struct Config {
     /// Per-channel Reciprocal Rank Fusion weights; all `1.0` (plain RRF) by
     /// default. Also `max_chunks_per_file` (default `2`; `0` is unlimited).
     pub fusion: FusionConfig,
+    /// Named query-time override sets, `[search_profiles.<name>]`, chosen per
+    /// request (see [`SearchProfile`]). None by default; a search that names
+    /// no profile ignores them all.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub search_profiles: BTreeMap<String, SearchProfile>,
 }
 
 /// Optional C# language-server (csharp-ls) configuration.
@@ -545,6 +614,7 @@ impl Default for Config {
             index: IndexConfig::default(),
             channels: ChannelsConfig::default(),
             fusion: FusionConfig::default(),
+            search_profiles: BTreeMap::new(),
         }
     }
 }
@@ -662,6 +732,22 @@ impl Config {
             self.channels.semantic || self.channels.lexical || self.channels.lsp,
             "channels: at least one of semantic, lexical, and lsp must be enabled; a search with no retrieval channel can return nothing"
         );
+        for (name, profile) in &self.search_profiles {
+            ensure!(
+                is_valid_search_profile_name(name),
+                "search_profiles.{name}: a profile name is 1 to {SEARCH_PROFILE_NAME_MAX_LEN} letters, digits, '_' or '-' starting with a letter or digit, and cannot be \"default\" (the unprofiled search)"
+            );
+            let resolved = self.resolve_search_profile(name, profile);
+            ensure!(
+                resolved.channels.semantic || resolved.channels.lexical || resolved.channels.lsp,
+                "search_profiles.{name}: at least one of semantic, lexical, and lsp must be enabled once the profile is applied to [channels]; a search with no retrieval channel can return nothing"
+            );
+            ensure!(
+                (1..=200).contains(&resolved.rerank_candidate_count),
+                "search_profiles.{name}: rerank_candidate_count must be 1..=200 (got {})",
+                resolved.rerank_candidate_count
+            );
+        }
         ensure!(
             (1..=40).contains(&self.default_top_k),
             "default_top_k must be 1..=40"
@@ -704,6 +790,54 @@ impl Config {
             "model names must be nonempty"
         );
         Ok(())
+    }
+
+    /// The query-time settings a search runs with when it names no profile:
+    /// `[channels]` and `rerank_candidate_count` as configured.
+    pub fn base_search_settings(&self) -> SearchSettings {
+        SearchSettings {
+            profile: None,
+            channels: self.channels,
+            rerank_candidate_count: self.rerank_candidate_count,
+        }
+    }
+
+    /// The query-time settings for `profile`: the top-level values with that
+    /// `[search_profiles.<name>]`'s overrides applied. `None` is the
+    /// unprofiled search ([`Self::base_search_settings`]). A name that is not
+    /// configured is an error listing the configured names, never a silent
+    /// fall back to the defaults.
+    pub fn search_settings(&self, profile: Option<&str>) -> Result<SearchSettings> {
+        let Some(name) = profile else {
+            return Ok(self.base_search_settings());
+        };
+        let Some(overrides) = self.search_profiles.get(name) else {
+            if self.search_profiles.is_empty() {
+                bail!("unknown search profile {name:?}; no search profiles are configured");
+            }
+            let configured: Vec<&str> = self.search_profiles.keys().map(String::as_str).collect();
+            bail!(
+                "unknown search profile {name:?}; configured: {}",
+                configured.join(", ")
+            );
+        };
+        Ok(self.resolve_search_profile(name, overrides))
+    }
+
+    /// `overrides` applied over the top-level settings, under `name`.
+    fn resolve_search_profile(&self, name: &str, overrides: &SearchProfile) -> SearchSettings {
+        SearchSettings {
+            profile: Some(name.to_owned()),
+            channels: ChannelsConfig {
+                semantic: overrides.semantic.unwrap_or(self.channels.semantic),
+                lexical: overrides.lexical.unwrap_or(self.channels.lexical),
+                lsp: overrides.lsp.unwrap_or(self.channels.lsp),
+                reranker: overrides.reranker.unwrap_or(self.channels.reranker),
+            },
+            rerank_candidate_count: overrides
+                .rerank_candidate_count
+                .unwrap_or(self.rerank_candidate_count),
+        }
     }
 
     /// What the stored vectors were computed with; an index whose identity
@@ -1150,6 +1284,281 @@ mod tests {
         // silently leaving the channel enabled.
         let toml_text = format!("{}[channels]\nsemantics = false\n", base_toml());
         assert!(toml::from_str::<Config>(&toml_text).is_err());
+    }
+
+    /// A configuration with `[search_profiles.fast]` and `[search_profiles.deep]`
+    /// next to a non-default top-level `rerank_candidate_count`.
+    fn profiled_toml() -> String {
+        format!(
+            "{}rerank_candidate_count = 10\n\
+             [search_profiles.fast]\nreranker = false\nrerank_candidate_count = 5\n\
+             [search_profiles.deep]\nlsp = false\nrerank_candidate_count = 40\n",
+            base_toml()
+        )
+    }
+
+    #[test]
+    fn no_search_profiles_are_configured_by_default_and_the_base_settings_are_the_top_level_ones() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(config.search_profiles.is_empty());
+        let absent: Config = toml::from_str(&base_toml()).unwrap();
+        absent.validate().unwrap();
+        assert!(absent.search_profiles.is_empty());
+
+        let base = SearchSettings {
+            profile: None,
+            channels: ChannelsConfig::default(),
+            rerank_candidate_count: 24,
+        };
+        assert_eq!(config.search_settings(None).unwrap(), base);
+        assert_eq!(config.base_search_settings(), base);
+        // No profile is configured, so naming one is an error, not a default.
+        let error = config.search_settings(Some("fast")).unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("unknown search profile \"fast\""), "{error}");
+        assert!(
+            error.contains("no search profiles are configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_search_profile_overrides_only_the_keys_it_names() {
+        let config: Config = toml::from_str(&profiled_toml()).unwrap();
+        config.validate().unwrap();
+
+        // The unprofiled search is untouched by the profiles.
+        let base = config.search_settings(None).unwrap();
+        assert_eq!(base.profile, None);
+        assert_eq!(base.channels, ChannelsConfig::default());
+        assert_eq!(base.rerank_candidate_count, 10);
+
+        // `fast` turns the reranker off and shrinks the window; the three
+        // retrieval channels inherit.
+        let fast = config.search_settings(Some("fast")).unwrap();
+        assert_eq!(fast.profile.as_deref(), Some("fast"));
+        assert_eq!(
+            fast.channels,
+            ChannelsConfig {
+                semantic: true,
+                lexical: true,
+                lsp: true,
+                reranker: false,
+            }
+        );
+        assert_eq!(fast.rerank_candidate_count, 5);
+
+        // `deep` turns the language servers off and widens the window; the
+        // reranker inherits.
+        let deep = config.search_settings(Some("deep")).unwrap();
+        assert_eq!(
+            deep.channels,
+            ChannelsConfig {
+                semantic: true,
+                lexical: true,
+                lsp: false,
+                reranker: true,
+            }
+        );
+        assert_eq!(deep.rerank_candidate_count, 40);
+
+        // An empty profile inherits everything but is still a named profile.
+        let empty: Config =
+            toml::from_str(&format!("{}[search_profiles.same]\n", base_toml())).unwrap();
+        empty.validate().unwrap();
+        let same = empty.search_settings(Some("same")).unwrap();
+        assert_eq!(same.profile.as_deref(), Some("same"));
+        assert_eq!(same.channels, empty.channels);
+        assert_eq!(same.rerank_candidate_count, empty.rerank_candidate_count);
+
+        // A profile inherits the top-level `[channels]`, so it can switch a
+        // channel the top level turned off back on.
+        let inheriting: Config = toml::from_str(&format!(
+            "{}[channels]\nlsp = false\nreranker = false\n\
+             [search_profiles.back]\nlsp = true\n\
+             [search_profiles.plain]\nrerank_candidate_count = 7\n",
+            base_toml()
+        ))
+        .unwrap();
+        inheriting.validate().unwrap();
+        let back = inheriting.search_settings(Some("back")).unwrap();
+        assert!(back.channels.lsp && !back.channels.reranker);
+        let plain = inheriting.search_settings(Some("plain")).unwrap();
+        assert!(!plain.channels.lsp && !plain.channels.reranker);
+        assert_eq!(plain.rerank_candidate_count, 7);
+    }
+
+    #[test]
+    fn an_unknown_search_profile_is_an_error_that_lists_the_configured_names() {
+        let config: Config = toml::from_str(&profiled_toml()).unwrap();
+        config.validate().unwrap();
+        let error = config.search_settings(Some("nope")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown search profile \"nope\"; configured: deep, fast"
+        );
+        // `default` is not a profile; neither is an empty or differently
+        // cased name.
+        for name in ["default", "", "Fast"] {
+            let error = config.search_settings(Some(name)).unwrap_err().to_string();
+            assert!(error.contains("unknown search profile"), "{name}: {error}");
+            assert!(error.contains("configured: deep, fast"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_search_profile_with_an_unknown_key_is_rejected() {
+        // `deny_unknown_fields` catches a misspelled switch, and keeps a
+        // profile from overriding anything but the query-time switches.
+        for key in [
+            "semantics = false",
+            "rerank_document_max_bytes = 1024",
+            "semantic_candidate_count = 10",
+            "max_chunks_per_file = 1",
+            "embedding_model = 'other'",
+            "data_dir = '/tmp/other'",
+        ] {
+            let toml_text = format!("{}[search_profiles.fast]\n{key}\n", base_toml());
+            assert!(
+                toml::from_str::<Config>(&toml_text).is_err(),
+                "{key} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn search_profile_names_are_restricted_to_url_safe_words_and_not_default() {
+        let accepted = [
+            "fast",
+            "Deep",
+            "a",
+            "7",
+            "grep-only",
+            "grep_only",
+            "a2-b_3",
+            &"x".repeat(SEARCH_PROFILE_NAME_MAX_LEN),
+        ];
+        for name in accepted {
+            let toml_text = format!("{}[search_profiles.{name}]\n", base_toml());
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} rejected: {error}"));
+        }
+        let rejected = [
+            "default".to_owned(),
+            "-fast".to_owned(),
+            "_fast".to_owned(),
+            "fa st".to_owned(),
+            "fast/deep".to_owned(),
+            "fast.deep".to_owned(),
+            "f\u{e9}".to_owned(),
+            "x".repeat(SEARCH_PROFILE_NAME_MAX_LEN + 1),
+            String::new(),
+        ];
+        for name in rejected {
+            let mut config = Config {
+                data_dir: std::env::temp_dir(),
+                ..Config::default()
+            };
+            config
+                .search_profiles
+                .insert(name.clone(), SearchProfile::default());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("search_profiles."), "{name:?}: {error}");
+            assert!(error.contains("profile name"), "{name:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_search_profile_that_leaves_no_retrieval_channel_is_rejected() {
+        // Off in the profile.
+        let toml_text = format!(
+            "{}[search_profiles.empty]\nsemantic = false\nlexical = false\nlsp = false\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("search_profiles.empty"), "{error}");
+        assert!(error.contains("semantic, lexical, and lsp"), "{error}");
+
+        // Off at the top level and left alone by the profile.
+        let toml_text = format!(
+            "{}[channels]\nsemantic = false\nlexical = false\n\
+             [search_profiles.blind]\nlsp = false\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("search_profiles.blind"), "{error}");
+
+        // One channel is enough, and the reranker alone is not a channel.
+        let toml_text = format!(
+            "{}[search_profiles.grep]\nsemantic = false\nlsp = false\nreranker = false\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        let toml_text = format!(
+            "{}[search_profiles.reranker_only]\nsemantic = false\nlexical = false\nlsp = false\nreranker = true\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_search_profile_rerank_candidate_count_must_be_within_one_to_two_hundred() {
+        for (count, valid) in [(0, false), (1, true), (200, true), (201, false)] {
+            let toml_text = format!(
+                "{}[search_profiles.window]\nrerank_candidate_count = {count}\n",
+                base_toml()
+            );
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            match config.validate() {
+                Ok(()) => assert!(valid, "{count} was accepted"),
+                Err(error) => {
+                    assert!(!valid, "{count} was rejected: {error}");
+                    let error = error.to_string();
+                    assert!(error.contains("search_profiles.window"), "{error}");
+                    assert!(error.contains("rerank_candidate_count"), "{error}");
+                }
+            }
+        }
+        // A negative count does not even parse as a `usize`.
+        let toml_text = format!(
+            "{}[search_profiles.window]\nrerank_candidate_count = -1\n",
+            base_toml()
+        );
+        assert!(toml::from_str::<Config>(&toml_text).is_err());
+    }
+
+    #[test]
+    fn search_profiles_round_trip_through_toml_and_stay_out_of_a_profileless_file() {
+        let config: Config = toml::from_str(&profiled_toml()).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[search_profiles.fast]"), "{text}");
+        assert!(text.contains("[search_profiles.deep]"), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.search_profiles, config.search_profiles);
+        assert_eq!(
+            reloaded.search_profiles["fast"],
+            SearchProfile {
+                reranker: Some(false),
+                rerank_candidate_count: Some(5),
+                ..SearchProfile::default()
+            }
+        );
+
+        // Without profiles the serialized configuration has no such table.
+        let plain = toml::to_string(&Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(!plain.contains("search_profiles"), "{plain}");
     }
 
     #[test]

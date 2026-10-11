@@ -150,6 +150,27 @@ lexical = true
 lsp = true
 reranker = true
 
+# Named query-time profiles, [search_profiles.<name>]: none are configured by
+# default, and a search that names none behaves exactly as it does without this
+# section. A profile overrides only semantic, lexical, lsp, reranker (the same
+# switches as [channels]) and rerank_candidate_count (1..=200); a key it leaves
+# out keeps the top-level value above. Nothing that changes the index, the
+# embedding identity, fusion, the candidate depths, the per-file cap, or
+# rerank_document_max_bytes can be set here (an unknown key is an error), so
+# every profile searches the same index. Each profile must keep at least one of
+# semantic, lexical, and lsp enabled. A name is 1 to 32 letters, digits, "_" or
+# "-" starting with a letter or digit, and "default" is reserved. Choose one
+# with `search --search-profile <name>` on the command line; an unknown name is
+# an error that lists the configured ones, never a silent fall back to the
+# defaults. The response and the candidate dump then carry search_profile.
+# Fusion order only, no rerank request:
+# [search_profiles.fast]
+# reranker = false
+# Rerank a wider shortlist and leave the language servers out:
+# [search_profiles.deep]
+# lsp = false
+# rerank_candidate_count = 48
+
 # Per-channel weights for Reciprocal Rank Fusion. A channel adds
 # weight / (rrf_k + rank) for each chunk it returns, and a chunk several
 # channels return sums those terms; the source-role prior is added afterwards
