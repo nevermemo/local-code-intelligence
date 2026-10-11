@@ -11,6 +11,9 @@ use std::{
 pub enum FakeScenario {
     Initialized,
     WorkspaceSymbols,
+    /// Answers every `workspace/symbol` request with an empty list: a healthy
+    /// server with no match (`--mode no-symbols`).
+    NoSymbols,
     Definition,
     References,
     UnsolicitedNotification,
@@ -81,6 +84,7 @@ pub fn run_from_env() -> io::Result<()> {
     let scenario = match mode.as_str() {
         "initialized" => FakeScenario::Initialized,
         "workspace-symbols" => FakeScenario::WorkspaceSymbols,
+        "no-symbols" => FakeScenario::NoSymbols,
         "definition" => FakeScenario::Definition,
         "references" => FakeScenario::References,
         "unsolicited" => FakeScenario::UnsolicitedNotification,
@@ -339,6 +343,11 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                                 ]),
                             ),
                         )?;
+                    }
+                }
+                (FakeScenario::NoSymbols, Some("workspace/symbol")) => {
+                    if let Some(id) = id {
+                        write_message(&mut stdout, &json_response(id, json!([])))?;
                     }
                 }
                 (FakeScenario::SlowWithProgress, Some("workspace/symbol")) => {

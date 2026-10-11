@@ -849,6 +849,118 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
     models_task.abort();
 }
 
+/// A workspace that mixes C# and TypeScript, so `App::symbols` asks both
+/// csharp-ls and typescript-language-server, each replaced by the fake server
+/// in the given mode (see `fake_lsp.rs`). Each fake records what it saw under
+/// its own directory of `state_dir`.
+fn with_fake_csharp_and_typescript_servers(
+    mut config: Config,
+    state_dir: &std::path::Path,
+    csharp_mode: &str,
+    typescript_mode: &str,
+) -> Config {
+    config.lsp_timeout_seconds = 5;
+    let args = |mode: &str, name: &str| {
+        vec![
+            "--mode".to_owned(),
+            mode.to_owned(),
+            "--state".to_owned(),
+            state_dir.join(name).to_string_lossy().into_owned(),
+            "--primary-file".to_owned(),
+            "src/Calculator.ts".to_owned(),
+        ]
+    };
+    config.csharp = CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: args(csharp_mode, "csharp"),
+        disabled: false,
+    };
+    config.typescript = TypeScriptLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: args(typescript_mode, "typescript"),
+        disabled: false,
+    };
+    config
+}
+
+fn write_csharp_and_typescript_workspace(root: &std::path::Path) {
+    write_csharp_workspace(root);
+    write(
+        root,
+        "src/Calculator.ts",
+        "export class Calculator {\n  add(a: number, b: number): number {\n    return a + b;\n  }\n}\n",
+    );
+}
+
+/// In a mixed-language workspace one server failing must not turn another
+/// server's correct empty answer into an error: csharp-ls exits (as it does
+/// for a stray C# file in a Rust repository) while the TypeScript server
+/// answers that nothing matches. The query is a correct "no match", so the
+/// call succeeds with no results. Both servers really ran: the C# one was
+/// started and failed, the TypeScript one was asked once.
+#[tokio::test]
+async fn symbols_return_an_empty_answer_when_another_applicable_server_failed() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    let app = App::open(with_fake_csharp_and_typescript_servers(
+        config,
+        &state,
+        "exit-during-request",
+        "no-symbols",
+    ))
+    .await
+    .unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .symbols(&workspace, "NoSuchSymbolAnywhere")
+        .await
+        .expect("one server answered, so the call must not fail");
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    // An exiting server is started once and retried once with a fresh session.
+    assert_eq!(
+        state_count(&state.join("csharp"), "spawn_count.txt"),
+        2,
+        "csharp-ls must have been started and failed, not skipped"
+    );
+    assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
+    models_task.abort();
+}
+
+/// When every applicable server fails there is no answer to return: the call
+/// is an error that names each failed provider.
+#[tokio::test]
+async fn symbols_fail_when_every_applicable_server_failed() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    let app = App::open(with_fake_csharp_and_typescript_servers(
+        config,
+        &state,
+        "exit-during-request",
+        "exit-during-request",
+    ))
+    .await
+    .unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let error = app
+        .symbols(&workspace, "Calculator")
+        .await
+        .expect_err("no server answered, so the call must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("all applicable language servers failed"),
+        "{message}"
+    );
+    assert!(message.contains("csharp-ls:"), "{message}");
+    assert!(message.contains("typescript-language-server:"), "{message}");
+    models_task.abort();
+}
+
 /// Service exit stops every language server within the bound the grace period
 /// gives it, even a server that answers neither `shutdown` nor `exit`, which
 /// is then killed.

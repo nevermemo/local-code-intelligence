@@ -85,13 +85,15 @@ impl App {
             }
         }
         let mut results = Vec::new();
-        let mut failures = Vec::new();
+        let mut failures: Vec<(&'static str, String)> = Vec::new();
         for adapter in applicable.values() {
             match self.analyzer.symbols(adapter, &workspace, query).await {
                 Ok(mut found) => results.append(&mut found),
-                Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
+                Err(error) => failures.push((adapter.provider(), format!("{error:#}"))),
             }
         }
+        // `applicable` is a map, so sort for a stable message and log order.
+        failures.sort();
         results.sort_by(|a, b| {
             a.relative_file_path
                 .cmp(&b.relative_file_path)
@@ -99,10 +101,26 @@ impl App {
                 .then(a.language.cmp(&b.language))
         });
         results.dedup();
-        if results.is_empty() && !failures.is_empty() {
+        // Only an answer from no server at all is an error. A server that
+        // answered with nothing is a correct "no match", even when another
+        // server of a mixed-language workspace failed (a stray C# file whose
+        // csharp-ls exits, a TypeScript server that finds no project).
+        if !applicable.is_empty() && failures.len() == applicable.len() {
+            let rendered: Vec<String> = failures
+                .iter()
+                .map(|(provider, error)| format!("{provider}: {error}"))
+                .collect();
             anyhow::bail!(
                 "all applicable language servers failed: {}",
-                failures.join("; ")
+                rendered.join("; ")
+            );
+        }
+        for (provider, error) in &failures {
+            tracing::warn!(
+                provider = *provider,
+                workspace = %workspace.path.display(),
+                error = %error,
+                "language server failed to answer workspace/symbol; the other servers' results are returned"
             );
         }
         Ok(NavigationReport { workspace, results })
