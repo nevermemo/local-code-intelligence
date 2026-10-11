@@ -448,7 +448,7 @@ fn glob_rejects_absolute_unix() {
 #[test]
 fn glob_rejects_absolute_windows() {
     assert!(matches!(
-        GlobPattern::compile("C:/Users/foo"),
+        GlobPattern::compile("C:/projects/foo"),
         Err(FilterError::AbsolutePath { .. })
     ));
 }

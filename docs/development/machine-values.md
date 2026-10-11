@@ -146,7 +146,66 @@ Committed files name machine values by role with the resolver in backticks:
 defaults live only in the local overlay, `.local/machine.toml`, the
 client's local settings, the agent's memory and the run checkpoint. Examples
 in committed text are generic placeholders (`<work_area>`, `D:/lci-work`),
-never a real machine's value.
+never a real machine's value. `cargo xtask lint-machine-paths` checks the
+rule (next section).
+
+## Lint
+
+`cargo xtask lint-machine-paths` fails when committed text names a machine
+value. It runs first in `cargo xtask test --suite Full`; its unit tests are
+`cargo test -p xtask lint::`.
+
+**What it scans.** Every tracked text file (`git ls-files`). It skips binary
+files and the vendored `.agents/skills/rust-skills/**`. Untracked and
+gitignored files, where machine values belong, are not scanned; a new file is
+checked once it is staged, so run the lint again after `git add`.
+
+**What it flags.** Each hit prints `file:line: <pattern name>` and the command
+exits 1. The built-in patterns are generic:
+
+| Pattern | Matches |
+| --- | --- |
+| drive-letter user profile path | a drive letter, a colon, a separator, the Users folder, a separator and a name; either kind of separator (an escaped, doubled backslash too), any case |
+| macOS user directory | `/Users/`, a name and a slash (exact case, so a web route in lower case is fine) |
+| Linux home directory | `/home/`, a name and a slash |
+| `AppData` path component | the word AppData as a path component, directly followed by a separator |
+| client session folder | a `Temp` component, a separator and the client's `claude` folder |
+
+A name starts with a letter or digit. A placeholder such as `<name>`,
+`%USERNAME%`, `$USER` or `{user}` is therefore not a hit, while a literal like
+`you` or `someone` is a name and is a hit. `%LOCALAPPDATA%` and
+`$env:LOCALAPPDATA` are variables, not paths, and are fine. A URL that happens
+to contain one of the patterns is a hit too; reword it.
+
+**Local patterns.** Owner-specific tokens (a user name, the name of a local
+folder) are not generic, and committing them would publish them. Put them, one
+literal per line, in `.local/lint-machine-paths.txt` at the repository root:
+
+```text
+# one literal per line; blank lines and lines starting with # are ignored
+your-user-name
+your-local-folder-name
+```
+
+`.local/` is gitignored, so the file stays on the machine. Each machine writes
+its own, and a linked worktree reads only its own `.local/`, not the main
+worktree's. A line matches anywhere in a line of text, ignoring case, so write a short
+token with its separators (`\name\`, `/name/`) when it could occur inside an ordinary word. A hit on
+a local pattern prints `local pattern (line N of .local/lint-machine-paths.txt)`
+and never the token. Without the file only the built-in patterns apply; a
+clean run ends with a line saying how many local patterns it read.
+
+**Fixing a hit.** Replace the value with its role and resolver from the table
+above, and keep everything else in the sentence (report names, commit hashes,
+numbers). A launch command or start script becomes "the reranker start script
+(kept in the owner's memory, never committed)". An example path becomes a
+placeholder in angle brackets (`<work_area>/plans`) or a path with no
+user-profile folder (`D:/lci-work`); a test fixture that needs an absolute path
+uses one of those too. In a quoted historical line, reword as little as
+possible. The lint has no allowlist: reword instead.
+
+The lint scans its own source and tests, so they never spell a pattern out;
+the matchers are code and the sample lines are assembled at run time.
 
 ## Live evaluation provenance
 

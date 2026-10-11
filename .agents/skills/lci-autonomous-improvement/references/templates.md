@@ -224,6 +224,7 @@ Background tasks: <id | purpose | what to do when it finishes>
 | port | what runs | started by (script or task id) | restore |
 
 ## Key paths
+Resolve with `lci config --json` / `cargo xtask env --json`; list only what they cannot give:
 <frozen binaries and trees (commit), scratch configs and data_dirs, plan files, evidence directories, the archive of the previous checkpoint>
 
 ## Open questions

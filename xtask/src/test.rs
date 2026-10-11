@@ -105,6 +105,8 @@ pub fn run(suite: Suite) -> Result<()> {
             invoke_focused(&["test", "--test", "integration", "navigation::"])
         }
         Suite::Full => {
+            println!("> cargo xtask lint-machine-paths");
+            crate::lint::run()?;
             invoke(&["fmt", "--all", "--", "--check"])?;
             invoke(&["test", "--workspace"])?;
             invoke(&[

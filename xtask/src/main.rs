@@ -1,6 +1,7 @@
 mod acceptance;
 mod build;
 mod env;
+mod lint;
 mod live_acceptance;
 mod mine;
 mod setup;
@@ -57,6 +58,12 @@ enum Command {
     /// defaults < .local/machine.toml < LCI_DEV_<KEY>. See
     /// docs/development/machine-values.md.
     Env(env::EnvArgs),
+    /// Fail when a tracked text file names a machine-specific location (a
+    /// user profile path, an AppData folder, a client session folder, or a
+    /// literal from the gitignored .local/lint-machine-paths.txt). Prints
+    /// file:line for each hit. Also part of `test --suite Full`. See
+    /// docs/development/machine-values.md, "Lint".
+    LintMachinePaths,
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
@@ -241,6 +248,7 @@ async fn main() -> Result<()> {
         },
         Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
         Command::Env(args) => env::run(args),
+        Command::LintMachinePaths => lint::run(),
         Command::MineQueries {
             repo,
             key,

@@ -43,6 +43,7 @@ check instead of another narrow invocation.
 | Evaluation definitions or metrics | `cargo xtask test --suite Evaluation` |
 | Mined-query generator (`xtask/src/mine.rs`) | `cargo test -p xtask mine::` (xtask is a binary crate, so the `--lib` unit suites do not run it); `--suite Evaluation` also checks the checked-in mined set |
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
+| Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |
 | Index lifecycle or persistence | `cargo xtask test --suite Indexing` |
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
@@ -56,7 +57,7 @@ they share `--suite Full`'s feature resolution and build cache. Every focused
 suite counts the tests it executed and fails when its filter matched none, so
 a renamed or moved module can't make a suite pass vacuously.
 
-`cargo xtask test --suite Full` runs formatting, all workspace tests, and Clippy.
+`cargo xtask test --suite Full` runs the machine-value lint, formatting, all workspace tests, and Clippy.
 Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
 it depends on locally running services. Generated reports belong under
 `test-results` and are never committed.
