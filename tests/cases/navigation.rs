@@ -219,6 +219,15 @@ fn state_count(state: &std::path::Path, name: &str) -> u64 {
         .unwrap()
 }
 
+/// `state_count` for a poll that may run before the fake server has written
+/// the file (or while it is half written): 0 until there is a whole number.
+fn state_count_so_far(state: &std::path::Path, name: &str) -> u64 {
+    std::fs::read_to_string(state.join(name))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
     for (mode, operation) in [
@@ -466,19 +475,22 @@ async fn an_abandoned_request_leaves_the_session_usable() {
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
-    // Stop waiting 300 ms after the server is up (and primed), i.e. while the
-    // slow request is in flight. The call is dropped at the end of the block.
+    // Stop waiting once the server has read the slow request, i.e. while it is
+    // in flight: the fourth frame after initialize, initialized and the
+    // priming request. `running` is true as soon as the server is up, before
+    // priming settles, so on a slow machine a fixed wait after it can end
+    // before the request has even been sent. The call is dropped at the end
+    // of the block.
     let finished = {
         let call = manager.symbols(&adapter, &workspace, "Calculator");
         tokio::pin!(call);
         tokio::select! {
             result = &mut call => Some(result),
-            () = async {
-                while !manager.running("csharp-ls", &workspace.id).await {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            } => None,
+            () = wait_until(
+                "the slow request to reach the server",
+                Duration::from_secs(30),
+                async || state_count_so_far(&state, "request_count.txt") >= 4,
+            ) => None,
         }
     };
     assert!(finished.is_none(), "the slow request must outlast the wait");
