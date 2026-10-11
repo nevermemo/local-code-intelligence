@@ -191,12 +191,12 @@ reviewer decisions, applied in each item):
 
 Mark an item `in-progress (<date>)` in its table row when a slice starts; list in-flight or next-queued slices here; remove an entry here when its slice is committed. Keep this block to 10 lines: the compaction hook prints the first 15 lines of this section.
 
-**Now** (2026-10-11, code as of `38d6d18`):
-- I-10 agent A/B: pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (v2.1, amendments A1-A21 inside it; untracked). Harness, run workflows and the Java/C# sandbox are built; frozen 2026-10-11 at `8d8a0fd`; next: the frozen server, index-reuse proof, canary re-run, binary freeze, dry runs, pilot, SC2, full pass. 8766 serves the 0.6B embedder (swapped 2026-10-11 for the A/B's indexing; restore the 4B afterwards).
-- A/B plumbing in LCI is complete: AB-1, N3a, N3b, A6a, A6b (plans in the coordinator's work area (`cargo xtask env work_area`) outside the repository); M7 done; SC1 done (GO WITH FIXES, fixes in the harness and the pre-registration A23-A24); the A/B binary is frozen (release build of `8d8a0fd`, configuration provenance checked with `lci config`); next the frozen server, the canary re-run, dry runs and the pilot.
-- A7 portable configuration (owner request 2026-10-11; P2 table): A7a-A7e and SC6 done; SC6's two fixes landed (pre-build rule in `machine-values.md`, role-relative `--init` comments), and an uncommented `<work_area>` placeholder in `.local/machine.toml` is now an error. Plan: `portable-config-plan.md` in the coordinator's plans directory.
-- R1b: windows 14/16 live confirm (pre-registered in R1), deferred until the 4B embedder is back on 8766 after the A/B.
-- Housekeeping: the audit's own actions A1-A9 are done (`HOUSEKEEPING-AUDIT.md`, `HOUSEKEEPING-SANITY.md`, untracked); its batches B (after the A/B freeze) and C (owner decisions, recorded) remain; the roadmap split waits for the next renewal.
+**Now** (2026-10-11 evening, code as of `05780cf`):
+- I-10 agent A/B: pilot done; amendment A34 declared the A32 uptake gate NO-GO (no LCI calls in the LCI arms), so the full pass does not start under the `8d8a0fd` freeze. Pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (A1-A34, untracked).
+- U1 uptake study (owner chose 2026-10-11 "measure on typical tasks"): a seeded draw of 10 ordinary tasks, arms A / D / D-cue / D-forced plus a no-tools covariate; does LCI save calls and tokens when used, and does a one-line prompt get it used? Pre-registration `research_notes/grand-vision/ab/U1-PREREGISTRATION.md` (R2, untracked) is in its second cross-family review; then the harness slice, a new freeze from `05780cf` and the owner's run approvals.
+- N10 (default log filter adds `lci_core`) and N13 are implemented on side branches; N10 is in its gate and review. N13 changes navigation output, so it lands only after the U1 freeze.
+- R1b: windows 14/16 live confirm, deferred until the 4B embedder is back on 8766 after the A/B (8766 serves the 0.6B for the A/B indexing).
+- Housekeeping: batches B (after the A/B freeze) and C (owner decisions, recorded) remain; the roadmap split waits for the next renewal.
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
