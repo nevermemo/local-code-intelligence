@@ -3,6 +3,7 @@ use super::*;
 #[tokio::test]
 async fn watcher_debounces_and_refreshes_changed_typescript_source() {
     let (temp, mut config, _fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Watch;
     config.watch_poll_milliseconds = 50;
     config.watch_debounce_milliseconds = 50;
     let workspace = temp.path().join("watched");
