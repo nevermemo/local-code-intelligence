@@ -91,12 +91,12 @@ const SELF_PROFILE: LspProfile = LspProfile {
     expect_symbol_name: "openapi_document",
     declaration_file: "src/rest.rs",
     declaration: Anchor::Located {
-        line_needle: "fn openapi_document() -> Value {",
+        line_needle: "fn openapi_document(port: u16) -> Value {",
         symbol: "openapi_document",
     },
     call_site_file: "src/rest.rs",
     call_site: Anchor::Located {
-        line_needle: "\"/openapi.json\"",
+        line_needle: "Json(openapi_document(",
         symbol: "openapi_document",
     },
     // The declaration plus the one router wiring that calls it.

@@ -3028,13 +3028,9 @@ async fn run_search_cli(config_path: &Path, args: Vec<String>) -> std::process::
     // The fake model service runs on this runtime, so the command must not
     // block it.
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"))
-            .arg("--config")
-            .arg(config_path)
-            .args(args)
-            .env_remove("LCI_CANDIDATE_DUMP")
-            .output()
-            .unwrap()
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command.arg("--config").arg(config_path).args(args);
+        strip_lci_env(&mut command).output().unwrap()
     })
     .await
     .unwrap()

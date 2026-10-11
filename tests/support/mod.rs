@@ -217,3 +217,30 @@ fn write(root: &Path, name: &str, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
+
+/// Removes every `LCI_*` variable the test process has from the environment
+/// `command` will spawn with, so what a developer's own shell exports
+/// (`LCI_CONFIG`, `LCI_PORT`, `LCI_DATA_DIR`, `LCI_CANDIDATE_DUMP`, any
+/// future one) cannot change a CLI result. Call it before setting any
+/// variable the test itself needs. Names are compared case-insensitively
+/// because Windows treats them so.
+fn strip_lci_env(command: &mut std::process::Command) -> &mut std::process::Command {
+    strip_lci_env_named(command, std::env::vars_os().map(|(name, _)| name))
+}
+
+/// [`strip_lci_env`] over an explicit list of variable names.
+fn strip_lci_env_named(
+    command: &mut std::process::Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> &mut std::process::Command {
+    for name in names {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("LCI_")
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}

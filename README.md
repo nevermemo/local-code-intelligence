@@ -54,6 +54,8 @@ The executable serves:
 - Health: `http://127.0.0.1:8768/health`
 - Readiness: `http://127.0.0.1:8768/ready`
 
+Those URLs use the default port. With another `port` (configuration file, local overlay or `LCI_PORT`), `lci config` prints the URLs for the port in effect (see Configuration); a one-off `serve --port` override is not visible to it.
+
 Smoke test from another terminal:
 
 ```bash
@@ -64,7 +66,16 @@ The server binds only to loopback. Its MCP transport uses the official `rmcp` SD
 
 ## Configuration
 
-Defaults work with the services specified for this project. Copy `config.example.toml` to `config.toml` to override them, then pass `--config config.toml` before or after a subcommand. Configuration files are read only when explicitly supplied. Unknown fields are errors.
+Defaults work with the services specified for this project. Copy `config.example.toml` to `config.toml` to override them, then pass `--config config.toml` before or after a subcommand (or set `LCI_CONFIG` to its path). A configuration file is read only when named this way; the one other file consulted is the local overlay described below. Unknown fields are errors.
+
+Values resolve in layers, lowest to highest: the built-in default, the configuration file, one local overlay file, `LCI_<KEY>` environment variables, and command-line flags (`serve --port`). Resolution is per key: an overlay that sets `data_dir` leaves the file's `embedding_url` alone, and a setting no layer sets keeps its default. Without an overlay file and without `LCI_*` variables the result is exactly the file's values over the defaults.
+
+The configuration file describes behaviour and is the one to share. Only machine-specific settings may come from the overlay or the environment: `data_dir`, `port`, `embedding_url`, `embedding_model`, `reranker_url`, `reranker_model`, `ripgrep_path`, `rust_analyzer_path`, and, for each language-server section (`csharp`, `typescript`, `python`, `go`, `java`, `clangd`), `path`, `args` and `disabled`. Any other key in the overlay (a candidate count, a template, a timeout, `[channels]`, `[fusion]`, `[index]`, `[search_profiles]`) is an error that names the key and says it belongs in the configuration file, so a local file can never change ranking. Changing `embedding_url` or `embedding_model` this way changes the embedding identity, so indexes built with the old values are re-embedded; `lci config` prints the identity.
+
+- Overlay file: `<stem>.local.toml` beside the configuration file in use (`config.local.toml` for `config.toml`, `lab.local.toml` for `lab.toml`). With no configuration file it is the per-user file `local-code-intelligence/config.local.toml` under the platform's configuration directory (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux). `LCI_LOCAL_CONFIG=<path>` names a different file, and `--no-local-config` ignores it. A missing overlay is not an error, and nothing creates it. It holds this machine's paths: keep it out of version control.
+- Environment: `LCI_DATA_DIR`, `LCI_PORT`, `LCI_EMBEDDING_URL`, `LCI_EMBEDDING_MODEL`, `LCI_RERANKER_URL`, `LCI_RERANKER_MODEL`, `LCI_RIPGREP_PATH`, `LCI_RUST_ANALYZER_PATH`, and `LCI_<LANG>_PATH` / `LCI_<LANG>_DISABLED` (`true`, `false`, `1` or `0`) for `LANG` in `CSHARP`, `TYPESCRIPT`, `PYTHON`, `GO`, `JAVA`, `CLANGD`; `args` can be set only in a file. An empty variable counts as unset, and a malformed one is an error naming it. `LCI_CONFIG` and `LCI_LOCAL_CONFIG` name the two files; `--config` wins over `LCI_CONFIG`. `LCI_CANDIDATE_DUMP` is process-level behaviour, not configuration (see Direct CLI).
+- Values are taken exactly as written: there is no `~` or `${VAR}` expansion, and `data_dir` must be absolute.
+- `lci config [--json]` resolves all of this and prints every value with the layer it came from, the files it consulted, and the URLs derived from the port, without creating the data directory, opening the index, sending a request or starting a language server. Values are printed as configured, including any credentials in a URL, so treat the output as local. See Direct CLI.
 
 | Setting | Default |
 | --- | --- |
@@ -73,6 +84,7 @@ Defaults work with the services specified for this project. Copy `config.example
 | `reranker_url` | `http://localhost:8767/rerank` |
 | `reranker_model` | `qwen3-reranker-4b` |
 | `data_dir` | OS-native local data dir + `local-code-intelligence`: `%LOCALAPPDATA%\local-code-intelligence` (Windows), `~/Library/Application Support/local-code-intelligence` (macOS), `$XDG_DATA_HOME` or `~/.local/share/local-code-intelligence` (Linux) |
+| `port` | 8768 (the loopback port `serve` binds; 8765, 8766 and 8767 are rejected because other services use them; `serve --port` overrides it) |
 | `default_top_k` | 8 (allowed: 1–40) |
 | `embedding_batch_size` | 8 |
 | `embedding_query_template` | `Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}` (must contain `{query}`; shapes the query only, so changing it never re-embeds an index; e.g. EmbeddingGemma 2 wants `task: code retrieval \| query: {query}`) |
@@ -221,13 +233,22 @@ repo=$PWD                                    # this repository: the walkthrough 
 "$lci" list-files "$repo"
 "$lci" search "$repo" 'plain REST JSON-over-HTTP mirror of the MCP tools'
 "$lci" symbols "$repo" 'openapi_document#'
-"$lci" definition "$repo" 'src/rest.rs' 230 52
-"$lci" references "$repo" 'src/rest.rs' 144 3 --include-declaration
+"$lci" definition "$repo" 'src/rest.rs' 264 64
+"$lci" references "$repo" 'src/rest.rs' 160 3 --include-declaration
 "$lci" references "$repo" 'lci-core/src/workspace.rs' 17 11 --include-declaration
 "$lci" index "$repo"
 ```
 
-Everything above runs against this repository, so the walkthrough needs nothing but a clone, a build, and the embedding/reranking services. `search` returns `openapi_document` in `src/rest.rs` as its top hit -- the function that builds the document served at `/openapi.json`. `definition` starts from the router wiring on the last line of `src/rest.rs` and resolves to that function's declaration; the first `references` call starts from the declaration and returns both it and the wiring. The second `references` call starts from `Workspace::resolve` in `lci-core/src/workspace.rs` and crosses crates: its callers live in `src/app/` and `tests/cases/`. Lines are one-based and characters are zero-based UTF-16, as in every navigation call; the numbers above are this repository's own, so if a file has shifted since, `grep -n openapi_document src/rest.rs` gives the current ones. The second indexing pass should report zero new embeddings if source and model configuration are unchanged. `cargo xtask acceptance core` runs this same index/search/repeat-index flow against this repository and checks that production implementation chunks dominate the top eight results, including `openapi_document`. Pointing any of these at another repository is just a different first argument -- the optional GUST example under retrieval evaluation below shows one.
+Everything above runs against this repository, so the walkthrough needs nothing but a clone, a build, and the embedding/reranking services. `search` returns `openapi_document` in `src/rest.rs` as its top hit -- the function that builds the document served at `/openapi.json`. `definition` starts from the call in the `/openapi.json` route at the end of `src/rest.rs` and resolves to that function's declaration; the first `references` call starts from the declaration and returns both it and the wiring. The second `references` call starts from `Workspace::resolve` in `lci-core/src/workspace.rs` and crosses crates: its callers live in `src/app/` and `tests/cases/`. Lines are one-based and characters are zero-based UTF-16, as in every navigation call; the numbers above are this repository's own, so if a file has shifted since, `grep -n openapi_document src/rest.rs` gives the current ones. The second indexing pass should report zero new embeddings if source and model configuration are unchanged. `cargo xtask acceptance core` runs this same index/search/repeat-index flow against this repository and checks that production implementation chunks dominate the top eight results, including `openapi_document`. Pointing any of these at another repository is just a different first argument -- the optional GUST example under retrieval evaluation below shows one.
+
+`config` shows how the configuration resolves (see Configuration) without opening the application:
+
+```bash
+"$lci" --config config.toml config          # layers, machine settings with their sources, derived URLs, other settings
+"$lci" --config config.toml config --json   # the same as one JSON object
+```
+
+`--json` prints one object on stdout: `valid` and `error`; `layers` (`file` with `path` and `named_by`, `--config` or `LCI_CONFIG`; `local` with `path`, `state` of `present`, `absent` or `disabled`, and `named_by`; `env`, the machine-set variables that were set; `flags`); `values`, every setting keyed by its dotted name (`port`, `typescript.path`, `index.freshness`; the `[search_profiles.<name>]` tables are one entry, `search_profiles`, present when profiles are configured) with `value`, `source` (`default`, `file`, `local`, `env` or `flag`) and `from` (the file, variable or flag); `config`, the whole resolved configuration; `derived` (`mcp_url`, `mcp_profile_urls`, `rest_base`, `health_url`, `ready_url`, `openapi_url`, `embedding_identity`); and `environment.other` (whether `LCI_CANDIDATE_DUMP` is set). The exit status is 0 for a valid configuration, 2 for one that resolves but fails validation (for example a reserved `port`; the report is still printed, with `valid` false), and 1 when a layer cannot be read or parsed (a missing file, a key outside the machine set in the overlay, a malformed `LCI_*` value; only `valid` and `error` are printed with `--json`).
 
 Search accepts repeatable `--language`, `--include-path`, `--exclude-path`, and `--source-role` filters. Path filters are case-sensitive repository-relative globs: `*` and `?` stay within one path component, while `**` crosses directories. Absolute paths, backslashes, traversal components, empty patterns, and malformed globs are rejected. An explicitly empty include list is a valid filter that returns no results. Requested filters are applied to every retrieval channel and reported back as effective filters; no result may bypass them.
 

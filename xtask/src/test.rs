@@ -18,6 +18,7 @@ pub enum Suite {
     Unit,
     Chunk,
     Filter,
+    Config,
     Evaluation,
     Indexing,
     Readiness,
@@ -86,6 +87,10 @@ pub fn run(suite: Suite) -> Result<()> {
         Suite::Unit => invoke_focused(&["test", "--workspace", "--lib"]),
         Suite::Chunk => invoke_focused(&["test", "--workspace", "--lib", "chunk::"]),
         Suite::Filter => invoke_focused(&["test", "--workspace", "--lib", "filter::"]),
+        Suite::Config => {
+            invoke_focused(&["test", "--workspace", "--lib", "config::"])?;
+            invoke_focused(&["test", "--test", "integration", "config::"])
+        }
         Suite::Evaluation => {
             invoke_focused(&["test", "--workspace", "--lib", "evaluate::"])?;
             invoke_focused(&["test", "--test", "integration", "evaluation::"])

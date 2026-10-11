@@ -31,6 +31,7 @@ change that stays inside `lci-core` can be checked in seconds with
   on port 8767.
 - `lexical` and `lsp` are independent, fail-open retrieval channels.
 - `filter` validates retrieval controls and classifies source roles.
+- `config` loads and validates settings; `config::layers` (in `lci-core`) resolves them as default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints the result with each value's source.
 - `evaluate` measures retrieval behavior without influencing ranking.
 - `server` and `main` expose the MCP, REST/OpenAPI, and command-line interfaces; `rest` mirrors the MCP tools as plain JSON-over-HTTP on the same process and port.
 

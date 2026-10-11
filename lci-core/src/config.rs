@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod layers;
+
 /// Controls when a search request may trigger an automatic incremental
 /// refresh of a workspace's index. `on-search` is the default for coding
 /// agents: freshness is checked lazily on the first retrieval that needs it,
@@ -219,6 +221,14 @@ impl Default for FusionConfig {
     }
 }
 
+/// Default for [`Config::port`]: the loopback port the service listens on.
+pub const DEFAULT_PORT: u16 = 8768;
+
+/// Ports that belong to other services and that LCI itself never listens on:
+/// 8765 is the external generation model, 8766 the embedding service, 8767
+/// the reranker. [`Config::validate`] rejects them as [`Config::port`].
+pub const RESERVED_PORTS: std::ops::RangeInclusive<u16> = 8765..=8767;
+
 /// Default for [`Config::embedding_query_template`]: the instruction
 /// Qwen3-Embedding is trained with, then the query. It is
 /// `models::QUERY_INSTRUCTION` followed by `{query}` (a test pins that), so the
@@ -236,6 +246,10 @@ pub struct Config {
     pub reranker_url: String,
     pub reranker_model: String,
     pub data_dir: PathBuf,
+    /// Loopback port `serve` binds (`127.0.0.1:<port>`) and the one the URLs
+    /// `lci config` derives name. `serve --port` overrides it. Never one of
+    /// [`RESERVED_PORTS`].
+    pub port: u16,
     pub default_top_k: usize,
     pub embedding_batch_size: usize,
     /// Text embedded for a search query, with `{query}` replaced by the query
@@ -585,6 +599,7 @@ impl Default for Config {
             reranker_url: "http://localhost:8767/rerank".into(),
             reranker_model: "qwen3-reranker-4b".into(),
             data_dir: base.join("local-code-intelligence"),
+            port: DEFAULT_PORT,
             default_top_k: 8,
             embedding_batch_size: 8,
             embedding_query_template: DEFAULT_EMBEDDING_QUERY_TEMPLATE.into(),
@@ -633,6 +648,11 @@ impl Config {
         ensure!(
             self.data_dir.is_absolute(),
             "data_dir must be absolute; set it explicitly if the platform's local data directory is unavailable"
+        );
+        ensure!(
+            !RESERVED_PORTS.contains(&self.port),
+            "port {} is reserved for another service (8765 generation model, 8766 embedding service, 8767 reranker); choose another port",
+            self.port
         );
         ensure!(
             (1..=200).contains(&self.semantic_candidate_count)
@@ -1170,6 +1190,52 @@ mod tests {
         let config: Config = toml::from_str(&toml_text).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("clangd.path"));
+    }
+
+    #[test]
+    fn port_defaults_to_8768_loads_from_a_file_and_round_trips() {
+        assert_eq!(Config::default().port, DEFAULT_PORT);
+        assert_eq!(DEFAULT_PORT, 8768);
+        // A file without the key keeps the default.
+        let absent: Config = toml::from_str(&base_toml()).unwrap();
+        absent.validate().unwrap();
+        assert_eq!(absent.port, 8768);
+
+        let configured: Config = toml::from_str(&format!("{}port = 9100\n", base_toml())).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.port, 9100);
+        let text = toml::to_string(&configured).unwrap();
+        assert!(text.contains("port = 9100"), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.port, 9100);
+    }
+
+    #[test]
+    fn the_ports_of_the_other_services_are_rejected_as_the_listening_port() {
+        for port in [8765, 8766, 8767] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                port,
+                ..Config::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(&port.to_string()), "{error}");
+            assert!(error.contains("reserved"), "{error}");
+            let from_file: Config =
+                toml::from_str(&format!("{}port = {port}\n", base_toml())).unwrap();
+            assert!(from_file.validate().is_err(), "{port}");
+        }
+        for port in [1, 8764, 8768, 8769, 65_535] {
+            let config = Config {
+                data_dir: std::env::temp_dir(),
+                port,
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
+        // The key is a port number, so a value outside u16 does not load.
+        assert!(toml::from_str::<Config>(&format!("{}port = 70000\n", base_toml())).is_err());
     }
 
     #[test]

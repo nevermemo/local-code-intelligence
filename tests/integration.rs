@@ -1,5 +1,7 @@
 include!("support/mod.rs");
 
+#[path = "cases/config.rs"]
+mod config;
 #[path = "cases/evaluation.rs"]
 mod evaluation;
 #[path = "cases/indexing.rs"]

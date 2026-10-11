@@ -117,7 +117,7 @@ another agent's report never grants it.
     degrades with `data_dir_path_length` above the limit.
 - Build and test. `cargo check -p lci-core` and
   `cargo test -p lci-core --lib <module>::` cover pure-logic changes in
-  seconds. `cargo xtask test --suite <Unit|Chunk|Filter|Evaluation|Indexing|Readiness|Mcp|Watching|Lsp|Full>`
+  seconds. `cargo xtask test --suite <Unit|Chunk|Filter|Config|Evaluation|Indexing|Readiness|Mcp|Watching|Lsp|Full>`
   runs a focused suite; unit suites run `--workspace --lib` and fail when a
   filter matches zero tests. `cargo xtask test --suite Full` (fmt check,
   workspace tests, clippy `-D warnings`) runs once per completed slice.

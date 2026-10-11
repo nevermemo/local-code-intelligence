@@ -154,7 +154,10 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 /// endpoint returns, since committing a second, hand-maintained copy of
 /// those result schemas here would just be one more place for them to go
 /// stale.
-fn openapi_document() -> Value {
+///
+/// `servers` names the loopback port the service is configured to listen on
+/// (`Config::port`), so the document is right for any port, not only 8768.
+fn openapi_document(port: u16) -> Value {
     let workspace_schema = serde_json::to_value(schema_for!(WorkspaceArgs)).unwrap();
     let search_schema = serde_json::to_value(schema_for!(SearchArgs)).unwrap();
     let symbol_schema = serde_json::to_value(schema_for!(SymbolArgs)).unwrap();
@@ -217,7 +220,7 @@ fn openapi_document() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Plain JSON-over-HTTP mirror of LCI's MCP tools, for clients that don't speak MCP. Every endpoint below wraps exactly the same application logic as the matching MCP tool of the same name -- see README.md for full semantics; this document only describes the wire shape."
         },
-        "servers": [{"url": "http://127.0.0.1:8768"}],
+        "servers": [{"url": format!("http://127.0.0.1:{port}")}],
         "paths": {
             "/v1/index_workspace": post_operation("Index a workspace", "index_workspace", workspace_schema.clone()),
             "/v1/index_status": post_operation("Read persistent index status", "index_status", workspace_schema.clone()),
@@ -256,5 +259,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/v1/find_references", post(find_references))
         .route("/v1/search_code", post(search_code))
         .route("/v1/service_status", get(service_status))
-        .route("/openapi.json", get(|| async { Json(openapi_document()) }))
+        .route(
+            "/openapi.json",
+            get(|State(app): State<Arc<App>>| async move { Json(openapi_document(app.config.port)) }),
+        )
 }

@@ -1,3 +1,11 @@
+# This file describes behaviour. Machine-specific values -- data_dir, port, the
+# model URLs and names, ripgrep_path, rust_analyzer_path and the language-server
+# sections below -- can also be set per machine, outside this file, so it can
+# be shared unchanged: in a local overlay file beside it (config.local.toml for
+# config.toml; the same keys, nothing else) or in LCI_* environment variables
+# (LCI_DATA_DIR, LCI_PORT, ...). Both win over this file; the environment wins
+# over the overlay. `lci config` prints every resolved value with the layer it
+# came from. Details: the Configuration section of the README.
 embedding_url = "http://localhost:8766/v1"
 embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
@@ -5,9 +13,14 @@ reranker_model = "qwen3-reranker-4b"
 default_top_k = 8
 # Defaults to the OS-native local data directory joined with
 # "local-code-intelligence": %LOCALAPPDATA% on Windows, ~/Library/Application
-# Support on macOS, $XDG_DATA_HOME or ~/.local/share on Linux.
-# Must be outside every workspace you index.
-# data_dir = 'C:\Users\you\AppData\Local\local-code-intelligence'
+# Support on macOS, $XDG_DATA_HOME or ~/.local/share on Linux, which is
+# usually right. Must be absolute and outside every workspace you index. To
+# place it for this machine only, set data_dir in the local overlay or
+# LCI_DATA_DIR instead of here.
+# data_dir = '/absolute/path/outside/every/indexed/workspace'
+# Loopback port `serve` binds (127.0.0.1). 8765, 8766 and 8767 belong to other
+# services and are rejected. `serve --port` overrides it.
+port = 8768
 embedding_batch_size = 8
 # Prompt formats for the embedding model. Models differ in what they expect (an
 # instruction prefix, a task label), so the text embedded for a query and for an

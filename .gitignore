@@ -2,3 +2,5 @@
 /config.toml
 /test-results/
 /.tools/
+# Local overlay files hold machine values and never belong in the public repository.
+*.local.toml

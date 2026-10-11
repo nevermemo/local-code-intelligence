@@ -1052,9 +1052,10 @@ async fn concurrent_searches_append_one_whole_line_each() {
     task.abort();
 }
 
-/// Runs the command-line binary in `cwd`; the real `LCI_CANDIDATE_DUMP` is
-/// set on the child to `dump`, or removed from it when `None`, so what the
-/// developer's own shell exports cannot change the result.
+/// Runs the command-line binary in `cwd`; every `LCI_*` variable is removed
+/// from the child and `LCI_CANDIDATE_DUMP` is then set to `dump` when it is
+/// `Some`, so what the developer's own shell exports cannot change the
+/// result.
 async fn run_cli(
     config_path: &Path,
     cwd: &Path,
@@ -1070,8 +1071,8 @@ async fn run_cli(
             .current_dir(cwd)
             .arg("--config")
             .arg(config_path)
-            .args(args)
-            .env_remove("LCI_CANDIDATE_DUMP");
+            .args(args);
+        strip_lci_env(&mut command);
         if let Some(path) = dump {
             command.env("LCI_CANDIDATE_DUMP", path);
         }
