@@ -417,6 +417,21 @@ fn head_within(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+/// Whether a path the lexical channel reports is still absolute, that is,
+/// `lexical::search` could not make it relative to the workspace root: it
+/// starts with a separator (a Unix path, a `\\server\share` UNC path, or a
+/// `\\?\` verbatim path, which `dunce` keeps for a path it cannot simplify)
+/// or with a drive (`C:\` or `C:/`). `\` and `/` are alike. Deliberately not
+/// `Path::is_absolute`, which depends on the platform running the search.
+fn is_absolute_reported(path: &str) -> bool {
+    let separator = |byte: u8| byte == b'/' || byte == b'\\';
+    match path.as_bytes() {
+        [first, ..] if separator(*first) => true,
+        [drive, b':', third, ..] => drive.is_ascii_alphabetic() && separator(*third),
+        _ => false,
+    }
+}
+
 fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
     filters.matches(
         &hit.chunk.language,
@@ -1098,10 +1113,20 @@ impl App {
     /// over `all_chunks`. Chunks that match only terms too common to score
     /// are not candidates.
     ///
-    /// A reported path selects its candidate chunks once (every chunk whose
-    /// file path equals it, or is a `/`-delimited suffix of it, compared
-    /// case-insensitively); each line then takes the first candidate, in
-    /// `all_chunks` order, whose line range holds it.
+    /// A reported path selects its candidate chunks once, comparing paths
+    /// case-insensitively: the chunks of the indexed file whose path equals
+    /// it. Only when no indexed path equals it and the reported path is
+    /// still absolute (see `is_absolute_reported`: ripgrep's path could not
+    /// be made relative to the workspace root) does it fall back to the
+    /// indexed files whose path is a `/`-delimited suffix of it, and then
+    /// only to the longest such path, so an absolute
+    /// `.../crates/a/src/lib.rs` is credited to `crates/a/src/lib.rs` and
+    /// not to a root `src/lib.rs`. A relative reported path with no exact
+    /// match (ripgrep scans files that a filtered search or the index leaves
+    /// out of `all_chunks`) credits nothing, never a suffix file. Indexed
+    /// paths that compare equal ignoring case are candidates together. Each
+    /// line then takes the first candidate chunk, in `all_chunks` order,
+    /// whose line range holds it.
     fn map_lexical_matches(
         all_chunks: &[Hit],
         search: lexical::LexicalSearch,
@@ -1140,11 +1165,32 @@ impl App {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let reported = entry.key().replace('\\', "/").to_lowercase();
-                    let mut chunks: Vec<usize> = files
+                    let mut selected: Vec<&IndexedFile> = files
                         .iter()
-                        .filter(|file| {
-                            reported == file.lowercase_path || reported.ends_with(&file.path_suffix)
-                        })
+                        .filter(|file| file.lowercase_path == reported)
+                        .collect();
+                    if selected.is_empty() && is_absolute_reported(&reported) {
+                        // The path could not be made relative to the root:
+                        // take the most specific indexed suffix. A relative
+                        // path with no exact match is a file the index does
+                        // not hold (a filtered search, a skipped file), not
+                        // a spelling problem, so it credits nothing.
+                        // Equal-length suffixes of one string are equal
+                        // strings, so only paths equal ignoring case can
+                        // tie.
+                        selected = files
+                            .iter()
+                            .filter(|file| reported.ends_with(&file.path_suffix))
+                            .collect();
+                        let longest = selected
+                            .iter()
+                            .map(|file| file.lowercase_path.len())
+                            .max()
+                            .unwrap_or(0);
+                        selected.retain(|file| file.lowercase_path.len() == longest);
+                    }
+                    let mut chunks: Vec<usize> = selected
+                        .into_iter()
                         .flat_map(|file| file.chunks.iter().copied())
                         .collect();
                     chunks.sort_unstable();
@@ -1385,6 +1431,7 @@ mod tests {
         chunk::Chunk,
         config::FusionConfig,
         filter::SourceRole,
+        lexical::{LexicalMatch, LexicalSearch},
         store::{Hit, source_role_prior},
     };
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
@@ -1751,6 +1798,232 @@ mod tests {
         assert_eq!(fused[0].lexical_match_count, 3);
         assert_eq!(fused[0].lexical_score, Some(5.0));
         assert_eq!(fused[0].retrieval_channels, ["lexical"]);
+    }
+
+    /// A one-term lexical search with one credited line per `(reported path,
+    /// line)`, the paths spelled as `lexical::search` reports them.
+    fn lexical_lines(lines: &[(&str, u32)]) -> LexicalSearch {
+        LexicalSearch {
+            terms: vec!["needle".into()],
+            matches: lines
+                .iter()
+                .map(|&(path, line)| LexicalMatch {
+                    relative_path: path.into(),
+                    line,
+                    term_mask: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// The `(file, start line)` of every chunk the lexical channel returned,
+    /// best first, each with its credited line count.
+    fn lexical_chunks(hits: &[Hit]) -> Vec<(&str, u32, u32)> {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.chunk.relative_file_path.as_str(),
+                    hit.chunk.start_line,
+                    hit.lexical_match_count,
+                )
+            })
+            .collect()
+    }
+
+    /// Two files whose paths are suffixes of each other, with chunks over the
+    /// same lines and the shorter path first in `all_chunks`: the shape of
+    /// `src/lib.rs` beside `crates/a/src/lib.rs` in a Cargo workspace.
+    fn root_and_crate_chunks() -> Vec<Hit> {
+        vec![
+            hit("src/lib.rs", 1, SourceRole::Source),
+            hit("crates/a/src/lib.rs", 1, SourceRole::Source),
+        ]
+    }
+
+    #[test]
+    fn a_reported_path_credits_the_file_of_that_exact_path_only() {
+        let chunks = root_and_crate_chunks();
+
+        let crate_match =
+            App::map_lexical_matches(&chunks, lexical_lines(&[("crates/a/src/lib.rs", 5)]), 10);
+        assert_eq!(
+            lexical_chunks(&crate_match),
+            [("crates/a/src/lib.rs", 1, 1)],
+            "a match in the crate file must not be credited to the root file"
+        );
+
+        let root_match = App::map_lexical_matches(&chunks, lexical_lines(&[("src/lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&root_match), [("src/lib.rs", 1, 1)]);
+
+        // Both reported in one search: each file keeps its own line.
+        let both = App::map_lexical_matches(
+            &chunks,
+            lexical_lines(&[("crates/a/src/lib.rs", 5), ("src/lib.rs", 6)]),
+            10,
+        );
+        let mut both = lexical_chunks(&both);
+        both.sort_unstable();
+        assert_eq!(
+            both,
+            [("crates/a/src/lib.rs", 1, 1), ("src/lib.rs", 1, 1)],
+            "each file is credited with its own line"
+        );
+    }
+
+    #[test]
+    fn an_exact_path_is_matched_case_insensitively() {
+        let chunks = root_and_crate_chunks();
+        let hits =
+            App::map_lexical_matches(&chunks, lexical_lines(&[("Crates/A/src/LIB.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("crates/a/src/lib.rs", 1, 1)]);
+    }
+
+    #[test]
+    fn an_absolute_reported_path_falls_back_to_the_longest_indexed_suffix() {
+        let chunks = root_and_crate_chunks();
+        for reported in [
+            "/work/space/crates/a/src/lib.rs",
+            // A Windows path that could not be made relative to the root.
+            r"C:\work\space\crates\a\src\lib.rs",
+            "c:/work/space/crates/a/src/lib.rs",
+            // A UNC path, and the verbatim spelling `dunce` keeps for a path
+            // that cannot be simplified (`\\?\C:\...`).
+            r"\\server\share\crates\a\src\lib.rs",
+            r"\\?\C:\work\space\crates\a\src\lib.rs",
+        ] {
+            let hits = App::map_lexical_matches(&chunks, lexical_lines(&[(reported, 5)]), 10);
+            assert_eq!(
+                lexical_chunks(&hits),
+                [("crates/a/src/lib.rs", 1, 1)],
+                "{reported}: the crate file, not the root file, takes the line"
+            );
+        }
+
+        // The root file is still found through the fallback when it is the
+        // longest indexed suffix.
+        let hits = App::map_lexical_matches(
+            &chunks,
+            lexical_lines(&[("/work/space/other/src/lib.rs", 5)]),
+            10,
+        );
+        assert_eq!(lexical_chunks(&hits), [("src/lib.rs", 1, 1)]);
+
+        // Among several suffixes the longest indexed path wins, whatever the
+        // order of `all_chunks`.
+        let chunks = vec![
+            hit("src/lib.rs", 1, SourceRole::Source),
+            hit("a/src/lib.rs", 1, SourceRole::Source),
+            hit("b/a/src/lib.rs", 1, SourceRole::Source),
+        ];
+        let hits = App::map_lexical_matches(
+            &chunks,
+            lexical_lines(&[("/work/space/c/b/a/src/lib.rs", 5)]),
+            10,
+        );
+        assert_eq!(lexical_chunks(&hits), [("b/a/src/lib.rs", 1, 1)]);
+    }
+
+    #[test]
+    fn an_exact_path_beats_a_shorter_indexed_suffix_candidate() {
+        // `lib.rs` is an indexed file and also a `/`-delimited suffix of the
+        // reported `src/lib.rs`; the exact match is the only candidate even
+        // though the suffix file comes first in `all_chunks`.
+        let chunks = vec![
+            hit("lib.rs", 1, SourceRole::Source),
+            hit("src/lib.rs", 1, SourceRole::Source),
+        ];
+        let hits = App::map_lexical_matches(&chunks, lexical_lines(&[("lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("lib.rs", 1, 1)]);
+        let hits = App::map_lexical_matches(&chunks, lexical_lines(&[("src/lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("src/lib.rs", 1, 1)]);
+    }
+
+    #[test]
+    fn a_reported_path_matching_no_indexed_file_yields_no_hit() {
+        let chunks = root_and_crate_chunks();
+        for reported in [
+            "other/main.rs",
+            // Ends with an indexed path but not at a `/` boundary.
+            "xsrc/lib.rs",
+            "/work/space/crates/b/lib.rs",
+            // A parent of an indexed path is not a match either.
+            "crates/a",
+        ] {
+            let hits = App::map_lexical_matches(&chunks, lexical_lines(&[(reported, 5)]), 10);
+            assert!(hits.is_empty(), "{reported}: {:?}", lexical_chunks(&hits));
+        }
+        // A line outside every chunk of the matched file is not credited.
+        let hits = App::map_lexical_matches(&chunks, lexical_lines(&[("src/lib.rs", 11)]), 10);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_relative_reported_path_with_no_exact_indexed_file_credits_nothing() {
+        // A filtered search keeps fewer chunks than ripgrep scans (and the
+        // index skips some files ripgrep reports): `crates/a/src/lib.rs` is
+        // reported relative to the root but is not in `all_chunks`. It must
+        // not fall back to the suffix file `src/lib.rs`.
+        let root_only = vec![hit("src/lib.rs", 1, SourceRole::Source)];
+        for reported in [
+            "crates/a/src/lib.rs",
+            "Crates/A/src/LIB.rs",
+            "a/src/lib.rs",
+            "./src/lib.rs",
+        ] {
+            let hits = App::map_lexical_matches(&root_only, lexical_lines(&[(reported, 5)]), 10);
+            assert!(hits.is_empty(), "{reported}: {:?}", lexical_chunks(&hits));
+        }
+        // The root file's own relative path still credits it.
+        let hits = App::map_lexical_matches(&root_only, lexical_lines(&[("src/lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("src/lib.rs", 1, 1)]);
+    }
+
+    #[test]
+    fn only_a_path_that_is_still_absolute_may_take_the_suffix_fallback() {
+        for absolute in [
+            "/work/space/src/lib.rs",
+            "/src/lib.rs",
+            r"\work\space\src\lib.rs",
+            "//server/share/src/lib.rs",
+            r"\\server\share\src\lib.rs",
+            r"\\?\C:\work\space\src\lib.rs",
+            "//?/UNC/server/share/src/lib.rs",
+            "C:/work/space/src/lib.rs",
+            r"c:\work\space\src\lib.rs",
+        ] {
+            assert!(super::is_absolute_reported(absolute), "{absolute}");
+        }
+        for relative in [
+            "src/lib.rs",
+            "crates/a/src/lib.rs",
+            "./src/lib.rs",
+            "../src/lib.rs",
+            "lib.rs",
+            "",
+            // Not a drive: no letter, no `/` after the colon.
+            "1:/src/lib.rs",
+            "ab:/src/lib.rs",
+            "c:src/lib.rs",
+            "c:",
+        ] {
+            assert!(!super::is_absolute_reported(relative), "{relative}");
+        }
+    }
+
+    #[test]
+    fn indexed_paths_equal_ignoring_case_stay_candidates_together() {
+        // Two indexed files whose paths differ only in case (a
+        // case-sensitive file system): the first chunk in `all_chunks` order
+        // that holds the line takes it, as before.
+        let chunks = vec![
+            hit("Src/lib.rs", 1, SourceRole::Source),
+            hit("src/lib.rs", 1, SourceRole::Source),
+        ];
+        let hits = App::map_lexical_matches(&chunks, lexical_lines(&[("src/lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("Src/lib.rs", 1, 1)]);
+        let hits =
+            App::map_lexical_matches(&chunks, lexical_lines(&[("/work/space/src/lib.rs", 5)]), 10);
+        assert_eq!(lexical_chunks(&hits), [("Src/lib.rs", 1, 1)]);
     }
 
     /// A fused order of `(file, start line)` chunks, best first, with strictly
