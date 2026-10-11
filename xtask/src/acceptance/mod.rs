@@ -55,6 +55,36 @@ pub fn lci_binary() -> PathBuf {
     ))
 }
 
+/// Removes every `LCI_*` variable of this process from the environment
+/// `command` will start with. The acceptance harness always hands the service
+/// its own `--config` and port, so a developer's exported `LCI_DATA_DIR`,
+/// `LCI_EMBEDDING_URL`, `LCI_LOCAL_CONFIG` or `LCI_PORT` (any variable the
+/// service reads now or later) must not redirect a live run to their data, a
+/// different model service or a different overlay. Names are compared
+/// case-insensitively because Windows treats them so. The harness's own
+/// `LCI_ACCEPTANCE_*` variables are read by this process, never by the
+/// service, so they are stripped along with the rest.
+pub fn strip_lci_env(command: &mut Command) -> &mut Command {
+    strip_lci_env_named(command, std::env::vars_os().map(|(name, _)| name))
+}
+
+/// [`strip_lci_env`] over an explicit list of variable names.
+fn strip_lci_env_named(
+    command: &mut Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> &mut Command {
+    for name in names {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("LCI_")
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 pub fn test_results_dir() -> Result<PathBuf> {
     let dir = workspace_root().join("test-results");
     std::fs::create_dir_all(&dir)?;
@@ -231,7 +261,9 @@ impl ManagedServer {
         std::fs::create_dir_all(log_dir)?;
         let stdout = std::fs::File::create(log_dir.join("serve.stdout.log"))?;
         let stderr = std::fs::File::create(log_dir.join("serve.stderr.log"))?;
-        let child = Command::new(lci_binary())
+        let mut command = Command::new(lci_binary());
+        strip_lci_env(&mut command);
+        let child = command
             .arg("--config")
             .arg(config_path)
             .arg("serve")
@@ -563,7 +595,9 @@ pub async fn run_npm(dir: &Path, args: &[&str]) -> Result<()> {
 /// Runs the compiled `local-code-intelligence` CLI (not the MCP server) with
 /// the given config and arguments.
 pub async fn run_lci(config_path: &Path, args: &[&str]) -> Result<LciOutput> {
-    let output = Command::new(lci_binary())
+    let mut command = Command::new(lci_binary());
+    strip_lci_env(&mut command);
+    let output = command
         .arg("--config")
         .arg(config_path)
         .args(args)
@@ -575,4 +609,63 @@ pub async fn run_lci(config_path: &Path, args: &[&str]) -> Result<LciOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn removed(command: &Command) -> Vec<String> {
+        let mut removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                assert!(value.is_none(), "{name:?} is set, not removed");
+                name.to_string_lossy().into_owned()
+            })
+            .collect();
+        removed.sort();
+        removed
+    }
+
+    #[test]
+    fn the_service_never_inherits_an_lci_variable() {
+        let mut command = Command::new("not-run");
+        strip_lci_env_named(
+            &mut command,
+            [
+                "LCI_DATA_DIR",
+                "lci_local_config",
+                "LCI_EMBEDDING_URL",
+                "LCI_ACCEPTANCE_JDTLS",
+                "LCI_SOMETHING_NEW",
+                "PATH",
+                "LCIX",
+                "HOME",
+            ]
+            .map(OsString::from),
+        );
+        assert_eq!(
+            removed(&command),
+            [
+                "LCI_ACCEPTANCE_JDTLS",
+                "LCI_DATA_DIR",
+                "LCI_EMBEDDING_URL",
+                "LCI_SOMETHING_NEW",
+                "lci_local_config"
+            ]
+        );
+
+        // Applied to the real environment it covers whatever the shell exports.
+        let mut command = Command::new("not-run");
+        strip_lci_env(&mut command);
+        let removed = removed(&command);
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            if name.to_ascii_uppercase().starts_with("LCI_") {
+                assert!(removed.contains(&name), "{name} would reach the service");
+            }
+        }
+    }
 }

@@ -5,7 +5,7 @@
 
 mod indexing;
 mod navigation;
-mod readiness;
+pub(crate) mod readiness;
 mod search;
 
 pub use indexing::{

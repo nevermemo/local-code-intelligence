@@ -7,6 +7,14 @@
 //! user-level overlay can change a result. Model URLs point at listeners the
 //! test owns, which must see no connection, or at nothing; no test touches
 //! ports 8765-8767, and `serve` binds loopback ports the test picked.
+//!
+//! The `init` tests (see [`InitBox`]) also give each process a `PATH` that is
+//! one temporary directory, holding copies of the fake language-server binary
+//! under the names of the tools `init` looks for, so what it finds never
+//! depends on what is installed. They probe only services the test owns
+//! (the fake model service, or a listener that must stay unconnected) and
+//! pass `--no-probe` whenever the configuration would otherwise name a model
+//! service on a port the test does not own.
 
 use super::*;
 use std::{
@@ -719,4 +727,850 @@ fn the_cli_spawn_helper_removes_lci_variables_and_only_those() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `lci init`
+// ---------------------------------------------------------------------------
+
+/// A temp directory with a configuration file and a `PATH` directory, and the
+/// helpers to run `init` and `config` against them.
+struct InitBox {
+    temp: tempfile::TempDir,
+    config: PathBuf,
+    bin: PathBuf,
+    /// The `port` the configuration file names: free when chosen.
+    port: u16,
+}
+
+impl InitBox {
+    /// A configuration whose model URLs name ports nothing listens on, so a
+    /// probe that slipped through would find nothing and never a real service.
+    fn new(extra: &str) -> Self {
+        let [embedder, reranker] = free_ports();
+        Self::with_urls(
+            &format!("http://127.0.0.1:{embedder}/v1"),
+            &format!("http://127.0.0.1:{reranker}/rerank"),
+            extra,
+        )
+    }
+
+    fn with_urls(embedding_url: &str, reranker_url: &str, extra: &str) -> Self {
+        let [port] = free_ports();
+        Self::build(embedding_url, reranker_url, port, extra)
+    }
+
+    fn build(embedding_url: &str, reranker_url: &str, port: u16, extra: &str) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "port = {port}\nreadiness_timeout_seconds = 1\nembedding_url = '{embedding_url}'\nreranker_url = '{reranker_url}'\n{extra}"
+            ),
+        )
+        .unwrap();
+        Self {
+            temp,
+            config,
+            bin,
+            port,
+        }
+    }
+
+    /// The overlay `lci --config <config> init` writes.
+    fn overlay(&self) -> PathBuf {
+        self.temp.path().join("config.local.toml")
+    }
+
+    fn exe(tool: &str) -> String {
+        format!("{tool}{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    /// Where `tool` is installed by [`Self::install`].
+    fn tool(&self, tool: &str) -> PathBuf {
+        self.bin.join(Self::exe(tool))
+    }
+
+    /// Puts a copy of the fake language-server binary on this box's `PATH`
+    /// under each name. Nothing runs it: `init` only looks for the file.
+    fn install(&self, tools: &[&str]) {
+        for tool in tools {
+            std::fs::copy(env!("CARGO_BIN_EXE_fake-lsp-server"), self.tool(tool)).unwrap();
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command
+            .current_dir(self.temp.path())
+            .arg("--config")
+            .arg(&self.config)
+            .args(args);
+        strip_lci_env(&mut command)
+            // The only place a tool can be found. The two Windows locations of
+            // the ripgrep copies bundled with VS Code are pointed at the temp
+            // directory too, where there are none.
+            .env("PATH", &self.bin)
+            .env("LOCALAPPDATA", self.temp.path())
+            .env("ProgramFiles", self.temp.path());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    /// For tests whose fake service runs on the test's own runtime, which a
+    /// blocking wait would starve.
+    async fn run_async(&self, args: &[&str]) -> Output {
+        tokio::process::Command::from(self.command(args))
+            .output()
+            .await
+            .unwrap()
+    }
+
+    /// `config --json` of this box, which must succeed.
+    fn config_report(&self) -> Value {
+        let output = self.run(&["config", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        parse(&output)
+    }
+
+    fn overlay_text(&self) -> String {
+        std::fs::read_to_string(self.overlay()).unwrap()
+    }
+
+    /// The overlay's setting lines (not comments, not blank, not tables).
+    fn overlay_settings(&self) -> Vec<String> {
+        self.overlay_text()
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('['))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether the overlay sets the top-level `key`.
+    fn overlay_sets(&self, key: &str) -> bool {
+        self.overlay_settings()
+            .iter()
+            .any(|line| line.starts_with(&format!("{key} = ")))
+    }
+
+    /// Every entry of the temp directory.
+    fn entries(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+fn setting_keys(settings: &[String]) -> Vec<String> {
+    settings
+        .iter()
+        .map(|line| line.split(" = ").next().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn init_writes_the_absolute_paths_of_the_tools_on_path_and_config_reads_them_back() {
+    // No `data_dir` in the file: the platform default is written out.
+    let init = InitBox::new("");
+    let installed = [
+        "rust-analyzer",
+        "typescript-language-server",
+        "gopls",
+        "clangd",
+    ];
+    init.install(&installed);
+    let config_before = std::fs::read(&init.config).unwrap();
+    assert_eq!(init.config_report()["layers"]["local"]["state"], "absent");
+
+    let output = init.run(&["init", "--no-probe"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!("wrote {}\n", text(&init.overlay()))),
+        "{stdout}"
+    );
+    assert!(stdout.contains("generated by lci init "), "{stdout}");
+
+    // Exactly what was found, and the data directory, were written.
+    let settings = init.overlay_settings();
+    assert_eq!(
+        setting_keys(&settings),
+        [
+            "data_dir",
+            "rust_analyzer_path",
+            "path", // [typescript]
+            "path", // [go]
+            "path", // [clangd]
+        ]
+    );
+    let overlay = init.overlay_text();
+    for table in ["[typescript]", "[go]", "[clangd]"] {
+        assert!(overlay.contains(table), "{overlay}");
+    }
+    for table in ["[csharp]", "[python]", "[java]"] {
+        assert!(!overlay.contains(&format!("\n{table}\n")), "{overlay}");
+    }
+    // The tools that were not there are explained, with how to get them.
+    for expected in [
+        "# rg: not on PATH (install ripgrep, or set ripgrep_path)",
+        "# csharp-ls: not on PATH (dotnet tool install --global csharp-ls)",
+        "# pyright-langserver: not on PATH (npm install -g pyright)",
+        "# jdtls: [java].path is an installation directory",
+    ] {
+        assert!(
+            overlay.contains(expected),
+            "missing {expected:?} in\n{overlay}"
+        );
+    }
+    assert!(overlay.contains("not for version control"), "{overlay}");
+    // Nothing init does not establish is written: no port, model or URL.
+    for key in [
+        "port",
+        "embedding_url",
+        "embedding_model",
+        "reranker_url",
+        "reranker_model",
+        "ripgrep_path",
+    ] {
+        assert!(!init.overlay_sets(key), "{key} was written:\n{overlay}");
+    }
+
+    // `config` now shows them, from the overlay, and the configuration is valid.
+    let report = init.config_report();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["layers"]["local"]["state"], "present");
+    assert_eq!(report["layers"]["local"]["path"], text(&init.overlay()));
+    let values = &report["values"];
+    for (key, tool) in [
+        ("rust_analyzer_path", "rust-analyzer"),
+        ("typescript.path", "typescript-language-server"),
+        ("go.path", "gopls"),
+        ("clangd.path", "clangd"),
+    ] {
+        assert_eq!(values[key]["source"], "local", "{key}");
+        assert_eq!(values[key]["value"], text(&init.tool(tool)), "{key}");
+    }
+    assert_eq!(values["data_dir"]["source"], "local");
+    assert_eq!(
+        values["data_dir"]["value"],
+        text(&local_code_intelligence::config::Config::default().data_dir)
+    );
+    for key in ["csharp.path", "python.path", "java.path", "ripgrep_path"] {
+        assert_eq!(values[key]["source"], "default", "{key}");
+    }
+    // The main configuration was not touched, and nothing else was left over.
+    assert_eq!(std::fs::read(&init.config).unwrap(), config_before);
+    assert_eq!(init.entries(), ["bin", "config.local.toml", "config.toml"]);
+}
+
+#[test]
+fn init_json_reports_what_it_set_found_and_noted() {
+    let init = InitBox::new("");
+    init.install(&["gopls"]);
+    let output = init.run(&["init", "--no-probe", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["status"], "written");
+    assert_eq!(report["written"], true);
+    assert_eq!(report["exists"], false);
+    assert_eq!(report["path"], text(&init.overlay()));
+    assert_eq!(report["named_by"], "config-file-sibling");
+    assert_eq!(report["overlay"], init.overlay_text());
+    assert_eq!(report["set"], json!(["data_dir", "go.path"]));
+    let tools = &report["detected"]["tools"];
+    assert_eq!(tools["gopls"]["action"], "written");
+    assert_eq!(tools["gopls"]["path"], text(&init.tool("gopls")));
+    assert_eq!(tools["csharp-ls"]["action"], "not_found");
+    assert!(
+        tools["csharp-ls"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("dotnet tool")
+    );
+    assert_eq!(report["detected"]["data_dir"]["action"], "written");
+    assert_eq!(report["probes"]["embedding_url"]["status"], "skipped");
+    assert_eq!(report["probes"]["reranker_url"]["status"], "skipped");
+    assert_eq!(report["probes"]["port"]["value"], init.port);
+    assert_eq!(report["valid"], true);
+    assert!(report["comments"].as_array().unwrap().len() >= 8);
+    assert_eq!(report["warnings"], json!([]));
+}
+
+#[test]
+fn init_never_replaces_an_existing_overlay_without_force_and_dry_run_writes_nothing() {
+    let init = InitBox::new("");
+    init.install(&["gopls"]);
+    let config_before = std::fs::read(&init.config).unwrap();
+
+    // A dry run on a fresh box prints the overlay and creates no file.
+    let output = init.run(&["init", "--no-probe", "--dry-run"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!(
+            "would write {} (dry run)\n",
+            text(&init.overlay())
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[go]"), "{stdout}");
+    assert!(!init.overlay().exists());
+    let output = init.run(&["init", "--no-probe", "--dry-run", "--json"]);
+    let report = parse(&output);
+    assert_eq!(report["status"], "dry_run");
+    assert_eq!(report["written"], false);
+    assert!(!init.overlay().exists());
+
+    // The first real run writes.
+    let output = init.run(&["init", "--no-probe"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let written = std::fs::read(init.overlay()).unwrap();
+
+    // The second refuses: exit 3, nothing printed on stdout, the file as it was.
+    for args in [
+        &["init", "--no-probe"][..],
+        &["init", "--no-probe", "--no-local-config"][..],
+    ] {
+        let output = init.run(args);
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        let message = stderr(&output);
+        assert!(message.contains(&text(&init.overlay())), "{message}");
+        assert!(message.contains("--force"), "{message}");
+        assert_eq!(std::fs::read(init.overlay()).unwrap(), written);
+    }
+    let output = init.run(&["init", "--no-probe", "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let report = parse(&output);
+    assert_eq!(report["status"], "exists");
+    assert_eq!(report["written"], false);
+    assert_eq!(report["exists"], true);
+    assert!(report["error"].as_str().unwrap().contains("--force"));
+    assert_eq!(std::fs::read(init.overlay()).unwrap(), written);
+
+    // A dry run beside an existing file still previews, and says what a real
+    // run would need.
+    std::fs::write(init.overlay(), "# my own edits\n").unwrap();
+    let output = init.run(&["init", "--no-probe", "--dry-run"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("needs --force"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init.overlay()).unwrap(),
+        "# my own edits\n"
+    );
+
+    // --force replaces it, even when the old file is not a valid overlay.
+    std::fs::write(init.overlay(), "port = \n").unwrap();
+    let output = init.run(&["init", "--no-probe", "--force"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        setting_keys(&init.overlay_settings()),
+        ["data_dir", "path"],
+        "{}",
+        init.overlay_text()
+    );
+
+    // The main configuration was never touched, and no temporary file stayed.
+    assert_eq!(std::fs::read(&init.config).unwrap(), config_before);
+    assert_eq!(init.entries(), ["bin", "config.local.toml", "config.toml"]);
+}
+
+#[test]
+fn init_leaves_a_key_that_a_higher_layer_sets_alone() {
+    let data = tempfile::tempdir().unwrap();
+    let init = InitBox::new(&format!(
+        "data_dir = '{}'\n[typescript]\npath = 'ts-from-file'\n",
+        data.path().display()
+    ));
+    init.install(&["rust-analyzer", "typescript-language-server", "gopls"]);
+    let mut command = init.command(&["init", "--no-probe"]);
+    command.env("LCI_RUST_ANALYZER_PATH", "ra-from-env");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let overlay = init.overlay_text();
+    assert_eq!(
+        setting_keys(&init.overlay_settings()),
+        ["path"],
+        "{overlay}"
+    );
+    assert!(overlay.contains("[go]"), "{overlay}");
+    assert!(!overlay.contains("[typescript]"), "{overlay}");
+    assert!(overlay.contains("# data_dir: set by file "), "{overlay}");
+    assert!(
+        overlay.contains("typescript.path is already set by file "),
+        "{overlay}"
+    );
+    assert!(
+        overlay.contains("rust_analyzer_path is already set by env LCI_RUST_ANALYZER_PATH"),
+        "{overlay}"
+    );
+    let report = init.config_report();
+    assert_eq!(report["values"]["typescript.path"]["source"], "file");
+    assert_eq!(report["values"]["typescript.path"]["value"], "ts-from-file");
+    assert_eq!(report["values"]["go.path"]["source"], "local");
+    assert_eq!(report["values"]["data_dir"]["source"], "file");
+    assert_eq!(report["values"]["rust_analyzer_path"]["source"], "default");
+}
+
+#[test]
+fn init_without_a_configuration_file_writes_where_lci_local_config_points() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gopls = bin.join(InitBox::exe("gopls"));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-lsp-server"), &gopls).unwrap();
+    // A file that does not exist, in a directory that does not exist either:
+    // that is what `init` is for.
+    let target = temp.path().join("user").join("nested").join("overlay.toml");
+    // Without a configuration file the port would be the default 8768, which
+    // `init` binds to see whether it is free: that is the real service's port,
+    // so the test names one of its own.
+    let [port] = free_ports();
+    let port = port.to_string();
+    let spawn = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command.current_dir(temp.path()).args(args);
+        strip_lci_env(&mut command)
+            .env("LCI_LOCAL_CONFIG", &target)
+            .env("LCI_PORT", &port)
+            .env("PATH", &bin)
+            .env("LOCALAPPDATA", temp.path())
+            .env("ProgramFiles", temp.path());
+        command.output().unwrap()
+    };
+
+    // `config` keeps calling the absent file absent.
+    let output = spawn(&["config", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["layers"]["local"]["state"], "absent");
+    assert_eq!(report["layers"]["local"]["path"], text(&target));
+    assert!(!target.exists());
+
+    // No configuration file: the built-in model URLs are 8766 and 8767, so
+    // nothing may be probed.
+    let output = spawn(&["init", "--no-probe"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let overlay = std::fs::read_to_string(&target).unwrap();
+    assert!(overlay.contains("[go]"), "{overlay}");
+    let report = parse(&spawn(&["config", "--json"]));
+    assert_eq!(report["layers"]["file"]["path"], Value::Null);
+    assert_eq!(report["layers"]["local"]["named_by"], "LCI_LOCAL_CONFIG");
+    assert_eq!(report["layers"]["local"]["state"], "present");
+    assert_eq!(report["values"]["go.path"]["source"], "local");
+    assert_eq!(report["values"]["go.path"]["value"], text(&gopls));
+    assert_eq!(report["values"]["data_dir"]["source"], "local");
+
+    // A second run refuses.
+    let output = spawn(&["init", "--no-probe"]);
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn init_fails_without_writing_when_a_layer_cannot_be_read() {
+    let init = InitBox::new("");
+    let missing = init.temp.path().join("missing.toml");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+    command
+        .current_dir(init.temp.path())
+        .arg("--config")
+        .arg(&missing)
+        .args(["init", "--no-probe"]);
+    let output = strip_lci_env(&mut command).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("read configuration"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!init.temp.path().join("missing.local.toml").exists());
+
+    // A malformed variable is the same kind of failure: nothing is guessed.
+    let output = init
+        .command(&["init", "--no-probe"])
+        .env("LCI_PORT", "abc")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("LCI_PORT"), "{}", stderr(&output));
+    assert!(!init.overlay().exists());
+}
+
+#[tokio::test]
+async fn init_reports_the_model_services_and_never_writes_a_model_name() {
+    let (_temp, fake, _state, _task) = fixture().await;
+    let init = InitBox::with_urls(&fake.embedding_url, &fake.reranker_url, "");
+    let output = init.run_async(&["init", "--json"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    for key in ["embedding_url", "reranker_url"] {
+        let probe = &report["probes"][key];
+        assert_eq!(probe["status"], "reachable", "{key}");
+        assert_eq!(probe["model_listed"], true, "{key}");
+        assert_eq!(
+            probe["models"],
+            json!(["qwen3-embedding-4b", "qwen3-reranker-4b"]),
+            "{key}"
+        );
+    }
+    let overlay = init.overlay_text();
+    assert!(
+        overlay.contains(
+            "# embedding_url: reachable; lists models: qwen3-embedding-4b, qwen3-reranker-4b; embedding_model 'qwen3-embedding-4b' is listed"
+        ),
+        "{overlay}"
+    );
+    assert!(overlay.contains("# reranker_url: reachable"), "{overlay}");
+    // No URL or model name leaked into the file's settings.
+    assert!(
+        !overlay.contains(&fake.embedding_url),
+        "a configured URL was copied into the overlay:\n{overlay}"
+    );
+    assert_eq!(setting_keys(&init.overlay_settings()), ["data_dir"]);
+
+    // The configured model is not among those listed: the comment says what
+    // to set, the file's value stays, and nothing is written for it.
+    let init = InitBox::with_urls(
+        &fake.embedding_url,
+        &fake.reranker_url,
+        "embedding_model = 'other-embedder'\n",
+    );
+    let output = init.run_async(&["init"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let overlay = init.overlay_text();
+    assert!(
+        overlay.contains("embedding_model 'other-embedder' is NOT listed"),
+        "{overlay}"
+    );
+    assert!(
+        overlay.contains("init does not change model names"),
+        "{overlay}"
+    );
+    assert!(
+        overlay.contains("reranker_model 'qwen3-reranker-4b' is listed"),
+        "{overlay}"
+    );
+    assert!(!init.overlay_sets("embedding_model"));
+    let report = init.config_report();
+    assert_eq!(report["values"]["embedding_model"]["source"], "file");
+    assert_eq!(
+        report["values"]["embedding_model"]["value"],
+        "other-embedder"
+    );
+}
+
+#[test]
+fn init_succeeds_and_says_so_when_the_model_services_are_down() {
+    let init = InitBox::new("");
+    let started = std::time::Instant::now();
+    let output = init.run(&["init", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(started.elapsed() < Duration::from_secs(60));
+    let report = parse(&output);
+    for key in ["embedding_url", "reranker_url"] {
+        assert_eq!(report["probes"][key]["status"], "unreachable", "{key}");
+    }
+    let overlay = init.overlay_text();
+    assert!(
+        overlay.contains("# embedding_url: unreachable ("),
+        "{overlay}"
+    );
+    assert!(
+        overlay.contains("# reranker_url: unreachable ("),
+        "{overlay}"
+    );
+    // A configured URL is not echoed into the file.
+    assert!(!overlay.contains("://"), "{overlay}");
+}
+
+/// The generation model's port is never contacted, whichever host spelling
+/// names it and whatever flags are given. The binary only judges the strings;
+/// no socket is opened to the port by the product or by this test.
+#[test]
+fn init_refuses_to_probe_port_8765_and_still_writes_the_rest() {
+    let init = InitBox::with_urls(
+        "http://127.0.0.1:8765/v1",
+        "http://192.0.2.10:8765/rerank",
+        "",
+    );
+    init.install(&["gopls"]);
+    for flags in [&[][..], &["--no-probe"][..]] {
+        let mut args = vec!["init", "--force", "--json"];
+        args.extend_from_slice(flags);
+        let started = std::time::Instant::now();
+        let output = init.run(&args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let report = parse(&output);
+        for key in ["embedding_url", "reranker_url"] {
+            assert_eq!(report["probes"][key]["status"], "refused", "{key}");
+            assert!(
+                report["probes"][key]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("port 8765 is the generation model; LCI never contacts it"),
+                "{key}"
+            );
+        }
+        let message = stderr(&output);
+        assert!(
+            message.contains("embedding_url: not probed; port 8765"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reranker_url: not probed; port 8765"),
+            "{message}"
+        );
+        let overlay = init.overlay_text();
+        assert!(
+            overlay.contains("# embedding_url: not probed; port 8765 is the generation model; LCI never contacts it (AGENTS.md)"),
+            "{overlay}"
+        );
+        // The rest was written; the configuration stays invalid, which init
+        // reports rather than hides.
+        assert!(overlay.contains("[go]"), "{overlay}");
+        assert_eq!(report["valid"], false);
+        let warnings = report["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("init cannot fix it")),
+            "{warnings:?}"
+        );
+    }
+    // Reading the result back still reports the file's own invalid value.
+    let output = init.run(&["config", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn init_refuses_to_probe_a_host_that_is_not_loopback() {
+    let init = InitBox::with_urls(
+        "http://192.0.2.10:8766/v1",
+        "https://models.example.com/rerank",
+        "",
+    );
+    let started = std::time::Instant::now();
+    let output = init.run(&["init", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // Nothing waited on a network that was never asked.
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let report = parse(&output);
+    for key in ["embedding_url", "reranker_url"] {
+        assert_eq!(report["probes"][key]["status"], "refused", "{key}");
+    }
+    let overlay = init.overlay_text();
+    assert!(
+        overlay.contains("# embedding_url: not probed; init contacts loopback hosts only"),
+        "{overlay}"
+    );
+    assert!(
+        stderr(&output).contains("loopback hosts only"),
+        "{}",
+        stderr(&output)
+    );
+    // The hosts are not echoed into the file.
+    assert!(!overlay.contains("192.0.2.10") && !overlay.contains("example.com"));
+}
+
+#[tokio::test]
+async fn init_follows_no_redirect_from_a_service_it_asks() {
+    // The service answers every request with a redirect to a listener the
+    // test holds; that listener must never see a connection.
+    let target = listener();
+    let target_url = format!("http://{}/v1/models", target.local_addr().unwrap());
+    let router = Router::new().fallback(move || {
+        let target_url = target_url.clone();
+        async move { axum::response::Redirect::temporary(&target_url) }
+    });
+    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = service.local_addr().unwrap();
+    let _task = tokio::spawn(async move {
+        axum::serve(service, router).await.unwrap();
+    });
+    let init = InitBox::with_urls(
+        &format!("http://{address}/v1"),
+        &format!("http://{address}/rerank"),
+        "",
+    );
+    let output = init.run_async(&["init", "--json"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    // The redirect is an answer, not a path to follow.
+    let probe = &report["probes"]["embedding_url"];
+    assert_eq!(probe["status"], "reachable");
+    assert!(probe["detail"].as_str().unwrap().contains("307"), "{probe}");
+    match target.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("init followed a redirect: {other:?}"),
+    }
+}
+
+/// A model id is data from a service. A line break in one must not turn the
+/// comment that lists it into a setting.
+#[tokio::test]
+async fn init_cannot_be_made_to_write_a_setting_by_what_a_service_lists() {
+    let router = Router::new().route(
+        "/v1/models",
+        get(|| async {
+            Json(json!({"data": [
+                {"id": "evil\nport = 1\n[csharp]\npath = 'x'"},
+                {"id": "ok-model"},
+            ]}))
+        }),
+    );
+    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = service.local_addr().unwrap();
+    let _task = tokio::spawn(async move {
+        axum::serve(service, router).await.unwrap();
+    });
+    let init = InitBox::with_urls(
+        &format!("http://{address}/v1"),
+        &format!("http://{address}/rerank"),
+        "",
+    );
+    let output = init.run_async(&["init"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let overlay = init.overlay_text();
+    assert!(
+        overlay.contains("evil port = 1 [csharp] path = 'x'"),
+        "{overlay}"
+    );
+    for line in overlay.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            line.starts_with('#') || line.starts_with("data_dir = "),
+            "{line:?} in\n{overlay}"
+        );
+    }
+    let report = init.config_report();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["values"]["port"]["source"], "file");
+    assert_eq!(report["values"]["csharp.path"]["source"], "default");
+}
+
+#[test]
+fn init_checks_the_port_by_binding_and_never_writes_it() {
+    // Free.
+    let init = InitBox::new("");
+    let output = init.run(&["init", "--no-probe", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["probes"]["port"]["state"], "free");
+    assert!(
+        init.overlay_text()
+            .contains(&format!("# port: {} is free on 127.0.0.1", init.port)),
+        "{}",
+        init.overlay_text()
+    );
+    assert!(!init.overlay_sets("port"));
+
+    // In use, with --no-probe: reported, and the holder is not contacted.
+    let holder = TcpListener::bind(("127.0.0.1", init.port)).unwrap();
+    holder.set_nonblocking(true).unwrap();
+    let output = init.run(&["init", "--no-probe", "--force", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["probes"]["port"]["state"], "in_use");
+    assert!(report["probes"]["port"]["lci_serving"].is_null());
+    let overlay = init.overlay_text();
+    assert!(overlay.contains("is in use on 127.0.0.1"), "{overlay}");
+    assert!(overlay.contains("--no-probe sends no request"), "{overlay}");
+    match holder.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("init contacted the port holder under --no-probe: {other:?}"),
+    }
+    assert!(!init.overlay_sets("port"));
+}
+
+#[tokio::test]
+async fn init_tells_a_running_lci_from_another_process_on_the_port() {
+    // An LCI answering `/health`.
+    let init = InitBox::new("");
+    let holder = tokio::net::TcpListener::bind(("127.0.0.1", init.port))
+        .await
+        .unwrap();
+    let router = Router::new().route(
+        "/health",
+        get(|| async {
+            Json(json!({"status": "ok", "service": "local-code-intelligence", "version": "0"}))
+        }),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(holder, router).await.unwrap();
+    });
+    let output = init.run_async(&["init", "--json"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["probes"]["port"]["state"], "in_use");
+    assert_eq!(report["probes"]["port"]["lci_serving"], true);
+    assert!(
+        init.overlay_text().contains("an LCI is serving there"),
+        "{}",
+        init.overlay_text()
+    );
+    assert!(!init.overlay_sets("port"));
+    task.abort();
+    let _ = task.await;
+
+    // Something else on the port: an HTTP server with no `/health`, and one
+    // whose `/health` is not this service's.
+    for router in [
+        Router::new(),
+        Router::new().route("/health", get(|| async { Json(json!({"status": "ok"})) })),
+    ] {
+        let init = InitBox::new("");
+        let holder = tokio::net::TcpListener::bind(("127.0.0.1", init.port))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(holder, router).await.unwrap();
+        });
+        let output = init.run_async(&["init", "--json"]).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+        let report = parse(&output);
+        assert_eq!(report["probes"]["port"]["lci_serving"], false);
+        assert!(
+            init.overlay_text().contains("another process holds it"),
+            "{}",
+            init.overlay_text()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[test]
+fn init_does_not_check_a_port_that_belongs_to_another_service() {
+    // The configuration is invalid with port 8766: init reports that, binds
+    // and asks nothing on that port, and says so.
+    let [embedder, reranker] = free_ports();
+    let init = InitBox::build(
+        &format!("http://127.0.0.1:{embedder}/v1"),
+        &format!("http://127.0.0.1:{reranker}/rerank"),
+        8766,
+        "",
+    );
+    let output = init.run(&["init", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["probes"]["port"]["state"], "reserved");
+    assert_eq!(report["valid"], false);
+    assert!(
+        init.overlay_text()
+            .contains("is reserved for another service")
+    );
+    assert!(!init.overlay_sets("port"));
 }

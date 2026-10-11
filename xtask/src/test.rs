@@ -89,6 +89,7 @@ pub fn run(suite: Suite) -> Result<()> {
         Suite::Filter => invoke_focused(&["test", "--workspace", "--lib", "filter::"]),
         Suite::Config => {
             invoke_focused(&["test", "--workspace", "--lib", "config::"])?;
+            invoke_focused(&["test", "--workspace", "--lib", "init::"])?;
             invoke_focused(&["test", "--test", "integration", "config::"])
         }
         Suite::Evaluation => {

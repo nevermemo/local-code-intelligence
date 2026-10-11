@@ -24,6 +24,9 @@
 //! The environment is passed in as a snapshot ([`ResolveSpec::env`]), never
 //! read inside the resolver, so every rule here is testable without touching
 //! the process environment.
+//!
+//! [`render_overlay`] is the other direction: it writes a [`LocalOverrides`]
+//! (with comments) as the text of an overlay file, for `lci init`.
 
 use super::Config;
 use anyhow::{Context, Result, anyhow, bail};
@@ -245,7 +248,7 @@ pub fn env_var_for_key(key: &str) -> Option<String> {
 
 /// A language-server section of the overlay (or of the environment). Every
 /// field is optional: only what is set overrides the file.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LspOverride {
     pub path: Option<String>,
@@ -258,7 +261,7 @@ pub struct LspOverride {
 /// nothing. Adding a machine-specific key later means adding a field here, a
 /// line in `SCALAR_KEYS` (or `LSP_SECTIONS`), its assignment in `apply`, and
 /// its variable in `from_env`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalOverrides {
     pub data_dir: Option<PathBuf>,
@@ -333,7 +336,13 @@ impl LocalOverrides {
         }
     }
 
-    fn lsp_mut(&mut self, section: &str) -> &mut Option<LspOverride> {
+    /// The slot of language-server section `section` (`csharp`, `typescript`,
+    /// `python`, `go`, `java` or `clangd`).
+    ///
+    /// # Panics
+    ///
+    /// When `section` is not one of those.
+    pub fn lsp_mut(&mut self, section: &str) -> &mut Option<LspOverride> {
         match section {
             "csharp" => &mut self.csharp,
             "typescript" => &mut self.typescript,
@@ -347,7 +356,7 @@ impl LocalOverrides {
 
     /// Writes every set field into `config` and returns the dotted keys it
     /// wrote.
-    fn apply(&self, config: &mut Config) -> Vec<String> {
+    pub fn apply(&self, config: &mut Config) -> Vec<String> {
         let mut set = Vec::new();
         if let Some(value) = &self.data_dir {
             config.data_dir = value.clone();
@@ -540,6 +549,147 @@ pub fn overlay_location(
             NAMED_BY_USER_DIR,
         )
     })
+}
+
+/// A comment written with the setting it is about (see [`render_overlay`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayNote {
+    /// The dotted machine-set key the note belongs to (`port`,
+    /// `typescript.path`). A language-server section name (`typescript`) stands
+    /// for the whole section. An empty or unrecognised key makes a general
+    /// note, written before every setting.
+    pub key: String,
+    pub text: String,
+}
+
+impl OverlayNote {
+    pub fn new(key: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// The text of an overlay file: `header` and the notes as comments, and every
+/// field `overrides` sets as a TOML setting, in [`machine_keys`] order with
+/// the top-level keys first and the language-server tables after them. A note
+/// is written just above the setting it belongs to, or on its own when that
+/// key is not set. [`LocalOverrides::parse`] reads the result back as
+/// `overrides`: comment text is flattened to one line (a control character
+/// becomes a space), so a note built from data a probe received cannot add a
+/// setting.
+pub fn render_overlay(header: &str, overrides: &LocalOverrides, notes: &[OverlayNote]) -> String {
+    let known = machine_keys();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+
+    let mut intro = vec![comment_line(header)];
+    intro.extend(
+        notes
+            .iter()
+            .filter(|note| !known.contains(&note.key) && !is_lsp_section(&note.key))
+            .map(|note| comment_line(&note.text)),
+    );
+    groups.push(intro);
+
+    for (key, _) in SCALAR_KEYS {
+        let mut group: Vec<String> = notes
+            .iter()
+            .filter(|note| note.key == key)
+            .map(|note| comment_line(&note.text))
+            .collect();
+        if let Some(value) = scalar_value(overrides, key) {
+            group.push(format!("{key} = {value}"));
+        }
+        if !group.is_empty() {
+            groups.push(group);
+        }
+    }
+    for (section, _) in LSP_SECTIONS {
+        let prefix = format!("{section}.");
+        let mut group: Vec<String> = notes
+            .iter()
+            .filter(|note| note.key == section || note.key.starts_with(&prefix))
+            .map(|note| comment_line(&note.text))
+            .collect();
+        if let Some(patch) = overrides.lsp(section) {
+            let mut fields = Vec::new();
+            if let Some(path) = &patch.path {
+                fields.push(format!("path = {}", toml_string(path)));
+            }
+            if let Some(args) = &patch.args {
+                let items: Vec<String> = args.iter().map(|arg| toml_string(arg)).collect();
+                fields.push(format!("args = [{}]", items.join(", ")));
+            }
+            if let Some(disabled) = patch.disabled {
+                fields.push(format!("disabled = {disabled}"));
+            }
+            if !fields.is_empty() {
+                group.push(format!("[{section}]"));
+                group.extend(fields);
+            }
+        }
+        if !group.is_empty() {
+            groups.push(group);
+        }
+    }
+
+    let mut text = groups
+        .iter()
+        .map(|group| group.join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    text.push('\n');
+    text
+}
+
+fn is_lsp_section(key: &str) -> bool {
+    let section = key.split_once('.').map_or(key, |(section, _)| section);
+    LSP_SECTIONS.iter().any(|(name, _)| *name == section)
+}
+
+/// The TOML text of a top-level machine-set value, or `None` when unset.
+fn scalar_value(overrides: &LocalOverrides, key: &str) -> Option<String> {
+    let text = |value: &Option<String>| value.as_deref().map(toml_string);
+    match key {
+        "data_dir" => overrides
+            .data_dir
+            .as_ref()
+            .map(|path| toml_string(&path.to_string_lossy())),
+        "port" => overrides.port.map(|port| port.to_string()),
+        "embedding_url" => text(&overrides.embedding_url),
+        "embedding_model" => text(&overrides.embedding_model),
+        "reranker_url" => text(&overrides.reranker_url),
+        "reranker_model" => text(&overrides.reranker_model),
+        "ripgrep_path" => text(&overrides.ripgrep_path),
+        "rust_analyzer_path" => text(&overrides.rust_analyzer_path),
+        _ => None,
+    }
+}
+
+/// A TOML string for `value`: a literal string (`'...'`, so a Windows path
+/// keeps its backslashes) unless it holds a quote or a control character, then
+/// an escaped basic string.
+fn toml_string(value: &str) -> String {
+    if value.chars().any(|c| c == '\'' || c.is_control()) {
+        toml::Value::String(value.to_owned()).to_string()
+    } else {
+        format!("'{value}'")
+    }
+}
+
+/// One comment line holding `text` flattened to a single line.
+fn comment_line(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    if flat.is_empty() {
+        "#".to_owned()
+    } else {
+        format!("# {flat}")
+    }
 }
 
 /// The overlay's patch, or `None` when no file is there.
@@ -1564,5 +1714,157 @@ mod tests {
         assert_eq!(find("typescript.path").value, Value::from("ts-test"));
         assert_eq!(find("python.args").value, Value::Array(Vec::new()));
         assert_eq!(find("python.args").provenance.source, Source::Default);
+    }
+
+    /// A patch that sets every machine key, with strings that need care in
+    /// TOML: backslashes, a single quote, a double quote, a non-ASCII letter.
+    fn full_overrides() -> LocalOverrides {
+        let lsp = |path: &str, args: &[&str], disabled: Option<bool>| LspOverride {
+            path: Some(path.to_owned()),
+            args: Some(args.iter().map(|arg| (*arg).to_owned()).collect()),
+            disabled,
+        };
+        LocalOverrides {
+            data_dir: Some(PathBuf::from(r"D:\team's data\idx")),
+            port: Some(9100),
+            embedding_url: Some("http://127.0.0.1:9101/v1".to_owned()),
+            embedding_model: Some(r#"embed "quoted" \ model"#.to_owned()),
+            reranker_url: Some("http://127.0.0.1:9102/rerank".to_owned()),
+            reranker_model: Some("rérank".to_owned()),
+            ripgrep_path: Some(r"C:\tools\rg.exe".to_owned()),
+            rust_analyzer_path: Some("/usr/local/bin/rust-analyzer".to_owned()),
+            csharp: Some(lsp(
+                r"C:\dotnet\csharp-ls.exe",
+                &["--a", "b c"],
+                Some(false),
+            )),
+            typescript: Some(lsp("/x/ts", &[], None)),
+            python: Some(LspOverride {
+                path: Some("/x/py".to_owned()),
+                ..LspOverride::default()
+            }),
+            go: Some(LspOverride {
+                disabled: Some(true),
+                ..LspOverride::default()
+            }),
+            java: Some(lsp("/x/jdtls", &["-Xmx1g"], None)),
+            clangd: Some(lsp(
+                "/x/clangd",
+                &["--compile-commands-dir=build"],
+                Some(true),
+            )),
+        }
+    }
+
+    #[test]
+    fn a_rendered_overlay_reads_back_as_the_patch_it_was_made_from() {
+        let overrides = full_overrides();
+        let text = render_overlay("generated for the test", &overrides, &[]);
+        assert!(text.starts_with("# generated for the test\n"), "{text}");
+        assert_eq!(LocalOverrides::parse(&text).unwrap(), overrides, "{text}");
+        // Literal strings keep a Windows path readable; the quote forces the
+        // escaped form only where it is needed.
+        assert!(text.contains(r"ripgrep_path = 'C:\tools\rg.exe'"), "{text}");
+        assert!(text.contains("port = 9100"), "{text}");
+
+        // The empty patch is a header only.
+        let text = render_overlay("nothing", &LocalOverrides::default(), &[]);
+        assert_eq!(text, "# nothing\n");
+        assert_eq!(
+            LocalOverrides::parse(&text).unwrap(),
+            LocalOverrides::default()
+        );
+    }
+
+    #[test]
+    fn notes_sit_with_their_setting_or_stand_alone_and_never_change_the_patch() {
+        let overrides = LocalOverrides {
+            ripgrep_path: Some("/x/rg".to_owned()),
+            typescript: Some(LspOverride {
+                path: Some("/x/ts".to_owned()),
+                ..LspOverride::default()
+            }),
+            ..LocalOverrides::default()
+        };
+        let notes = [
+            OverlayNote::new("", "general note"),
+            OverlayNote::new("not-a-key", "unknown keys are general too"),
+            OverlayNote::new("port", "port note"),
+            OverlayNote::new("ripgrep_path", "rg note"),
+            OverlayNote::new("csharp.path", "csharp-ls is not on PATH"),
+            OverlayNote::new("typescript.path", "ts note"),
+            OverlayNote::new("java", "java note"),
+        ];
+        let text = render_overlay("head", &overrides, &notes);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "# head",
+                "# general note",
+                "# unknown keys are general too",
+                "",
+                "# port note",
+                "",
+                "# rg note",
+                "ripgrep_path = '/x/rg'",
+                "",
+                "# csharp-ls is not on PATH",
+                "",
+                "# ts note",
+                "[typescript]",
+                "path = '/x/ts'",
+                "",
+                "# java note",
+            ]
+        );
+        assert_eq!(LocalOverrides::parse(&text).unwrap(), overrides);
+    }
+
+    /// A note may be built from what a service answered. A line break in it
+    /// must not end the comment and start a setting.
+    #[test]
+    fn a_note_cannot_break_out_of_its_comment() {
+        let hostile = "listed: evil\nport = 1\r\n[csharp]\npath = 'x'\u{0}\u{7f}\tend";
+        let notes = [
+            OverlayNote::new("embedding_url", hostile),
+            OverlayNote::new("", hostile),
+        ];
+        let text = render_overlay(hostile, &LocalOverrides::default(), &notes);
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            assert!(line.starts_with('#'), "{line:?} in {text}");
+        }
+        assert_eq!(
+            LocalOverrides::parse(&text).unwrap(),
+            LocalOverrides::default(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_overlay_applies_like_the_patch_and_names_the_keys_it_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let path = write(dir, "c.toml", &data_dir_line(dir));
+        let overrides = LocalOverrides {
+            port: Some(9150),
+            go: Some(LspOverride {
+                path: Some("/x/gopls".to_owned()),
+                ..LspOverride::default()
+            }),
+            ..LocalOverrides::default()
+        };
+        write(
+            dir,
+            "c.local.toml",
+            &render_overlay("test", &overrides, &[OverlayNote::new("port", "a note")]),
+        );
+        let resolved = resolve(&base_spec(Some(path))).unwrap();
+        assert_eq!(resolved.config.port, 9150);
+        assert_eq!(resolved.config.go.path.as_deref(), Some("/x/gopls"));
+        assert_eq!(resolved.sources["port"].source, Source::Local);
+        assert_eq!(resolved.sources["go.path"].source, Source::Local);
+        let mut config = Config::default();
+        assert_eq!(overrides.apply(&mut config), ["port", "go.path"]);
     }
 }

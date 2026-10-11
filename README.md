@@ -38,6 +38,7 @@ cd local-code-intelligence
 cargo xtask setup
 rustup component add rust-analyzer rust-src
 cargo xtask build --test
+./target/debug/local-code-intelligence init    # optional: write this machine's local overlay (tool paths, data_dir); see Configuration
 ./target/debug/local-code-intelligence serve   # local-code-intelligence.exe on Windows
 ```
 
@@ -60,6 +61,7 @@ Smoke test from another terminal:
 
 ```bash
 curl http://127.0.0.1:8768/health
+./target/debug/local-code-intelligence config   # every resolved value, its source and the URLs for the port in effect
 ```
 
 The server binds only to loopback. Its MCP transport uses the official `rmcp` SDK with host/origin validation (on `/mcp/<name>` too) and supports session-based older clients as well as the SDK's current protocol. Every other route (the REST mirror, `/openapi.json`, `/health`, `/ready`) applies the same DNS-rebinding protection: the `Host` header must name a loopback address (`127.0.0.1`, `localhost`, `::1`), and a browser `Origin`, when present, must be this server's own `http://127.0.0.1:<port>` or `http://localhost:<port>`; anything else gets HTTP 403. Non-browser clients that send no `Origin` (curl, scripts, the CLI) are unaffected. `/health` is a cheap process-liveness check and never contacts model services. `/ready` and the MCP `service_status` tool return the same bounded dependency report. They return HTTP 200 when a new semantic index can be created, even if optional channels are degraded, and `/ready` returns HTTP 503 when a required dependency is unavailable. Ctrl+C stops the server.
@@ -72,11 +74,17 @@ Values resolve in layers, lowest to highest: the built-in default, the configura
 
 The configuration file describes behaviour and is the one to share. Only machine-specific settings may come from the overlay or the environment: `data_dir`, `port`, `embedding_url`, `embedding_model`, `reranker_url`, `reranker_model`, `ripgrep_path`, `rust_analyzer_path`, and, for each language-server section (`csharp`, `typescript`, `python`, `go`, `java`, `clangd`), `path`, `args` and `disabled`. Any other key in the overlay (a candidate count, a template, a timeout, `[channels]`, `[fusion]`, `[index]`, `[search_profiles]`) is an error that names the key and says it belongs in the configuration file, so a local file can never change ranking. Changing `embedding_url` or `embedding_model` this way changes the embedding identity, so indexes built with the old values are re-embedded; `lci config` prints the identity.
 
-- Overlay file: `<stem>.local.toml` beside the configuration file in use (`config.local.toml` for `config.toml`, `lab.local.toml` for `lab.toml`). With no configuration file it is the per-user file `local-code-intelligence/config.local.toml` under the platform's configuration directory (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux). `LCI_LOCAL_CONFIG=<path>` names a different file, and `--no-local-config` ignores it. A missing overlay is not an error, and nothing creates it. It holds this machine's paths: keep it out of version control.
+- Overlay file: `<stem>.local.toml` beside the configuration file in use (`config.local.toml` for `config.toml`, `lab.local.toml` for `lab.toml`). With no configuration file it is the per-user file `local-code-intelligence/config.local.toml` under the platform's configuration directory (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux). `LCI_LOCAL_CONFIG=<path>` names a different file, and `--no-local-config` ignores it. A missing overlay is not an error, and nothing creates it except `lci init` (below). It holds this machine's paths: keep it out of version control.
 - Environment: `LCI_DATA_DIR`, `LCI_PORT`, `LCI_EMBEDDING_URL`, `LCI_EMBEDDING_MODEL`, `LCI_RERANKER_URL`, `LCI_RERANKER_MODEL`, `LCI_RIPGREP_PATH`, `LCI_RUST_ANALYZER_PATH`, and `LCI_<LANG>_PATH` / `LCI_<LANG>_DISABLED` (`true`, `false`, `1` or `0`) for `LANG` in `CSHARP`, `TYPESCRIPT`, `PYTHON`, `GO`, `JAVA`, `CLANGD`; `args` can be set only in a file. An empty variable counts as unset, and a malformed one is an error naming it. `LCI_CONFIG` and `LCI_LOCAL_CONFIG` name the two files; `--config` wins over `LCI_CONFIG`. `LCI_CANDIDATE_DUMP` is process-level behaviour, not configuration (see Direct CLI).
 - Values are taken exactly as written: there is no `~` or `${VAR}` expansion, and `data_dir` must be absolute.
 - Port 8765 belongs to the separate generation model, which LCI never contacts: `embedding_url` and `reranker_url` are rejected when their effective port is 8765 (an explicit `:8765` on any host; a URL without a port uses its scheme's default), whichever layer supplies them.
 - `lci config [--json]` resolves all of this and prints every value with the layer it came from, the files it consulted, and the URLs derived from the port, without creating the data directory, opening the index, sending a request or starting a language server. Values are printed as configured, including any credentials in a URL, so treat the output as local. See Direct CLI.
+- `lci [--config <file>] init [--force] [--dry-run] [--no-probe] [--json]` writes the overlay for this machine from what it finds, so an agent or a second machine does not have to guess a path:
+  - It writes only facts. `data_dir` is written as the platform default made explicit, and each of `rg`, `rust-analyzer`, `csharp-ls`, `typescript-language-server`, `pyright-langserver`, `gopls` and `clangd` found on `PATH` is written as an absolute path (the `.exe` or `.cmd` shim on Windows), because an editor-launched server often sees a shorter `PATH` than your shell. A key that a higher layer (the configuration file, an `LCI_*` variable) already sets is left alone and noted. Nothing is started to check a tool.
+  - Everything else it learns is a comment in the file: a missing tool and how to install it, whether each model service answers and which models it lists, whether the configured model is among them, whether the port is free on `127.0.0.1` (and, when it is not, whether an LCI answers `/health` there), and that `jdtls` (an installation directory) must be set by hand. It never writes a model name, a model URL or a port, never picks another port, and never writes the main configuration.
+  - The overlay is the one `lci config` reports as `local`: beside `--config`, else the per-user file, or the file `LCI_LOCAL_CONFIG` names (it need not exist; its directory is created). An existing file is never replaced without `--force`: without it `init` exits 3 and changes nothing. `--dry-run` prints what would be written and writes nothing; the file is otherwise written through a temporary file and a rename. The result is read back and validated before it is written.
+  - It contacts only the model services and the port, only on loopback hosts (`127.0.0.1`, `localhost`, `::1`), with no proxy and without following redirects, and never port 8765 (the generation model): a model URL on 8765 or on any other host is reported as not probed, on stderr and in the file, whatever flags are given. `--no-probe` sends no request at all. A port from 8765 to 8767 is not even bound.
+  - `--json` prints one object whose keys include `path`, `status` (`written`, `dry_run` or `exists`), `overlay` (the text), `set` (the keys written), `detected` (the data directory and each tool), `probes` (the two URLs and the port), `comments`, `valid` and `warnings`.
 
 | Setting | Default |
 | --- | --- |
@@ -249,6 +257,14 @@ Everything above runs against this repository, so the walkthrough needs nothing 
 ```bash
 "$lci" --config config.toml config          # layers, machine settings with their sources, derived URLs, other settings
 "$lci" --config config.toml config --json   # the same as one JSON object
+```
+
+`init` writes this machine's local overlay from what it detects (see Configuration for what it writes and what it will not contact):
+
+```bash
+"$lci" --config config.toml init --dry-run   # print the overlay it would write; write nothing
+"$lci" --config config.toml init             # write config.local.toml beside config.toml (exit 3 if it exists)
+"$lci" --config config.toml init --force --no-probe   # replace it, sending no request to any service
 ```
 
 `--json` prints one object on stdout: `valid` and `error`; `layers` (`file` with `path` and `named_by`, `--config` or `LCI_CONFIG`; `local` with `path`, `state` of `present`, `absent` or `disabled`, and `named_by`; `env`, the machine-set variables that were set; `flags`); `values`, every setting keyed by its dotted name (`port`, `typescript.path`, `index.freshness`; the `[search_profiles.<name>]` tables are one entry, `search_profiles`, present when profiles are configured) with `value`, `source` (`default`, `file`, `local`, `env` or `flag`) and `from` (the file, variable or flag); `config`, the whole resolved configuration; `derived` (`mcp_url`, `mcp_profile_urls`, `rest_base`, `health_url`, `ready_url`, `openapi_url`, `embedding_identity`); and `environment.other` (whether `LCI_CANDIDATE_DUMP` is set). The exit status is 0 for a valid configuration, 2 for one that resolves but fails validation (for example a reserved `port`; the report is still printed, with `valid` false), and 1 when a layer cannot be read or parsed (a missing file, a key outside the machine set in the overlay, a malformed `LCI_*` value; only `valid` and `error` are printed with `--json`).

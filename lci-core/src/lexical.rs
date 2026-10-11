@@ -404,7 +404,8 @@ fn resolve_ripgrep_path_from(
         return configured_path;
     }
 
-    if let Some(found) = find_on_path(path, windows) {
+    let names: &[&str] = if windows { &["rg.exe", "rg"] } else { &["rg"] };
+    if let Some(found) = first_file_on_path(path, names) {
         return found;
     }
     if windows {
@@ -417,17 +418,46 @@ fn resolve_ripgrep_path_from(
     configured_path
 }
 
-fn find_on_path(path: Option<&OsStr>, windows: bool) -> Option<PathBuf> {
-    let names: &[&str] = if windows { &["rg.exe", "rg"] } else { &["rg"] };
+/// The first of `names`, taken directory by directory in `path` order, that
+/// is a file.
+fn first_file_on_path<S: AsRef<str>>(path: Option<&OsStr>, names: &[S]) -> Option<PathBuf> {
     for directory in std::env::split_paths(path?) {
         for name in names {
-            let candidate = directory.join(name);
+            let candidate = directory.join(name.as_ref());
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// Finds the executable `name` in the directories of the process's `PATH`:
+/// the first directory that holds it wins. On Windows `name.exe` and
+/// `name.cmd` are tried before the bare `name` in each directory, because npm
+/// installs a bare, extensionless POSIX shell script next to the working
+/// `name.cmd` shim, and that script is not a valid Win32 program. Nothing is
+/// started: this only looks for files.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    find_on_path_in(name, std::env::var_os("PATH").as_deref(), cfg!(windows))
+}
+
+/// [`find_on_path`] over an explicit `PATH` value and platform, so the lookup
+/// order is testable anywhere.
+pub fn find_on_path_in(name: &str, path: Option<&OsStr>, windows: bool) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = if windows {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_owned(),
+        ]
+    } else {
+        vec![name.to_owned()]
+    };
+    first_file_on_path(path, &names)
 }
 
 fn vscode_install_roots(
@@ -1104,6 +1134,73 @@ mod tests {
             false,
         );
         assert_eq!(resolved, path_rg);
+    }
+
+    #[test]
+    fn find_on_path_tries_exe_then_cmd_then_the_bare_name_on_windows() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        for name in ["tool", "tool.cmd", "tool.exe"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let path = Some(dir.as_os_str());
+        assert_eq!(
+            find_on_path_in("tool", path, true),
+            Some(dir.join("tool.exe"))
+        );
+        std::fs::remove_file(dir.join("tool.exe")).unwrap();
+        assert_eq!(
+            find_on_path_in("tool", path, true),
+            Some(dir.join("tool.cmd"))
+        );
+        // The bare script is the last resort, never preferred over a shim.
+        std::fs::remove_file(dir.join("tool.cmd")).unwrap();
+        assert_eq!(find_on_path_in("tool", path, true), Some(dir.join("tool")));
+        std::fs::remove_file(dir.join("tool")).unwrap();
+        assert_eq!(find_on_path_in("tool", path, true), None);
+    }
+
+    #[test]
+    fn find_on_path_tries_only_the_bare_name_off_windows() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("tool.exe"), b"").unwrap();
+        std::fs::write(dir.join("tool.cmd"), b"").unwrap();
+        assert_eq!(find_on_path_in("tool", Some(dir.as_os_str()), false), None);
+        std::fs::write(dir.join("tool"), b"").unwrap();
+        assert_eq!(
+            find_on_path_in("tool", Some(dir.as_os_str()), false),
+            Some(dir.join("tool"))
+        );
+    }
+
+    #[test]
+    fn find_on_path_takes_the_first_directory_that_has_the_tool() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // A `.cmd` in an earlier directory beats an `.exe` in a later one:
+        // directory order comes before name order.
+        std::fs::write(first.join("tool.cmd"), b"").unwrap();
+        std::fs::write(second.join("tool.exe"), b"").unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        assert_eq!(
+            find_on_path_in("tool", Some(path.as_os_str()), true),
+            Some(first.join("tool.cmd"))
+        );
+        // A directory named like the tool is not a tool.
+        std::fs::remove_file(first.join("tool.cmd")).unwrap();
+        std::fs::create_dir(first.join("tool.exe")).unwrap();
+        assert_eq!(
+            find_on_path_in("tool", Some(path.as_os_str()), true),
+            Some(second.join("tool.exe"))
+        );
+        // No PATH, or an empty name, finds nothing.
+        assert_eq!(find_on_path_in("tool", None, true), None);
+        assert_eq!(find_on_path_in("", Some(path.as_os_str()), true), None);
     }
 
     #[test]

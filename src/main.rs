@@ -10,7 +10,7 @@ use local_code_intelligence::{
         self, CapStage, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED, ReplayOptions, RerankMode,
         RunOptions,
     },
-    lsp, server,
+    init, lsp, server,
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -59,6 +59,29 @@ enum Command {
     /// 2 when it resolves but is invalid (the report is still printed), and
     /// 1 when a layer cannot be read.
     Config {
+        /// Print one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write this machine's local overlay (the file `config` reports as
+    /// `local`) from what it finds: the platform data directory and the
+    /// absolute path of each tool on PATH, plus comments on the model
+    /// services, the configured models and the port. It never changes a model
+    /// name or the port, never writes the main configuration, and never
+    /// replaces an existing overlay without --force (exit 3 then). It contacts
+    /// only loopback hosts and never port 8765; --no-probe sends no request.
+    /// The overlay is the sibling of --config, else the per-user file, or the
+    /// file LCI_LOCAL_CONFIG names; --no-local-config does not apply here.
+    Init {
+        /// Replace an existing overlay.
+        #[arg(long)]
+        force: bool,
+        /// Print the overlay that would be written; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Send no request: do not ask the model services or the port.
+        #[arg(long)]
+        no_probe: bool,
         /// Print one JSON object instead of text.
         #[arg(long)]
         json: bool,
@@ -534,6 +557,52 @@ fn run_config(config_path: Option<PathBuf>, no_local_config: bool, json: bool) -
     Ok(())
 }
 
+/// `init`: detect this machine's tools and write the local overlay. Runs
+/// without opening the application. Exits 3, writing nothing, when the
+/// overlay exists and `--force` was not given.
+async fn run_init(config_path: Option<PathBuf>, options: init::Options, json: bool) -> Result<()> {
+    // The overlay being replaced must not count as a layer, whatever
+    // `--no-local-config` says.
+    let flags = Flags {
+        port: None,
+        no_local_config: true,
+    };
+    let outcome = match ResolveSpec::from_process(config_path, flags) {
+        Ok(spec) => init::run(&spec, &options).await,
+        Err(error) => Err(error),
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if json {
+                let failure = json!({"written": false, "error": format!("{error:#}")});
+                println!("{}", serde_json::to_string_pretty(&failure)?);
+            }
+            return Err(error);
+        }
+    };
+    for warning in &outcome.warnings {
+        eprintln!("{warning}");
+    }
+    let exists = outcome.status == init::Status::Exists;
+    let text = if json {
+        format!("{}\n", serde_json::to_string_pretty(&outcome.report)?)
+    } else if exists {
+        String::new()
+    } else {
+        outcome.render_text()
+    };
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()?;
+    drop(stdout);
+    if exists {
+        eprint!("{}", outcome.render_text());
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -594,6 +663,20 @@ async fn main() -> Result<()> {
     }
     if let Command::Config { json } = command {
         return run_config(cli.config, cli.no_local_config, json);
+    }
+    if let Command::Init {
+        force,
+        dry_run,
+        no_probe,
+        json,
+    } = command
+    {
+        let options = init::Options {
+            force,
+            dry_run,
+            no_probe,
+        };
+        return run_init(cli.config, options, json).await;
     }
     // Read the baseline report before opening the application, so an
     // unreadable path fails now rather than after a long evaluation.
@@ -684,6 +767,7 @@ async fn main() -> Result<()> {
             evaluate::report_with_comparison(&report, comparison.as_ref())?
         }
         Command::Config { .. } => unreachable!("config returns before the application opens"),
+        Command::Init { .. } => unreachable!("init returns before the application opens"),
         Command::Compare { .. } => unreachable!("compare returns before the application opens"),
         Command::Replay { .. } => unreachable!("replay returns before the application opens"),
         Command::Symbols { workspace, query } => {

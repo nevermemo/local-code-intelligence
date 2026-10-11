@@ -1,5 +1,6 @@
 pub mod app;
 pub mod evaluate;
+pub mod init;
 mod rest;
 pub mod server;
 pub mod store;
