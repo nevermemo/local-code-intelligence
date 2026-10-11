@@ -603,12 +603,15 @@ async fn run_init(config_path: Option<PathBuf>, options: init::Options, json: bo
     Ok(())
 }
 
+/// Default log filter (used when `RUST_LOG` is unset); `lci_core` is listed because LSP restart, readiness-timeout, and JSON-RPC reader events come from that crate.
+const DEFAULT_LOG_FILTER: &str = "local_code_intelligence=info,lci_core=info";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "local_code_intelligence=info".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -854,4 +857,49 @@ async fn main() -> Result<()> {
         anyhow::bail!("one or more required evaluation expectations failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
+
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Recorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(event.metadata().target().to_string());
+        }
+    }
+
+    #[test]
+    fn default_log_filter_enables_app_and_core_at_info() {
+        let filter = EnvFilter::try_new(DEFAULT_LOG_FILTER).expect("default filter parses");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(Recorder(seen.clone()).with_filter(filter));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "local_code_intelligence::app", "app info");
+            tracing::info!(target: "lci_core::lsp", "core info");
+            tracing::warn!(target: "lci_core::lsp", "core warn");
+            tracing::debug!(target: "lci_core::lsp", "core debug");
+            tracing::info!(target: "some_other_crate", "other info");
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "local_code_intelligence::app",
+                "lci_core::lsp",
+                "lci_core::lsp"
+            ]
+        );
+    }
 }
