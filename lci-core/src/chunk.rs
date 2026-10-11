@@ -104,7 +104,7 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
             end = start;
         } else if container || child.end_byte() - start > TARGET_BYTES {
             if end > start {
-                out.push((start, end));
+                out.push((start, child_start));
             }
             start = child_start;
             end = child.end_byte();
@@ -332,7 +332,10 @@ mod tests {
     use super::*;
 
     fn compact(source: &str) -> String {
-        source.chars().filter(|character| !character.is_whitespace()).collect()
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
     }
 
     fn assert_non_whitespace_coverage(source: &str, expected: &str) {
