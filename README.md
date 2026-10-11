@@ -191,14 +191,19 @@ this behavioral setting in the main LCI configuration, not a machine overlay.
 **Residual risks:** these defaults are defense in depth, not an untrusted-code
 sandbox. The manual describes `rust-analyzer.toml` support as work in progress;
 current rust-analyzer [configuration lookup](https://github.com/rust-lang/rust-analyzer/blob/master/crates/rust-analyzer/src/config.rs)
-lets workspace-scoped TOML settings take precedence over client settings. Such a
-file can re-enable build scripts/checks or replace their commands and environment;
-LCI does not suppress or rewrite it. The global `procMacro.enable` client setting
-wins over user TOML, but that alone does not prevent build-script execution.
+lets project TOML take precedence over client settings in workspace-scoped
+lookups, including the save-time check gate. Current startup Cargo/build-script
+loading and check-command construction use unscoped lookups, where client
+settings win; a TOML command entry alone does not prove it executes on startup.
+LCI does not suppress or rewrite these files, so do not rely on client settings
+as a version-independent policy against repository commands or environment
+overrides. The global `procMacro.enable` client setting wins over user TOML, but
+that alone does not prevent build-script execution.
 Cargo [configuration](https://doc.rust-lang.org/cargo/reference/config.html)
 environment overrides normally win over `.cargo/config.toml` wrapper settings,
-and Cargo aliases cannot replace built-in `metadata`/`check` commands. However,
-Cargo's `[env]` with `force = true` can replace inherited environment values;
+and Cargo aliases cannot replace built-in `metadata`/`check` commands. Cargo's
+`[env]` with `force = true` can replace inherited values for processes Cargo runs
+(a separate mechanism from Cargo's own configuration precedence);
 compiler/toolchain selection, repository-provided executables, other Cargo
 configuration and language-server vulnerabilities remain execution risks.
 rust-analyzer still invokes Cargo metadata and toolchain discovery. Other enabled
