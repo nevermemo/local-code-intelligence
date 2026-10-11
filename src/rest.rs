@@ -13,7 +13,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -108,12 +108,24 @@ async fn find_references(
     )
 }
 
+/// The query string of `POST /v1/search_code`. The request body is the same
+/// [`SearchArgs`] as the MCP tool's; the profile is a query parameter so that
+/// the body, like the MCP tool's arguments, is unchanged.
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    /// A configured `[search_profiles.<name>]`; absent is the default search.
+    /// An unknown name fails the request with an error that lists the
+    /// configured ones.
+    search_profile: Option<String>,
+}
+
 async fn search_code(
     State(app): State<Arc<App>>,
+    Query(query): Query<SearchQuery>,
     Json(args): Json<SearchArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
-        app.search_with_filters(
+        app.search_in_profile(
             Path::new(&args.workspace_path),
             &args.query,
             args.top_k,
@@ -123,6 +135,7 @@ async fn search_code(
                 exclude_paths: args.exclude_paths,
                 source_roles: args.source_roles,
             },
+            query.search_profile.as_deref(),
         )
         .await,
     )
@@ -181,6 +194,22 @@ fn openapi_document() -> Value {
         })
     };
 
+    // Same operation as the others, plus the one query parameter that picks a
+    // `[search_profiles.<name>]`. Documented statically: the names are the
+    // operator's configuration, and an unknown one is an error that lists them.
+    let mut search_code_path = post_operation(
+        "Hybrid semantic/lexical/LSP code search",
+        "search_code",
+        search_schema,
+    );
+    search_code_path["post"]["parameters"] = json!([{
+        "name": "search_profile",
+        "in": "query",
+        "required": false,
+        "description": "A configured [search_profiles.<name>] to run this search with; the same switches as the MCP endpoint /mcp/<name>. Omitted, the search is the default one and the result has no search_profile. An unknown name is an error that lists the configured ones.",
+        "schema": {"type": "string"}
+    }]);
+
     json!({
         "openapi": "3.0.3",
         "info": {
@@ -198,7 +227,7 @@ fn openapi_document() -> Value {
             "/v1/search_symbols": post_operation("Search workspace symbols via language servers", "search_symbols", symbol_schema),
             "/v1/find_definition": post_operation("Resolve a definition at a source position", "find_definition", position_schema),
             "/v1/find_references": post_operation("Find references at a source position", "find_references", references_schema),
-            "/v1/search_code": post_operation("Hybrid semantic/lexical/LSP code search", "search_code", search_schema),
+            "/v1/search_code": search_code_path,
             "/v1/service_status": {
                 "get": {
                     "operationId": "service_status",

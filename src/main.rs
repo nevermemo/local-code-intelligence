@@ -425,11 +425,23 @@ async fn main() -> Result<()> {
         )?,
         Command::Serve { port } => {
             let cancellation = tokio_util::sync::CancellationToken::new();
+            let profile_endpoints: Vec<String> = app
+                .config
+                .search_profiles
+                .keys()
+                .map(|name| format!("http://127.0.0.1:{port}{}", server::mcp_path(Some(name))))
+                .collect();
             let router = server::router(app, cancellation.clone(), port);
             let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
             tracing::info!(
                 "MCP: http://127.0.0.1:{port}/mcp; health: http://127.0.0.1:{port}/health"
             );
+            if !profile_endpoints.is_empty() {
+                tracing::info!(
+                    "MCP search profiles (same tools, search_code bound to the profile): {}",
+                    profile_endpoints.join(", ")
+                );
+            }
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;

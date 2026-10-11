@@ -11,6 +11,11 @@ use std::{path::Path, sync::Arc};
 pub struct McpServer {
     app: Arc<App>,
     tool_router: ToolRouter<Self>,
+    /// The `[search_profiles.<name>]` this endpoint's `search_code` runs
+    /// with: `None` on `/mcp`, the profile's name on `/mcp/<name>`. It is
+    /// the only thing that differs between the endpoints; the tool list and
+    /// the instructions are the same on every one.
+    search_profile: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -69,10 +74,11 @@ fn result<T: serde::Serialize>(value: anyhow::Result<T>) -> CallToolResult {
 }
 
 impl McpServer {
-    pub fn new(app: Arc<App>) -> Self {
+    pub fn new(app: Arc<App>, search_profile: Option<String>) -> Self {
         Self {
             app,
             tool_router: Self::tool_router(),
+            search_profile,
         }
     }
 }
@@ -167,7 +173,7 @@ impl McpServer {
     async fn search_code(&self, Parameters(args): Parameters<SearchArgs>) -> CallToolResult {
         result(
             self.app
-                .search_with_filters(
+                .search_in_profile(
                     Path::new(&args.workspace_path),
                     &args.query,
                     args.top_k,
@@ -177,6 +183,7 @@ impl McpServer {
                         exclude_paths: args.exclude_paths,
                         source_roles: args.source_roles,
                     },
+                    self.search_profile.as_deref(),
                 )
                 .await,
         )
@@ -197,17 +204,31 @@ impl ServerHandler for McpServer {
     }
 }
 
-pub fn router(
-    app: Arc<App>,
-    cancellation: tokio_util::sync::CancellationToken,
-    port: u16,
-) -> axum::Router {
+/// The path an MCP endpoint is mounted at: `/mcp` for the default search, or
+/// `/mcp/<name>` for the `[search_profiles.<name>]` it runs `search_code`
+/// with.
+pub fn mcp_path(search_profile: Option<&str>) -> String {
+    match search_profile {
+        Some(name) => format!("/mcp/{name}"),
+        None => "/mcp".to_owned(),
+    }
+}
+
+/// One MCP endpoint: the same tools, instructions, and rmcp configuration as
+/// every other, `search_code` bound to `search_profile`, and a session
+/// manager of its own, so a session id minted by one endpoint is unknown to
+/// every other.
+fn mcp_service(
+    app: &Arc<App>,
+    search_profile: Option<String>,
+    config: &rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
+) -> rmcp::transport::streamable_http_server::StreamableHttpService<
+    McpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+> {
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        StreamableHttpService, session::local::LocalSessionManager,
     };
-    let mut config = StreamableHttpServerConfig::default();
-    config.cancellation_token = cancellation;
-    config.allowed_origins = loopback_origins(port);
     // rmcp's session keep-alive defaults to 5 minutes of "inactivity" --
     // but a single long-running tool call (e.g. index_workspace cold-
     // embedding a large real workspace, which can legitimately take well
@@ -218,13 +239,25 @@ pub fn router(
     // front of it to worry about zombie connections at a shorter horizon.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(3600));
-    let ready_app = app.clone();
-    let service = StreamableHttpService::new(
-        move || Ok(McpServer::new(app.clone())),
+    let app = app.clone();
+    StreamableHttpService::new(
+        move || Ok(McpServer::new(app.clone(), search_profile.clone())),
         Arc::new(session_manager),
-        config,
-    );
-    axum::Router::new()
+        config.clone(),
+    )
+}
+
+pub fn router(
+    app: Arc<App>,
+    cancellation: tokio_util::sync::CancellationToken,
+    port: u16,
+) -> axum::Router {
+    use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
+    let mut config = StreamableHttpServerConfig::default();
+    config.cancellation_token = cancellation;
+    config.allowed_origins = loopback_origins(port);
+    let ready_app = app.clone();
+    let router = axum::Router::new()
         .merge(crate::rest::routes())
         .route(
             "/health",
@@ -244,15 +277,34 @@ pub fn router(
                 (status, axum::Json(report))
             }),
         )
-        // Applies only to the routes above; `/mcp` below gets rmcp's own
+        // Applies only to the routes above; `/mcp` and `/mcp/<name>` below get rmcp's own
         // equivalent Host/Origin validation.
-        .route_layer(axum::middleware::from_fn_with_state(port, loopback_guard))
-        .nest_service("/mcp", service)
+        .route_layer(axum::middleware::from_fn_with_state(port, loopback_guard));
+    // `route_service` (an exact path), not `nest_service`: a nested `/mcp`
+    // would claim every `/mcp/...` path as a catch-all and could not coexist
+    // with `/mcp/<name>`. As a result `/mcp/<unknown>` is a 404. `/mcp/`,
+    // which the nested service also answered, stays the default endpoint (the
+    // same service, so the same sessions). Added after `route_layer` so the
+    // loopback guard stays off these routes; each rmcp service validates Host
+    // and Origin itself.
+    let default_service = mcp_service(&app, None, &config);
+    let router = router
+        .route_service(&mcp_path(None), default_service.clone())
+        .route_service("/mcp/", default_service);
+    app.config
+        .search_profiles
+        .keys()
+        .fold(router, |router, name| {
+            router.route_service(
+                &mcp_path(Some(name)),
+                mcp_service(&app, Some(name.clone()), &config),
+            )
+        })
         .with_state(ready_app)
 }
 
 /// The only browser origins allowed to call this server: its own loopback
-/// addresses. Shared by rmcp's `/mcp` validation and [`loopback_guard`].
+/// addresses. Shared by rmcp's validation of every `/mcp` endpoint and [`loopback_guard`].
 fn loopback_origins(port: u16) -> Vec<String> {
     vec![
         format!("http://127.0.0.1:{port}"),
