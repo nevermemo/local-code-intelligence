@@ -52,7 +52,7 @@ pub const fn source_role_prior(role: SourceRole) -> f32 {
     }
 }
 
-/// Maximum characters retained in a bounded evidence snippet.
+/// Maximum bytes retained in a bounded evidence snippet, cut at a char boundary.
 pub const SNIPPET_BUDGET: usize = 400;
 
 /// Truncate code to the bounded snippet budget, marking truncation with a
@@ -463,6 +463,20 @@ mod tests {
     use super::*;
 
     const HASH: &str = "4f2a9c";
+
+    #[test]
+    fn bounded_snippet_limits_multibyte_input_by_bytes_at_a_char_boundary() {
+        let code = "界😀".repeat(SNIPPET_BUDGET);
+        assert!(code.len() > SNIPPET_BUDGET);
+        assert!(!code.is_char_boundary(SNIPPET_BUDGET));
+
+        let snippet = bounded_snippet(&code);
+        let retained = snippet.strip_suffix('…').unwrap();
+        assert!(snippet.len() <= SNIPPET_BUDGET + '…'.len_utf8());
+        assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+        assert!(code.is_char_boundary(retained.len()));
+        assert_eq!(retained, "界😀".repeat(SNIPPET_BUDGET / "界😀".len()));
+    }
 
     #[test]
     fn without_path_the_key_is_the_bare_content_hash() {
