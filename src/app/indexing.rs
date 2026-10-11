@@ -12,7 +12,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::Instant,
@@ -121,13 +121,28 @@ pub struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_check_error: Option<String>,
     pub watched: bool,
+    /// Deprecated, kept for one release: `analyzers_running["rust-analyzer"]`.
     pub analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["csharp-ls"]`.
     pub csharp_analyzer_running: bool,
+    /// Deprecated, kept for one release:
+    /// `analyzers_running["typescript-language-server"]`.
     pub typescript_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["pyright"]`.
     pub python_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["gopls"]`.
     pub go_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["jdtls"]`.
     pub java_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["clangd"]`.
     pub clangd_analyzer_running: bool,
+    /// Whether a started, ready language server is running for this
+    /// workspace, keyed by provider name (`rust-analyzer`, `csharp-ls`,
+    /// `typescript-language-server`, `pyright`, `gopls`, `jdtls`, `clangd`).
+    /// Derived from the language-server registry, so it has one entry for
+    /// every registered server, `false` for one that is not running, disabled
+    /// or unconfigured.
+    pub analyzers_running: BTreeMap<String, bool>,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -418,16 +433,24 @@ impl App {
                 Err(error) => (snapshot.is_some(), Some(format!("{error:#}"))),
             };
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
-        let analyzer_running = self.analyzer.running("rust-analyzer", &workspace.id).await;
-        let csharp_analyzer_running = self.analyzer.running("csharp-ls", &workspace.id).await;
-        let typescript_analyzer_running = self
-            .analyzer
-            .running("typescript-language-server", &workspace.id)
-            .await;
-        let python_analyzer_running = self.analyzer.running("pyright", &workspace.id).await;
-        let go_analyzer_running = self.analyzer.running("gopls", &workspace.id).await;
-        let java_analyzer_running = self.analyzer.running("jdtls", &workspace.id).await;
-        let clangd_analyzer_running = self.analyzer.running("clangd", &workspace.id).await;
+        let mut analyzers_running = BTreeMap::new();
+        for adapter in self.analyzer.adapters() {
+            let provider = adapter.provider();
+            analyzers_running.insert(
+                provider.to_owned(),
+                self.analyzer.running(provider, &workspace.id).await,
+            );
+        }
+        // The deprecated per-server booleans read the same map, so they can
+        // never disagree with it.
+        let running = |provider: &str| analyzers_running.get(provider).copied().unwrap_or(false);
+        let analyzer_running = running("rust-analyzer");
+        let csharp_analyzer_running = running("csharp-ls");
+        let typescript_analyzer_running = running("typescript-language-server");
+        let python_analyzer_running = running("pyright");
+        let go_analyzer_running = running("gopls");
+        let java_analyzer_running = running("jdtls");
+        let clangd_analyzer_running = running("clangd");
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -450,6 +473,7 @@ impl App {
             go_analyzer_running,
             java_analyzer_running,
             clangd_analyzer_running,
+            analyzers_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }

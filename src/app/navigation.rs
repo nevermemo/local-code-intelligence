@@ -21,7 +21,46 @@ pub struct NavigationReport {
     pub results: Vec<lsp::Location>,
 }
 
+/// What [`App::release_language_servers`] stopped.
+#[derive(Debug, Serialize)]
+pub struct ReleaseReport {
+    pub workspace: Workspace,
+    /// The language servers (provider names such as `csharp-ls`, sorted) that
+    /// were running for this workspace and have been shut down. Empty when
+    /// the workspace had none, which is not an error.
+    pub released: Vec<String>,
+}
+
 impl App {
+    /// Shuts down every language server this service runs for the workspace
+    /// (the protocol's `shutdown` and `exit`, bounded to about four seconds
+    /// per server, then a kill) and forgets its session; the next navigation
+    /// or search call starts a fresh server. Needs no index: a workspace that
+    /// was never indexed, or has no server running, reports an empty list.
+    /// The path is resolved like every other workspace call, so a directory
+    /// that does not exist is an error.
+    pub async fn release_language_servers(&self, path: &Path) -> Result<ReleaseReport> {
+        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
+        let released = self
+            .analyzer
+            .release(&workspace.id)
+            .await
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Ok(ReleaseReport {
+            workspace,
+            released,
+        })
+    }
+
+    /// Shuts down the language servers of every workspace, for service exit.
+    /// Returns how many servers were stopped. Bounded by about four seconds
+    /// however many servers there are, because they shut down side by side.
+    pub async fn shutdown_language_servers(&self) -> usize {
+        self.analyzer.shutdown_all().await
+    }
+
     pub async fn symbols(&self, path: &Path, query: &str) -> Result<NavigationReport> {
         ensure!(!query.trim().is_empty(), "query must not be empty");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;

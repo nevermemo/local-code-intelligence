@@ -758,6 +758,174 @@ async fn shutdown_all_releases_every_session() {
     assert_eq!(state_count(&state, "spawn_count.txt"), 3);
 }
 
+/// `Status.analyzers_running` has one entry per registered language server,
+/// `true` only for a started, ready session of that workspace, and the seven
+/// older per-server booleans keep reporting the same facts.
+#[tokio::test]
+async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_session() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let other = temp.path().join("other-workspace");
+    std::fs::create_dir_all(&other).unwrap();
+    let app = App::open(with_fake_csharp_server(config, &state, &[]))
+        .await
+        .unwrap();
+    let providers = [
+        "clangd",
+        "csharp-ls",
+        "gopls",
+        "jdtls",
+        "pyright",
+        "rust-analyzer",
+        "typescript-language-server",
+    ];
+    let running_providers = |status: &local_code_intelligence::app::Status| {
+        status
+            .analyzers_running
+            .iter()
+            .filter(|(_, running)| **running)
+            .map(|(provider, _)| provider.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Before anything has started (the workspace is not even indexed) every
+    // server is listed, none running.
+    let before = app.status(&workspace).await.unwrap();
+    assert_eq!(
+        before.analyzers_running.keys().collect::<Vec<_>>(),
+        providers
+    );
+    assert!(running_providers(&before).is_empty());
+
+    app.index(&workspace).await.unwrap();
+    app.symbols(&workspace, "Calculator").await.unwrap();
+    let during = app.status(&workspace).await.unwrap();
+    assert_eq!(
+        during.analyzers_running.keys().collect::<Vec<_>>(),
+        providers
+    );
+    assert_eq!(running_providers(&during), ["csharp-ls"]);
+    // The older booleans: the one for C# is true, the one for rust-analyzer
+    // (`analyzer_running`, the fixture has none) and the rest are false.
+    assert!(during.csharp_analyzer_running);
+    assert!(!during.analyzer_running);
+    assert!(!during.typescript_analyzer_running);
+    assert!(!during.python_analyzer_running);
+    assert!(!during.go_analyzer_running);
+    assert!(!during.java_analyzer_running);
+    assert!(!during.clangd_analyzer_running);
+    // The wire form carries both.
+    let wire = serde_json::to_value(&during).unwrap();
+    assert_eq!(wire["analyzers_running"]["csharp-ls"], true, "{wire}");
+    assert_eq!(wire["analyzers_running"]["rust-analyzer"], false, "{wire}");
+    assert_eq!(wire["csharp_analyzer_running"], true, "{wire}");
+    assert_eq!(wire["analyzer_running"], false, "{wire}");
+
+    // The map is per workspace.
+    let elsewhere = app.status(&other).await.unwrap();
+    assert!(running_providers(&elsewhere).is_empty());
+    assert!(!elsewhere.csharp_analyzer_running);
+
+    // Releasing the workspace turns the entry off, not out.
+    let report = app.release_language_servers(&workspace).await.unwrap();
+    assert_eq!(report.released, ["csharp-ls"]);
+    assert_eq!(report.workspace.id, during.workspace.id);
+    let after = app.status(&workspace).await.unwrap();
+    assert_eq!(
+        after.analyzers_running.keys().collect::<Vec<_>>(),
+        providers
+    );
+    assert!(running_providers(&after).is_empty());
+    assert!(!after.csharp_analyzer_running);
+    assert!(
+        app.release_language_servers(&workspace)
+            .await
+            .unwrap()
+            .released
+            .is_empty()
+    );
+    models_task.abort();
+}
+
+/// Service exit stops every language server within the bound the grace period
+/// gives it, even a server that answers neither `shutdown` nor `exit`, which
+/// is then killed.
+#[tokio::test]
+async fn shutting_the_service_down_finishes_within_the_shutdown_bound_for_a_server_that_ignores_it()
+{
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let app = App::open(with_fake_csharp_server(
+        config,
+        &state,
+        &["--ignore-shutdown"],
+    ))
+    .await
+    .unwrap();
+    app.index(&workspace).await.unwrap();
+    app.symbols(&workspace, "Calculator").await.unwrap();
+    assert!(
+        app.status(&workspace)
+            .await
+            .unwrap()
+            .csharp_analyzer_running
+    );
+    let heartbeat = |state: &std::path::Path| {
+        std::fs::read_to_string(state.join("heartbeat.txt")).unwrap_or_default()
+    };
+    let beat = heartbeat(&state);
+    wait_until(
+        "the server's heartbeat to move",
+        Duration::from_secs(10),
+        async || heartbeat(&state) != beat,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    // 10 s is only a hard stop against a hang. The bound is the construction
+    // one, as in `a_server_that_ignores_shutdown_is_killed_within_the_grace_period`;
+    // exceeding `serve`'s 5 s budget would degrade to a warning plus
+    // kill-on-exit, not a failure.
+    let stopped = tokio::time::timeout(Duration::from_secs(10), app.shutdown_language_servers())
+        .await
+        .expect("shutting the language servers down must not hang");
+    let elapsed = started.elapsed();
+    assert_eq!(stopped, 1);
+    assert!(
+        elapsed < 2 * local_code_intelligence::lsp::SHUTDOWN_GRACE + Duration::from_secs(2),
+        "the shutdown must be bounded by the grace period, took {elapsed:?}"
+    );
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 1);
+    assert!(
+        !app.status(&workspace)
+            .await
+            .unwrap()
+            .csharp_analyzer_running
+    );
+    assert_eq!(app.shutdown_language_servers().await, 0);
+
+    // The server that ignored both was killed: its heartbeat stops (a live one
+    // rewrites it every 50 ms).
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let before = heartbeat(&state);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if before == heartbeat(&state) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the server that ignored shutdown was still alive 10 s after the service shut down"
+        );
+    }
+    models_task.abort();
+}
+
 /// The priming request (3 s here) outlasts the idle timeout (1 s), and the
 /// `workspace/symbol` caller is waiting for it: the server must not be
 /// released from under that caller, which would fail its request and cost a

@@ -218,6 +218,42 @@ fn write(root: &Path, name: &str, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+/// A two-file C# workspace for the fake language server (see
+/// [`with_fake_csharp_server`]); its `Calculator` is what the fake answers.
+fn write_csharp_workspace(root: &Path) {
+    write(
+        root,
+        "src/Calculator.cs",
+        "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n",
+    );
+    write(
+        root,
+        "src/CallSite.cs",
+        "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\n",
+    );
+}
+
+/// `config` with the C# language server replaced by the fake one (see
+/// `fake_lsp.rs`) in `workspace-symbols` mode, recording what it saw under
+/// `state_dir`. `extra_args` are more fake-server flags, for example
+/// `--ignore-shutdown`. The request timeout is 5 s, so a slow process start
+/// under load does not fail `initialize`. Keep `config` from [`fixture`]: it
+/// points the model services at the fake ones, never at a real port.
+fn with_fake_csharp_server(mut config: Config, state_dir: &Path, extra_args: &[&str]) -> Config {
+    config.lsp_timeout_seconds = 5;
+    config.csharp = local_code_intelligence::config::CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: ["--mode", "workspace-symbols", "--state"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain([state_dir.to_string_lossy().into_owned()])
+            .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
+            .collect(),
+        disabled: false,
+    };
+    config
+}
+
 /// Removes every `LCI_*` variable the test process has from the environment
 /// `command` will spawn with, so what a developer's own shell exports
 /// (`LCI_CONFIG`, `LCI_PORT`, `LCI_DATA_DIR`, `LCI_CANDIDATE_DUMP`, any

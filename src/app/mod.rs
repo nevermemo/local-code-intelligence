@@ -11,7 +11,7 @@ mod search;
 pub use indexing::{
     IndexAction, IndexReport, IndexedFile, IndexedFilesReport, Status, WatchReport,
 };
-pub use navigation::NavigationReport;
+pub use navigation::{NavigationReport, ReleaseReport};
 pub use readiness::{ReadinessComponent, ReadinessDegraded, ServiceStatus};
 pub use search::{
     CANDIDATE_DUMP_ENV, CandidateTrace, RerankOutcome, SearchIndexLifecycle, SearchOptions,

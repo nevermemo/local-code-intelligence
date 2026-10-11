@@ -211,6 +211,162 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     models_task.abort();
 }
 
+/// How many lines the fake language server appended to `name` in its state
+/// directory (one per process that saw the event); 0 when there is no file.
+fn lsp_event_count(state: &Path, name: &str) -> usize {
+    std::fs::read_to_string(state.join(name)).map_or(0, |text| text.lines().count())
+}
+
+/// How many fake language-server processes have been started under `state`.
+fn lsp_spawn_count(state: &Path) -> u64 {
+    std::fs::read_to_string(state.join("spawn_count.txt"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `POST /v1/release_workspace` stops the language servers of the workspace
+/// it names, says which, and changes nothing else: `index_status` then shows
+/// them not running, a repeat finds nothing to stop, the next navigation call
+/// starts a server again, and there is still no MCP tool for it.
+#[tokio::test]
+async fn rest_release_workspace_stops_the_language_servers_of_that_workspace() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("lsp-state");
+    let workspace = temp.path().join("release-repository");
+    write_csharp_workspace(&workspace);
+    let app = Arc::new(
+        App::open(with_fake_csharp_server(config, &state, &[]))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let call = |path: &str, workspace: &Path| {
+        client
+            .post(format!("{base}{path}"))
+            .json(&json!({"workspace_path": workspace}))
+            .send()
+    };
+    let navigate = || {
+        client
+            .post(format!("{base}/v1/search_symbols"))
+            .json(&json!({"workspace_path": workspace, "query": "Calculator"}))
+            .send()
+    };
+
+    // A navigation call starts the server.
+    let symbols = navigate().await.unwrap();
+    assert_eq!(symbols.status(), StatusCode::OK);
+    let status = call("/v1/index_status", &workspace)
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(status["analyzers_running"]["csharp-ls"], true, "{status}");
+    assert_eq!(status["csharp_analyzer_running"], true, "{status}");
+    assert_eq!(lsp_spawn_count(&state), 1);
+
+    // The release names the workspace and the server it stopped, and has
+    // finished the whole protocol exchange by the time it answers.
+    let released = call("/v1/release_workspace", &workspace).await.unwrap();
+    assert_eq!(released.status(), StatusCode::OK);
+    let released = released.json::<Value>().await.unwrap();
+    assert_eq!(released["released"], json!(["csharp-ls"]), "{released}");
+    assert_eq!(released["workspace"], status["workspace"], "{released}");
+    let mut keys: Vec<&str> = released
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["released", "workspace"]);
+    assert_eq!(lsp_event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(lsp_event_count(&state, "exit_seen.txt"), 1);
+
+    // Nothing is running any more, in the map and in the older booleans.
+    let status = call("/v1/index_status", &workspace)
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(status["analyzers_running"]["csharp-ls"], false, "{status}");
+    assert_eq!(status["csharp_analyzer_running"], false, "{status}");
+
+    // A repeat has nothing to stop; that is not an error.
+    let again = call("/v1/release_workspace", &workspace).await.unwrap();
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(again.json::<Value>().await.unwrap()["released"], json!([]));
+    assert_eq!(lsp_event_count(&state, "shutdown_seen.txt"), 1);
+
+    // No index is needed: an existing directory that was never indexed (and
+    // so has no server) is an empty release, a directory that does not exist
+    // is the usual workspace error.
+    let unindexed = temp.path().join("never-indexed");
+    std::fs::create_dir_all(&unindexed).unwrap();
+    let empty = call("/v1/release_workspace", &unindexed).await.unwrap();
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(empty.json::<Value>().await.unwrap()["released"], json!([]));
+    let missing = call(
+        "/v1/release_workspace",
+        &temp.path().join("no-such-directory"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(missing.json::<Value>().await.unwrap()["error"].is_string());
+
+    // The next navigation call starts a fresh server on its own.
+    let symbols = navigate().await.unwrap();
+    assert_eq!(symbols.status(), StatusCode::OK);
+    assert_eq!(lsp_spawn_count(&state), 2);
+    let status = call("/v1/index_status", &workspace)
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(status["analyzers_running"]["csharp-ls"], true, "{status}");
+
+    // The OpenAPI document lists the endpoint with the workspace body.
+    let openapi = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let operation = &openapi["paths"]["/v1/release_workspace"]["post"];
+    assert_eq!(operation["operationId"], "release_workspace", "{openapi}");
+    assert!(
+        operation["requestBody"]["content"]["application/json"]["schema"]["properties"]["workspace_path"]
+            .is_object(),
+        "{operation}"
+    );
+
+    // REST only: the MCP tool list does not grow.
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let tools = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    assert!(
+        tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().contains("release")),
+        "{tools}"
+    );
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
 #[tokio::test]
 async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
     let (temp, config, _fake, models_task) = fixture().await;
@@ -233,6 +389,7 @@ async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
     for (method, path) in [
         ("POST", "/v1/index_status"),
         ("POST", "/v1/search_code"),
+        ("POST", "/v1/release_workspace"),
         ("GET", "/openapi.json"),
         ("GET", "/health"),
         ("GET", "/ready"),

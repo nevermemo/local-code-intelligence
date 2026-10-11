@@ -10,7 +10,7 @@ use local_code_intelligence::{
         self, CapStage, CompareOptions, DEFAULT_RESAMPLES, DEFAULT_SEED, ReplayOptions, RerankMode,
         RunOptions,
     },
-    server,
+    lsp, server,
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -19,6 +19,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 #[derive(Parser)]
@@ -724,7 +725,7 @@ async fn main() -> Result<()> {
                 .keys()
                 .map(|name| format!("http://127.0.0.1:{port}{}", server::mcp_path(Some(name))))
                 .collect();
-            let router = server::router(app, cancellation.clone(), port);
+            let router = server::router(Arc::clone(&app), cancellation.clone(), port);
             let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
             tracing::info!(
                 "MCP: http://127.0.0.1:{port}/mcp; health: http://127.0.0.1:{port}/health"
@@ -735,12 +736,27 @@ async fn main() -> Result<()> {
                     profile_endpoints.join(", ")
                 );
             }
-            axum::serve(listener, router)
+            let served = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     cancellation.cancel();
                 })
-                .await?;
+                .await;
+            // The server has stopped, gracefully (Ctrl+C) or not: stop the
+            // language servers cleanly instead of leaving it to the process
+            // exit killing them. Their shutdowns run side by side, each
+            // bounded by twice the grace period, so this budget (the grace
+            // period twice over plus a second, 5 s today) is a backstop;
+            // exceeding it only logs a warning and the rest are killed on exit.
+            let budget = 2 * lsp::SHUTDOWN_GRACE + Duration::from_secs(1);
+            match tokio::time::timeout(budget, app.shutdown_language_servers()).await {
+                Ok(released) => tracing::info!(released, "language servers released at shutdown"),
+                Err(_) => tracing::warn!(
+                    budget_s = budget.as_secs(),
+                    "language server shutdown did not finish in time; the rest are killed on exit"
+                ),
+            }
+            served?;
             return Ok(());
         }
     };

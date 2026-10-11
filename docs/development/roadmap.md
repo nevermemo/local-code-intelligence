@@ -192,8 +192,8 @@ reviewer decisions, applied in each item):
 Mark an item `in-progress (<date>)` in its table row when a slice starts; list in-flight or next-queued slices here; remove an entry here when its slice is committed. Keep this block to 10 lines: the compaction hook prints the first 15 lines of this section.
 
 **Now** (2026-10-11, code as of `38d6d18`):
-- I-10 agent A/B: pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (v2.1, amendments A1-A21 inside it; untracked). Harness, run workflows and the Java/C# sandbox are built; next: A7a and N3b, first-task indexes, SC1 sanity check, binary freeze, dry runs, pilot, SC2, full pass. 8766 serves the 0.6B embedder (swapped 2026-10-11 for the A/B's indexing; restore the 4B afterwards).
-- N3b: REST release endpoint, release on Ctrl+C, `Status.analyzers_running`; N3a landed in `ced5fbf`, A6 search profiles in `15bc4c6` (A6a) and `38d6d18` (A6b). Plan: `plans/p1-p2-plans.md` in the coordinator's work area outside the repository (old slice names P2a/P2b).
+- I-10 agent A/B: pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (v2.1, amendments A1-A21 inside it; untracked). Harness, run workflows and the Java/C# sandbox are built; next: M7, first-task indexes (running), SC1 sanity check, binary freeze, dry runs, pilot, SC2, full pass. 8766 serves the 0.6B embedder (swapped 2026-10-11 for the A/B's indexing; restore the 4B afterwards).
+- A/B plumbing in LCI is complete: AB-1, N3a, N3b, A6a, A6b (plans in the coordinator's work area outside the repository); next M7 (index-time embedding retries a dropped connection), then SC1 and the freeze.
 - A7 portable configuration (owner request 2026-10-11; P2 table): A7a and A7e done; next N3b, then A7b `lci init` (also strip `LCI_*` in the acceptance harness spawns), A7c `cargo xtask env`, A7d migration + lint, then SC6. Plan: `portable-config-plan.md` in the coordinator's plans directory.
 - R1b: windows 14/16 live confirm (pre-registered in R1), deferred until the 4B embedder is back on 8766 after the A/B.
 - Housekeeping: the audit's own actions A1-A9 are done (`HOUSEKEEPING-AUDIT.md`, `HOUSEKEEPING-SANITY.md`, untracked); its batches B (after the A/B freeze) and C (owner decisions, recorded) remain; the roadmap split waits for the next renewal.
@@ -572,7 +572,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | W1 | mtime+size stat cache before hashing (manifest additive fields) | ready | M | - |
 | W2 | `notify`-based watcher with polling fallback and persisted watch roots | ready | M | W1 preferred |
 | N2 | LSP document lifecycle: open once, `didChange` on edits, `didClose`, drop fixed sleeps | ready | M | - |
-| N3 | LSP `shutdown`/`exit`, idle eviction, registry-derived status | partly done: N3a `ced5fbf` (idle release and bounded `shutdown`/`exit`) landed; open: N3b = REST release endpoint, release on Ctrl+C, `Status.analyzers_running` | S | - |
+| N3 | LSP `shutdown`/`exit`, idle eviction, registry-derived status | done: N3a `ced5fbf` (idle release and bounded `shutdown`/`exit`); N3b 2026-10-11 (REST `POST /v1/release_workspace`, release on Ctrl+C within 2x the shutdown grace + 1 s, `Status.analyzers_running` with the seven booleans kept one release) | S | - |
 
 ### L0 - Engine-independent lexical channel fixes
 `ready` (edited in the 2026-10-10 triage: L2 `2031ffe` already did the per-file `dunce::canonicalize` and replaced the O(matches x chunks) lexical mapping with per-path candidate selection, and its term selection by rarity with a stop list closes the explorer paragraph below; what remains is listed here) - XS-S - deps: none - skill: `lci-retrieval-evaluation` (latency and robustness only; no ranking change)
