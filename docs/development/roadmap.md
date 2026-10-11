@@ -267,6 +267,7 @@ C2, C3 and N6).
 | M7 | Index-time embedding retries a request whose pooled connection the server closed or reset (`connection closed before message completed` aborted a 36-minute index run) | done (2026-10-11) | XS | - |
 | N9 | Discarded LSP sessions keep running (3 orphaned rust-analyzers from 2 requests during a warm-up stalled by a concurrent `cargo fetch`) and loading-time errors trigger cold restarts | ready (verified 2026-10-11; trigger needs a stalled load) | S-M, live | N7 |
 | N10 | The default log filter (`local_code_intelligence=info`) drops every `lci_core` event, so LSP restarts, readiness timeouts and JSON-RPC reader failures are never logged | ready (verified 2026-10-11) | XS | - |
+| N11 | Qt Linguist translation files (`*.ts`, XML) are indexed as TypeScript: in bitcoin they are 100 files and 14 MB, about as large as all its C/C++ sources, and their long chunks slow the embedding down | ready (verified 2026-10-11 from the extension table and the A/B's bitcoin index) | S | - |
 
 ### R0 - Fusion-only baseline
 `done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
@@ -544,6 +545,13 @@ status: see table (new in the second 2026-10-10 triage) - S - deps: E0 - skill: 
 - Scope: default filter `local_code_intelligence=info,lci_core=info` (one constant, used by `main`); the README's timing paragraph recommends `RUST_LOG=local_code_intelligence=debug`, which has the same blind spot: make it name both crates.
 - Accept: a unit test that the default filter enables a `lci_core` warn event and keeps `lci_core` debug off; live: a forced LSP request error on a fake server shows the restart warning in the serve log.
 - Risk: none beyond log volume (info-level `lci_core` events are few).
+
+### N11 - Qt Linguist `.ts` files are indexed as TypeScript
+`ready` (verified 2026-10-11 from `lci-core/src/language.rs` and the A/B's bitcoin index) - S - deps: none - skill: `lci-language-adapter`
+- Why: the language table maps the `ts` extension to TypeScript with no content check. Qt projects keep their translations in Qt Linguist files with the same extension (`<TS version="2.1" language="de">` XML). bitcoin has 100 of them under `src/qt/locale/`, 14.4 MB against 16.7 MB of `.cpp`/`.h`. They are parsed with the TypeScript grammar, chunked and embedded: the A/B's bitcoin index has spent more than an hour on these chunks so far, at about 500 tokens/s on the 0.6B embedder (the chunks are long), and every translated UI string becomes a lexical and semantic decoy for questions about the GUI code.
+- Scope: (1) sniff content for `ts` files before parsing (a leading `<?xml` or `<TS` after whitespace means Qt Linguist); classify such files as non-source data: skip them or index them as plain text under a size cap, and record the decision in the file's metadata; (2) check the other extensions in the table for the same kind of clash (`.m` Objective-C vs MATLAB, `.h` C vs C++ is already shared, `.pl` Perl vs Prolog) and list what is not handled; (3) report the skipped count in the index summary.
+- Accept: a fixture tree with one TypeScript file and one Qt Linguist file indexes the first as TypeScript and does not parse the second as TypeScript; a re-index after the change drops the old chunks of the Linguist file (deletion path); live: bitcoin's chunk count and indexing time before and after, and a GUI question's top 10 without translation chunks.
+- Risk: a real TypeScript file must never be misclassified: require an XML prolog or a `<TS` root element, which no TypeScript file starts with.
 
 ### H1 - Rust test-file classification
 `done` (3f5861e, recorded cca6744; six filter tests; core identical, mined W/L/T 0/3/32 with all three losses on LSP budget hits, see E5) - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
