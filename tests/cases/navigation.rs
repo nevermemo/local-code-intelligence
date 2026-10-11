@@ -909,7 +909,8 @@ fn write_csharp_and_typescript_workspace(root: &std::path::Path) {
 /// for a stray C# file in a Rust repository) while the TypeScript server
 /// answers that nothing matches. The query is a correct "no match", so the
 /// call succeeds with no results. Both servers really ran: the C# one was
-/// started and failed, the TypeScript one was asked once.
+/// started and failed, the TypeScript one was asked once. The answer carries
+/// one warning for the failed server, so it is not mistaken for a clean miss.
 #[tokio::test]
 async fn symbols_return_an_empty_answer_when_another_applicable_server_failed() {
     let (temp, config, _fake, models_task) = fixture().await;
@@ -938,7 +939,171 @@ async fn symbols_return_an_empty_answer_when_another_applicable_server_failed() 
         "csharp-ls must have been started and failed, not skipped"
     );
     assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with("Optional LSP provider unavailable: csharp-ls: "),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report.warnings[0].contains("typescript-language-server"),
+        "{:?}",
+        report.warnings
+    );
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["warnings"].as_array().map(Vec::len), Some(1), "{wire}");
     models_task.abort();
+}
+
+/// The warning does not depend on how the server failed: csharp-ls answers
+/// with a JSON-RPC error response to every request (`--mode error-response`,
+/// the process keeps running and no timeout is involved) while the TypeScript
+/// server answers that nothing matches. The call still succeeds with no
+/// results and one warning for csharp-ls.
+#[tokio::test]
+async fn symbols_warn_when_another_applicable_server_answered_with_an_error() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    let app = App::open(with_fake_csharp_and_typescript_servers(
+        config,
+        &state,
+        "error-response",
+        "no-symbols",
+    ))
+    .await
+    .unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .symbols(&workspace, "NoSuchSymbolAnywhere")
+        .await
+        .expect("the TypeScript server answered, so the call must not fail");
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    // An error response discards the session like an exit does: csharp-ls is
+    // started, answers with the error, is restarted once, and fails again.
+    assert_eq!(state_count(&state.join("csharp"), "spawn_count.txt"), 2);
+    assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with("Optional LSP provider unavailable: csharp-ls: "),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings[0].contains("fake internal error"),
+        "{:?}",
+        report.warnings
+    );
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["warnings"].as_array().map(Vec::len), Some(1), "{wire}");
+    models_task.abort();
+}
+
+/// Each failed server gets its own warning, in provider order, however many
+/// servers answered: csharp-ls and pyright exit while the TypeScript server
+/// answers with nothing, so the two warnings name `csharp-ls` then `pyright`.
+#[tokio::test]
+async fn symbols_warn_once_per_failed_server_in_provider_order() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    write(
+        &workspace,
+        "src/Calculator.py",
+        "class Calculator:\n    def add(self, a, b):\n        return a + b\n",
+    );
+    let mut config = with_fake_csharp_and_typescript_servers(
+        config,
+        &state,
+        "exit-during-request",
+        "no-symbols",
+    );
+    config.python = PythonLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: vec![
+            "--mode".to_owned(),
+            "exit-during-request".to_owned(),
+            "--state".to_owned(),
+            state.join("python").to_string_lossy().into_owned(),
+            "--primary-file".to_owned(),
+            "src/Calculator.py".to_owned(),
+        ],
+        disabled: false,
+    };
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app
+        .symbols(&workspace, "NoSuchSymbolAnywhere")
+        .await
+        .expect("the TypeScript server answered, so the call must not fail");
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with("Optional LSP provider unavailable: csharp-ls: "),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings[1].starts_with("Optional LSP provider unavailable: pyright: "),
+        "{:?}",
+        report.warnings
+    );
+    models_task.abort();
+}
+
+/// A navigation answer that no server failed to give has no `warnings` key at
+/// all, so the response of `search_symbols`, `find_definition`, and
+/// `find_references` is what it was before the field existed.
+#[tokio::test]
+async fn navigation_answers_without_a_server_failure_have_no_warnings_key() {
+    for (mode, operation) in [
+        ("workspace-symbols", "symbols"),
+        ("definition", "definition"),
+        ("references", "references"),
+    ] {
+        let (temp, mut config, _fake, models_task) = fixture().await;
+        let workspace = temp.path().join("workspace");
+        write_csharp_workspace(&workspace);
+        config.lsp_timeout_seconds = 5;
+        config.csharp = CSharpLspConfig {
+            path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+            args: vec![
+                "--mode".to_owned(),
+                mode.to_owned(),
+                "--state".to_owned(),
+                temp.path().join("state").to_string_lossy().into_owned(),
+            ],
+            disabled: false,
+        };
+        let app = App::open(config).await.unwrap();
+        app.index(&workspace).await.unwrap();
+
+        let report = match operation {
+            "symbols" => app.symbols(&workspace, "Calculator").await.unwrap(),
+            "definition" => app
+                .definition(&workspace, "src/CallSite.cs", 2, 72)
+                .await
+                .unwrap(),
+            "references" => app
+                .references(&workspace, "src/Calculator.cs", 2, 49, true)
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(!report.results.is_empty(), "{operation}: no results");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let wire = serde_json::to_value(&report).unwrap();
+        assert!(
+            wire.get("warnings").is_none(),
+            "{operation}: unexpected warnings key in {wire}"
+        );
+        assert!(wire.get("results").is_some(), "{operation}: {wire}");
+        models_task.abort();
+    }
 }
 
 /// When every applicable server fails there is no answer to return: the call

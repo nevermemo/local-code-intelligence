@@ -19,6 +19,14 @@ use std::{
 pub struct NavigationReport {
     pub workspace: Workspace,
     pub results: Vec<lsp::Location>,
+    /// One `Optional LSP provider unavailable: <provider>: <cause>` entry, in
+    /// provider order, for each language server that failed to answer while
+    /// the other servers' results were returned, so an empty or short
+    /// `results` is not read as a clean "no match". Absent from the JSON when
+    /// empty. Only `symbols` can set it: `definition` and `references` ask
+    /// one server and report its failure as an error.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What [`App::release_language_servers`] stopped.
@@ -123,7 +131,18 @@ impl App {
                 "language server failed to answer workspace/symbol; the other servers' results are returned"
             );
         }
-        Ok(NavigationReport { workspace, results })
+        // Same wording as the language-server entry of a search's `warning`.
+        let warnings = failures
+            .iter()
+            .map(|(provider, error)| {
+                format!("Optional LSP provider unavailable: {provider}: {error}")
+            })
+            .collect();
+        Ok(NavigationReport {
+            workspace,
+            results,
+            warnings,
+        })
     }
 
     fn source_path(workspace: &Workspace, relative_file_path: &str) -> Result<std::path::PathBuf> {
@@ -199,7 +218,11 @@ impl App {
                 character,
             )
             .await?;
-        Ok(NavigationReport { workspace, results })
+        Ok(NavigationReport {
+            workspace,
+            results,
+            warnings: Vec::new(),
+        })
     }
 
     pub async fn references(
@@ -227,6 +250,10 @@ impl App {
                 include_declaration,
             )
             .await?;
-        Ok(NavigationReport { workspace, results })
+        Ok(NavigationReport {
+            workspace,
+            results,
+            warnings: Vec::new(),
+        })
     }
 }

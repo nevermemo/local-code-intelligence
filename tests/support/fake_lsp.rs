@@ -30,6 +30,11 @@ pub enum FakeScenario {
     Malformed,
     ExitDuringRequest,
     RestartSuccess,
+    /// Initializes normally, then answers every request after `initialized`
+    /// with a JSON-RPC internal error and keeps running (`--mode
+    /// error-response`): a server that fails without exiting, hanging, or
+    /// breaking the protocol.
+    ErrorResponse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +99,7 @@ pub fn run_from_env() -> io::Result<()> {
         "malformed" => FakeScenario::Malformed,
         "exit-during-request" => FakeScenario::ExitDuringRequest,
         "restart-success" => FakeScenario::RestartSuccess,
+        "error-response" => FakeScenario::ErrorResponse,
         other => {
             eprintln!("unexpected FAKE_LSP_MODE: {other}");
             return Err(io::Error::new(
@@ -348,6 +354,20 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 (FakeScenario::NoSymbols, Some("workspace/symbol")) => {
                     if let Some(id) = id {
                         write_message(&mut stdout, &json_response(id, json!([])))?;
+                    }
+                }
+                // Every request (a message with a method and an id) gets the
+                // same error; notifications have no id and get no answer.
+                (FakeScenario::ErrorResponse, Some(_)) => {
+                    if let Some(id) = id {
+                        write_message(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32603, "message": "fake internal error"}
+                            }),
+                        )?;
                     }
                 }
                 (FakeScenario::SlowWithProgress, Some("workspace/symbol")) => {
