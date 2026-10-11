@@ -114,7 +114,7 @@ The author answers every B and S item in the document's amendment log (adopted, 
 Source of the checkpoints: roadmap "Strategy checkpoint" (keep the list below in sync with it). A fresh reviewer with no stake (stronger model, read-only, web research allowed for prior art) is briefed with:
 
 ```text
-Sanity checkpoint <SC1..SC5 | recurring: renewal, every fifth slice, surprising result, owner request>, <date>.
+Sanity checkpoint <SC1..SC6 | recurring: renewal, every fifth slice, surprising result, owner request>, <date>.
 Edit nothing, start no service. Read the roadmap "Strategy checkpoint", the items under test, <pre-registration, results, logs>, and `git log` since <last checkpoint>.
 Answer with evidence (file:line or URL; [unverified] if you could not open it):
   1. Is the goal still sound? What is measured and what is only assumed?
@@ -132,6 +132,7 @@ One page.
 | SC3 | at the A/B interim look (about 115 code tasks) | data quality and the futility decision |
 | SC4 | after the A/B results, before any decision | an independent re-analysis from the raw logs; an interpretation check (what the result does and does not license) |
 | SC5 | before pre-registering phase 2 (cross-map verbs and interfaces) and before any training or distillation on the RTX 5090 | phase 2's premise and its pre-registered measurement; the cost of being wrong |
+| SC6 | after A7 (portable configuration) implementation and docs are in place | measured first: fresh agents (clean worktree with no local files; the owner's machine) find or create every path, port and URL through the documented resolvers without guessing; then neutrality evidence, docs consistency, nothing machine-specific committed |
 
 The coordinator records the verdict and what changed in the roadmap "Strategy checkpoint".
 
