@@ -2,6 +2,8 @@ use crate::config::{Config, fill_template};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
+    error::Error as _,
+    io::ErrorKind,
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -20,6 +22,10 @@ pub struct Models {
     /// Shared by every clone: remembers that the reranker refused a
     /// connection so searches stop paying for it (see [`ConnectBreaker`]).
     reranker_breaker: Arc<ConnectBreaker>,
+    /// The sleep before the first retry under [`RetryPolicy::Retry`]; it
+    /// doubles for each further one. A field so the tests need not wait a
+    /// real second.
+    initial_backoff: Duration,
 }
 
 #[derive(Deserialize)]
@@ -43,25 +49,32 @@ struct Rank {
 
 /// Under [`RetryPolicy::Retry`], makes a plain request/response HTTP call up
 /// to this many attempts total (the first plus retries) when it fails with a
-/// timeout or connection error. A single flat per-request timeout can't tell a
-/// dead service from one that's merely cold (many local embedding/reranker
-/// servers are genuinely much slower on their first call while a model
-/// loads) or momentarily hiccupping -- unlike the LSP transport, there is
-/// no mid-request progress signal to reset a deadline against for a plain
-/// HTTP call, so bounded retry-with-backoff is the closest equivalent:
-/// treat a timeout as "maybe still warming up," not an instant hard
-/// failure. Does not retry HTTP error statuses or malformed responses --
-/// those indicate a real problem retrying the identical request won't fix.
+/// timeout, a connection error, or a connection that was closed or reset
+/// while the request was being sent (see [`is_connection_dropped`]: typically
+/// a pooled keep-alive connection the server closed while it sat idle). A
+/// single flat per-request timeout can't tell a dead service from one that's
+/// merely cold (many local embedding/reranker servers are genuinely much
+/// slower on their first call while a model loads) or momentarily hiccupping
+/// -- unlike the LSP transport, there is no mid-request progress signal to
+/// reset a deadline against for a plain HTTP call, so bounded
+/// retry-with-backoff is the closest equivalent: treat a timeout as "maybe
+/// still warming up," not an instant hard failure. Does not retry HTTP error
+/// statuses or malformed responses -- those indicate a real problem retrying
+/// the identical request won't fix.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// The sleep before the first retry; it doubles for each further one.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How [`Models::send_with_retry`] reacts to a failed attempt. Index-time
-/// document embedding retries connection errors and timeouts (a long
-/// indexing job should ride out a cold or restarting model). Query-time
-/// calls -- the query embedding and the reranker -- make a single attempt:
-/// a search already fails open without them, retrying a hung service would
-/// multiply its stall by `MAX_ATTEMPTS` (about six minutes at the default
-/// 120 s timeout), and backing off from a refused connection would add
-/// seconds to every search while the service is down.
+/// document embedding retries connection errors, timeouts, and connections
+/// closed or reset mid-request (a long indexing job should ride out a cold or
+/// restarting model, and one dropped keep-alive connection must not abort
+/// hours of work). Query-time calls -- the query embedding and the reranker --
+/// make a single attempt: a search already fails open without them, retrying
+/// a hung service would multiply its stall by `MAX_ATTEMPTS` (about six
+/// minutes at the default 120 s timeout), and backing off from a refused
+/// connection would add seconds to every search while the service is down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryPolicy {
     Retry,
@@ -129,6 +142,35 @@ fn is_connect_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether sending the request failed because the connection was closed or
+/// reset under it: the server closed a pooled keep-alive connection while it
+/// sat idle (uvicorn does after 5 s) and the next request on it hit the dead
+/// socket. reqwest classifies that as a request error, not a connect error or
+/// a timeout. Deliberately narrow: the error must be a request error (not a
+/// builder, redirect, body or decode error) whose source chain holds either
+/// hyper's incomplete-message error (`hyper::Error::is_incomplete_message`:
+/// the peer closed after the request was written) or an I/O error of kind reset, aborted, broken pipe or unexpected
+/// EOF (the peer reset the connection, or closed a TLS stream without a
+/// close-notify). A refused connection, a timeout, an HTTP status and a
+/// malformed response are none of these.
+fn is_connection_dropped(error: &reqwest::Error) -> bool {
+    error.is_request()
+        && std::iter::successors(error.source(), |&cause| cause.source()).any(|cause| {
+            cause
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_incomplete_message)
+                || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::UnexpectedEof
+                    )
+                })
+        })
+}
+
 /// A model service answered with a non-success HTTP status. Carries the
 /// status and the (bounded) response body, which is usually the only place
 /// the service says *why* -- e.g. vLLM's "maximum context length is 8192
@@ -185,6 +227,7 @@ impl Models {
                 .build()?,
             config: config.clone(),
             reranker_breaker: Arc::new(ConnectBreaker::new(RERANKER_DOWN_WINDOW)),
+            initial_backoff: INITIAL_BACKOFF,
         })
     }
     pub fn client(&self) -> &reqwest::Client {
@@ -192,24 +235,29 @@ impl Models {
     }
 
     /// Sends the request `build` constructs. With [`RetryPolicy::Retry`] a
-    /// connection error or a timeout is retried up to `MAX_ATTEMPTS` total
-    /// with a doubling backoff (1s, 2s, ...); with [`RetryPolicy::FailFast`]
-    /// the first failure is returned at once. `build` is called fresh on
-    /// every attempt since a `RequestBuilder` is consumed by `send`.
+    /// connection error, a timeout, or a connection closed or reset while the
+    /// request was sent ([`is_connection_dropped`]) is retried up to
+    /// `MAX_ATTEMPTS` total with a doubling backoff (1s, 2s, ...), so the
+    /// request must be safe to repeat (an embedding is a pure function of its
+    /// input); with [`RetryPolicy::FailFast`] the first failure is returned at
+    /// once. `build` is called fresh on every attempt since a `RequestBuilder`
+    /// is consumed by `send`.
     async fn send_with_retry(
         &self,
         label: &str,
         policy: RetryPolicy,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
-        let mut delay = Duration::from_secs(1);
+        let mut delay = self.initial_backoff;
         for attempt in 1..=MAX_ATTEMPTS {
             match build().send().await {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if policy == RetryPolicy::Retry
                         && attempt < MAX_ATTEMPTS
-                        && (error.is_connect() || error.is_timeout()) =>
+                        && (error.is_connect()
+                            || error.is_timeout()
+                            || is_connection_dropped(&error)) =>
                 {
                     tracing::warn!(
                         attempt,
@@ -226,8 +274,8 @@ impl Models {
         unreachable!("the loop always returns by its final attempt")
     }
 
-    /// Embeds documents for indexing, retrying connection errors and
-    /// timeouts (see [`RetryPolicy`]).
+    /// Embeds documents for indexing, retrying connection errors, timeouts,
+    /// and dropped connections (see [`RetryPolicy`]).
     pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_with(inputs, RetryPolicy::Retry).await
     }
@@ -372,14 +420,280 @@ impl Models {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
     /// An address on which nothing listens: bind to learn a free port, then
     /// release it.
-    fn closed_local_address() -> std::net::SocketAddr {
+    fn closed_local_address() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
         address
+    }
+
+    /// What the fake model server does with one request on a connection.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Answer with a well-formed one-vector embeddings response and keep
+        /// the connection open.
+        Reply,
+        /// Answer HTTP 500.
+        ServerError,
+        /// Read the whole request, then close the connection without
+        /// answering: the peer's FIN reaches a client waiting for a response.
+        Close,
+        /// Never read the request and close the connection: with unread data
+        /// the close resets it.
+        Reset,
+    }
+
+    /// A loopback server (never one of the real model ports) whose n-th
+    /// accepted connection runs the steps of `scripts[n]`, one per request;
+    /// the last script serves every later connection. A connection is closed
+    /// when its script ends.
+    struct FakeModelServer {
+        address: SocketAddr,
+        connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl FakeModelServer {
+        async fn start(scripts: Vec<Vec<Step>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let (accepted, handled) = (connections.clone(), requests.clone());
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let index = accepted.fetch_add(1, Ordering::SeqCst);
+                    let script = scripts[index.min(scripts.len() - 1)].clone();
+                    tokio::spawn(serve_connection(stream, script, handled.clone()));
+                }
+            });
+            Self {
+                address,
+                connections,
+                requests,
+            }
+        }
+
+        /// `Models` pointed at this server for both services, with a short
+        /// retry backoff so a test does not wait a real second.
+        fn models(&self) -> Models {
+            let config = Config {
+                embedding_url: format!("http://{}/v1", self.address),
+                reranker_url: format!("http://{}/rerank", self.address),
+                embedding_timeout_seconds: 10,
+                reranker_timeout_seconds: 10,
+                ..Config::default()
+            };
+            let mut models = Models::new(&config).unwrap();
+            models.initial_backoff = Duration::from_millis(10);
+            models
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn serve_connection(
+        mut stream: TcpStream,
+        script: Vec<Step>,
+        requests: Arc<AtomicUsize>,
+    ) {
+        for step in script {
+            if let Step::Reset = step {
+                // Wait for the request to arrive but leave it unread.
+                stream.readable().await.ok();
+                requests.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            if !read_request(&mut stream).await {
+                return;
+            }
+            requests.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = match step {
+                Step::Reply => ("200 OK", r#"{"data":[{"index":0,"embedding":[0.5,0.25]}]}"#),
+                Step::ServerError => ("500 Internal Server Error", r#"{"error":"boom"}"#),
+                Step::Close | Step::Reset => return,
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Reads one HTTP request (head and `content-length` body); false when
+    /// the client went away first.
+    async fn read_request(stream: &mut TcpStream) -> bool {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(head_end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&received[..head_end]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if received.len() >= head_end + 4 + length {
+                    return true;
+                }
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    fn documents() -> Vec<String> {
+        vec!["fn a() {}".to_owned()]
+    }
+
+    /// Whether any error in `error`'s chain is a dropped-connection request
+    /// error, as `send_with_retry` sees it.
+    fn is_dropped(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(is_connection_dropped)
+        })
+    }
+
+    #[tokio::test]
+    async fn document_embedding_retries_a_connection_closed_before_the_response() {
+        let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
+        let models = server.models();
+
+        let vectors = models.embed(&documents()).await.unwrap();
+
+        assert_eq!(vectors, vec![vec![0.5, 0.25]]);
+        assert_eq!(server.connections(), 2, "one failed attempt, one retry");
+        assert_eq!(server.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn document_embedding_retries_a_connection_reset_before_the_response() {
+        let server = FakeModelServer::start(vec![vec![Step::Reset], vec![Step::Reply]]).await;
+        let models = server.models();
+
+        let vectors = models.embed(&documents()).await.unwrap();
+
+        assert_eq!(vectors, vec![vec![0.5, 0.25]]);
+        assert_eq!(server.connections(), 2, "one failed attempt, one retry");
+    }
+
+    /// The measured failure: a keep-alive connection the server closed while
+    /// idle, found dead by the next request that reused it.
+    #[tokio::test]
+    async fn document_embedding_retries_a_stale_pooled_connection() {
+        let server =
+            FakeModelServer::start(vec![vec![Step::Reply, Step::Close], vec![Step::Reply]]).await;
+        let models = server.models();
+
+        assert_eq!(models.embed(&documents()).await.unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(models.embed(&documents()).await.unwrap().len(), 1);
+
+        // Request 2 reused the pooled connection and was closed unanswered;
+        // request 3 is its retry, on a new connection.
+        assert_eq!(server.requests(), 3);
+        assert_eq!(server.connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn document_embedding_gives_up_after_max_attempts_on_a_connection_that_always_closes() {
+        let server = FakeModelServer::start(vec![vec![Step::Close]]).await;
+        let models = server.models();
+
+        let error = models.embed(&documents()).await.unwrap_err();
+
+        assert_eq!(server.connections(), MAX_ATTEMPTS as usize);
+        assert!(
+            format!("{error:#}").contains("embedding service request failed"),
+            "{error:#}"
+        );
+        // Pins the real error's shape against the predicate: if a dependency
+        // change stops it being recognised, this fails and so do the retry
+        // tests.
+        assert!(is_dropped(&error), "{error:#}");
+        assert!(!is_connect_error(&error), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn an_http_error_status_is_not_retried() {
+        let server = FakeModelServer::start(vec![vec![Step::ServerError]]).await;
+        let models = server.models();
+
+        let error = models.embed(&documents()).await.unwrap_err();
+
+        assert_eq!(server.connections(), 1);
+        assert_eq!(server.requests(), 1);
+        assert!(
+            error.downcast_ref::<HttpStatusError>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_query_embedding_makes_one_attempt_on_a_dropped_connection() {
+        let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
+        let models = server.models();
+
+        let error = models.query("anything").await.unwrap_err();
+
+        assert!(is_dropped(&error), "{error:#}");
+        assert_eq!(server.connections(), 1, "fail-fast: no retry");
+        assert_eq!(server.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_reranker_makes_one_attempt_on_a_dropped_connection() {
+        let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
+        let models = server.models();
+
+        let error = models.rerank("query", &documents()).await.unwrap_err();
+
+        assert!(is_dropped(&error), "{error:#}");
+        assert_eq!(server.connections(), 1, "fail-fast: no retry");
+        // A dropped connection is not a refused one, so the reranker is not
+        // skipped afterwards.
+        assert_eq!(models.reranker_breaker.remaining(Instant::now()), None);
+    }
+
+    #[tokio::test]
+    async fn only_a_request_that_lost_its_connection_counts_as_dropped() {
+        let models = Models::new(&Config::default()).unwrap();
+
+        // A builder error: the request never left.
+        let invalid = models.client().get("not a url").send().await.unwrap_err();
+        assert!(!is_connection_dropped(&invalid), "{invalid:#}");
+
+        // A refused connection is a connect error, not a dropped one.
+        let url = format!("http://{}/", closed_local_address());
+        let refused = models.client().get(url).send().await.unwrap_err();
+        assert!(
+            refused.is_connect() && !is_connection_dropped(&refused),
+            "{refused:#}"
+        );
     }
 
     #[test]

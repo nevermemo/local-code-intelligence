@@ -3609,6 +3609,7 @@ dependencies = [
  "dirs",
  "dunce",
  "globset",
+ "hyper",
  "ignore",
  "reqwest 0.13.5",
  "serde",
