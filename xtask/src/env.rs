@@ -87,6 +87,16 @@ enum Derive {
     WorkArea(&'static str),
 }
 
+impl Derive {
+    /// The path below the work area for a role that follows it, else `None`.
+    fn work_area_relative(self) -> Option<&'static str> {
+        match self {
+            Derive::WorkArea(relative) => Some(relative),
+            Derive::LocalData(_) | Derive::Temp(_) => None,
+        }
+    }
+}
+
 struct Role {
     key: &'static str,
     kind: Kind,
@@ -744,8 +754,9 @@ fn toml_string(text: &str) -> String {
 }
 
 /// The text `--init` writes: `work_area` and `scratch_area` set explicitly for
-/// this machine, every other role listed as a commented line with its current
-/// value so it keeps following the work area until someone changes it.
+/// this machine, every role that follows the work area listed as a commented
+/// line holding its default relative to `<work_area>` (never an absolute
+/// value, which would go stale once the work area is edited).
 fn init_text(defaults: &Resolved) -> String {
     let mut out = String::new();
     out.push_str(
@@ -765,20 +776,14 @@ fn init_text(defaults: &Resolved) -> String {
         }
     }
     out.push_str(
-        "\n# Derived from work_area (shown with today's value). Uncomment a line to pin\n\
-         # that role somewhere else; leave it commented to keep following work_area.\n",
+        "\n# The roles below follow work_area (the path shown is relative to it) until a\n\
+         # line is uncommented. To pin a role somewhere else, uncomment its line and\n\
+         # replace <work_area> with a real path; leave it commented to keep following\n\
+         # work_area, wherever work_area points.\n",
     );
     for role in ROLES {
-        if matches!(role.key, "work_area" | "scratch_area") {
-            continue;
-        }
-        if let Some(entry) = defaults.get(role.key) {
-            let _ = writeln!(
-                out,
-                "# {} = {}",
-                role.key,
-                toml_string(&entry.value.display().to_string())
-            );
+        if let Some(relative) = role.derive.work_area_relative() {
+            let _ = writeln!(out, "# {} = '<work_area>/{relative}'", role.key);
         }
     }
     out
@@ -1363,9 +1368,30 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, ["scratch_area", "work_area"]);
         // The derived roles are shown as comments, so they keep following the
-        // work area.
-        assert!(text.contains("# plans_dir = "));
+        // work area. Each line is role-relative, built from the same default
+        // the resolver uses.
+        assert!(text.contains("# plans_dir = '<work_area>/plans'\n"));
         assert!(!text.contains("\nplans_dir"));
+        for role in ROLES {
+            match role.derive.work_area_relative() {
+                Some(relative) => assert!(
+                    text.contains(&format!("\n# {} = '<work_area>/{relative}'\n", role.key)),
+                    "{}",
+                    role.key
+                ),
+                None => assert!(
+                    text.contains(&format!("\n{} = '", role.key)),
+                    "{}",
+                    role.key
+                ),
+            }
+        }
+        // No commented line carries a value computed at init time: it would
+        // be wrong as soon as work_area is edited.
+        let work_area = value(&defaults, "work_area").display().to_string();
+        for line in text.lines().filter(|line| line.starts_with('#')) {
+            assert!(!line.contains(&work_area), "{line}");
+        }
 
         let located = fake.machine_file(&text);
         let again = fake.resolve(&located, &[]).unwrap();

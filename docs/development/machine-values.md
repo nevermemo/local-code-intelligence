@@ -17,7 +17,16 @@ A missing machine value is a lookup, never a reason to guess or to stop.
    area, plans, frozen binaries, evidence, logs, checkpoint, experiment root,
    scratch area, the repository root, the test-results directory) comes from
    `cargo xtask env` (`--json` for all of them, or `cargo xtask env KEY` for
-   one bare value).
+   one bare value). Before `lci` is built (a fresh clone), the product values
+   are the defaults in the README "Configuration" table, with any `LCI_*`
+   variable or local overlay you can see applied on top. Report them as
+   defaults ("not yet confirmed by `lci config --json`"); do not read them
+   out of the source code. Confirming them needs the build, which needs
+   `protoc` (and the other prerequisites in README "Build and run"): on
+   Windows `cargo xtask setup` downloads it, on macOS and Linux it comes from
+   the system package manager. Either way it is a download, so ask the human
+   first (`AGENTS.md`, "Approval rules"). `cargo xtask env` needs no `protoc`
+   and works in a fresh clone.
 2. **Create a missing directory.** A resolved directory that does not exist
    yet is created with `cargo xtask env --ensure` (or `--ensure KEY`). That
    is the normal first use on a fresh machine, not an error.
@@ -111,9 +120,12 @@ experiment_root = 'D:/lci-ab'
 ```
 
 `cargo xtask env --init` writes the file for this machine: `work_area` and
-`scratch_area` set to today's defaults, every other role as a commented line
-showing its current value, so those keep following the work area until a line
-is uncommented. It never overwrites an existing file without `--force`.
+`scratch_area` set to today's defaults, and every role that follows the work
+area as a commented line relative to it (for example
+`# plans_dir = '<work_area>/plans'`, the table's default), never as an absolute
+value. Those roles keep following `work_area`, wherever it points, until a line
+is uncommented and given a path of its own. It never overwrites an existing
+file without `--force`.
 
 A linked git worktree (an implementer's `git worktree add`) with no
 `.local/machine.toml` of its own reads the main worktree's, found through

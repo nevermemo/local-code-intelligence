@@ -87,6 +87,8 @@ The configuration file describes behaviour and is the one to share. Only machine
   - It contacts only the model services and the port, only on loopback hosts (`127.0.0.1`, `localhost`, `::1`), with no proxy and without following redirects, and never port 8765 (the generation model): a model URL on 8765 or on any other host is reported as not probed, on stderr and in the file, whatever flags are given. `--no-probe` sends no request at all. A port from 8765 to 8767 is not even bound.
   - `--json` prints one object whose keys include `path`, `status` (`written`, `dry_run` or `exists`), `overlay` (the text), `set` (the keys written), `detected` (the data directory and each tool), `probes` (the two URLs and the port), `comments`, `valid` and `warnings`.
 
+Before the first build, the defaults below are what `lci config --json` would report with no configuration file, no overlay and no `LCI_*` variables (the agent rule for that case is in `docs/development/machine-values.md`, "The agent rule").
+
 | Setting | Default |
 | --- | --- |
 | `embedding_url` | `http://localhost:8766/v1` |
