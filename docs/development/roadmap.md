@@ -266,6 +266,7 @@ C2, C3 and N6).
 | S5 | Shorten LanceDB table names so long `data_dir` paths work on Windows | done (2026-10-11: `ws_<16 hex>`; Windows ceiling ~110 -> ~163 characters, not 200; `/ready` warns above 150) | S | - |
 | M7 | Index-time embedding retries a request whose pooled connection the server closed or reset (`connection closed before message completed` aborted a 36-minute index run) | done (2026-10-11) | XS | - |
 | N9 | Discarded LSP sessions keep running (3 orphaned rust-analyzers from 2 requests during a warm-up stalled by a concurrent `cargo fetch`) and loading-time errors trigger cold restarts | ready (verified 2026-10-11; trigger needs a stalled load) | S-M, live | N7 |
+| N10 | The default log filter (`local_code_intelligence=info`) drops every `lci_core` event, so LSP restarts, readiness timeouts and JSON-RPC reader failures are never logged | ready (verified 2026-10-11) | XS | - |
 
 ### R0 - Fusion-only baseline
 `done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
@@ -536,6 +537,13 @@ status: see table (new in the second 2026-10-10 triage) - S - deps: E0 - skill: 
 - Scope: (1) log the error code/message at `warn_restart` and classify: retry on the same server after a short wait for ContentModified (-32801), ServerCancelled (-32802) and RequestFailed during loading; discard only on transport errors (pipe closed, process exited, timeout); (2) `discard` shuts the server down like `release` (shutdown/exit, then kill), and kill the whole process tree on Windows (a job object or tree kill), since `kill_on_drop` reaches only the direct child (a rustup proxy or a wrapper script); (3) find what keeps the discarded server's stdin open (a held `Arc<Session>` or an inherited pipe handle).
 - Accept: fake-LSP tests: a server that answers ContentModified twice and then succeeds is not restarted and the request succeeds; a discarded server's process tree is gone within the shutdown grace; live: polling find_definition every 10 s on a cold large Rust workspace starts exactly one rust-analyzer.
 - Risk: a server that keeps answering errors forever must still be replaced eventually: bound the same-server retries by time.
+
+### N10 - lci-core events never reach the log
+`ready` (verified 2026-10-11 from `src/main.rs` and a silent A/B server log) - XS - deps: none - skill: none
+- Why: `main` installs `EnvFilter::try_from_default_env().unwrap_or_else(|_| "local_code_intelligence=info".into())`. A directive list without a bare default level enables only the named target, so every `tracing` event from the `lci_core` crate is dropped, including all eight `tracing::warn!`/`error!`/`info!` sites, among them the LSP "request failed; discarding the session and restarting once" warning (`lci-core/src/lsp.rs`), rust-analyzer's readiness timeout (`lsp/rust.rs`), "JSON-RPC protocol reader stopped" and "failed to answer server-initiated request" (`lsp/transport.rs`), and the model-client warnings (`models.rs`). The same holds for any `RUST_LOG` that names only `local_code_intelligence` (the A/B server's `local_code_intelligence=debug` log stayed silent for hours of LSP traffic, and N9 had to be diagnosed from process lists).
+- Scope: default filter `local_code_intelligence=info,lci_core=info` (one constant, used by `main`); the README's timing paragraph recommends `RUST_LOG=local_code_intelligence=debug`, which has the same blind spot: make it name both crates.
+- Accept: a unit test that the default filter enables a `lci_core` warn event and keeps `lci_core` debug off; live: a forced LSP request error on a fake server shows the restart warning in the serve log.
+- Risk: none beyond log volume (info-level `lci_core` events are few).
 
 ### H1 - Rust test-file classification
 `done` (3f5861e, recorded cca6744; six filter tests; core identical, mined W/L/T 0/3/32 with all three losses on LSP budget hits, see E5) - S - deps: none - skill: `lci-retrieval-evaluation` (filters)
