@@ -30,7 +30,10 @@ pub enum Suite {
 
 fn invoke(args: &[&str]) -> Result<()> {
     println!("> cargo {}", args.join(" "));
-    let status = Command::new("cargo").args(args).status()?;
+    let mut command = Command::new("cargo");
+    command.args(args);
+    crate::build::use_local_protoc(&mut command);
+    let status = command.status()?;
     if !status.success() {
         bail!("cargo {} failed: {status}", args.join(" "));
     }
@@ -58,10 +61,10 @@ fn executed_in_summary(line: &str) -> Option<usize> {
 /// while counting executed tests, and fails when the filter matched none.
 fn invoke_focused(args: &[&str]) -> Result<()> {
     println!("> cargo {}", args.join(" "));
-    let mut child = Command::new("cargo")
-        .args(args)
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let mut command = Command::new("cargo");
+    command.args(args).stdout(Stdio::piped());
+    crate::build::use_local_protoc(&mut command);
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take().context("capture cargo test output")?;
     let mut executed = 0;
     for line in BufReader::new(stdout).lines() {

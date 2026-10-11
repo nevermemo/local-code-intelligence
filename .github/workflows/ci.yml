@@ -28,17 +28,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install protoc and cmake (Linux)
+      # The lexical channel runs ripgrep and the integration tests exercise
+      # it: a runner without `rg` fails 24 of them with "Lexical retrieval
+      # unavailable". Install it, then print its version so a missing or
+      # shadowed binary fails in one clear step.
+      - name: Install protoc, cmake and ripgrep (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake ripgrep
 
-      - name: Install protoc (macOS)
+      - name: Install protoc and ripgrep (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install protobuf ripgrep
+
+      - name: Install ripgrep (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep --no-progress -y
 
       - name: Provision protoc (Windows)
         if: runner.os == 'Windows'
         run: cargo xtask setup
+
+      - name: Check ripgrep
+        run: rg --version
 
       - name: Build and test
         run: cargo xtask test --suite Full
