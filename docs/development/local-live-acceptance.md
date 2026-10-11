@@ -4,14 +4,14 @@
 [`.github/workflows/live-acceptance.yml`](../../.github/workflows/live-acceptance.yml)
 -- `cargo xtask acceptance <name>` and `evaluate ./evaluations/core.toml`
 against the real embedding/reranker services and real language-server
-executables -- but directly in a normal terminal on this machine, with no
+executables -- but directly in a normal terminal on this machine, needing no
 GitHub repo, no self-hosted runner registration, and no dependency on
-GitHub's control plane at all. Like the rest of `xtask` (`AGENTS.md`: "Dev/
-build/test/acceptance tasks run through the `xtask` crate ... not shell
-scripts, so the workflow stays portable across operating systems"), it's
-plain cross-platform Rust (`xtask/src/live_acceptance.rs`), not a
-Windows-only PowerShell script -- process spawning and tree-killing go
-through `std::process`/`sysinfo`, the same toolkit
+GitHub's control plane at all. Like the rest of `xtask` (see the opening
+paragraph of [`AGENTS.md`](../../AGENTS.md): dev, build, test and acceptance
+tasks run through `cargo xtask <command>`, never shell scripts), it's plain
+cross-platform Rust (`xtask/src/live_acceptance.rs`), not a Windows-only
+PowerShell script -- process spawning and tree-killing go through
+`std::process`/`sysinfo`, the same toolkit
 `xtask::acceptance::ManagedServer` already uses elsewhere in this crate.
 
 ## Why this exists alongside the GitHub Actions path

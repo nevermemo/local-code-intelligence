@@ -47,14 +47,13 @@ services and tools installed) is the only complete option, and that's what
   that needs a human glance at Task Manager, not a workflow step guessing by
   process name alone.
 
-## What only you can do
+## One-time setup (needs the repository owner's GitHub account)
 
-These need your GitHub account and hands-on-machine actions -- I can't do
-them for you:
+These steps need the owner's GitHub account and hands-on access to the
+machine that hosts the services, so an agent cannot do them:
 
-1. **Create a GitHub repository and push.** This repo currently has no git
-   remote at all (`git remote -v` is empty, `main` has no upstream). Actions
-   only runs against a repo hosted on GitHub.
+1. **Repository.** Done: `origin` is the project's GitHub repository
+   (`git remote -v`). Actions only runs against a repo hosted on GitHub.
 2. **Register a self-hosted runner** on this machine (or wherever the
    embedding/reranker services and language-server tooling live): repo
    Settings -> Actions -> Runners -> "New self-hosted runner", or via `gh`:
@@ -63,17 +62,25 @@ them for you:
    ```
    then follow the download/config steps GitHub shows, and give it the
    `lci-live` label during `config.cmd`/`config.sh` (`--labels lci-live`) so
-   only this workflow schedules onto it.
+   only this workflow schedules onto it. Check
+   `gh api repos/<owner>/<repo>/actions/runners` before registering a runner,
+   to see which runners already exist and whether they are online.
 3. **Install the runner as a persistent Windows service**
    (`.\svc install` / `.\svc start` from the runner's install directory)
    rather than leaving it running in a terminal window, so it survives
    reboots and logouts.
-4. **If this repo ever becomes public**, double-check GitHub's fork-PR
-   protections are still in effect before relying on this workflow's
-   `pull_request`-less trigger alone -- self-hosted runners on public repos
-   are a known code-execution risk surface if that default is ever changed.
+4. **The repository is public** (as of 2026-10-11, per
+   `gh api repos/<owner>/<repo> --jq .visibility`), so check GitHub's fork-PR
+   protections (repo Settings -> Actions -> General) before registering the
+   runner, and keep relying on this workflow's `pull_request`-less trigger
+   too -- self-hosted runners on public repos are a known code-execution risk
+   surface if that default is ever changed.
 
-## Prerequisites checked on this machine (2026-09-19)
+## Prerequisites
+
+Last checked on the development machine 2026-10-11 (`Get-Command` and
+`--version` for each tool): every tool below was present; jdtls is the one
+that needs its directory named explicitly.
 
 | Tool | Needed for | Status |
 | --- | --- | --- |
@@ -82,11 +89,11 @@ them for you:
 | `pyright` (`pyright-langserver`) | `cargo xtask acceptance python-lsp/-missing/-recovery` | installed |
 | `typescript-language-server` | `cargo xtask acceptance typescript-lsp/-missing/-recovery` | installed |
 | `go` + `gopls` | `cargo xtask acceptance go-lsp/-missing/-recovery` | installed (`go install golang.org/x/tools/gopls@latest`) |
-| JDK 21+ + jdtls install | `cargo xtask acceptance java-lsp/-missing/-recovery` | installed (Temurin 25; jdtls extracted to a local directory named by `$LCI_ACCEPTANCE_JDTLS` -- `[java].path`/`--java <dir>` point at that directory, not an executable) |
+| JDK 21+ + jdtls install | `cargo xtask acceptance java-lsp/-missing/-recovery` | installed (Temurin 25). jdtls has no `PATH` lookup: set `LCI_ACCEPTANCE_JDTLS` or pass `--java <dir>` (`xtask/src/acceptance/java_lsp.rs:5-11`); either names the jdtls install *directory*, which `[java].path` also points at, not an executable. Without one of them the Java steps print `PREREQUISITE_UNAVAILABLE` |
 | `clangd` | `cargo xtask acceptance c-lsp/-missing/-recovery`, `cpp-lsp/-missing/-recovery` | installed (`winget install LLVM.clangd`) -- one instance navigates both `c` and `cpp` |
 
 Every `*-lsp`/`*-missing`/`*-recovery` subcommand skips gracefully (prints
 `PREREQUISITE_UNAVAILABLE`) rather than failing when its tool isn't on
 `PATH`, so a missing optional tool degrades that one step rather than the
-whole workflow -- but installing the two missing ones above gets full
+whole workflow -- but every tool in the table has to be reachable for full
 coverage.

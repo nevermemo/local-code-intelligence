@@ -5,6 +5,22 @@ keeps persistent data outside indexed repositories. Clients may be Kilo,
 Copilot, Codex, or any other MCP-capable agent; client-specific behavior does
 not belong in the service.
 
+## Crates
+
+The Cargo workspace has three members: the root package
+`local-code-intelligence`, `lci-core`, and `xtask` (build, test and acceptance
+commands). `lci-core` holds the pure logic -- `chunk`, `config`, `filter`,
+`language`, `lexical`, `lsp`, `manifest`, `models` and `workspace`, with the
+Tree-sitter grammars -- and depends on none of LanceDB, Arrow, axum or rmcp. The
+root crate holds what needs the embedded database or a protocol server: `app`,
+`store` (the only code that imports LanceDB and Arrow), `evaluate`, `server`,
+`rest` and `main`, and re-exports the `lci-core` modules from `src/lib.rs` so
+existing `crate::chunk`-style paths keep resolving. The split exists for build
+time (commit `0729d9a`): the LanceDB/Arrow tree takes minutes to compile, so a
+change that stays inside `lci-core` can be checked in seconds with
+`cargo check -p lci-core` and `cargo test -p lci-core --lib <module>::` (see the
+[testing guide](development/testing.md)).
+
 ## Runtime boundaries
 
 - `app` coordinates indexing, retrieval, navigation, watching, and readiness.
