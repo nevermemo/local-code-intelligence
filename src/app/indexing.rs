@@ -29,6 +29,10 @@ pub struct IndexReport {
     pub parsed_files: usize,
     pub unchanged_files: usize,
     pub removed_files: usize,
+    /// Files with a source extension left out of the index because their
+    /// content is another format (a Qt Linguist `.ts` catalog is XML, not
+    /// TypeScript). They are not counted in `files` and have no chunks.
+    pub skipped_non_source_files: usize,
     /// Files that were not valid UTF-8 and were indexed from a lossy decoding.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lossy_decoded_files: Vec<String>,
@@ -265,6 +269,10 @@ impl App {
             tracing::warn!(workspace_id = %workspace.id, file = %path, "file is not valid UTF-8; indexed from a lossy decoding");
         }
         let lossy_decoded_files = scan.lossy_files;
+        let skipped_non_source_files = scan.skipped_files.len();
+        if let Some(first) = scan.skipped_files.first() {
+            tracing::info!(workspace_id = %workspace.id, skipped = skipped_non_source_files, first = %first.relative_path, reason = first.reason.identifier(), "skipped files whose content is not source for their extension");
+        }
         let next_manifest = Manifest {
             version: manifest::VERSION,
             workspace_id: workspace.id.clone(),
@@ -282,6 +290,7 @@ impl App {
             parsed_files: scan.parsed_files,
             unchanged_files: scan.unchanged_files,
             removed_files: scan.removed_files,
+            skipped_non_source_files,
             lossy_decoded_files,
             truncated_for_embedding,
             total_ms: ms(start),

@@ -13,6 +13,28 @@ pub(crate) enum Syntax {
     Cpp,
 }
 
+/// A data format that shares a registered source extension and is therefore
+/// not source code in the language the extension names.
+///
+/// This is never used to choose a language: the extension still does that.
+/// It only lets a scan leave out a file whose content cannot be that
+/// language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonSource {
+    /// A Qt Linguist translation catalog (XML) saved with the `.ts`
+    /// extension, which TypeScript also uses.
+    QtLinguist,
+}
+
+impl NonSource {
+    /// Stable name for logs and reports.
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::QtLinguist => "qt-linguist",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LanguageAdapter {
     extension: &'static str,
@@ -25,6 +47,21 @@ pub struct LanguageAdapter {
 impl LanguageAdapter {
     pub const fn identifier(&self) -> &'static str {
         self.identifier
+    }
+
+    /// Reports whether the content of a file with this adapter's extension is
+    /// a known non-source data format, so the file must not be parsed or
+    /// indexed as this language. Only extensions with a known clash are
+    /// checked; every other adapter returns `None` without reading `content`.
+    ///
+    /// A false positive would drop real source from the index, so each check
+    /// requires something the language cannot start with. For `ts` that is a
+    /// Qt Linguist XML start in UTF-8 or byte-order-marked UTF-16.
+    pub fn non_source(&self, content: &[u8]) -> Option<NonSource> {
+        match self.extension {
+            "ts" => qt_linguist(content),
+            _ => None,
+        }
     }
 
     pub const fn cache_version(&self) -> &'static str {
@@ -359,6 +396,75 @@ fn cpp() -> Language {
     tree_sitter_cpp::LANGUAGE.into()
 }
 
+/// Code units of a UTF-16 file decoded when looking for a Qt Linguist
+/// catalog. An XML declaration or a `<TS` start tag with its first attribute
+/// is far shorter, so the rest of the file is never decoded.
+const UTF16_PREFIX_UNITS: usize = 512;
+
+/// Detects a Qt Linguist catalog from the start of a `.ts` file, in UTF-8
+/// (with or without a byte-order mark) or in UTF-16 with a byte-order mark
+/// (little or big endian; a UTF-16 file without a mark is not guessed).
+///
+/// After the mark and whitespace the text must start with either an XML
+/// declaration (`<?xml`, which no TypeScript statement or expression can
+/// start with) or a `<TS` root element that carries an attribute
+/// (`<TS version="2.1" ...>`). Both encodings share that one rule
+/// ([`is_catalog_start`]): a UTF-16 file is decoded to ASCII bytes first, and
+/// only as far as the rule needs, never the whole file.
+fn qt_linguist(content: &[u8]) -> Option<NonSource> {
+    let catalog = if let Some(units) = content.strip_prefix(b"\xFF\xFE") {
+        is_catalog_start(&utf16_ascii_prefix(units, u16::from_le_bytes))
+    } else if let Some(units) = content.strip_prefix(b"\xFE\xFF") {
+        is_catalog_start(&utf16_ascii_prefix(units, u16::from_be_bytes))
+    } else {
+        is_catalog_start(content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content))
+    };
+    catalog.then_some(NonSource::QtLinguist)
+}
+
+/// The leading text of UTF-16 `units` (two bytes each, byte order given by
+/// `decode`) as ASCII-compatible bytes: whitespace is skipped without limit,
+/// then at most [`UTF16_PREFIX_UNITS`] units are kept. A unit outside ASCII
+/// becomes `0x80`, which neither the whitespace nor the name checks accept; a
+/// trailing odd byte is ignored.
+fn utf16_ascii_prefix(units: &[u8], decode: fn([u8; 2]) -> u16) -> Vec<u8> {
+    units
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| decode(pair))
+        .skip_while(|&unit| u8::try_from(unit).is_ok_and(|byte| byte.is_ascii_whitespace()))
+        .take(UTF16_PREFIX_UNITS)
+        .map(|unit| u8::try_from(unit).ok().filter(u8::is_ascii).unwrap_or(0x80))
+        .collect()
+}
+
+/// The shared catalog rule over ASCII-compatible text (see [`qt_linguist`]).
+///
+/// A bare `<TS>` or `<TS extends Base>(...) => ...` is not enough: both are
+/// valid TypeScript (a type assertion and a generic arrow function), so the
+/// element must be followed by `name=`.
+fn is_catalog_start(text: &[u8]) -> bool {
+    let text = text.trim_ascii_start();
+    if text.starts_with(b"<?xml") {
+        return true;
+    }
+    let Some(after_tag) = text.strip_prefix(b"<TS") else {
+        return false;
+    };
+    let attributes = after_tag.trim_ascii_start();
+    if attributes.len() == after_tag.len() {
+        return false;
+    }
+    let name_len = attributes
+        .iter()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+        })
+        .count();
+    name_len > 0 && attributes[name_len..].trim_ascii_start().first() == Some(&b'=')
+}
+
 pub const ADAPTERS: &[LanguageAdapter] = &[
     LanguageAdapter {
         extension: "rs",
@@ -502,6 +608,195 @@ mod tests {
             "CPP", "HPP", "cc", "cxx", "hh", "hxx",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
+        }
+    }
+
+    fn ts_non_source(content: &[u8]) -> Option<NonSource> {
+        for_extension("ts").unwrap().non_source(content)
+    }
+
+    #[test]
+    fn qt_linguist_catalogs_are_recognized_by_their_xml_start() {
+        for content in [
+            &b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n</TS>\n"[..],
+            b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TS version=\"2.1\">",
+            b"\n  \r\n\t<?xml version=\"1.0\"?>",
+            b"\xEF\xBB\xBF \n<?xml?>",
+            b"<TS version=\"2.1\" language=\"de\">\n</TS>",
+            b"  <TS\n  version = \"2.1\">",
+            b"<TS language=\"de\" version=\"2.1\">",
+        ] {
+            assert_eq!(
+                ts_non_source(content),
+                Some(NonSource::QtLinguist),
+                "{}",
+                String::from_utf8_lossy(content)
+            );
+        }
+        assert_eq!(NonSource::QtLinguist.identifier(), "qt-linguist");
+    }
+
+    #[test]
+    fn typescript_is_never_mistaken_for_a_qt_linguist_catalog() {
+        for content in [
+            &b""[..],
+            b"   \n",
+            b"\xEF\xBB\xBF",
+            b"export const value = 1;\n",
+            b"// <?xml version=\"1.0\"?>\nexport const value = 1;\n",
+            b"// <TS version=\"2.1\">\nexport const value = 1;\n",
+            b"/* <?xml */\nexport const value = 1;\n",
+            b"\xEF\xBB\xBF// bom then a comment\nexport const value = 1;\n",
+            b"const xml = '<?xml version=\"1.0\"?>';\n",
+            // Valid TypeScript that starts with `<TS`: a type assertion and
+            // generic arrow functions.
+            b"<TS>value;\n",
+            b"<TS extends Base>(item: TS) => item;\n",
+            b"<TS = string>(item: TS) => item;\n",
+            b"<TS\n  extends Base>(item: TS) => item;\n",
+            b"<TS>\nvalue;\n",
+            b"<TSX version=\"1\">",
+            b"<T version=\"1\">",
+            b"<ts version=\"2.1\">",
+            b"<TS",
+            b"<TS ",
+            b"<TS version",
+            b"<?xm",
+            b"< ?xml",
+        ] {
+            assert_eq!(
+                ts_non_source(content),
+                None,
+                "{}",
+                String::from_utf8_lossy(content)
+            );
+        }
+    }
+
+    /// `text` as UTF-16, with a byte-order mark when `bom` is set.
+    fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in bom
+            .then_some(0xFEFF_u16)
+            .into_iter()
+            .chain(text.encode_utf16())
+        {
+            bytes.extend(if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn utf16_qt_linguist_catalogs_with_a_byte_order_mark_are_recognized() {
+        let declared = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<translation>M\u{fc}nzen senden \u{1F4B0}</translation>\n</TS>\n";
+        let root_only = "<TS version=\"2.1\" language=\"de\">\n</TS>\n";
+        let spaced = " \r\n\t<TS\n  version = \"2.1\">";
+        for text in [declared, root_only, spaced, "<?xml?>"] {
+            for big_endian in [false, true] {
+                let content = utf16(text, big_endian, true);
+                assert_eq!(
+                    ts_non_source(&content),
+                    Some(NonSource::QtLinguist),
+                    "big_endian={big_endian}: {text}"
+                );
+            }
+        }
+        // Only a bounded prefix is decoded: a large body changes nothing,
+        // and neither does whitespace before the root element.
+        for big_endian in [false, true] {
+            let text = format!("{}<TS version=\"2.1\">", " ".repeat(5000));
+            let mut content = utf16(&text, big_endian, true);
+            content.extend(std::iter::repeat_n(0xD8, 200_000));
+            assert_eq!(ts_non_source(&content), Some(NonSource::QtLinguist));
+        }
+    }
+
+    #[test]
+    fn utf16_typescript_and_look_alikes_are_not_qt_linguist_catalogs() {
+        let texts = [
+            "export const a = 1;\n",
+            "<TS>value;\n",
+            "<TS extends Base>(item: TS) => item;\n",
+            "// <?xml version=\"1.0\"?>\nexport const a = 1;\n",
+            "// <TS version=\"2.1\">\nexport const a = 1;\n",
+            "\u{e9}<?xml?>",
+            "<?xm",
+            "<TS version",
+            "",
+            "  \n",
+        ];
+        for text in texts {
+            for big_endian in [false, true] {
+                let content = utf16(text, big_endian, true);
+                assert_eq!(
+                    ts_non_source(&content),
+                    None,
+                    "big_endian={big_endian}: {text:?}"
+                );
+            }
+        }
+        // A lone byte-order mark.
+        assert_eq!(ts_non_source(b"\xFF\xFE"), None);
+        assert_eq!(ts_non_source(b"\xFE\xFF"), None);
+        // UTF-16 without a byte-order mark is not guessed, even for a catalog.
+        for big_endian in [false, true] {
+            let text = "<?xml version=\"1.0\"?>\n<TS version=\"2.1\">";
+            let catalog = utf16(text, big_endian, false);
+            assert_eq!(ts_non_source(&catalog), None, "big_endian={big_endian}");
+        }
+        // A UTF-32 little-endian mark starts with the UTF-16 one but is not
+        // decoded as UTF-16 text.
+        assert_eq!(
+            ts_non_source(b"\xFF\xFE\x00\x00<\x00\x00\x00?\x00\x00\x00"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_truncated_utf16_stream_is_handled_without_panicking() {
+        for big_endian in [false, true] {
+            let complete = utf16("<?xml?>", big_endian, true);
+            // An odd trailing byte after complete units is ignored.
+            let mut odd = complete.clone();
+            odd.push(0x3C);
+            assert_eq!(ts_non_source(&odd), Some(NonSource::QtLinguist));
+            // Every truncation is either a catalog (the `<?xml` units are
+            // complete) or not, and none panics.
+            let needed = 2 + 2 * "<?xml".len();
+            for length in 0..=complete.len() {
+                let expected = (length >= needed).then_some(NonSource::QtLinguist);
+                assert_eq!(
+                    ts_non_source(&complete[..length]),
+                    expected,
+                    "big_endian={big_endian} length={length}"
+                );
+            }
+            // A cut before the attribute's `=` never matches, odd or even.
+            let root = utf16("<TS version=\"2.1\">", big_endian, true);
+            let cut = 2 + 2 * "<TS version".len();
+            assert_eq!(ts_non_source(&root[..cut]), None);
+            assert_eq!(ts_non_source(&root[..cut + 1]), None);
+            assert_eq!(ts_non_source(&root[..cut + 2]), Some(NonSource::QtLinguist));
+        }
+        assert_eq!(ts_non_source(b"\xFF\xFE<"), None);
+        assert_eq!(ts_non_source(b"\xFE\xFF\x00"), None);
+    }
+
+    #[test]
+    fn only_the_ts_extension_checks_for_a_clash() {
+        let utf16_catalog = utf16("<?xml?>", false, true);
+        for catalog in [
+            &b"<?xml version=\"1.0\"?>\n<TS version=\"2.1\">"[..],
+            &utf16_catalog,
+        ] {
+            for adapter in ADAPTERS {
+                let expected = (adapter.glob() == "*.ts").then_some(NonSource::QtLinguist);
+                assert_eq!(adapter.non_source(catalog), expected, "{}", adapter.glob());
+            }
         }
     }
 }

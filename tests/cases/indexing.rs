@@ -3126,3 +3126,195 @@ async fn the_command_line_search_takes_a_search_profile_and_names_the_configured
     assert!(unknown.stdout.is_empty());
     task.abort();
 }
+
+/// The Qt Linguist form of a `.ts` file: XML, with a word the fake embedding
+/// service gives the same vector as the TypeScript fixtures, so an indexed
+/// copy would show up in results.
+const QT_LINGUIST_CATALOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<context>\n    <name>SendCoinsDialog</name>\n    <message>\n        <source>Send coins</source>\n        <translatorcomment>translator note</translatorcomment>\n        <translation>Muenzen senden</translation>\n    </message>\n</context>\n</TS>\n";
+
+fn indexed_paths(report: &local_code_intelligence::app::IndexedFilesReport) -> Vec<(&str, &str)> {
+    let mut files: Vec<_> = report
+        .files
+        .iter()
+        .map(|file| (file.relative_file_path.as_str(), file.language.as_str()))
+        .collect();
+    files.sort_unstable();
+    files
+}
+
+#[tokio::test]
+async fn a_qt_linguist_ts_file_is_skipped_while_typescript_is_indexed() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("qt-app");
+    write(
+        &workspace,
+        "src/translator.ts",
+        "export function translator() { return 1; }\n",
+    );
+    write(&workspace, "locale/app_de.ts", QT_LINGUIST_CATALOG);
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    assert_eq!(report.skipped_non_source_files, 1);
+    assert_eq!(report.parsed_files, 1);
+    assert_eq!(
+        serde_json::to_value(&report).unwrap()["skipped_non_source_files"],
+        1
+    );
+    // The catalog never reached the embedding service.
+    assert!(report.chunks >= 1);
+    assert_eq!(report.embedded_chunks, report.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), report.chunks);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(
+        indexed_paths(&indexed),
+        [("src/translator.ts", "typescript")]
+    );
+
+    let found = app.search(&workspace, "translator", Some(8)).await.unwrap();
+    assert!(!found.results.is_empty());
+    assert!(
+        found
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path == "src/translator.ts"
+                && hit.chunk.language == "typescript"),
+        "{:?}",
+        found
+            .results
+            .iter()
+            .map(|hit| hit.chunk.relative_file_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    let catalog_only = app
+        .search(&workspace, "Muenzen senden", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        catalog_only
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "locale/app_de.ts")
+    );
+
+    // A repeat does no work and still reports the skipped file.
+    let repeat = app.index(&workspace).await.unwrap();
+    assert_eq!(repeat.parsed_files, 0);
+    assert_eq!(repeat.unchanged_files, 1);
+    assert_eq!(repeat.embedded_chunks, 0);
+    assert_eq!(repeat.skipped_non_source_files, 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_ts_file_that_becomes_a_qt_linguist_catalog_drops_its_old_chunks() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    let workspace = temp.path().join("qt-reclassified");
+    write(&workspace, "keep.rs", "fn translator_keep() {}\n");
+    let typescript = "export function translator_catalog() { return 1; }\n";
+    write(&workspace, "catalog.ts", typescript);
+    let app = App::open(config).await.unwrap();
+
+    let first = app.index(&workspace).await.unwrap();
+    assert_eq!(first.files, 2);
+    assert_eq!(first.skipped_non_source_files, 0);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(
+        indexed_paths(&indexed),
+        [("catalog.ts", "typescript"), ("keep.rs", "rust")]
+    );
+    let catalog_chunks = first.chunks - 1;
+    assert!(catalog_chunks >= 1);
+
+    // The same path now holds a Linguist catalog: the next index treats it
+    // like a deleted file and drops its chunks.
+    write(&workspace, "catalog.ts", QT_LINGUIST_CATALOG);
+    assert!(app.status(&workspace).await.unwrap().stale);
+    let second = app.index(&workspace).await.unwrap();
+    assert_eq!(second.files, 1);
+    assert_eq!(second.chunks, first.chunks - catalog_chunks);
+    assert_eq!(second.removed_files, 1);
+    assert_eq!(second.parsed_files, 0);
+    assert_eq!(second.skipped_non_source_files, 1);
+    assert_eq!(second.embedded_chunks, 0);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed_paths(&indexed), [("keep.rs", "rust")]);
+    assert!(!app.status(&workspace).await.unwrap().stale);
+
+    // Back to TypeScript, then to a catalog again, each picked up by the
+    // on-search refresh with no explicit index call.
+    write(&workspace, "catalog.ts", typescript);
+    let restored = app.search(&workspace, "translator", Some(8)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(
+        restored
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "catalog.ts"
+                && hit.chunk.language == "typescript")
+    );
+    let documents_before = fake.documents.load(Ordering::SeqCst);
+    write(&workspace, "catalog.ts", QT_LINGUIST_CATALOG);
+    let dropped = app.search(&workspace, "translator", Some(8)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&dropped).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(
+        dropped
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path == "keep.rs")
+    );
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents_before);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed_paths(&indexed), [("keep.rs", "rust")]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn qt_linguist_detection_handles_a_bom_a_comment_mentioning_ts_and_an_empty_file() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("qt-edge-cases");
+    write(
+        &workspace,
+        "bom.ts",
+        &format!("\u{feff}{QT_LINGUIST_CATALOG}"),
+    );
+    write(
+        &workspace,
+        "comment.ts",
+        "// <TS version=\"2.1\"> is the Qt Linguist root; this file is TypeScript.\nexport function translator() { return 1; }\n",
+    );
+    write(&workspace, "empty.ts", "");
+    let app = App::open(config).await.unwrap();
+
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.skipped_non_source_files, 1);
+    assert_eq!(report.files, 2);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    // The empty file is TypeScript with no chunks: indexed, not skipped.
+    assert_eq!(
+        indexed_paths(&indexed),
+        [("comment.ts", "typescript"), ("empty.ts", "typescript")]
+    );
+    let found = app.search(&workspace, "translator", Some(8)).await.unwrap();
+    assert!(
+        found
+            .results
+            .iter()
+            .any(|hit| hit.chunk.relative_file_path == "comment.ts")
+    );
+    assert!(
+        found
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "bom.ts")
+    );
+    task.abort();
+}

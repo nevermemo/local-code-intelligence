@@ -22,6 +22,21 @@ pub struct Scan {
     /// Repository-relative paths of files that were not valid UTF-8 and were
     /// indexed from a lossy decoding (invalid bytes become U+FFFD).
     pub lossy_files: Vec<String>,
+    /// Files with a registered source extension that were left out because
+    /// their content is a known non-source format (for example a Qt Linguist
+    /// catalog saved as `.ts`). They are neither parsed, chunked, hashed nor
+    /// recorded in the manifest, so a file that stops being source disappears
+    /// from the next snapshot like a deleted one, and the staleness
+    /// fingerprint ignores them.
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+/// A file with a source extension that is not indexed as source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    /// Repository-relative path with `/` separators.
+    pub relative_path: String,
+    pub reason: language::NonSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,8 +182,14 @@ fn decode_source(bytes: Vec<u8>) -> (String, bool) {
     }
 }
 
-fn sources(root: &Path) -> Result<Vec<SourceFile>> {
+struct Sources {
+    files: Vec<SourceFile>,
+    skipped: Vec<SkippedFile>,
+}
+
+fn sources(root: &Path) -> Result<Sources> {
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(false)
@@ -191,6 +212,13 @@ fn sources(root: &Path) -> Result<Vec<SourceFile>> {
             .context("non-UTF-8 file path")?
             .replace('\\', "/");
         let bytes = std::fs::read(entry.path()).with_context(|| format!("read {relative}"))?;
+        if let Some(reason) = adapter.non_source(&bytes) {
+            skipped.push(SkippedFile {
+                relative_path: relative,
+                reason,
+            });
+            continue;
+        }
         let (source, lossy) = decode_source(bytes);
         let source_hash = hash(&source);
         files.push(SourceFile {
@@ -202,7 +230,8 @@ fn sources(root: &Path) -> Result<Vec<SourceFile>> {
         });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(files)
+    skipped.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(Sources { files, skipped })
 }
 
 fn fingerprint_material(file: &SourceFile) -> String {
@@ -217,6 +246,7 @@ fn fingerprint_material(file: &SourceFile) -> String {
 
 pub fn fingerprint(root: &Path) -> Result<String> {
     let material = sources(root)?
+        .files
         .iter()
         .map(fingerprint_material)
         .collect::<String>();
@@ -231,7 +261,10 @@ pub fn scan_incremental(
     let mut files = HashMap::new();
     let mut parsed_files = 0;
     let mut unchanged_files = 0;
-    let source_files = sources(root)?;
+    let Sources {
+        files: source_files,
+        skipped: skipped_files,
+    } = sources(root)?;
     let present: HashSet<_> = source_files
         .iter()
         .map(|file| file.relative_path.as_str())
@@ -286,6 +319,7 @@ pub fn scan_incremental(
         unchanged_files,
         removed_files,
         lossy_files,
+        skipped_files,
     })
 }
 
@@ -580,6 +614,226 @@ export interface TelemetryLifecycle {
                 "ignored.py",
                 "Service.cs"
             ])
+        );
+    }
+
+    const QT_LINGUIST_CATALOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<context>\n    <name>SendCoinsDialog</name>\n    <message>\n        <source>Send coins</source>\n        <translation>Muenzen senden</translation>\n    </message>\n</context>\n</TS>\n";
+
+    #[test]
+    fn qt_linguist_files_are_skipped_while_typescript_is_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("locale")).unwrap();
+        std::fs::write(
+            temp.path().join("send.ts"),
+            "export function sendCoins() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("locale/app_de.ts"), QT_LINGUIST_CATALOG).unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert_eq!(
+            scan.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["send.ts"]
+        );
+        assert_eq!(scan.files["send.ts"].language, "typescript");
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| chunk.language == "typescript"
+                    && chunk.relative_file_path == "send.ts"
+                    && !chunk.code.contains("Muenzen"))
+        );
+        assert_eq!(scan.parsed_files, 1);
+        assert_eq!(
+            scan.skipped_files,
+            vec![SkippedFile {
+                relative_path: "locale/app_de.ts".into(),
+                reason: language::NonSource::QtLinguist,
+            }]
+        );
+        assert!(scan.lossy_files.is_empty());
+    }
+
+    #[test]
+    fn skipped_files_do_not_change_the_staleness_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("send.ts"), "export const a = 1;\n").unwrap();
+        let without = fingerprint(temp.path()).unwrap();
+        std::fs::write(temp.path().join("app_de.ts"), QT_LINGUIST_CATALOG).unwrap();
+        assert_eq!(fingerprint(temp.path()).unwrap(), without);
+        std::fs::write(
+            temp.path().join("app_de.ts"),
+            QT_LINGUIST_CATALOG.replace("Muenzen", "Coins"),
+        )
+        .unwrap();
+        assert_eq!(fingerprint(temp.path()).unwrap(), without);
+        // Once the file turns out to be TypeScript the fingerprint moves.
+        std::fs::write(temp.path().join("app_de.ts"), "export const b = 2;\n").unwrap();
+        assert_ne!(fingerprint(temp.path()).unwrap(), without);
+    }
+
+    #[test]
+    fn a_file_reclassified_as_qt_linguist_drops_its_cached_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("send.ts"), "export const send = 1;\n").unwrap();
+        std::fs::write(
+            temp.path().join("catalog.ts"),
+            "export function translatorOnly() { return 1; }\n",
+        )
+        .unwrap();
+        let first = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert!(first.skipped_files.is_empty());
+        assert!(
+            first
+                .chunks
+                .iter()
+                .any(|chunk| chunk.relative_file_path == "catalog.ts")
+        );
+
+        std::fs::write(temp.path().join("catalog.ts"), QT_LINGUIST_CATALOG).unwrap();
+        let second = scan_incremental(temp.path(), &first.files).unwrap();
+        assert_eq!(second.removed_files, 1);
+        assert_eq!(second.unchanged_files, 1);
+        assert_eq!(second.parsed_files, 0);
+        assert!(!second.files.contains_key("catalog.ts"));
+        assert!(
+            second
+                .chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "send.ts")
+        );
+        assert_eq!(second.skipped_files.len(), 1);
+        assert_ne!(second.fingerprint, first.fingerprint);
+
+        // And back: the same path is parsed again as TypeScript.
+        std::fs::write(
+            temp.path().join("catalog.ts"),
+            "export function translatorOnly() { return 1; }\n",
+        )
+        .unwrap();
+        let third = scan_incremental(temp.path(), &second.files).unwrap();
+        assert_eq!(third.parsed_files, 1);
+        assert!(third.skipped_files.is_empty());
+        assert_eq!(third.files["catalog.ts"].language, "typescript");
+    }
+
+    #[test]
+    fn qt_linguist_edge_cases_keep_real_typescript_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        let bom_catalog = format!("\u{feff}{QT_LINGUIST_CATALOG}");
+        let blank_then_catalog = format!("\n\n  \t{QT_LINGUIST_CATALOG}");
+        for (name, content) in [
+            ("bom.ts", bom_catalog.as_str()),
+            ("blank_then_catalog.ts", blank_then_catalog.as_str()),
+            (
+                "root_only.ts",
+                "<TS version=\"2.1\" language=\"fr\">\n</TS>\n",
+            ),
+            (
+                "comment.ts",
+                "// <TS version=\"2.1\"> is the Qt Linguist root element\nexport const note = 1;\n",
+            ),
+            (
+                "jsdoc.ts",
+                "/** Reads <?xml prologs. */\nexport function readProlog() {}\n",
+            ),
+            ("assertion.ts", "<TS>value;\n"),
+            (
+                "generic_arrow.ts",
+                "<TS extends object>(item: TS) => item;\n",
+            ),
+            ("bom_typescript.ts", "\u{feff}export const bomValue = 1;\n"),
+            ("empty.ts", ""),
+            ("blank.ts", "\n  \n"),
+        ] {
+            std::fs::write(temp.path().join(name), content).unwrap();
+        }
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let skipped: Vec<_> = scan
+            .skipped_files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(skipped, ["blank_then_catalog.ts", "bom.ts", "root_only.ts"]);
+        let mut indexed: Vec<_> = scan.files.keys().map(String::as_str).collect();
+        indexed.sort_unstable();
+        assert_eq!(
+            indexed,
+            [
+                "assertion.ts",
+                "blank.ts",
+                "bom_typescript.ts",
+                "comment.ts",
+                "empty.ts",
+                "generic_arrow.ts",
+                "jsdoc.ts"
+            ]
+        );
+        // Empty and blank files are indexed (as zero chunks), not skipped.
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| !matches!(chunk.relative_file_path.as_str(), "empty.ts" | "blank.ts"))
+        );
+        assert!(
+            scan.chunks
+                .iter()
+                .any(|chunk| chunk.relative_file_path == "comment.ts"
+                    && chunk.code.contains("export const note"))
+        );
+    }
+
+    #[test]
+    fn utf16_qt_linguist_catalogs_are_skipped_instead_of_decoded_lossily() {
+        fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+            std::iter::once(0xFEFF_u16)
+                .chain(text.encode_utf16())
+                .flat_map(|unit| {
+                    if big_endian {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                })
+                .collect()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("app_de_le.ts"),
+            utf16(QT_LINGUIST_CATALOG, false),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app_de_be.ts"),
+            utf16(QT_LINGUIST_CATALOG, true),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("send.ts"),
+            "export function sendCoins() { return 1; }\n",
+        )
+        .unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let skipped: Vec<_> = scan
+            .skipped_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.reason))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("app_de_be.ts", language::NonSource::QtLinguist),
+                ("app_de_le.ts", language::NonSource::QtLinguist)
+            ]
+        );
+        // Skipped before decoding: neither catalog is reported as lossy.
+        assert!(scan.lossy_files.is_empty());
+        assert_eq!(scan.files.keys().collect::<Vec<_>>(), ["send.ts"]);
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "send.ts")
         );
     }
 
