@@ -38,6 +38,11 @@ const DEV_DIR: &str = "local-code-intelligence-dev";
 /// Named so that `live_acceptance`'s end-of-run cleanup of `lci-*` temp
 /// directories (fixture leftovers) can never remove the scratch area.
 const SCRATCH_DIR: &str = "local-code-intelligence-scratch";
+/// Stands for the work area in the commented lines `--init` writes. A value
+/// still holding it was uncommented without being edited, so
+/// [`parse_machine_file`] rejects it: left alone it would resolve to a path
+/// literally named `<work_area>` inside the checkout.
+const WORK_AREA_PLACEHOLDER: &str = "<work_area>";
 
 #[derive(Args)]
 pub struct EnvArgs {
@@ -299,7 +304,7 @@ pub fn snapshot_env() -> Result<BTreeMap<String, String>> {
 }
 
 /// The machine file's roles: every key must name a settable role and hold a
-/// non-empty string.
+/// non-empty string that is not an unedited `<work_area>` placeholder.
 fn parse_machine_file(file: &MachineFile) -> Result<BTreeMap<&'static str, String>> {
     let shown = file.path.display();
     let table: toml::Table =
@@ -322,6 +327,12 @@ fn parse_machine_file(file: &MachineFile) -> Result<BTreeMap<&'static str, Strin
         else {
             bail!("{shown}: `{key}` must be a non-empty path string");
         };
+        if text.contains(WORK_AREA_PLACEHOLDER) {
+            bail!(
+                "{shown}: `{key}` still holds the `{WORK_AREA_PLACEHOLDER}` placeholder: \
+                 replace it with a real path or keep the line commented"
+            );
+        }
         values.insert(role.key, text.to_owned());
     }
     Ok(values)
@@ -775,15 +786,17 @@ fn init_text(defaults: &Resolved) -> String {
             );
         }
     }
-    out.push_str(
+    let _ = write!(
+        out,
         "\n# The roles below follow work_area (the path shown is relative to it) until a\n\
          # line is uncommented. To pin a role somewhere else, uncomment its line and\n\
-         # replace <work_area> with a real path; leave it commented to keep following\n\
-         # work_area, wherever work_area points.\n",
+         # replace {WORK_AREA_PLACEHOLDER} with a real path (a line that still holds it is an\n\
+         # error); leave it commented to keep following work_area, wherever work_area\n\
+         # points.\n"
     );
     for role in ROLES {
         if let Some(relative) = role.derive.work_area_relative() {
-            let _ = writeln!(out, "# {} = '<work_area>/{relative}'", role.key);
+            let _ = writeln!(out, "# {} = '{WORK_AREA_PLACEHOLDER}/{relative}'", role.key);
         }
     }
     out
@@ -847,8 +860,9 @@ fn init(root: &Path, platform: &Platform, force: bool) -> Result<String> {
     })?;
     write_machine_file(&target, &init_text(&defaults), force)?;
     let mut message = format!(
-        "wrote {}\nedit work_area (and uncomment a derived role to move it), then run \
-         `cargo xtask env --ensure` to create the directories\n",
+        "wrote {}\nedit work_area (and uncomment a derived role to move it, replacing \
+         {WORK_AREA_PLACEHOLDER} with a real path), then run `cargo xtask env --ensure` to \
+         create the directories\n",
         target.display()
     );
     if let Some(main_file) = shadowed {
@@ -1402,6 +1416,88 @@ mod tests {
         assert_eq!(source(&again, "plans_dir"), Source::Default);
     }
 
+    /// `text` with the leading `# ` removed from every commented role line
+    /// (`# plans_dir = '...'`), leaving the prose comments alone.
+    fn uncomment_role_lines(text: &str) -> String {
+        text.lines()
+            .map(|line| {
+                let role_line = line.strip_prefix("# ").filter(|rest| {
+                    ROLES
+                        .iter()
+                        .any(|role| rest.starts_with(&format!("{} = ", role.key)))
+                });
+                format!("{}\n", role_line.unwrap_or(line))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_uncommented_work_area_placeholder_is_an_error_naming_the_key_and_the_file() {
+        let fake = Fake::new();
+        let line = format!("plans_dir = '{WORK_AREA_PLACEHOLDER}/plans'\n");
+        let error = fake
+            .resolve(&fake.machine_file(&line), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`plans_dir`"), "{error}");
+        assert!(error.contains("machine.toml"), "{error}");
+        assert!(error.contains(WORK_AREA_PLACEHOLDER), "{error}");
+        assert!(error.contains("commented"), "{error}");
+        // The placeholder is rejected wherever it sits in a value and under
+        // any key, while the same line with a real path is accepted.
+        let error = fake
+            .resolve(
+                &fake.machine_file(&format!("work_area = 'x/{WORK_AREA_PLACEHOLDER}'\n")),
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`work_area`"), "{error}");
+        let resolved = fake
+            .resolve(&fake.machine_file("plans_dir = 'elsewhere/plans'\n"), &[])
+            .unwrap();
+        assert_eq!(
+            value(&resolved, "plans_dir"),
+            fake.root.join("elsewhere/plans")
+        );
+    }
+
+    #[test]
+    fn init_text_parses_untouched_and_is_rejected_once_its_lines_are_uncommented() {
+        let fake = Fake::new();
+        let defaults = fake.resolve(&fake.no_file(), &[]).unwrap();
+        let text = init_text(&defaults);
+        fake.resolve(&fake.machine_file(&text), &[]).unwrap();
+
+        // Every commented line at once.
+        let uncommented = uncomment_role_lines(&text);
+        assert_ne!(uncommented, text);
+        let error = fake
+            .resolve(&fake.machine_file(&uncommented), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(WORK_AREA_PLACEHOLDER), "{error}");
+
+        // Each commented line on its own, so every derived role is covered
+        // and the error names that role.
+        let mut checked = 0;
+        for role in ROLES {
+            let Some(relative) = role.derive.work_area_relative() else {
+                continue;
+            };
+            let commented = format!("# {} = '{WORK_AREA_PLACEHOLDER}/{relative}'", role.key);
+            assert!(text.contains(&commented), "{}", role.key);
+            let one = text.replace(&commented, commented.trim_start_matches("# "));
+            let error = fake
+                .resolve(&fake.machine_file(&one), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("`{}`", role.key)), "{error}");
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
     #[test]
     fn toml_strings_stay_literal_unless_they_cannot_be() {
         assert_eq!(toml_string("C:\\a\\b"), "'C:\\a\\b'");
@@ -1423,6 +1519,7 @@ mod tests {
 
         let message = init(&root, &platform, false).unwrap();
         assert!(message.contains("--ensure"));
+        assert!(message.contains(WORK_AREA_PLACEHOLDER), "{message}");
         let written = std::fs::read_to_string(&target).unwrap();
         assert!(written.contains("work_area = "));
 

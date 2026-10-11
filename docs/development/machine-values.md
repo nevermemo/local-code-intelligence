@@ -124,8 +124,10 @@ experiment_root = 'D:/lci-ab'
 area as a commented line relative to it (for example
 `# plans_dir = '<work_area>/plans'`, the table's default), never as an absolute
 value. Those roles keep following `work_area`, wherever it points, until a line
-is uncommented and given a path of its own. It never overwrites an existing
-file without `--force`.
+is uncommented and given a path of its own. A line uncommented without
+replacing `<work_area>` is an error that names the key and the file, because
+the text would otherwise resolve to a path literally named `<work_area>`
+inside the checkout. It never overwrites an existing file without `--force`.
 
 A linked git worktree (an implementer's `git worktree add`) with no
 `.local/machine.toml` of its own reads the main worktree's, found through
