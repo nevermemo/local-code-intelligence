@@ -369,6 +369,20 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
     }
 
     if should_run(&only, "Evaluate", "evaluate") {
+        // The evaluation below inherits this process's environment and passes
+        // no --config, so it honours the user-level local overlay and any
+        // LCI_* variable (the self-hosted runner may rely on its machine
+        // overlay). Neither is stripped. Instead, resolve the same
+        // configuration with the same binary and environment first, so this
+        // run's logs show which layers and values the evaluation used (the
+        // step's stdout log is `lci config --json`).
+        steps.push(binary_step(
+            "Evaluate provenance - lci config --json",
+            "evaluate-config",
+            lci_binary(),
+            vec!["config".to_string(), "--json".to_string()],
+            1,
+        ));
         let workspace_arg = format!("self={}", root.display());
         let output_arg = test_results_dir()?.join("evaluation.json");
         steps.push(binary_step(

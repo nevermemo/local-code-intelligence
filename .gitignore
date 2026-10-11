@@ -2,5 +2,7 @@
 /config.toml
 /test-results/
 /.tools/
+# Machine-specific development-tooling values (`cargo xtask env --init`).
+/.local/
 # Local overlay files hold machine values and never belong in the public repository.
 *.local.toml

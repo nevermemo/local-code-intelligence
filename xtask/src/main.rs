@@ -1,5 +1,6 @@
 mod acceptance;
 mod build;
+mod env;
 mod live_acceptance;
 mod mine;
 mod setup;
@@ -51,6 +52,11 @@ enum Command {
         #[arg(long)]
         skip_build: bool,
     },
+    /// Resolve the development-tooling paths (work area, plans, frozen
+    /// binaries, checkpoint, ...) by role instead of hard-coding them:
+    /// defaults < .local/machine.toml < LCI_DEV_<KEY>. See
+    /// docs/development/machine-values.md.
+    Env(env::EnvArgs),
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
@@ -234,6 +240,7 @@ async fn main() -> Result<()> {
             }
         },
         Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
+        Command::Env(args) => env::run(args),
         Command::MineQueries {
             repo,
             key,

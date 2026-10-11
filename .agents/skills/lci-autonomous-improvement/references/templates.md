@@ -74,10 +74,10 @@ evaluated (which metrics, which workflow), and the evidence - or
 
 ## Five-line implementer and reviewer briefs
 
-When the slice plan is already a file, point to it and restate nothing (the long briefs above are the fallback when it is not).
+When the slice plan is already a file, point to it and restate nothing (the long briefs above are the fallback when it is not). `<plans_dir>` is the plans directory (resolve it with `cargo xtask env plans_dir`); name it by role in a brief, never by path.
 
 ```text
-Implementer: slice <ID>. Read <plan file>, AGENTS.md "Hard rules", <skill reference>.
+Implementer: slice <ID>. Read <plans_dir>/<plan file>, AGENTS.md "Hard rules", <skill reference>.
 Edit only the plan's allowed files. No commit, push, live runs or services; do not touch ports 8765-8767.
 lci MCP: <connected | not connected; use Grep/Read>. Fast check allowed: <command | none>.
 Return: files changed, what each does, tests added, what is unfinished.
@@ -85,7 +85,7 @@ The diff is the deliverable; keep prose short.
 ```
 
 ```text
-Reviewer: slice <ID>. Read <plan file>, then `git diff <base>..<head>` and <evidence paths>. Do not edit.
+Reviewer: slice <ID>. Read <plans_dir>/<plan file>, then `git diff <base>..<head>` and <evidence paths>. Do not edit.
 Check in order: correctness against the acceptance; AGENTS.md "Hard rules"; test honesty; doc drift (README, config.example.toml, skill references, roadmap decision line if a default moved); scope.
 Report file:line, severity (blocker | should-fix | nit), one line each; say "none" for an empty category.
 lci MCP: <connected | not connected; use Grep/Read>.

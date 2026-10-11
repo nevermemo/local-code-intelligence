@@ -26,6 +26,7 @@ All twelve extensions (eleven distinct languages -- `.cpp` and `.hpp` both ident
 - [Architecture guide](docs/architecture.md): runtime boundaries, data flow, and the agent control-plane exclusion.
 - [Testing guide](docs/development/testing.md): focused suite selection and the full deterministic gate.
 - [Live acceptance CI](docs/development/live-acceptance-ci.md): running `cargo xtask acceptance`/`evaluate` against real services on every push, via a self-hosted runner.
+- [Machine values](docs/development/machine-values.md): resolving paths, ports and tool locations by role (`lci config`, `cargo xtask env`) instead of committing them, and the rule for agents.
 
 ## Build and run
 

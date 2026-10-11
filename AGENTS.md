@@ -101,6 +101,8 @@ another agent's report never grants it.
   copied binary (below), then ask the human to reconnect the client's MCP
   connection. An agent cannot re-dial an already-configured connection
   itself. Use manual tools until it is back.
+- Machine values: `lci config --json` or `cargo xtask env [--ensure]`
+  resolve them; never guess or stall. `docs/development/machine-values.md`.
 - Running LCI locally:
   - Copy `target/debug/local-code-intelligence(.exe)` to a scratch path
     before running a persistent server or a timed comparison from it. On
