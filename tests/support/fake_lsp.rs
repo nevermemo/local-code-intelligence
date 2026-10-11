@@ -2,7 +2,7 @@ use serde_json::json;
 use std::{
     env, fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process, str, thread,
     time::Duration,
 };
@@ -54,6 +54,12 @@ pub struct FakeLspConfig {
     /// Milliseconds to sleep before answering every LATER `workspace/symbol`
     /// request (`--symbol-delay-ms`).
     pub symbol_delay_ms: u64,
+    /// A server that never shuts down (`--ignore-shutdown`): it still records
+    /// the `shutdown` request and the `exit` notification, but sends no
+    /// answer to the first and keeps running after the second, so only a
+    /// kill ends it. While it runs it also rewrites `heartbeat.txt` in the
+    /// state directory every 50 ms, which stops changing once it is dead.
+    pub ignore_shutdown: bool,
 }
 
 pub fn run_from_env() -> io::Result<()> {
@@ -105,6 +111,7 @@ pub fn run_from_env() -> io::Result<()> {
     let symbol_delay_ms = cli_arg(&cli, "--symbol-delay-ms")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let ignore_shutdown = cli.iter().any(|arg| arg == "--ignore-shutdown");
     let config = FakeLspConfig {
         scenario,
         state_dir: state_path,
@@ -115,8 +122,24 @@ pub fn run_from_env() -> io::Result<()> {
         initialize_delay_ms,
         first_symbol_delay_ms,
         symbol_delay_ms,
+        ignore_shutdown,
     };
     run_server(config)
+}
+
+/// Appends one line (this process's id) to `name` in the state directory, so
+/// a test can count how many processes saw the event. Best effort.
+fn record_event(state_dir: Option<&Path>, name: &str) {
+    let Some(path) = state_dir else { return };
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.join(name))
+    {
+        // One `write_all` of the whole line: `writeln!` may issue several
+        // writes, which two servers appending at once could interleave.
+        let _ = file.write_all(format!("{}\n", process::id()).as_bytes());
+    }
 }
 
 pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
@@ -145,6 +168,31 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         let current = fs::read_to_string(&spawn_file).unwrap_or_default();
         spawn_count = current.trim().parse::<u64>().unwrap_or(0) + 1;
         fs::write(&spawn_file, spawn_count.to_string())?;
+    }
+
+    // A server that ignores shutdown can only be ended by a kill; the beat
+    // lets a test see that it really stopped.
+    if config.ignore_shutdown
+        && let Some(path) = config.state_dir.clone()
+    {
+        thread::spawn(move || {
+            let mut beat = 0u64;
+            loop {
+                beat += 1;
+                // Overwritten in place with fixed-width text, never
+                // truncated: `fs::write` would leave an empty file behind
+                // if the kill landed between its truncate and its write.
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(path.join("heartbeat.txt"))
+                {
+                    let _ = file.write_all(format!("{beat:020}").as_bytes());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
     }
 
     let mut symbol_requests = 0u64;
@@ -242,6 +290,20 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 stdout.write_all(malformed).unwrap();
                 stdout.flush().unwrap();
                 return Ok(());
+            }
+        } else if method == Some("shutdown") {
+            // Recorded even when ignored, so a test can tell the request
+            // arrived.
+            record_event(config.state_dir.as_deref(), "shutdown_seen.txt");
+            if !config.ignore_shutdown
+                && let Some(id) = id
+            {
+                write_message(&mut stdout, &json_response(id, serde_json::Value::Null))?;
+            }
+        } else if method == Some("exit") {
+            record_event(config.state_dir.as_deref(), "exit_seen.txt");
+            if !config.ignore_shutdown {
+                process::exit(0);
             }
         } else {
             // Scenario-specific request methods. Build file URIs from the

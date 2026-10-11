@@ -717,7 +717,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 ### N3 - LSP shutdown, idle eviction, registry-derived status
 `ready` (second triage 2026-10-10: build on N7's `Session`/`Manager` in `lci-core/src/lsp.rs` -- sessions are now held by the manager on a detached start task, so shutdown on drop and idle eviction have one owner to hook; also home for N7's follow-up "shorter quiescence wait now that priming exists") - S - deps: N7 (done) - skill: `lci-lsp-adapter`
 - Why: processes are only `kill_on_drop`; no `shutdown`/`exit` handshake; servers live as long as the service (many workspaces = many servers). `Status` in `src/app/indexing.rs` hard-codes seven `*_analyzer_running` booleans. codesearch evicts idle watchers/servers (https://github.com/flupkede/codesearch); Claude Code's LSP config has `shutdownTimeout` (https://code.claude.com/docs/en/plugins-reference).
-- Scope: `shutdown` request + `exit` notification bounded to 2 s on session drop and on `serve` Ctrl+C; `lsp_idle_minutes` (default 30, 0 = never) eviction task; `Status.analyzers_running: BTreeMap<String, bool>` derived from `Manager::adapters()` (keep the old fields one release for REST/MCP consumers, mark deprecated in README).
+- Scope: `shutdown` request + `exit` notification bounded to 2 s on session drop and on `serve` Ctrl+C; `lsp_idle_minutes` (default 30, 0 = never) eviction task (landed in P2a as `lsp_idle_timeout_seconds`, default 1800, 0 = never; see below); `Status.analyzers_running: BTreeMap<String, bool>` derived from `Manager::adapters()` (keep the old fields one release for REST/MCP consumers, mark deprecated in README).
 - Accept: fake LSP sees `shutdown` then `exit`; eviction test with a 1-second idle setting; `cargo xtask acceptance <lang>-recovery` still passes.
 - Risk: none to retrieval.
 
@@ -739,6 +739,7 @@ freshness (independent of ranking, can interleave), then LSP lifecycle.
 | C3 | Split declarations above ~8 KB with header carry | blocked(C1) | M | C1, E3 |
 | X1 | Extensions `.h`, `.cc/.cxx/.hh/.hxx`, `.mts/.cts`, `.mjs/.cjs` through the acceptance bar | ready | S each | - |
 | H2 | Documentation sync: README docs index links this file and the evaluation workflow; two `compare` README notes from the E3a review | ready (edited 2026-10-10; AGENTS/BM25 parts landed) | XS | - |
+- P2a (2026-10-11, A/B plumbing): idle release and the bounded `shutdown`/`exit` handshake landed: `lsp_idle_timeout_seconds` (default 1800, 0 = never), a sweeper that releases only ready, primed, unused sessions, `Manager::release`/`shutdown_all`, about 4 s worst case per release; the idle test uses 2 s (N3 asked for 1 s; the tick clamps at 1 s). Still open: the REST release endpoint and Ctrl+C release (P2b) and `Status.analyzers_running` (part 3).
 
 ### N4 - Project-root discovery and priming
 `ready` (second triage 2026-10-10: N7 already primes every started server with one `workspace/symbol` and dedupes starts per (provider, workspace); what remains here is per-root sessions, the representative `didOpen` for TS/Python, and N7's follow-up of priming at `index`/`serve` start so a workspace's first queries also get LSP hits) - M - deps: N2, N7 (done) - skill: `lci-lsp-adapter`

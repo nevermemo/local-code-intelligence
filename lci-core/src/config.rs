@@ -216,6 +216,14 @@ pub struct Config {
     /// server keeps starting in the background for later searches. Separate
     /// from `lsp_timeout_seconds`, which bounds one request to a hung server.
     pub lsp_search_budget_ms: u64,
+    /// Seconds a language-server session may go unused before its server is
+    /// shut down to free its memory (default `1800`, 30 minutes; `0` keeps
+    /// every server until the service stops). A server that is still
+    /// priming or serving a call is never released. The next search or
+    /// navigation call for that workspace starts a fresh server, so a
+    /// released server costs one cold start (and re-priming) later. Values
+    /// below 60 are meant for tests.
+    pub lsp_idle_timeout_seconds: u64,
     /// Optional C# language-server (csharp-ls) settings. Absent or empty
     /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
     pub csharp: CSharpLspConfig,
@@ -527,6 +535,7 @@ impl Default for Config {
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
             lsp_search_budget_ms: 1500,
+            lsp_idle_timeout_seconds: 1800,
             csharp: CSharpLspConfig::default(),
             typescript: TypeScriptLspConfig::default(),
             python: PythonLspConfig::default(),
@@ -849,6 +858,30 @@ mod tests {
                 ..Config::default()
             };
             config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn lsp_idle_timeout_defaults_to_thirty_minutes_allows_zero_and_round_trips() {
+        // A file without the key keeps the default.
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.lsp_idle_timeout_seconds, 1800);
+        assert_eq!(Config::default().lsp_idle_timeout_seconds, 1800);
+
+        // 0 means never release; it is a valid setting, not an error.
+        for seconds in [0, 1, 600] {
+            let configured: Config = toml::from_str(&format!(
+                "{}lsp_idle_timeout_seconds = {seconds}\n",
+                base_toml()
+            ))
+            .unwrap();
+            configured.validate().unwrap();
+            assert_eq!(configured.lsp_idle_timeout_seconds, seconds);
+
+            let reloaded: Config = toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
+            reloaded.validate().unwrap();
+            assert_eq!(reloaded.lsp_idle_timeout_seconds, seconds);
         }
     }
 

@@ -15,6 +15,15 @@ use tokio::{
     sync::{Mutex, oneshot},
 };
 
+/// Most time [`JsonRpcClient::shutdown`] gives the `exit` notification's
+/// write. It only fills a pipe buffer, so anything longer means the server
+/// stopped reading.
+const EXIT_WRITE_BOUND: Duration = Duration::from_millis(200);
+
+/// Most time [`JsonRpcClient::shutdown`] waits to reap a child it has just
+/// killed; the kill itself does not wait.
+const KILL_REAP_BOUND: Duration = Duration::from_millis(500);
+
 type LastActivity = Arc<std::sync::Mutex<Instant>>;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
@@ -233,6 +242,48 @@ impl JsonRpcClient {
     /// The configured request timeout.
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Stops the server the way the protocol asks: a `shutdown` request, an
+    /// `exit` notification, then a wait for the process to end. The request
+    /// and the wait are each bounded by `grace`, the `exit` write by 200 ms
+    /// (it is a pipe write, not a round trip), so the call returns within
+    /// about `2 * grace` for any server, however unresponsive. A server that
+    /// is still alive after that is killed and reaped (the kill is immediate;
+    /// the reaping is bounded by 500 ms). Returns `true` when the process
+    /// ended on its own, `false` when it had to be killed.
+    ///
+    /// Failures of the first two steps are ignored: the server may already
+    /// be gone, and the goal is the same either way. The client is unusable
+    /// afterwards. The child lock is held only inside the bounded wait and
+    /// kill, so [`Drop`]'s `try_lock` still works.
+    pub async fn shutdown(&self, grace: Duration) -> bool {
+        if tokio::time::timeout(grace, self.request("shutdown", Value::Null))
+            .await
+            .is_err()
+        {
+            tracing::debug!(label = %self.label, "language server did not answer shutdown in time");
+        }
+        // The write blocks only if a hung server stopped reading its input
+        // and the pipe is full; do not let that hold the release.
+        let _ = tokio::time::timeout(EXIT_WRITE_BOUND, self.notify("exit", Value::Null)).await;
+        if let Ok(Ok(_)) = tokio::time::timeout(grace, self.wait_exit()).await {
+            return true;
+        }
+        tracing::debug!(label = %self.label, "language server did not exit in time; killing it");
+        // Do not leave the kill to `Drop`: another holder of this client (a
+        // request that is still in flight) may keep it alive.
+        let _ = tokio::time::timeout(KILL_REAP_BOUND, async {
+            self.child.lock().await.kill().await
+        })
+        .await;
+        false
+    }
+
+    /// Waits for the child process to end. Cancel-safe: dropping it only
+    /// stops waiting, and releases the child lock.
+    async fn wait_exit(&self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.lock().await.wait().await
     }
 
     /// Writes one message on a detached task. A caller that is dropped while

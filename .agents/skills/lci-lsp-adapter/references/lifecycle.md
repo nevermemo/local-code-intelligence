@@ -5,7 +5,7 @@
 - Start lazily on the first applicable symbol/navigation request or retrieval channel use.
 - Reuse one healthy process per workspace and configuration. Serialize JSON-RPC writes, correlate response IDs, drain notifications, and keep stderr from corrupting protocol output.
 - Bound initialization and requests. On process exit, malformed protocol data, or timeout, discard the client and allow one fresh retry where the operation is safe.
-- Stop child processes when the application shuts down or the owning state is dropped.
+- Stop child processes when the application shuts down, when the owning state is dropped, or when a session is released (below).
 - LSP search is one candidate channel. Its failure must not suppress available semantic or lexical results.
 - Direct navigation validates supported language before startup and reports tooling failures as MCP errors.
 - Normalize UTF-16 character offsets according to LSP. Public input line numbers remain one-based.
@@ -18,3 +18,10 @@
 - **Per-search budget.** `lsp_search_budget_ms` (default 1500) is the most one search waits for each provider's symbol queries; providers run side by side. A provider that is still starting, still priming, or slow costs the search at most the budget: the search keeps the answers the provider already gave, returns, and reports an informational `notes` entry. That is not a `warning`, because nothing failed and `evaluate` counts warnings as fallbacks. The session is never discarded for running past the budget. With the LSP channel as the only enabled channel, a cold server is a clean miss plus the note, not an error.
 - **Abandoning a request.** A request future that is dropped before its response (a search past its budget) removes its pending entry and sends `$/cancelRequest`; the session stays and the late response is ignored. Writes run on a detached task so a dropped caller never leaves half a frame on the pipe.
 - **Diagnosing a slow search.** `RUST_LOG=local_code_intelligence=debug,lci_core=debug` shows the session start and priming durations, the quiescence wait (`warn` when it expires), and a `warn` for every request failure that discards and restarts a session (the usual cause of a sudden multi-second search).
+
+## Releasing a session
+
+- **Idle release.** `lsp_idle_timeout_seconds` (default 1800; 0 = never, today's behaviour before release existed) starts a sweeper in `Manager::new` that ticks every `clamp(idle / 4, 1 s, 30 s)`. It releases a session only when the session is ready, has finished priming, is not in use (no caller holds it: the strong count is checked under the registry lock, where callers get their handle), and has been idle for the timeout. Use means `Manager::session` handing the session out (touched under the lock) and the caller's wait for the start and priming ending (touched again); status polls and the session's own priming do not count. Values under 60 s are for tests.
+- **Release mechanics.** A released session is removed from the registry under the lock and shut down outside it: `shutdown` request (bounded by `SHUTDOWN_GRACE`, 2 s), `exit` notification (write bounded at 200 ms), then up to 2 s for the process to exit, then kill and reap (bounded at 500 ms): about 4 s at most. A session that is still starting counts as released; its process ends when the last handle drops, and a caller already waiting on that start is still served by it. `Manager::release(workspace)` and `Manager::shutdown_all()` release explicitly; they skip the in-use check, so a request in flight fails and takes the usual retry-once path with a fresh session.
+- **After a release.** The next call starts a fresh session transparently. It primes again, so the first search may spend its budget and report a `notes` entry, exactly as after `serve` starts.
+

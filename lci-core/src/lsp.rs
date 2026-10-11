@@ -14,10 +14,13 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Weak},
+    time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, watch};
+use tokio::{
+    sync::{Mutex, watch},
+    task::JoinSet,
+};
 
 pub mod adapter;
 pub mod clangd;
@@ -91,6 +94,16 @@ fn workspace_symbol_params(query: &str) -> Value {
 
 type SessionKey = (String, String);
 
+/// The registry of live sessions. The idle sweeper holds a [`Weak`] to it, so
+/// it never keeps the sessions (and their child processes) alive.
+type Sessions = Mutex<HashMap<SessionKey, Arc<Session>>>;
+
+/// How long each of the two slow steps of a language server's shutdown (the
+/// `shutdown` request, the wait for the process to exit) is given before the
+/// server is killed, so releasing a session is bounded by about twice this
+/// (the `exit` write adds at most 200 ms, the kill is immediate).
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 /// What one server start produced: the ready client, or the rendered cause of
 /// the failure (shared by every caller that waited on the same start).
 type StartOutcome = Result<Arc<GenericClient>, String>;
@@ -120,17 +133,33 @@ type StartOutcome = Result<Arc<GenericClient>, String>;
 /// is never cancelled by a caller's budget, and only `workspace/symbol`
 /// callers wait for it ([`Session::primed`]); definition and references are
 /// served as soon as the start succeeds.
+///
+/// A session that nobody has asked for in a while is released: the idle
+/// sweeper (see [`Manager::new`]) and [`Manager::release`] remove it from the
+/// registry and [`Session::shutdown`] stops its server. The next caller then
+/// starts a fresh session.
 struct Session {
     start: watch::Receiver<Option<StartOutcome>>,
     /// Flips to `true` when priming has settled, whether it succeeded or
     /// not. Never flips if the start failed.
     primed: watch::Receiver<bool>,
+    provider: &'static str,
+    /// The workspace's path, for log lines (the registry key holds its id).
+    workspace: PathBuf,
+    /// When a caller last asked for this session, for the idle sweeper:
+    /// set when the session begins and touched by [`Manager::session`] and
+    /// [`Manager::client`], so a search and a navigation call both count. The session's own start and
+    /// priming never touch it, and neither does [`Manager::running`], so a
+    /// status poll does not keep a server alive.
+    last_used: std::sync::Mutex<Instant>,
 }
 
 impl Session {
     fn begin(adapter: Arc<dyn LspAdapter>, workspace: Workspace) -> Arc<Self> {
         let (sender, start) = watch::channel(None);
         let (primed_sender, primed) = watch::channel(false);
+        let provider = adapter.provider();
+        let workspace_path = workspace.path.clone();
         tokio::spawn(async move {
             let provider = adapter.provider();
             let started = Instant::now();
@@ -185,7 +214,69 @@ impl Session {
             }
             primed_sender.send_replace(true);
         });
-        Arc::new(Self { start, primed })
+        Arc::new(Self {
+            start,
+            primed,
+            provider,
+            workspace: workspace_path,
+            last_used: std::sync::Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Records that a caller just asked for this session.
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+
+    /// How long ago a caller last asked for this session.
+    fn idle_for(&self) -> Duration {
+        self.last_used.lock().unwrap().elapsed()
+    }
+
+    /// Whether the idle sweeper may release this session, called under the
+    /// registry lock. All of these must hold:
+    ///
+    /// - the server has started and priming has settled: a session that is
+    ///   still priming is busy building the index its `workspace/symbol`
+    ///   callers wait for, and releasing it would fail them (the retry could
+    ///   fail the same way at a small idle timeout);
+    /// - no call is using it: the registry holds one reference and every
+    ///   call in progress holds another (a call gets its reference under the
+    ///   same lock), so this cannot release a server between a caller
+    ///   finding it and its request;
+    /// - nobody has asked for it for `idle`.
+    fn idle_and_unused(self: &Arc<Self>, idle: Duration) -> bool {
+        self.ready_client().is_some()
+            && *self.primed.borrow()
+            && Arc::strong_count(self) == 1
+            && self.idle_for() >= idle
+    }
+
+    /// Stops this session's server, bounded by about `2 * grace`. Returns
+    /// `false` only when the session has no server to stop because its start
+    /// failed. A session that is still starting counts as released (`true`):
+    /// there is nothing to shut down yet, so this just lets go of it. Its
+    /// process dies when the last `Arc` to the session drops, and a caller
+    /// still waiting in [`Session::client`] holds one, so that caller is
+    /// served by the removed session's server (the start is not cancelled)
+    /// and the next call starts a fresh session.
+    ///
+    /// The caller removes the session from the registry first, so no new
+    /// request can pick it up. A request already in flight on a started
+    /// server fails when the server exits and recovers through the manager's
+    /// retry-once path with a fresh session.
+    async fn shutdown(self: Arc<Self>, grace: Duration) -> bool {
+        let Some(client) = self.ready_client() else {
+            return !self.failed();
+        };
+        let exited = client.rpc.shutdown(grace).await;
+        tracing::debug!(
+            provider = self.provider,
+            workspace = %self.workspace.display(),
+            exited_on_its_own = exited,
+            "language server shut down"
+        );
+        true
     }
 
     /// Waits for the start to finish (not for priming). Cancel-safe:
@@ -232,14 +323,23 @@ impl Session {
 /// disableable adapters. A disabled or unconfigured adapter simply never
 /// produces a session (`transport_config` returns `None`), which surfaces
 /// as a clear error from the caller.
+///
+/// A session is released, its server shut down cleanly (see
+/// [`SHUTDOWN_GRACE`]), when nobody has used it for `lsp_idle_timeout_seconds`
+/// (`0` keeps it for the life of the manager), on [`Self::release`], and on
+/// [`Self::shutdown_all`]. The next call for that workspace starts a new
+/// session transparently.
 pub struct Manager {
     adapters: Vec<Arc<dyn LspAdapter>>,
-    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
+    sessions: Arc<Sessions>,
 }
 
 impl Manager {
+    /// Builds the registry. When `lsp_idle_timeout_seconds` is positive and a
+    /// Tokio runtime is running, this also spawns the idle sweeper; without a
+    /// runtime only explicit [`Self::release`] frees a session.
     pub fn new(config: &Config) -> Self {
-        let timeout = std::time::Duration::from_secs(config.lsp_timeout_seconds);
+        let timeout = Duration::from_secs(config.lsp_timeout_seconds);
         let adapters: Vec<Arc<dyn LspAdapter>> = vec![
             Arc::new(RustServer::new(config)),
             Arc::new(CSharpServer::new(&config.csharp, timeout)),
@@ -249,10 +349,14 @@ impl Manager {
             Arc::new(JavaServer::new(config, timeout)),
             Arc::new(ClangdServer::new(&config.clangd, timeout)),
         ];
-        Self {
-            adapters,
-            sessions: Mutex::new(HashMap::new()),
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        if config.lsp_idle_timeout_seconds > 0 {
+            spawn_idle_sweeper(
+                Arc::downgrade(&sessions),
+                Duration::from_secs(config.lsp_idle_timeout_seconds),
+            );
         }
+        Self { adapters, sessions }
     }
 
     pub fn adapters(&self) -> &[Arc<dyn LspAdapter>] {
@@ -276,13 +380,16 @@ impl Manager {
     /// none. At most one start is ever in flight per key: concurrent callers
     /// get the same session. A session whose start already failed is replaced
     /// (a failure is reported to the callers that waited on it, never cached
-    /// for later ones).
+    /// for later ones). Asking for the session counts as using it, recorded
+    /// under the registry lock, so the idle sweeper cannot release it between
+    /// this caller finding it and the caller's first request.
     async fn session(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Arc<Session> {
         let key = Self::session_key(adapter, workspace);
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(&key)
             && !existing.failed()
         {
+            existing.touch();
             return Arc::clone(existing);
         }
         let session = Session::begin(Arc::clone(adapter), workspace.clone());
@@ -306,7 +413,45 @@ impl Manager {
         if after_priming {
             session.primed().await?;
         }
+        // The start and priming can take far longer than the idle timeout
+        // (a cold rust-analyzer): count the moment the caller finally has its
+        // server, so the sweeper cannot release it just before the request.
+        session.touch();
         Ok((session, client))
+    }
+
+    /// Releases every session of this workspace: removes it from the
+    /// registry, shuts its server down (the sessions side by side, each
+    /// bounded by [`SHUTDOWN_GRACE`] twice over), and returns the providers
+    /// that had a server to stop. A session whose start failed is dropped
+    /// without being listed. Returns an empty list when the workspace has no
+    /// session. The next call for this workspace starts a fresh server.
+    ///
+    /// Only this manager's sessions are touched: the same workspace under
+    /// another `Manager` (another process, say) is unaffected.
+    pub async fn release(&self, workspace_id: &str) -> Vec<&'static str> {
+        let removed: Vec<Arc<Session>> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .extract_if(|(_, id), _| id == workspace_id)
+                .map(|(_, session)| session)
+                .collect()
+        };
+        let mut released = shut_down(removed).await;
+        released.sort_unstable();
+        released
+    }
+
+    /// Releases every session of every workspace, like [`Self::release`]
+    /// for each, and returns how many servers were stopped. For service
+    /// shutdown: bounded by about `2 * SHUTDOWN_GRACE` however many
+    /// sessions there are.
+    pub async fn shutdown_all(&self) -> usize {
+        let removed: Vec<Arc<Session>> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.drain().map(|(_, session)| session).collect()
+        };
+        shut_down(removed).await.len()
     }
 
     /// Forgets a failed session so the next caller starts a fresh server.
@@ -513,6 +658,79 @@ impl Manager {
             .get(&(provider.to_string(), workspace_id.to_string()))
             .is_some_and(|session| session.ready_client().is_some())
     }
+}
+
+/// Shuts the servers of already-removed sessions down side by side and
+/// returns the providers that had a server to stop. Dropping this future
+/// (the caller gave up) aborts the shutdowns, and dropping the clients then
+/// kills any server that is left.
+async fn shut_down(removed: Vec<Arc<Session>>) -> Vec<&'static str> {
+    let mut shutdowns = JoinSet::new();
+    for session in removed {
+        let provider = session.provider;
+        shutdowns.spawn(async move { (provider, session.shutdown(SHUTDOWN_GRACE).await) });
+    }
+    let mut stopped = Vec::new();
+    while let Some(outcome) = shutdowns.join_next().await {
+        if let Ok((provider, true)) = outcome {
+            stopped.push(provider);
+        }
+    }
+    stopped
+}
+
+/// Spawns the task that releases sessions idle for `idle` or longer. It
+/// wakes every quarter of `idle` (at least 1 s, at most 30 s apart), removes
+/// the sessions that [`Session::idle_and_unused`] accepts (started, primed,
+/// not in use, and nobody has asked for them for `idle`), and shuts them down
+/// outside the registry lock. It holds only a [`Weak`] reference to the registry and
+/// ends at its next wake-up once the [`Manager`] is dropped. Without a Tokio
+/// runtime nothing is spawned.
+fn spawn_idle_sweeper(registry: Weak<Sessions>, idle: Duration) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no async runtime; idle language servers are released only on request");
+        return;
+    };
+    let tick = (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+    runtime.spawn(async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(sessions) = registry.upgrade() else {
+                return;
+            };
+            let expired: Vec<Arc<Session>> = sessions
+                .lock()
+                .await
+                .extract_if(|_, session| session.idle_and_unused(idle))
+                .map(|(_, session)| session)
+                .collect();
+            // The shutdowns take seconds: do not keep the registry alive
+            // (or locked) meanwhile.
+            drop(sessions);
+            if expired.is_empty() {
+                continue;
+            }
+            let released: Vec<(&'static str, PathBuf, u64)> = expired
+                .iter()
+                .map(|session| {
+                    (
+                        session.provider,
+                        session.workspace.clone(),
+                        session.idle_for().as_secs(),
+                    )
+                })
+                .collect();
+            shut_down(expired).await;
+            for (provider, workspace, idle_s) in released {
+                tracing::info!(
+                    provider,
+                    workspace = %workspace.display(),
+                    idle_s,
+                    "language server released after idle"
+                );
+            }
+        }
+    });
 }
 
 /// Normalizes an LSP `workspace/symbol`/`textDocument/definition`/

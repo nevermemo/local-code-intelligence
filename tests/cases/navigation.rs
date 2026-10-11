@@ -498,6 +498,380 @@ async fn an_abandoned_request_leaves_the_session_usable() {
     assert_eq!(state_count(&state, "request_count.txt"), 6);
 }
 
+/// Polls `done` every 50 ms until it returns `true`, and fails with `what`
+/// when `deadline` passes first. Waiting on the observable change rather than
+/// sleeping a fixed time keeps the idle and release tests from depending on
+/// how fast the machine is.
+async fn wait_until(what: &str, deadline: Duration, mut done: impl AsyncFnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !done().await {
+        assert!(
+            started.elapsed() < deadline,
+            "timed out after {deadline:?} waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How many lines the fake server has appended to `name` in its state
+/// directory (one per process that saw the event); 0 when there is no file.
+fn event_count(state: &std::path::Path, name: &str) -> usize {
+    std::fs::read_to_string(state.join(name)).map_or(0, |text| text.lines().count())
+}
+
+/// A second workspace next to the fixture's, in the same data directory. The
+/// fixture's one configured fake server (and so its state directory) serves
+/// both, which makes `spawn_count.txt` the number of sessions ever started.
+fn second_workspace(temp: &tempfile::TempDir, config: &Config) -> Workspace {
+    let path = temp.path().join("workspace-two");
+    std::fs::create_dir_all(path.join("src")).unwrap();
+    Workspace::resolve(&path, &config.data_dir).unwrap()
+}
+
+/// A C# fixture for the idle and release tests. They never depend on a 1 s
+/// request timeout, and the fixture's 1 s would make a slow process start
+/// under load fail their `initialize`, so this one allows 5 s.
+fn fake_csharp_release_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf) {
+    let (mut config, workspace, state) = fake_csharp_fixture(temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 5;
+    (config, workspace, state)
+}
+
+/// The idle timeout (2 s here, checked about every second) shuts an unused
+/// server down through the protocol -- `shutdown`, then `exit` -- and the next
+/// call starts a fresh process instead of failing.
+#[tokio::test]
+async fn an_idle_session_is_shut_down_and_restarted_on_the_next_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_idle_timeout_seconds = 2;
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    let first_process = std::fs::read_to_string(state.join("pid.txt")).unwrap();
+
+    wait_until(
+        "the idle server to be released",
+        Duration::from_secs(30),
+        async || {
+            !manager.running("csharp-ls", &workspace.id).await
+                && event_count(&state, "exit_seen.txt") == 1
+        },
+    )
+    .await;
+    assert_eq!(
+        event_count(&state, "shutdown_seen.txt"),
+        1,
+        "the server must be asked to shut down before it is told to exit"
+    );
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "releasing an idle session must not start a replacement"
+    );
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    assert_ne!(
+        std::fs::read_to_string(state.join("pid.txt")).unwrap(),
+        first_process,
+        "the next call must be served by a new process"
+    );
+}
+
+/// `lsp_idle_timeout_seconds = 0` means never: the same wait that ends the
+/// session in the test above leaves it running here.
+#[tokio::test]
+async fn idle_timeout_zero_never_releases() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_idle_timeout_seconds = 0;
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    // A 2 s timeout is released within 3 s of its last use (see above).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+}
+
+/// An explicit release stops the servers of one workspace, reports them, and
+/// leaves every other workspace's server serving.
+#[tokio::test]
+async fn release_shuts_down_only_that_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, first, state) = fake_csharp_release_fixture(&temp);
+    let second = second_workspace(&temp, &config);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    for workspace in [&first, &second] {
+        manager
+            .symbols(&adapter, workspace, "Calculator")
+            .await
+            .unwrap();
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+
+    assert_eq!(manager.release(&first.id).await, vec!["csharp-ls"]);
+    assert!(!manager.running("csharp-ls", &first.id).await);
+    assert!(manager.running("csharp-ls", &second.id).await);
+    // `release` returns once the process is gone, so the whole exchange has
+    // happened: one server was asked to shut down and told to exit.
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 1);
+
+    assert!(
+        manager.release(&first.id).await.is_empty(),
+        "a workspace with no session has nothing to release"
+    );
+    assert!(manager.release("no-such-workspace").await.is_empty());
+
+    // The other workspace is still served by its original process; the
+    // released one starts again.
+    manager
+        .symbols(&adapter, &second, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    manager
+        .symbols(&adapter, &first, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(state_count(&state, "spawn_count.txt"), 3);
+    assert!(manager.running("csharp-ls", &first.id).await);
+}
+
+/// A server that answers nothing to `shutdown` and survives `exit` must not
+/// hang the release: it is killed once the grace period has passed.
+#[tokio::test]
+async fn a_server_that_ignores_shutdown_is_killed_within_the_grace_period() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.csharp.args.push("--ignore-shutdown".to_owned());
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    let heartbeat = |state: &std::path::Path| {
+        std::fs::read_to_string(state.join("heartbeat.txt")).unwrap_or_default()
+    };
+    // The server is alive: its heartbeat moves.
+    let beat = heartbeat(&state);
+    wait_until(
+        "the server's heartbeat to move",
+        Duration::from_secs(10),
+        async || heartbeat(&state) != beat,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let released = manager.release(&workspace.id).await;
+    let elapsed = started.elapsed();
+    assert_eq!(released, vec!["csharp-ls"]);
+    assert!(
+        elapsed >= local_code_intelligence::lsp::SHUTDOWN_GRACE,
+        "the release must have waited out the grace period for an exit that never came: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the release must be bounded by the grace period, took {elapsed:?}"
+    );
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 1);
+
+    // Killed: the heartbeat stops. A live server rewrites it every 50 ms and a
+    // dead one cannot, so two equal reads 300 ms apart mean it ended. The
+    // kill is already done when `release` returns; the polling only absorbs
+    // the operating system's delay in ending the process.
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let before = heartbeat(&state);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = heartbeat(&state);
+        if before == after {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the server that ignored shutdown was still alive 10 s after the release \
+             (heartbeat {before:?}, then {after:?})"
+        );
+    }
+}
+
+/// Shutting the manager down (service exit) releases every workspace's
+/// server, not only one.
+#[tokio::test]
+async fn shutdown_all_releases_every_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, first, state) = fake_csharp_release_fixture(&temp);
+    let second = second_workspace(&temp, &config);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    for workspace in [&first, &second] {
+        manager
+            .symbols(&adapter, workspace, "Calculator")
+            .await
+            .unwrap();
+    }
+    assert!(manager.running("csharp-ls", &first.id).await);
+    assert!(manager.running("csharp-ls", &second.id).await);
+
+    assert_eq!(manager.shutdown_all().await, 2);
+    assert!(!manager.running("csharp-ls", &first.id).await);
+    assert!(!manager.running("csharp-ls", &second.id).await);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 2);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 2);
+    assert_eq!(manager.shutdown_all().await, 0);
+
+    // The manager is still usable: the next call starts a new server.
+    manager
+        .symbols(&adapter, &first, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(state_count(&state, "spawn_count.txt"), 3);
+}
+
+/// The priming request (3 s here) outlasts the idle timeout (1 s), and the
+/// `workspace/symbol` caller is waiting for it: the server must not be
+/// released from under that caller, which would fail its request and cost a
+/// second start.
+#[tokio::test]
+async fn a_symbol_call_waiting_for_priming_is_not_cut_off_by_the_idle_sweep() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 5;
+    config.lsp_idle_timeout_seconds = 1;
+    config
+        .csharp
+        .args
+        .extend(["--first-symbol-delay-ms".to_owned(), "3000".to_owned()]);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "the call must be served by the server it started, not by a restart"
+    );
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+}
+
+/// Nobody is waiting on this server (the caller gave up, as a search past its
+/// budget does), and it is still priming for much longer (5 s) than the idle
+/// timeout (1 s): the sweep must leave it alone until priming has settled,
+/// because releasing it mid-priming throws the index build away. Without the
+/// check the first sweep that finds the session idle (about 2 s in) releases
+/// it inside the 2.5 s the test watches.
+#[tokio::test]
+async fn the_idle_sweep_leaves_a_server_alone_while_it_is_priming() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 10;
+    config.lsp_idle_timeout_seconds = 1;
+    config
+        .csharp
+        .args
+        .extend(["--first-symbol-delay-ms".to_owned(), "5000".to_owned()]);
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(300),
+        manager.symbols(&adapter, &workspace, "Calculator"),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the call must give up while the server is still priming"
+    );
+    wait_until("the server to start", Duration::from_secs(10), async || {
+        manager.running("csharp-ls", &workspace.id).await
+    })
+    .await;
+
+    let watching_since = std::time::Instant::now();
+    while watching_since.elapsed() < Duration::from_millis(2500) {
+        assert!(
+            manager.running("csharp-ls", &workspace.id).await
+                && event_count(&state, "shutdown_seen.txt") == 0,
+            "the server was released after {:?}, while it was still priming",
+            watching_since.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Releasing a session whose server is still starting has nothing to shut
+/// down, so it only lets go of the session; a caller already waiting on that
+/// start is still served by it (fail-open), without a second spawn.
+#[tokio::test]
+async fn releasing_a_server_that_is_still_starting_does_not_fail_the_waiting_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) =
+        fake_slow_start_csharp_fixture(&temp, "workspace-symbols", 2000);
+    let manager = Arc::new(Manager::new(&config));
+    let adapter = csharp_adapter(&manager);
+    let waiting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        let adapter = Arc::clone(&adapter);
+        let workspace = workspace.clone();
+        async move { manager.symbols(&adapter, &workspace, "Calculator").await }
+    });
+    wait_until(
+        "the server process to be spawned",
+        Duration::from_secs(10),
+        async || state.join("spawn_count.txt").exists(),
+    )
+    .await;
+    assert!(
+        !manager.running("csharp-ls", &workspace.id).await,
+        "the server must still be starting when it is released"
+    );
+
+    assert_eq!(manager.release(&workspace.id).await, vec!["csharp-ls"]);
+    assert!(!manager.running("csharp-ls", &workspace.id).await);
+
+    let results = waiting.await.unwrap().unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert!(
+        !manager.running("csharp-ls", &workspace.id).await,
+        "the released session is not back in the registry"
+    );
+}
+
 #[tokio::test]
 async fn fake_typescript_lsp_maps_symbols_definitions_and_references() {
     for (mode, operation) in [
