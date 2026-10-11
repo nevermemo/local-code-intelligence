@@ -20,4 +20,4 @@
 - Return the registered language identifier, normalized relative path, exact code, content hash, and one-based inclusive line range.
 - Source-role classification is a shared path concern. Do not duplicate it inside a language adapter.
 - Apply language/path/role filters consistently to semantic, lexical, LSP, fusion, reranker input, and final output.
-- Keep document embeddings free of query instructions. Preserve the established query instruction exactly unless a separately evaluated retrieval change requires it.
+- Keep document embeddings free of query instructions. The query text comes from `embedding_query_template`, not from an adapter; leave its default unchanged unless a separately evaluated retrieval change requires it.
