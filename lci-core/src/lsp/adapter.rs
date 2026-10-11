@@ -35,6 +35,11 @@ pub trait LspAdapter: Send + Sync {
     /// disabled or unconfigured; never spawns a process itself.
     fn transport_config(&self, root: &Path) -> Option<TransportConfig>;
 
+    /// Child-process environment overrides; other variables remain inherited.
+    fn environment(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Build the LSP `initialize` params for `root`. `None` when disabled.
     fn initialize_params(&self, root: &Path) -> Option<Value>;
 

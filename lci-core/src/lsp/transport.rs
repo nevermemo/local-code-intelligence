@@ -90,6 +90,21 @@ pub struct TransportConfig {
     pub label: String,
 }
 
+impl TransportConfig {
+    pub(crate) fn command(&self, environment: &[(String, String)]) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&self.args)
+            .envs(environment.iter().map(|(key, value)| (key, value)))
+            .current_dir(&self.working_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+}
+
 /// A JSON-RPC client over a child process's stdio.
 ///
 /// Handles process lifecycle (spawn, kill on drop), Content-Length framing,
@@ -133,16 +148,10 @@ impl JsonRpcClient {
     /// `true`, the client transitions to the ready state.
     pub async fn spawn(
         config: &TransportConfig,
+        environment: &[(String, String)],
         ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     ) -> Result<Arc<Self>> {
-        let mut command = Command::new(&config.executable);
-        command
-            .args(&config.args)
-            .current_dir(&config.working_dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = config.command(environment);
         #[cfg(windows)]
         let job = job::prepare(&mut command);
         let mut child = command

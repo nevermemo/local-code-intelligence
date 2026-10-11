@@ -21,6 +21,7 @@ pub const LANGUAGE_IDENTIFIER: &str = "rust";
 pub struct RustServer {
     path: String,
     timeout: Duration,
+    trusted: bool,
 }
 
 impl RustServer {
@@ -28,6 +29,7 @@ impl RustServer {
         Self {
             path: config.rust_analyzer_path.clone(),
             timeout: Duration::from_secs(config.lsp_timeout_seconds),
+            trusted: config.rust_analyzer_trusted,
         }
     }
 }
@@ -64,13 +66,46 @@ impl LspAdapter for RustServer {
         })
     }
 
+    fn environment(&self) -> Vec<(String, String)> {
+        if self.trusted {
+            return Vec::new();
+        }
+        [
+            ("CARGO_NET_OFFLINE", "true"),
+            ("RUSTC_WRAPPER", ""),
+            ("RUSTC_WORKSPACE_WRAPPER", ""),
+            ("CARGO_BUILD_RUSTC_WRAPPER", ""),
+            ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", ""),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+    }
+
     fn initialize_params(&self, root: &Path) -> Option<Value> {
         let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
+        let mut options = json!({
+            "workspace":{"symbol":{"search":{"scope":"workspace","kind":"all_symbols","limit":256}}}
+        });
+        if !self.trusted {
+            let environment: serde_json::Map<String, Value> = self
+                .environment()
+                .into_iter()
+                .map(|(key, value)| (key, Value::String(value)))
+                .collect();
+            options["cargo"] = json!({
+                "buildScripts": {"enable": false, "overrideCommand": null},
+                "extraEnv": &environment
+            });
+            options["procMacro"] = json!({"enable": false});
+            options["checkOnSave"] = json!(false);
+            options["check"] = json!({"overrideCommand": null, "extraEnv": &environment});
+        }
         Some(json!({
             "processId": std::process::id(), "rootUri": &root_uri,
             "capabilities": {"workspace":{"symbol":{"resolveSupport":{"properties":["location.range"]}}},"experimental":{"serverStatusNotification":true}},
             "workspaceFolders":[{"uri":&root_uri,"name":root.file_name().and_then(|v|v.to_str()).unwrap_or("workspace")}],
-            "initializationOptions":{"workspace":{"symbol":{"search":{"scope":"workspace","kind":"all_symbols","limit":256}}}}
+            "initializationOptions": options
         }))
     }
 
@@ -122,6 +157,81 @@ impl LspAdapter for RustServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_initialization_disables_repository_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let server = RustServer::new(&Config::default());
+        let params = server.initialize_params(root.path()).unwrap();
+        let options = &params["initializationOptions"];
+        assert_eq!(options["cargo"]["buildScripts"]["enable"], json!(false));
+        assert_eq!(options["procMacro"]["enable"], json!(false));
+        assert_eq!(options["checkOnSave"], json!(false));
+        assert_eq!(
+            options["workspace"]["symbol"]["search"],
+            json!({"scope":"workspace","kind":"all_symbols","limit":256})
+        );
+        let environment = json!({
+            "CARGO_NET_OFFLINE": "true",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_BUILD_RUSTC_WRAPPER": "",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": ""
+        });
+        assert_eq!(
+            options,
+            &json!({
+                "workspace": {"symbol": {"search": {
+                    "scope": "workspace", "kind": "all_symbols", "limit": 256
+                }}},
+                "cargo": {
+                    "buildScripts": {"enable": false, "overrideCommand": null},
+                    "extraEnv": &environment
+                },
+                "procMacro": {"enable": false},
+                "checkOnSave": false,
+                "check": {"overrideCommand": null, "extraEnv": &environment}
+            })
+        );
+        let transport = server.transport_config(root.path()).unwrap();
+        let command = transport.command(&server.environment());
+        let overrides: serde_json::Map<String, Value> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().unwrap().to_owned(),
+                    json!(value.unwrap().to_str().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(Value::Object(overrides), environment);
+    }
+
+    #[test]
+    fn trusted_initialization_restores_server_defaults_and_inherited_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str("rust_analyzer_trusted = true").unwrap();
+        let server = RustServer::new(&config);
+        let params = server.initialize_params(root.path()).unwrap();
+        assert_eq!(
+            params["initializationOptions"],
+            json!({"workspace":{"symbol":{"search":{
+                "scope":"workspace","kind":"all_symbols","limit":256
+            }}}})
+        );
+        assert!(server.environment().is_empty());
+        let transport = server.transport_config(root.path()).unwrap();
+        assert_eq!(
+            transport
+                .command(&server.environment())
+                .as_std()
+                .get_envs()
+                .count(),
+            0
+        );
+        assert!(!toml::from_str::<Config>("").unwrap().rust_analyzer_trusted);
+    }
 
     fn error(code: i64, message: &str) -> RpcError {
         RpcError {
