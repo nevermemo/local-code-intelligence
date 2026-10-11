@@ -224,10 +224,15 @@ impl Default for FusionConfig {
 /// Default for [`Config::port`]: the loopback port the service listens on.
 pub const DEFAULT_PORT: u16 = 8768;
 
+/// The port of the external generation model. LCI never contacts it, so
+/// [`Config::validate`] rejects it in [`Config::embedding_url`] and
+/// [`Config::reranker_url`], whatever host the URL names.
+pub const GENERATION_MODEL_PORT: u16 = 8765;
+
 /// Ports that belong to other services and that LCI itself never listens on:
 /// 8765 is the external generation model, 8766 the embedding service, 8767
 /// the reranker. [`Config::validate`] rejects them as [`Config::port`].
-pub const RESERVED_PORTS: std::ops::RangeInclusive<u16> = 8765..=8767;
+pub const RESERVED_PORTS: std::ops::RangeInclusive<u16> = GENERATION_MODEL_PORT..=8767;
 
 /// Default for [`Config::embedding_query_template`]: the instruction
 /// Qwen3-Embedding is trained with, then the query. It is
@@ -798,11 +803,19 @@ impl Config {
             (256..=1_048_576).contains(&self.rerank_document_max_bytes),
             "rerank_document_max_bytes must be 256..=1048576"
         );
-        for value in [&self.embedding_url, &self.reranker_url] {
+        for (name, value) in [
+            ("embedding_url", &self.embedding_url),
+            ("reranker_url", &self.reranker_url),
+        ] {
             let url = reqwest::Url::parse(value)?;
             ensure!(
                 matches!(url.scheme(), "http" | "https"),
                 "model URL must use HTTP(S)"
+            );
+            // The effective port: an explicit one, else the scheme's default.
+            ensure!(
+                url.port_or_known_default() != Some(GENERATION_MODEL_PORT),
+                "`{name}` uses port {GENERATION_MODEL_PORT}, which is reserved for the generation model; LCI never contacts it; choose another port"
             );
         }
         ensure!(
@@ -1236,6 +1249,112 @@ mod tests {
         }
         // The key is a port number, so a value outside u16 does not load.
         assert!(toml::from_str::<Config>(&format!("{}port = 70000\n", base_toml())).is_err());
+    }
+
+    /// A configuration with `key` set to `url` and everything else default.
+    fn config_with_url(key: &str, url: &str) -> Config {
+        toml::from_str(&format!("{}{key} = '{url}'\n", base_toml())).unwrap()
+    }
+
+    #[test]
+    fn a_model_url_on_the_generation_models_port_is_rejected_for_any_host() {
+        assert_eq!(GENERATION_MODEL_PORT, 8765);
+        for key in ["embedding_url", "reranker_url"] {
+            for url in [
+                "http://127.0.0.1:8765/v1",
+                "http://localhost:8765/v1",
+                "http://LocalHost:8765/v1",
+                "http://[::1]:8765/v1",
+                "http://127.1:8765/v1",
+                "http://0.0.0.0:8765/rerank",
+                "http://192.168.1.20:8765/v1",
+                "http://models.example.com:8765/v1",
+                "https://models.example.com:8765",
+                "http://user:secret@models.example.com:8765/v1",
+                "http://models.example.com:08765/v1",
+            ] {
+                let error = config_with_url(key, url)
+                    .validate()
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&format!("`{key}`")), "{url}: {error}");
+                assert!(error.contains("port 8765"), "{url}: {error}");
+                assert!(error.contains("generation model"), "{url}: {error}");
+                assert!(error.contains("never contacts it"), "{url}: {error}");
+                // The message never repeats the URL, which may hold credentials.
+                assert!(!error.contains("secret"), "{url}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rejection_names_the_key_that_holds_the_port() {
+        let both = Config {
+            data_dir: std::env::temp_dir(),
+            embedding_url: "http://localhost:8766/v1".into(),
+            reranker_url: "http://localhost:8765/rerank".into(),
+            ..Config::default()
+        };
+        let error = both.validate().unwrap_err().to_string();
+        assert!(error.contains("`reranker_url`"), "{error}");
+        assert!(!error.contains("`embedding_url`"), "{error}");
+    }
+
+    #[test]
+    fn a_model_url_on_another_port_or_with_no_explicit_port_is_accepted() {
+        for key in ["embedding_url", "reranker_url"] {
+            for url in [
+                "http://localhost:8766/v1",
+                "http://localhost:8767/rerank",
+                "http://localhost:8764/v1",
+                "http://localhost:8768/v1",
+                "http://localhost:18765/v1",
+                // No explicit port: the scheme's default (80 or 443) applies.
+                "http://localhost/v1",
+                "https://models.example.com/v1",
+                "http://localhost:80/v1",
+                "https://models.example.com:443",
+                // 8765 only in the path, query or credentials is not a port.
+                "http://localhost/8765",
+                "http://localhost:8766/v1?port=8765",
+                "http://user:8765@localhost:8766/v1",
+                "http://models-8765.example.com/v1",
+            ] {
+                config_with_url(key, url)
+                    .validate()
+                    .unwrap_or_else(|error| {
+                        panic!("{key} = {url} should validate: {error}");
+                    });
+            }
+        }
+        Config::default().validate().unwrap();
+        assert_eq!(Config::default().embedding_url, "http://localhost:8766/v1");
+        assert_eq!(
+            Config::default().reranker_url,
+            "http://localhost:8767/rerank"
+        );
+    }
+
+    /// The port rule adds no new failure for a URL that does not parse or
+    /// does not use HTTP(S): those are rejected exactly as before.
+    #[test]
+    fn unparsable_and_non_http_model_urls_keep_their_existing_errors() {
+        let error = config_with_url("embedding_url", "not a url")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("8765"), "{error}");
+        let error = config_with_url("reranker_url", "")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("8765"), "{error}");
+        // The scheme check still comes first, even on the reserved port.
+        let error = config_with_url("embedding_url", "ftp://localhost:8765/v1")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must use HTTP(S)"), "{error}");
     }
 
     #[test]

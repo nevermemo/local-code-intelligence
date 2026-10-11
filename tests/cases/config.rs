@@ -477,6 +477,72 @@ fn bad_values_fail_with_the_exit_code_of_their_kind() {
     sandbox.assert_no_connections();
 }
 
+/// Port 8765 is the generation model's: a model URL naming it, for any host,
+/// is an invalid configuration (exit 2, still printed) whichever layer
+/// supplies it. The binary only parses the string; nothing here opens a
+/// connection, and the listeners the file's own URLs name stay untouched.
+#[test]
+fn a_model_url_on_port_8765_is_invalid_whichever_layer_supplies_it() {
+    let sandbox = Sandbox::new("");
+
+    // The environment, with a loopback host.
+    let output = sandbox.run(
+        &["config", "--json"],
+        &[("LCI_EMBEDDING_URL", "http://localhost:8765/v1")],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["valid"], false);
+    let error = report["error"].as_str().unwrap();
+    assert!(error.contains("`embedding_url`"), "{error}");
+    assert!(error.contains("port 8765"), "{error}");
+    assert!(error.contains("generation model"), "{error}");
+    assert!(error.contains("never contacts it"), "{error}");
+    assert_eq!(report["values"]["embedding_url"]["source"], "env");
+    assert_eq!(
+        report["values"]["embedding_url"]["value"],
+        "http://localhost:8765/v1"
+    );
+
+    // The local overlay, with another host spelling (an address reserved for
+    // documentation, so no name is ever resolved).
+    std::fs::write(
+        sandbox.overlay(),
+        "reranker_url = 'http://192.0.2.10:8765/rerank'\n",
+    )
+    .unwrap();
+    let output = sandbox.run(&["config", "--json"], &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let report = parse(&output);
+    assert_eq!(report["valid"], false);
+    let error = report["error"].as_str().unwrap();
+    assert!(error.contains("`reranker_url`"), "{error}");
+    assert!(error.contains("generation model"), "{error}");
+    assert_eq!(report["values"]["reranker_url"]["source"], "local");
+
+    // The text report says so too.
+    let output = sandbox.run(&["config"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let text_report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text_report.starts_with("configuration: INVALID"),
+        "{text_report}"
+    );
+    assert!(text_report.contains("generation model"), "{text_report}");
+
+    // Another service's port in the same place is fine, so the rule is about
+    // 8765 only.
+    std::fs::write(
+        sandbox.overlay(),
+        "reranker_url = 'http://localhost:8767/rerank'\n",
+    )
+    .unwrap();
+    let report = sandbox.report(&[], &[("LCI_EMBEDDING_URL", "http://localhost:8766/v1")]);
+    assert_eq!(report["valid"], true);
+    assert!(!sandbox.data_dir().exists());
+    sandbox.assert_no_connections();
+}
+
 /// A `serve` child that is killed when it goes out of scope.
 struct Serve {
     child: Child,

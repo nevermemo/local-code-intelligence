@@ -1283,6 +1283,90 @@ mod tests {
         }
     }
 
+    /// Port 8765 belongs to the generation model: a model URL naming it is
+    /// rejected whichever layer supplies it, and a higher layer can repair it.
+    #[test]
+    fn a_model_url_on_port_8765_is_rejected_from_the_file_the_overlay_and_the_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let path = write(dir, "c.toml", &data_dir_line(dir));
+        let overlay = dir.join("c.local.toml");
+        for (key, variable, url) in [
+            (
+                "embedding_url",
+                "LCI_EMBEDDING_URL",
+                "http://127.0.0.1:8765/v1",
+            ),
+            (
+                "reranker_url",
+                "LCI_RERANKER_URL",
+                "http://models.example.com:8765/rerank",
+            ),
+        ] {
+            let names_the_rule = |error: anyhow::Error| {
+                let error = error.to_string();
+                assert!(error.contains(&format!("`{key}`")), "{error}");
+                assert!(error.contains("port 8765"), "{error}");
+                assert!(error.contains("generation model"), "{error}");
+            };
+
+            // The configuration file.
+            let in_file = write(
+                dir,
+                "reserved.toml",
+                &format!("{}{key} = '{url}'\n", data_dir_line(dir)),
+            );
+            names_the_rule(resolve(&base_spec(Some(in_file))).unwrap_err());
+
+            // The local overlay.
+            write(dir, "c.local.toml", &format!("{key} = '{url}'\n"));
+            names_the_rule(resolve(&base_spec(Some(path.clone()))).unwrap_err());
+            let unvalidated = resolve_unvalidated(&base_spec(Some(path.clone()))).unwrap();
+            assert_eq!(unvalidated.sources[key].source, Source::Local);
+            assert!(unvalidated.config.validate().is_err());
+
+            // The environment, which also beats a harmless overlay value.
+            write(
+                dir,
+                "c.local.toml",
+                &format!("{key} = 'http://127.0.0.1:9300/v1'\n"),
+            );
+            let mut by_env = base_spec(Some(path.clone()));
+            by_env.env = env(&[(variable, url)]);
+            names_the_rule(resolve(&by_env).unwrap_err());
+            fs::remove_file(&overlay).unwrap();
+            let mut by_env = base_spec(Some(path.clone()));
+            by_env.env = env(&[(variable, url)]);
+            names_the_rule(resolve(&by_env).unwrap_err());
+
+            // A higher layer repairs a reserved value from a lower one.
+            let in_file = write(
+                dir,
+                "reserved.toml",
+                &format!("{}{key} = '{url}'\n", data_dir_line(dir)),
+            );
+            let mut repaired = base_spec(Some(in_file));
+            repaired.env = env(&[(variable, "http://127.0.0.1:9301/v1")]);
+            let resolved = resolve(&repaired).unwrap();
+            assert_eq!(resolved.sources[key].source, Source::Env);
+
+            // The neighbouring service ports and a URL with no explicit port
+            // are fine from the overlay and the environment.
+            for allowed in [
+                "http://127.0.0.1:8766/v1",
+                "http://127.0.0.1:8767/rerank",
+                "http://localhost/v1",
+            ] {
+                write(dir, "c.local.toml", &format!("{key} = '{allowed}'\n"));
+                assert!(resolve(&base_spec(Some(path.clone()))).is_ok(), "{allowed}");
+                fs::remove_file(&overlay).unwrap();
+                let mut ok = base_spec(Some(path.clone()));
+                ok.env = env(&[(variable, allowed)]);
+                assert!(resolve(&ok).is_ok(), "{allowed}");
+            }
+        }
+    }
+
     /// Validation runs once, on the layered result: a file that is invalid on
     /// its own is fine when a higher layer repairs the key.
     #[test]
