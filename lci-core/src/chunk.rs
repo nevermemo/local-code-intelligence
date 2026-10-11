@@ -330,6 +330,21 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact(source: &str) -> String {
+        source.chars().filter(|character| !character.is_whitespace()).collect()
+    }
+
+    fn assert_non_whitespace_coverage(source: &str, expected: &str) {
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        let packed: String = chunks.iter().map(|chunk| compact(&chunk.code)).collect();
+        let expected = compact(expected);
+        assert!(
+            packed.contains(&expected),
+            "chunks do not cover {expected:?}:\n{chunks:#?}"
+        );
+    }
+
     #[test]
     fn chunks_have_exact_source_lines_and_stable_hashes() {
         let source =
@@ -889,6 +904,35 @@ export interface TelemetryLifecycle {
                     .join("\n")
                     .contains(&c.code)
             );
+        }
+    }
+
+    #[test]
+    fn oversized_expression_keeps_the_traced_operator() {
+        let left = "a".repeat(3500);
+        let right = "b".repeat(3500);
+        let expression = format!("emit(\"{left}\" + \"{right}\")");
+        let statements = format!("    {expression};\n").repeat(4);
+        let source = format!("fn main() {{\n{statements}}}\n");
+
+        assert_non_whitespace_coverage(&source, &expression);
+    }
+
+    #[test]
+    fn oversized_containers_cover_non_whitespace_bytes_across_inputs() {
+        let left = "a".repeat(3500);
+        let middle = "b".repeat(3500);
+        let right = "c".repeat(3500);
+        let expressions = [
+            format!("emit([\"{left}\", \"{middle}\"])"),
+            format!("emit((\"{left}\", \"{middle}\"))"),
+            format!("emit(\"{left}\" + \"{middle}\" + \"{right}\")"),
+        ];
+
+        for expression in expressions {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
         }
     }
 
