@@ -191,12 +191,12 @@ reviewer decisions, applied in each item):
 
 Mark an item `in-progress (<date>)` in its table row when a slice starts; list in-flight or next-queued slices here; remove an entry here when its slice is committed. Keep this block to 10 lines: the compaction hook prints the first 15 lines of this section.
 
-**Now** (2026-10-11 evening, code as of `05780cf`):
-- I-10 agent A/B: pilot done; amendment A34 declared the A32 uptake gate NO-GO (no LCI calls in the LCI arms), so the full pass does not start under the `8d8a0fd` freeze. Pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (A1-A34, untracked).
-- U1 uptake study (owner chose 2026-10-11 "measure on typical tasks"): a seeded draw of 10 ordinary tasks, arms A / D / D-cue / D-forced plus a no-tools covariate; does LCI save calls and tokens when used, and does a one-line prompt get it used? Pre-registration `research_notes/grand-vision/ab/U1-PREREGISTRATION.md` (R2, untracked) is in its second cross-family review; then the harness slice, a new freeze from `05780cf` and the owner's run approvals.
-- N10 (default log filter adds `lci_core`) is done. N13 (navigation `warnings`) is implemented on a side branch; it changes navigation output, so it lands only after the U1 freeze.
-- R1b: windows 14/16 live confirm, deferred until the 4B embedder is back on 8766 after the A/B (8766 serves the 0.6B for the A/B indexing).
-- Housekeeping: batches B (after the A/B freeze) and C (owner decisions, recorded) remain; the roadmap split waits for the next renewal.
+**Now** (2026-10-11 ~20:00Z, code as of `182c062`):
+- U1 uptake study (pre-registration `research_notes/grand-vision/ab/U1-PREREGISTRATION.md`, untracked, R1-R5): frozen at `182c062`; the seeded draw is done; R5 added a per-task orphan sweep to the prep script (scripts-only re-freeze). Next: the dry run, then waves W1-W3 (the owner launches each), then the R4 4B pass.
+- N9 (orphaned language servers, restart-once policy): implementation on a side branch (job objects, discard shutdown, error classification); lands after U1 with its live gate.
+- Side branches waiting for U1: N11 (Qt Linguist `.ts`), N13 (navigation `warnings`), N14.
+- New from the cross-family bug-hunt pilot (14 claims, 5 verified, 3 plausible, 6 refuted): N16-N18.
+- R1b: windows 14/16 live confirm, deferred until the 4B embedder is back on 8766 after the A/B.
 
 ## P0 - measure first, then cut latency, then fix verified defects
 
@@ -270,6 +270,9 @@ C2, C3 and N6).
 | N11 | Qt Linguist translation files (`*.ts`, XML) are indexed as TypeScript: in bitcoin they are 100 files and 14 MB, about as large as all its C/C++ sources, and their long chunks slow the embedding down | ready (verified 2026-10-11 from the extension table and the A/B's bitcoin index) | S | - |
 | N12 | `search_symbols` answered a no-match query with an error ("all applicable language servers failed", HTTP 500) whenever another language server of a mixed-language workspace failed, although the relevant server answered correctly with nothing (deno: csharp-ls and clangd exit, typescript-language-server finds no project); found by the A/B pilot's prep probe | done (2026-10-11: an error only when every applicable server failed; partial failures are logged at warn) | XS | - |
 | N13 | Navigation answers cannot tell "no match" from "the server that mattered is down": after N12 a failed server is only logged. Add an additive `warnings` list to `NavigationReport` (skipped when empty), as search already reports LSP failures | ready (from the N12 review, 2026-10-11) | XS | N12 |
+| N16 | A search during an index job ignores `wait_for_existing_job_seconds`: after the write-lock wait times out it warns "reusing previous snapshot" but then awaits the read lock until indexing ends (`src/app/search.rs` `resolve_index_for_search`), so it can hang for the whole embedding run, `wait_ms` omits that wait, and the snapshot it returns is the new one | ready (verified by reading 2026-10-11; found by the cross-family bug-hunt pilot) | S | - |
+| N17 | `watcher_debounces_and_refreshes_changed_typescript_source` passes with a dead watcher: it keeps the default on-search freshness, so its own `search` refreshes the index; run it under `IndexFreshness::Watch` (the only test of the watch refresh loop) | ready (verified by reading 2026-10-11; bug-hunt pilot) | XS | - |
+| N18 | Low-severity batch from the bug-hunt pilot. Verified by reading: (a) `manifest::save` removes the destination before `rename`, which already replaces on Windows, so a crash in between loses the manifest (one full re-parse); (b) the Java readiness probe runs `<jdtls directory> --version`, so a working jdtls always reads unavailable; (c) `serve --port 0` logs, advertises (`/openapi.json`) and Origin-checks port 0 instead of the bound port. Plausible, low: (d) three navigation tests assert rust-analyzer's `analyzer_running` instead of their own adapter's flag; (e) the embedding model listing is probed at the origin's `/v1/models` even for a path-prefixed `embedding_url`; (f) no per-file size cap before a source file is read whole | ready (2026-10-11) | XS each | - |
 
 ### R0 - Fusion-only baseline
 `done` (2026-10-10; decision: keep the reranker on by default, cut its latency via R1/R6/V1) - S, live, config-only - deps: none - skill: `lci-retrieval-evaluation`
