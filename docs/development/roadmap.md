@@ -55,7 +55,7 @@ before this rule still use the old names). A document's internal numbering
 (pre-registration amendments, audit actions) is scoped to that document; none
 of it is a roadmap ID.
 
-## Snapshot: where things stand (refreshed 2026-10-11 by the housekeeping pass from this file's own results and the git history, branch `fix/verified-bugs`, code as of `15bc4c6`; every measured number keeps the date of its run)
+## Snapshot: where things stand (refreshed 2026-10-11 by the housekeeping pass from this file's own results and the git history, branch `fix/verified-bugs`, code as of `38d6d18`; every measured number keeps the date of its run)
 
 | Fact | Value |
 | --- | --- |
@@ -190,12 +190,12 @@ reviewer decisions, applied in each item):
 
 Mark an item `in-progress (<date>)` in its table row when a slice starts; list in-flight or next-queued slices here; remove an entry here when its slice is committed. Keep this block to 10 lines: the compaction hook prints the first 15 lines of this section.
 
-**Now** (2026-10-11, code as of `15bc4c6`):
-- I-10 agent A/B: pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (v2.1, amendments A1-A20 inside it; untracked). Harness, run workflows and sandbox are built; after A6b and N3b: first-task indexes, SC1 sanity check, binary freeze, dry runs, pilot, SC2, full pass. 8766 serves the 0.6B embedder (swapped 2026-10-11 for the A/B's indexing; restore the 4B afterwards).
-- A6b: search profiles on MCP (`/mcp/<profile>`) and REST (`?search_profile=`); A6a landed in `15bc4c6`. Plan: `plans/p1-p2-plans.md` in the coordinator's work area outside the repository, which holds both plans under the old slice names (P1a/P1b for A6, P2a/P2b for N3).
-- N3b: REST release endpoint, release on Ctrl+C, `Status.analyzers_running`; N3a (idle release, bounded `shutdown`/`exit`) landed in `ced5fbf`. Starts after A6b, one implementer at a time; plan in the same file (as P2b).
+**Now** (2026-10-11, code as of `38d6d18`):
+- I-10 agent A/B: pre-registration `research_notes/grand-vision/ab/PREREGISTRATION.md` (v2.1, amendments A1-A21 inside it; untracked). Harness, run workflows and the Java/C# sandbox are built; next: N3b, first-task indexes, SC1 sanity check, binary freeze, dry runs, pilot, SC2, full pass. 8766 serves the 0.6B embedder (swapped 2026-10-11 for the A/B's indexing; restore the 4B afterwards).
+- N3b: REST release endpoint, release on Ctrl+C, `Status.analyzers_running`; N3a landed in `ced5fbf`, A6 search profiles in `15bc4c6` (A6a) and `38d6d18` (A6b). Plan: `plans/p1-p2-plans.md` in the coordinator's work area outside the repository (old slice names P2a/P2b).
+- Portable configuration (owner request 2026-10-11): machine-specific values (paths, ports, URLs, models) resolved from portable defaults, a local overlay, environment and flags, with `lci config` showing sources and `lci init` detecting; being planned; ID assigned with the plan.
 - R1b: windows 14/16 live confirm (pre-registered in R1), deferred until the 4B embedder is back on 8766 after the A/B.
-- Housekeeping pass (`research_notes/HOUSEKEEPING-AUDIT.md`, revised by `HOUSEKEEPING-SANITY.md`; both untracked): the audit's own actions A1-A9 running -- status reconcile of this file (A3), durable copies under `` in the coordinator's work area outside the repository (A4), research index, skill references, docs. The roadmap split waits for the next roadmap renewal.
+- Housekeeping: the audit's own actions A1-A9 are done (`HOUSEKEEPING-AUDIT.md`, `HOUSEKEEPING-SANITY.md`, untracked); its batches B (after the A/B freeze) and C (owner decisions, recorded) remain; the roadmap split waits for the next renewal.
 
 ## P0 - measure first, then cut latency, then fix verified defects
 

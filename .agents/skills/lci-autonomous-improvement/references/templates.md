@@ -201,10 +201,11 @@ Stopped because: <usage at N% | roadmap empty | approval needed>
 
 ## Run checkpoint file
 
-Current state only, at most 12 KB, re-read whole after every compaction. Delete a finished item at the next refresh (its record is the roadmap, a commit or the agent's memory); refresh after every push. The post-compaction check asserts these strings, so keep them verbatim: `Last pushed: <7 hex characters>`, `Standing mandate`, `Approvals`, `90%`.
+Current state only, at most about 7 KB (the post-compaction hook prints it whole), re-read whole after every compaction. Delete a finished item at the next refresh (its record is the roadmap, a commit or the agent's memory); refresh after every push. The post-compaction check asserts these strings, so keep them verbatim: `Active run: yes|no`, `Last pushed: <7 hex characters>`, `Standing mandate`, `Approvals`, `90%`.
 
 ```text
 # Run checkpoint -- <date time>. Last pushed: <hash> (<branch>, <PR>). Tree: <clean | uncommitted: files>
+Active run: <yes (since <date>; what) | no>
 FIRST AFTER ANY COMPACTION: run the post-compaction check script; call get_usage; read this file; read the roadmap "In progress" section and `git status`.
 
 ## Standing mandate

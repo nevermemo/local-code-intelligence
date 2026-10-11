@@ -84,4 +84,5 @@ that prints the run checkpoint, the roadmap's In progress section and git
 state, and a `PostToolUse` hook (`if: "Bash(git push*)"`) reminding the agent
 to refresh the checkpoint after every push. The agent cannot trigger
 compaction itself; it keeps the checkpoint current so any compaction is
-cheap. Keep the checkpoint in the session scratchpad, never in the repo.
+cheap. Keep the checkpoint outside the repository at a durable path recorded in the agent's memory,
+never in the repo.
