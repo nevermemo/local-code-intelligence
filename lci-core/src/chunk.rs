@@ -772,8 +772,9 @@ export interface TelemetryLifecycle {
         assert_eq!(chunks[0].relative_file_path, "lib.rs");
     }
 
+    // Linux only: APFS refuses to create a file whose name is not valid UTF-8.
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn scan_skips_non_utf8_paths_and_indexes_other_files() {
         use std::os::unix::ffi::OsStrExt;
 
