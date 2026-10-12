@@ -204,7 +204,7 @@ async fn checks(
             }),
         )
         .await?;
-    let returned_results = search_body.to_lowercase().contains("calculator");
+    let returned_results = search_returns_calculator(&search_body);
     let warning_mentions_provider = mentions_provider(&search_body, spec);
     evidence.set("search_code_returned_results", returned_results)?;
     evidence.set(
@@ -374,4 +374,92 @@ fn json_field_matches(text: &str, field: &str, value: &str) -> bool {
     compact
         .to_lowercase()
         .contains(&format!("\"{field}\":\"{value}\"").to_lowercase())
+}
+
+fn search_returns_calculator(body: &str) -> bool {
+    std::iter::once(body)
+        .chain(body.lines().filter_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .any(|value| {
+            let report = value.pointer("/result/structuredContent").unwrap_or(&value);
+            report
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|results| {
+                    results.iter().any(|result| {
+                        ["file_path", "relative_file_path", "code"]
+                            .iter()
+                            .filter_map(|field| result.get(field)?.as_str())
+                            .any(|text| text.to_lowercase().contains("calculator"))
+                    })
+                })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_returns_calculator;
+    use serde_json::json;
+
+    #[test]
+    fn query_echo_with_empty_results_is_not_retrieval() {
+        let body = json!({"query": "Calculator Add", "results": []}).to_string();
+        assert!(!search_returns_calculator(&body));
+    }
+
+    #[test]
+    fn fixture_code_or_path_counts_as_retrieval() {
+        for result in [
+            json!({
+                "relative_file_path": "src/Production.cs",
+                "code": "public sealed class Calculator : ICalculator {}"
+            }),
+            json!({"file_path": "src/Calculator.cs", "code": "public int Add() => 1;"}),
+            json!({"relative_file_path": "src/calculator.py"}),
+        ] {
+            let body = json!({"query": "add", "results": [result]}).to_string();
+            assert!(search_returns_calculator(&body));
+        }
+    }
+
+    #[test]
+    fn calculator_outside_result_path_or_code_is_not_retrieval() {
+        let body = json!({
+            "query": "Calculator Add",
+            "warning": "Calculator provider unavailable",
+            "results": [{"relative_file_path": "src/lib.rs", "code": "fn add() {}", "name": "Calculator"}]
+        })
+        .to_string();
+        assert!(!search_returns_calculator(&body));
+    }
+
+    #[test]
+    fn mcp_sse_response_checks_structured_results() {
+        for results in [
+            json!([]),
+            json!([{"relative_file_path": "src/Production.cs", "code": "class Calculator {}"}]),
+        ] {
+            let expected = !results.as_array().unwrap().is_empty();
+            let envelope = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"structuredContent": {"query": "Calculator Add", "results": results}}
+            });
+            let body = format!("event: message\ndata: {envelope}\n\n");
+            assert_eq!(search_returns_calculator(&body), expected);
+            assert_eq!(search_returns_calculator(&envelope.to_string()), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_or_missing_results_is_not_retrieval() {
+        for body in [
+            "Calculator",
+            r#"{"query":"Calculator Add"}"#,
+            r#"{"results":null,"query":"Calculator Add"}"#,
+            r#"{"results":"Calculator"}"#,
+        ] {
+            assert!(!search_returns_calculator(body), "{body}");
+        }
+    }
 }
