@@ -2281,6 +2281,66 @@ async fn a_server_that_ignores_shutdown_is_killed_within_the_grace_period() {
     .await;
 }
 
+/// Cancelling release must not cancel shutdown, even while an in-flight
+/// request holds another `Arc` to the removed session and its client.
+#[tokio::test]
+async fn cancelling_release_still_stops_a_server_with_an_in_flight_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.csharp.args.push("--ignore-shutdown".to_owned());
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    let server: u32 = std::fs::read_to_string(state.join("pid.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_is_running(server).await);
+
+    // This scenario answers symbols but not definitions. Keep the pending
+    // future alive, without polling it again, until the process has ended.
+    let file = workspace.path.join("src/Calculator.cs");
+    let mut request =
+        Box::pin(manager.definition(&adapter, &workspace, &file, "src/Calculator.cs", 2, 4));
+    tokio::select! {
+        result = &mut request => panic!("the definition must remain pending: {result:?}"),
+        () = wait_until(
+            "the definition request to reach the server",
+            Duration::from_secs(30),
+            async || state_count_so_far(&state, "request_count.txt") >= 5,
+        ) => {}
+    }
+
+    {
+        let release = manager.release(&workspace.id);
+        tokio::pin!(release);
+        tokio::select! {
+            result = &mut release => panic!("shutdown must still be waiting: {result:?}"),
+            () = async {
+                wait_until(
+                    "the shutdown request to reach the server",
+                    Duration::from_secs(30),
+                    async || event_count(&state, "shutdown_seen.txt") == 1,
+                ).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } => {}
+        }
+    }
+    assert!(!manager.running("csharp-ls", &workspace.id).await);
+    wait_until_process_ends(
+        "the server to end after release was cancelled with a request still holding the session",
+        server,
+        2 * local_code_intelligence::lsp::SHUTDOWN_GRACE,
+    )
+    .await;
+    assert_eq!(event_count(&state, "exit_seen.txt"), 1);
+    drop(request);
+}
+
 /// Shutting the manager down (service exit) releases every workspace's
 /// server, not only one.
 #[tokio::test]

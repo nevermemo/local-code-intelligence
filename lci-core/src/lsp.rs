@@ -26,10 +26,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::{Mutex, watch},
-    task::JoinSet,
-};
+use tokio::sync::{Mutex, watch};
 
 pub mod adapter;
 pub mod clangd;
@@ -1060,18 +1057,20 @@ fn log_final_answer(
 }
 
 /// Shuts the servers of already-removed sessions down side by side and
-/// returns the providers that had a server to stop. Dropping this future
-/// (the caller gave up) aborts the shutdowns, and dropping the clients then
-/// kills any server that is left.
+/// returns the providers that had a server to stop. The tasks are detached:
+/// dropping this future only stops waiting, so shutdowns finish even when
+/// another caller still holds a session or its client.
 async fn shut_down(removed: Vec<Arc<Session>>) -> Vec<&'static str> {
-    let mut shutdowns = JoinSet::new();
+    let mut shutdowns = Vec::new();
     for session in removed {
         let provider = session.provider;
-        shutdowns.spawn(async move { (provider, session.shutdown(SHUTDOWN_GRACE).await) });
+        shutdowns.push(tokio::spawn(async move {
+            (provider, session.shutdown(SHUTDOWN_GRACE).await)
+        }));
     }
     let mut stopped = Vec::new();
-    while let Some(outcome) = shutdowns.join_next().await {
-        if let Ok((provider, true)) = outcome {
+    for shutdown in shutdowns {
+        if let Ok((provider, true)) = shutdown.await {
             stopped.push(provider);
         }
     }
