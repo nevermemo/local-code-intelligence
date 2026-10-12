@@ -25,6 +25,7 @@ use std::{
 #[derive(Clone)]
 pub struct Store {
     db: Connection,
+    legacy_readers: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -82,6 +83,7 @@ pub struct Snapshot {
     pub identity: String,
     pub dimension: usize,
     pub indexed_at: String,
+    _legacy_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 /// The key under which a chunk's stored vector is cached between index passes
@@ -109,6 +111,7 @@ impl Store {
             db: lancedb::connect(path.to_str().context("data path must be UTF-8")?)
                 .execute()
                 .await?,
+            legacy_readers: Arc::default(),
         })
     }
 
@@ -131,16 +134,20 @@ impl Store {
         // An index written before the table name was shortened lives under the
         // legacy name until the workspace's next commit moves it (`replace`).
         let name = workspace.table_name();
-        let (name, table) = match self.open_table(&name).await? {
-            Some(table) => (name, table),
+        let (name, table, legacy_read_guard) = match self.open_table(&name).await? {
+            Some(table) => (name, table, None),
             None => {
                 let legacy = workspace.legacy_table_name();
+                let guard = self.legacy_readers.clone().read_owned().await;
                 match self.open_table(&legacy).await? {
-                    Some(table) => (legacy, table),
+                    Some(table) => (legacy, table, Some(guard)),
                     None => return Ok(None),
                 }
             }
         };
+        // Keep metadata and every later read on this exact revision, even
+        // when an index job overwrites the table while a search is running.
+        let table = table.checkout_current().await?;
         let schema = table.schema().await?;
         // The short name keeps only 64 bits of the workspace id. A table that
         // records another workspace path is a collision (or a hand-copied
@@ -173,6 +180,7 @@ impl Store {
             identity,
             dimension,
             indexed_at,
+            _legacy_read_guard: legacy_read_guard,
         }))
     }
 
@@ -320,6 +328,11 @@ impl Store {
     /// `snapshot` prefers the short one. Callers hold `<data_dir>/index.lock`,
     /// so two writers never race on the drop.
     async fn drop_legacy_table(&self, workspace: &Workspace) {
+        // A pinned revision still needs its files. Defer deletion while any
+        // legacy snapshot is in use; a later commit retries cleanup.
+        let Ok(_exclusive) = self.legacy_readers.try_write() else {
+            return;
+        };
         let legacy = workspace.legacy_table_name();
         match self.db.drop_table(&legacy, &[]).await {
             Ok(()) => {
@@ -550,6 +563,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_retains_its_revision_after_a_concurrent_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = Workspace {
+            id: crate::workspace::hash("pinned"),
+            path: temp.path().join("workspace"),
+        };
+        commit(&store, &workspace, &["fn previous_snapshot() {}"]).await;
+        let previous = store.snapshot(&workspace).await.unwrap().unwrap();
+        commit(
+            &store,
+            &workspace,
+            &["fn replacement_snapshot() {}", "fn added() {}"],
+        )
+        .await;
+
+        assert_eq!(previous.table.count_rows(None).await.unwrap(), 1);
+        let chunks = Store::chunks(&previous, &workspace).await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk.code, "fn previous_snapshot() {}");
+        let hits = Store::search(
+            &previous,
+            &workspace,
+            &[1.0, 0.0, 0.0],
+            8,
+            &EffectiveFilter::from_request(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk.code, "fn previous_snapshot() {}");
+        let current = store.snapshot(&workspace).await.unwrap().unwrap();
+        assert_eq!(current.table.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn languages_match_distinct_chunk_languages_in_a_multilanguage_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
@@ -679,6 +728,31 @@ mod tests {
                 std::fs::copy(entry.path(), target).unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_stays_readable_during_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let lancedb = temp.path().join("lancedb");
+        let store = Store::open(&lancedb).await.unwrap();
+        let workspace = Workspace {
+            id: crate::workspace::hash("legacy-pinned"),
+            path: temp.path().join("workspace"),
+        };
+        commit(&store, &workspace, &["fn previous_snapshot() {}"]).await;
+        let short = table_dir(&lancedb, &workspace.table_name());
+        let legacy = table_dir(&lancedb, &workspace.legacy_table_name());
+        std::fs::rename(&short, &legacy).unwrap();
+        let previous = store.snapshot(&workspace).await.unwrap().unwrap();
+
+        commit(&store, &workspace, &["fn replacement_snapshot() {}"]).await;
+        let chunks = Store::chunks(&previous, &workspace).await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk.code, "fn previous_snapshot() {}");
+        assert!(legacy.is_dir(), "migration deleted an active snapshot");
+        drop(previous);
+        commit(&store, &workspace, &["fn replacement_snapshot() {}"]).await;
+        assert!(!legacy.exists(), "later commits retry deferred cleanup");
     }
 
     #[tokio::test]

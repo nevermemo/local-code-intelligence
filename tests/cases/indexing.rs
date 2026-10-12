@@ -32,7 +32,6 @@ async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
     fake.hold_documents.store(false, Ordering::SeqCst);
     fake.release_documents.notify_one();
     let indexed = job.await.unwrap().unwrap();
-    task.abort();
 
     assert!(
         returned_before_release,
@@ -63,6 +62,15 @@ async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
     assert!(found.results[0].chunk.code.contains("previous_snapshot"));
     assert!(!found.results[0].chunk.code.contains("replacement_snapshot"));
     assert_eq!(indexed.embedded_chunks, 1);
+    let current = app.search(&workspace, "snapshot", Some(8)).await.unwrap();
+    assert_eq!(current.results.len(), 1);
+    assert!(
+        current.results[0]
+            .chunk
+            .code
+            .contains("replacement_snapshot")
+    );
+    task.abort();
 }
 
 #[cfg(unix)]

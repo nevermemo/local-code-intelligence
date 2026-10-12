@@ -514,12 +514,9 @@ struct LspChannel {
     elapsed_ms: f64,
 }
 
-/// Outcome of resolving which index snapshot a search should read: the
-/// (re-checked) snapshot, the lifecycle action to report, and the read
-/// guard that must stay held for the rest of the search so the snapshot
-/// cannot be replaced out from under it.
-struct IndexResolution<'a> {
-    _read_guard: tokio::sync::RwLockReadGuard<'a, ()>,
+/// Outcome of resolving which pinned index snapshot a search should read,
+/// together with its lifecycle action and any fallback warning.
+struct IndexResolution {
     snapshot: Option<Snapshot>,
     action: IndexAction,
     wait_ms: f64,
@@ -1037,14 +1034,14 @@ impl App {
     /// Resolves the index snapshot a search should read: creates or waits
     /// for a first-search index when the workspace has never been indexed,
     /// otherwise applies the configured freshness policy to an existing
-    /// snapshot. Returns a read guard that must be held for the remainder
-    /// of the search so the snapshot cannot be replaced concurrently.
-    async fn resolve_index_for_search<'a>(
+    /// snapshot. The returned snapshot is pinned, so a concurrent index commit
+    /// cannot change its contents and no workspace read lock is needed.
+    async fn resolve_index_for_search(
         &self,
         workspace: &Workspace,
-        coordination: &'a WorkspaceCoordination,
+        coordination: &WorkspaceCoordination,
         initial_snapshot: Option<Snapshot>,
-    ) -> Result<IndexResolution<'a>> {
+    ) -> Result<IndexResolution> {
         if initial_snapshot.is_none() {
             let flight = Instant::now();
             let mut created = false;
@@ -1101,14 +1098,11 @@ impl App {
             if created {
                 action = IndexAction::Created;
             }
-            let wait_ms = ms(flight);
-            let _read_guard = coordination.lock.read().await;
             let snapshot = self.store.snapshot(workspace).await?;
             Ok(IndexResolution {
-                _read_guard,
                 snapshot,
                 action,
-                wait_ms,
+                wait_ms: ms(flight),
                 warning: None,
             })
         } else {
@@ -1129,14 +1123,15 @@ impl App {
                     (IndexAction::Reused, None)
                 }
             };
-            let wait_ms = ms(flight);
-            let _read_guard = coordination.lock.read().await;
-            let snapshot = self.store.snapshot(workspace).await?;
+            let snapshot = if matches!(action, IndexAction::Reused) {
+                initial_snapshot
+            } else {
+                self.store.snapshot(workspace).await?
+            };
             Ok(IndexResolution {
-                _read_guard,
                 snapshot,
                 action,
-                wait_ms,
+                wait_ms: ms(flight),
                 warning,
             })
         }
