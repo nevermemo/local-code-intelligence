@@ -1422,7 +1422,10 @@ mod tests {
         assert_eq!(padded_file.config.embedding_identity(), baseline_identity);
         assert_eq!(padded_file.config.embedding_url, "http://127.0.0.1:8766/v1");
         assert_eq!(padded_file.config.embedding_model, "embed-test");
-        assert_eq!(padded_file.config.reranker_url, "http://127.0.0.1:8767/rerank");
+        assert_eq!(
+            padded_file.config.reranker_url,
+            "http://127.0.0.1:8767/rerank"
+        );
         assert_eq!(padded_file.config.reranker_model, "rerank-test");
         assert_eq!(
             Config::load(Some(&padded_path))
@@ -1431,11 +1434,7 @@ mod tests {
             baseline_identity
         );
 
-        let mut by_env = base_spec(Some(write(
-            dir,
-            "defaults.toml",
-            &data_dir_line(dir),
-        )));
+        let mut by_env = base_spec(Some(write(dir, "defaults.toml", &data_dir_line(dir))));
         by_env.env = env(&[
             ("LCI_EMBEDDING_URL", " http://127.0.0.1:8766/v1 "),
             ("LCI_EMBEDDING_MODEL", " embed-test "),
@@ -1446,7 +1445,10 @@ mod tests {
         assert_eq!(padded_env.config.embedding_identity(), baseline_identity);
         assert_eq!(padded_env.config.embedding_url, "http://127.0.0.1:8766/v1");
         assert_eq!(padded_env.config.embedding_model, "embed-test");
-        assert_eq!(padded_env.config.reranker_url, "http://127.0.0.1:8767/rerank");
+        assert_eq!(
+            padded_env.config.reranker_url,
+            "http://127.0.0.1:8767/rerank"
+        );
         assert_eq!(padded_env.config.reranker_model, "rerank-test");
     }
 
