@@ -1868,6 +1868,7 @@ fn dumped_query(
             language: "rust".to_owned(),
             start_line: spec.start,
             end_line: spec.start + 9,
+            content_hash: format!("{}:{}", spec.path, spec.start),
             source_role: spec.role,
             semantic_rank: spec.semantic,
             semantic_score: spec.semantic.map(|_| 0.5),
@@ -1896,6 +1897,8 @@ fn dumped_query(
             .total_cmp(&a.fusion_score)
             .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
             .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.content_hash.cmp(&b.content_hash))
     });
     for (index, row) in rows.iter_mut().enumerate() {
         row.fused_rank = index + 1;

@@ -16,6 +16,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, hash_map::Entry},
     ffi::OsString,
     io::Write,
@@ -258,10 +259,13 @@ pub struct CandidateTrace {
     /// Language identifier.
     pub language: String,
     /// One-based inclusive start line of the chunk. With `relative_file_path`
-    /// it breaks `fusion_score` ties in the fused order.
+    /// and `end_line`, it breaks `fusion_score` ties in the fused order.
     pub start_line: u32,
     /// One-based inclusive end line of the chunk.
     pub end_line: u32,
+    /// Stable content identity used to break otherwise equal fused-order keys.
+    #[serde(default)]
+    pub content_hash: String,
     /// Source role of the file.
     pub source_role: SourceRole,
     /// One-based position in the semantic channel's list (cosine order after
@@ -285,8 +289,9 @@ pub struct CandidateTrace {
     /// The fusion score, prior included.
     pub fusion_score: f32,
     /// One-based position in the pool ordered by `fusion_score` descending,
-    /// then `relative_file_path`, then `start_line`; before the per-file cap
-    /// and before the shortlist cut. The dump lists candidates in this order.
+    /// then `relative_file_path`, `start_line`, `end_line`, and `content_hash`;
+    /// before the per-file cap and before the shortlist cut. The dump lists
+    /// candidates in this order.
     pub fused_rank: usize,
     /// One-based position after the per-file cap (`max_chunks_per_file` of the
     /// arm) reordered the fused order, still before the shortlist cut. Equal
@@ -329,6 +334,15 @@ fn rerank_document(hit: &Hit, max_bytes: usize) -> String {
     )
 }
 
+fn fusion_order(a: &Hit, b: &Hit) -> Ordering {
+    b.fusion_score
+        .total_cmp(&a.fusion_score)
+        .then_with(|| a.chunk.relative_file_path.cmp(&b.chunk.relative_file_path))
+        .then(a.chunk.start_line.cmp(&b.chunk.start_line))
+        .then(a.chunk.end_line.cmp(&b.chunk.end_line))
+        .then(a.chunk.content_hash.cmp(&b.chunk.content_hash))
+}
+
 /// Records the fused pool before it is capped and cut, in fused order.
 /// `hits` is the pool exactly as the cap receives it; `max_per_file`,
 /// `shortlist`, and `max_bytes` are the cap, `rerank_candidate_count`, and
@@ -364,6 +378,7 @@ fn trace_candidates(
                 language: hit.chunk.language.clone(),
                 start_line: hit.chunk.start_line,
                 end_line: hit.chunk.end_line,
+                content_hash: hit.chunk.content_hash.clone(),
                 source_role: hit.source_role,
                 semantic_rank: hit.semantic_rank,
                 semantic_score: hit.semantic_score,
@@ -923,12 +938,7 @@ impl App {
             lsp_hits,
         );
         hits.retain(|hit| hit_matches(&filters, hit));
-        hits.sort_by(|a, b| {
-            b.fusion_score
-                .total_cmp(&a.fusion_score)
-                .then_with(|| a.chunk.relative_file_path.cmp(&b.chunk.relative_file_path))
-                .then(a.chunk.start_line.cmp(&b.chunk.start_line))
-        });
+        hits.sort_by(fusion_order);
         // Optional per-file cap: demote (never drop) a file's chunks beyond
         // `max_chunks_per_file`, before the cut, so the reranker shortlist,
         // the reranker-off results, and the reranker-failure fallback all fill
@@ -1402,8 +1412,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, head_within,
-        pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
+        App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, fusion_order,
+        head_within, pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
     };
     use crate::{
         chunk::Chunk,
@@ -1549,12 +1559,7 @@ mod tests {
     fn fuse(rrf_k: f32, weights: &FusionConfig, rows: &[Row]) -> Vec<Hit> {
         let (semantic, lexical, lsp) = channels(rows);
         let mut hits = App::fuse_hits(rrf_k, weights, semantic, lexical, lsp);
-        hits.sort_by(|a, b| {
-            b.fusion_score
-                .total_cmp(&a.fusion_score)
-                .then_with(|| a.chunk.relative_file_path.cmp(&b.chunk.relative_file_path))
-                .then(a.chunk.start_line.cmp(&b.chunk.start_line))
-        });
+        hits.sort_by(fusion_order);
         hits
     }
 
@@ -1791,6 +1796,48 @@ mod tests {
         assert_eq!(fused[0].lexical_match_count, 3);
         assert_eq!(fused[0].lexical_score, Some(5.0));
         assert_eq!(fused[0].retrieval_channels, ["lexical"]);
+    }
+
+    #[test]
+    fn equal_score_chunks_with_the_same_path_and_start_line_have_a_stable_order() {
+        use SourceRole::Source;
+        let mut semantic = semantic_at(hit("same.rs", 1, Source), 1);
+        semantic.chunk.end_line = 3;
+        semantic.chunk.content_hash = "z-semantic".into();
+        let mut lexical = lexical_at(hit("same.rs", 1, Source), 1);
+        lexical.chunk.end_line = 2;
+        lexical.chunk.content_hash = "a-lexical".into();
+        let fused = App::fuse_hits(
+            RRF_K,
+            &FusionConfig::UNIT,
+            vec![semantic],
+            vec![lexical],
+            vec![],
+        );
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].fusion_score, fused[1].fusion_score);
+
+        let ordered_hashes = |mut hits: Vec<Hit>| {
+            hits.sort_by(fusion_order);
+            hits.into_iter()
+                .map(|hit| hit.chunk.content_hash)
+                .collect::<Vec<_>>()
+        };
+        let forward = ordered_hashes(fused.clone());
+        let reverse = ordered_hashes(fused.iter().cloned().rev().collect());
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, ["a-lexical", "z-semantic"]);
+
+        let same_end_line = |mut hits: Vec<Hit>| {
+            for hit in &mut hits {
+                hit.chunk.end_line = 3;
+            }
+            hits
+        };
+        let forward = ordered_hashes(same_end_line(fused.clone()));
+        let reverse = ordered_hashes(same_end_line(fused.iter().cloned().rev().collect()));
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, ["a-lexical", "z-semantic"]);
     }
 
     /// A fused order of `(file, start line)` chunks, best first, with strictly
@@ -2106,13 +2153,16 @@ mod tests {
                     row.relative_file_path
                 );
             }
-            // The rows are in the fused order: score descending, then path.
+            // The rows are in the fused order: score descending, then the
+            // stable path and chunk identity keys.
             let mut resorted = traced.clone();
             resorted.sort_by(|a, b| {
                 b.fusion_score
                     .total_cmp(&a.fusion_score)
                     .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
                     .then(a.start_line.cmp(&b.start_line))
+                    .then(a.end_line.cmp(&b.end_line))
+                    .then(a.content_hash.cmp(&b.content_hash))
             });
             assert_eq!(traced, resorted);
             assert_eq!(
@@ -2127,11 +2177,19 @@ mod tests {
         let hits = fused_order(&INTERLEAVED);
         let mut rows = trace_candidates(&hits, 2, 4, 1024);
         record_rerank_scores(&mut rows, &[(0, 0.75), (1, 0.25), (2, 0.5), (3, 0.125)]);
+        assert_eq!(rows[0].content_hash, hits[0].chunk.content_hash);
         let json = serde_json::to_string(&rows).unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<CandidateTrace>>(&json).unwrap(),
             rows
         );
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy_json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_hash");
+        let legacy: Vec<CandidateTrace> = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy[0].content_hash, "");
         assert_eq!(
             serde_json::to_string(&[
                 RerankOutcome::Scored,
