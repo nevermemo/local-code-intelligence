@@ -248,11 +248,15 @@ fn sources_with_read(
             continue;
         };
         let path = entry.path().strip_prefix(root)?;
-        let Some(relative) = path.to_str() else {
+        let relative = path
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>();
+        let Some(relative) = relative else {
             tracing::warn!(path = ?path, "skipping source file: non-UTF-8 file path");
             continue;
         };
-        let relative = relative.replace('\\', "/");
+        let relative = relative.join("/");
         let bytes = match read(entry.path()) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -775,7 +779,10 @@ export interface TelemetryLifecycle {
         std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
 
         let result = scan_incremental(temp.path(), &HashMap::new());
-        assert!(result.is_ok(), "one non-UTF-8 path failed the scan: {result:?}");
+        assert!(
+            result.is_ok(),
+            "one non-UTF-8 path failed the scan: {result:?}"
+        );
         let scan = result.unwrap();
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.chunks.len(), 1);
