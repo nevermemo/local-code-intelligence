@@ -398,19 +398,21 @@ fn cpp() -> Language {
 
 /// Code units of a UTF-16 file decoded when looking for a Qt Linguist
 /// catalog. An XML declaration or a `<TS` start tag with its first attribute
-/// is far shorter, so the rest of the file is never decoded.
+/// is far shorter, so the rest of the file is never decoded; a UTF-16 catalog
+/// whose leading comments run past this limit is not recognized.
 const UTF16_PREFIX_UNITS: usize = 512;
 
 /// Detects a Qt Linguist catalog from the start of a `.ts` file, in UTF-8
 /// (with or without a byte-order mark) or in UTF-16 with a byte-order mark
 /// (little or big endian; a UTF-16 file without a mark is not guessed).
 ///
-/// After the mark and whitespace the text must start with either an XML
-/// declaration (`<?xml`, which no TypeScript statement or expression can
-/// start with) or a `<TS` root element that carries an attribute
-/// (`<TS version="2.1" ...>`). Both encodings share that one rule
-/// ([`is_catalog_start`]): a UTF-16 file is decoded to ASCII bytes first, and
-/// only as far as the rule needs, never the whole file.
+/// After the mark and whitespace, leading XML comments and a DOCTYPE are
+/// skipped before checking for an XML declaration (`<?xml`, which no
+/// TypeScript statement or expression can start with) or a `<TS` root element
+/// that carries an attribute (`<TS version="2.1" ...>`). Both encodings share
+/// that one rule ([`is_catalog_start`]): a UTF-16 file is decoded to
+/// ASCII-compatible bytes first, and only as far as the rule needs, never the
+/// whole file.
 fn qt_linguist(content: &[u8]) -> Option<NonSource> {
     let catalog = if let Some(units) = content.strip_prefix(b"\xFF\xFE") {
         is_catalog_start(&utf16_ascii_prefix(units, u16::from_le_bytes))
@@ -445,7 +447,24 @@ fn utf16_ascii_prefix(units: &[u8], decode: fn([u8; 2]) -> u16) -> Vec<u8> {
 /// valid TypeScript (a type assertion and a generic arrow function), so the
 /// element must be followed by `name=`.
 fn is_catalog_start(text: &[u8]) -> bool {
-    let text = text.trim_ascii_start();
+    let mut text = text.trim_ascii_start();
+    loop {
+        if let Some(after_comment) = text.strip_prefix(b"<!--") {
+            let Some(comment_end) = after_comment.windows(3).position(|window| window == b"-->")
+            else {
+                return false;
+            };
+            text = &after_comment[comment_end + 3..];
+        } else if text.starts_with(b"<!DOCTYPE") {
+            let Some(after_doctype) = skip_doctype(text) else {
+                return false;
+            };
+            text = after_doctype;
+        } else {
+            break;
+        }
+        text = text.trim_ascii_start();
+    }
     if text.starts_with(b"<?xml") {
         return true;
     }
@@ -463,6 +482,32 @@ fn is_catalog_start(text: &[u8]) -> bool {
         })
         .count();
     name_len > 0 && attributes[name_len..].trim_ascii_start().first() == Some(&b'=')
+}
+
+fn skip_doctype(text: &[u8]) -> Option<&[u8]> {
+    let after_keyword = text.strip_prefix(b"<!DOCTYPE")?;
+    if !after_keyword.first().is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut subset_depth = 0_usize;
+    for (index, &byte) in after_keyword.iter().enumerate() {
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => subset_depth += 1,
+            b']' => subset_depth = subset_depth.saturating_sub(1),
+            b'>' if subset_depth == 0 => return Some(&after_keyword[index + 1..]),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
@@ -631,6 +676,11 @@ mod tests {
             b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TS version=\"2.1\">",
             b"\n  \r\n\t<?xml version=\"1.0\"?>",
             b"\xEF\xBB\xBF \n<?xml?>",
+            b"<!-- hand-edited catalog -->\n<TS version=\"2.1\">",
+            b"<!-- before declaration -->\n<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<!DOCTYPE TS>\n<TS version=\"2.1\">",
+            b"<!-- catalog -->\n<!DOCTYPE TS>\n<TS version=\"2.1\">",
             b"<TS version=\"2.1\" language=\"de\">\n</TS>",
             b"  <TS\n  version = \"2.1\">",
             b"<TS language=\"de\" version=\"2.1\">",
@@ -657,6 +707,12 @@ mod tests {
             b"/* <?xml */\nexport const value = 1;\n",
             b"\xEF\xBB\xBF// bom then a comment\nexport const value = 1;\n",
             b"const xml = '<?xml version=\"1.0\"?>';\n",
+            b"const template = `<!-- not an XML prolog -->`;\nexport const value = 1;\n",
+            // A leading `<!--` or `<!DOCTYPE` is skipped, but what follows must
+            // still be an XML declaration or a `<TS` root with an attribute.
+            b"<!-- an html-style comment line -->\nexport const value = 1;\n",
+            b"<!-- unterminated\nexport const value = 1;\n",
+            b"<!DOCTYPE html>\nexport const value = 1;\n",
             // Valid TypeScript that starts with `<TS`: a type assertion and
             // generic arrow functions.
             b"<TS>value;\n",
@@ -724,7 +780,8 @@ mod tests {
         let declared = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<translation>M\u{fc}nzen senden \u{1F4B0}</translation>\n</TS>\n";
         let root_only = "<TS version=\"2.1\" language=\"de\">\n</TS>\n";
         let spaced = " \r\n\t<TS\n  version = \"2.1\">";
-        for text in [declared, root_only, spaced, "<?xml?>"] {
+        let commented = "<!-- hand-edited catalog -->\n<TS version=\"2.1\">";
+        for text in [declared, root_only, spaced, commented, "<?xml?>"] {
             for big_endian in [false, true] {
                 let content = utf16(text, big_endian, true);
                 assert_eq!(
