@@ -19,12 +19,16 @@ use std::{
 pub struct NavigationReport {
     pub workspace: Workspace,
     pub results: Vec<lsp::Location>,
-    /// One `Optional LSP provider unavailable: <provider>: <cause>` entry, in
-    /// provider order, for each language server that failed to answer while
-    /// the other servers' results were returned, so an empty or short
-    /// `results` is not read as a clean "no match". Absent from the JSON when
-    /// empty. Only `symbols` can set it: `definition` and `references` ask
-    /// one server and report its failure as an error.
+    /// Why `results` may be shorter than a clean "no match" would be, so an
+    /// empty answer is not read as one. Two kinds of entry, the first kind
+    /// first and each kind in order: `No language server is enabled for
+    /// <language> (<providers>): its symbols were not searched` for an indexed
+    /// language none of whose servers is switched off or lacks a path, and
+    /// `Optional LSP provider unavailable: <provider>: <cause>` for each
+    /// language server that failed to answer while the other servers' results
+    /// were returned. Absent from the JSON when empty. Only `symbols` can set
+    /// it: `definition` and `references` ask one server and report its failure
+    /// as an error.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -83,15 +87,32 @@ impl App {
             .map(|hit| hit.chunk.language.as_str())
             .collect();
         let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
+        // A language none of whose servers is enabled is not searched, and
+        // says so: its absence from `results` is not a clean "no match".
+        let mut not_searched: Vec<String> = Vec::new();
         for language in indexed_languages {
-            for adapter in self.analyzer.adapters_for_language(language) {
-                if adapter.enabled() {
-                    applicable
-                        .entry(adapter.provider())
-                        .or_insert_with(|| Arc::clone(adapter));
-                }
+            let adapters = self.analyzer.adapters_for_language(language);
+            let mut any_enabled = false;
+            for adapter in adapters.iter().copied().filter(|adapter| adapter.enabled()) {
+                any_enabled = true;
+                applicable
+                    .entry(adapter.provider())
+                    .or_insert_with(|| Arc::clone(adapter));
+            }
+            if !any_enabled {
+                let providers: Vec<&str> =
+                    adapters.iter().map(|adapter| adapter.provider()).collect();
+                let providers = if providers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", providers.join(", "))
+                };
+                not_searched.push(format!(
+                    "No language server is enabled for {language}{providers}: its symbols were not searched"
+                ));
             }
         }
+        not_searched.sort();
         let mut results = Vec::new();
         let mut failures: Vec<(&'static str, String)> = Vec::new();
         for adapter in applicable.values() {
@@ -132,11 +153,11 @@ impl App {
             );
         }
         // Same wording as the language-server entry of a search's `warning`.
-        let warnings = failures
-            .iter()
-            .map(|(provider, error)| {
+        let warnings = not_searched
+            .into_iter()
+            .chain(failures.iter().map(|(provider, error)| {
                 format!("Optional LSP provider unavailable: {provider}: {error}")
-            })
+            }))
             .collect();
         Ok(NavigationReport {
             workspace,

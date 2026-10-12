@@ -2406,6 +2406,62 @@ async fn symbols_return_an_empty_answer_when_another_applicable_server_failed() 
     models_task.abort();
 }
 
+/// An indexed language whose only server is switched off in the configuration
+/// is not searched, and the answer says so: empty results with a warning that
+/// names the language and the provider, and the server is never started. A
+/// clean "no match" has no warning.
+#[tokio::test]
+async fn symbols_name_an_indexed_language_whose_only_server_is_disabled() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let mut config =
+        with_fake_csharp_and_typescript_servers(config, &state, "workspace-symbols", "no-symbols");
+    config.csharp.disabled = true;
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.symbols(&workspace, "Calculator").await.unwrap();
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert_eq!(
+        report.warnings,
+        ["No language server is enabled for csharp (csharp-ls): its symbols were not searched"]
+    );
+    assert!(
+        !state.join("csharp").join("spawn_count.txt").exists(),
+        "a disabled server must not be started"
+    );
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["warnings"].as_array().map(Vec::len), Some(1), "{wire}");
+    models_task.abort();
+}
+
+/// The same in a mixed workspace: the language with a server that is switched
+/// off is named, and the other language is still searched.
+#[tokio::test]
+async fn symbols_still_search_the_enabled_language_when_another_one_is_disabled() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_and_typescript_workspace(&workspace);
+    let mut config =
+        with_fake_csharp_and_typescript_servers(config, &state, "workspace-symbols", "no-symbols");
+    config.csharp.disabled = true;
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.symbols(&workspace, "NoSuchSymbol").await.unwrap();
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert_eq!(
+        report.warnings,
+        ["No language server is enabled for csharp (csharp-ls): its symbols were not searched"]
+    );
+    assert_eq!(state_count(&state.join("typescript"), "spawn_count.txt"), 1);
+    assert!(!state.join("csharp").join("spawn_count.txt").exists());
+    models_task.abort();
+}
+
 /// The warning does not depend on how the server failed: csharp-ls answers
 /// with a JSON-RPC error response to every request (`--mode error-response`,
 /// the process keeps running and no timeout is involved) while the TypeScript
