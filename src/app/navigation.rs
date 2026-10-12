@@ -123,13 +123,7 @@ impl App {
         }
         // `applicable` is a map, so sort for a stable message and log order.
         failures.sort();
-        results.sort_by(|a, b| {
-            a.relative_file_path
-                .cmp(&b.relative_file_path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.language.cmp(&b.language))
-        });
-        results.dedup();
+        order_symbols(&mut results);
         // Only an answer from no server at all is an error. A server that
         // answered with nothing is a correct "no match", even when another
         // server of a mixed-language workspace failed (a stray C# file whose
@@ -276,5 +270,66 @@ impl App {
             results,
             warnings: Vec::new(),
         })
+    }
+}
+
+/// Puts the answers of all servers in one order that does not depend on which
+/// server answered first, and drops repeats. The order is file, line and
+/// language first, then every other field: sorting by those three alone left
+/// ties in the order the servers happened to answer, and `dedup` removes only
+/// neighbours, so a repeat with another symbol between its copies survived.
+fn order_symbols(results: &mut Vec<lsp::Location>) {
+    results.sort_by(|a, b| {
+        a.relative_file_path
+            .cmp(&b.relative_file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.language.cmp(&b.language))
+            .then(a.start_character.cmp(&b.start_character))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.end_character.cmp(&b.end_character))
+            .then(a.name.cmp(&b.name))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.provider.cmp(&b.provider))
+            .then(a.file_path.cmp(&b.file_path))
+    });
+    results.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(line: u32, character: u32, name: &str) -> lsp::Location {
+        lsp::Location {
+            file_path: std::path::PathBuf::from("/w/src/a.cs"),
+            relative_file_path: Some("src/a.cs".to_owned()),
+            start_line: line,
+            start_character: character,
+            end_line: line,
+            end_character: character + 1,
+            name: Some(name.to_owned()),
+            kind: Some(5),
+            language: Some("csharp".to_owned()),
+            provider: Some("csharp-ls".to_owned()),
+        }
+    }
+
+    #[test]
+    fn answers_on_one_line_come_out_in_the_same_order_whatever_order_they_arrive_in() {
+        let (late, early, first) = (symbol(3, 8, "b"), symbol(3, 2, "a"), symbol(1, 0, "z"));
+        let mut one = vec![late.clone(), early.clone(), first.clone()];
+        let mut other = vec![first.clone(), early.clone(), late.clone()];
+        order_symbols(&mut one);
+        order_symbols(&mut other);
+        assert_eq!(one, other);
+        assert_eq!(one, [first, early, late]);
+    }
+
+    #[test]
+    fn a_repeated_answer_is_removed_even_with_another_symbol_between_the_copies() {
+        let repeated = symbol(3, 8, "b");
+        let mut results = vec![repeated.clone(), symbol(3, 2, "a"), repeated.clone()];
+        order_symbols(&mut results);
+        assert_eq!(results, [symbol(3, 2, "a"), repeated]);
     }
 }
