@@ -172,9 +172,9 @@ fn is_connection_dropped(error: &reqwest::Error) -> bool {
 }
 
 /// A model service answered with a non-success HTTP status. Carries the
-/// status and the (bounded, credential-redacted) response body, which is usually the only place
-/// the service says *why* -- e.g. vLLM's "maximum context length is 8192
-/// tokens" for an oversized embedding input.
+/// status and the (bounded, credential-redacted) response body, which is usually
+/// the only place the service says *why* -- e.g. vLLM's "maximum context length
+/// is 8192 tokens" for an oversized embedding input.
 #[derive(Debug)]
 pub struct HttpStatusError {
     pub status: u16,
@@ -258,7 +258,7 @@ fn redact_error_body(body: &str, endpoint: &str) -> String {
 
     // Match the original text once (longest value first), never the inserted
     // marker. Redact before capping so the cap cannot expose a secret's prefix.
-    let mut remaining = body.trim();
+    let mut remaining = body;
     let mut redacted = String::new();
     let mut written = 0;
     while !remaining.is_empty() && written < MAX_ERROR_BODY_CHARS {
@@ -271,11 +271,20 @@ fn redact_error_body(body: &str, endpoint: &str) -> String {
             written += "[redacted]".len();
         } else {
             let character = remaining.chars().next().unwrap();
-            redacted.push(character);
             remaining = &remaining[character.len_utf8()..];
-            written += 1;
+            // Trim leading diagnostic whitespace only after checking whether
+            // it belongs to a credential.
+            if written > 0 || !character.is_whitespace() {
+                redacted.push(character);
+                written += 1;
+            }
         }
     }
+    let redacted = if remaining.is_empty() {
+        redacted.trim_end()
+    } else {
+        &redacted
+    };
     redacted.chars().take(MAX_ERROR_BODY_CHARS).collect()
 }
 
@@ -556,6 +565,8 @@ mod tests {
         ServerError,
         /// Reject the request and echo its request line and a password.
         EchoError(u16, &'static str),
+        /// Echo a value at both edges of the response body.
+        EchoEdgeValue(&'static str),
         /// Answer HTTP 500 with a body larger than the model response limit.
         OversizedError,
         /// Answer with a valid embedding response followed by enough
@@ -705,6 +716,11 @@ mod tests {
                     String::new(),
                     format!("rejected {target}; userinfo: {password}; retry later"),
                 ),
+                Step::EchoEdgeValue(value) => (
+                    "401 Unauthorized",
+                    String::new(),
+                    format!("{value}\nrejected {target}; userinfo: {value}"),
+                ),
                 Step::Close | Step::Reset => return,
             };
             let response = format!(
@@ -849,7 +865,9 @@ mod tests {
             format!("{label} HTTP error: HTTP status {status}: {body}")
         );
         let debug = format!("{error:?}");
-        assert!(debug.contains(body), "{debug}");
+        for line in body.lines() {
+            assert!(debug.contains(line), "{debug}");
+        }
         for secret in secrets {
             assert!(!chain.contains(secret), "{chain}");
             assert!(!debug.contains(secret), "{debug}");
@@ -979,6 +997,25 @@ mod tests {
             "embedding service",
             &expected,
             &[secret, "n89-long"],
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_http_error_body_redacts_values_before_trimming() {
+        let secret = " n89-edge ";
+        let server = FakeModelServer::start(vec![vec![Step::EchoEdgeValue(secret)]]).await;
+        let mut models = server.models();
+        models
+            .config
+            .reranker_url
+            .push_str("?api_key=%20n89-edge%20");
+        let error = models.rerank("query", &documents()).await.unwrap_err();
+        assert_redacted_http_error(
+            &error,
+            401,
+            "reranker",
+            "[redacted]\nrejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: [redacted]",
+            &["n89-edge"],
         );
     }
 
