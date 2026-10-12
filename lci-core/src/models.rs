@@ -205,13 +205,51 @@ pub fn is_input_rejected(error: &anyhow::Error) -> bool {
 /// Longest response body kept in an [`HttpStatusError`].
 const MAX_ERROR_BODY_CHARS: usize = 600;
 
+/// Maximum number of bytes buffered from a model response body.
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+struct LimitedBody {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Result<LimitedBody> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let remaining = limit.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            return Ok(LimitedBody {
+                bytes,
+                truncated: true,
+            });
+        }
+    }
+    Ok(LimitedBody {
+        bytes,
+        truncated: false,
+    })
+}
+
 async fn check_status(response: reqwest::Response, label: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
-    let body: String = body.trim().chars().take(MAX_ERROR_BODY_CHARS).collect();
+    let bounded = read_limited_body(response, MAX_RESPONSE_BODY_BYTES)
+        .await
+        .unwrap_or(LimitedBody {
+            bytes: Vec::new(),
+            truncated: false,
+        });
+    let mut body: String = String::from_utf8_lossy(&bounded.bytes)
+        .trim()
+        .chars()
+        .take(MAX_ERROR_BODY_CHARS)
+        .collect();
+    if bounded.truncated {
+        body.push_str(" [truncated]");
+    }
     Err(anyhow::Error::new(HttpStatusError {
         status: status.as_u16(),
         body,
@@ -224,6 +262,7 @@ impl Models {
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             config: config.clone(),
             reranker_breaker: Arc::new(ConnectBreaker::new(RERANKER_DOWN_WINDOW)),
@@ -282,10 +321,17 @@ impl Models {
 
     async fn embed_with(&self, inputs: &[String], policy: RetryPolicy) -> Result<Vec<Vec<f32>>> {
         ensure!(!inputs.is_empty(), "embedding input is empty");
-        let url = format!(
-            "{}/embeddings",
-            self.config.embedding_url.trim_end_matches('/')
+        let mut url = reqwest::Url::parse(&self.config.embedding_url)
+            .context("invalid embedding service URL")?;
+        ensure!(
+            !url.cannot_be_a_base(),
+            "embedding service URL cannot be a base URL"
         );
+        // Every trailing slash goes before `/embeddings` is appended, like
+        // `embedding_identity` does (one `pop_if_empty` would turn `/v1//` into
+        // `/v1//embeddings`); the query stays where it is.
+        let path = format!("{}/embeddings", url.path().trim_end_matches('/'));
+        url.set_path(&path);
         let body = serde_json::json!({
             "model": self.config.embedding_model,
             "input": inputs,
@@ -294,13 +340,20 @@ impl Models {
         let timeout = Duration::from_secs(self.config.embedding_timeout_seconds);
         let response = self
             .send_with_retry("embedding service", policy, || {
-                self.client.post(&url).timeout(timeout).json(&body)
+                self.client.post(url.clone()).timeout(timeout).json(&body)
             })
             .await?;
-        let response = check_status(response, "embedding service")
-            .await?
-            .json::<Embeddings>()
-            .await
+        let bounded = read_limited_body(
+            check_status(response, "embedding service").await?,
+            MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .context("invalid embedding response")?;
+        ensure!(
+            !bounded.truncated,
+            "embedding response body exceeds {MAX_RESPONSE_BODY_BYTES} byte limit"
+        );
+        let response = serde_json::from_slice::<Embeddings>(&bounded.bytes)
             .context("invalid embedding response")?;
         ensure!(
             response.data.len() == inputs.len(),
@@ -391,10 +444,17 @@ impl Models {
                 return Err(error);
             }
         };
-        let response = check_status(response, "reranker")
-            .await?
-            .json::<Reranking>()
-            .await
+        let bounded = read_limited_body(
+            check_status(response, "reranker").await?,
+            MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .context("invalid reranker response")?;
+        ensure!(
+            !bounded.truncated,
+            "reranker response body exceeds {MAX_RESPONSE_BODY_BYTES} byte limit"
+        );
+        let response = serde_json::from_slice::<Reranking>(&bounded.bytes)
             .context("invalid reranker response")?;
         ensure!(
             response.results.len() == documents.len(),
@@ -446,6 +506,16 @@ mod tests {
         Reply,
         /// Answer HTTP 500.
         ServerError,
+        /// Answer HTTP 500 with a body larger than the model response limit.
+        OversizedError,
+        /// Answer with a valid embedding response followed by enough
+        /// whitespace to exceed the model response limit.
+        OversizedReply,
+        /// Answer with a valid reranker response followed by enough
+        /// whitespace to exceed the model response limit.
+        OversizedRerank,
+        /// Redirect the request to another fake server.
+        Redirect(SocketAddr),
         /// Read the whole request, then close the connection without
         /// answering: the peer's FIN reaches a client waiting for a response.
         Close,
@@ -462,6 +532,7 @@ mod tests {
         address: SocketAddr,
         connections: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
+        request_targets: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeModelServer {
@@ -470,18 +541,29 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let connections = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(AtomicUsize::new(0));
-            let (accepted, handled) = (connections.clone(), requests.clone());
+            let request_targets = Arc::new(Mutex::new(Vec::new()));
+            let (accepted, handled, targets) = (
+                connections.clone(),
+                requests.clone(),
+                request_targets.clone(),
+            );
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let index = accepted.fetch_add(1, Ordering::SeqCst);
                     let script = scripts[index.min(scripts.len() - 1)].clone();
-                    tokio::spawn(serve_connection(stream, script, handled.clone()));
+                    tokio::spawn(serve_connection(
+                        stream,
+                        script,
+                        handled.clone(),
+                        targets.clone(),
+                    ));
                 }
             });
             Self {
                 address,
                 connections,
                 requests,
+                request_targets,
             }
         }
 
@@ -507,12 +589,17 @@ mod tests {
         fn requests(&self) -> usize {
             self.requests.load(Ordering::SeqCst)
         }
+
+        fn request_targets(&self) -> Vec<String> {
+            self.request_targets.lock().unwrap().clone()
+        }
     }
 
     async fn serve_connection(
         mut stream: TcpStream,
         script: Vec<Step>,
         requests: Arc<AtomicUsize>,
+        request_targets: Arc<Mutex<Vec<String>>>,
     ) {
         for step in script {
             if let Step::Reset = step {
@@ -521,18 +608,49 @@ mod tests {
                 requests.fetch_add(1, Ordering::SeqCst);
                 return;
             }
-            if !read_request(&mut stream).await {
+            let Some(target) = read_request(&mut stream).await else {
                 return;
-            }
+            };
+            request_targets.lock().unwrap().push(target);
             requests.fetch_add(1, Ordering::SeqCst);
-            let (status, body) = match step {
-                Step::Reply => ("200 OK", r#"{"data":[{"index":0,"embedding":[0.5,0.25]}]}"#),
-                Step::ServerError => ("500 Internal Server Error", r#"{"error":"boom"}"#),
+            let (status, headers, body) = match step {
+                Step::Reply => (
+                    "200 OK",
+                    String::new(),
+                    r#"{"data":[{"index":0,"embedding":[0.5,0.25]}]}"#.to_owned(),
+                ),
+                Step::OversizedError => (
+                    "500 Internal Server Error",
+                    String::new(),
+                    format!("readable error {}", "x".repeat(MAX_RESPONSE_BODY_BYTES + 1)),
+                ),
+                Step::OversizedReply => (
+                    "200 OK",
+                    String::new(),
+                    r#"{"data":[{"index":0,"embedding":[0.5,0.25]}]}"#.to_owned()
+                        + &" ".repeat(MAX_RESPONSE_BODY_BYTES + 1),
+                ),
+                Step::OversizedRerank => (
+                    "200 OK",
+                    String::new(),
+                    r#"{"results":[{"index":0,"relevance_score":0.9}]}"#.to_owned()
+                        + &" ".repeat(MAX_RESPONSE_BODY_BYTES + 1),
+                ),
+                Step::Redirect(address) => (
+                    "307 Temporary Redirect",
+                    format!("location: http://{address}/redirected\r\nconnection: close\r\n"),
+                    String::new(),
+                ),
+                Step::ServerError => (
+                    "500 Internal Server Error",
+                    String::new(),
+                    r#"{"error":"boom"}"#.to_owned(),
+                ),
                 Step::Close | Step::Reset => return,
             };
             let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\n\r\n{body}",
+                body.len(),
             );
             if stream.write_all(response.as_bytes()).await.is_err() {
                 return;
@@ -540,9 +658,9 @@ mod tests {
         }
     }
 
-    /// Reads one HTTP request (head and `content-length` body); false when
-    /// the client went away first.
-    async fn read_request(stream: &mut TcpStream) -> bool {
+    /// Reads one HTTP request (head and `content-length` body), returning its
+    /// request line or `None` when the client went away first.
+    async fn read_request(stream: &mut TcpStream) -> Option<String> {
         let mut received = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -554,11 +672,14 @@ mod tests {
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 if received.len() >= head_end + 4 + length {
-                    return true;
+                    return String::from_utf8_lossy(&received[..head_end])
+                        .lines()
+                        .next()
+                        .map(str::to_owned);
                 }
             }
             match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => return false,
+                Ok(0) | Err(_) => return None,
                 Ok(n) => received.extend_from_slice(&chunk[..n]),
             }
         }
@@ -649,6 +770,110 @@ mod tests {
         assert_eq!(server.requests(), 1);
         assert!(
             error.downcast_ref::<HttpStatusError>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_endpoint_appends_to_the_path_before_its_query() {
+        let server = FakeModelServer::start(vec![vec![Step::Reply]]).await;
+        let config = Config {
+            embedding_url: format!("http://{}/v1?tenant=local", server.address),
+            ..Config::default()
+        };
+        let models = Models::new(&config).unwrap();
+
+        models.embed(&documents()).await.unwrap();
+
+        assert_eq!(
+            server.request_targets(),
+            ["POST /v1/embeddings?tenant=local HTTP/1.1"]
+        );
+    }
+
+    /// The configured URL may end in any number of slashes: all of them are
+    /// dropped before `/embeddings`, as `embedding_identity` does.
+    #[tokio::test]
+    async fn embedding_endpoint_ignores_every_trailing_slash() {
+        for suffix in ["", "/", "//"] {
+            let server = FakeModelServer::start(vec![vec![Step::Reply]]).await;
+            let config = Config {
+                embedding_url: format!("http://{}/v1{suffix}", server.address),
+                ..Config::default()
+            };
+            let models = Models::new(&config).unwrap();
+
+            models.embed(&documents()).await.unwrap();
+
+            assert_eq!(
+                server.request_targets(),
+                ["POST /v1/embeddings HTTP/1.1"],
+                "embedding_url ending in {suffix:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_post_is_not_replayed_to_a_redirect_target() {
+        let target = FakeModelServer::start(vec![vec![Step::Reply]]).await;
+        let redirect = FakeModelServer::start(vec![vec![Step::Redirect(target.address)]]).await;
+        let models = redirect.models();
+
+        let error = models.embed(&documents()).await.unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<HttpStatusError>()
+                .map(|error| error.status),
+            Some(307),
+            "{error:#}"
+        );
+        assert_eq!(redirect.requests(), 1);
+        assert_eq!(target.requests(), 0, "the POST was replayed after redirect");
+    }
+
+    #[tokio::test]
+    async fn oversized_error_body_is_capped_and_keeps_its_readable_prefix() {
+        let server = FakeModelServer::start(vec![vec![Step::OversizedError]]).await;
+        let models = server.models();
+
+        let error = models.embed(&documents()).await.unwrap_err();
+        let status = error.downcast_ref::<HttpStatusError>().unwrap();
+
+        assert!(
+            status.body.starts_with("readable error"),
+            "the useful error prefix should remain visible: {:?}",
+            status.body
+        );
+        assert!(
+            status.body.ends_with("[truncated]"),
+            "the bounded read should be reported: {:?}",
+            status.body
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_success_body_is_rejected_at_the_response_limit() {
+        let server = FakeModelServer::start(vec![vec![Step::OversizedReply]]).await;
+        let models = server.models();
+
+        let error = models.embed(&documents()).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("response body exceeds"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reranker_body_is_rejected_at_the_response_limit() {
+        let server = FakeModelServer::start(vec![vec![Step::OversizedRerank]]).await;
+        let models = server.models();
+
+        let error = models.rerank("query", &documents()).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("reranker response body exceeds"),
             "{error:#}"
         );
     }
