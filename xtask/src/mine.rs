@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
+use lci_core::evaluation::{EvaluationFile, validate_definition};
 
 /// Extensions LCI indexes (exact, lowercase). Mirrors the `extension` fields
 /// of `ADAPTERS` in `lci-core/src/language.rs`. The
@@ -354,7 +355,7 @@ fn has_supported_extension(path: &str) -> bool {
 /// Lockfiles, vendored and generated paths, and paths that cannot be written
 /// as an exact evaluation pattern (glob metacharacters, backslashes).
 fn is_excluded_path(path: &str) -> bool {
-    if path.contains(['*', '?', '[', ']', '\\']) {
+    if path.contains(['*', '?', '[', ']', '{', '}', '\\']) {
         return true;
     }
     let mut parts: Vec<&str> = path.split('/').collect();
@@ -945,6 +946,10 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn write_definition(out: &Path, rendered: &str) -> Result<()> {
+    let definition: EvaluationFile =
+        toml::from_str(rendered).context("failed to parse mined evaluation definition")?;
+    validate_definition(&definition).context("invalid mined evaluation definition")?;
+
     if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -982,6 +987,7 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
             "log",
             "--no-merges",
             "--name-status",
+            "-M",
             "--no-color",
             "--no-show-signature",
             "--encoding=UTF-8",
@@ -1064,7 +1070,7 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use local_code_intelligence::evaluate::{EvaluationFile, validate_definition};
+    use lci_core::evaluation::{EvaluationFile, validate_definition};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);

@@ -4,81 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{CandidateTrace, RerankOutcome};
 use crate::config::{ChannelsConfig, Config, FusionConfig};
-use crate::filter::{EffectiveFilterReport, FilterRequest};
+use crate::filter::EffectiveFilterReport;
 
 use super::metrics::query_metrics;
-/// A portable evaluation file: the workspaces it references plus the
-/// queries to run against them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvaluationFile {
-    /// Workspaces referenced by key.
-    #[serde(default)]
-    pub workspaces: Vec<EvalWorkspace>,
-    /// Queries to evaluate.
-    #[serde(default)]
-    pub queries: Vec<EvalQuery>,
-}
-
-/// A workspace referenced by an evaluation file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvalWorkspace {
-    /// Stable key used by [`EvalQuery::workspace`].
-    pub key: String,
-    /// Required workspaces must be present; when an optional workspace is
-    /// missing, its queries are skipped rather than failing the run.
-    /// Defaults to `true` when omitted in a definition file.
-    #[serde(default = "default_required")]
-    pub required: bool,
-}
-
-const fn default_required() -> bool {
-    true
-}
-
-/// A single evaluation query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvalQuery {
-    /// Query text sent to search.
-    pub query: String,
-    /// Key of the workspace this query runs against.
-    pub workspace: String,
-    /// Result window size; `None` uses the service default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<usize>,
-    /// Optional retrieval filters, shared with the service filter request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<FilterRequest>,
-    /// Repository-relative path patterns that count as a hit. When several
-    /// patterns match the same result, the result still counts as one hit.
-    #[serde(default)]
-    pub expected_paths: Vec<String>,
-    /// Path patterns that should appear in the results; each matching
-    /// result counts once toward [`QueryMetrics::preferred_count`]
-    /// regardless of how many patterns match it.
-    #[serde(default)]
-    pub preferred_paths: Vec<String>,
-    /// Path patterns that should not appear before the first expected hit.
-    #[serde(default)]
-    pub disfavored_paths: Vec<String>,
-    /// Source-role names (lowercase wire names) expected on the first
-    /// expected hit. Empty means no role expectation.
-    #[serde(default)]
-    pub expected_roles: Vec<String>,
-    /// A snippet that must appear in the first expected hit's bounded
-    /// snippet; `None` means no snippet expectation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_snippet: Option<String>,
-    /// Free-form labels that stratify the aggregate: the report carries one
-    /// [`TagAggregate`] per distinct tag. Generated query sets use
-    /// `keyword` or `keyword-agnostic`, optionally followed by `gold-drift`
-    /// and one of `short-query` / `long-query`. Tags never affect search or
-    /// the per-query metrics.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-}
+pub use lci_core::evaluation::{EvalQuery, EvalWorkspace, EvaluationFile};
 
 // ---------------------------------------------------------------------------
 // Bounded result evidence

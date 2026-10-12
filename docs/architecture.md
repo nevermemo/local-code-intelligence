@@ -11,7 +11,8 @@ The Cargo workspace has three members: the root package
 `local-code-intelligence`, `lci-core`, and `xtask` (build, test and acceptance
 commands). `lci-core` holds the pure logic -- `chunk`, `config`, `filter`,
 `language`, `lexical`, `lsp`, `manifest`, `models` and `workspace`, with the
-Tree-sitter grammars -- and depends on none of LanceDB, Arrow, axum or rmcp. The
+Tree-sitter grammars, plus portable evaluation definitions and validation --
+and depends on none of LanceDB, Arrow, axum or rmcp. The
 root crate holds what needs the embedded database or a protocol server: `app`,
 `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server`,
 `rest` and `main`, and re-exports the `lci-core` modules from `src/lib.rs` so
