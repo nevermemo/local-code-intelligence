@@ -133,3 +133,54 @@ fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::fs::Fil
     }
     Ok(file)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{INDEX_LOCK_FILE, lock_data_dir_for_indexing};
+    use std::{
+        fs::OpenOptions,
+        sync::mpsc::{self, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    #[test]
+    fn data_dir_index_lock_waits_for_another_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(temp.path().join(INDEX_LOCK_FILE))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let data_dir = temp.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = lock_data_dir_for_indexing(&data_dir);
+            let _ = returned_tx.send(result);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must signal before attempting the lock");
+        assert!(
+            matches!(
+                returned_rx.recv_timeout(Duration::from_millis(500)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "lock_data_dir_for_indexing returned while another holder held the lock"
+        );
+
+        drop(holder);
+        let acquired = returned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lock_data_dir_for_indexing must return promptly after the lock is released")
+            .unwrap();
+        worker.join().unwrap();
+        drop(acquired);
+    }
+}
