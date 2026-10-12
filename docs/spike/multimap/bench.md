@@ -127,12 +127,15 @@ repositories is stored. Mined by `cargo xtask bench mine` (filters recorded in t
   tagged `keyword`, one that names a gold symbol `names-symbol`.
 - Gold files: the supported-extension files the fix modified, excluding test files;
   fixes that add, delete or rename a non-test source file are skipped.
-- Gold symbols: the declaration names in the hunk headers of `git diff -U0 base fix` for
-  each gold file, using git's built-in `rust`, `golang` and `python` funcname drivers
-  selected through a temporary `core.attributesFile` (never a file inside the checkout).
-  The bare name is the identifier after `fn`/`struct`/`enum`/`trait`/`union`/`type`/
-  `const`/`static` (Rust), after `func` and an optional receiver or after `type` (Go),
-  after `def`/`class` (Python); `impl` and `mod` headers name no symbol. Not derived from
+- Gold symbols: per hunk of `git diff -U0 base fix` of each gold file, the declaration
+  on the first changed code line if there is one, else (an indented change inside a
+  body) the name in git's built-in `rust`, `golang` or `python` funcname hunk header,
+  selected through a temporary `core.attributesFile` (never a file inside the
+  checkout); comment-only hunks, top-level non-declaration hunks and names under three
+  characters give none. The bare name is the identifier after `fn` (first), else
+  `struct`/`enum`/`trait`/`union`/`type`/`const`/`static` (Rust), after `func` and an
+  optional receiver or after `type` (Go), after `def`/`class` (Python). Approximate by
+  construction (the header is the nearest declaration above the hunk). Not derived from
   a SCIP or LSP index, nor from LCI's own parser (lesson L8): the gold must not share a
   source with any map it scores.
 

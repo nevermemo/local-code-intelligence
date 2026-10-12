@@ -9,7 +9,7 @@
       "bugfix",
       "regression"
     ],
-    "gold_symbols": "names from git's built-in rust/golang/python diff driver hunk headers of git diff -U0 base..fix",
+    "gold_symbols": "per hunk of git diff -U0 base..fix: the declaration on the first changed code line, else (indented change) the name in git's built-in rust/golang/python funcname hunk header; comment-only and top-level non-declaration hunks and names under 3 characters give none",
     "max_gold_files": 3,
     "min_subject_words": 4,
     "only_modified_source_files": true,
@@ -46,7 +46,7 @@
       "skipped": {
         "adds, deletes or renames a non-test source file": 1,
         "formatting, lint or typo fix": 11,
-        "merge commit": 8,
+        "merge or root commit": 8,
         "message does not say fix or bug": 245,
         "modifies more than 3 non-test source files": 3,
         "modifies no non-test source file": 13,
@@ -135,12 +135,7 @@
       "gold_files": [
         "tokio/src/runtime/builder.rs"
       ],
-      "gold_symbols": [
-        {
-          "name": "global_queue_interval",
-          "path": "tokio/src/runtime/builder.rs"
-        }
-      ],
+      "gold_symbols": [],
       "id": "tokio-03fe44c10302",
       "query": "runtime: fix `event_interval` doc",
       "query_source": "commit-message",
@@ -265,14 +260,6 @@
           "path": "tokio/src/runtime/time_alt/entry.rs"
         },
         {
-          "name": "wake",
-          "path": "tokio/src/runtime/time_alt/entry.rs"
-        },
-        {
-          "name": "elapsed",
-          "path": "tokio/src/runtime/time_alt/wheel/mod.rs"
-        },
-        {
           "name": "insert",
           "path": "tokio/src/runtime/time_alt/wheel/mod.rs"
         }
@@ -293,6 +280,10 @@
         "tokio/src/signal/windows/sys.rs"
       ],
       "gold_symbols": [
+        {
+          "name": "REGISTRY",
+          "path": "tokio/src/signal/windows/sys.rs"
+        },
         {
           "name": "index",
           "path": "tokio/src/signal/windows/sys.rs"
@@ -317,23 +308,13 @@
       "gold_files": [
         "tokio-util/src/codec/length_delimited.rs"
       ],
-      "gold_symbols": [
-        {
-          "name": "new_codec",
-          "path": "tokio-util/src/codec/length_delimited.rs"
-        },
-        {
-          "name": "num_skip",
-          "path": "tokio-util/src/codec/length_delimited.rs"
-        }
-      ],
+      "gold_symbols": [],
       "id": "tokio-b6ed00435dc4",
       "query": "codec: fix broken length_delimited builder doc examples. The Builder::new, new_codec, and new_read doc examples combined length_adjustment(0) with num_skip(0). This leaves the length header bytes in the buffer without accounting for them, so decoding returns a frame that includes the raw header at",
       "query_source": "commit-message",
       "repo": "tokio",
       "tags": [
-        "keyword",
-        "names-symbol"
+        "keyword"
       ]
     },
     {
@@ -413,6 +394,10 @@
         {
           "name": "finish_string_read",
           "path": "tokio/src/io/util/read_line.rs"
+        },
+        {
+          "name": "read_line_internal",
+          "path": "tokio/src/io/util/read_line.rs"
         }
       ],
       "id": "tokio-89f4d133ba37",
@@ -466,10 +451,6 @@
         {
           "name": "transition_from_parked",
           "path": "tokio/src/runtime/scheduler/multi_thread/worker.rs"
-        },
-        {
-          "name": "transition_to_parked",
-          "path": "tokio/src/runtime/scheduler/multi_thread/worker.rs"
         }
       ],
       "id": "tokio-130945198760",
@@ -489,6 +470,10 @@
         "tokio/src/task/coop/mod.rs"
       ],
       "gold_symbols": [
+        {
+          "name": "JoinHandle",
+          "path": "tokio/src/blocking.rs"
+        },
         {
           "name": "spawn_blocking",
           "path": "tokio/src/blocking.rs"
@@ -538,20 +523,8 @@
       ],
       "gold_symbols": [
         {
-          "name": "task_meta",
-          "path": "tokio/src/runtime/task/mod.rs"
-        },
-        {
-          "name": "transition_to_notified_by_ref",
-          "path": "tokio/src/runtime/task/state.rs"
-        },
-        {
           "name": "transition_to_notified_for_tracing",
           "path": "tokio/src/runtime/task/state.rs"
-        },
-        {
-          "name": "trace_owned",
-          "path": "tokio/src/runtime/task/trace/mod.rs"
         }
       ],
       "id": "tokio-86678437268b",
@@ -592,6 +565,10 @@
         "tokio/src/net/unix/ucred.rs"
       ],
       "gold_symbols": [
+        {
+          "name": "SOL_LOCAL",
+          "path": "tokio/src/net/unix/ucred.rs"
+        },
         {
           "name": "get_peer_cred",
           "path": "tokio/src/net/unix/ucred.rs"
@@ -662,6 +639,10 @@
         {
           "name": "getModules",
           "path": "cmd/packagesfuncs.go"
+        },
+        {
+          "name": "moduleContainsPackage",
+          "path": "cmd/packagesfuncs.go"
         }
       ],
       "id": "caddy-a75817f5500c",
@@ -711,10 +692,6 @@
         },
         {
           "name": "handleUpgradeResponse",
-          "path": "modules/caddyhttp/reverseproxy/streaming.go"
-        },
-        {
-          "name": "switchProtocolCopier",
           "path": "modules/caddyhttp/reverseproxy/streaming.go"
         }
       ],
@@ -780,10 +757,6 @@
         "modules/caddyhttp/errors.go"
       ],
       "gold_symbols": [
-        {
-          "name": "Unwrap",
-          "path": "modules/caddyhttp/errors.go"
-        },
         {
           "name": "randString",
           "path": "modules/caddyhttp/errors.go"
@@ -895,10 +868,6 @@
         {
           "name": "Stop",
           "path": "modules/caddyhttp/app.go"
-        },
-        {
-          "name": "httpsPort",
-          "path": "modules/caddyhttp/app.go"
         }
       ],
       "id": "caddy-ff112bb2309f",
@@ -920,6 +889,10 @@
       ],
       "gold_symbols": [
         {
+          "name": "FlushError",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
           "name": "IdleTimeoutWriter",
           "path": "modules/caddyhttp/idletimeout.go"
         },
@@ -929,14 +902,6 @@
         },
         {
           "name": "Write",
-          "path": "modules/caddyhttp/idletimeout.go"
-        },
-        {
-          "name": "clearDeadlineLocked",
-          "path": "modules/caddyhttp/idletimeout.go"
-        },
-        {
-          "name": "next",
           "path": "modules/caddyhttp/idletimeout.go"
         },
         {
@@ -971,15 +936,15 @@
       ],
       "gold_symbols": [
         {
-          "name": "FlushError",
+          "name": "Override",
           "path": "modules/caddyhttp/idletimeout.go"
         },
         {
-          "name": "HandlerDone",
+          "name": "idleOverride",
           "path": "modules/caddyhttp/idletimeout.go"
         },
         {
-          "name": "next",
+          "name": "idleTimeouts",
           "path": "modules/caddyhttp/idletimeout.go"
         },
         {
@@ -993,14 +958,6 @@
         {
           "name": "ServeHTTP",
           "path": "modules/caddyhttp/timeouts/timeouts.go"
-        },
-        {
-          "name": "Timeouts",
-          "path": "modules/caddyhttp/timeouts/timeouts.go"
-        },
-        {
-          "name": "init",
-          "path": "modules/caddyhttp/timeouts/timeouts.go"
         }
       ],
       "id": "caddy-8f549e6df151",
@@ -1008,8 +965,7 @@
       "query_source": "commit-message",
       "repo": "caddy",
       "tags": [
-        "keyword",
-        "names-symbol"
+        "keyword"
       ]
     },
     {
@@ -1068,7 +1024,7 @@
           "path": "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go"
         },
         {
-          "name": "DialError",
+          "name": "NewDialError",
           "path": "modules/caddyhttp/reverseproxy/reverseproxy.go"
         }
       ],
@@ -1077,8 +1033,7 @@
       "query_source": "commit-message",
       "repo": "caddy",
       "tags": [
-        "keyword",
-        "names-symbol"
+        "keyword"
       ]
     },
     {
@@ -1095,7 +1050,7 @@
           "path": "cmd/commandfuncs.go"
         },
         {
-          "name": "BufferedLog",
+          "name": "UnbufferDefaultLogger",
           "path": "logging.go"
         }
       ],
@@ -1143,7 +1098,7 @@
           "path": "src/black/linegen.py"
         },
         {
-          "name": "can_be_split",
+          "name": "_is_annotated_assignment",
           "path": "src/black/lines.py"
         },
         {
@@ -1215,7 +1170,7 @@
       ],
       "gold_symbols": [
         {
-          "name": "_TopLevelStatementsVisitor",
+          "name": "_NodeReplacements",
           "path": "src/black/ranges.py"
         },
         {
@@ -1291,7 +1246,7 @@
       ],
       "gold_symbols": [
         {
-          "name": "_is_parenthesized_lambda_or_ternary",
+          "name": "_has_redundant_generator_parentheses",
           "path": "src/black/linegen.py"
         },
         {
@@ -1486,11 +1441,11 @@
       ],
       "gold_symbols": [
         {
-          "name": "best_effort_relative_path",
+          "name": "_collapse_parent_dirs",
           "path": "src/black/files.py"
         },
         {
-          "name": "resolves_outside_root_or_cannot_stat",
+          "name": "best_effort_relative_path",
           "path": "src/black/files.py"
         }
       ],
@@ -1631,10 +1586,6 @@
         "src/black/ranges.py"
       ],
       "gold_symbols": [
-        {
-          "name": "f",
-          "path": "src/black/__init__.py"
-        },
         {
           "name": "_calculate_lines_mappings",
           "path": "src/black/ranges.py"

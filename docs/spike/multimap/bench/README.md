@@ -32,14 +32,26 @@ cargo xtask bench mine \
 
 A commit qualifies when it is not a merge or a revert; its subject has at least four
 words and is not a formatting, lint or typo fix; its subject or body contains `fix`,
-`fixes`, `fixed`, `fixing`, `bug`, `bugfix` or `regression`; and it modifies one to
+`fixes`, `fixed`, `fixing`, `bug`, `bugfix` or `regression` as a word (anywhere in the
+body, so a `Fixes #n` trailer counts and so does "add regression tests"); and it modifies one to
 three non-test source files (supported extension, not vendored or generated) and adds,
 deletes or renames none. Duplicate query text is dropped. The skip counts per reason are
 in each repository's `skipped` block; most skipped commits are not fixes.
 
 Tags: 42 `keyword` and 18 `keyword-agnostic` tasks (the query names a gold file stem or
-has an identifier shape, or not), 17 `names-symbol` (the query names a gold symbol). One
-task has no gold symbol (its hunk headers name no single declaration).
+has an identifier shape, or not), 14 `names-symbol` (the query names a gold symbol).
+121 gold symbols in all; three tasks have none.
+
+Gold symbols are approximate by construction. Per hunk of `git diff -U0 base fix`: the
+declaration on the first changed code line if there is one (a changed signature, a new
+function); otherwise, when that line is indented (a change inside a body), the name in
+git's funcname hunk header, which is the nearest declaration above the hunk; hunks that
+change only comments or blank lines, hunks whose first code line is top-level code that
+is not a declaration, and names under three characters give none. A first version that
+took every hunk header was checked against the commits by the independent review and
+named the preceding declaration for doc-comment, appended-code and attribute changes;
+the rules above replace it (before any result used the set). Level B scores symbols only
+as a labelled proxy; level C scores files.
 
 ## Using it
 

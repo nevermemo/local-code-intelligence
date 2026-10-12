@@ -119,6 +119,7 @@ pub fn is_test_path(path: &str) -> bool {
         || name.ends_with("_test.py")
         || name.starts_with("test_")
         || name == "tests.rs"
+        || name == "test.rs"
         || name == "conftest.py"
 }
 
@@ -160,7 +161,7 @@ pub enum Skip {
 impl Skip {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Merge => "merge commit",
+            Self::Merge => "merge or root commit",
             Self::Revert => "revert",
             Self::ShortSubject => "subject under 4 words",
             Self::Noise => "formatting, lint or typo fix",
@@ -264,15 +265,20 @@ fn after_keyword<'a>(header: &'a str, keyword: &str) -> Option<&'a str> {
 pub fn header_symbol(extension: &str, header: &str) -> Option<String> {
     let header = header.trim();
     match extension {
-        "rs" => [
-            "fn", "struct", "enum", "trait", "union", "type", "const", "static",
-        ]
-        .iter()
-        .filter_map(|keyword| {
-            after_keyword(header, keyword).map(|rest| (header.len() - rest.len(), rest))
-        })
-        .min_by_key(|(position, _)| *position)
-        .and_then(|(_, rest)| identifier(rest.trim_start_matches("mut ").trim_start())),
+        // `fn` first: `pub const fn new()` is the function `new`.
+        "rs" => after_keyword(header, "fn")
+            .or_else(|| {
+                [
+                    "struct", "enum", "trait", "union", "type", "const", "static",
+                ]
+                .iter()
+                .filter_map(|keyword| {
+                    after_keyword(header, keyword).map(|rest| (header.len() - rest.len(), rest))
+                })
+                .min_by_key(|(position, _)| *position)
+                .map(|(_, rest)| rest)
+            })
+            .and_then(|rest| identifier(rest.trim_start_matches("mut ").trim_start())),
         "go" => {
             if let Some(rest) = after_keyword(header, "func") {
                 let rest = if rest.starts_with('(') {
@@ -294,25 +300,81 @@ pub fn header_symbol(extension: &str, header: &str) -> Option<String> {
     }
 }
 
-/// Gold symbols per file from `git diff -U0` output written with
-/// [`DIFF_ATTRIBUTES`]: `path -> names`, only for paths in `gold_files`.
+/// Whether a changed line is blank or only a comment.
+fn is_comment_or_blank(extension: &str, line: &str) -> bool {
+    let line = line.trim();
+    line.is_empty()
+        || match extension {
+            "py" => line.starts_with('#'),
+            _ => line.starts_with("//") || line.starts_with("/*") || line.starts_with('*'),
+        }
+}
+
+/// The gold symbol of one hunk, from its header and its changed lines.
+///
+/// git's funcname header is the nearest declaration line *above* the hunk in
+/// the old file, which is not always the declaration the hunk changes:
+///
+/// - a hunk whose first changed line is itself a declaration (a changed
+///   signature, a new function) names that declaration;
+/// - a hunk that changes only comments or blank lines (a doc comment above
+///   the next declaration) names nothing;
+/// - a hunk whose first code line is not indented changes top-level code
+///   after a declaration (a new `var`, an attribute, a closing brace) and
+///   names nothing;
+/// - otherwise the change is inside a body and the header names it.
+///
+/// Names shorter than [`MIN_SYMBOL_CHARS`] (closures like `f`) are dropped.
+pub fn hunk_symbol(extension: &str, header: &str, changed: &[&str]) -> Option<String> {
+    let code: Vec<&str> = changed
+        .iter()
+        .copied()
+        .filter(|line| !is_comment_or_blank(extension, line))
+        .collect();
+    let first = code.first()?;
+    let name = match header_symbol(extension, first) {
+        Some(name) => Some(name),
+        None if !first.starts_with([' ', '\t']) => None,
+        None => header_symbol(extension, header),
+    }?;
+    (name.chars().count() >= MIN_SYMBOL_CHARS).then_some(name)
+}
+
+/// Gold symbols per file from `git diff -U0 --src-prefix=a/ --dst-prefix=b/`
+/// output written with [`DIFF_ATTRIBUTES`]: `path -> names`, only for paths
+/// in `gold_files`.
 pub fn hunk_symbols(diff: &str, gold_files: &[String]) -> BTreeMap<String, BTreeSet<String>> {
     let mut symbols: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // (path, header, changed lines) of the hunk being read.
+    let mut hunk: Option<(&String, &str, Vec<&str>)> = None;
     let mut current: Option<&String> = None;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.strip_prefix("b/").unwrap_or(rest);
-            current = gold_files.iter().find(|gold| gold.as_str() == path);
-        } else if let (Some(path), Some(rest)) = (current, line.strip_prefix("@@ ")) {
-            let Some((_, header)) = rest.split_once(" @@") else {
-                continue;
-            };
+    let mut finish = |hunk: Option<(&String, &str, Vec<&str>)>| {
+        if let Some((path, header, changed)) = hunk {
             let extension = path.rsplit_once('.').map_or("", |(_, ext)| ext);
-            if let Some(name) = header_symbol(extension, header) {
+            if let Some(name) = hunk_symbol(extension, header, &changed) {
                 symbols.entry(path.clone()).or_default().insert(name);
             }
         }
+    };
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            finish(hunk.take());
+            current = None;
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            let path = rest.strip_prefix("b/").unwrap_or(rest);
+            current = gold_files.iter().find(|gold| gold.as_str() == path);
+        } else if let Some(rest) = line.strip_prefix("@@ ") {
+            finish(hunk.take());
+            if let (Some(path), Some((_, header))) = (current, rest.split_once(" @@")) {
+                hunk = Some((path, header, Vec::new()));
+            }
+        } else if let Some((_, _, changed)) = hunk.as_mut()
+            && (line.starts_with('+') || line.starts_with('-'))
+        {
+            changed.push(&line[1..]);
+        }
     }
+    finish(hunk.take());
     symbols
 }
 
@@ -401,6 +463,8 @@ fn mine_repo(source: &Source, max: usize, attributes: &Path) -> Result<Value> {
             "-U0",
             "--no-color",
             "--no-ext-diff",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             candidate.base.as_str(),
             candidate.hash.as_str(),
             "--",
@@ -480,7 +544,7 @@ pub fn run(sources: Vec<Source>, max: usize, version: &str, out: &Path) -> Resul
             "only_modified_source_files": true,
             "skip": ["merge commits", "reverts", "formatting, lint or typo fixes", "duplicate query text"],
             "query": "commit subject plus the first body paragraph when it adds 3 or more words, at most 300 characters",
-            "gold_symbols": "names from git's built-in rust/golang/python diff driver hunk headers of git diff -U0 base..fix",
+            "gold_symbols": "per hunk of git diff -U0 base..fix: the declaration on the first changed code line, else (indented change) the name in git's built-in rust/golang/python funcname hunk header; comment-only and top-level non-declaration hunks and names under 3 characters give none",
         },
         "repos": repos,
         "tasks": tasks,
@@ -670,7 +734,7 @@ mod tests {
     #[test]
     fn hunk_symbols_reads_only_gold_files() {
         let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
-                    @@ -10 +10 @@ fn first() {\n-x\n+y\n@@ -20,0 +21 @@ impl Foo {\n+z\n\
+                    @@ -10 +10 @@ fn first() {\n-    x\n+    y\n@@ -20,0 +21 @@ impl Foo {\n+z\n\
                     diff --git a/tests/t.rs b/tests/t.rs\n--- a/tests/t.rs\n+++ b/tests/t.rs\n\
                     @@ -1 +1 @@ fn in_test() {\n";
         let symbols = hunk_symbols(diff, &["src/a.rs".to_owned()]);
@@ -679,6 +743,72 @@ mod tests {
             symbols["src/a.rs"].iter().collect::<Vec<_>>(),
             vec!["first"]
         );
+    }
+
+    #[test]
+    fn hunk_symbol_names_the_declaration_the_hunk_changes() {
+        let cases: [(&str, &str, &[&str], Option<&str>); 10] = [
+            // A change inside a body: the header names it.
+            (
+                "rs",
+                "fn poll(&mut self) {",
+                &["        self.ready = true;"],
+                Some("poll"),
+            ),
+            // A changed signature: the changed line names it, not the
+            // declaration above.
+            (
+                "rs",
+                "fn above() {",
+                &["pub fn changed(x: u32) -> u32 {"],
+                Some("changed"),
+            ),
+            // A doc comment above the next declaration names nothing.
+            (
+                "rs",
+                "fn above() {",
+                &["/// Fix the doc.", "/// More."],
+                None,
+            ),
+            // A new top-level `var` after a function names nothing.
+            ("go", "func above() {", &["var httpsPort = 443"], None),
+            // A function appended after another names itself.
+            (
+                "go",
+                "func above() {",
+                &["", "func HandlerDone() {"],
+                Some("HandlerDone"),
+            ),
+            // A comment line and then indented code: the header.
+            (
+                "go",
+                "func (s *Server) Serve() error {",
+                &["\t// why", "\treturn nil"],
+                Some("Serve"),
+            ),
+            // A closure too short to look up.
+            ("py", "    def f(x):", &["        return x"], None),
+            (
+                "py",
+                "def format_str(src):",
+                &["    return src.strip()"],
+                Some("format_str"),
+            ),
+            ("py", "def above():", &["# comment only"], None),
+            (
+                "rs",
+                "pub const fn new() -> Self {",
+                &["        Self { a: 1 }"],
+                Some("new"),
+            ),
+        ];
+        for (extension, header, changed, expected) in cases {
+            assert_eq!(
+                hunk_symbol(extension, header, changed).as_deref(),
+                expected,
+                "{header} / {changed:?}"
+            );
+        }
     }
 
     #[test]
