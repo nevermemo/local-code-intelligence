@@ -195,7 +195,10 @@ fn decode_source(bytes: Vec<u8>) -> (String, bool) {
         Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
     };
     (
-        source.strip_prefix('\u{feff}').unwrap_or(&source).to_owned(),
+        source
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&source)
+            .to_owned(),
         lossy,
     )
 }
@@ -459,11 +462,7 @@ mod tests {
         let with_bom = tempfile::tempdir().unwrap();
         for (path, source) in fixtures {
             std::fs::write(without_bom.path().join(path), source).unwrap();
-            std::fs::write(
-                with_bom.path().join(path),
-                format!("\u{feff}{source}"),
-            )
-            .unwrap();
+            std::fs::write(with_bom.path().join(path), format!("\u{feff}{source}")).unwrap();
         }
 
         let without_bom = scan_incremental(without_bom.path(), &HashMap::new()).unwrap();
@@ -491,19 +490,17 @@ mod tests {
             with_bom.chunks,
             without_bom.chunks
         );
-        assert!(
-            with_bom
-                .chunks
-                .iter()
-                .all(|chunk| chunk.code != "\u{feff}")
-        );
+        assert!(with_bom.chunks.iter().all(|chunk| chunk.code != "\u{feff}"));
         let differing_source_hashes: Vec<_> = fixtures
             .iter()
             .filter_map(|(path, _)| {
                 let with_bom_hash = &with_bom.files[*path].content_hash;
                 let without_bom_hash = &without_bom.files[*path].content_hash;
-                (with_bom_hash != without_bom_hash)
-                    .then_some((*path, with_bom_hash, without_bom_hash))
+                (with_bom_hash != without_bom_hash).then_some((
+                    *path,
+                    with_bom_hash,
+                    without_bom_hash,
+                ))
             })
             .collect();
         assert!(
