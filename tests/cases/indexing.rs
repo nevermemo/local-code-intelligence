@@ -1,5 +1,58 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_backslashes_preserve_indexed_names_and_result_paths() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("backslash-paths");
+    let names = [r"a\b.rs", "a/b.rs", r"\tmp\x.rs"];
+    for (name, source) in names.iter().zip([
+        "fn backslash_name() {}\n",
+        "fn nested_name() {}\n",
+        "fn leading_backslash() {}\n",
+    ]) {
+        write(&workspace, name, source);
+    }
+    // A temp directory can be a symlink (macOS); results carry the canonical path.
+    let workspace = std::fs::canonicalize(&workspace).unwrap();
+    let app = App::open(config.clone()).await.unwrap();
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, names.len(), "distinct file names collided");
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    let indexed_names: std::collections::HashSet<_> = indexed
+        .files
+        .iter()
+        .map(|file| file.relative_file_path.as_str())
+        .collect();
+    assert_eq!(
+        indexed_names,
+        names.into_iter().collect::<std::collections::HashSet<_>>()
+    );
+
+    let found = app.search(&workspace, "file names", Some(8)).await.unwrap();
+    assert_eq!(found.results.len(), names.len());
+    for hit in &found.results {
+        let relative = &hit.chunk.relative_file_path;
+        assert!(names.contains(&relative.as_str()));
+        let path = Path::new(&hit.file_path);
+        assert!(path.starts_with(&workspace), "result left the workspace");
+        assert_eq!(path, workspace.join(relative));
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains(&hit.chunk.code)
+        );
+    }
+
+    drop(app);
+    let reopened = App::open(config).await.unwrap();
+    let reused = reopened.index(&workspace).await.unwrap();
+    assert_eq!(reused.files, names.len());
+    assert_eq!(reused.parsed_files, 0);
+    assert_eq!(reused.unchanged_files, names.len());
+    task.abort();
+}
+
 #[tokio::test]
 async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings() {
     let (temp, config, fake, task) = fixture().await;
