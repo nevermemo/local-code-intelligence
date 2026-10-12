@@ -72,9 +72,11 @@ fn assert_hook_matches_chunker(root: &Path) -> (usize, usize) {
         let path = &file.relative_path;
         let today = chunks_with_adapter(path, &file.source, file.adapter).unwrap();
         let hooked = extract_with_adapter(path, &file.source, file.adapter).unwrap();
+        // JSON text: byte identity of every field and of the order, with a
+        // readable difference on failure.
         assert_eq!(
-            serde_json::to_vec(&hooked.chunks).unwrap(),
-            serde_json::to_vec(&today).unwrap(),
+            serde_json::to_string(&hooked.chunks).unwrap(),
+            serde_json::to_string(&today).unwrap(),
             "{path}: the hook's chunks differ from chunks_with_adapter's"
         );
         let declarations =
@@ -94,9 +96,26 @@ fn hook_chunks_are_byte_identical_on_a_tree_of_every_language() {
     let temp = tempfile::tempdir().unwrap();
     write_multilanguage_tree(temp.path());
     let (files, chunks) = assert_hook_matches_chunker(temp.path());
-    // Every registered extension is in the tree, so a language the walker
-    // skipped would show up here.
-    assert_eq!(files, 12);
+    // One file per registered adapter, and every adapter is some file's:
+    // a language added later without a file here fails this test.
+    assert_eq!(files, language::ADAPTERS.len());
+    // (`ADAPTERS` is a `const`, so adapters are compared by identity
+    // fields, not by address.)
+    let identity =
+        |adapter: &language::LanguageAdapter| (adapter.identifier(), adapter.cache_version());
+    let mut registered: Vec<_> = language::ADAPTERS.iter().map(identity).collect();
+    let mut walked: Vec<_> = sources(temp.path())
+        .unwrap()
+        .files
+        .iter()
+        .map(|file| identity(file.adapter))
+        .collect();
+    registered.sort();
+    walked.sort();
+    assert_eq!(
+        walked, registered,
+        "one fixture file per registered adapter"
+    );
     assert!(chunks >= 24, "{chunks} chunks");
     let declared = extract_for_path(
         "src/lib.rs",
@@ -117,7 +136,10 @@ fn hook_chunks_are_byte_identical_on_a_tree_of_every_language() {
 #[test]
 fn hook_chunks_are_byte_identical_on_this_repository() {
     // The workspace root (lci-core's parent): every tracked Rust and Python
-    // file of this repository, walked as a scan walks it.
+    // file of this repository, walked as a scan walks it. Both chunkers run
+    // the test-only uncovered-bytes check, so a new file that exposes a
+    // chunker coverage gap fails here with "uncovered byte" even though the
+    // hook and the chunker still agree: fix the chunker, not this test.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let (files, chunks) = assert_hook_matches_chunker(root);
     assert!(files >= 100, "{files} files");
@@ -132,6 +154,7 @@ fn hook_keeps_the_scan_order_of_chunks() {
     let temp = tempfile::tempdir().unwrap();
     write_multilanguage_tree(temp.path());
     let scanned = scan(temp.path()).unwrap();
+    assert!(!scanned.is_empty());
     let mut hooked: Vec<Chunk> = Vec::new();
     for file in sources(temp.path()).unwrap().files {
         hooked.extend(
@@ -144,7 +167,7 @@ fn hook_keeps_the_scan_order_of_chunks() {
         (&a.relative_file_path, a.start_line).cmp(&(&b.relative_file_path, b.start_line))
     });
     assert_eq!(
-        serde_json::to_vec(&hooked).unwrap(),
-        serde_json::to_vec(&scanned).unwrap()
+        serde_json::to_string(&hooked).unwrap(),
+        serde_json::to_string(&scanned).unwrap()
     );
 }
