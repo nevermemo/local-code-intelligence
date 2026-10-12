@@ -49,17 +49,17 @@ to a client.
 // lci-core/src/node.rs (proposed; S1)
 pub enum NodeId {
     File { path: RelPath },
-    Chunk { path: RelPath, content_hash: Hash, ordinal: u16 },
+    Chunk { path: RelPath, content_hash: Hash, ordinal: u32 },  // S1: u32, see section 7
     Symbol(SymbolKey),
     Commit { sha: GitSha },             // full 40-hex (or 64-hex) object id
     Test { runner: TestRunner, name: String },
     ConfigKey { namespace: ConfigNamespace, key: String },
-    DocSection { path: RelPath, heading_path: Vec<Slug>, ordinal: u16 },
+    DocSection { path: RelPath, heading_path: Vec<Slug>, ordinal: u32 },
     StringLiteral { text_hash: Hash },
 }
 
 pub struct SymbolKey {
-    pub language: &'static str,          // LanguageAdapter::identifier()
+    pub language: String,                // LanguageAdapter::identifier(); S1: owned, parse needs it
     pub module_path: Vec<String>,        // derived from the file path at load, never stored in a bundle
     pub container: Vec<ContainerSegment>,// e.g. impl header `impl Map for LexicalMap`, trait, class
     pub name: String,
@@ -81,9 +81,15 @@ Canonical strings (all scoped by the workspace id, which is not part of the stri
 | DocSection | `doc:<path>#<slug>/<slug>[~<n>]` | `doc:AGENTS.md#hard-rules` |
 | StringLiteral | `str:<text_hash>` | `str:41ab...` (SHA-256 of the literal's normalised text) |
 
-Percent-encoding applies to `@`, `#`, `~`, `/` inside a segment (not inside a path) so that
-the string parses back unambiguously. `content_hash` is the full 64-hex value in the canonical
-form; displays may shorten it.
+Percent-encoding (upper-case `%XX` per UTF-8 byte) applies to `%` and control characters
+everywhere; to `@`, `#` and `~` inside a path (a path may contain them; `/` stays as
+written); to `@`, `#`, `~`, `/` and `:` inside a segment (hash, slug, container segment);
+and additionally to a space inside a module segment or a symbol name. A container segment
+always holds a space (`impl App`, `trait Map`) and a module segment never does, which is how
+the parser tells them apart in `sym:` strings. Parsing accepts only canonical strings: a
+string that parses but formats differently (`%41`, `#01`, `~0`) is refused. `content_hash`
+is the full stored value in the canonical form; displays may shorten it. (S1: the v0 text
+said no encoding inside a path, which made `chunk:a@b.rs@<hash>#0` ambiguous.)
 
 ### 3.2 Per-kind rules
 
@@ -182,6 +188,7 @@ Invariants (each is a test, see section 6):
 | N-6 | File rename = new id plus a `renamed_from` edge. | A rename-stable file id (first-seen path plus git rename chain). Rejected for MVP: needs runtime git for every File node. | W3 (history maps). |
 | N-7 | Path normalisation follows the scanner, whatever the merged fix branch does with backslashes. | Normalise NodeId paths separately. Rejected: two path conventions would break joins. | S1 merge of the fix branch. |
 | N-8 | Module path for non-Rust languages = file path without extension. | Per-language module resolution (package for Java/Go, dotted module for Python). | When each language's symbol map lands. |
+| N-9 | (S1) Rust module path = the components after the last `src` directory, without a final `lib`, `main` or `mod`, prefixed with the crate's directory when the crate is not at the repository root (`lci-core/src/chunk.rs` -> `lci-core::chunk`). Without the prefix two crates' `chunk` modules collide. | Resolve the crate name from `Cargo.toml` (`lci_core::chunk`); follow `#[path]` attributes. | When `sym.defs` lands (S3). |
 
 ## 5. What this spec does not decide
 
@@ -204,3 +211,45 @@ none exists yet.
 | Symbol key and impl header | Fixture with `impl A for X { fn f() }` and `impl B for X { fn f() }`: two distinct Symbol NodeIds (lesson L1); dropping the impl header from the key would make them collide, which the test asserts against a deliberately reduced key. |
 | No paths in bundles | Serialise a bundle for a file, move the file, rescan: the bundle is reused unchanged (same key) and the joined NodeIds use the new path. |
 | Legacy mapping | Within one snapshot, every legacy fusion key maps to exactly one Chunk NodeId, except the N-5 case, which the test enumerates and reports. |
+
+## 7. S1 as built (2026-10-12)
+
+Code: `lci-core/src/node.rs` (types, canonical strings, `chunk_ids`, `legacy_fusion_key`),
+`lci-core/src/node/rust.rs` (a declaration-only Rust extractor for symbol keys), tests in
+`lci-core/src/node/tests.rs`, and the history tool `lci-core/examples/node_stability.rs`
+with its result in [../s1-stability.md](../s1-stability.md). Nothing on the search path
+uses it; the manifest is unchanged (`VERSION = 2`). The only change to existing code is that
+`chunk::decode_source` became `pub` for the history tool. Line references re-checked on
+`origin/fix/verified-bugs` at `66f999d`: `Chunk` `lci-core/src/chunk.rs:43`,
+`chunks_with_adapter` `:159` (hash at `:186`), `scan_incremental` `:312` (reuse check
+`:344`), fusion key `src/app/search.rs:1314`, `fusion_order` `:337`.
+
+Deviations from sections 3 and 6, each taken as the conservative choice:
+
+- Ordinals are `u32`, not `u16`: a generated file can hold more than 65535 equal chunks,
+  and an overflow would make two chunks share an id.
+- Paths and hashes are plain strings. Chunk hashes are not checked to be hex, because the
+  stored value is the identity whatever it is (unit fixtures use readable hashes); commit
+  ids and literal hashes are checked (40 or 64, and 64, lower-case hex).
+- "Source order" for ordinals is `start_line`, then `end_line`, then the position in the
+  given list (byte order for a scan or a manifest file), so `chunk_ids` gives the same ids
+  for any input order of chunks except two same-hash chunks on the same lines.
+- Symbol keys in S1 come from a minimal Rust extractor: functions, methods, structs,
+  enums, unions, traits, consts, statics, type aliases, macros and modules (inline modules
+  join the module path); impl headers are kept as written up to the body, whitespace
+  collapsed, generics and `where` clauses included; items inside function bodies are not
+  walked. The per-file bundle that stores them is S3.
+- Kinds' string names: `fn`, `method`, `struct`, `enum`, `union`, `trait`, `const`,
+  `static`, `type`, `mod`, `macro`.
+- Canonical form of a symbol: `sym:<lang>:<modules and containers joined by ::>::<name>/<kind>[~<n>]`,
+  exactly the shape of the section 3.1 example; see the encoding paragraph there for how
+  module and container segments are told apart.
+- `NodeId` orders by canonical string (`Ord`), as the tie rule for non-chunk nodes needs.
+
+Test status per row of section 6: round trip, line independence, determinism, incremental
+equals full (edit, insert above, rename, duplicate chunk, adapter version bump, delete),
+locality, ordinal rule, symbol key and impl header, and legacy mapping are unit tests in
+`lci-core/src/node/tests.rs`. "No paths in bundles" is covered only for its path-free half
+(declarations hold no path, a moved file's keys join the new path); the bundle store and its
+reuse are deferred to S3. Decision N-5 measured: no same-line twins in any of 201 snapshots of
+this repository (s1-stability.md).

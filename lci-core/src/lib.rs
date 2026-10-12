@@ -6,4 +6,5 @@ pub mod lexical;
 pub mod lsp;
 pub mod manifest;
 pub mod models;
+pub mod node;
 pub mod workspace;
