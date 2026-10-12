@@ -1,5 +1,7 @@
 # Maps inventory
 
+Idea catalogue and status: [ideas.md](ideas.md)
+
 Generated: 2026-10-12T04:04Z (`date -u`). Base commit: `7f9c636` (`origin/fix/verified-bugs`).
 Revised: 2026-10-12T06:49Z (fact-check corrections: status column, persistence limits,
 update vocabulary, new rows 3b, 7b and 7c).
