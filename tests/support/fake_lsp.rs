@@ -118,6 +118,8 @@ pub struct FakeLspConfig {
     /// is `sleeper_<N>.txt` in the state directory for the Nth process started,
     /// and its process id is `sleeper_<N>.pid`.
     pub spawn_grandchild: bool,
+    /// Keep running after stdin closes, to model servers that outlive their client.
+    pub keep_alive_on_eof: bool,
     /// Sends the `custom/ready` notification after `initialized` in every
     /// scenario (`--ready-notification`), the way `Initialized` always does:
     /// for an adapter whose readiness predicate matches it.
@@ -260,6 +262,7 @@ pub fn run_from_env() -> io::Result<()> {
         huge_frame_on_symbol_request,
         never_read_stdin: cli.iter().any(|arg| arg == "--never-read-stdin"),
         spawn_grandchild: cli.iter().any(|arg| arg == "--spawn-grandchild"),
+        keep_alive_on_eof: cli.iter().any(|arg| arg == "--keep-alive-on-eof"),
         ready_notification: cli.iter().any(|arg| arg == "--ready-notification"),
         string_id_server_requests: cli.iter().any(|arg| arg == "--string-id-server-requests"),
     };
@@ -372,7 +375,15 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
 
-    while let Some(frame) = read_frame(&mut stdin)? {
+    loop {
+        let Some(frame) = read_frame(&mut stdin)? else {
+            if config.keep_alive_on_eof {
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }
+            break;
+        };
         request_count += 1;
         if let Some(path) = &config.state_dir {
             fs::write(path.join("request_count.txt"), request_count.to_string())?;

@@ -2002,6 +2002,152 @@ fn fake_csharp_release_fixture(
     (config, workspace, state)
 }
 
+#[cfg(unix)]
+struct SigtermServe {
+    child: std::process::Child,
+    language_server_pid_file: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SigtermServe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Ok(pid) = std::fs::read_to_string(&self.language_server_pid_file) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_shuts_down_the_running_language_server() {
+    let (temp, mut config, _models, models_task) = fixture().await;
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/Calculator.cs"), "class Calculator {}\n").unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config.port = listener.local_addr().unwrap().port();
+    drop(listener);
+    config.csharp = CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: vec![
+            "--mode".to_owned(),
+            "workspace-symbols".to_owned(),
+            "--state".to_owned(),
+            temp.path().join("lsp-state").to_string_lossy().into_owned(),
+            "--keep-alive-on-eof".to_owned(),
+        ],
+        disabled: false,
+    };
+    config.lsp_timeout_seconds = 5;
+    let state = temp.path().join("lsp-state");
+    std::fs::write(
+        temp.path().join("serve.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+    command
+        .arg("--config")
+        .arg(temp.path().join("serve.toml"))
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    strip_lci_env(&mut command);
+    let child = command.spawn().unwrap();
+    let mut serve = SigtermServe {
+        child,
+        language_server_pid_file: state.join("pid.txt"),
+    };
+
+    let port = config.port;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut healthy = false;
+    for _ in 0..200 {
+        if serve.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if let Ok(response) = client.get(format!("{base}/health")).send().await
+            && response.status().is_success()
+        {
+            healthy = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(healthy, "serve did not become healthy");
+
+    let indexed = client
+        .post(format!("{base}/v1/index_workspace"))
+        .json(&serde_json::json!({"workspace_path": workspace}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        indexed.status().is_success(),
+        "indexing failed: {}",
+        indexed.text().await.unwrap()
+    );
+    let response = client
+        .post(format!("{base}/v1/search_symbols"))
+        .json(&serde_json::json!({
+            "workspace_path": workspace,
+            "query": "Calculator"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "navigation failed: {}",
+        response.text().await.unwrap()
+    );
+    let pid: u32 = std::fs::read_to_string(&serve.language_server_pid_file)
+        .expect("fake language server wrote its pid")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_is_running(pid).await);
+
+    let signal = tokio::process::Command::new("kill")
+        .args(["-TERM", &serve.child.id().to_string()])
+        .status()
+        .await
+        .unwrap();
+    assert!(signal.success(), "could not send SIGTERM to serve");
+    let server_exited = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if serve.child.try_wait().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process_is_running(pid).await && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let language_server_exited = !process_is_running(pid).await;
+    drop(models_task);
+    assert!(server_exited, "serve did not exit after SIGTERM");
+    assert!(
+        language_server_exited,
+        "language server process {pid} survived SIGTERM"
+    );
+}
+
 /// Checks liveness only while the answer is pending: after it returns, an idle
 /// release is legitimate because the request has outlasted the idle timeout.
 async fn answer_without_idle_release(
