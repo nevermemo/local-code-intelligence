@@ -88,11 +88,14 @@ impl JavaServer {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("org.eclipse.equinox.launcher_") && name.ends_with(".jar")
-                    })
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("org.eclipse.equinox.launcher_")
+                                && name.ends_with(".jar")
+                        })
             })
     }
 
@@ -130,6 +133,23 @@ impl LspAdapter for JavaServer {
 
     fn readiness_component_name(&self) -> &'static str {
         "java_language_server_available"
+    }
+
+    async fn probe_readiness(&self, timeout: Duration) -> Result<()> {
+        let Some(jdtls_dir) = self.config.path.as_deref() else {
+            return Ok(());
+        };
+        let jdtls_dir = PathBuf::from(jdtls_dir);
+        let launcher = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || Self::find_launcher_jar(&jdtls_dir)),
+        )
+        .await
+        .context("timed out finding jdtls launcher jar")??;
+        launcher.context(
+            "jdtls launcher jar not found in the configured installation's plugins directory",
+        )?;
+        Ok(())
     }
 
     fn transport_config(&self, root: &Path) -> Option<TransportConfig> {

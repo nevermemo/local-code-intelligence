@@ -2,8 +2,8 @@
 //! dependency, shared by `/ready` and the `service_status` MCP tool.
 
 use super::App;
-use crate::lexical;
-use anyhow::{Context, Result, anyhow, ensure};
+use crate::{lexical, lsp::adapter::probe_subprocess_version};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::{path::Path, sync::Arc};
 
@@ -112,10 +112,8 @@ impl App {
                 async move {
                     let probe: Result<()> = if !adapter.enabled() {
                         Ok(())
-                    } else if let Some(command) = adapter.configured_command() {
-                        Self::probe_subprocess_version(Path::new(&command), timeout).await
                     } else {
-                        Ok(())
+                        adapter.probe_readiness(timeout).await
                     };
                     (adapter, probe)
                 }
@@ -149,7 +147,7 @@ impl App {
                 "reranker model listing",
                 timeout
             ),
-            Self::probe_subprocess_version(&ripgrep_resolved, timeout),
+            probe_subprocess_version(&ripgrep_resolved, timeout),
             lsp_probes_future,
         );
 
@@ -305,28 +303,6 @@ impl App {
             result.with_context(|| format!("write readiness probe in {}", data_dir.display()))
         })
         .await?
-    }
-
-    async fn probe_subprocess_version(
-        resolved: &std::path::Path,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        let mut command = tokio::process::Command::new(resolved);
-        command.arg("--version");
-        command
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .with_context(|| format!("timed out running {} --version", resolved.display()))?
-            .with_context(|| format!("start {}", resolved.display()))?;
-        ensure!(
-            output.status.success(),
-            "subprocess {} --version failed",
-            resolved.display()
-        );
-        Ok(())
     }
 }
 

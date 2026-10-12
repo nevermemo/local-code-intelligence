@@ -30,7 +30,12 @@ async fn java_readiness_checks_the_launcher_jar_in_the_install_directory() {
 async fn java_readiness_without_a_launcher_jar_is_degraded_but_optional() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     let install = temp.path().join("jdtls");
-    std::fs::create_dir_all(install.join("plugins")).unwrap();
+    std::fs::create_dir_all(
+        install
+            .join("plugins")
+            .join("org.eclipse.equinox.launcher_1.0.0.jar"),
+    )
+    .unwrap();
     config.java.path = Some(install.to_string_lossy().into_owned());
     let app = App::open(config).await.unwrap();
     let status = app.service_status().await;
@@ -41,6 +46,13 @@ async fn java_readiness_without_a_launcher_jar_is_degraded_but_optional() {
         .unwrap();
     assert!(!component.ready);
     assert!(!component.required);
+    assert!(
+        component
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("launcher jar not found")
+    );
     assert!(status.ready);
     assert!(
         status

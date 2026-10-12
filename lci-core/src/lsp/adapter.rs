@@ -5,10 +5,10 @@
 //! by omitting the adapter.
 
 use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 #[async_trait]
 pub trait LspAdapter: Send + Sync {
@@ -23,13 +23,22 @@ pub trait LspAdapter: Send + Sync {
     /// Whether this server is configured and not explicitly disabled.
     fn enabled(&self) -> bool;
 
-    /// The configured executable/command, for readiness detail messages.
+    /// The configured command or installation path, for readiness details.
     /// `None` when nothing is configured (as opposed to disabled).
     fn configured_command(&self) -> Option<String>;
 
     /// The `service_status`/`/ready` readiness component name for this
     /// adapter (e.g. `"rust_analyzer_available"`).
     fn readiness_component_name(&self) -> &'static str;
+
+    /// Probe availability without starting an LSP session. Called only when
+    /// enabled; adapters with an installation path override the version probe.
+    async fn probe_readiness(&self, timeout: Duration) -> Result<()> {
+        if let Some(command) = self.configured_command() {
+            probe_subprocess_version(Path::new(&command), timeout).await?;
+        }
+        Ok(())
+    }
 
     /// Build the transport for spawning this server in `root`. `None` when
     /// disabled or unconfigured; never spawns a process itself.
@@ -83,4 +92,24 @@ pub trait LspAdapter: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Checks a configured executable with a bounded `--version` invocation.
+pub async fn probe_subprocess_version(resolved: &Path, timeout: Duration) -> Result<()> {
+    let mut command = tokio::process::Command::new(resolved);
+    command.arg("--version");
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .with_context(|| format!("timed out running {} --version", resolved.display()))?
+        .with_context(|| format!("start {}", resolved.display()))?;
+    ensure!(
+        output.status.success(),
+        "subprocess {} --version failed",
+        resolved.display()
+    );
+    Ok(())
 }
