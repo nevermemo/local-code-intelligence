@@ -527,7 +527,7 @@ struct IndexResolution<'a> {
 }
 
 fn lookup_lexical_files(file_ids: &HashMap<String, Vec<usize>>, reported: &str) -> Vec<usize> {
-    let reported = reported.replace('\\', "/").to_lowercase();
+    let reported = crate::path::normalize_path_separators(reported).to_lowercase();
     std::iter::once(reported.as_str())
         .chain(
             reported
@@ -1432,7 +1432,11 @@ mod tests {
         filter::SourceRole,
         store::{Hit, source_role_prior},
     };
-    use std::{collections::HashSet, ffi::OsString, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        ffi::OsString,
+        path::PathBuf,
+    };
 
     const RRF_K: f32 = 60.0;
 
@@ -1457,7 +1461,6 @@ mod tests {
         for (reported, expected) in [
             ("src/main.rs", vec![0, 1, 2]),
             ("SrC/MAIN.rs", vec![0, 1, 2]),
-            ("prefix\\src\\MAIN.rs", vec![0, 1, 2]),
             ("prefix/src/main.rs", vec![0, 1, 2]),
             ("main.rs", vec![2]),
             ("other/main.rs", vec![2, 4]),
@@ -1466,7 +1469,7 @@ mod tests {
             ("prefix/src/main.rs.bak", vec![]),
             ("missing.rs", vec![]),
         ] {
-            let normalized = reported.replace('\\', "/").to_lowercase();
+            let normalized = reported.to_lowercase();
             let old: Vec<_> = paths
                 .iter()
                 .enumerate()
@@ -1481,6 +1484,46 @@ mod tests {
             found.sort_unstable();
             assert_eq!(found, old, "{reported}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_path_lookup_keeps_unix_backslashes_in_the_filename() {
+        let file_ids = HashMap::from([
+            (r"a\b.rs".to_owned(), vec![0]),
+            ("a/b.rs".to_owned(), vec![1]),
+        ]);
+
+        assert_eq!(super::lookup_lexical_files(&file_ids, r"a\b.rs"), [0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_match_is_attributed_to_the_indexed_backslash_filename() {
+        let chunks = vec![
+            hit(r"a\b.rs", 1, SourceRole::Source),
+            hit("a/b.rs", 1, SourceRole::Source),
+        ];
+        let results = App::map_lexical_matches(
+            &chunks,
+            crate::lexical::LexicalSearch {
+                terms: vec!["needle".into()],
+                matches: vec![crate::lexical::LexicalMatch {
+                    relative_path: r"a\b.rs".into(),
+                    line: 1,
+                    term_mask: 1,
+                }],
+            },
+            8,
+        );
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.chunk.relative_file_path.as_str())
+                .collect::<Vec<_>>(),
+            [r"a\b.rs"]
+        );
     }
 
     #[test]
