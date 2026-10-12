@@ -526,6 +526,22 @@ struct IndexResolution<'a> {
     warning: Option<String>,
 }
 
+fn lookup_lexical_files(file_ids: &HashMap<String, Vec<usize>>, reported: &str) -> Vec<usize> {
+    let reported = reported.replace('\\', "/").to_lowercase();
+    std::iter::once(reported.as_str())
+        .chain(
+            reported
+                .match_indices('/')
+                .map(|(boundary, _)| &reported[boundary + 1..]),
+        )
+        .flat_map(|path| {
+            #[cfg(test)]
+            tests::LEXICAL_PATH_PROBES.with(|probes| probes.set(probes.get() + 1));
+            file_ids.get(path).into_iter().flatten().copied()
+        })
+        .collect()
+}
+
 impl App {
     pub async fn search(
         &self,
@@ -1141,28 +1157,22 @@ impl App {
         search: lexical::LexicalSearch,
         candidate_count: usize,
     ) -> Vec<Hit> {
-        struct IndexedFile {
-            lowercase_path: String,
-            /// `/` + `lowercase_path`, for suffix matches.
-            path_suffix: String,
-            chunks: Vec<usize>,
-        }
         let mut file_ids = HashMap::<&str, usize>::new();
-        let mut files: Vec<IndexedFile> = Vec::new();
+        let mut lowercase_file_ids = HashMap::<String, Vec<usize>>::new();
+        let mut files: Vec<Vec<usize>> = Vec::new();
         let mut chunk_files = Vec::with_capacity(all_chunks.len());
         for (index, hit) in all_chunks.iter().enumerate() {
             let path = hit.chunk.relative_file_path.as_str();
             let next = files.len();
             let id = *file_ids.entry(path).or_insert(next);
             if id == next {
-                let lowercase_path = path.to_lowercase();
-                files.push(IndexedFile {
-                    path_suffix: format!("/{lowercase_path}"),
-                    lowercase_path,
-                    chunks: Vec::new(),
-                });
+                lowercase_file_ids
+                    .entry(path.to_lowercase())
+                    .or_default()
+                    .push(id);
+                files.push(Vec::new());
             }
-            files[id].chunks.push(index);
+            files[id].push(index);
             chunk_files.push(id);
         }
         let total_files = files.len();
@@ -1173,14 +1183,11 @@ impl App {
             let chunks = match candidates.entry(matched.relative_path) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    let reported = entry.key().replace('\\', "/").to_lowercase();
-                    let mut chunks: Vec<usize> = files
-                        .iter()
-                        .filter(|file| {
-                            reported == file.lowercase_path || reported.ends_with(&file.path_suffix)
-                        })
-                        .flat_map(|file| file.chunks.iter().copied())
-                        .collect();
+                    let mut chunks: Vec<usize> =
+                        lookup_lexical_files(&lowercase_file_ids, entry.key())
+                            .into_iter()
+                            .flat_map(|id| files[id].iter().copied())
+                            .collect();
                     chunks.sort_unstable();
                     entry.insert(chunks)
                 }
@@ -1424,6 +1431,87 @@ mod tests {
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
+
+    thread_local! {
+        pub(super) static LEXICAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn lexical_path_lookup_preserves_the_old_filter_file_set() {
+        let paths = [
+            "src/main.rs",
+            "SRC/MAIN.RS",
+            "main.rs",
+            "ain.rs",
+            "other/main.rs",
+            "src/é.rs",
+        ];
+        let mut file_ids = std::collections::HashMap::<String, Vec<usize>>::new();
+        for (id, path) in paths.iter().enumerate() {
+            file_ids.entry(path.to_lowercase()).or_default().push(id);
+        }
+        for (reported, expected) in [
+            ("src/main.rs", vec![0, 1, 2]),
+            ("SrC/MAIN.rs", vec![0, 1, 2]),
+            ("prefix\\src\\MAIN.rs", vec![0, 1, 2]),
+            ("prefix/src/main.rs", vec![0, 1, 2]),
+            ("main.rs", vec![2]),
+            ("other/main.rs", vec![2, 4]),
+            ("prefix/src/É.rs", vec![5]),
+            ("prefix/notmain.rs", vec![]),
+            ("prefix/src/main.rs.bak", vec![]),
+            ("missing.rs", vec![]),
+        ] {
+            let normalized = reported.replace('\\', "/").to_lowercase();
+            let old: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| {
+                    let path = path.to_lowercase();
+                    normalized == path || normalized.ends_with(&format!("/{path}"))
+                })
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(old, expected, "{reported}");
+            let mut found = super::lookup_lexical_files(&file_ids, reported);
+            found.sort_unstable();
+            assert_eq!(found, old, "{reported}");
+        }
+    }
+
+    #[test]
+    fn lexical_path_lookup_work_is_bounded_by_reported_path_depth() {
+        let all_chunks: Vec<_> = (0..64)
+            .map(|id| hit(&format!("src/file_{id}.rs"), 1, SourceRole::Source))
+            .collect();
+        let matches: Vec<_> = all_chunks[..8]
+            .iter()
+            .map(|hit| crate::lexical::LexicalMatch {
+                relative_path: hit.chunk.relative_file_path.clone(),
+                line: 1,
+                term_mask: 1,
+            })
+            .collect();
+        let probe_limit: usize = matches
+            .iter()
+            .map(|matched| 1 + matched.relative_path.matches('/').count())
+            .sum();
+        LEXICAL_PATH_PROBES.with(|probes| probes.set(0));
+        let hits = App::map_lexical_matches(
+            &all_chunks,
+            crate::lexical::LexicalSearch {
+                terms: vec!["needle".into()],
+                matches,
+            },
+            8,
+        );
+        assert_eq!(hits.len(), 8);
+        let probes = LEXICAL_PATH_PROBES.with(|probes| probes.get());
+        assert!(
+            probes <= probe_limit,
+            "{probes} path probes exceeded the path-depth bound of {probe_limit}"
+        );
+    }
 
     #[test]
     fn a_note_names_top_k_and_the_window_only_when_the_cut_leaves_fewer_results_than_asked() {
