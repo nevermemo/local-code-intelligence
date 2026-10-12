@@ -10,6 +10,8 @@
 //! and checked against `fuse_hits` bit for bit (test T0).
 
 pub mod kit;
+pub mod labels;
+pub mod run_record;
 
 /// Re-exported so a crate that implements [`Map`] needs no direct
 /// dependency on `async-trait`.

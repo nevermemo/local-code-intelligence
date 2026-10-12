@@ -13,6 +13,8 @@
 //! LSP maps in `lci-maps`; moving that code would change the production
 //! path).
 
+mod record;
+
 use super::{App, LspChannel};
 use crate::{
     config::Config,
@@ -605,6 +607,15 @@ pub struct MapFusion {
     pub notes: Vec<String>,
 }
 
+/// What a registry run of the legacy maps ran over, handed to the
+/// callbacks of [`App::with_legacy_run`].
+pub(super) struct LegacySetup<'s, 'a> {
+    pub view: &'s SnapshotView<'a>,
+    pub universe: &'s [Hit],
+    pub snapshot: &'s Snapshot,
+    pub workspace: &'s Workspace,
+}
+
 impl App {
     /// Spike slice S2, for tests only: the fused pool of `query` over the
     /// workspace's current snapshot (no filter), computed by the map
@@ -617,6 +628,20 @@ impl App {
         path: &std::path::Path,
         query: &str,
     ) -> anyhow::Result<MapFusion> {
+        self.with_legacy_run(path, query, |_| (), |(), setup, run| map_fusion(setup, run))
+            .await
+    }
+
+    /// Runs the legacy maps through the registry as
+    /// [`Self::fuse_through_maps`] describes, calling `before` once the
+    /// snapshot and its universe are resolved and `after` with the run.
+    pub(super) async fn with_legacy_run<B, T>(
+        &self,
+        path: &std::path::Path,
+        query: &str,
+        before: impl FnOnce(&LegacySetup<'_, '_>) -> B,
+        after: impl FnOnce(B, &LegacySetup<'_, '_>, &lci_maps::Run) -> T,
+    ) -> anyhow::Result<T> {
         use anyhow::Context;
         let filters = EffectiveFilter::from_request(&crate::filter::FilterRequest::default())?;
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
@@ -663,31 +688,46 @@ impl App {
                 descriptor: source_role_descriptor(),
             }),
         );
-        let run = registry
-            .run(Some(query), Duration::from_secs(600), &view)
-            .await;
-        let rows = run
-            .fused
-            .iter()
-            .map(|fused| {
-                let chunk = view.chunk(&fused.node).expect("fused nodes are chunks");
-                MapFusionRow {
-                    node: fused.node.to_string(),
-                    relative_file_path: chunk.relative_file_path.clone(),
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    fusion_score: fused.score,
-                }
-            })
-            .collect();
-        Ok(MapFusion {
-            rows,
-            warnings: run
-                .warnings()
-                .into_iter()
-                .map(|(_, w)| w.to_owned())
-                .collect(),
-            notes: run.notes().into_iter().map(|(_, n)| n.to_owned()).collect(),
+        let setup = LegacySetup {
+            view: &view,
+            universe: &universe,
+            snapshot: &snapshot,
+            workspace: &workspace,
+        };
+        let prepared = before(&setup);
+        let run = registry.run(Some(query), LEGACY_RUN_BUDGET, &view).await;
+        Ok(after(prepared, &setup, &run))
+    }
+}
+
+/// Each map's budget in a registry run of the legacy maps.
+pub(super) const LEGACY_RUN_BUDGET: Duration = Duration::from_secs(600);
+
+fn map_fusion(setup: &LegacySetup<'_, '_>, run: &lci_maps::Run) -> MapFusion {
+    let rows = run
+        .fused
+        .iter()
+        .map(|fused| {
+            let chunk = setup
+                .view
+                .chunk(&fused.node)
+                .expect("fused nodes are chunks");
+            MapFusionRow {
+                node: fused.node.to_string(),
+                relative_file_path: chunk.relative_file_path.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                fusion_score: fused.score,
+            }
         })
+        .collect();
+    MapFusion {
+        rows,
+        warnings: run
+            .warnings()
+            .into_iter()
+            .map(|(_, w)| w.to_owned())
+            .collect(),
+        notes: run.notes().into_iter().map(|(_, n)| n.to_owned()).collect(),
     }
 }
