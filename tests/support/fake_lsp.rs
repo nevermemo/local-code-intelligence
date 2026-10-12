@@ -112,6 +112,7 @@ pub struct FakeLspConfig {
     /// is `sleeper_<N>.txt` in the state directory for the Nth process started,
     /// and its process id is `sleeper_<N>.pid`.
     pub spawn_grandchild: bool,
+    /// Keep running after stdin closes, to model servers that outlive their client.
     pub keep_alive_on_eof: bool,
     /// Sends the `custom/ready` notification after `initialized` in every
     /// scenario (`--ready-notification`), the way `Initialized` always does:

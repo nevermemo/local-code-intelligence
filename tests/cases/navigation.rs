@@ -2016,6 +2016,8 @@ impl Drop for SigtermServe {
         if let Ok(pid) = std::fs::read_to_string(&self.language_server_pid_file) {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", pid.trim()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
     }
@@ -2045,7 +2047,11 @@ async fn sigterm_shuts_down_the_running_language_server() {
     };
     config.lsp_timeout_seconds = 5;
     let state = temp.path().join("lsp-state");
-    std::fs::write(temp.path().join("serve.toml"), toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(
+        temp.path().join("serve.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
 
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
     command

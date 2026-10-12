@@ -23,14 +23,20 @@ use std::{
     time::Duration,
 };
 
-async fn cancel_on_signal<F>(
-    signal: F,
-    cancellation: tokio_util::sync::CancellationToken,
-) where
+async fn cancel_on_signal<F>(signal: F, cancellation: tokio_util::sync::CancellationToken) -> bool
+where
     F: Future<Output = std::io::Result<()>>,
 {
-    let _ = signal.await;
-    cancellation.cancel();
+    match signal.await {
+        Ok(()) => {
+            cancellation.cancel();
+            true
+        }
+        Err(error) => {
+            tracing::error!(%error, "shutdown signal wait failed; continuing to serve");
+            false
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -836,7 +842,32 @@ async fn main() -> Result<()> {
             }
             let served = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
-                    cancel_on_signal(tokio::signal::ctrl_c(), cancellation).await;
+                    let ctrl_c = async {
+                        if !cancel_on_signal(tokio::signal::ctrl_c(), cancellation.clone()).await {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    #[cfg(unix)]
+                    let terminate = async {
+                        let signal = async {
+                            let mut terminate = tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::terminate(),
+                            )?;
+                            terminate.recv().await.ok_or_else(|| {
+                                std::io::Error::other("SIGTERM signal stream closed")
+                            })
+                        };
+                        if !cancel_on_signal(signal, cancellation.clone()).await {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    #[cfg(unix)]
+                    tokio::select! {
+                        () = ctrl_c => {}
+                        () = terminate => {}
+                    }
+                    #[cfg(not(unix))]
+                    ctrl_c.await;
                 })
                 .await;
             // The server has stopped, gracefully (Ctrl+C) or not: stop the
@@ -882,7 +913,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let signal = std::future::ready(Err(std::io::Error::other("registration failed")));
 
-        cancel_on_signal(signal, cancellation.clone()).await;
+        assert!(!cancel_on_signal(signal, cancellation.clone()).await);
 
         assert!(!cancellation.is_cancelled());
     }
@@ -892,7 +923,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let signal = std::future::ready(Ok(()));
 
-        cancel_on_signal(signal, cancellation.clone()).await;
+        assert!(cancel_on_signal(signal, cancellation.clone()).await);
 
         assert!(cancellation.is_cancelled());
     }
