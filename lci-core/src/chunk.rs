@@ -206,7 +206,7 @@ struct SourceFile {
 /// Line structure is preserved, so line ranges stay valid. One leading byte
 /// order mark (U+FEFF) is dropped: it is not text, `trim()` keeps it, and it
 /// would otherwise sit in the first chunk's code and in the file's hash.
-fn decode_source(bytes: Vec<u8>) -> (String, bool) {
+pub fn decode_source(bytes: Vec<u8>) -> (String, bool) {
     let (mut source, lossy) = match String::from_utf8(bytes) {
         Ok(source) => (source, false),
         Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
