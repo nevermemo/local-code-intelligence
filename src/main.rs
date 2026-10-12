@@ -16,11 +16,22 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
+    future::Future,
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+
+async fn cancel_on_signal<F>(
+    signal: F,
+    cancellation: tokio_util::sync::CancellationToken,
+) where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let _ = signal.await;
+    cancellation.cancel();
+}
 
 #[derive(Parser)]
 #[command(
@@ -825,8 +836,7 @@ async fn main() -> Result<()> {
             }
             let served = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    cancellation.cancel();
+                    cancel_on_signal(tokio::signal::ctrl_c(), cancellation).await;
                 })
                 .await;
             // The server has stopped, gracefully (Ctrl+C) or not: stop the
@@ -861,11 +871,31 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_LOG_FILTER;
+    use super::{DEFAULT_LOG_FILTER, cancel_on_signal};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 
     struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    #[tokio::test]
+    async fn a_shutdown_signal_error_does_not_cancel() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let signal = std::future::ready(Err(std::io::Error::other("registration failed")));
+
+        cancel_on_signal(signal, cancellation.clone()).await;
+
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_signal_success_cancels() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let signal = std::future::ready(Ok(()));
+
+        cancel_on_signal(signal, cancellation.clone()).await;
+
+        assert!(cancellation.is_cancelled());
+    }
 
     impl<S: tracing::Subscriber> Layer<S> for Recorder {
         fn on_event(
