@@ -181,7 +181,13 @@ async fn checks(
     evidence.set("lci_pid", lci_pid)?;
 
     evidence.stage("wait-ready")?;
-    let ready = wait_http_ok(&format!("{BASE}/ready"), 30, Duration::from_millis(500)).await;
+    let ready = wait_http_ok(
+        &format!("{BASE}/ready"),
+        30,
+        Duration::from_millis(500),
+        || server.as_mut().is_none_or(ManagedServer::has_exited),
+    )
+    .await;
     evidence.set("ready_while_missing", ready)?;
     if !ready {
         bail!(

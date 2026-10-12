@@ -248,6 +248,15 @@ impl Fixture {
 /// actually failing to bind, producing confusing false failures.
 pub const PORT: u16 = 8769;
 
+fn ensure_port_free(port: u16) -> Result<()> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+        Ok(_) => bail!("acceptance server port {port} is already accepting connections"),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("check acceptance server port {port}")),
+    }
+}
+
 /// A `local-code-intelligence serve` process this acceptance run owns, plus
 /// cross-platform helpers to inspect and kill its child language-server
 /// processes.
@@ -258,6 +267,7 @@ pub struct ManagedServer {
 
 impl ManagedServer {
     pub async fn spawn(config_path: &Path, working_dir: &Path, log_dir: &Path) -> Result<Self> {
+        ensure_port_free(PORT)?;
         std::fs::create_dir_all(log_dir)?;
         let stdout = std::fs::File::create(log_dir.join("serve.stdout.log"))?;
         let stderr = std::fs::File::create(log_dir.join("serve.stderr.log"))?;
@@ -380,11 +390,24 @@ impl ManagedServer {
     }
 }
 
-/// Polls `GET url` until it returns a 2xx status or `attempts` is exhausted.
-pub async fn wait_http_ok(url: &str, attempts: u32, delay: Duration) -> bool {
+/// Polls `GET url` until it returns a 2xx status, the owned child exits, or
+/// `attempts` is exhausted.
+pub async fn wait_http_ok(
+    url: &str,
+    attempts: u32,
+    delay: Duration,
+    mut exited: impl FnMut() -> bool,
+) -> bool {
     let client = reqwest::Client::new();
     for _ in 0..attempts {
-        if let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await
+        if exited() {
+            return false;
+        }
+        let response = client.get(url).timeout(Duration::from_secs(2)).send().await;
+        if exited() {
+            return false;
+        }
+        if let Ok(response) = response
             && response.status().is_success()
         {
             return true;
@@ -615,6 +638,89 @@ pub async fn run_lci(config_path: &Path, args: &[&str]) -> Result<LciOutput> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn free_port_check_rejects_listener_and_accepts_after_drop() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            ensure_port_free(port).is_err(),
+            "an occupied loopback port must be rejected"
+        );
+        drop(listener);
+        assert!(ensure_port_free(port).is_ok());
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_stops_without_polling_when_child_exited() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = requests.clone();
+        let fake_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_http_ok(
+                &format!("http://{address}/health"),
+                30,
+                Duration::from_secs(1),
+                || true,
+            ),
+        )
+        .await;
+        fake_server.abort();
+        assert!(
+            !result.expect("an exited child must end the wait immediately"),
+            "readiness must fail when the owned child has exited"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_accepts_success_only_while_child_is_alive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for exits_during_request in [false, true] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let fake_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            let mut checks = 0;
+            let ready = wait_http_ok(
+                &format!("http://{address}/health"),
+                1,
+                Duration::ZERO,
+                || {
+                    checks += 1;
+                    exits_during_request && checks > 1
+                },
+            )
+            .await;
+            fake_server.await.unwrap();
+            assert_eq!(ready, !exits_during_request);
+        }
+    }
 
     fn removed(command: &Command) -> Vec<String> {
         let mut removed: Vec<String> = command
