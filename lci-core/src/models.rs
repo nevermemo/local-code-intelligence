@@ -289,11 +289,7 @@ impl Models {
     ) -> Result<reqwest::Response> {
         let mut delay = self.initial_backoff;
         for attempt in 1..=MAX_ATTEMPTS {
-            match build()
-                .send()
-                .await
-                .map_err(reqwest::Error::without_url)
-            {
+            match build().send().await.map_err(reqwest::Error::without_url) {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if policy == RetryPolicy::Retry

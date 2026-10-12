@@ -1,7 +1,7 @@
 use super::*;
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use tracing::{field::Field, field::Visit, Subscriber};
+use tracing::{Subscriber, field::Field, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt};
 
 struct LogCapture(Arc<Mutex<Vec<String>>>);
