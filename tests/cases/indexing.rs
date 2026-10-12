@@ -923,6 +923,115 @@ async fn a_path_document_template_embeds_per_path_and_reuses_unchanged_chunks() 
     task.abort();
 }
 
+/// The semantic score of the chunk a one-result "translator" search ranks
+/// first, and the search warning. `None` means semantic retrieval served
+/// nothing, for example because the index vectors have another width.
+async fn translator_semantic_score(app: &App, workspace: &Path) -> (Option<f32>, Option<String>) {
+    let found = app.search(workspace, "translator", Some(1)).await.unwrap();
+    let value = serde_json::to_value(&found).unwrap();
+    let warning = value["warning"].as_str().map(str::to_owned);
+    (
+        found.results.first().and_then(|hit| hit.semantic_score),
+        warning,
+    )
+}
+
+#[tokio::test]
+async fn a_changed_embedding_width_under_the_same_identity_is_repaired_by_the_next_index_run() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Manual;
+    // No language server, so a search warning can only come from retrieval.
+    config.channels.lsp = false;
+    let workspace = temp.path().join("width-change");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    write(&workspace, "other.rs", "fn unrelated() {}\n");
+    let app = App::open(config.clone()).await.unwrap();
+    let first = app.index(&workspace).await.unwrap();
+    assert_eq!(first.embedded_chunks, first.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(3)
+    );
+    drop(app);
+
+    // A restart against a service that now returns 4-wide vectors under the
+    // same URL and model name. Nothing changed on disk, so every chunk is a
+    // vector-cache hit; reusing them would commit the old width again.
+    fake.embedding_width.store(4, Ordering::SeqCst);
+    let app = App::open(config.clone()).await.unwrap();
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let restarted = app.index(&workspace).await.unwrap();
+    assert_eq!(restarted.embedded_chunks, restarted.chunks);
+    assert_eq!(restarted.reused_chunks, 0);
+    // One probe document, then every chunk once.
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst) - documents,
+        1 + restarted.chunks
+    );
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(4)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+    assert_eq!(warning, None);
+
+    // In the running process the width changes again and one file changes:
+    // the run that embeds it re-embeds the cached vectors of the old width.
+    fake.embedding_width.store(5, Ordering::SeqCst);
+    write(&workspace, "other.rs", "fn unrelated_changed() {}\n");
+    let changed = app.index(&workspace).await.unwrap();
+    assert_eq!(changed.embedded_chunks, changed.chunks);
+    assert_eq!(changed.reused_chunks, 0);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(5)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+
+    // A search that meets another width warns and serves no semantic hits;
+    // the index run it asks for repairs the index with nothing changed.
+    fake.embedding_width.store(6, Ordering::SeqCst);
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert_eq!(score, None);
+    assert!(
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("dimension differs from index")),
+        "{warning:?}"
+    );
+    let repaired = app.index(&workspace).await.unwrap();
+    assert_eq!(repaired.embedded_chunks, repaired.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(6)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+
+    // An unchanged index run with the width unchanged still embeds nothing.
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let unchanged = app.index(&workspace).await.unwrap();
+    assert_eq!(unchanged.embedded_chunks, 0);
+    assert_eq!(unchanged.reused_chunks, unchanged.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents);
+    drop(app);
+
+    // After a restart with the service down, the failed probe only warns:
+    // the unchanged run reuses every cached vector, as it did before probes.
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let app = App::open(config).await.unwrap();
+    let offline = app.index(&workspace).await.unwrap();
+    assert_eq!(offline.embedded_chunks, 0);
+    assert_eq!(offline.reused_chunks, offline.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(6)
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn persistence_incremental_isolation_deletion_and_fail_open() {
     let (temp, mut config, fake, task) = fixture().await;
