@@ -704,6 +704,10 @@ impl App {
         }
         let mut all_chunks = Store::chunks(&snapshot, &report.workspace).await?;
         all_chunks.retain(|hit| hit_matches(&filters, hit));
+        if all_chunks.is_empty() {
+            report.timings.total_ms = ms(total);
+            return Ok(report);
+        }
         // `[channels]` switches, as a search profile may override them. A
         // deliberately disabled channel is skipped outright: no work, a zero
         // timing, and no "unavailable" warning.
