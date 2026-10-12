@@ -70,16 +70,16 @@ fn pattern(rng: &mut Rng) -> String {
 fn respell(rng: &mut Rng, path: &str) -> String {
     let mut out = String::new();
     if rng.below(3) == 0 {
-        out.push_str(rng.pick(&["./", "/", "\\", ".\\"]));
+        out.push_str(rng.pick::<&str>(&["./", "/", "\\", ".\\"]));
     }
     for (index, component) in path.split('/').enumerate() {
         if index > 0 {
-            out.push_str(rng.pick(&["/", "\\", "//", "/./", "\\.\\"]));
+            out.push_str(rng.pick::<&str>(&["/", "\\", "//", "/./", "\\.\\"]));
         }
         out.push_str(component);
     }
     if rng.below(3) == 0 {
-        out.push_str(rng.pick(&["/", "\\", "/."]));
+        out.push_str(rng.pick::<&str>(&["/", "\\", "/."]));
     }
     out
 }
@@ -98,11 +98,11 @@ fn respell_pattern(rng: &mut Rng, pattern: &str, doubled: bool) -> String {
     }
     for (index, component) in pattern.split('/').enumerate() {
         if index > 0 {
-            out.push_str(rng.pick(separators));
+            out.push_str(rng.pick::<&str>(separators));
         }
         out.push_str(component);
     }
-    out.push_str(rng.pick(&["", " ", "\n"]));
+    out.push_str(rng.pick::<&str>(&["", " ", "\n"]));
     out
 }
 
