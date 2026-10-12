@@ -223,6 +223,13 @@ struct Sources {
 }
 
 fn sources(root: &Path) -> Result<Sources> {
+    sources_with_read(root, |path| std::fs::read(path))
+}
+
+fn sources_with_read(
+    root: &Path,
+    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Sources> {
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
@@ -240,13 +247,19 @@ fn sources(root: &Path) -> Result<Sources> {
         let Some(adapter) = language::for_path(entry.path()) else {
             continue;
         };
-        let relative = entry
-            .path()
-            .strip_prefix(root)?
-            .to_str()
-            .context("non-UTF-8 file path")?
-            .replace('\\', "/");
-        let bytes = std::fs::read(entry.path()).with_context(|| format!("read {relative}"))?;
+        let path = entry.path().strip_prefix(root)?;
+        let Some(relative) = path.to_str() else {
+            tracing::warn!(path = ?path, "skipping source file: non-UTF-8 file path");
+            continue;
+        };
+        let relative = relative.replace('\\', "/");
+        let bytes = match read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(path = %relative, %error, "skipping unreadable source file");
+                continue;
+            }
+        };
         if let Some(reason) = adapter.non_source(&bytes) {
             skipped.push(SkippedFile {
                 relative_path: relative,
@@ -749,6 +762,59 @@ export interface TelemetryLifecycle {
         let chunks = scan(temp.path()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].relative_file_path, "lib.rs");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_skips_non_utf8_paths_and_indexes_other_files() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let invalid = std::ffi::OsStr::from_bytes(b"invalid-\xff.rs");
+        std::fs::write(temp.path().join(invalid), "fn invisible() {}\n").unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+
+        let result = scan_incremental(temp.path(), &HashMap::new());
+        assert!(result.is_ok(), "one non-UTF-8 path failed the scan: {result:?}");
+        let scan = result.unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.chunks.len(), 1);
+        assert_eq!(scan.chunks[0].relative_file_path, "lib.rs");
+        assert!(scan.chunks[0].code.contains("visible"));
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
+        let repeated = scan_incremental(temp.path(), &scan.files).unwrap();
+        assert_eq!(repeated.unchanged_files, 1);
+        assert_eq!(repeated.parsed_files, 0);
+    }
+
+    #[test]
+    fn scan_skips_a_file_removed_between_discovery_and_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("vanishing.rs");
+        std::fs::write(&victim, "fn vanishing() {}\n").unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+        let previous = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let mut removed = false;
+
+        let result = sources_with_read(temp.path(), |path| {
+            if path == victim {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::read(path)
+        });
+        assert!(removed, "the walker must discover the file before removal");
+        assert!(result.is_ok(), "one disappearing file failed the scan");
+        let sources = result.unwrap();
+        assert_eq!(sources.files.len(), 1);
+        assert_eq!(sources.files[0].relative_path, "lib.rs");
+        assert!(sources.files[0].source.contains("visible"));
+        let scan = scan_incremental(temp.path(), &previous.files).unwrap();
+        assert_eq!(scan.removed_files, 1);
+        assert_eq!(scan.unchanged_files, 1);
+        assert_eq!(scan.chunks.len(), 1);
+        assert!(scan.chunks[0].code.contains("visible"));
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
     }
 
     #[test]
