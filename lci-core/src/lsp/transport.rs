@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use crate::lsp::job;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -8,12 +8,12 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, oneshot},
 };
@@ -26,6 +26,20 @@ const EXIT_WRITE_BOUND: Duration = Duration::from_millis(200);
 /// Most time [`JsonRpcClient::shutdown`] waits to reap a child it has just
 /// killed; the kill itself does not wait.
 const KILL_REAP_BOUND: Duration = Duration::from_millis(500);
+
+/// Largest message body the reader accepts. A reply to `workspace/symbol` or
+/// `textDocument/references` on a very large workspace is megabytes, never
+/// this much; a server that announces more is broken (or hostile) and the
+/// body is not allocated: the session is treated like one whose transport
+/// failed.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Longest header line the reader accepts, terminator included. Real headers
+/// are `Content-Length: N` and `Content-Type: ...`.
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+/// Most header lines before the blank line that ends them.
+const MAX_HEADER_LINES: usize = 32;
 
 type LastActivity = Arc<std::sync::Mutex<Instant>>;
 
@@ -106,7 +120,7 @@ pub struct TransportConfig {
 /// field). When it returns `true`, the client is marked ready and waiters on
 /// [`wait_ready`](Self::wait_ready) are notified.
 pub struct JsonRpcClient {
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Writer>,
     child: Mutex<Child>,
     pending: Pending,
     next_id: AtomicU64,
@@ -126,6 +140,11 @@ pub struct JsonRpcClient {
     /// `lsp.rs`). Only that one method counts: any other message would make a
     /// server that chats forever look busy.
     progress: Arc<AtomicU64>,
+    /// Why the reader task stopped (end of output, or a protocol failure such
+    /// as a frame over [`MAX_FRAME_BYTES`]); `None` while it runs. It is set
+    /// before the pending requests are failed, so a request that arrives later
+    /// fails at once instead of waiting for a timeout nothing can end.
+    reader_stopped: Arc<std::sync::Mutex<Option<String>>>,
     /// The server's process tree. Closing it (dropping the client) kills every
     /// process in it. `None` when the job could not be set up.
     #[cfg(windows)]
@@ -170,23 +189,30 @@ impl JsonRpcClient {
             .stderr
             .take()
             .with_context(|| format!("{} stderr unavailable", config.label))?;
-        let stdin = Arc::new(Mutex::new(stdin));
+        let writer = Arc::new(Writer {
+            stdin: Mutex::new(stdin),
+            bound: config.timeout,
+            broken: AtomicBool::new(false),
+            label: config.label.clone(),
+        });
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let ready = Arc::new(tokio::sync::Notify::new());
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_activity: LastActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
         let progress = Arc::new(AtomicU64::new(0));
-        let reader_stdin = Arc::clone(&stdin);
+        let reader_writer = Arc::clone(&writer);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
         let reader_last_activity = Arc::clone(&last_activity);
         let reader_progress = Arc::clone(&progress);
+        let reader_stopped: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let stopped = Arc::clone(&reader_stopped);
         let label = config.label.clone();
         tokio::spawn(async move {
-            if let Err(error) = read_messages(
+            let reason = match read_messages(
                 stdout,
-                reader_stdin,
+                reader_writer,
                 reader_pending.clone(),
                 reader_ready,
                 reader_is_ready,
@@ -196,11 +222,18 @@ impl JsonRpcClient {
             )
             .await
             {
-                tracing::warn!(error = %error, "JSON-RPC protocol reader stopped");
-            }
+                Ok(()) => format!("{label} exited"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "JSON-RPC protocol reader stopped");
+                    format!("{label} stopped after a protocol failure: {error:#}")
+                }
+            };
+            // Recorded before the pending requests are failed: a request that
+            // registers after the drain below sees it (see `request`).
+            *stopped.lock().unwrap() = Some(reason.clone());
             let mut pending = reader_pending.lock().await;
             for (_, sender) in pending.drain() {
-                let _ = sender.send(Err(anyhow::anyhow!("{label} exited")));
+                let _ = sender.send(Err(anyhow::anyhow!("{reason}")));
             }
         });
         tokio::spawn(async move {
@@ -210,7 +243,7 @@ impl JsonRpcClient {
             }
         });
         Ok(Arc::new(Self {
-            stdin,
+            writer,
             child: Mutex::new(child),
             pending,
             next_id: AtomicU64::new(1),
@@ -220,6 +253,7 @@ impl JsonRpcClient {
             is_ready,
             last_activity,
             progress,
+            reader_stopped,
             #[cfg(windows)]
             job,
         }))
@@ -269,17 +303,29 @@ impl JsonRpcClient {
         let mut abandoned = AbandonedRequest {
             id,
             pending: Arc::clone(&self.pending),
-            stdin: Arc::clone(&self.stdin),
+            writer: Arc::clone(&self.writer),
             armed: true,
         };
+        // After registering: a reader that stopped before this point has
+        // already drained the pending requests, so only this check fails us.
+        let stopped = self.reader_stopped.lock().unwrap().clone();
+        if let Some(reason) = stopped {
+            self.pending.lock().await.remove(&id);
+            abandoned.armed = false;
+            bail!("{reason}");
+        }
         if let Err(error) = self
             .write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await
         {
             self.pending.lock().await.remove(&id);
             abandoned.armed = false;
-            // A failed write means the server closed its input: it exited.
-            return Err(error.context(format!("{} exited or closed its input", self.label)));
+            // A failed write means the server closed its input (it exited) or
+            // stopped reading it (see `Writer::write_framed`).
+            return Err(error.context(format!(
+                "{} could not be written to (it exited, closed its input or stopped reading it)",
+                self.label
+            )));
         }
 
         let started = Instant::now();
@@ -399,9 +445,9 @@ impl JsonRpcClient {
     /// on the pipe, which would desynchronize the stream for every later
     /// caller; the spawned write always runs to completion.
     async fn write(&self, value: &Value) -> Result<()> {
-        let stdin = Arc::clone(&self.stdin);
+        let writer = Arc::clone(&self.writer);
         let value = value.clone();
-        tokio::spawn(async move { write_framed(&stdin, &value).await })
+        tokio::spawn(async move { writer.write_framed(&value).await })
             .await
             .context("language-server write task ended unexpectedly")?
     }
@@ -413,7 +459,7 @@ impl JsonRpcClient {
 struct AbandonedRequest {
     id: u64,
     pending: Pending,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Writer>,
     /// Cleared once the request completed or failed on its own.
     armed: bool,
 }
@@ -427,7 +473,7 @@ impl Drop for AbandonedRequest {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let (id, pending, stdin) = (self.id, Arc::clone(&self.pending), Arc::clone(&self.stdin));
+        let (id, pending, writer) = (self.id, Arc::clone(&self.pending), Arc::clone(&self.writer));
         // The caller may be dropped while its own request is still being
         // written (that write runs on a detached task), so this cancel can
         // reach the server's stdin before the request it names. That is
@@ -440,23 +486,56 @@ impl Drop for AbandonedRequest {
                 "method": "$/cancelRequest",
                 "params": { "id": id },
             });
-            let _ = write_framed(&stdin, &cancel).await;
+            let _ = writer.write_framed(&cancel).await;
         });
     }
 }
 
-/// Writes one Content-Length-framed JSON-RPC message as a single buffer.
-/// Shared by the client's own outgoing requests/notifications and the reader
-/// task's automatic responses to server-initiated requests (both write to the
-/// same stdin).
-async fn write_framed(stdin: &Mutex<ChildStdin>, value: &Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
-    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    frame.extend_from_slice(&body);
-    let mut stdin = stdin.lock().await;
-    stdin.write_all(&frame).await?;
-    stdin.flush().await?;
-    Ok(())
+/// The server's stdin, shared by the client's own outgoing requests and
+/// notifications and by the reader task's automatic responses to
+/// server-initiated requests.
+struct Writer {
+    stdin: Mutex<ChildStdin>,
+    /// Longest one message may take to write, waiting for the lock included.
+    /// A server that stops reading fills the pipe, and without a bound the
+    /// write (and every write queued behind it on the lock) would never end.
+    bound: Duration,
+    /// Set when a write ran out of time: its message may be half written, so
+    /// nothing is written again and the session has to be replaced.
+    broken: AtomicBool,
+    label: String,
+}
+
+impl Writer {
+    /// Writes one Content-Length-framed JSON-RPC message as a single buffer.
+    /// Fails with a timeout error when the server does not take it within
+    /// `bound`, and from then on fails at once.
+    async fn write_framed(&self, value: &Value) -> Result<()> {
+        ensure!(
+            !self.broken.load(Ordering::Acquire),
+            "{} stopped reading its input: an earlier write did not finish",
+            self.label
+        );
+        let body = serde_json::to_vec(value)?;
+        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        frame.extend_from_slice(&body);
+        let write = async {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(&frame).await?;
+            stdin.flush().await
+        };
+        match tokio::time::timeout(self.bound, write).await {
+            Ok(written) => Ok(written?),
+            Err(_) => {
+                self.broken.store(true, Ordering::Release);
+                bail!(
+                    "{} did not take a message within {} seconds",
+                    self.label,
+                    self.bound.as_secs()
+                )
+            }
+        }
+    }
 }
 
 impl Drop for JsonRpcClient {
@@ -474,7 +553,7 @@ impl Drop for JsonRpcClient {
 #[allow(clippy::too_many_arguments)]
 async fn read_messages(
     stdout: tokio::process::ChildStdout,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Writer>,
     pending: Pending,
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
@@ -484,22 +563,9 @@ async fn read_messages(
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     loop {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).await? == 0 {
-                return Ok(());
-            }
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = Some(value.trim().parse::<usize>()?);
-            }
-        }
-        let length = content_length.context("LSP message missing Content-Length")?;
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).await?;
+        let Some(body) = read_frame(&mut reader, MAX_FRAME_BYTES).await? else {
+            return Ok(());
+        };
         let message: Value = serde_json::from_slice(&body)?;
         // Any successfully parsed message -- response, notification, or a
         // server-initiated request -- is evidence the server is alive and
@@ -525,7 +591,7 @@ async fn read_messages(
                 _ => Value::Null,
             };
             let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
-            if let Err(error) = write_framed(&stdin, &response).await {
+            if let Err(error) = writer.write_framed(&response).await {
                 tracing::warn!(error = %error, %method, "failed to answer server-initiated request");
             }
             continue;
@@ -546,6 +612,49 @@ async fn read_messages(
             let _ = sender.send(response_outcome(&message));
         }
     }
+}
+
+/// Reads one Content-Length-framed message body. `Ok(None)` is the end of
+/// the server's output. Every length is checked before anything is allocated
+/// or read for it: a header line over [`MAX_HEADER_LINE_BYTES`], more than
+/// [`MAX_HEADER_LINES`] header lines, or a body over `max_body` is an error,
+/// so a broken or hostile server cannot make the client allocate what it
+/// announces or buffer an unterminated line without end.
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_body: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut content_length = None;
+    let mut line = Vec::new();
+    for _ in 0..MAX_HEADER_LINES {
+        line.clear();
+        let read = (&mut *reader)
+            .take(MAX_HEADER_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        ensure!(
+            line.len() <= MAX_HEADER_LINE_BYTES,
+            "LSP header line longer than {MAX_HEADER_LINE_BYTES} bytes"
+        );
+        if line == b"\r\n" || line == b"\n" {
+            let length = content_length.context("LSP message missing Content-Length")?;
+            ensure!(
+                length <= max_body,
+                "LSP message of {length} bytes is over the limit of {max_body} bytes"
+            );
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await?;
+            return Ok(Some(body));
+        }
+        let header = std::str::from_utf8(&line).context("LSP header is not UTF-8")?;
+        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    bail!("LSP message with more than {MAX_HEADER_LINES} header lines")
 }
 
 /// What a response to one of our requests says: its result, or its error as
@@ -642,5 +751,86 @@ mod tests {
                 .downcast_ref::<RpcError>()
                 .is_none()
         );
+    }
+
+    async fn frame_of(bytes: &[u8], max_body: usize) -> (Result<Option<Vec<u8>>>, Vec<u8>) {
+        let mut reader = BufReader::new(bytes);
+        let outcome = read_frame(&mut reader, max_body).await;
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        (outcome, rest)
+    }
+
+    #[tokio::test]
+    async fn a_frame_is_read_whole_and_the_next_one_is_left_alone() {
+        let bytes = b"Content-Length: 5\r\nContent-Type: application/vscode-jsonrpc\r\n\r\nhelloContent-Length: 1\r\n\r\nx";
+        let (first, rest) = frame_of(bytes, MAX_FRAME_BYTES).await;
+        assert_eq!(first.unwrap().unwrap(), b"hello");
+        assert_eq!(rest, b"Content-Length: 1\r\n\r\nx");
+        // A bare line feed ends the headers too, and the name's case is free.
+        let (lenient, _) = frame_of(b"content-length: 2\n\nab", MAX_FRAME_BYTES).await;
+        assert_eq!(lenient.unwrap().unwrap(), b"ab");
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_output_is_not_an_error_before_a_frame() {
+        for bytes in [&b""[..], b"Content-Length: 5\r\n"] {
+            let (outcome, _) = frame_of(bytes, MAX_FRAME_BYTES).await;
+            assert!(outcome.unwrap().is_none());
+        }
+        let (cut, _) = frame_of(b"Content-Length: 5\r\n\r\nhe", MAX_FRAME_BYTES).await;
+        assert!(cut.is_err(), "a body that ends early is a failure");
+    }
+
+    /// The announced length is checked before the body is allocated or read:
+    /// the bytes after the headers are still unread when the error comes.
+    #[tokio::test]
+    async fn a_frame_over_the_limit_is_refused_before_its_body_is_read() {
+        let (at_limit, _) = frame_of(b"Content-Length: 16\r\n\r\n0123456789abcdef", 16).await;
+        assert_eq!(at_limit.unwrap().unwrap().len(), 16);
+        for announced in ["17", "4294967296", "18446744073709551615"] {
+            let message = format!("Content-Length: {announced}\r\n\r\nBODY");
+            let (outcome, rest) = frame_of(message.as_bytes(), 16).await;
+            let error = outcome.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("over the limit"),
+                "{announced}: {error:#}"
+            );
+            assert_eq!(rest, b"BODY", "{announced}: the body must not be consumed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_line_over_the_bound_is_refused_without_buffering_it() {
+        let longest = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE_BYTES - 9));
+        assert_eq!(longest.len(), MAX_HEADER_LINE_BYTES);
+        let framed = format!("{longest}Content-Length: 2\r\n\r\nok");
+        let (accepted, _) = frame_of(framed.as_bytes(), MAX_FRAME_BYTES).await;
+        assert_eq!(accepted.unwrap().unwrap(), b"ok");
+
+        let endless = vec![b'a'; MAX_HEADER_LINE_BYTES * 4];
+        let (outcome, rest) = frame_of(&endless, MAX_FRAME_BYTES).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("header line longer"));
+        assert!(
+            rest.len() >= MAX_HEADER_LINE_BYTES * 3 - 1,
+            "only about one bound of the line may be read, {} bytes left",
+            rest.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_header_lines_a_missing_length_and_a_bad_length_are_refused() {
+        let mut many = "X: 1\r\n".repeat(MAX_HEADER_LINES);
+        many.push_str("Content-Length: 2\r\n\r\nok");
+        let (outcome, _) = frame_of(many.as_bytes(), MAX_FRAME_BYTES).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("header lines"));
+
+        let (missing, _) = frame_of(b"X: 1\r\n\r\nbody", MAX_FRAME_BYTES).await;
+        assert!(format!("{:#}", missing.unwrap_err()).contains("missing Content-Length"));
+
+        let (bad, _) = frame_of(b"Content-Length: lots\r\n\r\n", MAX_FRAME_BYTES).await;
+        assert!(bad.is_err());
+        let (not_utf8, _) = frame_of(b"X: \xff\r\n\r\n", MAX_FRAME_BYTES).await;
+        assert!(format!("{:#}", not_utf8.unwrap_err()).contains("UTF-8"));
     }
 }

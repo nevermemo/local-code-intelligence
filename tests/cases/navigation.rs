@@ -4,7 +4,7 @@ use local_code_intelligence::{
     lsp::{
         Location, Manager,
         adapter::LspAdapter,
-        transport::{RpcError, TransportConfig},
+        transport::{JsonRpcClient, RpcError, TransportConfig},
     },
     workspace::Workspace,
 };
@@ -370,6 +370,7 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
         assert!(
             message.contains("timed out")
                 || message.contains("exited")
+                || message.contains("protocol failure")
                 || message.contains("restart after"),
             "unexpected {mode} error: {message}"
         );
@@ -879,6 +880,212 @@ async fn a_server_that_dies_mid_request_is_replaced_once() {
         2,
         "one restart for the death, none for the call after it"
     );
+}
+
+/// A client for the fake server started directly, past its `initialize`
+/// handshake, with the transport's inactivity and write bound at `timeout`.
+async fn fake_client(
+    temp: &tempfile::TempDir,
+    extra: &[&str],
+    timeout: Duration,
+) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
+    let state = temp.path().join("state");
+    let mut args = fake_args(&["--mode", "workspace-symbols", "--state"]);
+    args.push(state.to_string_lossy().into_owned());
+    args.extend(fake_args(extra));
+    let transport = TransportConfig {
+        executable: env!("CARGO_BIN_EXE_fake-lsp-server").to_owned(),
+        args,
+        working_dir: temp.path().to_owned(),
+        timeout,
+        label: "fake".to_owned(),
+    };
+    let client = JsonRpcClient::spawn(&transport, Box::new(|_| false))
+        .await
+        .unwrap();
+    client
+        .request(
+            "initialize",
+            json!({"rootUri": "file:///workspace/", "capabilities": {}}),
+        )
+        .await
+        .unwrap();
+    client.notify("initialized", json!({})).await.unwrap();
+    (client, state)
+}
+
+/// A message that announces more than the client will ever read is refused by
+/// its header: the body is not allocated and not waited for (the server here
+/// sends the header of a 4 GiB message and then nothing). The request fails at
+/// once, naming the limit, and so does every later one, instead of each
+/// waiting out the inactivity timeout (30 s here) behind a reader that has
+/// stopped.
+#[tokio::test]
+async fn a_frame_that_announces_too_much_fails_the_request_and_the_ones_after_it_at_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _state) = fake_client(
+        &temp,
+        &["--huge-frame-on-symbol-request", "1"],
+        Duration::from_secs(30),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let first = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request("workspace/symbol", json!({"query": "Calculator"})),
+    )
+    .await
+    .expect("the oversize header must fail the request, not leave it waiting for 4 GiB")
+    .unwrap_err();
+    assert!(format!("{first:#}").contains("over the limit"), "{first:#}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let again = std::time::Instant::now();
+    let later = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request("workspace/symbol", json!({"query": "Calculator"})),
+    )
+    .await
+    .expect("a request after the reader stopped must not wait for an answer")
+    .unwrap_err();
+    assert!(format!("{later:#}").contains("over the limit"), "{later:#}");
+    assert!(
+        later.downcast_ref::<RpcError>().is_none(),
+        "a dead transport is not a server's error answer"
+    );
+    assert!(
+        again.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        again.elapsed()
+    );
+    client.shutdown(Duration::from_secs(1)).await;
+}
+
+/// The same server through the manager: whether the oversize header answers
+/// the priming request (1) or the caller's request (2), the session is
+/// discarded and one fresh server serves the call, within a few seconds
+/// although the inactivity timeout is 30 s.
+#[tokio::test]
+async fn a_server_that_announces_a_huge_frame_is_replaced_once() {
+    for at_request in ["1", "2"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+        config.lsp_timeout_seconds = 30;
+        config
+            .csharp
+            .args
+            .extend(fake_args(&["--huge-frame-on-symbol-request", at_request]));
+        let manager = Manager::new(&config);
+        let adapter = csharp_adapter(&manager);
+
+        let started = std::time::Instant::now();
+        let results = tokio::time::timeout(
+            Duration::from_secs(20),
+            manager.symbols(&adapter, &workspace, "Calculator"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request {at_request}: the call waited for the huge frame"))
+        .unwrap();
+        assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "request {at_request}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            state_count(&state, "spawn_count.txt"),
+            2,
+            "request {at_request}: one restart"
+        );
+    }
+}
+
+/// A server that is alive but has stopped reading its input: a request big
+/// enough to fill the pipe (4 MiB) cannot be written, and the write is bounded
+/// by the client timeout (2 s) instead of holding the caller, and the write
+/// lock, forever. The client then refuses further writes at once, because the
+/// message that timed out may have left half a frame in the pipe.
+#[tokio::test]
+async fn a_server_that_stops_reading_fails_the_write_within_the_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _state) =
+        fake_client(&temp, &["--never-read-stdin"], Duration::from_secs(2)).await;
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.request(
+            "workspace/symbol",
+            json!({"query": "x".repeat(4 * 1024 * 1024)}),
+        ),
+    )
+    .await
+    .expect("a full pipe must not hold the request past the write bound")
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not take a message within 2 seconds"),
+        "{error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let again = std::time::Instant::now();
+    let later = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request("workspace/symbol", json!({"query": "x"})),
+    )
+    .await
+    .expect("a write after a timed-out write must fail at once")
+    .unwrap_err();
+    assert!(
+        format!("{later:#}").contains("stopped reading its input"),
+        "{later:#}"
+    );
+    assert!(
+        again.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        again.elapsed()
+    );
+    client.shutdown(Duration::from_secs(1)).await;
+}
+
+/// The same deaf server through the manager: the write that cannot finish is a
+/// transport failure, so the session is discarded and one fresh server serves
+/// the call, instead of the call failing or hanging.
+#[tokio::test]
+async fn a_server_that_stops_reading_is_replaced_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_timeout_seconds = 2;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--never-read-stdin"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let query = "x".repeat(4 * 1024 * 1024);
+    let started = std::time::Instant::now();
+    let results = tokio::time::timeout(
+        Duration::from_secs(30),
+        manager.symbols(&adapter, &workspace, &query),
+    )
+    .await
+    .expect("the call waited on a pipe nobody reads")
+    .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2, "one restart");
 }
 
 /// An `error` member that is not a well-formed error object (`null`, no

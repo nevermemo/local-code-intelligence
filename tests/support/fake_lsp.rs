@@ -96,6 +96,17 @@ pub struct FakeLspConfig {
     /// directory (`--exit-on-symbol-request N`; 0 = never): a server that dies
     /// while a request is in flight, replaced by a healthy one.
     pub exit_on_symbol_request: u64,
+    /// The Nth `workspace/symbol` request of the first process of a state
+    /// directory is answered with the header of a frame that announces 4 GiB
+    /// and no body, and the process keeps running (`--huge-frame-on-symbol-request
+    /// N`; 0 = never): a server whose output the client must refuse by its
+    /// announced length, not by waiting for the body.
+    pub huge_frame_on_symbol_request: u64,
+    /// The first process of a state directory stops reading its input after
+    /// `initialized` and exits 60 seconds later (`--never-read-stdin`): a
+    /// server that is alive and silent while the client's writes fill the
+    /// pipe.
+    pub never_read_stdin: bool,
     /// Starts a descendant (`--spawn-grandchild`): a copy of this program in
     /// sleeper mode, the way a `.cmd` shim's `node.exe` or a `rustup` proxy's
     /// real binary is a child of the process the client spawned. Its heartbeat
@@ -206,6 +217,9 @@ pub fn run_from_env() -> io::Result<()> {
     let exit_on_symbol_request = cli_arg(&cli, "--exit-on-symbol-request")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let huge_frame_on_symbol_request = cli_arg(&cli, "--huge-frame-on-symbol-request")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let config = FakeLspConfig {
         scenario,
         state_dir: state_path,
@@ -228,6 +242,8 @@ pub fn run_from_env() -> io::Result<()> {
         symbol_raw_error: cli_arg(&cli, "--symbol-raw-error")
             .and_then(|raw| serde_json::from_str(&raw).ok()),
         exit_on_symbol_request,
+        huge_frame_on_symbol_request,
+        never_read_stdin: cli.iter().any(|arg| arg == "--never-read-stdin"),
         spawn_grandchild: cli.iter().any(|arg| arg == "--spawn-grandchild"),
         ready_notification: cli.iter().any(|arg| arg == "--ready-notification"),
     };
@@ -431,6 +447,12 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     &json_notification("custom/ready", json!({"ready": true})),
                 )?;
             }
+            // Alive but deaf: nothing more is read from the input, so the
+            // client's pipe fills up once it writes enough.
+            if config.never_read_stdin && spawn_count == 1 {
+                thread::sleep(Duration::from_secs(60));
+                process::exit(0);
+            }
             // ExitDuringRequest: the server dies right after accepting the
             // initialized notification, so the next request finds a dead
             // process. Acting on `initialized` (rather than immediately after
@@ -485,6 +507,11 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     symbol_requests += 1;
                     if symbol_requests == config.exit_on_symbol_request && spawn_count == 1 {
                         process::exit(0);
+                    }
+                    if symbol_requests == config.huge_frame_on_symbol_request && spawn_count == 1 {
+                        stdout.write_all(b"Content-Length: 4294967296\r\n\r\n")?;
+                        stdout.flush()?;
+                        continue;
                     }
                     let delay_ms = if symbol_requests == 1 {
                         config.first_symbol_delay_ms
