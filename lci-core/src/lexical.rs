@@ -1,4 +1,4 @@
-use crate::language;
+use crate::{language, path::normalize_path_separators};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
@@ -598,11 +598,11 @@ fn relative_to_root(root: &Path, reported: &Path) -> String {
     } else {
         root.join(reported)
     };
-    normalized
+    let relative = normalized
         .strip_prefix(root)
         .unwrap_or(&normalized)
-        .to_string_lossy()
-        .replace('\\', "/")
+        .to_string_lossy();
+    normalize_path_separators(&relative)
 }
 
 /// A credited line already attributed to an indexed chunk and its file.
@@ -759,6 +759,20 @@ pub fn score_chunks(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_preserves_backslash_in_unix_filename() {
+        let temp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join(r"a\b.rs"), "needle\n").unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/b.rs"), "needle\n").unwrap();
+
+        // ripgrep reports absolute paths, so take the canonicalizing branch.
+        assert_eq!(relative_to_root(&root, &root.join(r"a\b.rs")), r"a\b.rs");
+    }
+
     #[test]
     fn extracts_useful_terms() {
         assert_eq!(
