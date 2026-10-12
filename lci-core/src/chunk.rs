@@ -76,6 +76,7 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
     let mut start = node.start_byte();
     let mut end = start;
     let mut pending_prefix = None;
+    let mut last_split_range = None;
     for child in children {
         if container && adapter.is_prefix(child.kind()) {
             pending_prefix.get_or_insert(child.start_byte());
@@ -100,15 +101,24 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
             if let Some(range) = out.get_mut(first) {
                 range.0 = if attach_header { start } else { child_start };
             }
+            last_split_range = out.len().checked_sub(1).filter(|&index| index >= first);
             start = child.end_byte();
             end = start;
         } else if container || child.end_byte() - start > TARGET_BYTES {
             if end > start {
                 out.push((start, child_start));
+            } else if let Some(index) = last_split_range.take() {
+                if let Some((_, previous_end)) = out.get_mut(index)
+                    && *previous_end == start
+                {
+                    *previous_end = child_start;
+                }
             }
+            last_split_range = None;
             start = child_start;
             end = child.end_byte();
         } else {
+            last_split_range = None;
             end = child.end_byte();
         }
     }
@@ -338,14 +348,18 @@ mod tests {
             .collect()
     }
 
-    fn assert_non_whitespace_coverage(source: &str, expected: &str) {
-        let chunks = rust_chunks("lib.rs", source).unwrap();
+    fn assert_chunks_cover(chunks: &[Chunk], expected: &str) {
         let packed: String = chunks.iter().map(|chunk| compact(&chunk.code)).collect();
         let expected = compact(expected);
         assert!(
             packed.contains(&expected),
             "chunks do not cover {expected:?}:\n{chunks:#?}"
         );
+    }
+
+    fn assert_non_whitespace_coverage(source: &str, expected: &str) {
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        assert_chunks_cover(&chunks, expected);
     }
 
     #[test]
@@ -937,6 +951,34 @@ export interface TelemetryLifecycle {
             let source = format!("fn main() {{\n{statements}}}\n");
             assert_non_whitespace_coverage(&source, &expression);
         }
+    }
+
+    #[test]
+    fn split_children_keep_separators_before_following_small_siblings() {
+        let large = "a".repeat(6500);
+        for expression in [
+            format!("consume(\"{large}\", short_name)"),
+            format!("[\"{large}\", short_name]"),
+            format!("(\"{large}\", short_name)"),
+        ] {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
+        }
+
+        let mut properties: String = (0..1200)
+            .map(|index| format!("  field_{index}: string,\n"))
+            .collect();
+        properties.push_str(&format!("  oversized: \"{large}\",\n  short: string,\n"));
+        let source = format!("type Fields = {{\n{properties}}};\n");
+        let chunks = chunks_for_path("fields.ts", &source).unwrap();
+        assert_chunks_cover(&chunks, &format!("\"{large}\", short: string"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk.code.trim(), "," | ";")),
+            "a chunk contains only separators:\n{chunks:#?}"
+        );
     }
 
     #[test]
