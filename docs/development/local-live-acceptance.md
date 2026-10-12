@@ -91,6 +91,10 @@ cargo xtask live-acceptance --skip-build
 
 # Only specific steps, by step name or xtask acceptance subcommand substring
 cargo xtask live-acceptance --only python,core --skip-build
+
+# A step whose tool is missing is listed as SKIPPED and the run ends with
+# "Completed with skipped steps."; --require-all turns a skip into a failure
+cargo xtask live-acceptance --require-all
 ```
 
 Logs land under `test-results/live-acceptance-logs/<timestamp>/` (gitignored

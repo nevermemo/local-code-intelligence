@@ -96,4 +96,7 @@ Every `*-lsp`/`*-missing`/`*-recovery` subcommand skips gracefully (prints
 `PREREQUISITE_UNAVAILABLE`) rather than failing when its tool isn't on
 `PATH`, so a missing optional tool degrades that one step rather than the
 whole workflow -- but every tool in the table has to be reachable for full
-coverage.
+coverage. This workflow runs the steps one by one, so a skip still ends a step
+successfully here. `cargo xtask live-acceptance` (the local orchestrator) lists
+such a step as SKIPPED and ends with "Completed with skipped steps."; its
+`--require-all` flag turns a skip into a failure.
