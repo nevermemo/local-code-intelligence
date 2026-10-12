@@ -700,7 +700,7 @@ mod tests {
             let fake_server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0; 1024];
-                stream.read(&mut request).await.unwrap();
+                assert!(stream.read(&mut request).await.unwrap() > 0);
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                     .await
