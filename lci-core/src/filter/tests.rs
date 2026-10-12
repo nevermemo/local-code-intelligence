@@ -479,6 +479,16 @@ fn glob_dot_components_are_removed() {
 }
 
 #[test]
+fn glob_collapses_doubled_separators_but_rejects_leading_unc() {
+    let pattern = GlobPattern::compile("src//*.rs").unwrap();
+    assert!(pattern.matches("src/a.rs"));
+    assert!(matches!(
+        GlobPattern::compile("//server/share"),
+        Err(FilterError::AbsolutePath { .. })
+    ));
+}
+
+#[test]
 fn normalize_path_removes_dot_components() {
     assert_eq!(normalize_path("src/./lib.rs"), "src/lib.rs");
 }
