@@ -2002,6 +2002,38 @@ fn fake_csharp_release_fixture(
     (config, workspace, state)
 }
 
+/// Checks liveness only while the answer is pending: after it returns, an idle
+/// release is legitimate because the request has outlasted the idle timeout.
+async fn answer_without_idle_release(
+    manager: &Manager,
+    workspace: &Workspace,
+    state: &std::path::Path,
+    answer: impl std::future::Future<Output = anyhow::Result<Vec<Location>>>,
+) -> Vec<Location> {
+    tokio::pin!(answer);
+    let mut replacement_running = false;
+    loop {
+        tokio::select! {
+            result = &mut answer => {
+                assert!(replacement_running, "the replacement must be observed while answering");
+                return result.expect("the replacement must finish the retried request");
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                if state_count(state, "spawn_count.txt") == 2 {
+                    let running = manager.running("csharp-ls", &workspace.id).await;
+                    assert!(
+                        !replacement_running || running,
+                        "the idle sweep must not release the replacement during its answer"
+                    );
+                    replacement_running |= running;
+                    assert_eq!(event_count(state, "shutdown_seen.txt"), 0);
+                    assert_eq!(event_count(state, "exit_seen.txt"), 0);
+                }
+            }
+        }
+    }
+}
+
 /// Both retry paths must keep the replacement session in use while its answer
 /// outlasts the idle timeout. Priming answers immediately; only the real request
 /// is slow, so priming cannot mask a missing session handle.
@@ -2020,22 +2052,19 @@ async fn a_retried_symbol_request_is_not_cut_off_by_the_idle_sweep() {
     let adapter = csharp_adapter(&manager);
 
     let started = std::time::Instant::now();
-    let results = manager
-        .symbols(&adapter, &workspace, "Calculator")
-        .await
-        .expect("the replacement must finish the retried symbol request");
+    let results = answer_without_idle_release(
+        &manager,
+        &workspace,
+        &state,
+        manager.symbols(&adapter, &workspace, "Calculator"),
+    )
+    .await;
     assert!(
         started.elapsed() >= Duration::from_secs(3),
         "the retried answer must outlast the idle timeout"
     );
     assert_eq!(results[0].name.as_deref(), Some("Calculator"));
     assert_eq!(state_count(&state, "spawn_count.txt"), 2, "one restart");
-    assert!(
-        manager.running("csharp-ls", &workspace.id).await,
-        "the idle sweep must not release the replacement during its answer"
-    );
-    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
-    assert_eq!(event_count(&state, "exit_seen.txt"), 0);
     manager.shutdown_all().await;
 }
 
@@ -2054,17 +2083,20 @@ async fn a_retried_position_request_is_not_cut_off_by_the_idle_sweep() {
     let adapter = csharp_adapter(&manager);
 
     let started = std::time::Instant::now();
-    let results = manager
-        .definition(
+    let results = answer_without_idle_release(
+        &manager,
+        &workspace,
+        &state,
+        manager.definition(
             &adapter,
             &workspace,
             &workspace.path.join("src/CallSite.cs"),
             "src/CallSite.cs",
             1,
             82,
-        )
-        .await
-        .expect("the replacement must finish the retried position request");
+        ),
+    )
+    .await;
     assert!(
         started.elapsed() >= Duration::from_secs(3),
         "the retried answer must outlast the idle timeout"
@@ -2074,12 +2106,6 @@ async fn a_retried_position_request_is_not_cut_off_by_the_idle_sweep() {
         Some("src/Calculator.cs")
     );
     assert_eq!(state_count(&state, "spawn_count.txt"), 2, "one restart");
-    assert!(
-        manager.running("csharp-ls", &workspace.id).await,
-        "the idle sweep must not release the replacement during its answer"
-    );
-    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
-    assert_eq!(event_count(&state, "exit_seen.txt"), 0);
     manager.shutdown_all().await;
 }
 

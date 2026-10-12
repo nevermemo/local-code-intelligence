@@ -368,6 +368,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut symbol_requests = 0u64;
     let mut symbol_error = config.symbol_error.clone();
     let mut definition_error = config.definition_error.clone();
+    let mut pending_definition = None;
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
 
@@ -631,36 +632,41 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 (FakeScenario::Definition, Some("workspace/symbol"))
                     if config.exit_on_definition_request =>
                 {
+                    symbol_requests += 1;
                     if let Some(id) = id {
                         write_message(&mut stdout, &json_response(id, json!([])))?;
+                    }
+                    if let Some(response) = pending_definition.take() {
+                        thread::sleep(Duration::from_millis(config.definition_delay_ms));
+                        write_message(&mut stdout, &response)?;
                     }
                 }
                 (FakeScenario::Definition, Some("textDocument/definition")) => {
                     if config.exit_on_definition_request && spawn_count == 1 {
                         process::exit(0);
                     }
-                    if config.definition_delay_ms > 0 {
-                        thread::sleep(Duration::from_millis(config.definition_delay_ms));
-                    }
                     if let Some(id) = id {
-                        if let Some(error) = definition_error.as_mut()
+                        let response = if let Some(error) = definition_error.as_mut()
                             && error.take()
                         {
-                            write_message(
-                                &mut stdout,
-                                &json_error(id, error.code, &error.message),
-                            )?;
+                            json_error(id, error.code, &error.message)
                         } else {
-                            write_message(
-                                &mut stdout,
-                                &json_response(
-                                    id,
-                                    json!({
-                                        "uri": calc_uri,
-                                        "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
-                                    }),
-                                ),
-                            )?;
+                            json_response(
+                                id,
+                                json!({
+                                    "uri": calc_uri,
+                                    "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
+                                }),
+                            )
+                        };
+                        // Position calls do not wait for priming. Answer it
+                        // before sleeping even if the definition arrived first,
+                        // so priming cannot shield the session from idle release.
+                        if config.exit_on_definition_request && symbol_requests == 0 {
+                            pending_definition = Some(response);
+                        } else {
+                            thread::sleep(Duration::from_millis(config.definition_delay_ms));
+                            write_message(&mut stdout, &response)?;
                         }
                     }
                 }
