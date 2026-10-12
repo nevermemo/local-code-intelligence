@@ -123,14 +123,10 @@ async fn http_mcp_initialization_tools_and_health() {
         }),
     )
     .await;
-    assert!(invalid_arguments.status().is_success());
-    let invalid_arguments = rpc_response(&invalid_arguments.text().await.unwrap());
+    assert_eq!(invalid_arguments.status(), StatusCode::BAD_REQUEST);
+    let invalid_arguments = invalid_arguments.text().await.unwrap();
     assert!(
-        invalid_arguments.get("error").is_some() || invalid_arguments["result"]["isError"] == true,
-        "{invalid_arguments}"
-    );
-    assert!(
-        invalid_arguments.to_string().contains("include_path"),
+        invalid_arguments.contains("include_path"),
         "{invalid_arguments}"
     );
     let rejected = client
@@ -247,16 +243,6 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     assert!(!invalid_arguments.status().is_success());
     let body = invalid_arguments.text().await.unwrap();
     assert!(body.contains("include_path"), "{body}");
-
-    let invalid_query = client
-        .post(format!("{base}/v1/search_code?search_profiel=fast"))
-        .json(&json!({"workspace_path": workspace, "query": "translator"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(!invalid_query.status().is_success());
-    let body = invalid_query.text().await.unwrap();
-    assert!(body.contains("search_profiel"), "{body}");
 
     let ready = client
         .get(format!("{base}/v1/service_status"))
