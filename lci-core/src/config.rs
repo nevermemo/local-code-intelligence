@@ -294,6 +294,9 @@ pub struct Config {
     pub watch_poll_milliseconds: u64,
     pub watch_debounce_milliseconds: u64,
     pub rust_analyzer_path: String,
+    /// Restore rust-analyzer's execution/network defaults. Only enable when
+    /// every repository this process accesses and its dependencies are trusted.
+    pub rust_analyzer_trusted: bool,
     /// Seconds one request to a language server may go without any sign of
     /// life from it before it fails (1..=86400).
     pub lsp_timeout_seconds: u64,
@@ -643,6 +646,7 @@ impl Default for Config {
             watch_poll_milliseconds: 2000,
             watch_debounce_milliseconds: 750,
             rust_analyzer_path: "rust-analyzer".into(),
+            rust_analyzer_trusted: false,
             lsp_timeout_seconds: 60,
             lsp_candidate_count: 40,
             lsp_search_budget_ms: 1500,

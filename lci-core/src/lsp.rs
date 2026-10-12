@@ -67,7 +67,12 @@ impl GenericClient {
         let transport = adapter
             .transport_config(&workspace.path)
             .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
-        let rpc = JsonRpcClient::spawn(&transport, adapter.ready_predicate()).await?;
+        let rpc = JsonRpcClient::spawn(
+            &transport,
+            &adapter.environment(),
+            adapter.ready_predicate(),
+        )
+        .await?;
         let params = adapter
             .initialize_params(&workspace.path)
             .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;

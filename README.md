@@ -115,6 +115,7 @@ Before the first build, the defaults below are what `lci config --json` would re
 | `watch_poll_milliseconds` | 2000 |
 | `watch_debounce_milliseconds` | 750 |
 | `rust_analyzer_path` | `rust-analyzer` |
+| `rust_analyzer_trusted` | `false` (execution/network restrictions; see the security note below) |
 | `[csharp].path` | unset (disabled) |
 | `[csharp].args` | `[]` |
 | `[csharp].disabled` | `false` |
@@ -159,6 +160,51 @@ Before the first build, the defaults below are what `lci config --json` would re
 Persistent data lives in `data_dir\lancedb` and `data_dir\manifests`, outside indexed repositories. Canonicalization resolves path aliases and symlinks. A SHA-256 of the canonical workspace path identifies a workspace; each workspace has a separate LanceDB table (`ws_` plus the first 16 hex digits of that id) and parse manifest. Indexes written under the earlier full-id table name (`ws_<64 hex>`) stay searchable and are read until the workspace's next index commit, which writes the short-named table without re-embedding unchanged chunks and then drops the old one. The move is one-way: an older binary then sees the workspace as not indexed and embeds it again. A table that records a different workspace path than the one asking for it is refused with a table-name collision error instead of being overwritten; give one of the workspaces its own `data_dir`. On Windows keep `data_dir` under 150 characters: LanceDB's internal paths below it must fit Windows' 260-character limit, and `/ready` flags a longer one. Manifest schema v2 records language and adapter compatibility per file, so changing one language parser does not invalidate unaffected languages. Compatible schema-v1 Rust manifests are migrated without reparsing unchanged files. Data directories and indexed workspaces cannot contain one another. Moving a repository creates a new workspace identity. This milestone has no automatic index cleanup command.
 
 The generation service at port 8765 is independent and is never called, inspected, proxied, or managed by this application.
+
+### Security: language servers and untrusted repositories
+
+Search uses enabled language servers for the indexed languages; symbol search,
+definitions and references also start the applicable server. Rust's adapter is
+always enabled when its executable is available; the other adapters are disabled
+until configured. These are local processes with the user's permissions, not
+sandboxed parsers.
+
+By default LCI starts rust-analyzer with `cargo.buildScripts.enable = false`,
+`procMacro.enable = false` and `checkOnSave = false`, and clears
+`cargo.buildScripts.overrideCommand` and `check.overrideCommand`. Its child
+environment sets `CARGO_NET_OFFLINE=true` and empties `RUSTC_WRAPPER`,
+`RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` and
+`CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`; the same overrides are supplied through
+`cargo.extraEnv` and `check.extraEnv`. This avoids ordinary build-script,
+procedural-macro and check-on-save execution and Cargo downloads, at the cost of
+incomplete analysis of generated code and missing uncached dependencies.
+See the rust-analyzer manual's [Configuration](https://rust-analyzer.github.io/book/configuration.html)
+sections for those option names.
+
+The top-level config key `rust_analyzer_trusted = true` removes these LCI
+restrictions (but keeps workspace-symbol search settings), restoring
+rust-analyzer's own defaults and inherited environment. It permits build scripts,
+procedural macros, checks and dependency downloads, including dependency code.
+Enable it only when **all** repositories and dependencies accessed by that LCI
+process are trusted; it is not a per-request or per-workspace trust grant. Keep
+this behavioral setting in the main LCI configuration, not a machine overlay.
+
+**Residual risks:** these defaults are defense in depth, not an untrusted-code
+sandbox. LCI does not suppress or rewrite repository files such as
+`rust-analyzer.toml` or `.cargo/config.toml`; depending on the rust-analyzer
+version, settings in them can take precedence over the client settings LCI
+sends, so do not rely on client settings as a version-independent policy against
+repository commands or environment overrides. Cargo's `[env]` table with
+`force = true` can replace inherited values for processes Cargo runs. Compiler
+and toolchain selection, repository-provided executables, other Cargo
+configuration and language-server vulnerabilities remain execution risks, and
+rust-analyzer still invokes Cargo metadata and toolchain discovery. Other enabled
+servers can also execute project tooling or load plugins (notably Java build
+imports and C# MSBuild) or access the network (for example gopls modules); this
+Rust option does not harden them. For untrusted input, use OS-level isolation with
+restricted permissions/network and trusted tool binaries. `[channels].lsp = false`
+disables language servers for code search only; it does **not** disable explicit
+symbol/navigation tools.
 
 ## MCP tools
 

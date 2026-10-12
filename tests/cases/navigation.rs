@@ -956,7 +956,7 @@ async fn fake_client_with(
         timeout,
         label: "fake".to_owned(),
     };
-    let client = JsonRpcClient::spawn(&transport, ready).await.unwrap();
+    let client = JsonRpcClient::spawn(&transport, &[], ready).await.unwrap();
     client
         .request(
             "initialize",
