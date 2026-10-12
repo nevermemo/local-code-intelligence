@@ -289,7 +289,7 @@ impl Models {
     ) -> Result<reqwest::Response> {
         let mut delay = self.initial_backoff;
         for attempt in 1..=MAX_ATTEMPTS {
-            match build().send().await {
+            match build().send().await.map_err(reqwest::Error::without_url) {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if policy == RetryPolicy::Retry
@@ -1028,6 +1028,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let probed = models.rerank("query", &documents).await.unwrap_err();
         assert!(is_connect_error(&probed), "{probed:#}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_embedding_error_does_not_carry_the_url_credentials() {
+        let config = Config {
+            embedding_url: format!("http://{}/v1?api_key=marker", closed_local_address()),
+            ..Config::default()
+        };
+        let models = Models::new(&config).unwrap();
+
+        let error = models.query("anything").await.unwrap_err();
+        assert!(is_connect_error(&error), "{error:#}");
+        assert!(!format!("{error:#}").contains("marker"), "{error:#}");
+        assert!(!format!("{error:?}").contains("marker"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_reranker_error_does_not_carry_the_url_credentials() {
+        let config = Config {
+            reranker_url: format!("http://{}/rerank?api_key=marker", closed_local_address()),
+            ..Config::default()
+        };
+        let models = Models::new(&config).unwrap();
+        let documents = vec!["fn a() {}".to_owned()];
+
+        let error = models.rerank("query", &documents).await.unwrap_err();
+        assert!(is_connect_error(&error), "{error:#}");
+        assert!(!format!("{error:#}").contains("marker"), "{error:#}");
+        assert!(!format!("{error:?}").contains("marker"), "{error:?}");
     }
 
     #[tokio::test]

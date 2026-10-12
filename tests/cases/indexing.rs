@@ -1564,6 +1564,26 @@ async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
 }
 
 #[tokio::test]
+async fn a_refused_reranker_url_credential_is_not_reported() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_address = closed.local_addr().unwrap();
+    drop(closed);
+    config.reranker_url = format!("http://{closed_address}/rerank?api_key=marker");
+    let workspace = temp.path().join("reranker-url-credential");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    let warning = report.warning.as_deref().unwrap();
+    assert!(warning.contains("reranker request failed"), "{warning}");
+    assert!(!warning.contains("marker"), "{warning}");
+    task.abort();
+}
+
+#[tokio::test]
 async fn a_reranker_error_status_is_retried_by_the_next_search() {
     let (temp, config, fake, task) = fixture().await;
     let workspace = temp.path().join("failing-reranker");
