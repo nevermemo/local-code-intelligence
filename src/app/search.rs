@@ -1074,7 +1074,7 @@ impl App {
                     if self.store.snapshot(workspace).await?.is_some() {
                         action = IndexAction::WaitedForExistingJob;
                     } else {
-                        // The holder committed nothing. If an automatic flight
+                        // The holder committed nothing. If an index job
                         // failed, share its cause instead of starting a
                         // duplicate within the same failed flight.
                         let shared = coordination.flight_error.lock().await.clone();
@@ -1083,8 +1083,8 @@ impl App {
                                 "indexing failed while waiting for the in-progress index job: {cause}"
                             ));
                         }
-                        // The holder was not an automatic flight (e.g. an
-                        // explicit index that failed); we now hold the write
+                        // No failure was recorded (e.g. the holder was
+                        // cancelled); we now hold the write
                         // lock exclusively, so index ourselves.
                         *coordination.flight_error.lock().await = None;
                         match self.index_locked(workspace.clone()).await {
