@@ -25,12 +25,12 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// Per-workspace coordination: the existing read/write lock plus the minimum
-/// state needed to share the outcome of an automatic first-index flight and
+/// state needed to share the outcome of an index job and
 /// to throttle `on-search` staleness checks.
 #[derive(Default)]
 struct WorkspaceCoordination {
     lock: RwLock<()>,
-    /// Formatted cause of the most recent failed automatic first-index flight.
+    /// Formatted cause of the most recent failed index job.
     /// Consulted only by a caller that holds the write lock and finds no
     /// committed snapshot; cleared when a new flight starts.
     flight_error: Mutex<Option<String>>,

@@ -186,7 +186,12 @@ impl App {
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let coordination = self.lock(&workspace.id).await;
         let _write = coordination.lock.write().await;
-        self.index_locked(workspace).await
+        *coordination.flight_error.lock().await = None;
+        let result = self.index_locked(workspace).await;
+        if let Err(error) = &result {
+            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
+        }
+        result
     }
 
     /// Runs the indexing pipeline for `workspace`, assuming the caller already
