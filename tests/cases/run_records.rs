@@ -175,12 +175,19 @@ async fn a_run_record_carries_no_machine_paths_urls_or_unasked_code() {
         .trim_start_matches("http://")
         .trim_end_matches("/v1")
         .to_owned();
+    // A file URI as tools write it: `/` separators, and `file:///C:/...` on
+    // Windows.
+    let slashed = workspace.to_string_lossy().replace('\\', "/");
+    let uri = if slashed.starts_with('/') {
+        format!("file://{slashed}")
+    } else {
+        format!("file:///{slashed}")
+    };
     let query = format!(
-        "Calculator {} {} {} file://{}/src {}",
+        "Calculator {} {} {} {uri}/src {}",
         workspace.display(),
         config.data_dir.display(),
         config.embedding_url,
-        workspace.display(),
         host
     );
     for embedding_fails in [false, true] {
