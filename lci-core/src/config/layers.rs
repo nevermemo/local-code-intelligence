@@ -952,6 +952,8 @@ pub fn resolve_unvalidated(spec: &ResolveSpec) -> Result<Resolved> {
         flags.push("--port".to_owned());
     }
 
+    config.trim_model_settings();
+
     Ok(Resolved {
         config,
         sources,
@@ -1416,12 +1418,18 @@ mod tests {
                 data_dir_line(dir)
             ),
         );
-        let padded_file = resolve(&base_spec(Some(padded_path))).unwrap();
+        let padded_file = resolve(&base_spec(Some(padded_path.clone()))).unwrap();
         assert_eq!(padded_file.config.embedding_identity(), baseline_identity);
         assert_eq!(padded_file.config.embedding_url, "http://127.0.0.1:8766/v1");
         assert_eq!(padded_file.config.embedding_model, "embed-test");
         assert_eq!(padded_file.config.reranker_url, "http://127.0.0.1:8767/rerank");
         assert_eq!(padded_file.config.reranker_model, "rerank-test");
+        assert_eq!(
+            Config::load(Some(&padded_path))
+                .unwrap()
+                .embedding_identity(),
+            baseline_identity
+        );
 
         let mut by_env = base_spec(Some(write(
             dir,
