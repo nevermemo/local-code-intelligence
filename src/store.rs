@@ -16,7 +16,11 @@ use lancedb::{
     query::{ExecutableQuery, QueryBase, Select},
 };
 use serde::Serialize;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone)]
 pub struct Store {
@@ -397,6 +401,23 @@ impl Store {
         Ok(hits)
     }
 
+    pub async fn languages(snapshot: &Snapshot) -> Result<HashSet<String>> {
+        let mut batches = snapshot
+            .table
+            .query()
+            .select(Select::columns(&["language"]))
+            .execute()
+            .await?;
+        let mut languages = HashSet::new();
+        while let Some(batch) = batches.try_next().await? {
+            let column = column::<StringArray>(&batch, "language")?;
+            for i in 0..batch.num_rows() {
+                languages.insert(column.value(i).to_owned());
+            }
+        }
+        Ok(languages)
+    }
+
     pub async fn chunks(snapshot: &Snapshot, workspace: &Workspace) -> Result<Vec<Hit>> {
         let batches = snapshot
             .table
@@ -526,6 +547,66 @@ mod tests {
 
     fn table_dir(lancedb: &Path, name: &str) -> std::path::PathBuf {
         lancedb.join(format!("{name}.lance"))
+    }
+
+    #[tokio::test]
+    async fn languages_match_distinct_chunk_languages_in_a_multilanguage_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = Workspace {
+            id: crate::workspace::hash("multilanguage"),
+            path: temp.path().join("workspace"),
+        };
+        let chunks: Vec<Chunk> = [
+            ("src/a.rs", "rust", "fn a() {}"),
+            ("src/b.py", "python", "def b(): pass"),
+            ("src/c.rs", "rust", "fn c() {}"),
+        ]
+        .into_iter()
+        .map(|(path, language, code)| Chunk {
+            relative_file_path: path.into(),
+            language: language.into(),
+            start_line: 1,
+            end_line: 1,
+            code: code.into(),
+            content_hash: crate::workspace::hash(code),
+        })
+        .collect();
+        store
+            .replace(
+                &workspace,
+                &chunks,
+                &vec![vec![1.0, 0.0, 0.0]; chunks.len()],
+                "identity",
+                3,
+            )
+            .await
+            .unwrap();
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        let expected: HashSet<String> = Store::chunks(&snapshot, &workspace)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.chunk.language)
+            .collect();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(Store::languages(&snapshot).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn languages_are_empty_for_an_empty_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = Workspace {
+            id: crate::workspace::hash("empty"),
+            path: temp.path().join("workspace"),
+        };
+        store
+            .replace(&workspace, &[], &[], "identity", 3)
+            .await
+            .unwrap();
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        assert!(Store::languages(&snapshot).await.unwrap().is_empty());
     }
 
     #[tokio::test]
