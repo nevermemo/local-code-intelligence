@@ -2002,6 +2002,87 @@ fn fake_csharp_release_fixture(
     (config, workspace, state)
 }
 
+/// Both retry paths must keep the replacement session in use while its answer
+/// outlasts the idle timeout. Priming answers immediately; only the real request
+/// is slow, so priming cannot mask a missing session handle.
+#[tokio::test]
+async fn a_retried_symbol_request_is_not_cut_off_by_the_idle_sweep() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_idle_timeout_seconds = 1;
+    config.csharp.args.extend(fake_args(&[
+        "--exit-on-symbol-request",
+        "2",
+        "--symbol-delay-ms",
+        "3000",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let started = std::time::Instant::now();
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the replacement must finish the retried symbol request");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the retried answer must outlast the idle timeout"
+    );
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2, "one restart");
+    assert!(
+        manager.running("csharp-ls", &workspace.id).await,
+        "the idle sweep must not release the replacement during its answer"
+    );
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 0);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_retried_position_request_is_not_cut_off_by_the_idle_sweep() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "definition");
+    config.lsp_timeout_seconds = 5;
+    config.lsp_idle_timeout_seconds = 1;
+    config.csharp.args.extend(fake_args(&[
+        "--exit-on-definition-request",
+        "--definition-delay-ms",
+        "3000",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let started = std::time::Instant::now();
+    let results = manager
+        .definition(
+            &adapter,
+            &workspace,
+            &workspace.path.join("src/CallSite.cs"),
+            "src/CallSite.cs",
+            1,
+            82,
+        )
+        .await
+        .expect("the replacement must finish the retried position request");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the retried answer must outlast the idle timeout"
+    );
+    assert_eq!(
+        results[0].relative_file_path.as_deref(),
+        Some("src/Calculator.cs")
+    );
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2, "one restart");
+    assert!(
+        manager.running("csharp-ls", &workspace.id).await,
+        "the idle sweep must not release the replacement during its answer"
+    );
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert_eq!(event_count(&state, "exit_seen.txt"), 0);
+    manager.shutdown_all().await;
+}
+
 /// The idle timeout (2 s here, checked about every second) shuts an unused
 /// server down through the protocol -- `shutdown`, then `exit` -- and the next
 /// call starts a fresh process instead of failing.
