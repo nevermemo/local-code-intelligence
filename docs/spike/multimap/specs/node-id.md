@@ -263,3 +263,82 @@ locality, ordinal rule, symbol key and impl header, and legacy mapping are unit 
 (declarations hold no path, a moved file's keys join the new path); the bundle store and its
 reuse are deferred to S3. Decision N-5 measured: no same-line twins in any of 201 snapshots of
 this repository (s1-stability.md).
+
+## 8. S3 as built (2026-10-12, slice S3a)
+
+Code: the extraction hook `chunk::extract_with_adapter` / `extract_for_path`
+(`lci-core/src/chunk.rs`, tests in `lci-core/src/chunk/extraction_tests.rs`), the bundle store
+and its sync (`lci-core/src/bundle.rs`, `lci-core/src/bundle/produce.rs`, tests in
+`lci-core/src/bundle/tests.rs`). Nothing on the scan or search path calls either; the
+manifest is unchanged (`VERSION = 2`).
+
+- **Hook.** One parse yields `Extraction { chunks, declarations }`. The chunks come from the
+  same `ranges` walk and trimming as `chunks_with_adapter`, which is left untouched (the loop
+  is repeated in the hook, so the existing function cannot change); a test keeps the two
+  byte-identical on a tree with one file per registered extension and on every Rust and
+  Python file of this repository. Declarations come from the S1 Rust extractor run on the
+  same tree (`node::rust_declarations_in`, split out of `rust_declarations`); other languages
+  give `None`. S4 can make `chunks_with_adapter` call the hook and drop the repeated loop.
+- **Bundle store.** `<data_dir>/bundles/<first 16 hex of the workspace id>/<2 hex>/<30
+  hex>.json`, where the 32 hex digits are the start of SHA-256 of the key
+  `(content_hash, language, adapter_version, producer)` joined by NUL. The file holds
+  `{format, key, payload}`; a file of another format or key (a digest collision), or one that
+  does not parse, reads as missing; a file that exists but cannot be read is an error. Writes
+  go to a temporary file in the same directory and are renamed into place. The relative path
+  is 63 characters (a temporary file's name is longer, up to about 70 characters), so a
+  `data_dir` under the 150-character limit stays under 260 on Windows. When the rename fails
+  but a bundle of the same key is in place (another writer, or Windows refusing to replace a
+  file held open), that bundle is kept: a bundle is a function of its key.
+  `BundleStore::retain(keys)` deletes the bundle files of one workspace whose key is not in
+  `keys`, and temporary files older than an hour (a killed writer); nothing else. A file name
+  does not say which producer wrote it, so `keys` must be the union over every producer that
+  uses the store (today only `sym.defs@1`).
+- **Producers and sync.** A `Producer` names itself with a version (`sym.defs@1`), says which
+  languages it applies to, and derives a payload from an `Extraction`. `bundle::sync(store,
+  producer, root, files)` visits a scan's files in path order: a stored bundle is reused
+  without reading the file; otherwise the file is read, must still hash to the scan's
+  `content_hash` and still map to the scanned adapter and version, is extracted with the hook
+  and stored. Any failure fails the whole sync, so a caller keeps its previous data
+  (contract C3). Until S4 wires the hook into `scan_incremental`, a file whose bundle is
+  missing is parsed twice (once by the scan, once by the sync); a file whose content is
+  already bundled (unchanged, moved or copied) is not read at all.
+- **Path-free payloads.** The `sym.defs` payload is `StoredDeclaration` (inline modules,
+  container, name, kind name, disambiguator, lines); the module path is joined at read time
+  from the file's current path (`Declaration::key`).
+
+Section 6 "No paths in bundles": done
+(`bundle::tests::sync::a_moved_file_reuses_its_bundle_unchanged_and_joins_the_new_path`):
+after a move the sync reuses both bundles (0 extracted), their files are byte-identical, the
+keys are equal, no bundle text contains a path fragment, and the joined symbol ids use the new
+path and equal a fresh extraction's.
+
+Open decisions added here:
+
+| # | Decision taken here | Alternative | Revisit at |
+| --- | --- | --- | --- |
+| N-10 | One bundle store per workspace, so `retain` can delete unused bundles without knowing other workspaces. | One content-addressed store shared by all workspaces of a `data_dir` (a file indexed in two workspaces is extracted once; needs reference counting to delete). | When a `data_dir` commonly holds several large workspaces. |
+| N-11 | A sync fails as a whole on the first file it cannot read or that changed since the scan. | Skip that file and mark the map stale for it. | When the hook runs inside the scan (S4): the race then disappears. |
+| N-12 | A producer's id carries a version that is bumped by hand when its output changes, the extractor's code included. | Derive the version from a hash of the extractor's source. | First accidental reuse of a stale bundle. |
+
+### N-9 settled (2026-10-12, owner: "crate name fusion")
+
+The canonical Rust module path of a file in a crate that is not at the repository root uses
+the Cargo crate name: `[package].name` from `<crate directory>/Cargo.toml`, `-` turned into
+`_`, as Rust code writes it (`lci-core/src/chunk.rs` -> `lci_core::chunk`). The directory form
+(`lci-core::chunk`) stays a valid alias: `SymIndex::resolve` maps it to the canonical id and
+`SymIndex::lookup` finds the same declarations for either form, so the two never become two
+nodes. There is no edge store yet, so the alias is a resolution rule, not a stored edge.
+Names are read from the tree when bundles are joined (`lci_maps::crates::CrateNames`), never
+stored in a bundle. Taken as the conservative reading where the decision left a choice:
+
+| # | Decision taken here | Alternative | Revisit at |
+| --- | --- | --- | --- |
+| N-13 | The root crate's files keep their S1 path without a crate-name prefix (`src/app/search.rs` -> `app::search`), as `crate::app::search` is written inside the crate; only the directory prefix of a non-root crate is replaced. | Prefix every file with its crate name (`local_code_intelligence::app::search`), which changes every root-crate symbol id. | S4 trait freeze. |
+| N-15 | A crate name that another crate also uses, or that is itself some crate's directory, is not applied: those crates keep the directory form, so two crates never share a first segment and resolving an id twice gives the same id. | A discriminator suffix on colliding names. | First workspace with such a collision. |
+| N-14 | A crate directory without a readable `[package].name` (no manifest, `name.workspace = true`) keeps the directory form. | Fall back to the directory name with `-` turned into `_`. | First workspace with inherited names. |
+
+S1's own key function (`Declaration::key`, `rust_module_path`) is unchanged; the crate name is
+applied by `sym.defs` at join time. S1's stability measurement (`../s1-stability.md`) used the
+directory form; renaming a crate's package now changes its symbol ids, renaming its directory
+alone does not (the alias still resolves only for the current directory).
+

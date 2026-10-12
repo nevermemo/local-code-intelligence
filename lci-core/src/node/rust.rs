@@ -241,13 +241,19 @@ pub fn rust_declarations(source: &str) -> Result<Vec<Declaration>> {
     let tree = parser
         .parse(source, None)
         .context("Tree-sitter parse cancelled")?;
+    Ok(rust_declarations_in(tree.root_node(), source))
+}
+
+/// [`rust_declarations`] over a tree already parsed from `source` with the
+/// Rust grammar (the extraction hook's single parse, slice S3).
+pub fn rust_declarations_in(root: Node<'_>, source: &str) -> Vec<Declaration> {
     let mut walk = Walk {
         source,
         modules: Vec::new(),
         container: Vec::new(),
         out: Vec::new(),
     };
-    walk.children(tree.root_node());
+    walk.children(root);
     let mut seen = HashMap::<(Vec<String>, Vec<String>, String, &str), u16>::new();
     for declaration in &mut walk.out {
         let count = seen
@@ -261,5 +267,5 @@ pub fn rust_declarations(source: &str) -> Result<Vec<Declaration>> {
         declaration.disambiguator = *count;
         *count = count.saturating_add(1);
     }
-    Ok(walk.out)
+    walk.out
 }

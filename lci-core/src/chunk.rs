@@ -191,6 +191,69 @@ fn chunks_with_adapter(
     Ok(chunks)
 }
 
+/// What one parse of a file yields (the extraction hook of the multimap
+/// spike, slice S3): the file's chunks, exactly as [`chunks_for_path`] gives
+/// them, and its declarations where the language has an extractor (Rust
+/// only so far; `None` for every other language).
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub chunks: Vec<Chunk>,
+    pub declarations: Option<Vec<crate::node::Declaration>>,
+}
+
+/// [`chunks_for_path`] plus the declarations, from one parse.
+pub fn extract_for_path(path: &str, source: &str) -> Result<Extraction> {
+    let Some(adapter) = language::for_path(Path::new(path)) else {
+        bail!("unsupported source extension: {path}");
+    };
+    extract_with_adapter(path, source, adapter)
+}
+
+/// The extraction hook beside `chunks_with_adapter`: one parse, then the
+/// same chunking steps on that tree and the declaration walk on it. Nothing
+/// on the scan or search path calls it yet, so today's chunk output cannot
+/// change; `extraction_tests` keeps the two byte-identical on the fixture
+/// trees until S4 makes `chunks_with_adapter` call this.
+pub fn extract_with_adapter(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser.set_language(&adapter.grammar())?;
+    let tree = parser
+        .parse(source, None)
+        .context("Tree-sitter parse cancelled")?;
+    let mut spans = Vec::new();
+    ranges(adapter, tree.root_node(), &mut spans);
+    let mut chunks = Vec::new();
+    for &(start, end) in &spans {
+        let raw = &source[start..end];
+        let code = raw.trim();
+        if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+            continue;
+        }
+        let begin = start + raw.len() - raw.trim_start().len();
+        let finish = begin + code.len();
+        chunks.push(Chunk {
+            relative_file_path: path.into(),
+            language: adapter.identifier().into(),
+            start_line: source[..begin].bytes().filter(|&b| b == b'\n').count() as u32 + 1,
+            end_line: source[..finish].bytes().filter(|&b| b == b'\n').count() as u32 + 1,
+            code: code.into(),
+            content_hash: hash(code),
+        });
+    }
+    #[cfg(test)]
+    tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
+    let declarations = (adapter.identifier() == "rust")
+        .then(|| crate::node::rust_declarations_in(tree.root_node(), source));
+    Ok(Extraction {
+        chunks,
+        declarations,
+    })
+}
+
 struct SourceFile {
     relative_path: String,
     source: String,
@@ -382,6 +445,9 @@ pub fn scan_incremental(
 pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
     Ok(scan_incremental(root, &HashMap::new())?.chunks)
 }
+
+#[cfg(test)]
+mod extraction_tests;
 
 #[cfg(test)]
 mod tests {

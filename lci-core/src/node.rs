@@ -13,7 +13,7 @@
 
 mod rust;
 
-pub use rust::{Declaration, rust_declarations, rust_module_path};
+pub use rust::{Declaration, rust_declarations, rust_declarations_in, rust_module_path};
 
 use crate::chunk::Chunk;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

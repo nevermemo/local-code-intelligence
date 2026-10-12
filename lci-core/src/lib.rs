@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod chunk;
 pub mod config;
 pub mod filter;

@@ -252,3 +252,47 @@ language server failing while another answers) are compared with a traced search
 `tests/cases/indexing.rs`. Disabled is silent: done at registry level (kit, "switched off"); the timing part
 waits for an engine. Order independence of registration: done. Filter before fusion and
 status-to-error mapping: deferred, they need C2 and the engine (S4).
+
+## 8. S3 as built (2026-10-12, slice S3a)
+
+Code: `lci-maps/src/symdefs.rs` (the `sym.defs` map), `lci-maps/src/fresh.rs` (`Target`,
+`Refreshable`), tests in `lci-maps/src/symdefs/tests.rs`. No production search registers it.
+
+Changes to this spec, each the conservative choice where one was open:
+
+- **`IndexedMap` is split in two.** Per-file extraction is a `lci_core::bundle::Producer`
+  (`id`, `applies`, `produce(path, &Extraction)`, `key`), not a method of the map: the hook
+  lives in `lci-core`, which cannot depend on `lci-maps` (decision N-2). The map side is
+  `fresh::Refreshable { data_snapshot(), refresh(&mut self, &Target) }`, where `Target` is the
+  core snapshot's identity, the workspace root and the snapshot's files (the manifest's),
+  instead of `(ScanDelta, BundleStore)`: the map recomputes its delta from the bundle keys, so
+  it needs no delta type, and a refresh error is a `String` because `lci-maps` has no
+  `anyhow` dependency (adding one needs a manifest change outside this slice).
+- **`sym.defs` descriptor:** id `sym.defs`, version 1, `RankList`, accepts text, emits
+  `Chunk`, freshness `per-file`, label `tags` (Tree-sitter), needs nothing.
+- **Answer.** The query is split into identifier tokens (maximal runs of alphanumeric
+  characters and `_`, Unicode-aware). A declaration matches when its name equals a token ignoring case; exact-case
+  matches rank first, then the rest, each class ordered by the symbol's canonical string. Each
+  match is projected to its head chunk (decision M-4): among the chunks overlapping the
+  declaration's lines, the first in source order whose code names the declaration as a
+  whole identifier (the signature chunk, not a body fragment or a lone `pub trait` keyword
+  chunk); failing that, the chunk holding its first line, the one starting last on a tie. Two
+  items on one line can share a head. A declaration in no chunk is left out, as is a head
+  outside the view. A chunk is listed once, at its best declaration; ranks are positions.
+  Evidence: `via = None`, `QueryMatch`, `tags`, detail = the symbol's canonical string (its
+  last 256 bytes when longer, so `::<name>/<kind>` survives). `score` is `None`.
+- **Build.** `build`/`refresh` syncs the bundles, joins them and replaces the data only when
+  the sync succeeded; `last_sync` records (reused, extracted). It then deletes the store's
+  bundles no current file uses (`BundleStore::retain` with this producer's keys, so the store
+  must hold no other producer's bundles; today it holds only `sym.defs@1`); a failed clean-up
+  is kept in `cleanup_error` and does not fail the build.
+- **Freshness of the answer.** `freshness.snapshot` is the snapshot the data was built for,
+  not the view's; `stale` is true when they differ (the hits are then those of the old data
+  that are still chunks of the view). A map that was never built answers `Failed` with a
+  warning.
+- **Cost:** `nodes_touched` is the number of declarations held; `elapsed_ms` is measured.
+  The deadline is not checked inside the call (the answer is an in-memory lookup); the
+  registry's timeout still applies.
+
+Test status: kit C1 (`check_fail_open`) and C6 (`check_determinism`) pass for `sym.defs`
+against a control map; registered beside it, its hits fuse with weight 1.
