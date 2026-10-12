@@ -564,9 +564,18 @@ pub fn for_path(path: &Path) -> Option<&'static LanguageAdapter> {
         .and_then(for_extension)
 }
 
-/// Iterate over the registered language identifiers.
+/// Iterate over the registered language identifiers, each once, in the order
+/// of their first adapter (`cpp` belongs to two extensions).
 pub fn identifiers() -> impl Iterator<Item = &'static str> {
-    ADAPTERS.iter().map(|adapter| adapter.identifier)
+    ADAPTERS
+        .iter()
+        .enumerate()
+        .filter(|(index, adapter)| {
+            !ADAPTERS[..*index]
+                .iter()
+                .any(|earlier| earlier.identifier == adapter.identifier)
+        })
+        .map(|(_, adapter)| adapter.identifier)
 }
 
 /// Report whether `identifier` is a registered language identifier.
@@ -688,6 +697,26 @@ mod tests {
             });
         }
         bytes
+    }
+
+    #[test]
+    fn each_identifier_is_listed_once_in_registration_order() {
+        assert_eq!(
+            identifiers().collect::<Vec<_>>(),
+            [
+                "rust",
+                "typescript",
+                "tsx",
+                "javascript",
+                "jsx",
+                "python",
+                "csharp",
+                "go",
+                "java",
+                "c",
+                "cpp"
+            ]
+        );
     }
 
     #[test]

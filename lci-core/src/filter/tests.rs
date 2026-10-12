@@ -524,6 +524,26 @@ fn rejects_unknown_language() {
 }
 
 #[test]
+fn the_unknown_language_message_names_each_identifier_once() {
+    let req = FilterRequest {
+        languages: Some(vec!["cobol".into()]),
+        ..Default::default()
+    };
+    let message = EffectiveFilter::from_request(&req).unwrap_err().to_string();
+    let (_, listed) = message.split_once("registered identifiers: ").unwrap();
+    let listed: Vec<&str> = listed.split(", ").collect();
+    assert_eq!(
+        listed.iter().filter(|name| **name == "cpp").count(),
+        1,
+        "{message}"
+    );
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), listed.len(), "{message}");
+}
+
+#[test]
 fn rejects_unknown_source_role() {
     let req = FilterRequest {
         source_roles: Some(vec!["bogus".into()]),
