@@ -117,20 +117,31 @@ impl Map for Labelled<'_> {
         let descriptor = self.describe();
         match check_labels(descriptor, &response) {
             Ok(()) => response,
-            Err(reason) => MapResponse {
-                hits: Vec::new(),
-                status: MapStatus::Failed {
-                    warning: format!("map {} returned an invalid answer: {reason}", descriptor.id),
-                },
-                ..response
-            },
+            Err(reason) => {
+                let mut warning =
+                    format!("map {} returned an invalid answer: {reason}", descriptor.id);
+                // Keep what a partial answer said about itself.
+                if let MapStatus::Partial { note, warning: own } = &response.status {
+                    for text in [own, note].into_iter().flatten() {
+                        warning.push_str("; ");
+                        warning.push_str(text);
+                    }
+                }
+                MapResponse {
+                    hits: Vec::new(),
+                    status: MapStatus::Failed { warning },
+                    ..response
+                }
+            }
         }
     }
 }
 
 /// The kit's contract C5: runs the subject beside the control and checks
 /// every answer the registry got, the subject's and the control's, against
-/// its card. A failure names the map and the label.
+/// its card. A failure names the map and the label. The check must bite: a
+/// subject that returns no used hit (an empty or failed answer, or one the
+/// registry refused) is a kit failure, not a pass.
 pub async fn check_source_labels<'a>(
     subject: Factory<'_, 'a>,
     control: Factory<'_, 'a>,
@@ -150,6 +161,21 @@ pub async fn check_source_labels<'a>(
     let run = registry
         .run(Some(fixture.text), fixture.budget, fixture.view)
         .await;
+    let subject_id = descriptors[0].id;
+    let exercised = run.calls.iter().any(|call| {
+        call.id == subject_id
+            && matches!(
+                call.response.status,
+                MapStatus::Ok | MapStatus::Partial { .. }
+            )
+            && !call.response.hits.is_empty()
+    });
+    if !exercised {
+        return Err(ContractFailure {
+            contract: "kit",
+            detail: format!("map {subject_id} returned no used hit, so C5 was not exercised"),
+        });
+    }
     for call in &run.calls {
         let descriptor = descriptors
             .iter()
@@ -300,6 +326,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.contract, "C5", "{failure:?}");
         assert!(failure.detail.contains("no evidence"), "{failure:?}");
+        // A subject with nothing to check does not pass vacuously.
+        let empty = || map(&view, "empty", vec![], None, &[]);
+        let failure = check_source_labels(&empty, &control, &fixture)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.contract, "kit", "{failure:?}");
         // The control is checked too: a mislabelled control is caught.
         let failure = check_source_labels(&good, &bad, &fixture)
             .await

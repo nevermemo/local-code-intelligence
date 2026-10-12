@@ -117,11 +117,12 @@ impl App {
 
     /// Strings no record may contain (run-record.md 3.2), each with its
     /// placeholder: the workspace and the data directory (as given when
-    /// absolute, and resolved), each also with `/` separators, as a
-    /// `file://` URI and with spaces percent-encoded; the service URLs and
-    /// their `host:port`; and every absolute executable path in the
-    /// configuration. A relative path is never a secret: it could match
-    /// repository paths.
+    /// absolute, and resolved; trailing separators dropped), each also with
+    /// `/` separators, as a `file://` URI and with spaces percent-encoded,
+    /// and on Windows lower-cased and with the drive colon as `%3A`; the
+    /// service URLs and their `host:port`; and every absolute executable
+    /// path in the configuration. A relative path is never a secret: it
+    /// could match repository paths.
     fn record_secrets(&self, path: &Path) -> Vec<(String, &'static str)> {
         let config = &self.config;
         let mut secrets = Vec::new();
@@ -131,14 +132,29 @@ impl App {
                 if !candidate.is_absolute() {
                     continue;
                 }
-                let raw = candidate.to_string_lossy().into_owned();
+                let full = candidate.to_string_lossy().into_owned();
+                let raw = full.trim_end_matches(['/', '\\']);
+                let raw = if raw.is_empty() { full.as_str() } else { raw };
                 let slashed = raw.replace('\\', "/");
                 let uri = if slashed.starts_with('/') {
                     format!("file://{slashed}")
                 } else {
                     format!("file:///{slashed}")
                 };
-                for form in [raw, slashed.replace(' ', "%20"), uri, slashed] {
+                let mut forms = vec![
+                    raw.to_owned(),
+                    slashed.replace(' ', "%20"),
+                    uri,
+                    slashed.clone(),
+                ];
+                if cfg!(windows) {
+                    if let Some((drive, rest)) = slashed.split_once(':') {
+                        forms.push(format!("file:///{drive}%3A{rest}"));
+                    }
+                    let lower: Vec<String> = forms.iter().map(|form| form.to_lowercase()).collect();
+                    forms.extend(lower);
+                }
+                for form in forms {
                     secrets.push((form, placeholder));
                 }
             }
@@ -153,7 +169,7 @@ impl App {
             if let Some(host) = url
                 .split_once("://")
                 .and_then(|(_, rest)| rest.split('/').next())
-                .filter(|host| !host.is_empty())
+                .filter(|host| host.contains(':'))
             {
                 secrets.push((host.to_owned(), host_placeholder));
             }

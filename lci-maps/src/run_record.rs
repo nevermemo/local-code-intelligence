@@ -121,6 +121,9 @@ pub fn utc_rfc3339(at: SystemTime) -> String {
     )
 }
 
+/// Fields that hold NodeIds, skipped by [`redact`].
+const STRUCTURAL: [&str; 2] = ["node", "via"];
+
 /// Replaces each secret (an absolute path, a service URL, a `host:port`) in
 /// every string of `value` with its placeholder, wherever it stands on its
 /// own: the character before it is not a letter, digit, `_`, `-` or `.`,
@@ -128,7 +131,9 @@ pub fn utc_rfc3339(at: SystemTime) -> String {
 /// `/src` redacts `/src/x.rs` and `"/src"` but leaves the repository path
 /// `lib/src/x.rs` (and so the NodeIds) alone. Longer secrets are replaced
 /// first, so a path inside another is never half-replaced. Empty secrets
-/// are ignored.
+/// are ignored. NodeIds (`node`, `via`) are never rewritten: they are
+/// repository-relative by construction, and a rewritten one would fail the
+/// schema.
 pub fn redact(value: &mut Value, secrets: &[(String, &str)]) {
     let mut ordered: Vec<&(String, &str)> = secrets.iter().filter(|(s, _)| !s.is_empty()).collect();
     ordered.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
@@ -166,7 +171,13 @@ pub fn redact(value: &mut Value, secrets: &[(String, &str)]) {
                 }
             }
             Value::Array(items) => items.iter_mut().for_each(|item| walk(item, secrets)),
-            Value::Object(fields) => fields.values_mut().for_each(|field| walk(field, secrets)),
+            Value::Object(fields) => {
+                for (key, field) in fields.iter_mut() {
+                    if !STRUCTURAL.contains(&key.as_str()) {
+                        walk(field, secrets);
+                    }
+                }
+            }
             _ => {}
         }
     }

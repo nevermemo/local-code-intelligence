@@ -185,8 +185,9 @@ async fn a_run_record_carries_no_machine_paths_urls_or_unasked_code() {
         for snippets in [false, true] {
             let mut options = RecordOptions::new(temp.path().join("records"));
             options.capture_snippets = snippets;
+            // Given with a trailing separator, as a caller may pass it.
             let recorded = app
-                .record_through_maps(&workspace, &query, &options)
+                .record_through_maps(&workspace.join(""), &query, &options)
                 .await
                 .unwrap();
             if embedding_fails {

@@ -54,14 +54,17 @@ one-shot search records steps for all of them and never pauses.
 - Code text only as `snippet` (the existing bounded snippet: cut at 400 bytes plus a 3-byte
   ellipsis, `src/store.rs:56-73`), and only when `capture.snippets` is true.
 - Redaction (S3): before a line is written, the workspace path and the data directory (as
-  given when absolute, and resolved; each also with `/` separators, as a `file://` URI and
-  with spaces as `%20`), the embedding and reranker URLs and their `host:port`, and every
+  given when absolute, and resolved; trailing separators dropped; each also with `/`
+  separators, as a `file://` URI and with spaces as `%20`, and on Windows lower-cased and
+  with the drive colon as `%3A`), the embedding and reranker URLs and their `host:port` (only
+  when the URL names a port), and every
   absolute executable path in the configuration are replaced by a placeholder
   (`<workspace>`, `<data_dir>`, `<embedding_url>`, `<embedding_host>`, `<reranker_url>`,
   `<reranker_host>`, `<executable>`) in every string, the query text included. A match
   counts only where the secret stands on its own (no letter, digit, `_`, `-` or `.` before
   it; no letter, digit, `_` or `-` after it), so a workspace at `/src` never rewrites the
-  repository path `lib/src/x.rs` inside a NodeId. A relative path is never a secret.
+  repository path `lib/src/x.rs`. NodeId fields (`node`, `via`) are never rewritten: they are
+  repository-relative by construction. A relative path is never a secret.
   Evidence `detail` is cut to 200 characters.
 - Private gold sets: `item.set` is an opaque id; records of private items stay outside the
   repository, like every report (`test-results/`, `AGENTS.md`, Working method).

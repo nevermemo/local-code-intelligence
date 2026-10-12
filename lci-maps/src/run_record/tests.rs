@@ -154,6 +154,7 @@ fn redaction_replaces_every_secret_longest_first() {
 fn redaction_leaves_repository_paths_and_numbers_alone() {
     let original = json!({
         "node": "chunk:lib/src/a.rs@00ff#0",
+        "hits": [{ "node": "chunk:c++/src/x.cc@00ff#0", "evidence": [{ "via": "file:+/src" }] }],
         "via": "file:src/b.rs",
         "other": "/srcs/x and /src-old/y",
     });
