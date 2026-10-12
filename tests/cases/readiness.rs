@@ -1,6 +1,57 @@
 use super::*;
 
 #[tokio::test]
+async fn java_readiness_checks_the_launcher_jar_in_the_install_directory() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    let install = temp.path().join("jdtls");
+    let plugins = install.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("org.eclipse.equinox.launcher.jar"), b"").unwrap();
+    config.java.path = Some(install.to_string_lossy().into_owned());
+    let app = App::open(config).await.unwrap();
+    let status = app.service_status().await;
+    let component = status
+        .components
+        .iter()
+        .find(|component| component.name == "java_language_server_available")
+        .unwrap();
+    assert!(component.ready, "{:?}", component.detail);
+    assert!(!component.required);
+    assert!(
+        !status
+            .degraded
+            .iter()
+            .any(|entry| entry.name == "java_language_server_available")
+    );
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn java_readiness_without_a_launcher_jar_is_degraded_but_optional() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    let install = temp.path().join("jdtls");
+    std::fs::create_dir_all(install.join("plugins")).unwrap();
+    config.java.path = Some(install.to_string_lossy().into_owned());
+    let app = App::open(config).await.unwrap();
+    let status = app.service_status().await;
+    let component = status
+        .components
+        .iter()
+        .find(|component| component.name == "java_language_server_available")
+        .unwrap();
+    assert!(!component.ready);
+    assert!(!component.required);
+    assert!(status.ready);
+    assert!(
+        status
+            .degraded
+            .iter()
+            .any(|entry| entry.name == "java_language_server_available")
+    );
+    models_task.abort();
+}
+
+#[tokio::test]
 async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
     let temp = tempfile::tempdir().unwrap();
     let unavailable = Config {
