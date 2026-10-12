@@ -659,7 +659,8 @@ async fn call<'a>(
     record(response)
 }
 
-/// The registry's checks on an answer with hits: every node is a chunk of
+/// The registry's checks on an answer with hits: a partial answer names
+/// what is missing, every node is a chunk of
 /// the view (and, for a prior, one of its seeds), no node twice, ranks
 /// are at least 1 and never fall, scores are finite, a prior carries its value, and
 /// no more than `limit` hits.
@@ -672,6 +673,14 @@ fn check(
 ) -> Result<(), String> {
     if !matches!(response.status, MapStatus::Ok | MapStatus::Partial { .. }) {
         return Ok(());
+    }
+    // A partial answer must say what is missing (`MapStatus::Partial`).
+    if let MapStatus::Partial {
+        note: None,
+        warning: None,
+    } = response.status
+    {
+        return Err("a partial answer with neither a note nor a warning".into());
     }
     if descriptor.contribution != Contribution::Prior && response.hits.len() > limit {
         return Err(format!(
