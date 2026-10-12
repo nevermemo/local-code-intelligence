@@ -1,7 +1,8 @@
 # Multimap traversal evaluation seed set
 
 - Generated: `2026-10-12T04:22Z` (UTC)
-- Base commit: `7f9c636` (`origin/fix/verified-bugs`, 188 commits of history). Answers were verified there; the spike branch adds only docs under `docs/spike/multimap/`, which no question references by line and which co-change counts exclude.
+- Revised: `2026-10-12T06:51Z` (UTC): fact-check corrections to q07, q08, q11, q13, q14, q15, q22 and q23; baseline expectations and the Baseline section added
+- Base commit: `7f9c636` (`origin/fix/verified-bugs`, 188 commits of history). Answers, co-change counts, recency and commit answers were verified there; the spike branch adds only docs under `docs/spike/multimap/`, which no question references by line and which co-change counts exclude. History counts by revision: 188 at `7f9c636`, 191 at spike commit `842a5e9` (the count first written into q08), 192 at spike commit `b5e5851`. A shallow clone gives wrong counts; use a full clone.
 - Machine-readable twin: `eval-seed.json` (same ids, answers, and verification)
 - Questions: 28 (easy 4, medium 16, hard 8); `needs_model_service` is false for all
 
@@ -11,7 +12,7 @@ Seed questions for the modular multimap traversal spike. Each question is about 
 
 ## Schema
 
-Top level: `schema_version`, `generated`, `base_commit`, `repository` (`self`), `questions[]`. Each question has `id`, `question`, `maps` (map kinds needed), `hops` (expected traversal steps), `answer[]` (`path`, `symbol`, `lines`, `role`), `verification[]` (`method`: `grep` | `read` | `git_log`, `detail`), `needs_model_service`, and `difficulty`.
+Top level: `schema_version`, `generated`, `base_commit`, `repository` (`self`), `questions[]`. Each question has `id`, `question`, `maps` (map kinds needed), `hops` (expected traversal steps), `answer[]` (`path`, `symbol`, `lines`, `role`), `verification[]` (`method`: `grep` | `read` | `git_log`, `detail`), `needs_model_service`, `difficulty`, `baseline_expectation` (`guess`: `easy` | `needs-reading` | `needs-structure`, plus `basis`; a guess, see Baseline), and an optional `notes` string. The top level also has `revised`, `history_counts` and `baseline_expectation_note`.
 
 Conventions:
 
@@ -19,6 +20,27 @@ Conventions:
 - `lines` is one-based and inclusive. It usually spans the whole item (function, impl, test). The specific line inside it is given in `role`, for example `caller (line 195 ...)`.
 - Co-change answers leave `symbol` and `lines` empty and put the count in `role` as `k of n commits`. They are counted without `--follow`.
 - `verification` commands use short forms (`rg` for ripgrep). The co-change command is `git log --format=%h -- <file> | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn`.
+
+## Baseline
+
+The questions have real cross-file chains, but a lexical search plus reading files can recover most of them: a distinctive string from the question (an error text, a config key, a hook name) usually lands on the first hop, and reading the hit and its neighbours does the rest. The `maps` labels say which kinds of map *could* serve each hop. They do not show that graph traversal is *needed*, and they were written by the same author who picked the questions.
+
+So the spike's evaluation must include a lexical-plus-reading baseline: an agent with ripgrep and file reads only (and, as a separate arm, plain `git` CLI for the history questions). For every question and every arm, record:
+
+- hops: search or navigation calls made;
+- files read (count and paths);
+- tokens read and spent;
+- whether the answer matched (per answer row, using the Line drift rules).
+
+"Multimap helps" is then a measured difference against that baseline, not an assumption.
+
+Each question carries a `baseline_expectation` guess. It is the author's guess, not a measurement:
+
+- `easy`: one grep plus reading one or two files answers it;
+- `needs-reading`: lexical search finds the entry point, but the answer needs following several references by reading;
+- `needs-structure`: the working tree alone cannot answer it (git history counts, recency or commits). With plain `git` CLI allowed, most of these probably drop to `needs-reading`.
+
+Current guesses: easy 1, needs-reading 13, needs-structure 14. Every `needs-structure` guess is there because of git history, none because of a code graph. That is the main reason to measure before building graph maps.
 
 ## Line drift
 
@@ -59,6 +81,8 @@ One REST endpoint served by LCI has no MCP tool counterpart. Which endpoint is i
 
 Maps: `entrypoint_rest`, `entrypoint_mcp`, `call_graph`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep the route and #[tool] lists, diff them by reading two files, then follow two calls.
+
 Hops:
 
 1. List the REST routes in the router and the #[tool] methods of the MCP server; diff the two sets.
@@ -89,6 +113,8 @@ Verification:
 AGENTS.md tells Windows users to keep data_dir below a length limit and says /ready degrades above it. Where is the numeric limit defined, which function builds the readiness component, where is it wired into the readiness report with a compile-time platform check, which HTTP route exposes the report, and which tests pin the rule?
 
 Maps: `agent_instructions`, `doc_to_code`, `build_graph`, `call_graph`, `entrypoint_rest`, `test_link`
+
+Baseline expectation (guess, not measured): `needs-reading`: the AGENTS.md wording gives grep terms; the chain is followed by reading call sites.
 
 Hops:
 
@@ -124,6 +150,8 @@ When the command-line search is given a search profile name that is not configur
 
 Maps: `entrypoint_cli`, `call_graph`, `config_key`, `error_string`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep 'unknown search profile' finds the message and the test; the CLI path needs reading.
+
 Hops:
 
 1. Find the clap flag for the profile on the Search subcommand.
@@ -153,6 +181,8 @@ Verification:
 Which configuration key decides whether rust-analyzer may run repository build scripts and use the network, which adapter methods read it, where does the LSP manager hand those environment overrides to the spawned process, which unit tests cover both settings, and which commit introduced it?
 
 Maps: `config_key`, `trait_impl`, `call_graph`, `test_link`, `git_commit_message`
+
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep plus reading from the key name; the commit needs git history.
 
 Hops:
 
@@ -188,6 +218,8 @@ The LspAdapter trait has an optional hook that runs before a definition or refer
 
 Maps: `trait_impl`, `lsp_symbol`, `call_graph`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep the hook name across lsp/*.rs; the default-only set is a diff over seven files.
+
 Hops:
 
 1. Read the trait and find the default method.
@@ -219,6 +251,8 @@ Verification:
 Exactly one language-server adapter overrides both the hook that classifies a JSON-RPC error as 'still loading' and the hook that supplies child-process environment overrides. Which adapter, where are those two hooks consumed in the LSP manager, and which test pins the loading-error rule?
 
 Maps: `trait_impl`, `call_graph`, `lsp_reference`, `test_link`
+
+Baseline expectation (guess, not measured): `needs-reading`: grep both hook names and intersect; consumers found by grep of the method names.
 
 Hops:
 
@@ -252,6 +286,8 @@ A file with the TypeScript extension that is really a Qt Linguist translation ca
 
 Maps: `language_map`, `call_graph`, `test_link`, `git_commit_message`
 
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep for qt_linguist/non_source; the commit needs git history.
+
 Hops:
 
 1. Find the ts LanguageAdapter and its non-source check.
@@ -265,7 +301,7 @@ Answer:
 | --- | --- | --- | --- |
 | `lci-core/src/language.rs` | `LanguageAdapter::non_source` | 60-65 | detector |
 | `lci-core/src/language.rs` | `qt_linguist` | 414-423 | detector |
-| `lci-core/src/chunk.rs` | `sources` | 204-249 | caller (line 229 pushes SkippedFile) |
+| `lci-core/src/chunk.rs` | `sources` | 204-249 | caller (line 229 calls non_source, line 230 pushes SkippedFile) |
 | `lci-core/src/language.rs` | `tests::qt_linguist_catalogs_are_recognized_by_their_xml_start` | 628-646 | test |
 | `tests/cases/indexing.rs` | `a_qt_linguist_ts_file_is_skipped_while_typescript_is_indexed` | 3281-3343 | test |
 | `df1255c` | `commit: N11: Qt Linguist .ts catalogs are skipped instead of parsed as TypeScript` |  | commit |
@@ -281,6 +317,8 @@ Verification:
 The file that defines the JSON-RPC client used to talk to every language server: which test file has changed together with it most often in git history, and which test-support file is its most frequent support co-change? Give the counts.
 
 Maps: `lsp_symbol`, `module_graph`, `git_cochange`, `test_link`
+
+Baseline expectation (guess, not measured): `needs-structure`: co-change counts need git history.
 
 Hops:
 
@@ -299,13 +337,15 @@ Answer:
 Verification:
 
 - grep: `rg -n 'pub struct JsonRpcClient' lci-core (transport.rs 142)`
-- git_log: `git log --format=%h -- lci-core/src/lsp/transport.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> tests/cases/navigation.rs 9/10; tests/support/fake_lsp.rs 7/10 (tied with lci-core/src/config.rs 7 and docs/development/roadmap.md 7); lci-core/src/lsp.rs 6/10; 10 commits touch the file (no --follow), full history of 191 commits`
+- git_log: `git log --format=%h -- lci-core/src/lsp/transport.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> tests/cases/navigation.rs 9/10; tests/support/fake_lsp.rs 7/10 (tied with lci-core/src/config.rs 7 and docs/development/roadmap.md 7); lci-core/src/lsp.rs 6/10; 10 commits touch the file (no --follow), history counts: 188 commits at base 7f9c636, where the counts above were taken; the earlier "191" was the spike branch at 842a5e9 (192 at b5e5851); the spike commits touch only docs/spike, so the co-change counts are the same at base and at the spike tip`
 
 ### q09 (easy)
 
 Which source file changes most often together with the language registry (the module mapping file extensions to Tree-sitter grammars and identifiers), how many of the registry's commits include it, and which function in that file looks languages up per path during the workspace scan?
 
 Maps: `language_map`, `git_cochange`, `call_graph`
+
+Baseline expectation (guess, not measured): `needs-structure`: co-change counts need git history.
 
 Hops:
 
@@ -331,6 +371,8 @@ Verification:
 Which non-documentation source file changes most often together with the search pipeline module (the one holding App::search_in_profile), what are the counts, and through which two methods of that file does a search obtain its per-query settings?
 
 Maps: `git_cochange`, `config_key`, `call_graph`
+
+Baseline expectation (guess, not measured): `needs-structure`: co-change counts need git history.
 
 Hops:
 
@@ -359,6 +401,8 @@ Without RUST_LOG set, why do events from the lci-core crate (LSP restarts, JSON-
 
 Maps: `git_commit_message`, `config_key`, `entrypoint_cli`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-structure`: code part is one grep for 'lci_core=info'; the commit needs git history.
+
 Hops:
 
 1. Find the default env-filter string in the binary.
@@ -371,7 +415,7 @@ Answer:
 | Path | Symbol | Lines | Role |
 | --- | --- | --- | --- |
 | `src/main.rs` | `DEFAULT_LOG_FILTER` | 606-607 | constant |
-| `src/main.rs` | `main` | 609-617 | reader (EnvFilter::try_from_default_env fallback) |
+| `src/main.rs` | `main` | 609-860 | reader (EnvFilter::try_from_default_env fallback at 612-614) |
 | `src/main.rs` | `tests::default_log_filter_enables_app_and_core_at_info` | 884-904 | test |
 | `182c062` | `commit: N10: the default log filter keeps lci_core events` |  | commit |
 
@@ -385,6 +429,8 @@ Verification:
 A huge lsp_timeout_seconds value used to make the first LSP request panic. Where is the value now rejected, what upper bound is used, what second guard keeps the request deadline from overflowing, which tests cover both, and which commit made the change?
 
 Maps: `config_key`, `error_string`, `call_graph`, `test_link`, `git_commit_message`
+
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep plus reading; the commit needs git history.
 
 Hops:
 
@@ -417,6 +463,8 @@ Which test sources does `cargo xtask test --suite Lsp` execute, and how do the c
 
 Maps: `entrypoint_xtask`, `build_graph`, `module_graph`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-reading`: read the suite arm, then map cargo filters to modules by reading lib.rs and tests/integration.rs.
+
 Hops:
 
 1. Find the Suite::Lsp arm in the xtask test module.
@@ -427,7 +475,7 @@ Answer:
 
 | Path | Symbol | Lines | Role |
 | --- | --- | --- | --- |
-| `xtask/src/test.rs` | `run (Suite::Lsp arm)` | 108-139 | suite_definition (lines 128-131) |
+| `xtask/src/test.rs` | `run (Suite::Lsp arm)` | 108-139 | suite_definition (Suite::Lsp arm at lines 126-129) |
 | `lci-core/src/lib.rs` | `pub mod lsp` | 6-6 | module_root |
 | `lci-core/src/lsp.rs` | `mod tests and lsp/* submodule tests` |  | unit_tests (lsp::) |
 | `tests/integration.rs` | `mod navigation (#[path = "cases/navigation.rs"])` | 11-12 | test_binary_module |
@@ -445,6 +493,8 @@ AGENTS.md states that focused test suites fail when their filter matches zero te
 
 Maps: `agent_instructions`, `entrypoint_xtask`, `call_graph`, `test_link`
 
+Baseline expectation (guess, not measured): `easy`: one grep lands in xtask/src/test.rs, which holds every code answer.
+
 Hops:
 
 1. Read the AGENTS.md Build-and-test bullet.
@@ -461,18 +511,24 @@ Answer:
 | `xtask/src/test.rs` | `executed_in_summary` | 46-58 | counter |
 | `xtask/src/test.rs` | `run` | 108-139 | caller (every focused suite, incl. integration filters) |
 | `xtask/src/test.rs` | `tests::a_filter_that_matches_nothing_counts_zero` | 178-185 | test |
+| `xtask/src/test.rs` | `tests::counts_passed_and_failed_but_not_ignored_or_filtered` | 162-175 | test |
+| `xtask/src/test.rs` | `tests::ignores_non_summary_lines` | 188-191 | test |
 | `tests/AGENTS.md` | `Every focused suite fails if its filter matches zero tests` | 18-19 | doc_statement |
 
 Verification:
 
 - read: `AGENTS.md 120-126; xtask/src/test.rs 1-192`
-- grep: `rg -n 'ran no tests' xtask/src/test.rs (80-83)`
+- grep: `rg -n 'ran no tests' xtask/src/test.rs (80-83); rg -n 'fn ' xtask/src/test.rs (tests at 162, 178, 188)`
+
+Note: Every code answer sits in one file (xtask/src/test.rs); only the two doc statements are elsewhere. Reading that file after one grep answers the question, so it is weak evidence that multiple maps are needed.
 
 ### q15 (medium)
 
 What does `cargo xtask lint-machine-paths` scan and how? Name the dispatch, the module entry, how it enumerates files, the directory it exempts, the optional local pattern file, and the other xtask command that runs it automatically.
 
 Maps: `entrypoint_xtask`, `module_graph`, `call_graph`, `config_key`, `doc_to_code`
+
+Baseline expectation (guess, not measured): `needs-reading`: grep the command name, then read lint.rs and test.rs.
 
 Hops:
 
@@ -491,19 +547,21 @@ Answer:
 | `xtask/src/lint.rs` | `tracked_files` | 233-256 | file_enumeration (git ls-files -z) |
 | `xtask/src/lint.rs` | `EXEMPT_PREFIX` | 26-26 | exemption (.agents/skills/rust-skills/) |
 | `xtask/src/lint.rs` | `EXTRA_PATTERNS_FILE / load_extra` | 24-24, 72-79 | local_pattern_file |
-| `xtask/src/test.rs` | `run (Suite::Full arm)` | 132-138 | automatic_caller |
+| `xtask/src/test.rs` | `run (Suite::Full arm)` | 130-137 | automatic_caller |
 | `docs/development/machine-values.md` | `## Lint` | 166-166 | doc |
 
 Verification:
 
 - read: `xtask/src/main.rs 60-70, 258; xtask/src/lint.rs 1-60, 233-315`
-- grep: `rg -n 'lint::run' xtask/src (main.rs 258, test.rs 134)`
+- grep: `rg -n 'lint::run' xtask/src (main.rs 258, test.rs 132)`
 
 ### q16 (hard)
 
 During `cargo xtask live-acceptance`, how does a step get reported as skipped rather than passed, which acceptance engines emit the signal, how does --require-all change the outcome, which test pins it, and which commit introduced the SKIPPED reporting?
 
 Maps: `error_string`, `call_graph`, `entrypoint_xtask`, `test_link`, `git_commit_message`, `doc_to_code`
+
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep plus reading across xtask; the commit needs git history.
 
 Hops:
 
@@ -539,6 +597,8 @@ Trace Go support end to end: from the .go extension to its language identifier, 
 
 Maps: `language_map`, `trait_impl`, `config_key`, `entrypoint_xtask`, `agent_instructions`, `lsp_symbol`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep go/gopls/GoServer across many files; long but lexical.
+
 Hops:
 
 1. Find the go entry in the language ADAPTERS table.
@@ -573,6 +633,8 @@ AGENTS.md says an embedding-identity change must make search fail rather than se
 
 Maps: `agent_instructions`, `config_key`, `error_string`, `call_graph`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep the error text and embedding_identity; the on-search path needs careful reading.
+
 Hops:
 
 1. Read the hard rule in AGENTS.md.
@@ -604,6 +666,8 @@ The ordering of fused search hits with equal scores is implemented in two places
 
 Maps: `call_graph`, `git_commit_message`, `entrypoint_cli`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep for fusion_order/fused_order; the commit that changed both needs git history.
+
 Hops:
 
 1. Find the comparator used by hits.sort_by in the search pipeline.
@@ -632,6 +696,8 @@ Verification:
 When an MCP search_code call asks for more results than the search can return, the response says so in notes rather than warnings. Which config value caps the result count, where is the note text built and appended, where does the MCP tool argument document it, which tests cover it, and which commit added it?
 
 Maps: `entrypoint_mcp`, `config_key`, `call_graph`, `test_link`, `git_commit_message`
+
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep for the note text; the commit needs git history.
 
 Hops:
 
@@ -664,6 +730,8 @@ If a workspace has indexed files in a language whose only language server is dis
 
 Maps: `entrypoint_mcp`, `call_graph`, `lsp_symbol`, `error_string`, `test_link`, `git_commit_message`
 
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep plus reading in navigation.rs; the commit needs git history.
+
 Hops:
 
 1. Find the search_symbols tool and the App method it calls.
@@ -693,6 +761,8 @@ How does a [search_profiles.<name>] table in the config become its own MCP endpo
 
 Maps: `config_key`, `entrypoint_mcp`, `call_graph`, `test_link`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep search_profiles and mcp_path, then read server.rs and the tests.
+
 Hops:
 
 1. Find the search_profiles field and name validation in Config.
@@ -708,7 +778,7 @@ Answer:
 | `lci-core/src/config.rs` | `is_valid_search_profile_name` | 141-149 | validation (used in validate at 797-801) |
 | `src/server.rs` | `mcp_path` | 213-218 | path_builder |
 | `src/server.rs` | `mcp_service` | 224-251 | endpoint_builder |
-| `src/server.rs` | `router` | 253-307 | mount (fold at 297-306) |
+| `src/server.rs` | `router` | 253-307 | mount (fold at 297-305) |
 | `tests/cases/mcp.rs` | `each_search_profile_has_its_own_mcp_endpoint_with_the_same_tools` | 641-772 | test |
 | `tests/cases/mcp.rs` | `an_unknown_mcp_profile_path_is_not_found_and_a_session_stays_on_its_endpoint` | 775-836 | test |
 
@@ -723,6 +793,8 @@ Which config key releases a language server nobody has used for a while, where i
 
 Maps: `config_key`, `call_graph`, `test_link`, `doc_to_code`
 
+Baseline expectation (guess, not measured): `needs-reading`: grep lsp_idle_timeout_seconds finds nearly every answer location.
+
 Hops:
 
 1. Find the config field and its default.
@@ -736,9 +808,10 @@ Answer:
 | --- | --- | --- | --- |
 | `lci-core/src/config.rs` | `Config::lsp_idle_timeout_seconds` | 318-318 | config_field (default 1800 at 653) |
 | `lci-core/src/lsp.rs` | `Manager::new` | 552-577 | reader (lines 564-569) |
-| `lci-core/src/lsp.rs` | `spawn_idle_sweeper` | 1088-1133 | sweeper |
+| `lci-core/src/lsp.rs` | `spawn_idle_sweeper` | 1088-1133 | sweeper (not started when the timeout is 0, or when no Tokio runtime is running: returns at 1089-1092) |
 | `tests/cases/navigation.rs` | `an_idle_session_is_shut_down_and_restarted_on_the_next_call` | 2009-2057 | test |
 | `tests/cases/navigation.rs` | `idle_timeout_zero_never_releases` | 2062-2083 | test |
+| `tests/cases/navigation.rs` | `a_symbol_call_waiting_for_priming_is_not_cut_off_by_the_idle_sweep` | 2705-2728 | test |
 | `tests/cases/navigation.rs` | `the_idle_sweep_leaves_a_server_alone_while_it_is_priming` | 2737-2773 | test |
 | `README.md` | `LSP lifecycle paragraph` | 254-254 | doc |
 
@@ -752,6 +825,8 @@ Verification:
 On Windows, language servers run inside a Job Object. Which build-graph entry makes this Windows-only, how is the module gated, where in process spawning is it applied, and what is logged (and where) when a job cannot be created or assigned?
 
 Maps: `build_graph`, `module_graph`, `call_graph`, `error_string`
+
+Baseline expectation (guess, not measured): `needs-reading`: grep job/JobObject and Cargo.toml target sections, then read the spawn path.
 
 Hops:
 
@@ -782,6 +857,8 @@ Verification:
 A search filter naming an unregistered language fails with a message listing the valid identifiers. Where is the error raised and rendered, which registry function produces the list, which identifier used to appear twice and why, and which tests and commit fixed it?
 
 Maps: `error_string`, `language_map`, `call_graph`, `test_link`, `git_commit_message`
+
+Baseline expectation (guess, not measured): `needs-structure`: code part is grep for the error text; why an identifier appeared twice needs git history.
 
 Hops:
 
@@ -815,6 +892,8 @@ Among the seven LspAdapter implementations, which adapter source files have not 
 
 Maps: `trait_impl`, `git_recency`
 
+Baseline expectation (guess, not measured): `needs-structure`: last-modified commits per file need git history.
+
 Hops:
 
 1. List the impl LspAdapter for ... files.
@@ -839,6 +918,8 @@ Verification:
 Which commit introduced the Windows data_dir length limit, what index-table naming change came with it, where does the store still read and later drop tables with the old name, and which integration tests did that commit add?
 
 Maps: `git_blame`, `call_graph`, `test_link`, `doc_to_code`
+
+Baseline expectation (guess, not measured): `needs-structure`: the introducing commit and the tests it added need git history.
 
 Hops:
 
@@ -871,6 +952,8 @@ Verification:
 tests/AGENTS.md says the fake language server is built as a separate binary. Which manifest declares it, how does that binary reuse the fake's logic, and how do integration tests point the C# server configuration at it?
 
 Maps: `agent_instructions`, `build_graph`, `module_graph`, `test_link`
+
+Baseline expectation (guess, not measured): `needs-reading`: grep fake-lsp-server across Cargo.toml and tests, then read three files.
 
 Hops:
 

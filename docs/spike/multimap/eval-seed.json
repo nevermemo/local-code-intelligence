@@ -1,8 +1,16 @@
 {
   "schema_version": 1,
   "generated": "2026-10-12T04:22Z",
+  "revised": "2026-10-12T06:51Z",
   "base_commit": "7f9c636",
+  "history_counts": {
+    "base_commit_7f9c636": 188,
+    "spike_842a5e9": 191,
+    "spike_b5e5851": 192,
+    "note": "Co-change, recency and commit answers were taken at the base commit; the spike commits touch only docs/spike, so they are unchanged at the spike tip."
+  },
   "repository": "self",
+  "baseline_expectation_note": "baseline_expectation.guess is the author's guess of how a lexical-search-plus-reading agent without git history would fare (easy / needs-reading / needs-structure). It is not a measurement. See eval-seed.md, Baseline.",
   "questions": [
     {
       "id": "q01",
@@ -78,7 +86,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep the route and #[tool] lists, diff them by reading two files, then follow two calls"
+      }
     },
     {
       "id": "q02",
@@ -167,7 +179,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "the AGENTS.md wording gives grep terms; the chain is followed by reading call sites"
+      }
     },
     {
       "id": "q03",
@@ -236,7 +252,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep 'unknown search profile' finds the message and the test; the CLI path needs reading"
+      }
     },
     {
       "id": "q04",
@@ -324,7 +344,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep plus reading from the key name; the commit needs git history"
+      }
     },
     {
       "id": "q05",
@@ -410,7 +434,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep the hook name across lsp/*.rs; the default-only set is a diff over seven files"
+      }
     },
     {
       "id": "q06",
@@ -492,7 +520,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep both hook names and intersect; consumers found by grep of the method names"
+      }
     },
     {
       "id": "q07",
@@ -526,7 +558,7 @@
           "path": "lci-core/src/chunk.rs",
           "symbol": "sources",
           "lines": "204-249",
-          "role": "caller (line 229 pushes SkippedFile)"
+          "role": "caller (line 229 calls non_source, line 230 pushes SkippedFile)"
         },
         {
           "path": "lci-core/src/language.rs",
@@ -562,7 +594,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep for qt_linguist/non_source; the commit needs git history"
+      }
     },
     {
       "id": "q08",
@@ -605,11 +641,15 @@
         },
         {
           "method": "git_log",
-          "detail": "git log --format=%h -- lci-core/src/lsp/transport.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> tests/cases/navigation.rs 9/10; tests/support/fake_lsp.rs 7/10 (tied with lci-core/src/config.rs 7 and docs/development/roadmap.md 7); lci-core/src/lsp.rs 6/10; 10 commits touch the file (no --follow), full history of 191 commits"
+          "detail": "git log --format=%h -- lci-core/src/lsp/transport.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> tests/cases/navigation.rs 9/10; tests/support/fake_lsp.rs 7/10 (tied with lci-core/src/config.rs 7 and docs/development/roadmap.md 7); lci-core/src/lsp.rs 6/10; 10 commits touch the file (no --follow), history counts: 188 commits at base 7f9c636, where the counts above were taken; the earlier \"191\" was the spike branch at 842a5e9 (192 at b5e5851); the spike commits touch only docs/spike, so the co-change counts are the same at base and at the spike tip"
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "co-change counts need git history"
+      }
     },
     {
       "id": "q09",
@@ -655,7 +695,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "easy"
+      "difficulty": "easy",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "co-change counts need git history"
+      }
     },
     {
       "id": "q10",
@@ -713,7 +757,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "co-change counts need git history"
+      }
     },
     {
       "id": "q11",
@@ -740,8 +788,8 @@
         {
           "path": "src/main.rs",
           "symbol": "main",
-          "lines": "609-617",
-          "role": "reader (EnvFilter::try_from_default_env fallback)"
+          "lines": "609-860",
+          "role": "reader (EnvFilter::try_from_default_env fallback at 612-614)"
         },
         {
           "path": "src/main.rs",
@@ -767,7 +815,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "easy"
+      "difficulty": "easy",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is one grep for 'lci_core=info'; the commit needs git history"
+      }
     },
     {
       "id": "q12",
@@ -844,7 +896,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep plus reading; the commit needs git history"
+      }
     },
     {
       "id": "q13",
@@ -865,7 +921,7 @@
           "path": "xtask/src/test.rs",
           "symbol": "run (Suite::Lsp arm)",
           "lines": "108-139",
-          "role": "suite_definition (lines 128-131)"
+          "role": "suite_definition (Suite::Lsp arm at lines 126-129)"
         },
         {
           "path": "lci-core/src/lib.rs",
@@ -907,7 +963,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "read the suite arm, then map cargo filters to modules by reading lib.rs and tests/integration.rs"
+      }
     },
     {
       "id": "q14",
@@ -956,6 +1016,18 @@
           "role": "test"
         },
         {
+          "path": "xtask/src/test.rs",
+          "symbol": "tests::counts_passed_and_failed_but_not_ignored_or_filtered",
+          "lines": "162-175",
+          "role": "test"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "tests::ignores_non_summary_lines",
+          "lines": "188-191",
+          "role": "test"
+        },
+        {
           "path": "tests/AGENTS.md",
           "symbol": "Every focused suite fails if its filter matches zero tests",
           "lines": "18-19",
@@ -969,11 +1041,16 @@
         },
         {
           "method": "grep",
-          "detail": "rg -n 'ran no tests' xtask/src/test.rs (80-83)"
+          "detail": "rg -n 'ran no tests' xtask/src/test.rs (80-83); rg -n 'fn ' xtask/src/test.rs (tests at 162, 178, 188)"
         }
       ],
       "needs_model_service": false,
-      "difficulty": "easy"
+      "difficulty": "easy",
+      "baseline_expectation": {
+        "guess": "easy",
+        "basis": "one grep lands in xtask/src/test.rs, which holds every code answer"
+      },
+      "notes": "Every code answer sits in one file (xtask/src/test.rs); only the two doc statements are elsewhere. Reading that file after one grep answers the question, so it is weak evidence that multiple maps are needed."
     },
     {
       "id": "q15",
@@ -1031,7 +1108,7 @@
         {
           "path": "xtask/src/test.rs",
           "symbol": "run (Suite::Full arm)",
-          "lines": "132-138",
+          "lines": "130-137",
           "role": "automatic_caller"
         },
         {
@@ -1048,11 +1125,15 @@
         },
         {
           "method": "grep",
-          "detail": "rg -n 'lint::run' xtask/src (main.rs 258, test.rs 134)"
+          "detail": "rg -n 'lint::run' xtask/src (main.rs 258, test.rs 132)"
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep the command name, then read lint.rs and test.rs"
+      }
     },
     {
       "id": "q16",
@@ -1148,7 +1229,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep plus reading across xtask; the commit needs git history"
+      }
     },
     {
       "id": "q17",
@@ -1239,7 +1324,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep go/gopls/GoServer across many files; long but lexical"
+      }
     },
     {
       "id": "q18",
@@ -1311,7 +1400,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep the error text and embedding_identity; the on-search path needs careful reading"
+      }
     },
     {
       "id": "q19",
@@ -1377,7 +1470,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep for fusion_order/fused_order; the commit that changed both needs git history"
+      }
     },
     {
       "id": "q20",
@@ -1454,7 +1551,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep for the note text; the commit needs git history"
+      }
     },
     {
       "id": "q21",
@@ -1522,7 +1623,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep plus reading in navigation.rs; the commit needs git history"
+      }
     },
     {
       "id": "q22",
@@ -1568,7 +1673,7 @@
           "path": "src/server.rs",
           "symbol": "router",
           "lines": "253-307",
-          "role": "mount (fold at 297-306)"
+          "role": "mount (fold at 297-305)"
         },
         {
           "path": "tests/cases/mcp.rs",
@@ -1594,7 +1699,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep search_profiles and mcp_path, then read server.rs and the tests"
+      }
     },
     {
       "id": "q23",
@@ -1628,7 +1737,7 @@
           "path": "lci-core/src/lsp.rs",
           "symbol": "spawn_idle_sweeper",
           "lines": "1088-1133",
-          "role": "sweeper"
+          "role": "sweeper (not started when the timeout is 0, or when no Tokio runtime is running: returns at 1089-1092)"
         },
         {
           "path": "tests/cases/navigation.rs",
@@ -1640,6 +1749,12 @@
           "path": "tests/cases/navigation.rs",
           "symbol": "idle_timeout_zero_never_releases",
           "lines": "2062-2083",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "a_symbol_call_waiting_for_priming_is_not_cut_off_by_the_idle_sweep",
+          "lines": "2705-2728",
           "role": "test"
         },
         {
@@ -1666,7 +1781,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep lsp_idle_timeout_seconds finds nearly every answer location"
+      }
     },
     {
       "id": "q24",
@@ -1738,7 +1857,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep job/JobObject and Cargo.toml target sections, then read the spawn path"
+      }
     },
     {
       "id": "q25",
@@ -1821,7 +1944,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "code part is grep for the error text; why an identifier appeared twice needs git history"
+      }
     },
     {
       "id": "q26",
@@ -1871,7 +1998,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "easy"
+      "difficulty": "easy",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "last-modified commits per file need git history"
+      }
     },
     {
       "id": "q27",
@@ -1953,7 +2084,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "hard"
+      "difficulty": "hard",
+      "baseline_expectation": {
+        "guess": "needs-structure",
+        "basis": "the introducing commit and the tests it added need git history"
+      }
     },
     {
       "id": "q28",
@@ -2013,7 +2148,11 @@
         }
       ],
       "needs_model_service": false,
-      "difficulty": "medium"
+      "difficulty": "medium",
+      "baseline_expectation": {
+        "guess": "needs-reading",
+        "basis": "grep fake-lsp-server across Cargo.toml and tests, then read three files"
+      }
     }
   ]
 }
