@@ -1339,10 +1339,7 @@ expected_paths = []
     let file: EvaluationFile = toml::from_str(raw).unwrap();
 
     let error = validate_definition(&file).expect_err("expected_paths must not be empty");
-    assert!(
-        error.to_string().contains("query at index 0"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("query at index 0"), "{error}");
     assert!(error.to_string().contains("expected_paths"), "{error}");
 }
 
