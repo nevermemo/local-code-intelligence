@@ -357,3 +357,61 @@ async fn sym_defs_passes_contracts_c1_and_c6_and_fuses_in_a_registry() {
     );
     assert!(run.warnings().is_empty() && run.notes().is_empty());
 }
+
+/// The head chunks of `source`'s declarations under the real chunker, as
+/// `name: the chunk's code`.
+fn real_heads(path: &str, source: &str) -> Vec<String> {
+    use lci_core::{bundle::Producer, chunk::extract_for_path};
+    let extraction = extract_for_path(path, source).unwrap();
+    let files: HashMap<String, CachedFile> = [(
+        path.to_owned(),
+        CachedFile {
+            language: "rust".into(),
+            adapter_version: "v".into(),
+            content_hash: "file".into(),
+            chunks: extraction.chunks.clone(),
+        },
+    )]
+    .into();
+    let payloads: BTreeMap<String, Vec<StoredDeclaration>> =
+        [(path.to_owned(), Declarations.produce(path, &extraction))].into();
+    let index = SymIndex::join(SnapshotRef::default(), &files, &payloads);
+    let chunks: HashMap<NodeId, &Chunk> = chunk_ids(&extraction.chunks)
+        .into_iter()
+        .zip(&extraction.chunks)
+        .collect();
+    index
+        .entries()
+        .iter()
+        .map(|entry| {
+            let head = entry.head.as_ref().map(|head| chunks[head].code.as_str());
+            format!("{}: {}", entry.name, head.unwrap_or("-"))
+        })
+        .collect()
+}
+
+#[test]
+fn on_real_chunks_the_head_is_the_chunk_that_names_the_declaration() {
+    // A doc-commented function long enough to be split: its signature and
+    // its body are separate chunks, and the body starts later.
+    let body: String = (0..1500)
+        .map(|i| format!("    let y{i} = x + {i};\n"))
+        .collect();
+    let source = format!(
+        "/// Big.\npub fn big(x: u64) -> u64 {{\n{body}    x\n}}\n\n\
+         pub trait Map {{\n    fn query(&self) -> u8;\n}}\n\n\
+         #[cfg(test)]\nmod tests {{\n    use super::*;\n\n    fn helper() {{}}\n}}\n"
+    );
+    let heads = real_heads("src/lib.rs", &source);
+    for head in &heads {
+        let (name, code) = head.split_once(": ").unwrap();
+        assert!(
+            code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == name),
+            "the head chunk of {name} does not name it: {code:?}"
+        );
+    }
+    let big = heads.iter().find(|h| h.starts_with("big: ")).unwrap();
+    assert!(big.contains("pub fn big"), "{big}");
+    assert_eq!(heads.len(), 5, "{heads:?}");
+}

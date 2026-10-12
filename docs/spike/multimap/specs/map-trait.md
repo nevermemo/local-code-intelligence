@@ -273,11 +273,19 @@ Changes to this spec, each the conservative choice where one was open:
 - **Answer.** The query is split into identifier tokens (maximal runs of alphanumeric
   characters and `_`, Unicode-aware). A declaration matches when its name equals a token ignoring case; exact-case
   matches rank first, then the rest, each class ordered by the symbol's canonical string. Each
-  match is projected to its head chunk (decision M-4): the chunk holding the declaration's
-  first line, the one starting last on a tie; a declaration in no chunk is left out, as is a
-  head outside the view. A chunk is listed once, at its best declaration; ranks are positions.
-  Evidence: `via = None`, `QueryMatch`, `tags`, detail = the symbol's canonical string (at
-  most 256 bytes). `score` is `None`.
+  match is projected to its head chunk (decision M-4): among the chunks overlapping the
+  declaration's lines, the first in source order whose code names the declaration as a
+  whole identifier (the signature chunk, not a body fragment or a lone `pub trait` keyword
+  chunk); failing that, the chunk holding its first line, the one starting last on a tie. Two
+  items on one line can share a head. A declaration in no chunk is left out, as is a head
+  outside the view. A chunk is listed once, at its best declaration; ranks are positions.
+  Evidence: `via = None`, `QueryMatch`, `tags`, detail = the symbol's canonical string (its
+  last 256 bytes when longer, so `::<name>/<kind>` survives). `score` is `None`.
+- **Build.** `build`/`refresh` syncs the bundles, joins them and replaces the data only when
+  the sync succeeded; `last_sync` records (reused, extracted). It then deletes the store's
+  bundles no current file uses (`BundleStore::retain` with this producer's keys, so the store
+  must hold no other producer's bundles; today it holds only `sym.defs@1`); a failed clean-up
+  is kept in `cleanup_error` and does not fail the build.
 - **Freshness of the answer.** `freshness.snapshot` is the snapshot the data was built for,
   not the view's; `stale` is true when they differ (the hits are then those of the old data
   that are still chunks of the view). A map that was never built answers `Failed` with a

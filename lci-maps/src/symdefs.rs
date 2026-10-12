@@ -33,7 +33,7 @@ const MAX_DETAIL: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entry {
     pub symbol: NodeId,
-    /// The chunk holding the declaration's first line, if any chunk does.
+    /// The chunk the hit points at (see `head_chunk`), if any.
     pub head: Option<NodeId>,
     pub name: String,
 }
@@ -49,19 +49,41 @@ pub struct SymIndex {
     by_name: HashMap<String, Vec<usize>>,
 }
 
-/// The chunk whose lines hold `line`: the one starting last at or before
-/// it, the first in source order on a tie. `None` when no chunk holds it.
-fn head_chunk<'c>(chunks: &'c [Chunk], ids: &'c [NodeId], line: u32) -> Option<&'c NodeId> {
-    let mut best: Option<usize> = None;
+/// Whether `code` holds `name` as a whole identifier.
+fn names(code: &str, name: &str) -> bool {
+    code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|token| token == name)
+}
+
+/// The chunk a declaration's hit points at. Among the chunks that overlap
+/// the declaration's lines, the first in source order whose code names it
+/// (the signature, not a body fragment or a lone `pub trait` keyword);
+/// failing that, the chunk holding its first line, the one starting last
+/// on a tie. `None` when no chunk holds the first line.
+fn head_chunk<'c>(
+    chunks: &'c [Chunk],
+    ids: &'c [NodeId],
+    declaration: &lci_core::node::Declaration,
+) -> Option<&'c NodeId> {
+    let (start, end) = (declaration.start_line, declaration.end_line);
+    let mut named: Option<usize> = None;
+    let mut holding: Option<usize> = None;
     for (index, chunk) in chunks.iter().enumerate() {
-        if chunk.start_line <= line
-            && line <= chunk.end_line
-            && best.is_none_or(|b| chunk.start_line > chunks[b].start_line)
+        let overlaps = chunk.start_line <= end && start <= chunk.end_line;
+        if overlaps
+            && names(&chunk.code, &declaration.name)
+            && named.is_none_or(|b| chunk.start_line < chunks[b].start_line)
         {
-            best = Some(index);
+            named = Some(index);
+        }
+        if chunk.start_line <= start
+            && start <= chunk.end_line
+            && holding.is_none_or(|b| chunk.start_line > chunks[b].start_line)
+        {
+            holding = Some(index);
         }
     }
-    best.map(|index| &ids[index])
+    named.or(holding).map(|index| &ids[index])
 }
 
 impl SymIndex {
@@ -82,7 +104,7 @@ impl SymIndex {
             for declaration in stored.iter().filter_map(StoredDeclaration::declaration) {
                 entries.push(Entry {
                     symbol: declaration.node_id(path),
-                    head: head_chunk(&file.chunks, &ids, declaration.start_line).cloned(),
+                    head: head_chunk(&file.chunks, &ids, &declaration).cloned(),
                     name: declaration.name,
                 });
             }
@@ -185,11 +207,13 @@ pub fn answer(index: &SymIndex, text: &str, limit: usize, view: &SnapshotView<'_
         }
         let mut detail = entry.symbol.to_string();
         if detail.len() > MAX_DETAIL {
-            let mut end = MAX_DETAIL;
-            while !detail.is_char_boundary(end) {
-                end -= 1;
+            // Keep the end, `::<name>/<kind>`: a long impl header is what
+            // goes.
+            let mut start = detail.len() - MAX_DETAIL;
+            while !detail.is_char_boundary(start) {
+                start += 1;
             }
-            detail.truncate(end);
+            detail.replace_range(..start, "");
         }
         hits.push(MapHit {
             node: head.clone(),
@@ -260,7 +284,9 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>>> SymDefs<P> {
             &synced.payloads,
         ));
         self.last_sync = Some((synced.reused, synced.extracted));
-        // A failed clean-up keeps the new data: unused bundles cost disk,
+        // `synced.keys` are this producer's only: the store must hold no
+        // other producer's bundles (`BundleStore::retain`); today
+        // `sym.defs@1` is the only one. A failed clean-up keeps the new data: unused bundles cost disk,
         // not correctness, and the next build retries.
         self.cleanup_error = self
             .store
