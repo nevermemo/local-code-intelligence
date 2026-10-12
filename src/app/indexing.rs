@@ -200,7 +200,7 @@ impl App {
         let _data_dir_lock =
             tokio::task::spawn_blocking(move || super::lock_data_dir_for_indexing(&data_dir))
                 .await??;
-        let prior_manifest = manifest::load(&self.config.data_dir, &workspace);
+        let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let root = workspace.path.clone();
         let prior_files = prior_manifest.files;
         let scan =
@@ -427,7 +427,16 @@ impl App {
             Some(s) => s.table.count_rows(None).await?,
             None => 0,
         };
-        let stored_manifest = manifest::load(&self.config.data_dir, &workspace);
+        // A manifest that cannot be read makes staleness unknown too: the
+        // snapshot is reported stale and the status says why.
+        let (stored_manifest, manifest_error) =
+            match manifest::try_load(&self.config.data_dir, &workspace) {
+                Ok(stored) => (stored, None),
+                Err(error) => (
+                    manifest::Manifest::empty(&workspace),
+                    Some(format!("{error:#}")),
+                ),
+            };
         let root = workspace.path.clone();
         // An unreadable file makes staleness unknown, not the status call a
         // failure: report the snapshot as stale and say why.
@@ -437,9 +446,15 @@ impl App {
                     snapshot.is_some()
                         && (stored_manifest.fingerprint.is_empty()
                             || stored_manifest.fingerprint != current_fingerprint),
-                    None,
+                    manifest_error,
                 ),
-                Err(error) => (snapshot.is_some(), Some(format!("{error:#}"))),
+                Err(error) => (
+                    snapshot.is_some(),
+                    Some(match manifest_error {
+                        Some(manifest_error) => format!("{manifest_error}; {error:#}"),
+                        None => format!("{error:#}"),
+                    }),
+                ),
             };
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let mut analyzers_running = BTreeMap::new();
@@ -498,7 +513,7 @@ impl App {
             self.store.snapshot(&workspace).await?.is_some(),
             "workspace is not indexed; call index_workspace first"
         );
-        let manifest = manifest::load(&self.config.data_dir, &workspace);
+        let manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let mut files: Vec<IndexedFile> = manifest
             .files
             .into_iter()

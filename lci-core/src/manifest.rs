@@ -118,20 +118,45 @@ fn path(data_dir: &Path, workspace_id: &str) -> PathBuf {
         .join(format!("{workspace_id}.json"))
 }
 
-pub fn load(data_dir: &Path, workspace: &Workspace) -> Manifest {
+/// The stored manifest of a workspace: empty when none was written, and also
+/// empty when the stored one is incompatible or cannot be parsed (the next scan
+/// rebuilds it). A manifest that exists but cannot be read (a permission error,
+/// a sharing violation, a directory at the path) is an error: it is not "never
+/// indexed", and an empty answer would make every indexed file look absent.
+pub fn try_load(data_dir: &Path, workspace: &Workspace) -> Result<Manifest> {
     let manifest_path = path(data_dir, &workspace.id);
-    let Some(bytes) = std::fs::read(&manifest_path).ok() else {
-        return Manifest::empty(workspace);
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Manifest::empty(workspace));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read workspace manifest {}", manifest_path.display()));
+        }
     };
     if let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes)
         && manifest.is_compatible(workspace)
     {
-        return manifest;
+        return Ok(manifest);
     }
-    serde_json::from_slice::<ManifestV1>(&bytes)
+    Ok(serde_json::from_slice::<ManifestV1>(&bytes)
         .ok()
         .and_then(|manifest| manifest.migrate(workspace))
-        .unwrap_or_else(|| Manifest::empty(workspace))
+        .unwrap_or_else(|| Manifest::empty(workspace)))
+}
+
+/// [`try_load`] for a caller that cannot fail: a manifest that cannot be read
+/// is logged and taken as empty.
+pub fn load(data_dir: &Path, workspace: &Workspace) -> Manifest {
+    try_load(data_dir, workspace).unwrap_or_else(|error| {
+        tracing::warn!(
+            workspace_id = %workspace.id,
+            error = %format!("{error:#}"),
+            "workspace manifest cannot be read; treating it as empty"
+        );
+        Manifest::empty(workspace)
+    })
 }
 
 pub fn save(data_dir: &Path, manifest: &Manifest) -> Result<()> {
@@ -199,6 +224,29 @@ mod tests {
         assert_eq!(scan.parsed_files, 0);
         assert_eq!(scan.unchanged_files, 1);
         assert_ne!(scan.fingerprint, old_fingerprint);
+    }
+
+    #[test]
+    fn a_missing_manifest_is_an_empty_one() {
+        let (_temp, _root, data, workspace) = fixture();
+        let manifest = try_load(&data, &workspace).unwrap();
+        assert!(manifest.files.is_empty());
+        assert!(manifest.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_that_cannot_be_read_is_an_error_not_an_empty_manifest() {
+        let (_temp, _root, data, workspace) = fixture();
+        // A directory where the file belongs: reading it fails, and the file is
+        // not missing.
+        std::fs::create_dir_all(path(&data, &workspace.id)).unwrap();
+        let error = try_load(&data, &workspace).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read workspace manifest"),
+            "{error:#}"
+        );
+        // The caller that cannot fail still gets an empty manifest (and a log).
+        assert!(load(&data, &workspace).files.is_empty());
     }
 
     #[test]

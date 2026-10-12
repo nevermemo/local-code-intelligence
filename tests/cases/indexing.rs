@@ -199,6 +199,58 @@ async fn indexed_files_lists_cached_files_with_language_and_chunk_counts() {
     task.abort();
 }
 
+/// A manifest that exists but cannot be read is not an index with no files:
+/// `indexed_files` and `index_workspace` fail and say so, and `status` reports
+/// the snapshot as stale with the cause instead of a clean answer. Here the
+/// manifest file is replaced by a directory.
+#[tokio::test]
+async fn an_unreadable_manifest_is_reported_not_taken_for_an_empty_index() {
+    let (temp, config, _fake, task) = fixture().await;
+    let data_dir = config.data_dir.clone();
+    let workspace = temp.path().join("unreadable-manifest");
+    write(&workspace, "src/lib.rs", "fn one() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    assert_eq!(app.indexed_files(&workspace).await.unwrap().files.len(), 1);
+
+    let id = app.status(&workspace).await.unwrap().workspace.id;
+    let manifest = data_dir.join("manifests").join(format!("{id}.json"));
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let listed = app.indexed_files(&workspace).await.unwrap_err();
+    assert!(
+        format!("{listed:#}").contains("read workspace manifest"),
+        "{listed:#}"
+    );
+    let reindexed = app.index(&workspace).await.unwrap_err();
+    assert!(
+        format!("{reindexed:#}").contains("read workspace manifest"),
+        "{reindexed:#}"
+    );
+    let status = app.status(&workspace).await.unwrap();
+    assert!(status.stale, "an unreadable manifest must not look fresh");
+    assert!(
+        status
+            .stale_check_error
+            .as_deref()
+            .is_some_and(|error| error.contains("read workspace manifest")),
+        "{:?}",
+        status.stale_check_error
+    );
+
+    // A missing manifest is still just an index that has none.
+    std::fs::remove_dir(&manifest).unwrap();
+    assert!(
+        app.indexed_files(&workspace)
+            .await
+            .unwrap()
+            .files
+            .is_empty()
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn concurrent_first_searches_share_one_initial_index_job() {
     let (temp, config, fake, task) = fixture().await;
