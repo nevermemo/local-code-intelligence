@@ -1863,10 +1863,23 @@ async fn concurrent_requests_share_one_language_server_start() {
     for results in [first, second, third, fourth, fifth] {
         assert_eq!(results.unwrap()[0].name.as_deref(), Some("Calculator"));
     }
+    // `spawns` holds one entry per start, claimed atomically, so it counts
+    // overlapping starts that `spawn_count.txt` (last writer wins) can hide.
     assert_eq!(
-        state_count(&state, "spawn_count.txt"),
+        std::fs::read_dir(state.join("spawns")).unwrap().count(),
         1,
         "five callers that arrived while the server was starting must share that one start"
+    );
+    let served: std::collections::BTreeSet<String> =
+        std::fs::read_to_string(state.join("symbol_request_pids.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(
+        served.len(),
+        1,
+        "one server process must answer every symbol request: {served:?}"
     );
 }
 
