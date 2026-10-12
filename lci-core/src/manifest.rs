@@ -101,7 +101,9 @@ impl ManifestV1 {
                         path,
                         CachedFile {
                             language: rust.identifier().into(),
-                            adapter_version: rust.cache_version().into(),
+                            // The chunks came from the first chunker: a later adapter
+                            // version must not take them as its own.
+                            adapter_version: "rust-chunks-v1".into(),
                             content_hash: file.content_hash,
                             chunks: file.chunks,
                         },
@@ -189,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_compatible_v1_rust_cache_without_reparsing() {
+    fn migrates_compatible_v1_rust_cache_and_reparses_for_new_adapter() {
         let (_temp, root, data, workspace) = fixture();
         let source = "// stable\nfn migrated() {}\n";
         std::fs::write(root.join("lib.rs"), source).unwrap();
@@ -216,13 +218,14 @@ mod tests {
         assert_eq!(migrated.version, VERSION);
         assert_eq!(migrated.fingerprint, old_fingerprint);
         assert_eq!(migrated.files["lib.rs"].language, "rust");
+        assert_eq!(migrated.files["lib.rs"].adapter_version, "rust-chunks-v1");
+        let scan = chunk::scan_incremental(&root, &migrated.files).unwrap();
+        assert_eq!(scan.parsed_files, 1);
+        assert_eq!(scan.unchanged_files, 0);
         assert_eq!(
-            migrated.files["lib.rs"].adapter_version,
+            scan.files["lib.rs"].adapter_version,
             language::for_extension("rs").unwrap().cache_version()
         );
-        let scan = chunk::scan_incremental(&root, &migrated.files).unwrap();
-        assert_eq!(scan.parsed_files, 0);
-        assert_eq!(scan.unchanged_files, 1);
         assert_ne!(scan.fingerprint, old_fingerprint);
     }
 

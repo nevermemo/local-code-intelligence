@@ -674,8 +674,8 @@ async fn persistence_incremental_isolation_deletion_and_fail_open() {
     assert!(app.status(&a).await.unwrap().stale);
     let reopened = app.index(&a).await.unwrap();
     assert_eq!(reopened.embedded_chunks, 0);
-    assert_eq!(reopened.parsed_files, 0);
-    assert_eq!(reopened.unchanged_files, 1);
+    assert_eq!(reopened.parsed_files, 1);
+    assert_eq!(reopened.unchanged_files, 0);
     assert!(!app.status(&a).await.unwrap().stale);
     write(&a, "lib.rs", "\n\nfn translator() {}\nfn changed() {}\n");
     fake.embed_fails.store(true, Ordering::SeqCst);

@@ -76,6 +76,7 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
     let mut start = node.start_byte();
     let mut end = start;
     let mut pending_prefix = None;
+    let mut last_split_range = None;
     for child in children {
         if container && adapter.is_prefix(child.kind()) {
             pending_prefix.get_or_insert(child.start_byte());
@@ -100,15 +101,26 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
             if let Some(range) = out.get_mut(first) {
                 range.0 = if attach_header { start } else { child_start };
             }
+            last_split_range = out.len().checked_sub(1).filter(|&index| index >= first);
             start = child.end_byte();
             end = start;
         } else if container || child.end_byte() - start > TARGET_BYTES {
+            // The chunk reaches the next child's start, so the bytes between two
+            // children (an operator, a comma) stay in a chunk: after a pending
+            // run, in it; right after a split child, in that child's last chunk.
             if end > start {
-                out.push((start, end));
+                out.push((start, child_start));
+            } else if let Some(index) = last_split_range.take()
+                && let Some((_, previous_end)) = out.get_mut(index)
+                && *previous_end == start
+            {
+                *previous_end = child_start;
             }
+            last_split_range = None;
             start = child_start;
             end = child.end_byte();
         } else {
+            last_split_range = None;
             end = child.end_byte();
         }
     }
@@ -142,7 +154,7 @@ fn chunks_with_adapter(
     let mut spans = Vec::new();
     ranges(adapter, tree.root_node(), &mut spans);
     let mut chunks = Vec::new();
-    for (start, end) in spans {
+    for &(start, end) in &spans {
         let raw = &source[start..end];
         let code = raw.trim();
         if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
@@ -159,6 +171,8 @@ fn chunks_with_adapter(
             content_hash: hash(code),
         });
     }
+    #[cfg(test)]
+    tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
     Ok(chunks)
 }
 
@@ -330,6 +344,93 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only check that runs on every chunking call of this crate's unit
+    /// tests: a byte that is in no chunk must be whitespace, a separator the
+    /// chunker drops on purpose (`{`, `}`, `;`), a leading byte order mark, or a
+    /// comment that no chunk carries as a prefix.
+    pub(super) fn assert_uncovered_bytes_are_expected(
+        adapter: &language::LanguageAdapter,
+        source: &str,
+        spans: &[(usize, usize)],
+    ) {
+        let mut covered = vec![false; source.len()];
+        for &(start, end) in spans {
+            let raw = &source[start..end];
+            let code = raw.trim();
+            if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                continue;
+            }
+            let begin = start + raw.len() - raw.trim_start().len();
+            covered[begin..begin + code.len()].fill(true);
+        }
+
+        let mut parser = Parser::new();
+        parser.set_language(&adapter.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        let mut comments = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "line_comment" | "block_comment" | "comment") {
+                comments.push((node.kind(), node.start_byte(), node.end_byte()));
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        for (kind, comment_start, comment_end) in comments {
+            let attached = spans.iter().any(|&(start, end)| {
+                let raw = &source[start..end];
+                let code = raw.trim();
+                if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                    return false;
+                }
+                let begin = start + raw.len() - raw.trim_start().len();
+                adapter.is_prefix(kind)
+                    && begin >= comment_end
+                    && source[comment_end..begin].chars().all(char::is_whitespace)
+            });
+            if attached {
+                covered[comment_start..comment_end].fill(true);
+            }
+        }
+
+        for (offset, character) in source.char_indices() {
+            let end = offset + character.len_utf8();
+            if covered[offset..end].iter().all(|&byte| byte)
+                || character.is_whitespace()
+                || "{};".contains(character)
+                || (offset == 0 && character == '\u{feff}')
+            {
+                continue;
+            }
+            panic!(
+                "unexpected uncovered byte at {offset} ({character:?}) in {} source bytes",
+                source.len()
+            );
+        }
+    }
+
+    fn compact(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    fn assert_chunks_cover(chunks: &[Chunk], expected: &str) {
+        let packed: String = chunks.iter().map(|chunk| compact(&chunk.code)).collect();
+        let expected = compact(expected);
+        assert!(
+            packed.contains(&expected),
+            "chunks do not cover {expected:?}:\n{chunks:#?}"
+        );
+    }
+
+    fn assert_non_whitespace_coverage(source: &str, expected: &str) {
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        assert_chunks_cover(&chunks, expected);
+    }
+
     #[test]
     fn chunks_have_exact_source_lines_and_stable_hashes() {
         let source =
@@ -890,6 +991,66 @@ export interface TelemetryLifecycle {
                     .contains(&c.code)
             );
         }
+    }
+
+    /// The traced example of N22: an oversized call whose two arguments are
+    /// joined by `+`. The operator lies between the two split children and used
+    /// to be in no chunk.
+    #[test]
+    fn oversized_expression_keeps_the_traced_operator() {
+        let left = "a".repeat(3500);
+        let right = "b".repeat(3500);
+        let expression = format!("emit(\"{left}\" + \"{right}\")");
+        let statements = format!("    {expression};\n").repeat(4);
+        let source = format!("fn main() {{\n{statements}}}\n");
+
+        assert_non_whitespace_coverage(&source, &expression);
+    }
+
+    #[test]
+    fn oversized_containers_cover_non_whitespace_bytes_across_inputs() {
+        let left = "a".repeat(3500);
+        let middle = "b".repeat(3500);
+        let right = "c".repeat(3500);
+        let expressions = [
+            format!("emit([\"{left}\", \"{middle}\"])"),
+            format!("emit((\"{left}\", \"{middle}\"))"),
+            format!("emit(\"{left}\" + \"{middle}\" + \"{right}\")"),
+        ];
+
+        for expression in expressions {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
+        }
+    }
+
+    #[test]
+    fn split_children_keep_separators_before_following_small_siblings() {
+        let large = "a".repeat(6500);
+        for expression in [
+            format!("consume(\"{large}\", short_name)"),
+            format!("[\"{large}\", short_name]"),
+            format!("(\"{large}\", short_name)"),
+        ] {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
+        }
+
+        let mut properties: String = (0..1200)
+            .map(|index| format!("  field_{index}: string,\n"))
+            .collect();
+        properties.push_str(&format!("  oversized: \"{large}\",\n  short: string,\n"));
+        let source = format!("type Fields = {{\n{properties}}};\n");
+        let chunks = chunks_for_path("fields.ts", &source).unwrap();
+        assert_chunks_cover(&chunks, &format!("\"{large}\", short: string"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk.code.trim(), "," | ";")),
+            "a chunk contains only separators:\n{chunks:#?}"
+        );
     }
 
     #[test]
