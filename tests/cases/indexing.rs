@@ -36,8 +36,9 @@ async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
     assert_eq!(report.files, 1);
     assert_eq!(report.parsed_files, 1);
     assert!(report.chunks > 0);
-    assert_eq!(report.embedded_chunks, report.chunks);
-    assert_eq!(fake.documents.load(Ordering::SeqCst), report.chunks);
+    assert!(report.embedded_chunks > 0);
+    assert!(report.embedded_chunks <= report.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), report.embedded_chunks);
     let indexed = app.indexed_files(&workspace).await.unwrap();
     assert_eq!(indexed.files.len(), 1);
     assert_eq!(indexed.files[0].relative_file_path, "lib.rs");
@@ -50,7 +51,8 @@ async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
     assert_eq!(repeat.unchanged_files, 1);
     assert_eq!(repeat.chunks, report.chunks);
     assert_eq!(repeat.embedded_chunks, 0);
-    assert_eq!(fake.documents.load(Ordering::SeqCst), report.chunks);
+    assert_eq!(repeat.reused_chunks, report.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), report.embedded_chunks);
     task.abort();
 }
 

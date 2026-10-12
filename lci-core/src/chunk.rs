@@ -9,6 +9,7 @@ use tree_sitter::{Node, Parser};
 
 const TARGET_BYTES: usize = 6000;
 const MAX_DECLARATION_BYTES: usize = 24000;
+const MAX_RANGE_DEPTH: usize = 128;
 pub const DOCUMENT_FORMAT_VERSION: &str = "rust-chunks-v1";
 
 #[derive(Debug)]
@@ -51,7 +52,17 @@ pub struct Chunk {
 
 // Recurse through oversized declarations to syntax boundaries (including match arms).
 // A large leaf remains whole: no arbitrary text windows or broken UTF-8.
-fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(usize, usize)>) {
+fn ranges(
+    adapter: &language::LanguageAdapter,
+    node: Node<'_>,
+    out: &mut Vec<(usize, usize)>,
+    depth: usize,
+) {
+    // Keep pathological nesting whole rather than exhausting a blocking worker's stack.
+    if depth >= MAX_RANGE_DEPTH {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
     let container = adapter.is_container(node.kind());
     let boundary = adapter.is_boundary(node.kind());
     let declaration = adapter.is_declaration(node.kind());
@@ -112,7 +123,7 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
                 out.push((start, child_start));
             }
             let first = out.len();
-            ranges(adapter, child, out);
+            ranges(adapter, child, out, depth + 1);
             if let Some(range) = out.get_mut(first) {
                 range.0 = if attach_header { start } else { child_start };
             }
@@ -167,7 +178,7 @@ fn chunks_with_adapter(
         .parse(source, None)
         .context("Tree-sitter parse cancelled")?;
     let mut spans = Vec::new();
-    ranges(adapter, tree.root_node(), &mut spans);
+    ranges(adapter, tree.root_node(), &mut spans, 0);
     let mut chunks = Vec::new();
     for &(start, end) in &spans {
         let raw = &source[start..end];
