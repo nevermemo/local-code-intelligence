@@ -12,7 +12,8 @@ name: spike-bench
 # A schedule fires only from the workflow file on the default branch; until
 # this file is there, run it by hand (workflow_dispatch) on a branch that has
 # `cargo xtask bench`. The scheduled run benches the branch in the repository
-# variable SPIKE_BENCH_REF, else cloud/spike-s1s2.
+# variable SPIKE_BENCH_REF, else cloud/spike-bench (the branch that has the
+# bench; set the variable once the bench is on the spike head).
 
 on:
   schedule:
@@ -37,11 +38,11 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event_name == 'schedule' && (vars.SPIKE_BENCH_REF || 'cloud/spike-s1s2') || (inputs.ref || github.ref) }}
+          ref: ${{ github.event_name == 'schedule' && (vars.SPIKE_BENCH_REF || 'cloud/spike-bench') || (inputs.ref || github.ref) }}
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (the toolchain is the `toolchain` input)
         with:
@@ -63,13 +64,18 @@ jobs:
           BASELINE: ${{ inputs.baseline || 'docs/spike/multimap/bench/results/baseline-bc.json' }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
+          compare=()
+          if [ -f "$BASELINE" ]; then
+            compare=(--baseline "$BASELINE" --table "$RUNNER_TEMP/out/comparison.md")
+          else
+            echo "No baseline at $BASELINE: results only, no comparison." >> "$GITHUB_STEP_SUMMARY"
+          fi
           cargo xtask bench run \
             --bin "$RUNNER_TEMP/lci-head" \
             --work "$RUNNER_TEMP/bench" \
             --output "$RUNNER_TEMP/out/results-bc.json" \
             --label "workflow run ${{ github.run_id }}" \
-            --baseline "$BASELINE" \
-            --table "$RUNNER_TEMP/out/comparison.md"
+            "${compare[@]}"
 
       - name: Job summary
         if: always()
