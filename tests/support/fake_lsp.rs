@@ -65,8 +65,7 @@ pub struct FakeLspConfig {
     /// A server that never shuts down (`--ignore-shutdown`): it still records
     /// the `shutdown` request and the `exit` notification, but sends no
     /// answer to the first and keeps running after the second, so only a
-    /// kill ends it. While it runs it also rewrites `heartbeat.txt` in the
-    /// state directory every 50 ms, which stops changing once it is dead.
+    /// kill ends it.
     pub ignore_shutdown: bool,
     /// An error response for `workspace/symbol` requests (`--symbol-error
     /// CODE:MESSAGE`, with `--symbol-error-count N` to stop after N). The
@@ -354,21 +353,6 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         let current = fs::read_to_string(&spawn_file).unwrap_or_default();
         spawn_count = current.trim().parse::<u64>().unwrap_or(0) + 1;
         fs::write(&spawn_file, spawn_count.to_string())?;
-    }
-
-    // A server that ignores shutdown can only be ended by a kill; the beat
-    // lets a test see that it really stopped.
-    if config.ignore_shutdown
-        && let Some(path) = config.state_dir.clone()
-    {
-        thread::spawn(move || {
-            let mut beat = 0u64;
-            loop {
-                beat += 1;
-                write_heartbeat(&path.join("heartbeat.txt"), beat);
-                thread::sleep(Duration::from_millis(50));
-            }
-        });
     }
 
     let mut symbol_requests = 0u64;

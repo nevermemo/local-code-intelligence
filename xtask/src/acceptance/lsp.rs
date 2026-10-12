@@ -196,7 +196,6 @@ pub async fn run(profile: AcceptanceProfile, workspace: Option<PathBuf>) -> Resu
     final_result.map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     spec: &LspProfile,
     workspace_path: &Path,
