@@ -1,0 +1,28 @@
+# Gold for the offline RunRecord fixture of tests/cases/run_records.rs: the
+# synthetic three-file workspace of the S2 golden test. Public and
+# hand-written; no private gold set is used.
+
+[[workspaces]]
+key = "run-records"
+
+[[queries]]
+query = "Calculator"
+workspace = "run-records"
+expected_paths = ["src/Calculator.cs"]
+preferred_paths = ["src/totals.go"]
+disfavored_paths = ["tests/**"]
+tags = ["keyword", "short-query"]
+
+[[queries]]
+query = "CalculatorTotal sums values"
+workspace = "run-records"
+expected_paths = ["src/totals.go"]
+required_snippet = "func CalculatorTotal"
+tags = ["descriptive"]
+
+[[queries]]
+query = "test_calculator_adds"
+workspace = "run-records"
+expected_paths = ["tests/calculator_test.py"]
+expected_roles = ["test"]
+tags = ["keyword"]
