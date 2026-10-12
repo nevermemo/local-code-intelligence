@@ -460,6 +460,333 @@ async fn a_server_that_keeps_answering_a_transient_error_is_answered_with_it_and
     assert!(manager.running("csharp-ls", &workspace.id).await);
 }
 
+/// A server that answers nothing but transient errors is wedged, not loading
+/// (N35): once it has done so for `lsp_stuck_seconds`, its session is replaced.
+/// Each call still returns the server's own error, the server is asked to shut
+/// down, and the next call starts a fresh one, whose span starts over.
+///
+/// The span counts every error response, each repeat's too: one failed call
+/// is three answers over about 2 s (the repeats wait 0.5 s and 1.5 s), so a
+/// limit of 4 s is reached during the second call, not the first.
+#[tokio::test]
+async fn a_server_that_answers_only_transient_errors_for_the_stuck_span_is_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 4;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-error", "-32801:content modified"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    // The first call starts the span; its three answers cover about 2 s.
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+
+    // The second call's answers end about 5 s after the first call's first:
+    // the caller still gets the server's error, and the session is discarded.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    wait_until(
+        "the stuck server to be shut down",
+        Duration::from_secs(30),
+        async || {
+            !manager.running("csharp-ls", &workspace.id).await
+                && event_count(&state, "exit_seen.txt") == 1
+        },
+    )
+    .await;
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    // The next call is served by a fresh server (which answers the same way),
+    // and its session is kept: its own span has only just begun.
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+}
+
+/// A call that is cancelled before its repeats end (a search past its latency
+/// budget, which is how most calls to a wedged server end) still counts: the
+/// answers it received extended the span, and a later call for the key replaces
+/// the session although no call ever saw the end of a request.
+///
+/// Each call is dropped after 1 s, between its second answer (about 0.5 s) and
+/// its third (about 2 s), so none of them returns. The first answers of five
+/// calls are about 1 s apart: the span passes the 2 s limit during the fourth
+/// call at the latest (the first one only starts the server), and some later
+/// call finds the session stuck.
+#[tokio::test]
+async fn cancelled_calls_still_count_toward_the_stuck_span() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 2;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-error", "-32801:content modified"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..6 {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1000),
+            manager.symbols(&adapter, &workspace, "Calculator"),
+        )
+        .await;
+        assert!(outcome.is_err(), "the call must be cancelled, not answered");
+    }
+    wait_until(
+        "the stuck server to be shut down",
+        Duration::from_secs(30),
+        async || event_count(&state, "exit_seen.txt") >= 1,
+    )
+    .await;
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "one replacement: the fresh session's own span is still short"
+    );
+}
+
+/// `lsp_stuck_seconds = 0` never replaces a session for transient errors: the
+/// same server that is replaced above keeps its session across any number of
+/// calls (the behaviour before N35).
+#[tokio::test]
+async fn lsp_stuck_seconds_zero_never_replaces_a_server_for_transient_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 0;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-error", "-32801:content modified"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..3 {
+        let error = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RpcError>().map(|e| e.code),
+            Some(-32801)
+        );
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// A server that reports progress while it answers "ask again" is loading, not
+/// wedged: every answer that finds new progress starts the span over, so the
+/// same server that is replaced after 2 s without progress keeps its session
+/// through three calls of about 2 s each.
+#[tokio::test]
+async fn progress_notifications_keep_a_loading_server_from_being_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 2;
+    config.csharp.args.extend(fake_args(&[
+        "--symbol-error",
+        "-32801:content modified",
+        "--progress-before-error",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..3 {
+        let error = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RpcError>().map(|e| e.code),
+            Some(-32801)
+        );
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// `RequestCancelled` (-32800) is the answer to a request that was cancelled,
+/// ours or the server's own: it says nothing about the server's health. Calls
+/// that this client cancels (a search past its latency budget) get that answer
+/// late, after the pending entry is gone, and the reader drops it; the server
+/// answers every one with -32800 for longer than `lsp_stuck_seconds` here, and
+/// the session is kept.
+#[tokio::test]
+async fn answers_to_cancelled_requests_do_not_make_a_server_stuck() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 1;
+    config.csharp.args.extend(fake_args(&[
+        "--symbol-error",
+        "-32800:request cancelled",
+        "--symbol-delay-ms",
+        "400",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..8 {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            manager.symbols(&adapter, &workspace, "Calculator"),
+        )
+        .await;
+        assert!(outcome.is_err(), "the call must be cancelled, not answered");
+    }
+    // The server works through its backlog, answering each cancelled request
+    // 400 ms after the last: wait until it has read the cancellations too.
+    wait_until(
+        "the server to read the cancelled requests",
+        Duration::from_secs(30),
+        async || state_count_so_far(&state, "request_count.txt") >= 12,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// An uncancelled -32800 is an error that is not transient: the caller gets it
+/// at once (no repeats) and it ends the span like any answer that is not "ask
+/// again", so a server answering that way over more than `lsp_stuck_seconds`
+/// keeps its session.
+#[tokio::test]
+async fn a_request_cancelled_error_is_not_transient_and_does_not_make_a_server_stuck() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 1;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-error", "-32800:request cancelled"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..4 {
+        let error = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RpcError>().map(|e| e.code),
+            Some(-32800)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // initialize, initialized, priming, and one request per call: no repeats.
+    assert_eq!(state_count(&state, "request_count.txt"), 7);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// A result ends the span: a server that fails (three answers over about 2 s),
+/// answers once, and fails again is not stuck, although the errors of the two
+/// failing calls together span about 4 s, past the 3 s limit. Without the
+/// reset on a result the third call would end that span and replace the session.
+#[tokio::test]
+async fn a_result_between_transient_errors_ends_the_stuck_span() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 3;
+    // Requests 2 to 4 (the first call and its repeats) fail, request 5 is
+    // answered, requests 6 to 8 (the third call) fail.
+    config.csharp.args.extend(fake_args(&[
+        "--symbol-error",
+        "-32801:content modified",
+        "--symbol-ok-at",
+        "5",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    // initialize, initialized, priming, three failing answers, the result, and
+    // three more failing answers.
+    assert_eq!(state_count(&state, "request_count.txt"), 10);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
+/// A slow answer is not an error: a server that takes longer than the stuck
+/// span to answer every request, successfully, is never replaced.
+#[tokio::test]
+async fn a_slow_successful_answer_is_not_a_stuck_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 1;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--symbol-delay-ms", "1500"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    for _ in 0..2 {
+        let results = manager
+            .symbols(&adapter, &workspace, "Calculator")
+            .await
+            .unwrap();
+        assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+}
+
 /// tsserver answers `workspace/symbol` with "No Project" for every call until
 /// a file is opened. That is an answer, not a dead server: each call returns
 /// the provider's error (the caller fails open across providers), nothing is

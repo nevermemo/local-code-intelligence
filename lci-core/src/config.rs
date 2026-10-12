@@ -307,6 +307,20 @@ pub struct Config {
     /// released server costs one cold start (and re-priming) later. Values
     /// below 60 are meant for tests.
     pub lsp_idle_timeout_seconds: u64,
+    /// Seconds a language server may answer nothing but transient errors
+    /// ("ask again": `ContentModified`, `ServerCancelled`, `RequestFailed`, a
+    /// loading server's own errors) before its session is replaced (default
+    /// `900`, 15 minutes; `0` never replaces it). The span runs from the
+    /// session's first such answer, each repeat's included, also for a call
+    /// that a search's latency budget cancelled. Any other answer (a result,
+    /// or an error that is not transient, `RequestCancelled` among them) ends
+    /// it, and so does a `$/progress` notification from the server: a server
+    /// that reports progress is loading. A server that is still loading
+    /// legitimately answers them for minutes, and a restarted one starts over,
+    /// so this must stay above the longest load you expect: a repository that
+    /// needs longer would be restarted every time the span runs out. The
+    /// default is not measured. Values below 60 are meant for tests.
+    pub lsp_stuck_seconds: u64,
     /// Optional C# language-server (csharp-ls) settings. Absent or empty
     /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
     pub csharp: CSharpLspConfig,
@@ -627,6 +641,7 @@ impl Default for Config {
             lsp_candidate_count: 40,
             lsp_search_budget_ms: 1500,
             lsp_idle_timeout_seconds: 1800,
+            lsp_stuck_seconds: 900,
             csharp: CSharpLspConfig::default(),
             typescript: TypeScriptLspConfig::default(),
             python: PythonLspConfig::default(),
@@ -1051,6 +1066,26 @@ mod tests {
             let reloaded: Config = toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
             reloaded.validate().unwrap();
             assert_eq!(reloaded.lsp_idle_timeout_seconds, seconds);
+        }
+    }
+
+    #[test]
+    fn lsp_stuck_seconds_defaults_to_fifteen_minutes_allows_zero_and_round_trips() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.lsp_stuck_seconds, 900);
+        assert_eq!(Config::default().lsp_stuck_seconds, 900);
+
+        // 0 means never replace; it is a valid setting, not an error.
+        for seconds in [0, 1, 3600] {
+            let configured: Config =
+                toml::from_str(&format!("{}lsp_stuck_seconds = {seconds}\n", base_toml())).unwrap();
+            configured.validate().unwrap();
+            assert_eq!(configured.lsp_stuck_seconds, seconds);
+
+            let reloaded: Config = toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
+            reloaded.validate().unwrap();
+            assert_eq!(reloaded.lsp_stuck_seconds, seconds);
         }
     }
 

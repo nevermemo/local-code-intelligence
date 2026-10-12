@@ -88,6 +88,16 @@ lsp_search_budget_ms = 1500
 # note it. Values below 60 are meant for tests.
 lsp_idle_timeout_seconds = 1800
 
+# Seconds a language server may answer nothing but transient "ask again"
+# errors (ContentModified, ServerCancelled, RequestFailed, a loading server's
+# own errors) before its session is replaced; the span runs from its first such
+# answer, and any result, any other error, or a progress notification from the
+# server ends it. A server that is still loading answers them for minutes and a
+# restarted one starts the load over, so keep this above the longest load you
+# expect. 0 never replaces a session for this.
+# Values below 60 are meant for tests.
+lsp_stuck_seconds = 900
+
 # Optional C# language server (csharp-ls). C# tooling is optional and
 # fail-open: omitting this section (or leaving path empty) keeps it disabled
 # without affecting syntax retrieval. The shared lsp_timeout_seconds and

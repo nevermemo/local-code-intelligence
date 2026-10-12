@@ -120,6 +120,12 @@ pub struct JsonRpcClient {
     /// wait by *inactivity* against this, not by total call duration: see
     /// `request`'s doc comment for why.
     last_activity: LastActivity,
+    /// How many `$/progress` notifications the server has sent. A server that
+    /// reports progress is doing work, so an answer made of transient errors
+    /// is "still loading", not "wedged" (see `Session::note_answer` in
+    /// `lsp.rs`). Only that one method counts: any other message would make a
+    /// server that chats forever look busy.
+    progress: Arc<AtomicU64>,
     /// The server's process tree. Closing it (dropping the client) kills every
     /// process in it. `None` when the job could not be set up.
     #[cfg(windows)]
@@ -169,11 +175,13 @@ impl JsonRpcClient {
         let ready = Arc::new(tokio::sync::Notify::new());
         let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_activity: LastActivity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let progress = Arc::new(AtomicU64::new(0));
         let reader_stdin = Arc::clone(&stdin);
         let reader_pending = Arc::clone(&pending);
         let reader_ready = Arc::clone(&ready);
         let reader_is_ready = Arc::clone(&is_ready);
         let reader_last_activity = Arc::clone(&last_activity);
+        let reader_progress = Arc::clone(&progress);
         let label = config.label.clone();
         tokio::spawn(async move {
             if let Err(error) = read_messages(
@@ -183,6 +191,7 @@ impl JsonRpcClient {
                 reader_ready,
                 reader_is_ready,
                 reader_last_activity,
+                reader_progress,
                 ready_predicate,
             )
             .await
@@ -210,9 +219,16 @@ impl JsonRpcClient {
             ready,
             is_ready,
             last_activity,
+            progress,
             #[cfg(windows)]
             job,
         }))
+    }
+
+    /// How many `$/progress` notifications the server has sent so far. Only
+    /// the change between two readings means anything.
+    pub fn progress_count(&self) -> u64 {
+        self.progress.load(Ordering::Relaxed)
     }
 
     /// Sends a JSON-RPC notification (no response expected).
@@ -454,6 +470,8 @@ impl Drop for JsonRpcClient {
     }
 }
 
+// One handle for each thing the reader signals; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn read_messages(
     stdout: tokio::process::ChildStdout,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -461,6 +479,7 @@ async fn read_messages(
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
     last_activity: LastActivity,
+    progress: Arc<AtomicU64>,
     ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
@@ -510,6 +529,9 @@ async fn read_messages(
                 tracing::warn!(error = %error, %method, "failed to answer server-initiated request");
             }
             continue;
+        }
+        if id.is_none() && method == Some("$/progress") {
+            progress.fetch_add(1, Ordering::Relaxed);
         }
         // Notifications (no id): evaluate readiness predicate.
         if id.is_none() && ready_predicate(&message) {

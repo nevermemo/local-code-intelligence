@@ -73,6 +73,15 @@ pub struct FakeLspConfig {
     /// first `workspace/symbol` request of the process is the priming one and
     /// is always answered normally.
     pub symbol_error: Option<InjectedError>,
+    /// The Nth `workspace/symbol` request of the process (the priming one is
+    /// number 1) is answered normally although `symbol_error` is set
+    /// (`--symbol-ok-at N`; 0 = none): a server that fails, answers once, then
+    /// fails again.
+    pub symbol_ok_at: u64,
+    /// Sends a `$/progress` notification before each injected `workspace/symbol`
+    /// error (`--progress-before-error`): a server that is still loading and
+    /// says so while it answers "ask again".
+    pub progress_before_error: bool,
     /// An error response for `textDocument/definition` requests
     /// (`--definition-error CODE:MESSAGE`, `--definition-error-count N`).
     pub definition_error: Option<InjectedError>,
@@ -191,6 +200,9 @@ pub fn run_from_env() -> io::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let ignore_shutdown = cli.iter().any(|arg| arg == "--ignore-shutdown");
+    let symbol_ok_at = cli_arg(&cli, "--symbol-ok-at")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let exit_on_symbol_request = cli_arg(&cli, "--exit-on-symbol-request")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
@@ -206,6 +218,8 @@ pub fn run_from_env() -> io::Result<()> {
         symbol_delay_ms,
         ignore_shutdown,
         symbol_error: InjectedError::from_cli(&cli, "--symbol-error", "--symbol-error-count"),
+        symbol_ok_at,
+        progress_before_error: cli.iter().any(|arg| arg == "--progress-before-error"),
         definition_error: InjectedError::from_cli(
             &cli,
             "--definition-error",
@@ -490,9 +504,16 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                                 &json!({"jsonrpc":"2.0","id":id,"error":raw}),
                             )?;
                         } else if symbol_requests > 1
+                            && symbol_requests != config.symbol_ok_at
                             && let Some(error) = symbol_error.as_mut()
                             && error.take()
                         {
+                            if config.progress_before_error {
+                                write_message(
+                                    &mut stdout,
+                                    &json_notification("$/progress", json!({"kind":"report"})),
+                                )?;
+                            }
                             write_message(
                                 &mut stdout,
                                 &json_error(id, error.code, &error.message),

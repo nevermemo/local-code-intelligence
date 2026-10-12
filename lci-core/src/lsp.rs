@@ -20,7 +20,10 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -171,6 +174,52 @@ fn is_transient_code(code: i64) -> bool {
     )
 }
 
+/// Whether an error response means "ask again" for this server: a code that
+/// is transient on any server, or one that is only for this adapter (given
+/// whether the server has reported ready). The one rule behind both the repeats
+/// of [`send_with_repeats`] and the stuck-session check of [`TransientStreak`].
+fn is_transient(adapter: &Arc<dyn LspAdapter>, response: &RpcError, ready: bool) -> bool {
+    is_transient_code(response.code) || adapter.is_loading_error(response, ready)
+}
+
+/// How long a session has answered nothing but transient errors: the time of
+/// the first one since the last answer of any other kind (a result, or an error
+/// that is not transient) and since the last time the server reported progress
+/// (`$/progress`). A server that is still loading answers transient errors for
+/// minutes, and a restarted one starts the load over, so only a long span is
+/// evidence of a server that will never be ready; a server that keeps sending
+/// progress is working, whatever its answers say. The limit is
+/// `lsp_stuck_seconds`. Time, not a count of failed requests: a burst of
+/// concurrent searches fails many requests within seconds of a perfectly normal
+/// load, and a count would replace the server that is about to be ready.
+#[derive(Default)]
+struct TransientStreak {
+    since: Option<Instant>,
+    /// The server's progress count when the span began.
+    progress: u64,
+}
+
+impl TransientStreak {
+    /// The server answered with a result or an error that is not transient.
+    fn answered(&mut self) {
+        self.since = None;
+    }
+
+    /// Records a transient answer received at `now`, when the server had sent
+    /// `progress` progress notifications in all. A count that differs from the
+    /// one at the start of the span starts the span over at `now`. Returns how
+    /// long the session has answered nothing else when that is at least
+    /// `limit`, which needs at least two such answers, `limit` apart.
+    fn transient(&mut self, now: Instant, progress: u64, limit: Duration) -> Option<Duration> {
+        if self.since.is_none() || progress != self.progress {
+            self.since = Some(now);
+            self.progress = progress;
+        }
+        let span = now.saturating_duration_since(self.since.unwrap_or(now));
+        (span >= limit).then_some(span)
+    }
+}
+
 /// What one server start produced: the ready client, or the rendered cause of
 /// the failure (shared by every caller that waited on the same start).
 type StartOutcome = Result<Arc<GenericClient>, String>;
@@ -219,10 +268,29 @@ struct Session {
     /// priming never touch it, and neither does [`Manager::running`], so a
     /// status poll does not keep a server alive.
     last_used: std::sync::Mutex<Instant>,
+    /// How long this session has answered nothing but transient errors, see
+    /// [`TransientStreak`]. Only requests made through [`Manager::send`] count,
+    /// not the session's own priming.
+    streak: std::sync::Mutex<TransientStreak>,
+    /// `lsp_stuck_seconds`: the span of transient errors after which the session
+    /// is marked [`Session::stuck`]. `None` never marks it.
+    stuck_after: Option<Duration>,
+    /// Set once the server has answered nothing but transient errors for
+    /// `stuck_after`. A stuck session is replaced by the next caller that asks
+    /// for its key ([`Manager::session`]), or at once by the call that
+    /// noticed ([`Manager::send`]). A flag and not a discard made on the spot,
+    /// because a request is cancelled as often as it finishes (a search past its
+    /// latency budget drops the call before the repeats end), and a cancelled
+    /// call must still count.
+    stuck: AtomicBool,
 }
 
 impl Session {
-    fn begin(adapter: Arc<dyn LspAdapter>, workspace: Workspace) -> Arc<Self> {
+    fn begin(
+        adapter: Arc<dyn LspAdapter>,
+        workspace: Workspace,
+        stuck_after: Option<Duration>,
+    ) -> Arc<Self> {
         let (sender, start) = watch::channel(None);
         let (primed_sender, primed) = watch::channel(false);
         let provider = adapter.provider();
@@ -287,7 +355,63 @@ impl Session {
             provider,
             workspace: workspace_path,
             last_used: std::sync::Mutex::new(Instant::now()),
+            streak: std::sync::Mutex::new(TransientStreak::default()),
+            stuck_after,
+            stuck: AtomicBool::new(false),
         })
+    }
+
+    /// Records the outcome of one request sent to this session's `client`, as
+    /// soon as the server has answered it (each repeat of a request is one
+    /// answer): a result or an error that is not transient ends the
+    /// [`TransientStreak`], a transient error extends it (or starts it over
+    /// when the server has reported progress since the streak began) and marks
+    /// the session stuck once the streak reaches `stuck_after`. A transport failure changes
+    /// nothing here: the caller discards the session itself.
+    fn note_answer(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        client: &GenericClient,
+        method: &str,
+        result: &Result<Value>,
+    ) {
+        let response = match result {
+            Ok(_) => return self.streak.lock().unwrap().answered(),
+            Err(error) => match error.downcast_ref::<RpcError>() {
+                Some(response) => response,
+                None => return,
+            },
+        };
+        if !is_transient(adapter, response, client.rpc.is_ready()) {
+            return self.streak.lock().unwrap().answered();
+        }
+        let Some(limit) = self.stuck_after else {
+            return;
+        };
+        let span = self.streak.lock().unwrap().transient(
+            Instant::now(),
+            client.rpc.progress_count(),
+            limit,
+        );
+        if let Some(span) = span
+            && !self.stuck.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                provider = self.provider,
+                workspace = %self.workspace.display(),
+                method,
+                code = response.code,
+                message = %response.message,
+                stuck_s = span.as_secs(),
+                "language server has answered nothing but transient errors for too long; its session will be replaced"
+            );
+        }
+    }
+
+    /// Whether the server has answered nothing but transient errors for
+    /// `lsp_stuck_seconds`.
+    fn stuck(&self) -> bool {
+        self.stuck.load(Ordering::Relaxed)
     }
 
     /// Records that a caller just asked for this session.
@@ -395,10 +519,15 @@ impl Session {
 /// [`SHUTDOWN_GRACE`]), when nobody has used it for `lsp_idle_timeout_seconds`
 /// (`0` keeps it for the life of the manager), on [`Self::release`], and on
 /// [`Self::shutdown_all`]. The next call for that workspace starts a new
-/// session transparently.
+/// session transparently. A session whose server has answered nothing but
+/// transient errors for `lsp_stuck_seconds` is replaced the same way (see
+/// [`Manager::send`]).
 pub struct Manager {
     adapters: Vec<Arc<dyn LspAdapter>>,
     sessions: Arc<Sessions>,
+    /// `lsp_stuck_seconds`: how long a session may answer nothing but transient
+    /// errors before it is replaced. `None` never replaces it.
+    stuck_after: Option<Duration>,
 }
 
 impl Manager {
@@ -423,7 +552,13 @@ impl Manager {
                 Duration::from_secs(config.lsp_idle_timeout_seconds),
             );
         }
-        Self { adapters, sessions }
+        let stuck_after =
+            (config.lsp_stuck_seconds > 0).then(|| Duration::from_secs(config.lsp_stuck_seconds));
+        Self {
+            adapters,
+            sessions,
+            stuck_after,
+        }
     }
 
     pub fn adapters(&self) -> &[Arc<dyn LspAdapter>] {
@@ -447,7 +582,9 @@ impl Manager {
     /// none. At most one start is ever in flight per key: concurrent callers
     /// get the same session. A session whose start already failed is replaced
     /// (a failure is reported to the callers that waited on it, never cached
-    /// for later ones). Asking for the session counts as using it, recorded
+    /// for later ones), and so is a stuck one (see [`Session::stuck`]), whose
+    /// server is stopped on a task of its own like a discarded session's.
+    /// Asking for the session counts as using it, recorded
     /// under the registry lock, so the idle sweeper cannot release it between
     /// this caller finding it and the caller's first request.
     async fn session(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Arc<Session> {
@@ -455,12 +592,17 @@ impl Manager {
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(&key)
             && !existing.failed()
+            && !existing.stuck()
         {
             existing.touch();
             return Arc::clone(existing);
         }
-        let session = Session::begin(Arc::clone(adapter), workspace.clone());
-        sessions.insert(key, Arc::clone(&session));
+        let session = Session::begin(Arc::clone(adapter), workspace.clone(), self.stuck_after);
+        if let Some(replaced) = sessions.insert(key, Arc::clone(&session))
+            && replaced.stuck()
+        {
+            tokio::spawn(replaced.shutdown(SHUTDOWN_GRACE));
+        }
         session
     }
 
@@ -563,7 +705,8 @@ impl Manager {
     /// reading, went silent past the timeout, or sent an error response that is
     /// not a well-formed error object) discard the session and retry once with
     /// a fresh client (never a retry loop). A server that answers with an error
-    /// response is alive: see [`Self::send`].
+    /// response is alive and keeps its session, unless it has answered nothing
+    /// else for `lsp_stuck_seconds`: see [`Self::send`].
     ///
     /// `after_priming` is true for `workspace/symbol` only (see
     /// [`Self::client`]).
@@ -580,42 +723,65 @@ impl Manager {
         after_priming: bool,
     ) -> Result<Value> {
         let (session, client) = self.client(adapter, workspace, after_priming).await?;
-        match Self::send(adapter, workspace, &client, method, &params).await {
+        match self
+            .send(adapter, workspace, &session, &client, method, &params)
+            .await
+        {
             Ok(value) => Ok(value),
             Err(first) if first.downcast_ref::<RpcError>().is_some() => Err(first),
             Err(first) => {
                 Self::warn_restart(adapter, workspace, method, &first);
                 self.discard(adapter, workspace, &session).await;
-                let (_, client) = self
+                let (session, client) = self
                     .client(adapter, workspace, after_priming)
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
-                Self::send(adapter, workspace, &client, method, &params).await
+                self.send(adapter, workspace, &session, &client, method, &params)
+                    .await
             }
         }
     }
 
-    /// Sends one request on `client`, repeating it on the same server while the
-    /// server keeps answering with a transient error response (see
-    /// [`send_with_repeats`] for the rules). The caller tells an answer from a
-    /// transport failure by the [`RpcError`] in the error.
+    /// Sends one request on `client` (the client of `session`), repeating it on
+    /// the same server while the server keeps answering with a transient error
+    /// response (see [`send_with_repeats`] for the rules). The caller tells an
+    /// answer from a transport failure by the [`RpcError`] in the error.
+    ///
+    /// Every answer, each repeat's too, updates the session's
+    /// [`TransientStreak`] as it arrives (see [`Session::note_answer`]). When
+    /// the server has answered nothing but transient errors for
+    /// `lsp_stuck_seconds` it is wedged, not loading: this call, if it is still
+    /// waiting, discards the session like a transport failure but without a
+    /// retry (it still returns the server's own error), and otherwise the next
+    /// caller for the key replaces it ([`Self::session`]). Repeating on a fresh
+    /// server would only hand this caller another cold start.
     async fn send(
+        &self,
         adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
+        session: &Arc<Session>,
         client: &GenericClient,
         method: &str,
         params: &Value,
     ) -> Result<Value> {
-        send_with_repeats(
+        let result = send_with_repeats(
             &RepeatPolicy::SAME_SERVER,
             tokio::time::sleep,
             adapter,
             workspace,
             method,
             move || client.rpc.is_ready(),
-            move || client.request(method, params.clone()),
+            move || async move {
+                let result = client.request(method, params.clone()).await;
+                session.note_answer(adapter, client, method, &result);
+                result
+            },
         )
-        .await
+        .await;
+        if session.stuck() {
+            self.discard(adapter, workspace, session).await;
+        }
+        result
     }
 
     /// Same retry contract as [`Self::request`], but runs the adapter's
@@ -642,7 +808,8 @@ impl Manager {
                 adapter
                     .before_position_request(&client.rpc, file, relative)
                     .await?;
-                Self::send(adapter, workspace, &client, method, &params).await
+                self.send(adapter, workspace, &session, &client, method, &params)
+                    .await
             }
             .await;
             result.map_err(|error| (Some(session), error))
@@ -655,14 +822,15 @@ impl Manager {
                 if let Some(session) = session {
                     self.discard(adapter, workspace, &session).await;
                 }
-                let (_, client) = self
+                let (session, client) = self
                     .client(adapter, workspace, false)
                     .await
                     .with_context(|| format!("{} restart after: {first:#}", adapter.provider()))?;
                 adapter
                     .before_position_request(&client.rpc, file, relative)
                     .await?;
-                Self::send(adapter, workspace, &client, method, &params).await
+                self.send(adapter, workspace, &session, &client, method, &params)
+                    .await
             }
         }
     }
@@ -787,7 +955,8 @@ impl Manager {
 /// Any other error, or a transient one that outlasts the repeats, is returned
 /// as it came with the session left alone: a server that answers is not dead,
 /// and replacing a loading one with a freshly started (so equally loading) one
-/// only costs another cold start. A failure that is not an error response (the
+/// only costs another cold start. (A server that answers nothing else for
+/// `lsp_stuck_seconds` is replaced by [`Manager::send`].) A failure that is not an error response (the
 /// process exited, a pipe closed, the timeout) is returned at once, unrepeated:
 /// that is the caller's cue to restart the server.
 async fn send_with_repeats<A, S>(
@@ -814,8 +983,7 @@ where
             return Err(error);
         };
         let first_error_at: Instant = *first_error.get_or_insert_with(Instant::now);
-        let transient =
-            is_transient_code(response.code) || adapter.is_loading_error(response, is_ready());
+        let transient = is_transient(adapter, response, is_ready());
         let wait = policy
             .wait_before(repeats, first_error_at.elapsed())
             .filter(|_| transient);
@@ -1194,6 +1362,77 @@ mod tests {
         assert_eq!(
             attempts, 1,
             "no repeat may start after the window has passed"
+        );
+    }
+
+    const LIMIT: Duration = Duration::from_secs(900);
+
+    #[test]
+    fn a_streak_needs_two_transient_answers_a_limit_apart() {
+        let start = Instant::now();
+        let mut streak = TransientStreak::default();
+        assert_eq!(streak.transient(start, 0, LIMIT), None, "the first answer");
+        assert_eq!(
+            streak.transient(start + LIMIT - Duration::from_millis(1), 0, LIMIT),
+            None,
+            "just under the limit"
+        );
+        assert_eq!(
+            streak.transient(start + LIMIT, 0, LIMIT),
+            Some(LIMIT),
+            "at the limit the session is stuck"
+        );
+    }
+
+    /// A server that answers (a result, or an error that is not transient)
+    /// is not stuck, and the span starts over with its next transient error.
+    #[test]
+    fn an_answer_ends_the_streak() {
+        let start = Instant::now();
+        let mut streak = TransientStreak::default();
+        assert_eq!(streak.transient(start, 0, LIMIT), None);
+        streak.answered();
+        let later = start + LIMIT * 2;
+        assert_eq!(
+            streak.transient(later, 0, LIMIT),
+            None,
+            "a new streak begins here, not at the first error"
+        );
+        assert_eq!(streak.transient(later + LIMIT, 0, LIMIT), Some(LIMIT));
+    }
+
+    /// An answer that arrives with an earlier timestamp than the streak's start
+    /// (clocks of concurrent requests) is no span at all, not a panic.
+    #[test]
+    fn a_transient_answer_before_the_streak_began_is_not_a_span() {
+        let start = Instant::now();
+        let mut streak = TransientStreak::default();
+        assert_eq!(streak.transient(start + LIMIT, 0, LIMIT), None);
+        assert_eq!(streak.transient(start, 0, LIMIT), None);
+    }
+
+    /// Progress means the server is working: a span that straddles a
+    /// progress notification starts over at the answer that saw it, and only
+    /// a span in which the count stayed the same can reach the limit.
+    #[test]
+    fn progress_restarts_the_streak() {
+        let start = Instant::now();
+        let mut streak = TransientStreak::default();
+        assert_eq!(streak.transient(start, 1, LIMIT), None);
+        assert_eq!(
+            streak.transient(start + LIMIT, 2, LIMIT),
+            None,
+            "the count moved: a new span begins here"
+        );
+        assert_eq!(
+            streak.transient(start + LIMIT * 2 - Duration::from_millis(1), 2, LIMIT),
+            None,
+            "just under the limit since the progress"
+        );
+        assert_eq!(
+            streak.transient(start + LIMIT * 2, 2, LIMIT),
+            Some(LIMIT),
+            "no more progress for the whole limit: stuck"
         );
     }
 
