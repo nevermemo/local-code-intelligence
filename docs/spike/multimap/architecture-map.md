@@ -1,6 +1,8 @@
 # Retrieval architecture map
 
 Generated: 2026-10-12T04:07Z
+Revised: 2026-10-12T06:48Z (fact-check corrections: identity-change freshness, lexical
+common-term fallback, seams 9.1 and 9.3)
 Base commit: 7f9c636 (`origin/fix/verified-bugs`; the spike branch adds only docs)
 
 This file describes the retrieval pipeline as it exists today. It is groundwork for the
@@ -92,8 +94,9 @@ There is no persisted lexical index. Each query runs a live `rg` over the workin
 - Lines are mapped to chunks in `App::map_lexical_matches` (`src/app/search.rs:1139`), and
   chunks are scored with BM25 by `score_chunks` (`lexical.rs:694`). The parameters are
   `BM25_K1 = 1.2` and `BM25_B = 0.75`. Document frequency is counted over indexed files only.
-  Terms that appear in more than 25% of files are dropped (`:26`), and at most 12 terms score
-  (`:29`).
+  Terms that appear in more than 25% of files are dropped (`MAX_DOCUMENT_FREQUENCY`, `:26`),
+  unless that would drop every credited term, in which case all credited terms are kept
+  (`select_terms`, `:660-675`). At most 12 terms score, rarest first (`:29`).
 - Results are capped at `lexical_candidate_count` (40).
 
 Ripgrep and the scanner see different file sets:
@@ -158,7 +161,11 @@ Freshness (`IndexFreshness`, `lci-core/src/config.rs:19`; resolved in
 | No snapshot | Index now, or wait for the job that holds the lock. A failed automatic flight shares its error (`search.rs:1060`). | `created` / `waited_for_existing_job` |
 | `on-search` (default) | `refresh_stale_snapshot` (`indexing.rs:306`). Re-fingerprints at most every `stale_check_interval_seconds` (10). If stale, tries the write lock and refreshes incrementally. Otherwise waits up to `wait_for_existing_job_seconds` (120) and re-checks. A failure keeps the old snapshot and warns (`:402`). | `reused` / `refreshed_incrementally` / `waited_for_existing_job` |
 | `manual`, `watch` | Never refresh from a search. | `reused` |
-| Embedding identity changed | Hard error in every mode. Old vectors are never served (`search.rs:1105`, `indexing.rs:406`). | (error) |
+| Embedding identity changed, `on-search` | `refresh_stale_snapshot` treats it as stale even when the fingerprint check is throttled. It re-embeds through `index_locked` and then searches the new snapshot (`refreshed_incrementally`). If that recovery fails, or the wait for another job times out, the search fails with a hard error (`stale_refresh_fallback`, `indexing.rs:402`; `:380`). | `refreshed_incrementally` / `waited_for_existing_job` / (error) |
+| Embedding identity changed, `manual` or `watch` | Rejected with "embedding configuration changed; reindex workspace" (`search.rs:1105`). | (error) |
+
+In no mode are old vectors a fallback after an identity change: either a fresh index exists or
+the search fails.
 
 `watch` (`indexing.rs:530`) runs a polling task. It re-fingerprints every
 `watch_poll_milliseconds`, debounces, and calls `App::index`.
@@ -250,7 +257,8 @@ These come from `AGENTS.md` (Hard rules) and `src/app/AGENTS.md`:
   reach the reranker or the results.
 - **Freshness.** Freshness follows `[index].freshness`. Only `on-search` may refresh from a
   search, and it reports `refreshed_incrementally`. A failed refresh keeps the old snapshot
-  and warns. An embedding-identity change is a hard error.
+  and warns. An embedding-identity change is re-embedded under `on-search` and rejected under
+  `manual`/`watch`; a failed recovery is a hard error, never a fallback to old vectors.
 - **No new store or service.** No Docker, no extra database, no extra service. Data stays in
   `data_dir`, outside every workspace. Map stores must be LanceDB tables or files under
   `data_dir` (manifest-style JSON).
@@ -267,8 +275,8 @@ These come from `AGENTS.md` (Hard rules) and `src/app/AGENTS.md`:
 | | |
 | --- | --- |
 | Where | Fan-out `search.rs:712`; per-channel post-processing `:836-906`; `fuse_hits` `:1297`; `Hit` `src/store.rs:27`; `ChannelsConfig` `config.rs:68`; `FusionConfig` `config.rs:172`; `Timings` `search.rs:29`; `CandidateTrace` `search.rs:256` |
-| What exists | Three channels hard-coded as three `tokio::join!` arms. Each yields a `Vec<Hit>` with its own rank field. `fuse_hits` takes exactly three lists. Weights, switches, timings and trace columns are fixed structs. `LspAdapter` (`lci-core/src/lsp/adapter.rs:14`) already shows the trait-object registry pattern. |
-| What would change | (1) A stable chunk id. Today's key includes `start_line`, so it moves when lines are inserted above the chunk. Option: `(path, content_hash, ordinal among equal hashes in the file)`, computed in `chunks_with_adapter` (`chunk.rs:144`) and stored as a column. (2) A trait in `lci-core`: `id`, `build(&Scan)`, `update(changed files)`, and `query(&MapQuery, &Universe) -> Result<Vec<(ChunkId, score)>>`, with seed-set queries for graph maps. Impls needing LanceDB (vector maps) go in the root crate. (3) `fuse_hits` becomes a loop over `(map_id, ranked list, weight)`. (4) `Hit` gains a `contributions` map. The legacy `semantic_rank`/`lexical_rank`/`lsp_rank` fields, `retrieval_channels` and `Timings` stay as projections so the JSON is unchanged. |
+| What exists | Three channels hard-coded as three `tokio::join!` arms. The arms return raw results, not hits: the semantic arm returns only the query embedding (the LanceDB `Store::search` runs after the join, `:844`), the lexical arm returns ripgrep line matches, and the LSP arm returns `Location`s. The per-channel post-processing (`:836-906`) then turns each into a `Vec<Hit>` over the filtered universe (`map_lexical_matches` `:1139`, `map_lsp_locations` `:1259`), each with its own rank field. `fuse_hits` takes exactly those three mapped lists. Weights, switches, timings and trace columns are fixed structs. `LspAdapter` (`lci-core/src/lsp/adapter.rs:14`) already shows the trait-object registry pattern. |
+| What would change | (1) A stable chunk id. Today's key includes `start_line`, so it moves when lines are inserted above the chunk. Option: `(path, content_hash, ordinal among equal hashes in the file)`, computed in `chunks_with_adapter` (`chunk.rs:144`) and stored as a column. (2) A trait in `lci-core`: `id`, `build(&Scan)`, `update(changed files)`, and `query(&MapQuery, &Universe) -> Result<Vec<(ChunkId, score)>>`, with seed-set queries for graph maps. Impls needing LanceDB (vector maps) go in the root crate. (3) `fuse_hits` becomes a loop over `(map_id, ranked list, weight)`. (4) `Hit` gains a `contributions` map. The legacy `semantic_rank`/`lexical_rank`/`lsp_rank` fields, `retrieval_channels` and `Timings` stay as projections, so existing readers keep working, but the serialized JSON does change: every hit gains the new field. A map registry must therefore accept both kinds of output (raw per-map results that it maps onto the universe, or ready `Vec<Hit>` lists). |
 | Risk | The f32 summation order is part of the dump contract (`search.rs:244-254`), and replay checks bit-exact equality (`replay.rs:406`). A generic loop must add the three legacy channels first, in that order, or every old dump is refused. Per-search cost: `Store::chunks` already loads the whole table (`search.rs:689`), and each extra map that maps onto the universe adds a linear pass (roadmap N84 covers the lexical one). |
 
 ### 9.2 (b) Step-wise traversal with checkpoints
@@ -285,8 +293,8 @@ These come from `AGENTS.md` (Hard rules) and `src/app/AGENTS.md`:
 | | |
 | --- | --- |
 | Where | `index_locked` `src/app/indexing.rs:196`; `Manifest` `lci-core/src/manifest.rs:20`; `IndexConfig` `lci-core/src/config.rs:28`; `embedding_identity` `config.rs:921`; walker `chunk.rs:204`; `Status` `indexing.rs:115`; `IndexReport` `indexing.rs:23` |
-| What exists | One fixed build: chunk, embed, one table. Compatibility is a single identity string in table metadata (`store.rs:256`). The manifest records chunks only. The fingerprint covers supported-extension files only. |
-| What would change | A profile picks which maps to build, either detected from the repository or set in a new config section. Note that `IndexConfig` and `Config` are `deny_unknown_fields`, and "profile" is already taken by query-time search profiles (`config.rs:107`). Changes: bump the manifest to v3 with `profile` and per-map `{identity, fingerprint, built_at}`, migrating the way `ManifestV1` does (`manifest.rs:57`). `index_locked` runs each selected map's build/update after `scan_incremental` and before `manifest::save`, under the same locks. Each map has its own identity, so changing one map's settings does not re-embed everything. Maps over non-code files (agent instructions, config keys, build graph) need their own walk with the same `WalkBuilder` settings (`chunk.rs:207-213`) and their own fingerprint, otherwise `on-search` staleness misses their changes. Map tables would be named `ws_<16hex>_<map>`. |
+| What exists | One fixed build: chunk, embed, one table. Compatibility is a single identity string in table metadata (`store.rs:256`). The manifest (`manifest.rs:12`, `:20`) holds a version, the workspace id and path, the workspace fingerprint, and per file the language, the adapter version (`cache_version`), the content hash and the chunk list (code, line ranges, hashes). It holds no syntax trees, declarations, signatures or edges. The fingerprint covers supported-extension files only. |
+| What would change | A profile picks which maps to build, either detected from the repository or set in a new config section. Note that `IndexConfig` and `Config` are `deny_unknown_fields`, and "profile" is already taken by query-time search profiles (`config.rs:107`). Changes: bump the manifest to v3 with `profile` and per-map `{identity, fingerprint, built_at}`, migrating the way `ManifestV1` does (`manifest.rs:57`). `index_locked` runs each selected map's build/update after `scan_incremental` and before `manifest::save`, under the same locks. Each map has its own identity, so changing one map's settings does not re-embed everything. Maps over non-code files (agent instructions, config keys, build graph) need their own walk with the same `WalkBuilder` settings (`chunk.rs:207-213`) and their own fingerprint, otherwise `on-search` staleness misses their changes. Map tables would be named `ws_<16hex>_<map>`. If per-map results also reach `Hit` through a new `contributions` field, the legacy rank fields stay but the response JSON changes (see 9.1). |
 | Risk | Windows path length (`AGENTS.md` running-locally notes, `workspace.rs:33-39`). A map that fails during indexing must not fail the core index, which keeps the fail-open rule at index time. An identity change in an optional map must not inherit the hard-error rule that exists for the embedding identity (`search.rs:1105`). Watch and on-search both go through `index_locked`, so map build cost lands on search latency under `on-search`. |
 
 ### 9.4 (d) MCP traversal tools
