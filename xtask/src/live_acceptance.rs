@@ -309,6 +309,13 @@ fn should_run(only: &[String], name: &str, cmd: &str) -> bool {
     })
 }
 
+fn select_steps<'a>(steps: &'a [StepSpec], only: &[String]) -> Vec<&'a StepSpec> {
+    steps
+        .iter()
+        .filter(|spec| spec.name == "Build" || should_run(only, spec.name, spec.cmd))
+        .collect()
+}
+
 pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()> {
     let root = workspace_root();
     std::env::set_current_dir(&root)?;
@@ -449,10 +456,7 @@ pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()>
         ));
     }
 
-    let selected: Vec<&StepSpec> = steps
-        .iter()
-        .filter(|spec| should_run(&only, spec.name, spec.cmd))
-        .collect();
+    let selected = select_steps(&steps, &only);
     if selected.is_empty() {
         println!(
             "No steps matched -only '{}' -- nothing ran.",
@@ -508,6 +512,69 @@ pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_test_steps(include_build: bool) -> Vec<StepSpec> {
+        let mut steps = Vec::new();
+        if include_build {
+            steps.push(cargo_step("Build", "build", &["build"], 20));
+        }
+        steps.push(binary_step(
+            "Acceptance - core indexing",
+            "core",
+            "xtask".into(),
+            vec![],
+            20,
+        ));
+        steps.push(binary_step(
+            "Acceptance - core search",
+            "core",
+            "xtask".into(),
+            vec![],
+            20,
+        ));
+        steps.push(binary_step(
+            "Acceptance - multilingual",
+            "multilingual",
+            "xtask".into(),
+            vec![],
+            15,
+        ));
+        steps
+    }
+
+    #[test]
+    fn only_core_keeps_build_and_core_steps() {
+        let steps = selection_test_steps(true);
+        let selected = select_steps(&steps, &["core".to_string()]);
+
+        assert_eq!(
+            selected.iter().map(|step| step.name).collect::<Vec<_>>(),
+            [
+                "Build",
+                "Acceptance - core indexing",
+                "Acceptance - core search"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_core_with_skip_build_keeps_core_steps() {
+        let steps = selection_test_steps(false);
+        let selected = select_steps(&steps, &["core".to_string()]);
+
+        assert_eq!(
+            selected.iter().map(|step| step.name).collect::<Vec<_>>(),
+            ["Acceptance - core indexing", "Acceptance - core search"]
+        );
+    }
+
+    #[test]
+    fn no_only_filter_keeps_every_step() {
+        let steps = selection_test_steps(true);
+        let selected = select_steps(&steps, &[]);
+
+        assert_eq!(selected.len(), steps.len());
+    }
 
     #[test]
     fn prerequisite_unavailable_child() {
