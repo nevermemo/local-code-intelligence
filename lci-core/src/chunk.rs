@@ -143,6 +143,8 @@ fn chunks_with_adapter(
     source: &str,
     adapter: &language::LanguageAdapter,
 ) -> Result<Vec<Chunk>> {
+    #[cfg(test)]
+    tests::record_fixture(path, source);
     let mut parser = Parser::new();
     parser.set_language(&adapter.grammar())?;
     let tree = parser
@@ -150,8 +152,13 @@ fn chunks_with_adapter(
         .context("Tree-sitter parse cancelled")?;
     let mut spans = Vec::new();
     ranges(adapter, tree.root_node(), &mut spans);
+    if source.starts_with('\u{feff}')
+        && let Some((start, _)) = spans.first_mut()
+    {
+        *start = 0;
+    }
     let mut chunks = Vec::new();
-    for (start, end) in spans {
+    for &(start, end) in &spans {
         let raw = &source[start..end];
         let code = raw.trim();
         if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
@@ -168,6 +175,8 @@ fn chunks_with_adapter(
             content_hash: hash(code),
         });
     }
+    #[cfg(test)]
+    tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
     Ok(chunks)
 }
 
@@ -337,8 +346,94 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
 }
 
 #[cfg(test)]
+#[path = "/tmp/chunk_delta.rs"]
+mod zz_delta;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static FIXTURES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+    pub(super) fn record_fixture(path: &str, source: &str) {
+        FIXTURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert((path.into(), source.into()));
+    }
+
+    pub(super) fn fixture_inputs() -> Vec<(String, String)> {
+        FIXTURES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn assert_uncovered_bytes_are_expected(
+        adapter: &language::LanguageAdapter,
+        source: &str,
+        spans: &[(usize, usize)],
+    ) {
+        let mut covered = vec![false; source.len()];
+        for &(start, end) in spans {
+            let raw = &source[start..end];
+            let code = raw.trim();
+            if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                continue;
+            }
+            let begin = start + raw.len() - raw.trim_start().len();
+            covered[begin..begin + code.len()].fill(true);
+        }
+
+        let mut parser = Parser::new();
+        parser.set_language(&adapter.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        let mut comments = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "line_comment" | "block_comment" | "comment") {
+                comments.push((node.kind(), node.start_byte(), node.end_byte()));
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        for (kind, comment_start, comment_end) in comments {
+            let attached = spans.iter().any(|&(start, end)| {
+                let raw = &source[start..end];
+                let code = raw.trim();
+                if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                    return false;
+                }
+                let begin = start + raw.len() - raw.trim_start().len();
+                adapter.is_prefix(kind)
+                    && begin >= comment_end
+                    && source[comment_end..begin].chars().all(char::is_whitespace)
+            });
+            if attached {
+                covered[comment_start..comment_end].fill(true);
+            }
+        }
+
+        for (offset, character) in source.char_indices() {
+            let end = offset + character.len_utf8();
+            if covered[offset..end].iter().all(|&byte| byte)
+                || character.is_whitespace()
+                || "{};".contains(character)
+            {
+                continue;
+            }
+            panic!(
+                "unexpected uncovered byte at {offset} ({character:?}) in {} source bytes",
+                source.len()
+            );
+        }
+    }
 
     fn compact(source: &str) -> String {
         source
@@ -811,6 +906,12 @@ export interface TelemetryLifecycle {
                 .iter()
                 .any(|chunk| chunk.relative_file_path == "comment.ts"
                     && chunk.code.contains("export const note"))
+        );
+        assert!(
+            scan.chunks
+                .iter()
+                .any(|chunk| chunk.relative_file_path == "bom_typescript.ts"
+                    && chunk.code.starts_with('\u{feff}'))
         );
     }
 

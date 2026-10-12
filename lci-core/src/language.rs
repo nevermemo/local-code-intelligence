@@ -469,84 +469,84 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
     LanguageAdapter {
         extension: "rs",
         identifier: "rust",
-        cache_version: "rust-chunks-v1",
+        cache_version: "rust-chunks-v2",
         grammar: rust,
         syntax: Syntax::Rust,
     },
     LanguageAdapter {
         extension: "ts",
         identifier: "typescript",
-        cache_version: "typescript-chunks-v1",
+        cache_version: "typescript-chunks-v2",
         grammar: typescript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "tsx",
         identifier: "tsx",
-        cache_version: "tsx-chunks-v1",
+        cache_version: "tsx-chunks-v2",
         grammar: tsx,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "js",
         identifier: "javascript",
-        cache_version: "javascript-chunks-v1",
+        cache_version: "javascript-chunks-v2",
         grammar: javascript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "jsx",
         identifier: "jsx",
-        cache_version: "jsx-chunks-v1",
+        cache_version: "jsx-chunks-v2",
         grammar: javascript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "py",
         identifier: "python",
-        cache_version: "python-chunks-v1",
+        cache_version: "python-chunks-v2",
         grammar: python,
         syntax: Syntax::Python,
     },
     LanguageAdapter {
         extension: "cs",
         identifier: "csharp",
-        cache_version: "csharp-chunks-v1",
+        cache_version: "csharp-chunks-v2",
         grammar: csharp,
         syntax: Syntax::CSharp,
     },
     LanguageAdapter {
         extension: "go",
         identifier: "go",
-        cache_version: "go-chunks-v1",
+        cache_version: "go-chunks-v2",
         grammar: go,
         syntax: Syntax::Go,
     },
     LanguageAdapter {
         extension: "java",
         identifier: "java",
-        cache_version: "java-chunks-v1",
+        cache_version: "java-chunks-v2",
         grammar: java,
         syntax: Syntax::Java,
     },
     LanguageAdapter {
         extension: "c",
         identifier: "c",
-        cache_version: "c-chunks-v1",
+        cache_version: "c-chunks-v2",
         grammar: c,
         syntax: Syntax::C,
     },
     LanguageAdapter {
         extension: "cpp",
         identifier: "cpp",
-        cache_version: "cpp-chunks-v1",
+        cache_version: "cpp-chunks-v2",
         grammar: cpp,
         syntax: Syntax::Cpp,
     },
     LanguageAdapter {
         extension: "hpp",
         identifier: "cpp",
-        cache_version: "cpp-chunks-v1",
+        cache_version: "cpp-chunks-v2",
         grammar: cpp,
         syntax: Syntax::Cpp,
     },
@@ -584,24 +584,24 @@ mod tests {
 
     #[test]
     fn recognizes_only_requested_lowercase_extensions() {
-        for (extension, identifier, glob) in [
-            ("rs", "rust", "*.rs"),
-            ("ts", "typescript", "*.ts"),
-            ("tsx", "tsx", "*.tsx"),
-            ("js", "javascript", "*.js"),
-            ("jsx", "jsx", "*.jsx"),
-            ("py", "python", "*.py"),
-            ("cs", "csharp", "*.cs"),
-            ("go", "go", "*.go"),
-            ("java", "java", "*.java"),
-            ("c", "c", "*.c"),
-            ("cpp", "cpp", "*.cpp"),
-            ("hpp", "cpp", "*.hpp"),
+        for (extension, identifier, glob, cache_version) in [
+            ("rs", "rust", "*.rs", "rust-chunks-v2"),
+            ("ts", "typescript", "*.ts", "typescript-chunks-v2"),
+            ("tsx", "tsx", "*.tsx", "tsx-chunks-v2"),
+            ("js", "javascript", "*.js", "javascript-chunks-v2"),
+            ("jsx", "jsx", "*.jsx", "jsx-chunks-v2"),
+            ("py", "python", "*.py", "python-chunks-v2"),
+            ("cs", "csharp", "*.cs", "csharp-chunks-v2"),
+            ("go", "go", "*.go", "go-chunks-v2"),
+            ("java", "java", "*.java", "java-chunks-v2"),
+            ("c", "c", "*.c", "c-chunks-v2"),
+            ("cpp", "cpp", "*.cpp", "cpp-chunks-v2"),
+            ("hpp", "cpp", "*.hpp", "cpp-chunks-v2"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
-            assert!(!adapter.cache_version().is_empty());
+            assert_eq!(adapter.cache_version(), cache_version);
         }
         for extension in [
             "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "h",
