@@ -2019,7 +2019,7 @@ async fn answer_without_idle_release(
                 return result.expect("the replacement must finish the retried request");
             }
             () = tokio::time::sleep(Duration::from_millis(50)) => {
-                if state_count(state, "spawn_count.txt") == 2 {
+                if state_count_so_far(state, "spawn_count.txt") == 2 {
                     let running = manager.running("csharp-ls", &workspace.id).await;
                     assert!(
                         !replacement_running || running,
