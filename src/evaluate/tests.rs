@@ -1291,6 +1291,60 @@ fn checked_in_definitions_load_and_validate() {
     }
 }
 
+#[test]
+fn definition_rejects_misspelled_expected_path() {
+    let raw = r#"
+[[workspaces]]
+key = "self"
+
+[[queries]]
+workspace = "self"
+query = "find a file"
+expected_path = "src/a.rs"
+"#;
+
+    let error = toml::from_str::<EvaluationFile>(raw).expect_err("unknown fields must be rejected");
+    assert!(error.to_string().contains("expected_path"), "{error}");
+}
+
+#[test]
+fn definition_rejects_singular_query_table() {
+    let raw = r#"
+[[workspaces]]
+key = "self"
+
+[[query]]
+workspace = "self"
+query = "find a file"
+expected_paths = ["src/a.rs"]
+"#;
+
+    assert!(
+        toml::from_str::<EvaluationFile>(raw).is_err(),
+        "the singular query table must be rejected"
+    );
+}
+
+#[test]
+fn definition_rejects_query_without_expected_paths() {
+    let raw = r#"
+[[workspaces]]
+key = "self"
+
+[[queries]]
+workspace = "self"
+query = "find a file"
+expected_paths = []
+"#;
+    let file: EvaluationFile = toml::from_str(raw).unwrap();
+
+    let error = validate_definition(&file).expect_err("expected_paths must not be empty");
+    assert!(
+        error.to_string().contains("query at index 0"),
+        "{error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Paired comparison
 // ---------------------------------------------------------------------------
