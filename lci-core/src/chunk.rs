@@ -190,10 +190,14 @@ struct SourceFile {
 /// of them must not make the whole workspace unindexable or unsearchable.
 /// Line structure is preserved, so line ranges stay valid.
 fn decode_source(bytes: Vec<u8>) -> (String, bool) {
-    match String::from_utf8(bytes) {
+    let (source, lossy) = match String::from_utf8(bytes) {
         Ok(source) => (source, false),
         Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
-    }
+    };
+    (
+        source.strip_prefix('\u{feff}').unwrap_or(&source).to_owned(),
+        lossy,
+    )
 }
 
 struct Sources {
