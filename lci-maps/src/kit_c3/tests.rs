@@ -62,11 +62,31 @@ struct Fixture {
     new: Tree,
     data: Scratch,
     missing: Scratch,
+    /// The new snapshot's files with content hashes no bundle has, so a
+    /// refresh to them must read the (missing) files whatever the store
+    /// holds.
+    broken_files: HashMap<String, lci_core::manifest::CachedFile>,
     broken_snapshot: SnapshotRef,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let mut fixture = Self::trees();
+        fixture.broken_files = fixture
+            .new
+            .scan
+            .files
+            .iter()
+            .map(|(path, file)| {
+                let mut file = file.clone();
+                file.content_hash = format!("unreadable-{}", file.content_hash);
+                (path.clone(), file)
+            })
+            .collect();
+        fixture
+    }
+
+    fn trees() -> Self {
         let old = Tree::new(
             "t1",
             &[
@@ -90,6 +110,7 @@ impl Fixture {
             data: Scratch::new("c3-data").unwrap(),
             // Exists, but holds none of the files: a refresh cannot read them.
             missing: Scratch::new("c3-missing").unwrap(),
+            broken_files: HashMap::new(),
             broken_snapshot: SnapshotRef {
                 indexed_at: "t2-broken".into(),
                 fingerprint: "unreadable".into(),
@@ -108,7 +129,7 @@ impl Fixture {
             broken: Target {
                 snapshot: &self.broken_snapshot,
                 root: self.missing.path(),
-                files: &self.new.scan.files,
+                files: &self.broken_files,
             },
             text: "alpha beta",
             budget: Duration::from_secs(5),
@@ -145,6 +166,9 @@ enum Flaw {
     RefreshesFromEverySearch,
     /// Refuses to build after a version bump (a hard error).
     FailsOnBump,
+    /// Answers nothing while its data is stale (the old snapshot is not
+    /// searchable).
+    EmptyWhenStale,
 }
 
 #[async_trait::async_trait]
@@ -155,6 +179,9 @@ impl Map for Broken {
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
         let mut response = self.inner.query(request, view).await;
+        if self.flaw == Flaw::EmptyWhenStale && response.freshness.stale {
+            response.hits.clear();
+        }
         if self.flaw == Flaw::HidesStaleness {
             response.freshness.stale = false;
             response.freshness.snapshot = view.snapshot.clone();
@@ -191,6 +218,10 @@ async fn c3_rejects_each_known_bad_stored_map() {
         (Flaw::DropsDataOnFailure, "failed refresh"),
         (Flaw::RefreshesFromEverySearch, "search after the edit"),
         (Flaw::FailsOnBump, "version bump"),
+        (
+            Flaw::EmptyWhenStale,
+            "core refreshed outside a search: answered []",
+        ),
     ] {
         let make = |version: u32| -> Box<dyn Refreshable> {
             Box::new(Broken {

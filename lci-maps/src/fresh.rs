@@ -51,7 +51,9 @@ pub enum Prepared {
     Failed { warning: String },
 }
 
-/// Brings `map` to `target` as `mode` allows (contract C3).
+/// Brings `map` to `target` as `mode` allows (contract C3), for a search.
+/// The explicit index command and the watcher refresh stored maps through
+/// their own path, which is S4's (decision K-7).
 pub fn prepare(map: &mut dyn Refreshable, mode: IndexFreshness, target: &Target<'_>) -> Prepared {
     let done = match map.data_snapshot() {
         Some(snapshot) if snapshot == target.snapshot => return Prepared::Current,
@@ -60,17 +62,18 @@ pub fn prepare(map: &mut dyn Refreshable, mode: IndexFreshness, target: &Target<
         Some(_) => return Prepared::Stale,
     };
     let id = map.describe().id;
+    let kept = if done == Prepared::Built {
+        "it has no data yet"
+    } else {
+        "it answers from its previous data"
+    };
     match std::panic::catch_unwind(AssertUnwindSafe(|| map.refresh(target))) {
         Ok(Ok(())) => done,
         Ok(Err(error)) => Prepared::Failed {
-            warning: format!(
-                "map {id} could not be refreshed: {error}; it answers from its previous data"
-            ),
+            warning: format!("map {id} could not be refreshed: {error}; {kept}"),
         },
         Err(_) => Prepared::Failed {
-            warning: format!(
-                "map {id} panicked while refreshing; it answers from its previous data"
-            ),
+            warning: format!("map {id} panicked while refreshing; {kept}"),
         },
     }
 }

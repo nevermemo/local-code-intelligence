@@ -10,7 +10,7 @@ use lci_core::{
     chunk::Extraction,
     node::{NodeId, rust_module_path},
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ffi::OsStr, path::PathBuf};
 
 fn write(root: &Path, name: &str, content: &str) {
     let path = root.join(name);
@@ -20,11 +20,11 @@ fn write(root: &Path, name: &str, content: &str) {
 
 const A: &str = "pub fn alpha() -> u8 {\n    1\n}\n\npub struct Engine;\n\nimpl Engine {\n    pub fn run(&self) -> u8 {\n        alpha()\n    }\n}\n";
 
-/// The synthetic edit script: every kind of change the spec lists, in an
-/// order where each known-bad map is first caught by its own step.
 /// Puts the scratch tree into one state of the script.
 type Edit = Box<dyn Fn(&Path)>;
 
+/// The synthetic edit script: every kind of change the spec lists, in an
+/// order where each known-bad map is first caught by its own step.
 fn script() -> Vec<(Step, Edit)> {
     let step = |label: &str, bump_adapter: bool| Step {
         label: label.into(),
@@ -286,7 +286,7 @@ impl Drop for Worktree<'_> {
     }
 }
 
-fn git(directory: &Path, args: &[&str]) -> Result<(), String> {
+fn git<S: AsRef<OsStr> + std::fmt::Debug>(directory: &Path, args: &[S]) -> Result<(), String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(directory)
@@ -302,8 +302,6 @@ fn git(directory: &Path, args: &[&str]) -> Result<(), String> {
         ))
     }
 }
-
-use std::path::PathBuf;
 
 /// The slow suite (decision K-3): replays commits of this repository into a
 /// scratch worktree, with one delete (3ba1422 removes `src/app.rs`), one
@@ -335,14 +333,16 @@ fn c4_commit_replay() {
     }
     let scratch = Scratch::new("c4-replay").unwrap();
     let tree = scratch.path().join("tree");
+    // Entries of worktrees whose directory is gone (a killed run) first.
+    git(repository, &["worktree", "prune"]).unwrap();
     git(
         repository,
         &[
-            "worktree",
-            "add",
-            "--detach",
-            tree.to_str().unwrap(),
-            commits[0].0,
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            tree.as_os_str(),
+            OsStr::new(commits[0].0),
         ],
     )
     .unwrap();
@@ -373,8 +373,9 @@ fn c4_commit_replay() {
         );
     }
     println!("total {:.1} s", started.elapsed().as_secs_f64());
-    // The move commit only moves files: every moved Rust file's bundle is
-    // reused.
+    // 0729d9a moves 18 files and edits `src/lib.rs` and adds
+    // `lci-core/src/lib.rs`: exactly those two are extracted, every moved
+    // file's bundle is reused.
     let moved = &subject.syncs[3];
-    assert!(moved.0 > 0, "{moved:?}");
+    assert_eq!(moved.1, 2, "{moved:?}");
 }

@@ -216,9 +216,14 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>> + Clone> Audited for SymDefsA
 
     /// Relabels the manifest and the bundles as produced by the previous
     /// adapter (`<version>~prior`) and makes that state detectably
-    /// different from what the current adapter produces: each file loses
-    /// its last chunk, each stored declaration's name gets the suffix. A
-    /// subject that reused any of it would differ from the full build.
+    /// different from what the current adapter produces: each file with
+    /// more than one chunk loses its last one, each stored declaration's
+    /// name gets the suffix `_prior`, and the bundle under the current key
+    /// is removed. A subject that reused any of it would differ from the
+    /// full build. (Today's scan re-parses any file whose adapter version
+    /// differs, so the chunk perturbation guards a future scan, not this
+    /// one; the bundle side is what a key without the adapter version
+    /// trips on.)
     fn bump_adapter(&mut self) -> Result<(), String> {
         for file in self.files.values_mut() {
             let current = self.producer.key(file);

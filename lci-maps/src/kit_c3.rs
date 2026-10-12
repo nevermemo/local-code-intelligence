@@ -9,7 +9,8 @@
 //! refreshed to give the new snapshot's answer, while under `manual` and
 //! `watch` the core keeps the old snapshot and the map answers from it;
 //! when the core moved without a search (an explicit index, the watcher),
-//! `manual` and `watch` leave the map stale and it says so. A failed
+//! `manual` and `watch` leave the map stale; it says so and still answers
+//! from its old data. A failed
 //! refresh keeps the previous data and warns. A version bump is a rebuild
 //! or a stale map, never a hard error. Every answer names the snapshot it
 //! came from.
@@ -274,6 +275,18 @@ pub async fn check_freshness(
                 old_snapshot,
                 &new_view,
             )?;
+            // The old data stays searchable: the old answer, restricted to
+            // the chunks the new snapshot still has, ranked by position.
+            let mut projected = want_old.clone();
+            projected.hits.retain(|hit| new_view.contains(&hit.node));
+            for (position, hit) in projected.hits.iter_mut().enumerate() {
+                hit.rank = position as u32 + 1;
+            }
+            expect_same_hits(
+                &label("core refreshed outside a search"),
+                &response,
+                &projected,
+            )?;
         }
     }
 
@@ -319,10 +332,12 @@ pub async fn check_freshness(
         });
     }
     let prepared = prepare(map.as_mut(), IndexFreshness::Manual, &case.old.target);
+    // Built again, or stale; never current (that would hide the identity
+    // change) and never a failure.
     expect_prepared(
         "version bump",
         &prepared,
-        &[Prepared::Built, Prepared::Current, Prepared::Stale],
+        &[Prepared::Built, Prepared::Stale],
     )?;
     let response = ask(map.as_ref(), case.text, case.budget, &old_view).await;
     let snapshot = map.data_snapshot().cloned();

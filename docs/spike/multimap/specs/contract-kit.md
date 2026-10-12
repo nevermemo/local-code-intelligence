@@ -272,12 +272,20 @@ snapshot, and the kit refuses a fixture whose edit does not change the answer. F
 `on-search` the map is refreshed and answers exactly as a fresh build of the new snapshot,
 while under `manual`/`watch` it answers exactly as the old one; then, for `manual`/`watch`,
 when the core moved to the new snapshot without a search, the map is not refreshed and its
-answer names the old snapshot with `stale = true`, every hit a chunk of the new view. A failed
-refresh must return a warning naming the map, keep the old data and answer as before. A
-version bump over the previous version's stored data must be built, current or stale, never a
-failure. `kit_c3::check_live_freshness` requires a live map to answer with `observed =
+answer names the old snapshot with `stale = true` and equals the old answer restricted to the
+chunks the new view still has (the old data stays searchable). A failed refresh (the broken
+target's files carry content hashes no bundle has, so the refresh must read the missing files
+whatever the store holds) must return a warning naming the map, keep the old data and answer
+as before. A version bump over the previous version's stored data must be built or stale:
+never current (that would hide the identity change) and never a failure. `kit_c3::check_live_freshness` requires a live map to answer with `observed =
 live-tree`, as of the view's snapshot, never stale (the wrapped lexical map's own test already
 asserts `LiveTree`; running this check on it is left to S4, since it lives in the root crate).
+
+Known gaps of the check (review of e369120): a stored map that answers from the live tree it
+last refreshed from is not caught, because the old and new trees are separate directories and
+`manual` never hands the map the new one (an in-place edit phase would catch it); and
+`check_live_freshness` checks the freshness fields only, not that the answer reflects an
+edit, so a live map that caches its first answer and reports `live-tree` passes.
 
 Deviations from section 2 (C3 "Test"): the check works at the map level with the policy
 function, not through `search_code` with `stale_check_interval_seconds = 0`, because no engine
@@ -289,7 +297,8 @@ producer id (decision N-12).
 Known-bad maps the kit rejects (`c3_rejects_each_known_bad_stored_map`): one that hides
 staleness (claims the searched snapshot), one that drops its data when a refresh fails, one
 that claims to have no data so every search rebuilds it (a refresh from a search under
-`manual`), one that refuses to build after a version bump; plus, for live maps, one that
+`manual`), one that refuses to build after a version bump, one that answers nothing while
+stale; plus, for live maps, one that
 reports `observed = snapshot`.
 
 ### C4 as built
@@ -299,14 +308,17 @@ the subject incrementally from its own previous state (`Audited::incremental`), 
 from nothing (`Audited::full`, a fresh scan into a fresh store) and compares the two sorted
 canonical lists; the first difference fails C4 with the entry and the side it is on.
 `SymDefsAudit` is the `sym.defs` subject: its state is the previous scan's files and a
-persistent bundle store; its canonical form is `<symbol>\t<head chunk>` per declaration.
+persistent bundle store; its canonical form is `<symbol>\t<head chunk or ->` per declaration.
 
 Adapter bump, a spec change: the adapter version belongs to the indexer binary, not to the
 tree, so replaying commits never changes it. A step with `bump_adapter` instead makes the
 subject relabel its stored state as produced by the previous adapter (`<version>~prior` in
 the manifest and in the bundle keys) and makes that state detectably different from what the
-current adapter produces (each file loses its last chunk; each stored declaration's name gets
-a suffix). A subject that reuses any of it differs from the full build.
+current adapter produces (each file with more than one chunk loses its last one; each stored
+declaration's name gets a suffix; the bundle under the current key is removed). A subject that
+reuses any of it differs from the full build. Today's scan already re-parses any file whose
+adapter version differs, so the chunk perturbation guards a future scan; the bundle side is
+what a key without the adapter version trips on.
 
 Unit suite (`Full`): a synthetic script of nine steps on one directory (initial, edit inside
 a function, lines inserted above, a duplicated chunk, a new file, a delete, a move, an adapter
@@ -320,7 +332,9 @@ Slow suite (decision K-3 kept): `audit::tests::c4_commit_replay`, `#[ignore]`d, 
 `cargo test -p lci-maps --lib -- --ignored c4_commit_replay --nocapture`. It replays this
 repository's commits into a scratch `git worktree`: `3ba1422^`, `3ba1422` (deletes
 `src/app.rs`), `0729d9a^`, `0729d9a` (moves 18 files into `lci-core/src`), an adapter bump on
-the same tree, and `b87b16a`. Measured 2026-10-12 on the cloud machine (debug build): 19.4 s
+the same tree, and `b87b16a`. At the move commit exactly two files are extracted (`src/lib.rs`
+edited, `lci-core/src/lib.rs` added) and every moved file's bundle is reused; the test asserts
+it. Measured 2026-10-12 on the cloud machine (debug build): 19.4 s
 in total, 1.1 to 1.9 s per step except 12.1 s for the last (2680 declarations, 95 files
 extracted). It stays out of `Full` because CI checks out one commit (no history to replay),
 not for its time. Run against the path-in-bundle producer, it fails at the move commit with the
