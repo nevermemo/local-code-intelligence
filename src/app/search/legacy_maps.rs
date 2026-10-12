@@ -141,10 +141,19 @@ impl Channel {
 /// its rank exactly as fusion consumed it. A hit that is not a chunk of the
 /// view is left out (none is, when the list came from the same snapshot and
 /// filter as the view).
+///
+/// A chunk listed twice (two stored rows with one path, lines and hash) is
+/// kept once, at its first rank; `fuse_hits` would merge the two rows into
+/// one entry too, but scored by the later one for the semantic channel and
+/// by both for the others. No real channel returns a chunk twice.
 pub(crate) fn map_hits(channel: Channel, hits: &[Hit], view: &SnapshotView<'_>) -> Vec<MapHit> {
+    let mut seen = std::collections::HashSet::new();
     hits.iter()
         .filter_map(|hit| {
             let node = view.locate(&hit.chunk)?.clone();
+            if !seen.insert(node.clone()) {
+                return None;
+            }
             let rank = u32::try_from(channel.rank(hit)?).ok()?;
             let detail = matches!(channel, Channel::Lexical)
                 .then(|| format!("{} credited lines", hit.lexical_match_count));
@@ -468,13 +477,12 @@ impl Map for LspMap<'_> {
                 channel.failures.join("; ")
             )
         });
-        let status = match (note, warning) {
-            (None, None) => MapStatus::Ok,
-            (None, Some(warning)) if channel.failures.len() == providers.len() => {
-                MapStatus::Failed { warning }
-            }
-            (note, warning) => MapStatus::Partial { note, warning },
-        };
+        let status = lsp_status(
+            note,
+            warning,
+            channel.failures.len() == providers.len(),
+            hits.is_empty(),
+        );
         response(
             &self.descriptor,
             view,
@@ -483,6 +491,22 @@ impl Map for LspMap<'_> {
             started,
             calls,
         )
+    }
+}
+
+/// The LSP map's status. `search_once` fuses whatever was gathered, also
+/// from a provider that failed after answering some queries; so only an
+/// answer with no hit, from providers that all failed, is a failure.
+pub(crate) fn lsp_status(
+    note: Option<String>,
+    warning: Option<String>,
+    all_failed: bool,
+    no_hits: bool,
+) -> MapStatus {
+    match (note, warning) {
+        (None, None) => MapStatus::Ok,
+        (None, Some(warning)) if all_failed && no_hits => MapStatus::Failed { warning },
+        (note, warning) => MapStatus::Partial { note, warning },
     }
 }
 
@@ -556,9 +580,9 @@ pub(crate) fn legacy_registry<'a>(
             .register(map, weight, limit)
             .expect("the legacy maps have distinct ids and no filter");
     }
-    registry.set_enabled(SEMANTIC, channels.semantic);
-    registry.set_enabled(LEXICAL, channels.lexical);
-    registry.set_enabled(LSP, channels.lsp);
+    assert!(registry.set_enabled(SEMANTIC, channels.semantic));
+    assert!(registry.set_enabled(LEXICAL, channels.lexical));
+    assert!(registry.set_enabled(LSP, channels.lsp));
     registry
 }
 

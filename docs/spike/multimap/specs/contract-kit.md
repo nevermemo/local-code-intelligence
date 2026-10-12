@@ -233,11 +233,16 @@ off, and under the five injected faults, and requires the fused pool (nodes, sco
 parts, order) to equal the control-only run, one warning (failure) or one note (deadline)
 attributed to the subject and none to another map, and every run to end within the budget
 plus the slack. C6 compares the subject's answer and the fused pool across a second run and a
-reversed registration; the randomised thread pool is not done yet.
+reversed registration; the randomised thread pool is not done yet, and three calls cannot
+catch a map that drifts only every fourth call or later. `check_real_failure` (added after
+the S2 review) runs the subject configured to fail for real and requires the control-only
+pool plus exactly one warning or note naming it: the injected faults never call the map, so
+without it a map that hides its error behind an empty `Ok` would pass C1.
 
 The kit's own tests (`lci-maps/src/tests.rs`): a known-good rank list and prior pass both; a
 map that blocks its thread past the deadline fails C1 (the registry's timeout cannot preempt
 it, so the search stalls); a map whose answer drifts between calls fails C6 and still passes
-C1. The four wrapped legacy maps pass C1 and C6 (`src/app/search/tests/t0.rs`), and so does
+C1; a map that swallows its failure passes the injected faults and fails
+`check_real_failure`. The four wrapped legacy maps pass C1 and C6 (`src/app/search/tests/t0.rs`), and so does
 the live lexical map over a real directory. C2-C5 and C7-C9 and their known-bad maps are not
 written yet.

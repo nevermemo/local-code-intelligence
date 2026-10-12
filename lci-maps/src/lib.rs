@@ -459,12 +459,16 @@ impl<'a> Registry<'a> {
 
     /// A disabled map is not called; its call is recorded as `Skipped`,
     /// which is silent (no warning, no note), as a disabled channel is today.
-    pub fn set_enabled(&mut self, id: &str, enabled: bool) {
+    /// Returns whether a map with that id is registered.
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> bool {
+        let mut found = false;
         for entry in &mut self.entries {
             if entry.map.describe().id == id {
                 entry.enabled = enabled;
+                found = true;
             }
         }
+        found
     }
 
     /// The registered ids in fusion order.
@@ -475,6 +479,10 @@ impl<'a> Registry<'a> {
     /// Runs every map once: rank lists and expansions side by side, each
     /// under `budget`; fuses them in fusion order; then asks every prior map
     /// about the fused nodes and adds its values unweighted; then sorts.
+    ///
+    /// Needs a Tokio runtime with the time driver (the deadline is a Tokio
+    /// timeout). `Map::describe` is called outside the fail-open boundary:
+    /// it must not panic.
     pub async fn run(&self, text: Option<&str>, budget: Duration, view: &SnapshotView<'_>) -> Run {
         let params = serde_json::Value::Null;
         let (ranked, priors): (Vec<&Entry<'a>>, Vec<&Entry<'a>>) = self

@@ -173,7 +173,7 @@ async fn run_maps<'a>(
         }
     }
     for id in disabled {
-        registry.set_enabled(id, false);
+        assert!(registry.set_enabled(id, false));
     }
     let started = Instant::now();
     let run = registry
@@ -328,6 +328,45 @@ pub async fn check_determinism<'a>(
         if subject_answer(&run, id) != subject_answer(&first, id) {
             return Err(broke("C6", format!("{label}: {id} answered differently")));
         }
+    }
+    Ok(())
+}
+
+/// Contract C1 for the map's own failure path: `broken` builds the subject
+/// configured to fail for real (a missing executable, a refused service). The
+/// run must fuse exactly what the control alone fuses, end within the budget
+/// plus the slack, and carry exactly one warning or note attributed to the
+/// subject and none to another map. A map that swallows its error into an
+/// empty `Ok` answer fails here, while it passes [`check_fail_open`], whose
+/// injected faults replace the map's answer without calling it.
+pub async fn check_real_failure<'a>(
+    broken: Factory<'_, 'a>,
+    control: Factory<'_, 'a>,
+    fixture: &Fixture<'_, 'a>,
+) -> Result<(), ContractFailure> {
+    let id = broken().describe().id;
+    let limit = fixture.budget + fixture.slack;
+    let (baseline, _) = run_maps(vec![(control(), true)], fixture).await?;
+    let (run, elapsed) = run_maps(vec![(broken(), true), (control(), true)], fixture).await?;
+    if elapsed > limit {
+        return Err(broke(
+            "C1",
+            format!("{id} failing kept the run for {elapsed:?}, past {limit:?}"),
+        ));
+    }
+    same_pool("C1", &format!("{id} failing"), &run.fused, &baseline.fused)?;
+    let mine = run.warnings().iter().filter(|(map, _)| *map == id).count()
+        + run.notes().iter().filter(|(map, _)| *map == id).count();
+    let others = run.warnings().len() + run.notes().len() - mine;
+    if mine != 1 || others != baseline.warnings().len() + baseline.notes().len() {
+        return Err(broke(
+            "C1",
+            format!(
+                "{id} failing: {mine} warnings or notes name it (expected 1); warnings {:?}, notes {:?}",
+                run.warnings(),
+                run.notes()
+            ),
+        ));
     }
     Ok(())
 }

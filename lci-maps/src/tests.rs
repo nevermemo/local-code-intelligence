@@ -1,5 +1,7 @@
 use super::*;
-use crate::kit::{ContractFailure, FixedMap, Fixture, check_determinism, check_fail_open};
+use crate::kit::{
+    ContractFailure, FixedMap, Fixture, check_determinism, check_fail_open, check_real_failure,
+};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 fn chunk(path: &str, start_line: u32) -> Chunk {
@@ -383,4 +385,80 @@ async fn the_kit_rejects_a_drifting_map_under_c6() {
         .await
         .unwrap_err();
     assert_eq!(failure.contract, "C6", "{failure:?}");
+}
+
+/// Known-bad for the real-failure half of C1: hides its own error behind an
+/// empty `Ok` answer, so nothing tells the caller a channel was lost.
+struct Swallowing(MapDescriptor);
+
+#[async_trait::async_trait]
+impl Map for Swallowing {
+    fn describe(&self) -> &MapDescriptor {
+        &self.0
+    }
+
+    async fn query(&self, _: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        MapResponse::empty(&self.0, view, MapStatus::Ok)
+    }
+}
+
+/// A map that reports its real failure as it should.
+struct Honest(MapDescriptor);
+
+#[async_trait::async_trait]
+impl Map for Honest {
+    fn describe(&self) -> &MapDescriptor {
+        &self.0
+    }
+
+    async fn query(&self, _: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        MapResponse::empty(
+            &self.0,
+            view,
+            MapStatus::Failed {
+                warning: "honest: service refused".into(),
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn the_kit_rejects_a_map_that_swallows_its_failure() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let fixture = fixture(&view);
+    let control = || fixed(&view, "control", Contribution::RankList, &[0, 1], None);
+    let honest =
+        || -> Box<dyn Map> { Box::new(Honest(descriptor("honest", Contribution::RankList))) };
+    check_real_failure(&honest, &control, &fixture)
+        .await
+        .unwrap();
+    let swallowing = || -> Box<dyn Map> {
+        Box::new(Swallowing(descriptor("swallowing", Contribution::RankList)))
+    };
+    // The injected faults never call the map, so it passes that half ...
+    check_fail_open(&swallowing, &control, &fixture)
+        .await
+        .unwrap();
+    // ... and fails the real-failure half.
+    let failure = check_real_failure(&swallowing, &control, &fixture)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.contract, "C1", "{failure:?}");
+}
+
+#[test]
+fn set_enabled_reports_an_unknown_id() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let mut registry = Registry::new(60.0);
+    registry
+        .register(
+            fixed(&view, "x", Contribution::RankList, &[0], None),
+            1.0,
+            40,
+        )
+        .unwrap();
+    assert!(registry.set_enabled("x", false));
+    assert!(!registry.set_enabled("typo", false));
 }

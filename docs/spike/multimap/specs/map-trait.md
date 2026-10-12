@@ -186,9 +186,10 @@ Code: crate `lci-maps` (`lci-maps/src/lib.rs`: types, `Map`, `Registry`, fusion;
 `src/app/search/legacy_maps.rs`, T0 in `src/app/search/tests/t0.rs` and two integration
 tests in `tests/cases/indexing.rs` (golden `search_code` JSON, registry against a traced
 search). The production search does not call the registry. Line references re-checked on
-`66f999d`: `search_once` `src/app/search.rs:653`, fan-out `:732`, `map_lexical_matches`
-`:1159`, `map_lsp_locations` `:1269`, `fuse_hits` `:1307` (key `:1314`), `fusion_order`
-`:337`, `source_role_prior` `src/store.rs:52`, `Store::search` `:335`.
+`66f999d`: `search_once` `src/app/search.rs:650`, fan-out `:729`, `map_lexical_matches`
+`:1158`, `map_lsp_locations` `:1269`, `fuse_hits` `:1307` (key `:1314`), `fusion_order`
+`:337`, `source_role_prior` `src/store.rs:53`, `Store::search` `:348` (corrected after the
+S2 review).
 
 Changes to this spec, each the conservative choice where one was open:
 
@@ -223,6 +224,17 @@ Changes to this spec, each the conservative choice where one was open:
 - `Need` gains `Ripgrep`; `Lsp` names no provider. `EdgeKind` has `QueryMatch` and `Prior`
   only. `SnapshotView` holds the snapshot reference and the filtered universe with interned
   NodeIds; the `EffectiveFilter` and config are not in it yet (C2).
+- `LspMap` is `Failed` only when every provider failed and no hit was gathered; a provider
+  that answered some symbol queries before failing keeps its hits, because `search_once`
+  fuses whatever was gathered (S2 review finding; `lsp_status`).
+- A chunk a channel lists twice (two stored rows with one path, lines and hash) is kept
+  once at its first rank by `map_hits`; `fuse_hits` would score the merged entry by the
+  later row (semantic) or by both rows (lexical, LSP). No real channel returns a chunk twice;
+  without the dedupe the registry would fail the whole channel ("returned twice").
+- Smaller drift from 3.2/3.3: `Skipped { reason }` (was `note`; never shown); `as_of` is an
+  `Option<&str>`, not a `GitSha`; of `Budget` only the deadline is enforced; `set_enabled`
+  returns whether the id is registered; `describe()` is called outside the fail-open
+  boundary and must not panic; `Registry::run` needs a Tokio runtime with the time driver.
 - A legacy hit that is not a chunk of the view is left out of a wrapped map's answer
   (`map_hits`); with the same snapshot and filter none is. The N-5 twins (one legacy key,
   two NodeIds) would fuse as two entries in the registry and one in `fuse_hits`; no fixture
@@ -234,6 +246,9 @@ candidate dumps: none is committed in the repository (dumps go to `test-results/
 replay part could not run; the end-to-end test compares with a traced search's pool
 instead. Response unchanged: done (golden JSON written before `lci-maps` existed, unchanged
 after). Fail-open per map: done through the kit (failed, panic, deadline, foreign node,
-NaN). Disabled is silent: done at registry level (kit, "switched off"); the timing part
+NaN), and the real failure path of the lexical map (ripgrep missing) through
+`kit::check_real_failure`; the semantic and LSP failure paths (embedding refused, one
+language server failing while another answers) are compared with a traced search in
+`tests/cases/indexing.rs`. Disabled is silent: done at registry level (kit, "switched off"); the timing part
 waits for an engine. Order independence of registration: done. Filter before fusion and
 status-to-error mapping: deferred, they need C2 and the engine (S4).

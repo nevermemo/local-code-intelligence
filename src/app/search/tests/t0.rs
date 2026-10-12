@@ -15,7 +15,7 @@ use crate::{
 };
 use lci_maps::{
     Map, SnapshotRef, SnapshotView,
-    kit::{Fixture, check_determinism, check_fail_open},
+    kit::{Fixture, check_determinism, check_fail_open, check_real_failure},
 };
 use std::time::Duration;
 
@@ -388,13 +388,18 @@ async fn the_live_lexical_map_passes_c1_and_c6_and_fails_open_without_ripgrep() 
         ripgrep_path: "definitely-missing-ripgrep".into(),
         ..Config::default()
     };
-    let broken = LexicalMap {
-        config: &missing,
-        workspace: &workspace,
-        universe: &universe,
-        descriptor: lexical_descriptor(),
+    let broken = || -> Box<dyn Map + '_> {
+        Box::new(LexicalMap {
+            config: &missing,
+            workspace: &workspace,
+            universe: &universe,
+            descriptor: lexical_descriptor(),
+        })
     };
-    let answer = broken.query(&request, &view).await;
+    check_real_failure(&broken, &control, &fixture)
+        .await
+        .unwrap();
+    let answer = broken().query(&request, &view).await;
     let lci_maps::MapStatus::Failed { warning } = answer.status else {
         panic!("{:?}", answer.status);
     };
@@ -403,4 +408,36 @@ async fn the_live_lexical_map_passes_c1_and_c6_and_fails_open_without_ripgrep() 
         "{warning}"
     );
     assert!(answer.hits.is_empty());
+}
+
+/// Review finding: a provider that answered some symbol queries and then
+/// failed keeps its hits (as `search_once` fuses them), with the warning.
+#[test]
+fn an_lsp_answer_with_hits_is_partial_even_when_every_provider_failed() {
+    use crate::app::search::legacy_maps::lsp_status;
+    use lci_maps::MapStatus;
+    let warning = || Some("Optional LSP provider unavailable: x".to_owned());
+    assert_eq!(lsp_status(None, None, false, false), MapStatus::Ok);
+    assert!(matches!(
+        lsp_status(None, warning(), true, true),
+        MapStatus::Failed { .. }
+    ));
+    assert_eq!(
+        lsp_status(None, warning(), true, false),
+        MapStatus::Partial {
+            note: None,
+            warning: warning()
+        }
+    );
+    assert!(matches!(
+        lsp_status(None, warning(), false, true),
+        MapStatus::Partial { .. }
+    ));
+    assert!(matches!(
+        lsp_status(Some("slow".into()), None, false, true),
+        MapStatus::Partial {
+            note: Some(_),
+            warning: None
+        }
+    ));
 }

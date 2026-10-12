@@ -3967,3 +3967,88 @@ async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
     }
     task.abort();
 }
+
+/// Spike T0 on failure paths: with the embedder refusing queries, and with
+/// one language server failing (rust-analyzer missing, a Rust file indexed)
+/// while the fake C# server answers, the map registry fuses the traced
+/// search's pool bit for bit and raises the same warnings: each map warning
+/// is one of the parts the production search joins with "; ".
+#[tokio::test]
+async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
+    let (temp, mut config, fake, task) = fixture().await;
+    let workspace = temp.path().join("t0-failing");
+    write(
+        &workspace,
+        "src/Calculator.cs",
+        "// golden_rank_4\nnamespace Acceptance;\npublic sealed class Calculator\n{\n    // golden_rank_1\n    public int Add(int a, int b) => a + b;\n}\n",
+    );
+    write(
+        &workspace,
+        "src/total.rs",
+        "/// Calculator totals. golden_rank_2\npub fn calculator_total() -> i32 {\n    3\n}\n",
+    );
+    let state = temp.path().join("lsp-state-t0-failing");
+    config.lsp_search_budget_ms = 30_000;
+    config = with_fake_csharp_server(config, &state, &[], 10);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+    for embedding_fails in [false, true] {
+        fake.embed_fails.store(embedding_fails, Ordering::SeqCst);
+        let report = app
+            .search_with_options(
+                &workspace,
+                "Calculator",
+                Some(10),
+                local_code_intelligence::filter::FilterRequest::default(),
+                local_code_intelligence::app::SearchOptions {
+                    trace_candidates: true,
+                },
+            )
+            .await
+            .unwrap();
+        let traced = report.candidates.as_ref().expect("the pool was traced");
+        let warning = report.warning.clone().expect("rust-analyzer is missing");
+        assert!(
+            warning.contains("Optional LSP provider unavailable: rust-analyzer"),
+            "{warning}"
+        );
+        assert_eq!(
+            warning.contains("Query embedding unavailable"),
+            embedding_fails,
+            "{warning}"
+        );
+        assert!(
+            traced.iter().any(|row| row.lsp_rank.is_some()),
+            "the C# server answered while rust-analyzer failed: {traced:?}"
+        );
+
+        let maps = app
+            .fuse_through_maps(&workspace, "Calculator")
+            .await
+            .unwrap();
+        let joined: usize = maps.warnings.iter().map(String::len).sum::<usize>()
+            + 2 * maps.warnings.len().saturating_sub(1);
+        assert_eq!(joined, warning.len(), "{:?} vs {warning}", maps.warnings);
+        for part in &maps.warnings {
+            assert!(warning.contains(part.as_str()), "{part} not in {warning}");
+        }
+        assert_eq!(
+            maps.notes, report.notes,
+            "embedding fails: {embedding_fails}"
+        );
+        assert_eq!(
+            maps.rows.len(),
+            traced.len(),
+            "embedding fails: {embedding_fails}"
+        );
+        for (row, trace) in maps.rows.iter().zip(traced) {
+            assert_eq!(
+                (&row.relative_file_path, row.start_line),
+                (&trace.relative_file_path, trace.start_line)
+            );
+            assert_eq!(row.fusion_score.to_bits(), trace.fusion_score.to_bits());
+        }
+    }
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    task.abort();
+}
