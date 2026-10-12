@@ -73,6 +73,74 @@ async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
     task.abort();
 }
 
+#[tokio::test]
+async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
+    const CHILD: &str = "LCI_TEST_DEEP_INDEX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexing::deeply_nested_modules_index_and_reuse_without_stack_overflow",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "deep indexing failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("deep-modules");
+    let source = format!(
+        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+        "mod m {\n".repeat(32768),
+        "}\n".repeat(32768)
+    );
+    write(&workspace, "lib.rs", &source);
+    let app = App::open(config.clone()).await.unwrap();
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    assert_eq!(report.parsed_files, 1);
+    assert!(report.chunks > 0);
+    assert!(report.embedded_chunks > 0);
+    assert!(report.embedded_chunks <= report.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks
+    );
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].relative_file_path, "lib.rs");
+    assert_eq!(indexed.files[0].chunks, report.chunks);
+
+    drop(app);
+    let reopened = App::open(config).await.unwrap();
+    let repeat = reopened.index(&workspace).await.unwrap();
+    assert_eq!(repeat.parsed_files, 0);
+    assert_eq!(repeat.unchanged_files, 1);
+    assert_eq!(repeat.chunks, report.chunks);
+    assert_eq!(repeat.embedded_chunks, 0);
+    assert_eq!(repeat.reused_chunks, report.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks
+    );
+    task.abort();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_backslashes_preserve_indexed_names_and_result_paths() {

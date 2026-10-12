@@ -9,6 +9,9 @@ use tree_sitter::{Node, Parser};
 
 const TARGET_BYTES: usize = 6000;
 const MAX_DECLARATION_BYTES: usize = 24000;
+/// Recursion frames of `ranges`, not syntactic levels: a nested Rust `mod`
+/// costs two (`mod_item`, `declaration_list`), so about 64 nested modules.
+const MAX_RANGE_DEPTH: usize = 128;
 pub const DOCUMENT_FORMAT_VERSION: &str = "rust-chunks-v1";
 
 #[derive(Debug)]
@@ -51,7 +54,19 @@ pub struct Chunk {
 
 // Recurse through oversized declarations to syntax boundaries (including match arms).
 // A large leaf remains whole: no arbitrary text windows or broken UTF-8.
-fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(usize, usize)>) {
+fn ranges(
+    adapter: &language::LanguageAdapter,
+    node: Node<'_>,
+    out: &mut Vec<(usize, usize)>,
+    depth: usize,
+) {
+    // Keep pathological nesting whole rather than exhausting a blocking worker's
+    // stack; such a range can exceed MAX_DECLARATION_BYTES, which the embedder
+    // already handles by halving rejected inputs.
+    if depth >= MAX_RANGE_DEPTH {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
     let container = adapter.is_container(node.kind());
     let boundary = adapter.is_boundary(node.kind());
     let declaration = adapter.is_declaration(node.kind());
@@ -112,7 +127,7 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
                 out.push((start, child_start));
             }
             let first = out.len();
-            ranges(adapter, child, out);
+            ranges(adapter, child, out, depth + 1);
             if let Some(range) = out.get_mut(first) {
                 range.0 = if attach_header { start } else { child_start };
             }
@@ -167,7 +182,7 @@ fn chunks_with_adapter(
         .parse(source, None)
         .context("Tree-sitter parse cancelled")?;
     let mut spans = Vec::new();
-    ranges(adapter, tree.root_node(), &mut spans);
+    ranges(adapter, tree.root_node(), &mut spans, 0);
     let mut chunks = Vec::new();
     for &(start, end) in &spans {
         let raw = &source[start..end];
@@ -471,6 +486,96 @@ mod tests {
     fn assert_non_whitespace_coverage(source: &str, expected: &str) {
         let chunks = rust_chunks("lib.rs", source).unwrap();
         assert_chunks_cover(&chunks, expected);
+    }
+
+    #[test]
+    fn ordinary_nested_modules_keep_exact_chunks() {
+        let depth = 32;
+        let source = format!(
+            "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+            "mod m {\n".repeat(depth),
+            "}\n".repeat(depth)
+        );
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        let mut expected: Vec<_> = (1..=depth as u32)
+            .map(|line| (line, line, "mod m"))
+            .collect();
+        expected.push((32, 34, "{\nfn leaf() {}\n}"));
+        expected.push((66, 66, "fn sibling() {}"));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.as_str()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for chunk in chunks {
+            assert_eq!(chunk.relative_file_path, "lib.rs");
+            assert_eq!(chunk.language, "rust");
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+        }
+    }
+
+    #[test]
+    fn deeply_nested_modules_on_default_blocking_stack() {
+        const CHILD_DEPTH: &str = "LCI_TEST_NESTING_DEPTH";
+        if let Ok(depth) = std::env::var(CHILD_DEPTH) {
+            let depth: usize = depth.parse().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let source = format!(
+                        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+                        "mod m {\n".repeat(depth),
+                        "}\n".repeat(depth)
+                    );
+                    let chunks = rust_chunks("deep.rs", &source).unwrap();
+                    assert_chunks_cover(&chunks, "fn leaf() {}");
+                    assert_chunks_cover(&chunks, "fn sibling() {}");
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.code.matches("mod m").count())
+                            .sum::<usize>(),
+                        depth
+                    );
+                    for chunk in chunks {
+                        assert_eq!(chunk.content_hash, hash(&chunk.code));
+                        assert!(source.contains(&chunk.code));
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            return;
+        }
+
+        // Isolate stack overflow in a child so the regression cannot abort
+        // the rest of the test suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "chunk::tests::deeply_nested_modules_on_default_blocking_stack",
+                "--nocapture",
+            ])
+            .env(CHILD_DEPTH, "32768")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "default-stack chunking failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]
