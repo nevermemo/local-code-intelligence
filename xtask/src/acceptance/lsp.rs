@@ -219,7 +219,13 @@ async fn run_inner(
     evidence.set("lci_pid", lci_pid)?;
 
     evidence.stage("wait-health")?;
-    let healthy = wait_http_ok(&format!("{BASE}/health"), 30, Duration::from_millis(500)).await;
+    let healthy = wait_http_ok(
+        &format!("{BASE}/health"),
+        30,
+        Duration::from_millis(500),
+        || server.as_mut().is_none_or(ManagedServer::has_exited),
+    )
+    .await;
     if !healthy {
         bail!("/health did not report ok within the bounded wait");
     }
