@@ -88,10 +88,7 @@ async fn filters_without_matching_chunks_skip_retrieval_channels() {
         .unwrap();
     assert!(no_language.results.is_empty());
     assert_eq!(fake.queries.load(Ordering::SeqCst), queries);
-    assert_eq!(
-        fake.rerank_requests.load(Ordering::SeqCst),
-        rerank_requests
-    );
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), rerank_requests);
 
     let matching = app
         .search_with_filters(
@@ -105,7 +102,12 @@ async fn filters_without_matching_chunks_skip_retrieval_channels() {
         )
         .await
         .unwrap();
-    assert!(matching.results.iter().any(|hit| hit.chunk.code.contains("translator")));
+    assert!(
+        matching
+            .results
+            .iter()
+            .any(|hit| hit.chunk.code.contains("translator"))
+    );
     assert_eq!(fake.queries.load(Ordering::SeqCst), queries + 1);
     assert_eq!(
         fake.rerank_requests.load(Ordering::SeqCst),
