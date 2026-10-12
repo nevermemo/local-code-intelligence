@@ -215,6 +215,8 @@ under `tests/` with the fake model service and fake LSP (`tests/support/mod.rs`,
 | K-4 | Random control is size-matched per query from the filtered universe. | Degree-matched random (same seed degree), closer to the map's structure. | First expansion map (W1b). |
 | K-5 | C5 vocabulary is closed and versioned with the RunRecord schema. | Free-form labels with a registry. | S4 freeze. |
 | K-6 | A map failing a contract is kept out of the default registry but may still be benchmarked as an opt-in arm with the failure recorded. | Block it entirely until it passes. | First failing map. |
+| K-7 | C5 refuses a used hit with no evidence (it has no source label); a map card must list every label its evidence uses. (S3) | Allow label-less hits and label them by the map's first card label. | S4 freeze. |
+| K-8 | C5 is applied at run time by wrapping each map in `labels::Labelled` (the registry path wraps the four legacy maps), not inside `Registry::run`, because `lib.rs` was out of scope for S3. A mislabelled answer becomes `Failed` with one warning (C1). (S3) | Check labels in `Registry::run`'s own answer check. | S4 freeze. |
 
 ## 5. How a test proves it
 
@@ -246,3 +248,23 @@ C1; a map that swallows its failure passes the injected faults and fails
 `check_real_failure`. The four wrapped legacy maps pass C1 and C6 (`src/app/search/tests/t0.rs`), and so does
 the live lexical map over a real directory. C2-C5 and C7-C9 and their known-bad maps are not
 written yet.
+
+## 7. S3 as built: C5 (2026-10-12, branch `cloud/spike-s3b`)
+
+`lci-maps/src/labels.rs`: the wire names of `SourceLabel` (`SourceLabel::ALL`, `as_str`,
+`from_wire`) with `LABELS_VERSION` equal to the RunRecord schema id; a test requires the
+checked-in schema's `label` enum to list exactly `SourceLabel::ALL`, in order, so a label is
+added or renamed only with a new schema id (K-5). `check_labels` refuses an `Ok` or
+`Partial` answer with a hit without evidence (K-7) or an evidence label the map's card
+(`MapDescriptor::source_labels`) does not list. `Labelled` applies it to every answer a
+registry gets (K-8); `App::fuse_through_maps` and `App::record_through_maps` register the
+legacy maps through it, and the T0 and golden tests stay bit-exact. The kit's
+`check_source_labels` runs a subject beside a control and checks both answers; its tests
+reject a map whose card lists `lexical` while it emits `vector`, a map whose hits carry no
+evidence, and a mislabelled control, and show `Labelled` turning the mislabelled answer into
+one warning with the control-only pool. Offline, the harness's `RunRecordFile::check_labels`
+checks every used call in a record against the labels its plan lists.
+
+Not done: the `derived_from: scip` refusal (no gold-set field carries it yet,
+`src/evaluate/types.rs`), and benchmark rows split by label (no live rows in the cloud).
+
