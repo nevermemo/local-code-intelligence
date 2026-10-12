@@ -67,6 +67,8 @@ pub struct Options {
     pub arms: Vec<Arm>,
     pub embedder: Embedder,
     pub repos: Vec<String>,
+    /// Only these task ids (empty: all).
+    pub tasks: Vec<String>,
     pub max_per_repo: Option<usize>,
     pub label: Option<String>,
 }
@@ -402,6 +404,9 @@ pub async fn run(options: Options) -> Result<()> {
             .context("set has no tasks")?
             .iter()
             .filter(|task| task["repo"] == key)
+            .filter(|task| {
+                options.tasks.is_empty() || options.tasks.iter().any(|id| task["id"] == id.as_str())
+            })
             .collect();
         if let Some(max) = options.max_per_repo {
             tasks.truncate(max);

@@ -84,6 +84,11 @@ pub enum BenchCommand {
         /// Only these repositories (repeatable).
         #[arg(long = "repo")]
         repos: Vec<String>,
+        /// Only these task ids (repeatable). A task run alone is indexed
+        /// from scratch at its base commit (the incremental-equals-full
+        /// check).
+        #[arg(long = "task")]
+        tasks: Vec<String>,
         /// At most this many tasks per repository (the oldest first).
         #[arg(long)]
         max_per_repo: Option<usize>,
@@ -202,6 +207,7 @@ pub async fn run(command: BenchCommand) -> Result<()> {
             embedding_url,
             embedding_model,
             repos,
+            tasks,
             max_per_repo,
             label,
             baseline,
@@ -233,6 +239,7 @@ pub async fn run(command: BenchCommand) -> Result<()> {
                 arms,
                 embedder,
                 repos,
+                tasks,
                 max_per_repo,
                 label,
             })
