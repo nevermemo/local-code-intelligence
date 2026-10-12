@@ -631,6 +631,11 @@ mod tests {
             b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TS version=\"2.1\">",
             b"\n  \r\n\t<?xml version=\"1.0\"?>",
             b"\xEF\xBB\xBF \n<?xml?>",
+            b"<!-- hand-edited catalog -->\n<TS version=\"2.1\">",
+            b"<!-- before declaration -->\n<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<!DOCTYPE TS>\n<TS version=\"2.1\">",
+            b"<!-- catalog -->\n<!DOCTYPE TS>\n<TS version=\"2.1\">",
             b"<TS version=\"2.1\" language=\"de\">\n</TS>",
             b"  <TS\n  version = \"2.1\">",
             b"<TS language=\"de\" version=\"2.1\">",
@@ -657,6 +662,7 @@ mod tests {
             b"/* <?xml */\nexport const value = 1;\n",
             b"\xEF\xBB\xBF// bom then a comment\nexport const value = 1;\n",
             b"const xml = '<?xml version=\"1.0\"?>';\n",
+            b"const template = `<!-- not an XML prolog -->`;\nexport const value = 1;\n",
             // Valid TypeScript that starts with `<TS`: a type assertion and
             // generic arrow functions.
             b"<TS>value;\n",
