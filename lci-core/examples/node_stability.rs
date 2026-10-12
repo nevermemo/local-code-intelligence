@@ -6,7 +6,7 @@
 //! no index, data directory or working tree.
 //!
 //! ```text
-//! cargo run -p lci-core --example node_stability -- [--repo DIR] [--rev REV] [--commits N]
+//! cargo run -p lci-core --example node_stability -- [--repo DIR] [--rev REV] [--commits N] [--explain]
 //! ```
 //!
 //! A snapshot is every blob of the commit's tree with a registered source
@@ -18,6 +18,19 @@
 //!
 //! "Kept" means the older commit's id is present in the newer commit's
 //! snapshot (set membership), for both kinds of key.
+//!
+//! Membership cannot see an id that survives but names another chunk (a
+//! duplicate inserted earlier in a file shifts the ordinals of the later
+//! copies). So the tool also pairs chunks by position: `git diff` of the two
+//! blobs maps each older chunk's lines to the newer file, and the newer chunk
+//! with the same text on the mapped lines is its successor. An id "points at
+//! the wrong chunk" when it resolves to a newer chunk other than the
+//! successor. Only files with a repeated `content_hash` in either version
+//! are diffed: elsewhere each text has one copy and an id cannot name
+//! another.
+//!
+//! The tool prints how many commits it actually replayed: on a shallow
+//! clone the history can end before `--commits` is reached.
 
 use anyhow::{Context, Result, bail, ensure};
 use ignore::gitignore::GitignoreBuilder;
@@ -37,6 +50,8 @@ struct Args {
     repo: PathBuf,
     rev: String,
     commits: usize,
+    /// Print every id that points at another chunk.
+    explain: bool,
 }
 
 fn args() -> Result<Args> {
@@ -44,9 +59,14 @@ fn args() -> Result<Args> {
         repo: PathBuf::from("."),
         rev: "HEAD".into(),
         commits: 200,
+        explain: false,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
+        if flag == "--explain" {
+            parsed.explain = true;
+            continue;
+        }
         let value = raw
             .next()
             .with_context(|| format!("{flag} needs a value"))?;
@@ -113,9 +133,11 @@ impl Blobs {
     }
 }
 
-/// A commit's source chunks, in each file's source order.
+/// A commit's source chunks, in each file's source order, and the blob of
+/// each source file.
 struct Snapshot {
     chunks: Vec<Chunk>,
+    blobs: HashMap<String, String>,
 }
 
 /// Chunks of a blob, without the path (re-attached per snapshot), cached
@@ -150,6 +172,7 @@ fn snapshot(
     }
     let ignore = builder.build()?;
     let mut chunks = Vec::new();
+    let mut sources = HashMap::new();
     for (path, blob) in entries {
         let Some(adapter) = language::for_path(Path::new(&path)) else {
             continue;
@@ -160,6 +183,7 @@ fn snapshot(
         {
             continue;
         }
+        sources.insert(path.clone(), blob.clone());
         let key = (blob, adapter.identifier());
         if !cache.contains_key(&key) {
             let bytes = blobs.read(&key.0)?;
@@ -176,7 +200,10 @@ fn snapshot(
             ..chunk.clone()
         }));
     }
-    Ok(Snapshot { chunks })
+    Ok(Snapshot {
+        chunks,
+        blobs: sources,
+    })
 }
 
 #[derive(Default)]
@@ -210,6 +237,179 @@ fn file_text(chunks: &[Chunk]) -> HashMap<&str, Vec<(&str, u32, u32)>> {
     files
 }
 
+/// Changed line ranges of `git diff -U0 old new`: `(old_start, old_count,
+/// new_count)` per hunk, in order. A count of 0 is a pure insertion after
+/// (or deletion before) the given line.
+fn hunks(repo: &Path, old: &str, new: &str) -> Result<Vec<(u32, u32, u32)>> {
+    let diff = git(
+        repo,
+        &["diff", "-U0", "--no-color", "--no-ext-diff", old, new],
+    )?;
+    let range = |text: &str| -> Result<(u32, u32)> {
+        let (start, count) = text.split_once(',').unwrap_or((text, "1"));
+        Ok((start.parse()?, count.parse()?))
+    };
+    let mut out = Vec::new();
+    for line in diff.lines().filter(|l| l.starts_with("@@ ")) {
+        let mut fields = line.split_whitespace().skip(1);
+        let old = fields.next().context("hunk")?.trim_start_matches('-');
+        let new = fields.next().context("hunk")?.trim_start_matches('+');
+        let ((old_start, old_count), (_, new_count)) = (range(old)?, range(new)?);
+        out.push((old_start, old_count, new_count));
+    }
+    Ok(out)
+}
+
+/// Where an older line range sits in the newer file, if the diff left every
+/// line of it (and nothing between them) in place.
+fn map_lines(hunks: &[(u32, u32, u32)], start: u32, end: u32) -> Option<(u32, u32)> {
+    let map = |line: u32| -> Option<i64> {
+        let mut offset = 0i64;
+        for &(old_start, old_count, new_count) in hunks {
+            let before = if old_count == 0 {
+                old_start < line
+            } else if line >= old_start && line < old_start + old_count {
+                return None;
+            } else {
+                old_start + old_count <= line
+            };
+            if before {
+                offset += i64::from(new_count) - i64::from(old_count);
+            }
+        }
+        Some(i64::from(line) + offset)
+    };
+    let (new_start, new_end) = (map(start)?, map(end)?);
+    (new_end - new_start == i64::from(end - start))
+        .then(|| Some((u32::try_from(new_start).ok()?, u32::try_from(new_end).ok()?)))
+        .flatten()
+}
+
+/// What an older chunk's id resolves to in the newer snapshot, against the
+/// chunk that really followed it there.
+#[derive(Default)]
+struct Pointing {
+    /// Unchanged chunks of the diffed files (those with a repeated text).
+    checked: usize,
+    /// Checked chunks with no newer chunk of the same text on the mapped
+    /// lines (moved, or the lines around them were rewritten).
+    no_successor: usize,
+    node_right: usize,
+    node_wrong: usize,
+    node_lost: usize,
+    legacy_right: usize,
+    legacy_wrong: usize,
+    legacy_lost: usize,
+}
+
+impl Pointing {
+    fn add(&mut self, other: &Pointing) {
+        self.checked += other.checked;
+        self.no_successor += other.no_successor;
+        self.node_right += other.node_right;
+        self.node_wrong += other.node_wrong;
+        self.node_lost += other.node_lost;
+        self.legacy_right += other.legacy_right;
+        self.legacy_wrong += other.legacy_wrong;
+        self.legacy_lost += other.legacy_lost;
+    }
+}
+
+/// Pairs the chunks of one file by position (see the module comment) and
+/// counts where each kind of id points. `old` and `new` are indices into
+/// the two snapshots' chunk lists, for this file only.
+fn pointing(
+    repo: &Path,
+    (old_blob, new_blob): (&str, &str),
+    (previous, next): (&Snapshot, &Snapshot),
+    (old_ids, new_ids): (&[NodeId], &[NodeId]),
+    old: &[usize],
+    new: &[usize],
+    explain: bool,
+) -> Result<Pointing> {
+    let hunks = hunks(repo, old_blob, new_blob)?;
+    let by_place: HashMap<(&str, u32, u32), usize> = new
+        .iter()
+        .map(|&j| {
+            let c = &next.chunks[j];
+            ((c.content_hash.as_str(), c.start_line, c.end_line), j)
+        })
+        .collect();
+    let by_id: HashMap<&NodeId, usize> = new.iter().map(|&j| (&new_ids[j], j)).collect();
+    let by_legacy: HashMap<(u32, &str), usize> = new
+        .iter()
+        .map(|&j| {
+            let c = &next.chunks[j];
+            ((c.start_line, c.content_hash.as_str()), j)
+        })
+        .collect();
+    let texts: HashSet<&str> = new
+        .iter()
+        .map(|&j| next.chunks[j].content_hash.as_str())
+        .collect();
+    let mut counts = Pointing::default();
+    for &i in old {
+        let chunk = &previous.chunks[i];
+        if !texts.contains(chunk.content_hash.as_str()) {
+            continue;
+        }
+        counts.checked += 1;
+        let successor = map_lines(&hunks, chunk.start_line, chunk.end_line)
+            .and_then(|(start, end)| by_place.get(&(chunk.content_hash.as_str(), start, end)));
+        let Some(&successor) = successor else {
+            counts.no_successor += 1;
+            continue;
+        };
+        match by_id.get(&old_ids[i]) {
+            None => counts.node_lost += 1,
+            Some(&j) if j == successor => counts.node_right += 1,
+            Some(&j) => {
+                counts.node_wrong += 1;
+                if explain {
+                    let (s, w) = (&next.chunks[successor], &next.chunks[j]);
+                    println!(
+                        "wrong NodeId: {} lines {}-{} ({:?}) -> successor {}-{}, id names {}-{}",
+                        chunk.relative_file_path,
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.code.chars().take(60).collect::<String>(),
+                        s.start_line,
+                        s.end_line,
+                        w.start_line,
+                        w.end_line
+                    );
+                }
+            }
+        }
+        match by_legacy.get(&(chunk.start_line, chunk.content_hash.as_str())) {
+            None => counts.legacy_lost += 1,
+            Some(&j) if j == successor => counts.legacy_right += 1,
+            Some(_) => counts.legacy_wrong += 1,
+        }
+    }
+    Ok(counts)
+}
+
+/// Chunk indices of a snapshot per file.
+fn by_file(chunks: &[Chunk]) -> HashMap<&str, Vec<usize>> {
+    let mut files = HashMap::<&str, Vec<usize>>::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        files
+            .entry(chunk.relative_file_path.as_str())
+            .or_default()
+            .push(index);
+    }
+    files
+}
+
+/// Whether two chunks of a file share a text.
+fn has_repeat(chunks: &[Chunk], indices: &[usize]) -> bool {
+    let mut seen = HashSet::new();
+    !indices
+        .iter()
+        .all(|&i| seen.insert(chunks[i].content_hash.as_str()))
+}
+
 /// Fusion keys of a snapshot shared by two or more NodeIds (decision N-5).
 fn twins(chunks: &[Chunk]) -> usize {
     let ids = chunk_ids(chunks);
@@ -237,17 +437,30 @@ fn main() -> Result<()> {
     let mut commits: Vec<&str> = list.lines().collect();
     commits.reverse();
     ensure!(commits.len() >= 2, "need at least two commits");
+    let shallow = git(&args.repo, &["rev-parse", "--is-shallow-repository"])?;
+    let shallow = shallow.trim() == "true";
+    if commits.len() - 1 < args.commits {
+        eprintln!(
+            "warning: {} pairs requested, history has {} (shallow clone: {})",
+            args.commits,
+            commits.len() - 1,
+            if shallow { "yes" } else { "no" }
+        );
+    }
     let mut blobs = Blobs::open(&args.repo)?;
     let mut cache = ChunkCache::new();
     let mut total = Counts::default();
     let mut pairs_with_gap = 0;
+    let mut pointed = Pointing::default();
+    let mut pairs_with_wrong = Vec::new();
     let mut worst: Vec<(String, usize, usize, usize)> = Vec::new();
     let mut previous = snapshot(&args.repo, commits[0], &mut blobs, &mut cache)?;
     let mut max_twins = twins(&previous.chunks);
     for window in commits.windows(2) {
         let next = snapshot(&args.repo, window[1], &mut blobs, &mut cache)?;
         let old_ids = chunk_ids(&previous.chunks);
-        let new_ids: HashSet<NodeId> = chunk_ids(&next.chunks).into_iter().collect();
+        let next_ids = chunk_ids(&next.chunks);
+        let new_ids: HashSet<&NodeId> = next_ids.iter().collect();
         let new_keys: HashSet<_> = next.chunks.iter().map(legacy_fusion_key).collect();
         let new_texts: HashSet<(&str, &str)> = next
             .chunks
@@ -275,6 +488,36 @@ fn main() -> Result<()> {
                 pair.legacy_kept_in_edited += usize::from(legacy);
             }
         }
+        let (old_by_file, new_by_file) = (by_file(&previous.chunks), by_file(&next.chunks));
+        let mut pair_pointed = Pointing::default();
+        for (path, old) in &old_by_file {
+            let Some(new) = new_by_file.get(path) else {
+                continue;
+            };
+            if old_files.get(path) == new_files.get(path)
+                || !(has_repeat(&previous.chunks, old) || has_repeat(&next.chunks, new))
+            {
+                continue;
+            }
+            pair_pointed.add(&pointing(
+                &args.repo,
+                (&previous.blobs[*path], &next.blobs[*path]),
+                (&previous, &next),
+                (&old_ids, &next_ids),
+                old,
+                new,
+                args.explain,
+            )?);
+        }
+        if pair_pointed.node_wrong + pair_pointed.legacy_wrong > 0 {
+            pairs_with_wrong.push(format!(
+                "`{}` {}/{}",
+                &window[1][..10],
+                pair_pointed.node_wrong,
+                pair_pointed.legacy_wrong
+            ));
+        }
+        pointed.add(&pair_pointed);
         if pair.node_kept != pair.legacy_kept {
             pairs_with_gap += 1;
         }
@@ -297,9 +540,12 @@ fn main() -> Result<()> {
     let percent = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
     let pairs = commits.len() - 1;
     println!(
-        "rev {} ({} commits, {pairs} pairs, first-parent)",
+        "rev {}: replayed {} first-parent commits ({pairs} pairs) of {} pairs requested; oldest {}; shallow clone: {}",
         args.rev,
-        commits.len()
+        commits.len(),
+        args.commits,
+        &commits[0][..10],
+        if shallow { "yes" } else { "no" }
     );
     println!("last snapshot: {} chunks", previous.chunks.len());
     println!();
@@ -329,6 +575,29 @@ fn main() -> Result<()> {
     println!("pairs where the two counts differ: {pairs_with_gap} of {pairs}");
     println!(
         "most fusion keys shared by two or more NodeIds in one snapshot (decision N-5): {max_twins}"
+    );
+    println!();
+    println!(
+        "positional pairing (files with a repeated text, diffed): {} unchanged chunks checked, {} without a successor on the mapped lines",
+        pointed.checked, pointed.no_successor
+    );
+    println!("| Key | Points at the successor | Points at another chunk | Lost |");
+    println!("| --- | ---: | ---: | ---: |");
+    println!(
+        "| NodeId | {} | {} | {} |",
+        pointed.node_right, pointed.node_wrong, pointed.node_lost
+    );
+    println!(
+        "| Legacy key | {} | {} | {} |",
+        pointed.legacy_right, pointed.legacy_wrong, pointed.legacy_lost
+    );
+    println!(
+        "pairs with an id pointing at another chunk (NodeId/legacy): {}",
+        if pairs_with_wrong.is_empty() {
+            "none".to_owned()
+        } else {
+            pairs_with_wrong.join(", ")
+        }
     );
     worst.sort_by_key(|(_, edited, node, legacy)| {
         std::cmp::Reverse((*node as i64 - *legacy as i64, *edited))
