@@ -266,6 +266,7 @@ impl App {
             .map(Vec::len)
             .or_else(|| previous.as_ref().map(|s| s.dimension))
             .unwrap_or(1);
+        drop(previous);
         self.store
             .replace(&workspace, &chunks, &vectors, &identity, dimension)
             .await?;

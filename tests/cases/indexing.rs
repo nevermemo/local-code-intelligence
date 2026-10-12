@@ -1,5 +1,78 @@
 use super::*;
 
+#[tokio::test]
+async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.wait_for_existing_job_seconds = 1;
+    config.index.stale_check_interval_seconds = 0;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("bounded-search");
+    write(&workspace, "lib.rs", "fn previous_snapshot() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    app.index(&workspace).await.unwrap();
+
+    write(&workspace, "lib.rs", "fn replacement_snapshot() {}\n");
+    fake.hold_documents.store(true, Ordering::SeqCst);
+    let indexing_app = app.clone();
+    let indexing_workspace = workspace.clone();
+    let job = tokio::spawn(async move { indexing_app.index(&indexing_workspace).await });
+    tokio::time::timeout(Duration::from_secs(30), fake.document_held.notified())
+        .await
+        .expect("index job did not reach the held embedding response");
+
+    // The response stays held throughout search: machine load can widen the
+    // margin, but search must never depend on the index job completing.
+    let search = tokio::time::timeout(
+        Duration::from_secs(15),
+        app.search(&workspace, "snapshot", Some(8)),
+    )
+    .await;
+    let returned_before_release = search.is_ok();
+    let job_was_running = !job.is_finished();
+    fake.hold_documents.store(false, Ordering::SeqCst);
+    fake.release_documents.notify_one();
+    let indexed = job.await.unwrap().unwrap();
+
+    assert!(
+        returned_before_release,
+        "search did not return before the held index job was released"
+    );
+    assert!(
+        job_was_running,
+        "index job ended before its response was released"
+    );
+    let found = search.unwrap().unwrap();
+    assert!(
+        found
+            .warning
+            .as_deref()
+            .unwrap_or("")
+            .contains("reusing previous snapshot")
+    );
+    assert!(matches!(
+        found.index.action,
+        local_code_intelligence::app::IndexAction::Reused
+    ));
+    assert!(
+        found.index.wait_ms >= 1000.0,
+        "index wait was not accounted for"
+    );
+    assert!(found.index.wait_ms <= found.timings.total_ms);
+    assert_eq!(found.results.len(), 1);
+    assert!(found.results[0].chunk.code.contains("previous_snapshot"));
+    assert!(!found.results[0].chunk.code.contains("replacement_snapshot"));
+    assert_eq!(indexed.embedded_chunks, 1);
+    let current = app.search(&workspace, "snapshot", Some(8)).await.unwrap();
+    assert_eq!(current.results.len(), 1);
+    assert!(
+        current.results[0]
+            .chunk
+            .code
+            .contains("replacement_snapshot")
+    );
+    task.abort();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_backslashes_preserve_indexed_names_and_result_paths() {

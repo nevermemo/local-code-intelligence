@@ -31,6 +31,9 @@ struct FakeModels {
     document_requests: AtomicUsize,
     queries: AtomicUsize,
     embed_delay_milliseconds: AtomicUsize,
+    hold_documents: AtomicBool,
+    document_held: tokio::sync::Notify,
+    release_documents: tokio::sync::Notify,
     rerank_fails: AtomicBool,
     embed_fails: AtomicBool,
     malformed_rerank: AtomicBool,
@@ -96,6 +99,10 @@ async fn embed(
         .any(|text| !text.as_str().unwrap().starts_with(QUERY_INSTRUCTION))
     {
         state.document_requests.fetch_add(1, Ordering::SeqCst);
+        if state.hold_documents.load(Ordering::SeqCst) {
+            state.document_held.notify_one();
+            state.release_documents.notified().await;
+        }
         let delay = state.embed_delay_milliseconds.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay as u64)).await;
