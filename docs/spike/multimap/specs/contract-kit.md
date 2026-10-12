@@ -223,3 +223,21 @@ node, one that keeps paths in its bundle, one that reads past `as_of`, one that 
 its cost, one without a source label) and the kit must fail each with the right contract id.
 A kit that passes a known-bad map is a kit bug. The known-good legacy maps (wrapped in S2)
 must pass every applicable contract with no exceptions recorded.
+
+## 6. S2 as built (2026-10-12)
+
+`lci-maps/src/kit.rs` implements C1 (`check_fail_open`) and C6 (`check_determinism`) over a
+`Fixture` (view, query text, per-call budget, slack, `rrf_k`) with a subject map and a
+control map that returns candidates (the C1 carve-out). C1 runs the subject as it is, switched
+off, and under the five injected faults, and requires the fused pool (nodes, score bits,
+parts, order) to equal the control-only run, one warning (failure) or one note (deadline)
+attributed to the subject and none to another map, and every run to end within the budget
+plus the slack. C6 compares the subject's answer and the fused pool across a second run and a
+reversed registration; the randomised thread pool is not done yet.
+
+The kit's own tests (`lci-maps/src/tests.rs`): a known-good rank list and prior pass both; a
+map that blocks its thread past the deadline fails C1 (the registry's timeout cannot preempt
+it, so the search stalls); a map whose answer drifts between calls fails C6 and still passes
+C1. The four wrapped legacy maps pass C1 and C6 (`src/app/search/tests/t0.rs`), and so does
+the live lexical map over a real directory. C2-C5 and C7-C9 and their known-bad maps are not
+written yet.

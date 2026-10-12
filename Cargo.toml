@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "lci-core"]
+members = ["xtask", "lci-core", "lci-maps"]
 
 [package]
 name = "local-code-intelligence"
@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 dunce = "1"
 futures = "0.3"
 lci-core = { path = "lci-core" }
+lci-maps = { path = "lci-maps" }
 # 0.38.0's job module references Error::Http without a feature guard.
 # Enable remote to compile upstream; the application opens only local paths.
 lancedb = { version = "=0.38.0", default-features = false, features = ["remote"] }
