@@ -401,6 +401,160 @@ async fn failed_initial_search_preserves_no_snapshot_and_can_retry() {
 }
 
 #[tokio::test]
+async fn a_search_waiting_for_a_failed_explicit_index_reports_its_error() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post({
+            let requests = requests.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let requests = requests.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    let cause = match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => "first-search failure X",
+                        1 => {
+                            started.notify_one();
+                            release.notified().await;
+                            "explicit-index failure Y"
+                        }
+                        // A waiter that missed the explicit index indexes by
+                        // itself; answer at once so the assertions fail fast.
+                        _ => "duplicate request",
+                    };
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, cause)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let failing_models = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let workspace = temp.path().join("failed-explicit-index");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let first = app
+        .search(&workspace, "translator", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{first:#}").contains("first-search failure X"));
+
+    let indexing = app.index(&workspace);
+    tokio::pin!(indexing);
+    tokio::select! {
+        result = &mut indexing => panic!("index finished before release: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), started.notified()) => {
+            result.expect("explicit indexing reaches the embedding request");
+        }
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+    let waiting = app.search(&workspace, "translator", None);
+    tokio::pin!(waiting);
+    // Keep the explicit index blocked while polling the search into its wait.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let explicit = indexing.await.unwrap_err();
+    assert!(format!("{explicit:#}").contains("explicit-index failure Y"));
+    let error = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("indexing failed while waiting"), "{error}");
+    assert!(error.contains("explicit-index failure Y"), "{error}");
+    assert!(!error.contains("first-search failure X"), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    failing_models.abort();
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_search_waiting_for_a_cancelled_explicit_index_does_not_report_a_stale_error() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let router = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post({
+            let requests = requests.clone();
+            let started = started.clone();
+            move || {
+                let requests = requests.clone();
+                let started = started.clone();
+                async move {
+                    let cause = match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => "first-search failure X",
+                        1 => {
+                            started.notify_one();
+                            std::future::pending::<()>().await;
+                            unreachable!()
+                        }
+                        _ => "own failure Z",
+                    };
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, cause)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let failing_models = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let workspace = temp.path().join("cancelled-explicit-index");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let first = app
+        .search(&workspace, "translator", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{first:#}").contains("first-search failure X"));
+
+    let mut indexing = Box::pin(app.index(&workspace));
+    tokio::select! {
+        result = &mut indexing => panic!("index finished while blocked: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), started.notified()) => {
+            result.expect("explicit indexing reaches the embedding request");
+        }
+    }
+    let waiting = app.search(&workspace, "translator", None);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err()
+    );
+    // Cancel the explicit index: it records no failure, so the waiter must
+    // index by itself instead of reporting the earlier flight's X.
+    drop(indexing);
+    let error = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("own failure Z"), "{error}");
+    assert!(!error.contains("first-search failure X"), "{error}");
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    failing_models.abort();
+    task.abort();
+}
+
+#[tokio::test]
 async fn manual_freshness_reuses_stale_snapshot_without_refresh() {
     let (temp, mut config, fake, task) = fixture().await;
     config.index.freshness = IndexFreshness::Manual;
