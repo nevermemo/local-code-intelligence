@@ -109,7 +109,7 @@ Before the first build, the defaults below are what `lci config --json` would re
 | `ripgrep_path` | `rg` (on Windows, also discovers common VS Code-bundled copies) |
 | `semantic_candidate_count` | 40 |
 | `lexical_candidate_count` | 40 |
-| `rerank_candidate_count` | 24 |
+| `rerank_candidate_count` | 24 (also the most results a search returns, whatever `top_k` asks for) |
 | `rerank_document_max_bytes` | 4096 (allowed: 256–1048576) |
 | `rrf_k` | 60 |
 | `watch_poll_milliseconds` | 2000 |
@@ -174,7 +174,7 @@ All tools return structured JSON, also available as MCP text content. Tool failu
 | `search_symbols` | `workspace_path`, `query` | Workspace symbols from every applicable enabled language server (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd), with provider/language metadata. When some servers fail and another answers, the call still succeeds with the answering servers' symbols plus, only when non-empty, `warnings` (one `Optional LSP provider unavailable: <provider>: <cause>` entry for each failed server, in provider order), so an empty `results` is not a confirmed "no match"; the call is an error only when every applicable server failed |
 | `find_definition` | workspace path, relative file path, one-based line, zero-based UTF-16 character | Definition locations routed by extension to the matching language server |
 | `find_references` | the definition arguments plus optional `include_declaration` | Reference locations routed by extension to the matching language server |
-| `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, informational notes (for example a language server still starting), and index lifecycle metadata; on `/mcp/<name>`, also `search_profile` (the search profile this endpoint runs, see below) |
+| `search_code` | `workspace_path`, `query`, optional `top_k` | Ranked source chunks, scores, timings, fallback warning, informational notes (for example a language server still starting, or a `top_k` above `rerank_candidate_count`), and index lifecycle metadata; on `/mcp/<name>`, also `search_profile` (the search profile this endpoint runs, see below) |
 | `service_status` | none | The same required/optional readiness report as `/ready` |
 
 Example arguments (these index this repository itself -- the one workspace every reader already has on disk):

@@ -59,6 +59,9 @@ readiness_timeout_seconds = 5
 ripgrep_path = "rg"
 semantic_candidate_count = 40
 lexical_candidate_count = 40
+# Candidates kept after fusion: the reranker's window, and the most results a
+# search returns even when top_k asks for more (a top_k passed above it adds
+# a note to the response). A search profile may set its own (1-200).
 rerank_candidate_count = 24
 # Most bytes of code sent to the reranker per candidate (256-1048576).
 rerank_document_max_bytes = 4096

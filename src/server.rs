@@ -27,7 +27,10 @@ pub struct WorkspaceArgs {
 pub struct SearchArgs {
     pub workspace_path: String,
     pub query: String,
-    /// Number of results, 1 through 40; defaults to configured top-k (8).
+    /// Number of results, 1 through 40; defaults to configured top-k (8). A
+    /// search returns at most `rerank_candidate_count` results (24 unless
+    /// configured), whatever top_k says; a larger top_k you pass adds a note
+    /// to the response.
     pub top_k: Option<usize>,
     /// Registered language identifiers to include.
     pub languages: Option<Vec<String>>,

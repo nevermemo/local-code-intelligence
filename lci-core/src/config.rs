@@ -277,6 +277,10 @@ pub struct Config {
     pub ripgrep_path: String,
     pub semantic_candidate_count: usize,
     pub lexical_candidate_count: usize,
+    /// Candidates kept after fusion: the reranker's window, and the most
+    /// results a search returns even when `top_k` asks for more (a `top_k`
+    /// passed above it adds a note to the response). A search profile may set
+    /// its own.
     pub rerank_candidate_count: usize,
     /// Upper bound, in bytes, on the code sent to the reranker per
     /// candidate (the path is always sent in full). Keeps every

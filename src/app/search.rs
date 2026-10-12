@@ -439,6 +439,22 @@ fn cap_chunks_per_file(hits: Vec<Hit>, max: u32) -> Vec<Hit> {
     cap_by_file(hits, max, |hit| hit.chunk.relative_file_path.as_str())
 }
 
+/// What `notes` says when the cut to `rerank_candidate_count` leaves fewer
+/// results than `top_k` asked for: the pool is cut before `top_k` applies, with
+/// the reranker off as well. A note, not a warning: nothing failed, and a
+/// warning would count the search as a fallback. `None` when `top_k` fits in
+/// the window or the pool was smaller than the window anyway.
+fn pool_cut_note(top_k: usize, window: usize, pool: usize) -> Option<String> {
+    (top_k > window && pool > window).then(|| {
+        format!(
+            "top_k {top_k} asks for more results than this search keeps: the candidate pool is \
+             cut to rerank_candidate_count = {window} (of {pool} candidates) before top_k \
+             applies, so at most {window} results come back. Ask for {window} or fewer, or \
+             raise rerank_candidate_count (a search profile may set its own)."
+        )
+    })
+}
+
 /// [`cap_chunks_per_file`] over any items that have a file path, so that the
 /// candidate trace can run the very same cap on positions instead of cloning
 /// hits.
@@ -934,7 +950,15 @@ impl App {
             rows
         });
         hits = cap_chunks_per_file(hits, self.config.fusion.max_chunks_per_file);
+        let pool = hits.len();
         hits.truncate(settings.rerank_candidate_count);
+        // Only for a `top_k` the caller passed: the default is the operator's own
+        // setting, and a profile with a small window is meant to return fewer.
+        if let Some(note) =
+            top_k.and_then(|asked| pool_cut_note(asked, settings.rerank_candidate_count, pool))
+        {
+            report.notes.push(note);
+        }
         report.timings.fusion_ms = ms(fusion_timer) - trace_ms;
         report.candidate_count = hits.len();
         if !hits.is_empty() {
@@ -1379,7 +1403,7 @@ impl App {
 mod tests {
     use super::{
         App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, head_within,
-        record_rerank_scores, rerank_document, trace_candidates,
+        pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
     };
     use crate::{
         chunk::Chunk,
@@ -1390,6 +1414,22 @@ mod tests {
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
+
+    #[test]
+    fn a_note_names_top_k_and_the_window_only_when_the_cut_leaves_fewer_results_than_asked() {
+        let note = pool_cut_note(40, 24, 60).unwrap();
+        assert!(
+            note.contains("top_k 40")
+                && note.contains("rerank_candidate_count = 24")
+                && note.contains("of 60 candidates"),
+            "{note}"
+        );
+        // top_k fits in the window, or the pool was never cut: nothing to say.
+        assert_eq!(pool_cut_note(24, 24, 60), None);
+        assert_eq!(pool_cut_note(8, 24, 60), None);
+        assert_eq!(pool_cut_note(40, 24, 24), None);
+        assert_eq!(pool_cut_note(40, 24, 10), None);
+    }
 
     #[test]
     fn the_candidate_dump_is_off_unless_the_variable_names_a_file() {

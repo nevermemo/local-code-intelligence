@@ -2867,6 +2867,89 @@ async fn a_search_in_no_profile_matches_search_with_filters() {
     task.abort();
 }
 
+/// A `top_k` above the rerank window is cut to the window, with the reranker
+/// on and off, and the answer says so in `notes` (not in `warning`: the
+/// search is not a fallback). A `top_k` that fits the window, or none passed,
+/// says nothing.
+#[tokio::test]
+async fn a_top_k_above_the_rerank_window_is_named_in_a_note() {
+    use local_code_intelligence::filter::FilterRequest;
+
+    let (temp, config, _fake, task) = fixture().await;
+    let config = profiled_config(config);
+    let workspace = temp.path().join("profile-window-note");
+    write_profile_workspace(&workspace);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+    let search = |top_k: usize, profile: Option<&'static str>| {
+        let (app, workspace) = (&app, &workspace);
+        async move {
+            app.search_in_profile(
+                workspace,
+                "translator",
+                Some(top_k),
+                FilterRequest::default(),
+                profile,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // The top-level window is five: eight asked for, five come back, and the
+    // note names both numbers.
+    let base = search(8, None).await;
+    assert_eq!(base.results.len(), 5);
+    assert_eq!(base.notes.len(), 1, "{:?}", base.notes);
+    assert!(
+        base.notes[0].contains("top_k 8") && base.notes[0].contains("rerank_candidate_count = 5"),
+        "{:?}",
+        base.notes
+    );
+    assert!(base.warning.is_none(), "{:?}", base.warning);
+    assert!(serde_json::to_value(&base).unwrap()["notes"].is_array());
+
+    // With the reranker off the cut is the same, and so is the note.
+    let fast = search(8, Some("fast")).await;
+    assert!(!fast.reranked);
+    assert_eq!(fast.results.len(), 5);
+    assert_eq!(fast.notes, base.notes);
+
+    // A profile with its own window names that one.
+    let deep = search(8, Some("deep")).await;
+    assert_eq!(deep.results.len(), 3);
+    assert_eq!(deep.notes.len(), 1, "{:?}", deep.notes);
+    assert!(
+        deep.notes[0].contains("top_k 8") && deep.notes[0].contains("rerank_candidate_count = 3"),
+        "{:?}",
+        deep.notes
+    );
+
+    // No `top_k` passed: the configured default (eight) is above the window of
+    // five too, but that is the operator's setting, not a request.
+    let default = app
+        .search_in_profile(
+            &workspace,
+            "translator",
+            None,
+            FilterRequest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(default.results.len(), 5);
+    assert!(default.notes.is_empty(), "{:?}", default.notes);
+
+    // A `top_k` that fits the window, the window itself included, says nothing.
+    for top_k in [3, 5] {
+        let fits = search(top_k, None).await;
+        assert_eq!(fits.results.len(), top_k);
+        assert!(fits.notes.is_empty(), "{:?}", fits.notes);
+        assert!(serde_json::to_value(&fits).unwrap().get("notes").is_none());
+    }
+    task.abort();
+}
+
 #[tokio::test]
 async fn profiles_switch_the_reranker_and_window_and_report_themselves() {
     use local_code_intelligence::{app::SearchReport, filter::FilterRequest};
