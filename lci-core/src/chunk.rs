@@ -188,12 +188,18 @@ struct SourceFile {
 /// sequences become U+FFFD) rather than failing. Legacy-encoded files --
 /// e.g. Windows-1252 C sources -- are common in real repositories, and one
 /// of them must not make the whole workspace unindexable or unsearchable.
-/// Line structure is preserved, so line ranges stay valid.
+/// Line structure is preserved, so line ranges stay valid. One leading byte
+/// order mark (U+FEFF) is dropped: it is not text, `trim()` keeps it, and it
+/// would otherwise sit in the first chunk's code and in the file's hash.
 fn decode_source(bytes: Vec<u8>) -> (String, bool) {
-    match String::from_utf8(bytes) {
+    let (mut source, lossy) = match String::from_utf8(bytes) {
         Ok(source) => (source, false),
         Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+    };
+    if source.starts_with('\u{feff}') {
+        source.drain(..'\u{feff}'.len_utf8());
     }
+    (source, lossy)
 }
 
 struct Sources {
@@ -442,6 +448,95 @@ mod tests {
             assert_eq!(c.content_hash, hash(&c.code));
             assert!(c.end_line >= c.start_line);
         }
+    }
+
+    #[test]
+    fn leading_bom_does_not_change_rust_typescript_or_csharp_chunks() {
+        let fixtures = [
+            ("lib.rs", "fn rust_value() { let _ = 1; }\n"),
+            ("types.ts", "export const typescriptValue = 1;\n"),
+            ("Service.cs", "public sealed class CsharpService {}\n"),
+        ];
+        let without_bom = tempfile::tempdir().unwrap();
+        let with_bom = tempfile::tempdir().unwrap();
+        for (path, source) in fixtures {
+            std::fs::write(without_bom.path().join(path), source).unwrap();
+            std::fs::write(with_bom.path().join(path), format!("\u{feff}{source}")).unwrap();
+        }
+
+        let without_bom = scan_incremental(without_bom.path(), &HashMap::new()).unwrap();
+        let with_bom = scan_incremental(with_bom.path(), &HashMap::new()).unwrap();
+        let details = |chunks: &[Chunk]| {
+            chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.relative_file_path.clone(),
+                        chunk.language.clone(),
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.code.clone(),
+                        chunk.content_hash.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            details(&with_bom.chunks),
+            details(&without_bom.chunks),
+            "chunks with BOM: {:#?}\nchunks without BOM: {:#?}",
+            with_bom.chunks,
+            without_bom.chunks
+        );
+        assert!(with_bom.chunks.iter().all(|chunk| chunk.code != "\u{feff}"));
+        let differing_source_hashes: Vec<_> = fixtures
+            .iter()
+            .filter_map(|(path, _)| {
+                let with_bom_hash = &with_bom.files[*path].content_hash;
+                let without_bom_hash = &without_bom.files[*path].content_hash;
+                (with_bom_hash != without_bom_hash).then_some((
+                    *path,
+                    with_bom_hash,
+                    without_bom_hash,
+                ))
+            })
+            .collect();
+        assert!(
+            differing_source_hashes.is_empty(),
+            "decoded source hashes differ by language: {differing_source_hashes:#?}"
+        );
+    }
+
+    #[test]
+    fn decode_source_drops_one_leading_byte_order_mark_and_keeps_the_lossy_flag() {
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBFfn a() {}\n".to_vec()),
+            ("fn a() {}\n".to_owned(), false)
+        );
+        assert_eq!(
+            decode_source(b"fn a() {}\n".to_vec()),
+            ("fn a() {}\n".to_owned(), false)
+        );
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBF".to_vec()),
+            (String::new(), false)
+        );
+        // Only the first mark is the byte order mark; a second one is content.
+        assert_eq!(
+            decode_source("\u{feff}\u{feff}x".as_bytes().to_vec()),
+            ("\u{feff}x".to_owned(), false)
+        );
+        // A mark in the middle is content too.
+        assert_eq!(
+            decode_source("a\u{feff}b".as_bytes().to_vec()),
+            ("a\u{feff}b".to_owned(), false)
+        );
+        // Invalid UTF-8 after the mark: the file is lossy, and the mark still goes.
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBFlet a = \xFF;\n".to_vec()),
+            ("let a = \u{fffd};\n".to_owned(), true)
+        );
     }
 
     #[test]
