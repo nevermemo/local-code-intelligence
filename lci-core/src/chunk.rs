@@ -445,6 +445,70 @@ mod tests {
     }
 
     #[test]
+    fn leading_bom_does_not_change_rust_typescript_or_csharp_chunks() {
+        let fixtures = [
+            ("lib.rs", "fn rust_value() { let _ = 1; }\n"),
+            ("types.ts", "export const typescriptValue = 1;\n"),
+            ("Service.cs", "public sealed class CsharpService {}\n"),
+        ];
+        let without_bom = tempfile::tempdir().unwrap();
+        let with_bom = tempfile::tempdir().unwrap();
+        for (path, source) in fixtures {
+            std::fs::write(without_bom.path().join(path), source).unwrap();
+            std::fs::write(
+                with_bom.path().join(path),
+                format!("\u{feff}{source}"),
+            )
+            .unwrap();
+        }
+
+        let without_bom = scan_incremental(without_bom.path(), &HashMap::new()).unwrap();
+        let with_bom = scan_incremental(with_bom.path(), &HashMap::new()).unwrap();
+        let details = |chunks: &[Chunk]| {
+            chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.relative_file_path.clone(),
+                        chunk.language.clone(),
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.code.clone(),
+                        chunk.content_hash.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            details(&with_bom.chunks),
+            details(&without_bom.chunks),
+            "chunks with BOM: {:#?}\nchunks without BOM: {:#?}",
+            with_bom.chunks,
+            without_bom.chunks
+        );
+        assert!(
+            with_bom
+                .chunks
+                .iter()
+                .all(|chunk| chunk.code != "\u{feff}")
+        );
+        let differing_source_hashes: Vec<_> = fixtures
+            .iter()
+            .filter_map(|(path, _)| {
+                let with_bom_hash = &with_bom.files[*path].content_hash;
+                let without_bom_hash = &without_bom.files[*path].content_hash;
+                (with_bom_hash != without_bom_hash)
+                    .then_some((*path, with_bom_hash, without_bom_hash))
+            })
+            .collect();
+        assert!(
+            differing_source_hashes.is_empty(),
+            "decoded source hashes differ by language: {differing_source_hashes:#?}"
+        );
+    }
+
+    #[test]
     fn rust_boundaries_remain_stable() {
         assert_eq!(DOCUMENT_FORMAT_VERSION, "rust-chunks-v1");
         let source =
