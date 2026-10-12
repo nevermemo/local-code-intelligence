@@ -12,6 +12,20 @@ on:
 # (`cargo xtask acceptance <name>`) is intentionally not run here: it
 # requires locally running embedding/reranker services and, for the C#
 # subcommands, a real dotnet SDK + csharp-ls install.
+#
+# Toolchains. The blocking `test` jobs build with the exact version in
+# RUST_PIN, the one the last green run resolved from `stable`, so an
+# unchanged commit cannot turn red because a new Rust release or a new
+# default clippy lint came out. Two more jobs watch the two ends:
+# `minimum-version` builds with the `rust-version` the manifests declare
+# (keep it equal to Cargo.toml and lci-core/Cargo.toml), and `canary` runs
+# clippy and the unit tests on the newest stable without blocking. A red
+# canary means: bump RUST_PIN on purpose and record the bump as a roadmap
+# row. There is no rust-toolchain file on purpose: it would also change the
+# toolchain of every contributor's local builds.
+env:
+  RUST_PIN: 1.99.0
+
 jobs:
   test:
     strategy:
@@ -20,13 +34,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (the toolchain is the `toolchain` input)
         with:
+          toolchain: ${{ env.RUST_PIN }}
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # The lexical channel runs ripgrep and the integration tests exercise
       # it: a runner without `rg` fails 24 of them with "Lexical retrieval
@@ -53,3 +68,46 @@ jobs:
 
       - name: Build and test
         run: cargo xtask test --suite Full
+
+  # The declared minimum Rust version builds the whole workspace with the
+  # committed lockfile: a newer-only library API or a dependency that needs a
+  # newer compiler turns this job red, and only this one.
+  minimum-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (the toolchain is the `toolchain` input)
+        with:
+          toolchain: "1.91"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install protoc and cmake
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Check with the declared minimum version
+        run: cargo check --workspace --locked --all-targets
+
+  # The newest stable, for early warning only: it never fails the workflow.
+  canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (the toolchain is the `toolchain` input)
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install protoc, cmake and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake ripgrep
+
+      - name: Clippy on the newest stable
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Unit tests on the newest stable
+        run: cargo xtask test --suite Unit

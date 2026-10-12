@@ -85,6 +85,26 @@ fn invoke_focused(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The cargo calls of [`Suite::Full`] after the path lint, in order. The ones
+/// that resolve dependencies run `--locked`, so a pull request that edits a
+/// `Cargo.toml` and forgets `Cargo.lock` fails here (as `cargo xtask build`
+/// does) instead of passing and failing later in a locked build. `cargo fmt`
+/// reads no lockfile. The focused suites stay unlocked, for a developer who is
+/// in the middle of an edit.
+const FULL_STEPS: [&[&str]; 3] = [
+    &["fmt", "--all", "--", "--check"],
+    &["test", "--workspace", "--locked"],
+    &[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ],
+];
+
 pub fn run(suite: Suite) -> Result<()> {
     match suite {
         Suite::Unit => invoke_focused(&["test", "--workspace", "--lib"]),
@@ -110,23 +130,33 @@ pub fn run(suite: Suite) -> Result<()> {
         Suite::Full => {
             println!("> cargo xtask lint-machine-paths");
             crate::lint::run()?;
-            invoke(&["fmt", "--all", "--", "--check"])?;
-            invoke(&["test", "--workspace"])?;
-            invoke(&[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ])
+            for step in FULL_STEPS {
+                invoke(step)?;
+            }
+            Ok(())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::executed_in_summary;
+    use super::{FULL_STEPS, executed_in_summary};
+
+    #[test]
+    fn the_full_suite_locks_every_step_that_resolves_dependencies() {
+        let steps: Vec<_> = FULL_STEPS.iter().map(|step| step[0]).collect();
+        assert_eq!(steps, ["fmt", "test", "clippy"]);
+        for step in FULL_STEPS.iter().filter(|step| step[0] != "fmt") {
+            // `--locked` must come before the `--` that starts the tool's own arguments.
+            let cargo_arguments = step.iter().take_while(|argument| **argument != "--");
+            assert!(
+                cargo_arguments
+                    .clone()
+                    .any(|argument| *argument == "--locked"),
+                "{step:?} is not --locked"
+            );
+        }
+    }
 
     #[test]
     fn counts_passed_and_failed_but_not_ignored_or_filtered() {
