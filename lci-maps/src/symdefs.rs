@@ -11,6 +11,7 @@
 use crate::{
     Contribution, EdgeKind, Evidence, FreshnessModel, Map, MapDescriptor, MapHit, MapRequest,
     MapResponse, MapStatus, SnapshotRef, SnapshotView, SourceLabel,
+    crates::CrateNames,
     fresh::{Refreshable, Target},
 };
 use lci_core::{
@@ -47,6 +48,8 @@ pub struct SymIndex {
     entries: Vec<Entry>,
     /// Lower-case name to entry positions.
     by_name: HashMap<String, Vec<usize>>,
+    /// Crate directory to crate name, for the alias form of symbol ids.
+    crates: CrateNames,
 }
 
 /// Whether `code` holds `name` as a whole identifier.
@@ -88,12 +91,14 @@ fn head_chunk<'c>(
 
 impl SymIndex {
     /// Joins `payloads` (per path) with the snapshot's files: symbol keys
-    /// take their module path from the path the file has now, head chunks
-    /// come from the file's chunk list.
+    /// take their module path from the path the file has now, with the
+    /// crate name for the crate directory (`crates`, decision N-9); head
+    /// chunks come from the file's chunk list.
     pub fn join(
         snapshot: SnapshotRef,
         files: &HashMap<String, CachedFile>,
         payloads: &BTreeMap<String, Vec<StoredDeclaration>>,
+        crates: CrateNames,
     ) -> Self {
         let mut entries = Vec::new();
         for (path, stored) in payloads {
@@ -103,7 +108,7 @@ impl SymIndex {
             let ids = chunk_ids(&file.chunks);
             for declaration in stored.iter().filter_map(StoredDeclaration::declaration) {
                 entries.push(Entry {
-                    symbol: declaration.node_id(path),
+                    symbol: crates.canonical(declaration.node_id(path)),
                     head: head_chunk(&file.chunks, &ids, &declaration).cloned(),
                     name: declaration.name,
                 });
@@ -121,11 +126,28 @@ impl SymIndex {
             snapshot,
             entries,
             by_name,
+            crates,
         }
     }
 
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// The canonical id of a symbol id in either form: the crate-directory
+    /// form (`lci-core::chunk`) is an alias of the crate-name form
+    /// (`lci_core::chunk`), never a second node.
+    pub fn resolve(&self, id: &NodeId) -> NodeId {
+        self.crates.canonical(id.clone())
+    }
+
+    /// The declarations with symbol id `id`, in either form.
+    pub fn lookup(&self, id: &NodeId) -> Vec<&Entry> {
+        let canonical = self.resolve(id);
+        self.entries
+            .iter()
+            .filter(|entry| entry.symbol == canonical)
+            .collect()
     }
 
     /// The canonical serialisation contract C4 compares: one line per
@@ -282,6 +304,7 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>>> SymDefs<P> {
             target.snapshot.clone(),
             target.files,
             &synced.payloads,
+            CrateNames::read(target.root, target.files),
         ));
         self.last_sync = Some((synced.reused, synced.extracted));
         // `synced.keys` are this producer's only: the store must hold no

@@ -10,6 +10,7 @@
 //! and checked against `fuse_hits` bit for bit (test T0).
 
 pub mod audit;
+pub mod crates;
 pub mod fresh;
 pub mod kit;
 pub mod kit_c3;

@@ -319,3 +319,25 @@ Open decisions added here:
 | N-10 | One bundle store per workspace, so `retain` can delete unused bundles without knowing other workspaces. | One content-addressed store shared by all workspaces of a `data_dir` (a file indexed in two workspaces is extracted once; needs reference counting to delete). | When a `data_dir` commonly holds several large workspaces. |
 | N-11 | A sync fails as a whole on the first file it cannot read or that changed since the scan. | Skip that file and mark the map stale for it. | When the hook runs inside the scan (S4): the race then disappears. |
 | N-12 | A producer's id carries a version that is bumped by hand when its output changes, the extractor's code included. | Derive the version from a hash of the extractor's source. | First accidental reuse of a stale bundle. |
+
+### N-9 settled (2026-10-12, owner: "crate name fusion")
+
+The canonical Rust module path of a file in a crate that is not at the repository root uses
+the Cargo crate name: `[package].name` from `<crate directory>/Cargo.toml`, `-` turned into
+`_`, as Rust code writes it (`lci-core/src/chunk.rs` -> `lci_core::chunk`). The directory form
+(`lci-core::chunk`) stays a valid alias: `SymIndex::resolve` maps it to the canonical id and
+`SymIndex::lookup` finds the same declarations for either form, so the two never become two
+nodes. There is no edge store yet, so the alias is a resolution rule, not a stored edge.
+Names are read from the tree when bundles are joined (`lci_maps::crates::CrateNames`), never
+stored in a bundle. Taken as the conservative reading where the decision left a choice:
+
+| # | Decision taken here | Alternative | Revisit at |
+| --- | --- | --- | --- |
+| N-13 | The root crate's files keep their S1 path without a crate-name prefix (`src/app/search.rs` -> `app::search`), as `crate::app::search` is written inside the crate; only the directory prefix of a non-root crate is replaced. | Prefix every file with its crate name (`local_code_intelligence::app::search`), which changes every root-crate symbol id. | S4 trait freeze. |
+| N-14 | A crate directory without a readable `[package].name` (no manifest, `name.workspace = true`) keeps the directory form. | Fall back to the directory name with `-` turned into `_`. | First workspace with inherited names. |
+
+S1's own key function (`Declaration::key`, `rust_module_path`) is unchanged; the crate name is
+applied by `sym.defs` at join time. S1's stability measurement (`../s1-stability.md`) used the
+directory form; renaming a crate's package now changes its symbol ids, renaming its directory
+alone does not (the alias still resolves only for the current directory).
+

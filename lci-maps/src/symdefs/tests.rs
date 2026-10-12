@@ -212,7 +212,12 @@ fn the_head_chunk_holds_the_first_line_and_a_chunk_is_listed_once() {
         ],
     )]
     .into();
-    let index = SymIndex::join(SnapshotRef::default(), &files, &payloads);
+    let index = SymIndex::join(
+        SnapshotRef::default(),
+        &files,
+        &payloads,
+        CrateNames::default(),
+    );
     let heads: Vec<String> = index
         .entries()
         .iter()
@@ -375,7 +380,12 @@ fn real_heads(path: &str, source: &str) -> Vec<String> {
     .into();
     let payloads: BTreeMap<String, Vec<StoredDeclaration>> =
         [(path.to_owned(), Declarations.produce(path, &extraction))].into();
-    let index = SymIndex::join(SnapshotRef::default(), &files, &payloads);
+    let index = SymIndex::join(
+        SnapshotRef::default(),
+        &files,
+        &payloads,
+        CrateNames::default(),
+    );
     let chunks: HashMap<NodeId, &Chunk> = chunk_ids(&extraction.chunks)
         .into_iter()
         .zip(&extraction.chunks)
@@ -414,4 +424,41 @@ fn on_real_chunks_the_head_is_the_chunk_that_names_the_declaration() {
     let big = heads.iter().find(|h| h.starts_with("big: ")).unwrap();
     assert!(big.contains("pub fn big"), "{big}");
     assert_eq!(heads.len(), 5, "{heads:?}");
+}
+
+#[test]
+fn a_crate_symbol_takes_the_crate_name_and_the_directory_form_is_an_alias() {
+    let workspace = Workspace::new(&[
+        ("lci-core/Cargo.toml", "[package]\nname = \"lci-core\"\n"),
+        ("lci-core/src/chunk.rs", "pub fn scan() {}\n"),
+        // No manifest: the directory form stays.
+        ("tools/gen/src/main.rs", "fn run() {}\n"),
+        ("src/app/search.rs", "pub fn search() {}\n"),
+    ]);
+    let map = workspace.built();
+    let index = map.data().unwrap();
+    let symbols: Vec<String> = index
+        .entries()
+        .iter()
+        .map(|entry| entry.symbol.to_string())
+        .collect();
+    assert_eq!(
+        symbols,
+        [
+            "sym:rust:app::search::search/fn",
+            "sym:rust:lci_core::chunk::scan/fn",
+            "sym:rust:tools%2Fgen::main::run/fn",
+        ]
+    );
+    let canonical: NodeId = "sym:rust:lci_core::chunk::scan/fn".parse().unwrap();
+    let alias: NodeId = "sym:rust:lci-core::chunk::scan/fn".parse().unwrap();
+    assert_ne!(canonical, alias);
+    // Both forms resolve to one node, and find the same one declaration.
+    assert_eq!(index.resolve(&alias), canonical);
+    assert_eq!(index.resolve(&canonical), canonical);
+    assert_eq!(index.lookup(&alias).len(), 1);
+    assert_eq!(index.lookup(&alias), index.lookup(&canonical));
+    // Other ids pass through unchanged.
+    let root: NodeId = "sym:rust:app::search::search/fn".parse().unwrap();
+    assert_eq!(index.resolve(&root), root);
 }
