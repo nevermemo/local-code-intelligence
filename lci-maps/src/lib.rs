@@ -9,7 +9,10 @@
 //! this crate yet: the legacy channels are wrapped as maps in the root crate
 //! and checked against `fuse_hits` bit for bit (test T0).
 
+pub mod fresh;
 pub mod kit;
+pub mod scratch;
+pub mod symdefs;
 
 /// Re-exported so a crate that implements [`Map`] needs no direct
 /// dependency on `async-trait`.
