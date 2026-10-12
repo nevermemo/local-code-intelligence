@@ -10,6 +10,7 @@ use super::metrics::query_metrics;
 /// A portable evaluation file: the workspaces it references plus the
 /// queries to run against them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationFile {
     /// Workspaces referenced by key.
     #[serde(default)]
@@ -21,6 +22,7 @@ pub struct EvaluationFile {
 
 /// A workspace referenced by an evaluation file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalWorkspace {
     /// Stable key used by [`EvalQuery::workspace`].
     pub key: String,
@@ -37,6 +39,7 @@ const fn default_required() -> bool {
 
 /// A single evaluation query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalQuery {
     /// Query text sent to search.
     pub query: String,

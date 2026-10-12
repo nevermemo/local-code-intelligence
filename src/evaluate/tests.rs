@@ -1343,6 +1343,7 @@ expected_paths = []
         error.to_string().contains("query at index 0"),
         "{error}"
     );
+    assert!(error.to_string().contains("expected_paths"), "{error}");
 }
 
 // ---------------------------------------------------------------------------

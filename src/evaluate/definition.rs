@@ -54,6 +54,9 @@ pub fn validate_definition(file: &EvaluationFile) -> Result<()> {
                 query.workspace
             );
         }
+        if query.expected_paths.is_empty() {
+            bail!("query at index {i} has no expected_paths");
+        }
         for pattern in &query.expected_paths {
             validate_pattern(pattern)
                 .with_context(|| format!("query at index {i}: invalid expected_paths pattern"))?;
