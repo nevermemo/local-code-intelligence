@@ -343,25 +343,11 @@ fn is_configuration(dirs: &[&str], file_name: &str) -> bool {
 /// Normalize a repository-relative path to use `/` separators.
 ///
 /// Backslashes are converted to forward slashes. Leading and trailing
-/// separators are trimmed. Repeated separators are collapsed.
+/// separators and `.` components are removed. Repeated separators are
+/// collapsed.
 pub(super) fn normalize_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut prev_sep = false;
-    for ch in path.chars() {
-        let is_sep = ch == '/' || ch == '\\';
-        if is_sep {
-            if !prev_sep && !out.is_empty() {
-                out.push('/');
-            }
-            prev_sep = true;
-        } else {
-            out.push(ch);
-            prev_sep = false;
-        }
-    }
-    // Trim trailing separator.
-    while out.ends_with('/') {
-        out.pop();
-    }
-    out
+    path.split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }

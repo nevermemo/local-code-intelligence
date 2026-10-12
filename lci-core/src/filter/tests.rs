@@ -1,5 +1,5 @@
-use super::*;
 use super::source_role::normalize_path;
+use super::*;
 use std::str::FromStr;
 
 // -- SourceRole parsing / display ------------------------------------
