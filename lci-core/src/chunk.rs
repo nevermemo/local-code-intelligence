@@ -474,6 +474,90 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_nested_modules_keep_exact_chunks() {
+        let depth = 32;
+        let source = format!(
+            "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+            "mod m {\n".repeat(depth),
+            "}\n".repeat(depth)
+        );
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        let mut expected: Vec<_> = (1..=depth as u32)
+            .map(|line| (line, line, "mod m"))
+            .collect();
+        expected.push((32, 34, "{\nfn leaf() {}\n}"));
+        expected.push((66, 66, "fn sibling() {}"));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.as_str()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for chunk in chunks {
+            assert_eq!(chunk.relative_file_path, "lib.rs");
+            assert_eq!(chunk.language, "rust");
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+        }
+    }
+
+    #[test]
+    fn deeply_nested_modules_on_default_blocking_stack() {
+        const CHILD_DEPTH: &str = "LCI_TEST_NESTING_DEPTH";
+        if let Ok(depth) = std::env::var(CHILD_DEPTH) {
+            let depth: usize = depth.parse().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let source = format!(
+                        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+                        "mod m {\n".repeat(depth),
+                        "}\n".repeat(depth)
+                    );
+                    let chunks = rust_chunks("deep.rs", &source).unwrap();
+                    assert_chunks_cover(&chunks, "fn leaf() {}");
+                    assert_chunks_cover(&chunks, "fn sibling() {}");
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.code.matches("mod m").count())
+                            .sum::<usize>(),
+                        depth
+                    );
+                    for chunk in chunks {
+                        assert_eq!(chunk.content_hash, hash(&chunk.code));
+                        assert!(source.contains(&chunk.code));
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            return;
+        }
+
+        // Isolate stack overflow in a child so the regression cannot abort
+        // the rest of the test suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "chunk::tests::deeply_nested_modules_on_default_blocking_stack",
+                "--nocapture",
+            ])
+            .env(CHILD_DEPTH, "32768")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "default-stack chunking failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn chunks_have_exact_source_lines_and_stable_hashes() {
         let source =
             "// café\nfn first() { println!(\"hello\"); }\n\nimpl A {\nfn second() {}\n}\n";
