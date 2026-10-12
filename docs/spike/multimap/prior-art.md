@@ -1,6 +1,7 @@
 # Multimap traversal: prior-art survey
 
 Generated: 2026-10-12T04:08Z
+Revised: 2026-10-12T06:51Z (constraint wording: one LCI service, not one OS process)
 
 Scope: prior art for the "modular multimap traversal" spike. The idea is to keep
 many indexes ("maps") over the same code units and let a step-wise traversal
@@ -13,9 +14,11 @@ repository profile.
 
 Every entry is judged against LCI's constraints:
 
-- local only, and one process;
-- no new service or database beyond the embedded LanceDB and the local
-  OpenAI-compatible embedding endpoint LCI already uses;
+- local only: one LCI service, using the embedding and reranking endpoints it
+  already has and the language-server child processes it already manages (this
+  is not a single-OS-process rule; LSP servers already run as children);
+- no new service or database beyond the embedded LanceDB and those existing
+  OpenAI-compatible embedding and reranking endpoints;
 - Windows, macOS and Linux;
 - Apache-2.0 or MIT preferred.
 
@@ -582,7 +585,8 @@ How things were checked:
 - **What it gives:** a Go engine that runs a DAG of analyses over full commit
   history: burndown, couples (file and developer coupling matrices), and
   structural diffs.
-- **Verdict:** skip as a dependency (Go binary, external process). The
+- **Verdict:** skip as a dependency (a Go binary LCI would have to ship and
+  manage as a new kind of child, for a one-off history pass). The
   "couples" analysis is the same idea as 6.1. The last tagged Go release was
   v10.3.0 (2019); archive status is unverified. Do not confuse it with the
   unrelated Rust crate `hercules` 0.5.0 (BSD-3-Clause), which is an optimisation
@@ -692,7 +696,7 @@ How things were checked:
 
 Note on graph storage. Edge maps (calls, imports, co-change, test-to-code and so
 on) can be stored as LanceDB tables (`src_unit, dst_unit, kind, weight,
-provenance`) and loaded into memory for traversal. That keeps "one process, no new
+provenance`) and loaded into memory for traversal. That keeps "one LCI service, no new
 database". A side file per map in LCI's data directory is the alternative.
 
 ---
