@@ -73,12 +73,22 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
         out.push((node.start_byte(), node.end_byte()));
         return;
     }
+    let trailing_prefix_start = children
+        .iter()
+        .rposition(|child| !adapter.is_prefix(child.kind()))
+        .map_or(0, |index| index + 1);
+    let split_trailing_prefix = children
+        .get(trailing_prefix_start)
+        .is_some_and(|child| node.end_byte() - child.start_byte() > TARGET_BYTES);
     let mut start = node.start_byte();
     let mut end = start;
     let mut pending_prefix = None;
     let mut last_split_range = None;
-    for child in children {
-        if container && adapter.is_prefix(child.kind()) {
+    for (index, child) in children.into_iter().enumerate() {
+        if container
+            && adapter.is_prefix(child.kind())
+            && (!split_trailing_prefix || index < trailing_prefix_start)
+        {
             pending_prefix.get_or_insert(child.start_byte());
             continue;
         }
@@ -1086,6 +1096,97 @@ export interface TelemetryLifecycle {
                     .contains(&c.code)
             );
         }
+    }
+
+    #[test]
+    fn oversized_trailing_comment_run_splits_at_syntax_boundaries() {
+        let body = "    let value = 42;\n".repeat(2000);
+        assert!(body.len() > MAX_DECLARATION_BYTES);
+        let comment = format!("// {}\n", "x".repeat(56));
+        assert_eq!(comment.len(), 60);
+        let trailing = comment.repeat(2 * TARGET_BYTES / comment.len());
+        assert_eq!(trailing.len(), 2 * TARGET_BYTES);
+        for declaration in [
+            format!("fn large() {{\n{body}}}\n"),
+            "fn small() {}\n".into(),
+            String::new(),
+        ] {
+            let source = format!("impl Example {{\n{declaration}{trailing}}}\n");
+            let chunks = rust_chunks("lib.rs", &source).unwrap();
+            assert!(
+                chunks.iter().all(|chunk| chunk.code.len() <= TARGET_BYTES),
+                "chunk lengths exceed target {TARGET_BYTES}: {:?}",
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.code.len())
+                    .collect::<Vec<_>>()
+            );
+            assert_chunks_cover(&chunks, &trailing);
+            assert_chunks_cover(&chunks, &declaration);
+            for chunk in chunks {
+                assert!(source.contains(&chunk.code));
+                assert_eq!(chunk.content_hash, hash(&chunk.code));
+                let lines: Vec<_> = source.lines().collect();
+                assert!(
+                    lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                        .join("\n")
+                        .contains(&chunk.code)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_trailing_comments_keep_existing_boundaries() {
+        let source = "impl Example {\nfn small() {}\n// tail\n}\n";
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        let boundaries: Vec<_> = chunks
+            .iter()
+            .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.as_str()))
+            .collect();
+        assert_eq!(
+            boundaries,
+            [
+                (1, 1, "impl Example"),
+                (1, 4, "{\nfn small() {}\n// tail\n}")
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_trailing_comments_split_for_every_adapter() {
+        for (path, declaration, marker) in [
+            ("lib.rs", "fn small() {}\n", "//"),
+            ("small.ts", "function small() {}\n", "//"),
+            ("small.tsx", "function small() {}\n", "//"),
+            ("small.js", "function small() {}\n", "//"),
+            ("small.jsx", "function small() {}\n", "//"),
+            ("small.py", "def small():\n    pass\n", "#"),
+            ("Small.cs", "class Small {}\n", "//"),
+            ("small.go", "package small\nfunc small() {}\n", "//"),
+            ("Small.java", "class Small {}\n", "//"),
+            ("small.c", "void small() {}\n", "//"),
+            ("small.cpp", "void small() {}\n", "//"),
+            ("small.hpp", "void small() {}\n", "//"),
+        ] {
+            let comment = format!("{marker} tail\n");
+            let trailing = comment.repeat(2 * TARGET_BYTES / comment.len() + 1);
+            let source = format!("{declaration}{trailing}");
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(
+                chunks.iter().all(|chunk| chunk.code.len() <= TARGET_BYTES),
+                "{path} has an oversized trailing chunk"
+            );
+            assert_chunks_cover(&chunks, &trailing);
+        }
+    }
+
+    #[test]
+    fn indivisible_trailing_comment_remains_whole() {
+        let comment = format!("/* {} */", "é".repeat(TARGET_BYTES));
+        let source = format!("impl Example {{\nfn small() {{}}\n{comment}\n}}\n");
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        assert!(chunks.iter().any(|chunk| chunk.code.contains(&comment)));
     }
 
     /// The traced example of N22: an oversized call whose two arguments are
