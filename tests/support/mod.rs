@@ -236,11 +236,18 @@ fn write_csharp_workspace(root: &Path) {
 /// `config` with the C# language server replaced by the fake one (see
 /// `fake_lsp.rs`) in `workspace-symbols` mode, recording what it saw under
 /// `state_dir`. `extra_args` are more fake-server flags, for example
-/// `--ignore-shutdown`. The request timeout is 5 s, so a slow process start
-/// under load does not fail `initialize`. Keep `config` from [`fixture`]: it
-/// points the model services at the fake ones, never at a real port.
-fn with_fake_csharp_server(mut config: Config, state_dir: &Path, extra_args: &[&str]) -> Config {
-    config.lsp_timeout_seconds = 5;
+/// `--ignore-shutdown`. `timeout_seconds` is the request timeout: 5 s is
+/// enough for a slow process start under load not to fail `initialize`, and a
+/// test that measures timing passes the value it was written with. Keep
+/// `config` from [`fixture`]: it points the model services at the fake ones,
+/// never at a real port.
+fn with_fake_csharp_server(
+    mut config: Config,
+    state_dir: &Path,
+    extra_args: &[&str],
+    timeout_seconds: u64,
+) -> Config {
+    config.lsp_timeout_seconds = timeout_seconds;
     config.csharp = local_code_intelligence::config::CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: ["--mode", "workspace-symbols", "--state"]

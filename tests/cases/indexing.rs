@@ -1540,32 +1540,18 @@ fn write_channel_workspace(root: &Path) {
     );
 }
 
-fn fake_csharp_lsp(state: &Path) -> local_code_intelligence::config::CSharpLspConfig {
-    local_code_intelligence::config::CSharpLspConfig {
-        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
-        args: vec![
-            "--mode".to_owned(),
-            "workspace-symbols".to_owned(),
-            "--state".to_owned(),
-            state.to_string_lossy().into_owned(),
-        ],
-        disabled: false,
-    }
-}
-
 #[tokio::test]
 async fn default_channels_keep_every_channel_and_the_reranker_on() {
     let (temp, mut config, fake, task) = fixture().await;
     let workspace = temp.path().join("channels-default");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-default");
-    config.lsp_timeout_seconds = 10;
     // A fake server start (a debug-build process spawn under parallel tests)
     // can take longer than the 1500 ms default budget. These tests are about
     // channels, not the budget, so the budget must not be what they measure.
     // The other tests below that set 30 s do so for the same reason.
     config.lsp_search_budget_ms = 30_000;
-    config.csharp = fake_csharp_lsp(&state);
+    config = with_fake_csharp_server(config, &state, &[], 10);
     assert_eq!(
         config.channels,
         local_code_intelligence::config::ChannelsConfig::default()
@@ -1610,9 +1596,8 @@ async fn a_traced_search_records_the_rank_each_channel_gave_every_candidate() {
     let workspace = temp.path().join("channels-traced");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-traced");
-    config.lsp_timeout_seconds = 10;
     config.lsp_search_budget_ms = 30_000;
-    config.csharp = fake_csharp_lsp(&state);
+    config = with_fake_csharp_server(config, &state, &[], 10);
     let app = App::open(config.clone()).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -1679,18 +1664,6 @@ async fn a_traced_search_records_the_rank_each_channel_gave_every_candidate() {
     task.abort();
 }
 
-fn fake_slow_start_csharp_lsp(
-    state: &Path,
-    initialize_delay_ms: u64,
-) -> local_code_intelligence::config::CSharpLspConfig {
-    let mut csharp = fake_csharp_lsp(state);
-    csharp.args.extend([
-        "--initialize-delay-ms".to_owned(),
-        initialize_delay_ms.to_string(),
-    ]);
-    csharp
-}
-
 /// Roadmap E0a. A language server that is still starting leaves a note on the
 /// search and contributes nothing, which changes what a dumped pool means. The
 /// dump keeps the note so a replay can exclude or stratify such queries; an
@@ -1729,9 +1702,13 @@ async fn an_evaluation_dump_keeps_the_note_of_a_cold_language_server() {
     for (label, dump_candidates) in [("plain", false), ("dump", true)] {
         let mut config = config.clone();
         config.data_dir = temp.path().join(format!("data-{label}"));
-        config.lsp_timeout_seconds = 10;
         config.lsp_search_budget_ms = 200;
-        config.csharp = fake_slow_start_csharp_lsp(&temp.path().join(format!("lsp-{label}")), 1500);
+        config = with_fake_csharp_server(
+            config,
+            &temp.path().join(format!("lsp-{label}")),
+            &["--initialize-delay-ms", "1500"],
+            10,
+        );
         let app = App::open(config).await.unwrap();
         app.index(&workspace).await.unwrap();
         let report = run_evaluation_with_options(
@@ -1811,10 +1788,9 @@ async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming
     let workspace = temp.path().join("channels-cold");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-cold");
-    config.lsp_timeout_seconds = 10;
     config.lsp_search_budget_ms = 200;
     // The server needs 1.5 s to answer `initialize`, far past the budget.
-    config.csharp = fake_slow_start_csharp_lsp(&state, 1500);
+    config = with_fake_csharp_server(config, &state, &["--initialize-delay-ms", "1500"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -1888,13 +1864,8 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
     let workspace = temp.path().join("channels-priming");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-priming");
-    config.lsp_timeout_seconds = 10;
     config.lsp_search_budget_ms = 200;
-    config.csharp = fake_csharp_lsp(&state);
-    config
-        .csharp
-        .args
-        .extend(["--first-symbol-delay-ms".to_owned(), "2000".to_owned()]);
+    config = with_fake_csharp_server(config, &state, &["--first-symbol-delay-ms", "2000"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -1947,9 +1918,8 @@ async fn a_cold_language_server_alone_is_a_clean_miss_with_a_note_not_an_error()
     let workspace = temp.path().join("channels-lsp-only-cold");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-lsp-only-cold");
-    config.lsp_timeout_seconds = 10;
     config.lsp_search_budget_ms = 200;
-    config.csharp = fake_slow_start_csharp_lsp(&state, 1500);
+    config = with_fake_csharp_server(config, &state, &["--initialize-delay-ms", "1500"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -1980,15 +1950,10 @@ async fn answers_gathered_before_the_budget_ran_out_are_kept() {
     let workspace = temp.path().join("channels-partial");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-partial");
-    config.lsp_timeout_seconds = 10;
     // Four terms make four symbol queries of 500 ms each: the first ones fit
     // the budget (together with the server's start), all four cannot.
     config.lsp_search_budget_ms = 1800;
-    config.csharp = fake_csharp_lsp(&state);
-    config
-        .csharp
-        .args
-        .extend(["--symbol-delay-ms".to_owned(), "500".to_owned()]);
+    config = with_fake_csharp_server(config, &state, &["--symbol-delay-ms", "500"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -2013,9 +1978,8 @@ async fn concurrent_searches_start_one_language_server() {
     let workspace = temp.path().join("channels-concurrent");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-concurrent");
-    config.lsp_timeout_seconds = 10;
     config.lsp_search_budget_ms = 30_000;
-    config.csharp = fake_slow_start_csharp_lsp(&state, 500);
+    config = with_fake_csharp_server(config, &state, &["--initialize-delay-ms", "500"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -2079,9 +2043,7 @@ async fn each_channel_switch_removes_exactly_that_channel() {
     ];
 
     // Index once with the defaults; every variant reuses the same index.
-    let mut indexing = config.clone();
-    indexing.lsp_timeout_seconds = 10;
-    indexing.csharp = fake_csharp_lsp(&state_root.join("indexing"));
+    let indexing = with_fake_csharp_server(config.clone(), &state_root.join("indexing"), &[], 10);
     let indexer = App::open(indexing).await.unwrap();
     indexer.index(&workspace).await.unwrap();
     drop(indexer);
@@ -2089,10 +2051,9 @@ async fn each_channel_switch_removes_exactly_that_channel() {
     for variant in variants {
         let name = variant.name;
         let mut variant_config = config.clone();
-        variant_config.lsp_timeout_seconds = 10;
         variant_config.lsp_search_budget_ms = 30_000;
         let state = state_root.join(name);
-        variant_config.csharp = fake_csharp_lsp(&state);
+        variant_config = with_fake_csharp_server(variant_config, &state, &[], 10);
         match name {
             "semantic" => variant_config.channels.semantic = false,
             "lexical" => {
@@ -2465,7 +2426,8 @@ async fn with_semantic_off_a_clean_miss_is_empty_but_failed_channels_are_an_erro
     // error.
     let mut lsp_broken = config.clone();
     lsp_broken.channels.lexical = false;
-    lsp_broken.csharp = fake_csharp_lsp(&temp.path().join("lsp-state-broken"));
+    lsp_broken =
+        with_fake_csharp_server(lsp_broken, &temp.path().join("lsp-state-broken"), &[], 10);
     lsp_broken.csharp.path = Some("definitely-missing-csharp-ls".into());
     let app = App::open(lsp_broken).await.unwrap();
     let error = app
@@ -2489,12 +2451,9 @@ async fn with_semantic_off_a_clean_miss_is_empty_but_failed_channels_are_an_erro
     let state = temp.path().join("lsp-state-healthy");
     let mut lsp_healthy = config.clone();
     lsp_healthy.ripgrep_path = missing_rg.into();
-    lsp_healthy.csharp = fake_csharp_lsp(&state);
     // The canned symbol points at a file the index does not contain.
-    lsp_healthy
-        .csharp
-        .args
-        .extend(["--primary-file".to_owned(), "src/Other.cs".to_owned()]);
+    lsp_healthy =
+        with_fake_csharp_server(lsp_healthy, &state, &["--primary-file", "src/Other.cs"], 10);
     let app = App::open(lsp_healthy).await.unwrap();
     let empty = app.search(&workspace, "Calculator", Some(5)).await.unwrap();
     assert!(state.join("spawn_count.txt").exists());

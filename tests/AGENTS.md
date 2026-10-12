@@ -9,8 +9,10 @@
   filters on those module names.
 - Two fake model servers exist by design: `FakeModelServer` in `lci-core`
   covers raw TCP connection faults, while `FakeModels` in `tests/support`
-  covers application behavior. C# fake-LSP config builders live inline in
-  `tests/cases/indexing.rs` and `tests/cases/navigation.rs`.
+  covers application behavior. The C# fake-LSP config builder is
+  `with_fake_csharp_server` in `tests/support/mod.rs` (the request timeout is
+  a parameter); a few tests in `tests/cases/navigation.rs` still build their
+  own `CSharpLspConfig` inline.
 - Follow `AGENTS.md` "Hard rules" for port restrictions; use the fakes and
   temporary data directories.
 - Iterate with the focused suite (`cargo xtask test --suite Indexing`, or

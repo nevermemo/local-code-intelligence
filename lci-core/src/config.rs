@@ -313,8 +313,8 @@ pub struct Config {
     /// every server until the service stops). A server that is still
     /// priming or serving a call is never released. The next search or
     /// navigation call for that workspace starts a fresh server, so a
-    /// released server costs one cold start (and re-priming) later. Values
-    /// below 60 are meant for tests.
+    /// released server costs one cold start (and re-priming) later. Allowed:
+    /// `0..=86400`. Values below 60 are meant for tests.
     pub lsp_idle_timeout_seconds: u64,
     /// Seconds a language server may answer nothing but transient errors
     /// ("ask again": `ContentModified`, `ServerCancelled`, `RequestFailed`, a
@@ -328,7 +328,8 @@ pub struct Config {
     /// legitimately answers them for minutes, and a restarted one starts over,
     /// so this must stay above the longest load you expect: a repository that
     /// needs longer would be restarted every time the span runs out. The
-    /// default is not measured. Values below 60 are meant for tests.
+    /// default is not measured. Allowed: `0..=86400`. Values below 60 are
+    /// meant for tests.
     pub lsp_stuck_seconds: u64,
     /// Optional C# language-server (csharp-ls) settings. Absent or empty
     /// configuration keeps C# tooling disabled; syntax retrieval is unaffected.
@@ -667,8 +668,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The longest `lsp_timeout_seconds` accepted: one day. The value is added
-    /// to the clock for every request, and an absurd one (`u64::MAX`) cannot be.
+    /// The longest request, idle, or stuck LSP timeout accepted: one day.
+    /// Request timeouts are added to the clock; absurd values cannot be.
     pub const MAX_LSP_TIMEOUT_SECONDS: u64 = 86_400;
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -734,6 +735,18 @@ impl Config {
             "lsp_timeout_seconds must be 1..={} (got {})",
             Self::MAX_LSP_TIMEOUT_SECONDS,
             self.lsp_timeout_seconds
+        );
+        ensure!(
+            self.lsp_idle_timeout_seconds <= Self::MAX_LSP_TIMEOUT_SECONDS,
+            "lsp_idle_timeout_seconds must be 0..={} (got {}); 0 means never release",
+            Self::MAX_LSP_TIMEOUT_SECONDS,
+            self.lsp_idle_timeout_seconds
+        );
+        ensure!(
+            self.lsp_stuck_seconds <= Self::MAX_LSP_TIMEOUT_SECONDS,
+            "lsp_stuck_seconds must be 0..={} (got {}); 0 means never replace",
+            Self::MAX_LSP_TIMEOUT_SECONDS,
+            self.lsp_stuck_seconds
         );
         ensure!(
             (100..=60_000).contains(&self.lsp_search_budget_ms),
@@ -1074,6 +1087,36 @@ mod tests {
                 lsp_search_budget_ms: budget,
                 ..Config::default()
             };
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn lsp_idle_timeout_seconds_outside_its_range_is_rejected() {
+        for seconds in [Config::MAX_LSP_TIMEOUT_SECONDS + 1, u64::MAX] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_idle_timeout_seconds = seconds;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("lsp_idle_timeout_seconds"), "{error}");
+        }
+        for seconds in [0, 1, Config::MAX_LSP_TIMEOUT_SECONDS] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_idle_timeout_seconds = seconds;
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn lsp_stuck_seconds_outside_its_range_is_rejected() {
+        for seconds in [Config::MAX_LSP_TIMEOUT_SECONDS + 1, u64::MAX] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_stuck_seconds = seconds;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("lsp_stuck_seconds"), "{error}");
+        }
+        for seconds in [0, 1, Config::MAX_LSP_TIMEOUT_SECONDS] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_stuck_seconds = seconds;
             config.validate().unwrap();
         }
     }

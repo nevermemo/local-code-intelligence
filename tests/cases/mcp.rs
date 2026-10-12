@@ -236,7 +236,7 @@ async fn rest_release_workspace_stops_the_language_servers_of_that_workspace() {
     let workspace = temp.path().join("release-repository");
     write_csharp_workspace(&workspace);
     let app = Arc::new(
-        App::open(with_fake_csharp_server(config, &state, &[]))
+        App::open(with_fake_csharp_server(config, &state, &[], 5))
             .await
             .unwrap()
             .with_candidate_dump(None),
