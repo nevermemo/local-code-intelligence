@@ -24,15 +24,10 @@ Fast build/test loop: `docs/development/testing.md`.
 
 ## Dogfooding with the `lci` MCP server
 
-- When `mcp__lci__*` tools are connected, prefer `search_code`,
-  `find_definition`, `find_references`, and `search_symbols` over Grep/Read
-  for exploring this codebase. AGENTS.md "Working method" lists the caveats
-  (needs 8766, and 8767 for reranking; tens of seconds per search; a quick
-  single-fact Grep is fine once noted).
-- If the session reports that the `lci` server failed to connect, follow
-  AGENTS.md: check `/health`, build, start `serve` from a copied binary,
-  then ask the user to run `/mcp` and reconnect it. You cannot re-dial it
-  yourself. Say once that you are using Grep/Read meanwhile.
+- Follow `AGENTS.md` "Working method" for `lci` MCP dogfooding and connection
+  recovery.
+- Claude Code cannot re-dial a failed MCP connection; ask the human to
+  reconnect it. Say once that you are using Grep/Read meanwhile.
 - Subagents launched with the Agent tool inherit the same rule; tell them
   whether `lci` is connected so they do not rediscover it.
 

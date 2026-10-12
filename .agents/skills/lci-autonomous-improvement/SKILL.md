@@ -32,7 +32,10 @@ A client entry point maps these roles to its own subagent mechanism; `AGENTS.md`
 
 ## Before the first slice
 
-1. Read `AGENTS.md`, `docs/development/roadmap.md`, `git log --oneline -n 15`, `git status --short`, and `ls test-results`.
+1. Read `AGENTS.md`, the Snapshot and In progress sections of
+   `docs/development/roadmap.md`, then grep for the one row you need; do not
+   read the whole file. Also read `git log --oneline -n 15`,
+   `git status --short`, and `ls test-results`.
 2. Confirm you are on a non-`main` branch with `origin` configured; create `feature/<topic>` if not.
 3. Check services without touching 8765: `curl http://127.0.0.1:8768/ready` (or the embedding service's `/v1/models`). Note which of 8766/8767 are up; do not start anything unless the human already permitted it. On the current development machine 8766 is the vLLM embedder in WSL and 8767 the llama.cpp reranker (roadmap V5); the reranker alone holds roughly 8-12 GB and both models share the iGPU, so never run a third model process (roadmap V1, R4); live numbers are in the roadmap Snapshot, and the embedder's `/v1/models` shows which model is loaded now. Keep heavy compiles away from timed live runs.
 4. If the running `local-code-intelligence serve` was started from `target/debug`, note that rebuilding will fail on Windows until it is restarted from a copied binary (see `AGENTS.md` "Running LCI locally"). Ask before stopping it.
@@ -42,7 +45,10 @@ A client entry point maps these roles to its own subagent mechanism; `AGENTS.md`
 
 Repeat until the stop rule fires or the roadmap has no ready item.
 
-1. **Pick.** Open `docs/development/roadmap.md`. Take the highest-priority item whose status marks it ready and unblocked. Mark it in progress with today's date. If the roadmap is missing or has no ready item, stop and ask rather than invent a backlog.
+1. **Pick.** Follow the roadmap-reading instruction in "Before the first
+   slice" step 1. Take the highest-priority item whose status marks it ready
+   and unblocked. Mark it in progress with today's date. If the roadmap is
+   missing or has no ready item, stop and ask rather than invent a backlog.
 2. **Plan.** Produce a slice plan (template in [references/templates.md](references/templates.md)): goal, allowed files, acceptance criteria, tests to add, which gate suites apply, whether a live evaluation is needed (yes for anything touching ranking, candidates, reranker input, priors, roles, embedding identity, or latency), and the revert condition. A slice is one logical change; if the plan needs more than roughly ten files or two subsystems, split it into separate roadmap items. Keep the plan in a file so briefs can point to it (the five-line briefs in the templates restate nothing).
 3. **Implement.** Brief an implementer with the plan, the allowed-file list, the relevant contract files, and whether the `lci` MCP tools are connected. Inspect the saved diff for file scope and intent before anything else; a valid diff counts even without prose. Fix small gaps yourself or send one focused continuation; do not start a second implementer on the same files.
 4. **Gate.** Run the focused suite first (`cargo xtask test --suite <name>` or `cargo test -p lci-core --lib <module>::`), then `cargo xtask test --suite Full` once the slice is complete. See "When a gate fails".

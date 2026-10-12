@@ -4,11 +4,15 @@
   service (`mod.rs`) and the fake LSP (`fake_lsp.rs`, built as the
   `fake-lsp-server` binary from `fake_lsp_bin.rs`). Behavioral cases live in
   `tests/cases/*.rs` and are registered as modules of the single
-  `tests/integration.rs` binary (`evaluation`, `indexing`, `mcp`,
+  `tests/integration.rs` binary (`config`, `evaluation`, `indexing`, `mcp`,
   `navigation`, `readiness`, `watching`). `cargo xtask test --suite <name>`
   filters on those module names.
-- Automated tests never need live services on ports 8765-8767. Use the fakes
-  and temporary data directories; never contact 8765 from any test.
+- Two fake model servers exist by design: `FakeModelServer` in `lci-core`
+  covers raw TCP connection faults, while `FakeModels` in `tests/support`
+  covers application behavior. C# fake-LSP config builders live inline in
+  `tests/cases/indexing.rs` and `tests/cases/navigation.rs`.
+- Follow `AGENTS.md` "Hard rules" for port restrictions; use the fakes and
+  temporary data directories.
 - Iterate with the focused suite (`cargo xtask test --suite Indexing`, or
   `cargo test -p lci-core --lib <module>::` for `lci-core`-only logic). Run
   `cargo xtask test --suite Full` once when the slice is complete. Every
