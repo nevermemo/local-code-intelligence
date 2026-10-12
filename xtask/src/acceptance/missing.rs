@@ -366,7 +366,9 @@ fn service_status_reports_missing_provider(body: &str, spec: &MissingServerSpec)
             let status = response
                 .pointer("/result/structuredContent")
                 .unwrap_or(&response);
-            let Some(components) = status.get("components").and_then(serde_json::Value::as_array)
+            let Some(components) = status
+                .get("components")
+                .and_then(serde_json::Value::as_array)
             else {
                 return false;
             };
@@ -441,7 +443,7 @@ mod tests {
         MissingServerSpec, ProcessCheck, definition_error_is_tooling_error,
         search_returns_calculator, service_status_reports_missing_provider,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn go_spec() -> MissingServerSpec {
         MissingServerSpec {
@@ -562,6 +564,11 @@ mod tests {
             }]),
         );
         assert!(service_status_reports_missing_provider(&body, &go_spec()));
+        let sse_body = format!("event: message\ndata: {body}\n\n");
+        assert!(service_status_reports_missing_provider(
+            &sse_body,
+            &go_spec()
+        ));
     }
 
     #[test]
@@ -574,6 +581,14 @@ mod tests {
     fn definition_error_with_only_an_incidental_go_word_is_not_a_tooling_error() {
         assert!(!definition_error_is_tooling_error(
             "unable to go to the requested source location",
+            &go_spec()
+        ));
+        assert!(definition_error_is_tooling_error(
+            "gopls is unavailable",
+            &go_spec()
+        ));
+        assert!(definition_error_is_tooling_error(
+            "program not found",
             &go_spec()
         ));
     }
