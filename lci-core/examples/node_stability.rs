@@ -239,11 +239,22 @@ fn file_text(chunks: &[Chunk]) -> HashMap<&str, Vec<(&str, u32, u32)>> {
 
 /// Changed line ranges of `git diff -U0 old new`: `(old_start, old_count,
 /// new_count)` per hunk, in order. A count of 0 is a pure insertion after
-/// (or deletion before) the given line.
+/// (or deletion before) the given line. Git's default alignment is pinned
+/// (Myers, indent heuristic), so a user's diff settings cannot change the
+/// pairing.
 fn hunks(repo: &Path, old: &str, new: &str) -> Result<Vec<(u32, u32, u32)>> {
     let diff = git(
         repo,
-        &["diff", "-U0", "--no-color", "--no-ext-diff", old, new],
+        &[
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--diff-algorithm=myers",
+            "--indent-heuristic",
+            old,
+            new,
+        ],
     )?;
     let range = |text: &str| -> Result<(u32, u32)> {
         let (start, count) = text.split_once(',').unwrap_or((text, "1"));

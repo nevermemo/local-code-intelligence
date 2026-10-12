@@ -30,9 +30,9 @@ in `tests/cases/indexing.rs`.
 
 ### M1. One LSP orchestration (S2; owner decision 2026-10-12T13:33Z)
 
-Today `search_once` (`src/app/search.rs`, the LSP arm around lines 714-846 at `b87b16a`:
+Today `search_once` (`src/app/search.rs`, the LSP arm around lines 714-840 at `b87b16a`:
 applicable adapters, `lsp_search_budget_ms`, the per-provider fan-out, the over-budget and
-failure warnings) and `LspMap::query` (`src/app/search/legacy_maps.rs` lines 372-470) carry
+failure warnings) and `LspMap::query` (`src/app/search/legacy_maps.rs`, `impl Map for LspMap` at lines 405-495) carry
 the same logic twice ("the 40-line provider orchestration of `search_once`",
 `docs/spike/multimap/specs/map-trait.md` lines 200-205). The owner decided that at merge the arm is extracted into one function that both
 `search_once` and `LspMap` call, guarded by T0.

@@ -24,8 +24,9 @@ agent outcome, and its two new sets ([eval-seed.md](eval-seed.md),
 [gold-bugloc.md](gold-bugloc.md)) were written around maps by one author, as both say. On
 (3) it rebuilt the surviving half on this tree and measured it here, without re-testing any
 falsified claim: symbol identity ([s1-stability.md](s1-stability.md): the Rust symbol key is
-injective over 2,524 declarations; chunk ids keep 100% by construction, and 53 of 4,118
-checked duplicate chunks are re-pointed) and per-file derivation (S3a's C4 auditor on
+injective over 2,524 declarations; chunk ids kept 100% over 200 commit pairs, a measurement
+of this history, and 53 of 4,118 checked chunks in files with a repeated text were
+re-pointed) and per-file derivation (S3a's C4 auditor on
 `cloud/spike-s3a`, equal to a full rebuild at the replayed commits). [lessons.md](lessons.md)
 L9 to L12 carry the falsified results as conditions, not as new results. The independent
 sanity review of the spike (2026-10-12, `reports/sanity-spike.md` on `cloud/sanity-spike`)
@@ -33,9 +34,10 @@ gave TRIM; the owner accepted it the same day.
 
 **Status after the trim (owner decision, 2026-10-12T18:08Z).** S1, S2 and S3a stay on their
 branches, unmerged, until the A/B result. Two pieces of work started outside this roadmap's
-gate, each by owner decision, and are now trimmed: S3b (the RunRecord writer and C5, gated
-below to CONTINUE, and the S4 offline harness, gated to after the A/B; owner decision
-13:25Z, first commit 13:55Z on `cloud/spike-s3b`, where commit `5ddbc05` edited that branch's copy of the S4 row
+gate, each under an owner decision, and are now trimmed: S3b (the RunRecord writer and C5, gated
+below to CONTINUE, and the S4 offline harness, gated to after the A/B; the owner's
+mandate at 13:25Z was "More work. Most importantly on multimap spike.", and the cloud monitor
+chose this scope under it; first commit 13:55Z on `cloud/spike-s3b`, where commit `5ddbc05` edited that branch's copy of the S4 row
 to "offline harness only" after the harness was built) and the map-representation research
 (`cloud/spike-repr`, owner decision 13:46Z, first commit 13:58Z; its pre-registration and results stay as documents, no
 further experiments before the A/B). No further S3b or S4 work, no S4 to S6 spec

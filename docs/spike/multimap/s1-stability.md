@@ -12,7 +12,7 @@ construction or measured" says which figure is which.
 ## Command (ran)
 
 ```text
-cargo run -p lci-core --example node_stability -- --rev 66f999d --commits 200
+cargo run -p lci-core --release --example node_stability -- --rev 66f999d --commits 200
 ```
 
 `66f999d` is the head of `fix/verified-bugs` that S1 started from. The tool
@@ -21,7 +21,8 @@ cargo run -p lci-core --example node_stability -- --rev 66f999d --commits 200
 root-level `.lciignore` keeps (the scanner's chunker, BOM handling and non-source check; not
 replayed: `.lciignore` files below the root, of which none exists in any of the 201 commits, and the walker's
 `.gitignore` handling, because committed files count as tracked), and
-compares each consecutive pair. Wall time 27.6 s (`time`, warm build); re-run at 11:34Z after the review fixes, with the
+compares each consecutive pair. Wall time 27.6 s (`time`, warm debug build, the command
+without `--release`); re-run at 11:34Z after the review fixes, with the
 same numbers. It reads git objects
 only.
 
@@ -61,7 +62,8 @@ legacy key kept): `3c92aac` 367/84, `8888858` 452/214, `bef9772` 373/139, `ab7de
 
 Set membership cannot see an id that is still present but now names a different chunk (a
 duplicate inserted earlier in the file shifts the ordinals of the later copies). The tool now
-pairs chunks by position: `git diff -U0` of the file's two blobs maps each older chunk's lines
+pairs chunks by position: `git diff -U0` of the file's two blobs (Myers with the indent
+heuristic, pinned so a user's diff settings cannot change it) maps each older chunk's lines
 to the newer file, and the newer chunk with the same text on the mapped lines is the
 successor. An id "points at another chunk" when it resolves to a newer chunk other than the
 successor. Only files that changed and hold a repeated `content_hash` in either version are
@@ -83,16 +85,21 @@ exact, not a sample). Same command, same 200 pairs, 4.2 s release build:
   with `chunks_for_path` on `lci-core/src/lsp.rs` at `66f999d`), so every such line of a file
   shares one hash, and adding a module line above others re-points the later fragments'
   ordinals. No full declaration chunk was re-pointed in these 200 pairs.
-- A synthetic two-commit repository (one function, then an identical copy inserted above it)
-  gives 1 right and 1 wrong NodeId, which is the case the counter is for.
-- Where whole lines repeat, the successor is whatever git's default diff alignment says; in
-  the 53 cases here the full lines differ (`pub mod csharp;` and `pub mod go;`), so the
-  alignment is unambiguous.
+- Synthetic checks (ran): two functions `alpha`, `beta`, then a copy of `beta` inserted above
+  `alpha`, gives 1 right (`alpha`) and 1 wrong (`beta`'s id now names the inserted copy);
+  three identical `beta` functions with one deleted gives membership 2 of 3 (one ordinal is
+  lost) and 2 right, 0 wrong.
+- Blind spot: when an identical whole-line block is inserted next to its copy, the diff
+  cannot tell which copy is new and aligns the insertion after the existing one, so the id
+  points at the "successor" and the counter sees nothing. The successor is whatever the
+  pinned diff alignment says. In the 53 cases here the full lines differ (`pub mod csharp;`
+  and `pub mod go;`), so their alignment is unambiguous; 53 is a lower bound that leaves out
+  repeats whose whole lines are identical.
 
 ## Symbol keys (ran)
 
 ```text
-cargo run -p lci-core --example symbol_keys -- --rev 66f999d
+cargo run -p lci-core --release --example symbol_keys -- --rev 66f999d
 ```
 
 `lci-core/examples/symbol_keys.rs` runs `rust_declarations` on every tracked `.rs` blob at the
@@ -116,8 +123,8 @@ revision and joins each declaration's Symbol NodeId with its path. 0.5 s release
 
 | Figure | Kind |
 | --- | --- |
-| Chunk NodeId kept 100% (set membership) | By construction: the id is built from the unchanged text. |
-| Chunk NodeId lost 0 in the positional pairing | By construction, for the same reason. |
+| Chunk NodeId kept 100% (set membership) | Measurement of this history. Insertions cannot lose an id (the text and every lower ordinal stay), but deleting an earlier copy of a repeated text while a later one stays drops the highest ordinal (synthetic check above); no commit in these 200 pairs did that. |
+| Chunk NodeId lost 0 in the positional pairing | Measurement of this history, for the same reason. |
 | Distinct symbol ids within one file | By construction: the disambiguator counts repeats. |
 | Legacy key kept 98.49% / 47.81% | Measurement of this history: any key with `start_line` breaks that often. |
 | 10111 unchanged duplicates (2.1%), 0 N-5 twins | Measurement of this history and chunker. |
@@ -127,10 +134,11 @@ revision and joins each declaration's Symbol NodeId with its path. 0.5 s release
 
 ## What it shows (inferred)
 
-- The NodeId's 100% is by construction, not a finding: an id built from the unchanged
-  text survives whenever the text does, except when a duplicate inserted earlier in the
-  file shifts an ordinal. Membership hides that shift; the positional pairing above measures
-  it: 53 of 4118 checked chunks (1.3%), all nameless header fragments that today's chunker
+- The NodeId's 100% is close to construction but not a guarantee: an id built from the
+  unchanged text survives whenever the text does, except where a duplicate inserted earlier
+  in the file shifts an ordinal (the id survives but names another copy) or an earlier copy
+  is deleted (the highest ordinal is lost). No deletion of that kind happened here. Membership
+  hides the shift; the positional pairing above measures it: 53 of 4118 checked chunks (1.3%), all nameless header fragments that today's chunker
   splits off. The legacy key re-points more often (70) and loses far more (2781). The ordinal
   is the failure mode the key adds over `(path, content_hash)`; it is silent (the id still
   resolves), and on this tree it hit only those fragments.

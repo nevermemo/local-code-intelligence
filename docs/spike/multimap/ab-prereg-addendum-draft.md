@@ -6,8 +6,10 @@ untracked notes, not in this repository, and was not read for this draft. This f
 wording for the six items the independent sanity review asks to pre-register before the
 pilot (`reports/sanity-spike.md` on `cloud/sanity-spike`, section 4 and section 5 item 1),
 each with its reason, for the owner to move into the local pre-registration, rewrite or
-drop. Numbers in square brackets are placeholders for the owner; no threshold, count or
-policy below is chosen on the owner's behalf.
+drop. Numbers and choices in square brackets are placeholders for the owner. Every
+sentence, including the unbracketed policies (which stratum is primary, what voids a task,
+which token comparison is primary), is proposed wording for the owner to change, not a
+decision.
 
 If an item already exists in the local pre-registration (SC1's amendments, A24, adopted a
 tool-usage rate, two sensitivities and an embedder-noise rule; `docs/development/roadmap.md`,
