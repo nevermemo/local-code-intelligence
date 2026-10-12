@@ -1388,6 +1388,61 @@ mod tests {
     }
 
     #[test]
+    fn model_endpoints_and_names_are_trimmed_from_file_and_environment_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let baseline_path = write(
+            dir,
+            "baseline.toml",
+            &format!(
+                "{}embedding_url = 'http://127.0.0.1:8766/v1'\n\
+                 embedding_model = 'embed-test'\n\
+                 reranker_url = 'http://127.0.0.1:8767/rerank'\n\
+                 reranker_model = 'rerank-test'\n",
+                data_dir_line(dir)
+            ),
+        );
+        let baseline = resolve(&base_spec(Some(baseline_path))).unwrap();
+        let baseline_identity = baseline.config.embedding_identity();
+
+        let padded_path = write(
+            dir,
+            "padded.toml",
+            &format!(
+                "{}embedding_url = ' http://127.0.0.1:8766/v1 '\n\
+                 embedding_model = ' embed-test '\n\
+                 reranker_url = ' http://127.0.0.1:8767/rerank '\n\
+                 reranker_model = ' rerank-test '\n",
+                data_dir_line(dir)
+            ),
+        );
+        let padded_file = resolve(&base_spec(Some(padded_path))).unwrap();
+        assert_eq!(padded_file.config.embedding_identity(), baseline_identity);
+        assert_eq!(padded_file.config.embedding_url, "http://127.0.0.1:8766/v1");
+        assert_eq!(padded_file.config.embedding_model, "embed-test");
+        assert_eq!(padded_file.config.reranker_url, "http://127.0.0.1:8767/rerank");
+        assert_eq!(padded_file.config.reranker_model, "rerank-test");
+
+        let mut by_env = base_spec(Some(write(
+            dir,
+            "defaults.toml",
+            &data_dir_line(dir),
+        )));
+        by_env.env = env(&[
+            ("LCI_EMBEDDING_URL", " http://127.0.0.1:8766/v1 "),
+            ("LCI_EMBEDDING_MODEL", " embed-test "),
+            ("LCI_RERANKER_URL", " http://127.0.0.1:8767/rerank "),
+            ("LCI_RERANKER_MODEL", " rerank-test "),
+        ]);
+        let padded_env = resolve(&by_env).unwrap();
+        assert_eq!(padded_env.config.embedding_identity(), baseline_identity);
+        assert_eq!(padded_env.config.embedding_url, "http://127.0.0.1:8766/v1");
+        assert_eq!(padded_env.config.embedding_model, "embed-test");
+        assert_eq!(padded_env.config.reranker_url, "http://127.0.0.1:8767/rerank");
+        assert_eq!(padded_env.config.reranker_model, "rerank-test");
+    }
+
+    #[test]
     fn a_malformed_environment_value_names_its_variable() {
         for (name, value) in [
             ("LCI_PORT", "abc"),

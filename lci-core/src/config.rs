@@ -1021,6 +1021,24 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_model_names_are_rejected_during_validation() {
+        for (name, model) in [
+            ("embedding_model", true),
+            ("reranker_model", false),
+        ] {
+            let mut config = Config::default();
+            if model {
+                config.embedding_model = " \t\n ".to_owned();
+            } else {
+                config.reranker_model = " \t\n ".to_owned();
+            }
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("nonempty"), "{error}");
+        }
+    }
+
+    #[test]
     fn old_config_shape_still_loads() {
         // A config containing only the pre-C# LSP fields must still load and
         // keep C# tooling disabled (backward compatibility).
