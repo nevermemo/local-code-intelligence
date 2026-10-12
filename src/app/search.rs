@@ -1420,6 +1420,9 @@ impl App {
 }
 
 #[cfg(test)]
+mod fusion_properties;
+
+#[cfg(test)]
 mod tests {
     use super::{
         App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, fusion_order,
