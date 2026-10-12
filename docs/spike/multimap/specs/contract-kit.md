@@ -246,3 +246,91 @@ C1; a map that swallows its failure passes the injected faults and fails
 `check_real_failure`. The four wrapped legacy maps pass C1 and C6 (`src/app/search/tests/t0.rs`), and so does
 the live lexical map over a real directory. C2-C5 and C7-C9 and their known-bad maps are not
 written yet.
+
+## 7. S3 as built (2026-10-12, slice S3a)
+
+Code: `lci-maps/src/fresh.rs` (`Target`, `Refreshable`, the policy `prepare`),
+`lci-maps/src/kit_c3.rs` (contract C3), `lci-maps/src/audit.rs` (contract C4 and the
+`sym.defs` subject), tests in `lci-maps/src/kit_c3/tests.rs` and `lci-maps/src/audit/tests.rs`.
+
+### C3 as built
+
+The freshness rule for stored maps is code, not only a test: `fresh::prepare(map, mode,
+target)` is what an engine calls for each stored map after the core index has been resolved
+under `[index].freshness`. It returns `Current` (data already for the target), `Built` (no data:
+built in any mode, as a search may create a missing index), `Refreshed` (`on-search` only),
+`Stale` (`manual`/`watch`: the map keeps its data and says it is stale) or `Failed { warning }`
+(an error or a panic in the build; the previous data is kept and the warning names the map).
+The map's answer carries the snapshot its data was built for and `stale` when that is not the
+searched one.
+
+`kit_c3::check_freshness(subject, bumped, case)` runs on a fixture with an old and a new
+snapshot (two tree directories, so both stay readable) and a broken target (the new files
+under a root that does not hold them). Reference answers come from fresh builds of each
+snapshot, and the kit refuses a fixture whose edit does not change the answer. For each of
+`manual`, `watch`, `on-search`: the first search builds the map; after the edit, under
+`on-search` the map is refreshed and answers exactly as a fresh build of the new snapshot,
+while under `manual`/`watch` it answers exactly as the old one; then, for `manual`/`watch`,
+when the core moved to the new snapshot without a search, the map is not refreshed and its
+answer names the old snapshot with `stale = true`, every hit a chunk of the new view. A failed
+refresh must return a warning naming the map, keep the old data and answer as before. A
+version bump over the previous version's stored data must be built, current or stale, never a
+failure. `kit_c3::check_live_freshness` requires a live map to answer with `observed =
+live-tree`, as of the view's snapshot, never stale (the wrapped lexical map's own test already
+asserts `LiveTree`; running this check on it is left to S4, since it lives in the root crate).
+
+Deviations from section 2 (C3 "Test"): the check works at the map level with the policy
+function, not through `search_code` with `stale_check_interval_seconds = 0`, because no engine
+calls stored maps yet (S4); "index.action = refreshed_incrementally" is the core's report and
+is not checked here. The map's version is not the producer's: a version bump that changes only
+how the map answers reuses the stored bundles (`sym.defs@1`), and a payload change needs a new
+producer id (decision N-12).
+
+Known-bad maps the kit rejects (`c3_rejects_each_known_bad_stored_map`): one that hides
+staleness (claims the searched snapshot), one that drops its data when a refresh fails, one
+that claims to have no data so every search rebuilds it (a refresh from a search under
+`manual`), one that refuses to build after a version bump; plus, for live maps, one that
+reports `observed = snapshot`.
+
+### C4 as built
+
+`audit::audit(subject, root, steps, apply)` walks a list of tree states; at each it updates
+the subject incrementally from its own previous state (`Audited::incremental`), builds it
+from nothing (`Audited::full`, a fresh scan into a fresh store) and compares the two sorted
+canonical lists; the first difference fails C4 with the entry and the side it is on.
+`SymDefsAudit` is the `sym.defs` subject: its state is the previous scan's files and a
+persistent bundle store; its canonical form is `<symbol>\t<head chunk>` per declaration.
+
+Adapter bump, a spec change: the adapter version belongs to the indexer binary, not to the
+tree, so replaying commits never changes it. A step with `bump_adapter` instead makes the
+subject relabel its stored state as produced by the previous adapter (`<version>~prior` in
+the manifest and in the bundle keys) and makes that state detectably different from what the
+current adapter produces (each file loses its last chunk; each stored declaration's name gets
+a suffix). A subject that reuses any of it differs from the full build.
+
+Unit suite (`Full`): a synthetic script of nine steps on one directory (initial, edit inside
+a function, lines inserted above, a duplicated chunk, a new file, a delete, a move, an adapter
+bump, an edit after the bump); `sym.defs` is equal to a full build at every step, the delete
+and the move extract nothing, and the bump extracts every Rust file again. Known-bad maps,
+each rejected at its own step: a producer that keeps the module path in the bundle (move), a
+bundle key without the adapter version (adapter bump), an index that keeps a deleted file's
+declarations (delete).
+
+Slow suite (decision K-3 kept): `audit::tests::c4_commit_replay`, `#[ignore]`d, run with
+`cargo test -p lci-maps --lib -- --ignored c4_commit_replay --nocapture`. It replays this
+repository's commits into a scratch `git worktree`: `3ba1422^`, `3ba1422` (deletes
+`src/app.rs`), `0729d9a^`, `0729d9a` (moves 18 files into `lci-core/src`), an adapter bump on
+the same tree, and `b87b16a`. Measured 2026-10-12 on the cloud machine (debug build): 19.4 s
+in total, 1.1 to 1.9 s per step except 12.1 s for the last (2680 declarations, 95 files
+extracted). It stays out of `Full` because CI checks out one commit (no history to replay),
+not for its time. Run against the path-in-bundle producer, it fails at the move commit with the
+first differing symbol (`lci-core::chunk::chunk::Chunk/struct`, the old module path joined
+under the new one).
+
+Open decisions added here:
+
+| # | Decision taken here | Alternative | Revisit at |
+| --- | --- | --- | --- |
+| K-7 | The C3 policy is a function (`fresh::prepare`) the engine calls per stored map, after the core snapshot is resolved; stored maps follow the core snapshot and never probe the tree themselves. | Each stored map probes the tree and refreshes itself under the mode. | S4 engine. |
+| K-8 | The C4 adapter bump is simulated by relabelling and perturbing the stored state. | Build a second adapter version into test builds. | When a second chunker version exists. |
+| K-9 | The commit replay runs in an ignored test, outside `Full`, because CI has no history. | Fetch the needed commits in CI (`fetch-depth: 0`) and run it in `Full` (about 20 s). | When CI's checkout depth is next changed. |
