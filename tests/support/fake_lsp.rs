@@ -62,6 +62,12 @@ pub struct FakeLspConfig {
     /// Milliseconds to sleep before answering every LATER `workspace/symbol`
     /// request (`--symbol-delay-ms`).
     pub symbol_delay_ms: u64,
+    /// Milliseconds to sleep before answering `textDocument/definition`
+    /// (`--definition-delay-ms`).
+    pub definition_delay_ms: u64,
+    /// The first process exits on its first definition request
+    /// (`--exit-on-definition-request`), leaving the replacement healthy.
+    pub exit_on_definition_request: bool,
     /// A server that never shuts down (`--ignore-shutdown`): it still records
     /// the `shutdown` request and the `exit` notification, but sends no
     /// answer to the first and keeps running after the second, so only a
@@ -235,6 +241,10 @@ pub fn run_from_env() -> io::Result<()> {
         initialize_delay_ms,
         first_symbol_delay_ms,
         symbol_delay_ms,
+        definition_delay_ms: cli_arg(&cli, "--definition-delay-ms")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        exit_on_definition_request: cli.iter().any(|arg| arg == "--exit-on-definition-request"),
         ignore_shutdown,
         symbol_error: InjectedError::from_cli(&cli, "--symbol-error", "--symbol-error-count"),
         symbol_ok_at,
@@ -358,6 +368,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut symbol_requests = 0u64;
     let mut symbol_error = config.symbol_error.clone();
     let mut definition_error = config.definition_error.clone();
+    let mut pending_definition = None;
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
 
@@ -618,26 +629,44 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                         )?;
                     }
                 }
-                (FakeScenario::Definition, Some("textDocument/definition")) => {
+                (FakeScenario::Definition, Some("workspace/symbol"))
+                    if config.exit_on_definition_request =>
+                {
+                    symbol_requests += 1;
                     if let Some(id) = id {
-                        if let Some(error) = definition_error.as_mut()
+                        write_message(&mut stdout, &json_response(id, json!([])))?;
+                    }
+                    if let Some(response) = pending_definition.take() {
+                        thread::sleep(Duration::from_millis(config.definition_delay_ms));
+                        write_message(&mut stdout, &response)?;
+                    }
+                }
+                (FakeScenario::Definition, Some("textDocument/definition")) => {
+                    if config.exit_on_definition_request && spawn_count == 1 {
+                        process::exit(0);
+                    }
+                    if let Some(id) = id {
+                        let response = if let Some(error) = definition_error.as_mut()
                             && error.take()
                         {
-                            write_message(
-                                &mut stdout,
-                                &json_error(id, error.code, &error.message),
-                            )?;
+                            json_error(id, error.code, &error.message)
                         } else {
-                            write_message(
-                                &mut stdout,
-                                &json_response(
-                                    id,
-                                    json!({
-                                        "uri": calc_uri,
-                                        "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
-                                    }),
-                                ),
-                            )?;
+                            json_response(
+                                id,
+                                json!({
+                                    "uri": calc_uri,
+                                    "range": {"start":{"line":2,"character":4},"end":{"line":2,"character":16}}
+                                }),
+                            )
+                        };
+                        // Position calls do not wait for priming. Answer it
+                        // before sleeping even if the definition arrived first,
+                        // so priming cannot shield the session from idle release.
+                        if config.exit_on_definition_request && symbol_requests == 0 {
+                            pending_definition = Some(response);
+                        } else {
+                            thread::sleep(Duration::from_millis(config.definition_delay_ms));
+                            write_message(&mut stdout, &response)?;
                         }
                     }
                 }
