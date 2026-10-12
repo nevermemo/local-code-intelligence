@@ -49,14 +49,17 @@ impl Declaration {
 
 /// The module path of a Rust file, from its repository-relative path: the
 /// components after the last `src` directory with the extension dropped,
-/// without a final `lib`, `main` or `mod`; prefixed with the crate's
-/// directory (the components before `src`, joined by `/`) when the crate is
-/// not at the repository root, so two crates' `chunk` modules differ. A file
-/// outside any `src` directory keeps all its components.
+/// without a final `mod` (a `mod.rs` is its directory's module) and without
+/// a `lib` directly under `src` (the library crate root); prefixed with the
+/// crate's directory (the components before `src`, joined by `/`) when the
+/// crate is not at the repository root, so two crates' `chunk` modules
+/// differ. A binary crate root `src/main.rs` keeps `main`, so it does not
+/// share the library root's (empty) path. A file outside any `src` directory
+/// keeps all its components.
 ///
 /// `src/app/search.rs` -> `app::search`; `lci-core/src/chunk.rs` ->
-/// `lci-core::chunk`; `src/lib.rs` -> (empty); `tests/cases/mcp.rs` ->
-/// `tests::cases::mcp`.
+/// `lci-core::chunk`; `src/lib.rs` -> (empty); `src/main.rs` -> `main`;
+/// `tests/cases/mcp.rs` -> `tests::cases::mcp`.
 pub fn rust_module_path(path: &str) -> Vec<String> {
     let mut components: Vec<&str> = path.split('/').collect();
     if let Some(last) = components.last_mut() {
@@ -73,21 +76,59 @@ pub fn rust_module_path(path: &str) -> Vec<String> {
         None => &components[..],
     };
     module_path.extend(modules.iter().map(|c| (*c).to_owned()));
-    if !modules.is_empty()
-        && matches!(
-            module_path.last().map(String::as_str),
-            Some("lib" | "main" | "mod")
-        )
-    {
+    let crate_root_lib = modules == ["lib"];
+    if (crate_root_lib || modules.last() == Some(&"mod")) && !modules.is_empty() {
         module_path.pop();
     }
     module_path
 }
 
-/// Collapses runs of whitespace to one space, so a reformatted impl header
-/// keeps its key.
-fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// The tokens of `node` that end before `end`, as written, skipping
+/// comments.
+fn tokens<'s>(node: Node<'_>, end: usize, source: &'s str, out: &mut Vec<&'s str>) {
+    if node.start_byte() >= end || node.kind().contains("comment") {
+        return;
+    }
+    if node.child_count() == 0 {
+        out.push(&source[node.byte_range()]);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        tokens(child, end, source, out);
+    }
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// An impl header from its tokens, so that neither whitespace nor comments
+/// change it: one space between tokens except before `,` `;` `:` `::` `>`
+/// `)` `]` `?`, after `<` `::` `(` `[` `&` `*` `!` `'` and `#`, and between a
+/// word and the `<` or `(` that follows it (`Into<u8>`, `Fn(u8)`). The result
+/// always holds a space after `impl`, which the canonical string relies on.
+fn impl_header(tokens: &[&str]) -> String {
+    let mut header = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 {
+            let previous = tokens[index - 1];
+            let glued = matches!(*token, "," | ";" | ":" | "::" | ">" | ")" | "]" | "?")
+                || matches!(
+                    previous,
+                    "<" | "::" | "(" | "[" | "&" | "*" | "!" | "'" | "#"
+                )
+                || (matches!(*token, "<" | "(") && previous.ends_with(is_word));
+            if !glued {
+                header.push(' ');
+            }
+        }
+        header.push_str(token);
+    }
+    if !header.contains(' ') {
+        header = header.replacen("impl", "impl ", 1);
+    }
+    header
 }
 
 fn name_of(node: Node<'_>, source: &str) -> Option<String> {
@@ -176,10 +217,12 @@ impl Walk<'_> {
                 let Some(body) = node.child_by_field_name("body") else {
                     return;
                 };
-                // The header as written, up to the body: `impl<T> Map for
-                // Lexical<T>`, `unsafe impl Send for X`, with `where`
+                // The header up to the body, from its tokens: `impl<T> Map
+                // for Lexical<T>`, `unsafe impl Send for X`, with `where`
                 // clauses (they tell two blanket impls apart).
-                let header = collapse(&self.source[node.start_byte()..body.start_byte()]);
+                let mut words = Vec::new();
+                tokens(node, body.start_byte(), self.source, &mut words);
+                let header = impl_header(&words);
                 self.container.push(header);
                 self.children(body);
                 self.container.pop();

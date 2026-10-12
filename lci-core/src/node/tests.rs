@@ -242,6 +242,13 @@ fn identical_chunks_take_ordinals_in_source_order_and_shift_when_one_is_inserted
     // accepted: the later duplicates get new ids).
     let shifted = ids_and_keys("src/dup.rs", &format!("{body}\n{source}"));
     assert_eq!(ordinals(&shifted), [(1, 0), (5, 0), (9, 1), (13, 2)]);
+    // Ordinals count per file: the same text in another file starts at 0.
+    let other_file = ids_and_keys("src/other.rs", &source);
+    assert_eq!(ordinals(&other_file), [(1, 0), (5, 0), (9, 1)]);
+    let mut both: Vec<Chunk> = chunk::chunks_for_path("src/dup.rs", &source).unwrap();
+    both.extend(chunk::chunks_for_path("src/other.rs", &source).unwrap());
+    let ids = chunk_ids(&both);
+    assert_eq!(ids[3..], chunk_ids(&both[3..])[..]);
 }
 
 #[test]
@@ -346,7 +353,9 @@ fn module_paths_follow_the_file_path() {
     for (path, expected) in [
         ("src/app/search.rs", &["app", "search"][..]),
         ("src/lib.rs", &[]),
-        ("src/main.rs", &[]),
+        ("src/main.rs", &["main"]),
+        ("src/app/lib.rs", &["app", "lib"]),
+        ("xtask/src/main.rs", &["xtask", "main"]),
         ("src/app/mod.rs", &["app"]),
         ("lci-core/src/chunk.rs", &["lci-core", "chunk"]),
         ("lci-core/src/lib.rs", &["lci-core"]),
@@ -531,4 +540,54 @@ fn an_edit_changes_only_ids_that_name_the_edited_file() {
         2,
         "one chunk out, one in"
     );
+}
+
+#[test]
+fn an_impl_header_is_the_same_whatever_its_whitespace_and_comments() {
+    let header = |source: &str| {
+        let declarations = rust_declarations(source).unwrap();
+        let method = declarations
+            .iter()
+            .find(|d| d.kind == SymbolKind::Method)
+            .unwrap();
+        let id = method.node_id("src/x.rs");
+        assert_eq!(id.to_string().parse::<NodeId>().unwrap(), id);
+        id.validate().unwrap();
+        method.container[0].clone()
+    };
+    let canonical = "impl<T, U> Foo<T, U> for Bar<'a> where T: Clone + Send";
+    for source in [
+        "impl<T, U> Foo<T, U> for Bar<'a> where T: Clone + Send { fn f() {} }",
+        "impl<T,U>Foo<T,U>for Bar<'a>where T:Clone+Send{fn f(){}}",
+        "impl < T , U >\n    Foo<T, U> /* note */ for Bar<'a>\nwhere\n    T: Clone + Send,\n{ fn f() {} }"
+            .replace(",\n{", "\n{")
+            .as_str(),
+    ] {
+        assert_eq!(header(source), canonical, "{source}");
+    }
+    // A header written with no space at all still gets one after `impl`.
+    assert_eq!(header("impl<T>Foo<T>{fn f(){}}"), "impl<T> Foo<T>");
+    assert_eq!(header("impl!Send for X{fn f(){}}"), "impl !Send for X");
+    assert_eq!(
+        header("impl Tr for &'a mut [u8]{fn f(){}}"),
+        "impl Tr for &'a mut [u8]"
+    );
+}
+
+#[test]
+fn ord_agrees_with_eq_even_for_invalid_ids() {
+    let none = NodeId::DocSection {
+        path: "a.md".into(),
+        heading_path: vec![],
+        ordinal: 0,
+    };
+    let empty = NodeId::DocSection {
+        path: "a.md".into(),
+        heading_path: vec![String::new()],
+        ordinal: 0,
+    };
+    assert_eq!(none.to_string(), empty.to_string());
+    assert_ne!(none, empty);
+    assert_ne!(none.cmp(&empty), std::cmp::Ordering::Equal);
+    assert_eq!(BTreeSet::from([none, empty]).len(), 2);
 }

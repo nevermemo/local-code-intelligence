@@ -13,9 +13,11 @@ cargo run -p lci-core --example node_stability -- --rev 66f999d --commits 200
 `66f999d` is the head of `fix/verified-bugs` that S1 started from. The tool
 (`lci-core/examples/node_stability.rs`) walks the 201 first-parent commits ending there
 (the oldest is `b8b0b8f`), chunks every committed source file that the commit's own
-`.lciignore` keeps (the scanner's chunker, BOM handling and non-source check; the walker's
-`.gitignore` handling is not replayed because committed files count as tracked), and
-compares each consecutive pair. Wall time 27.6 s (`time`, warm build). It reads git objects
+root-level `.lciignore` keeps (the scanner's chunker, BOM handling and non-source check; not
+replayed: `.lciignore` files below the root, of which none exists in any of the 201 commits, and the walker's
+`.gitignore` handling, because committed files count as tracked), and
+compares each consecutive pair. Wall time 27.6 s (`time`, warm build); re-run at 11:34Z after the review fixes, with the
+same numbers. It reads git objects
 only.
 
 Definitions: a chunk of the older commit "did not change" when the same file in the newer

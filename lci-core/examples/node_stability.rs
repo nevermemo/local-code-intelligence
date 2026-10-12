@@ -10,10 +10,11 @@
 //! ```
 //!
 //! A snapshot is every blob of the commit's tree with a registered source
-//! extension that the commit's own `.lciignore` does not exclude and that is
-//! not a known non-source format, chunked as the scanner chunks it. The
-//! walker's `.gitignore` handling is not replayed: committed files are
-//! taken as tracked.
+//! extension that the commit's own root-level `.lciignore` does not exclude
+//! and that is not a known non-source format, chunked as the scanner chunks
+//! it. Not replayed: `.lciignore` files below the root (the scanner honours
+//! them) and the walker's `.gitignore` handling (committed files are taken
+//! as tracked).
 //!
 //! "Kept" means the older commit's id is present in the newer commit's
 //! snapshot (set membership), for both kinds of key.
@@ -209,6 +210,19 @@ fn file_text(chunks: &[Chunk]) -> HashMap<&str, Vec<(&str, u32, u32)>> {
     files
 }
 
+/// Fusion keys of a snapshot shared by two or more NodeIds (decision N-5).
+fn twins(chunks: &[Chunk]) -> usize {
+    let ids = chunk_ids(chunks);
+    let mut by_key = HashMap::<_, HashSet<&NodeId>>::new();
+    for (chunk, id) in chunks.iter().zip(&ids) {
+        by_key
+            .entry(legacy_fusion_key(chunk))
+            .or_default()
+            .insert(id);
+    }
+    by_key.values().filter(|ids| ids.len() > 1).count()
+}
+
 fn main() -> Result<()> {
     let args = args()?;
     let list = git(
@@ -228,8 +242,8 @@ fn main() -> Result<()> {
     let mut total = Counts::default();
     let mut pairs_with_gap = 0;
     let mut worst: Vec<(String, usize, usize, usize)> = Vec::new();
-    let mut max_twins = 0;
     let mut previous = snapshot(&args.repo, commits[0], &mut blobs, &mut cache)?;
+    let mut max_twins = twins(&previous.chunks);
     for window in commits.windows(2) {
         let next = snapshot(&args.repo, window[1], &mut blobs, &mut cache)?;
         let old_ids = chunk_ids(&previous.chunks);
@@ -270,16 +284,7 @@ fn main() -> Result<()> {
             pair.node_kept_in_edited,
             pair.legacy_kept_in_edited,
         ));
-        let mut by_key = HashMap::<_, HashSet<&NodeId>>::new();
-        let next_ids = chunk_ids(&next.chunks);
-        for (chunk, id) in next.chunks.iter().zip(&next_ids) {
-            by_key
-                .entry(legacy_fusion_key(chunk))
-                .or_default()
-                .insert(id);
-        }
-        let twins = by_key.values().filter(|ids| ids.len() > 1).count();
-        max_twins = max_twins.max(twins);
+        max_twins = max_twins.max(twins(&next.chunks));
         total.unchanged += pair.unchanged;
         total.duplicates += pair.duplicates;
         total.node_kept += pair.node_kept;

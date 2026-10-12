@@ -188,7 +188,7 @@ Invariants (each is a test, see section 6):
 | N-6 | File rename = new id plus a `renamed_from` edge. | A rename-stable file id (first-seen path plus git rename chain). Rejected for MVP: needs runtime git for every File node. | W3 (history maps). |
 | N-7 | Path normalisation follows the scanner, whatever the merged fix branch does with backslashes. | Normalise NodeId paths separately. Rejected: two path conventions would break joins. | S1 merge of the fix branch. |
 | N-8 | Module path for non-Rust languages = file path without extension. | Per-language module resolution (package for Java/Go, dotted module for Python). | When each language's symbol map lands. |
-| N-9 | (S1) Rust module path = the components after the last `src` directory, without a final `lib`, `main` or `mod`, prefixed with the crate's directory when the crate is not at the repository root (`lci-core/src/chunk.rs` -> `lci-core::chunk`). Without the prefix two crates' `chunk` modules collide. | Resolve the crate name from `Cargo.toml` (`lci_core::chunk`); follow `#[path]` attributes. | When `sym.defs` lands (S3). |
+| N-9 | (S1) Rust module path = the components after the last `src` directory, without a final `mod` and without a `lib` directly under `src`, prefixed with the crate's directory when the crate is not at the repository root (`lci-core/src/chunk.rs` -> `lci-core::chunk`). Without the prefix two crates' `chunk` modules collide. A binary root `src/main.rs` keeps `main`, so its `mod tests` does not collide with the library root's. | Resolve the crate name from `Cargo.toml` (`lci_core::chunk`); follow `#[path]` attributes. | When `sym.defs` lands (S3). |
 
 ## 5. What this spec does not decide
 
@@ -218,8 +218,9 @@ Code: `lci-core/src/node.rs` (types, canonical strings, `chunk_ids`, `legacy_fus
 `lci-core/src/node/rust.rs` (a declaration-only Rust extractor for symbol keys), tests in
 `lci-core/src/node/tests.rs`, and the history tool `lci-core/examples/node_stability.rs`
 with its result in [../s1-stability.md](../s1-stability.md). Nothing on the search path
-uses it; the manifest is unchanged (`VERSION = 2`). The only change to existing code is that
-`chunk::decode_source` became `pub` for the history tool. Line references re-checked on
+uses it; the manifest is unchanged (`VERSION = 2`). The only changes to existing code are
+`pub mod node;` in `lci-core/src/lib.rs` and `chunk::decode_source` becoming `pub` for the
+history tool. Line references re-checked on
 `origin/fix/verified-bugs` at `66f999d`: `Chunk` `lci-core/src/chunk.rs:43`,
 `chunks_with_adapter` `:159` (hash at `:186`), `scan_incremental` `:312` (reuse check
 `:344`), fusion key `src/app/search.rs:1314`, `fusion_order` `:337`.
@@ -236,17 +237,26 @@ Deviations from sections 3 and 6, each taken as the conservative choice:
   for any input order of chunks except two same-hash chunks on the same lines.
 - Symbol keys in S1 come from a minimal Rust extractor: functions, methods, structs,
   enums, unions, traits, consts, statics, type aliases, macros and modules (inline modules
-  join the module path); impl headers are kept as written up to the body, whitespace
-  collapsed, generics and `where` clauses included; items inside function bodies are not
-  walked. The per-file bundle that stores them is S3.
+  join the module path). Not walked: function bodies, `extern` blocks and `const _ = { .. }`
+  blocks. An impl header is rebuilt from its tokens up to the body, comments dropped, with
+  fixed spacing (one space between tokens, none before `,` `;` `:` `::` `>` `)` `]` `?`, none
+  after `<` `::` `(` `[` `&` `*` `!` `'` `#`, none between a word and a following `<` or `(`),
+  so whitespace and comments never change a key: `impl<T,U>Foo<T,U>` and
+  `impl<T, U> Foo<T, U>` are both `impl<T, U> Foo<T, U>`, and a header always holds a space
+  after `impl`. A token change (a trailing comma in a `where` clause) does change it. The
+  per-file bundle that stores the keys is S3.
 - Kinds' string names: `fn`, `method`, `struct`, `enum`, `union`, `trait`, `const`,
   `static`, `type`, `mod`, `macro`.
 - Canonical form of a symbol: `sym:<lang>:<modules and containers joined by ::>::<name>/<kind>[~<n>]`,
   exactly the shape of the section 3.1 example; see the encoding paragraph there for how
   module and container segments are told apart.
-- `NodeId` orders by canonical string (`Ord`), as the tie rule for non-chunk nodes needs.
+- `NodeId` orders by canonical string (`Ord`), as the tie rule for non-chunk nodes needs;
+  two invalid ids that share a string (an empty heading slug and none) then order by their
+  debug form, so `Ord` agrees with `Eq`.
 
-Test status per row of section 6: round trip, line independence, determinism, incremental
+Test status per row of section 6 ("determinism" is tested by scanning from an empty and from
+a full previous manifest and by shuffling the chunk list; the walk order itself cannot vary,
+because the scanner sorts files by path before chunking): round trip, line independence, determinism, incremental
 equals full (edit, insert above, rename, duplicate chunk, adapter version bump, delete),
 locality, ordinal rule, symbol key and impl header, and legacy mapping are unit tests in
 `lci-core/src/node/tests.rs`. "No paths in bundles" is covered only for its path-free half

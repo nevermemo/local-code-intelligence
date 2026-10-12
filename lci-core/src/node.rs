@@ -17,7 +17,7 @@ pub use rust::{Declaration, rust_declarations, rust_module_path};
 
 use crate::chunk::Chunk;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{cmp::Ordering, collections::HashMap, fmt, str::FromStr};
+use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, fmt, str::FromStr};
 
 /// The kinds of node, in the order of the spec's table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -535,9 +535,13 @@ impl FromStr for NodeId {
 }
 
 /// Ordered by canonical string (the spec's tie order for non-chunk nodes).
+/// Two invalid ids can share a string (an empty heading slug and none);
+/// they are then ordered by their debug form, so `Ord` agrees with `Eq`.
 impl Ord for NodeId {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.to_string().cmp(&other.to_string())
+        self.to_string()
+            .cmp(&other.to_string())
+            .then_with(|| format!("{self:?}").cmp(&format!("{other:?}")))
     }
 }
 
@@ -578,10 +582,11 @@ pub fn legacy_fusion_key(chunk: &Chunk) -> (String, u32, String) {
 /// file's own order, which is byte order, decides two chunks on the same
 /// lines). Any order of `chunks` gives the same ids, except for that last
 /// tie.
-pub fn chunk_ids(chunks: &[Chunk]) -> Vec<NodeId> {
+pub fn chunk_ids<C: Borrow<Chunk>>(chunks: &[C]) -> Vec<NodeId> {
+    let chunks: Vec<&Chunk> = chunks.iter().map(Borrow::borrow).collect();
     let mut order: Vec<usize> = (0..chunks.len()).collect();
     order.sort_by(|&a, &b| {
-        let (a, b) = (&chunks[a], &chunks[b]);
+        let (a, b) = (chunks[a], chunks[b]);
         (&a.relative_file_path, a.start_line, a.end_line).cmp(&(
             &b.relative_file_path,
             b.start_line,
@@ -591,7 +596,7 @@ pub fn chunk_ids(chunks: &[Chunk]) -> Vec<NodeId> {
     let mut seen = HashMap::<(&str, &str), u32>::new();
     let mut ids = vec![None; chunks.len()];
     for index in order {
-        let chunk = &chunks[index];
+        let chunk = chunks[index];
         let ordinal = seen
             .entry((&chunk.relative_file_path, &chunk.content_hash))
             .or_insert(0);
