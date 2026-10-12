@@ -52,6 +52,9 @@ enum Command {
         /// Skip the initial `cargo build --workspace` step.
         #[arg(long)]
         skip_build: bool,
+        /// Fail if any selected step is skipped because a prerequisite is unavailable.
+        #[arg(long)]
+        require_all: bool,
     },
     /// Resolve the development-tooling paths (work area, plans, frozen
     /// binaries, checkpoint, ...) by role instead of hard-coding them:
@@ -246,7 +249,11 @@ async fn main() -> Result<()> {
                 acceptance::cpp_recovery::run(clangd).await
             }
         },
-        Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
+        Command::LiveAcceptance {
+            only,
+            skip_build,
+            require_all,
+        } => live_acceptance::run(only, skip_build, require_all),
         Command::Env(args) => env::run(args),
         Command::LintMachinePaths => lint::run(),
         Command::MineQueries {
@@ -255,5 +262,24 @@ async fn main() -> Result<()> {
             out,
             max,
         } => mine::run(repo, key, out, max),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_acceptance_require_all_is_opt_in() {
+        for (args, expected) in [
+            (vec!["xtask", "live-acceptance"], false),
+            (vec!["xtask", "live-acceptance", "--require-all"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::LiveAcceptance { require_all, .. } = cli.command else {
+                panic!("expected live-acceptance command");
+            };
+            assert_eq!(require_all, expected);
+        }
     }
 }
