@@ -1868,6 +1868,7 @@ fn dumped_query(
             language: "rust".to_owned(),
             start_line: spec.start,
             end_line: spec.start + 9,
+            content_hash: format!("{}:{}", spec.path, spec.start),
             source_role: spec.role,
             semantic_rank: spec.semantic,
             semantic_score: spec.semantic.map(|_| 0.5),

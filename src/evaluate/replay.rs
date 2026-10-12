@@ -326,12 +326,15 @@ fn row_prior(row: &CandidateTrace, arm: &ReplayArm) -> f32 {
     }
 }
 
-/// Search's fused order: score descending, then path, then start line.
+/// Search's fused order: score descending, then path, start, end, and content
+/// hash.
 fn fused_order(a: &Scored<'_>, b: &Scored<'_>) -> Ordering {
     b.score
         .total_cmp(&a.score)
         .then_with(|| a.row.relative_file_path.cmp(&b.row.relative_file_path))
         .then(a.row.start_line.cmp(&b.row.start_line))
+        .then(a.row.end_line.cmp(&b.row.end_line))
+        .then(a.row.content_hash.cmp(&b.row.content_hash))
 }
 
 /// Demotes, without removing, the items of a file beyond its `max`-th, stably:
@@ -1153,4 +1156,73 @@ pub fn replay_file(path: &Path, options: &ReplayOptions) -> Result<ReplayReport>
     let mut replayed = replay(&source, options)?;
     replayed.replay.source = Some(path.display().to_string());
     Ok(replayed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scored, fused_order};
+    use crate::{app::CandidateTrace, filter::SourceRole};
+
+    fn candidate(
+        end_line: u32,
+        content_hash: &str,
+        semantic_rank: Option<usize>,
+        lexical_rank: Option<usize>,
+    ) -> CandidateTrace {
+        CandidateTrace {
+            relative_file_path: "same.rs".into(),
+            language: "rust".into(),
+            start_line: 1,
+            end_line,
+            content_hash: content_hash.into(),
+            source_role: SourceRole::Source,
+            semantic_rank,
+            semantic_score: semantic_rank.map(|_| 0.5),
+            lexical_rank,
+            lexical_score: lexical_rank.map(|_| 1.5),
+            lexical_match_count: u32::from(lexical_rank.is_some()),
+            lsp_rank: None,
+            prior: 0.004,
+            fusion_score: 1.0,
+            fused_rank: 0,
+            capped_rank: 0,
+            shortlisted: false,
+            rerank_rank: None,
+            reranker_score: None,
+            document_bytes: None,
+            est_tokens: None,
+            snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn equal_score_candidates_with_the_same_path_and_start_line_have_a_stable_order() {
+        let semantic = candidate(3, "z-semantic", Some(1), None);
+        let lexical = candidate(2, "a-lexical", None, Some(1));
+        let ordered = |rows: [&CandidateTrace; 2]| {
+            let mut rows = rows.map(|row| Scored { row, score: 1.0 });
+            rows.sort_by(fused_order);
+            rows.map(|item| (item.row.end_line, item.row.content_hash.clone()))
+        };
+
+        let forward = ordered([&semantic, &lexical]);
+        let reverse = ordered([&lexical, &semantic]);
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward,
+            [(2, "a-lexical".to_owned()), (3, "z-semantic".to_owned())]
+        );
+
+        let mut same_end_semantic = semantic.clone();
+        let mut same_end_lexical = lexical.clone();
+        same_end_semantic.end_line = 3;
+        same_end_lexical.end_line = 3;
+        let forward = ordered([&same_end_semantic, &same_end_lexical]);
+        let reverse = ordered([&same_end_lexical, &same_end_semantic]);
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward,
+            [(3, "a-lexical".to_owned()), (3, "z-semantic".to_owned())]
+        );
+    }
 }
