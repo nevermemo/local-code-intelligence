@@ -2141,17 +2141,12 @@ async fn a_server_that_ignores_shutdown_is_killed_within_the_grace_period() {
         .symbols(&adapter, &workspace, "Calculator")
         .await
         .unwrap();
-    let heartbeat = |state: &std::path::Path| {
-        std::fs::read_to_string(state.join("heartbeat.txt")).unwrap_or_default()
-    };
-    // The server is alive: its heartbeat moves.
-    let beat = heartbeat(&state);
-    wait_until(
-        "the server's heartbeat to move",
-        Duration::from_secs(10),
-        async || heartbeat(&state) != beat,
-    )
-    .await;
+    let server: u32 = std::fs::read_to_string(state.join("pid.txt"))
+        .expect("the fake server records its process id on its first request")
+        .trim()
+        .parse()
+        .expect("a process id");
+    assert!(process_is_running(server).await, "the server is running");
 
     let started = std::time::Instant::now();
     let released = manager.release(&workspace.id).await;
@@ -2168,24 +2163,12 @@ async fn a_server_that_ignores_shutdown_is_killed_within_the_grace_period() {
     assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
     assert_eq!(event_count(&state, "exit_seen.txt"), 1);
 
-    // Killed: the heartbeat stops. A live server rewrites it every 50 ms and a
-    // dead one cannot, so two equal reads 300 ms apart mean it ended. The
-    // kill is already done when `release` returns; the polling only absorbs
-    // the operating system's delay in ending the process.
-    let give_up = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let before = heartbeat(&state);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let after = heartbeat(&state);
-        if before == after {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < give_up,
-            "the server that ignored shutdown was still alive 10 s after the release \
-             (heartbeat {before:?}, then {after:?})"
-        );
-    }
+    wait_until_process_ends(
+        "the server that ignored shutdown to end after the release",
+        server,
+        DROP_KILL_DEADLINE,
+    )
+    .await;
 }
 
 /// Shutting the manager down (service exit) releases every workspace's
@@ -2670,16 +2653,12 @@ async fn shutting_the_service_down_finishes_within_the_shutdown_bound_for_a_serv
             .unwrap()
             .csharp_analyzer_running
     );
-    let heartbeat = |state: &std::path::Path| {
-        std::fs::read_to_string(state.join("heartbeat.txt")).unwrap_or_default()
-    };
-    let beat = heartbeat(&state);
-    wait_until(
-        "the server's heartbeat to move",
-        Duration::from_secs(10),
-        async || heartbeat(&state) != beat,
-    )
-    .await;
+    let server: u32 = std::fs::read_to_string(state.join("pid.txt"))
+        .expect("the fake server records its process id on its first request")
+        .trim()
+        .parse()
+        .expect("a process id");
+    assert!(process_is_running(server).await, "the server is running");
 
     let started = std::time::Instant::now();
     // 10 s is only a hard stop against a hang. The bound is the construction
@@ -2705,20 +2684,12 @@ async fn shutting_the_service_down_finishes_within_the_shutdown_bound_for_a_serv
     );
     assert_eq!(app.shutdown_language_servers().await, 0);
 
-    // The server that ignored both was killed: its heartbeat stops (a live one
-    // rewrites it every 50 ms).
-    let give_up = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let before = heartbeat(&state);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        if before == heartbeat(&state) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < give_up,
-            "the server that ignored shutdown was still alive 10 s after the service shut down"
-        );
-    }
+    wait_until_process_ends(
+        "the server that ignored shutdown to end after the service shut down",
+        server,
+        DROP_KILL_DEADLINE,
+    )
+    .await;
     models_task.abort();
 }
 
