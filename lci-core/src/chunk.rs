@@ -107,12 +107,11 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
         } else if container || child.end_byte() - start > TARGET_BYTES {
             if end > start {
                 out.push((start, child_start));
-            } else if let Some(index) = last_split_range.take() {
-                if let Some((_, previous_end)) = out.get_mut(index)
-                    && *previous_end == start
-                {
-                    *previous_end = child_start;
-                }
+            } else if let Some(index) = last_split_range.take()
+                && let Some((_, previous_end)) = out.get_mut(index)
+                && *previous_end == start
+            {
+                *previous_end = child_start;
             }
             last_split_range = None;
             start = child_start;
