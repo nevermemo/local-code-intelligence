@@ -9,11 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 #[derive(Debug, Serialize)]
 pub struct NavigationReport {
@@ -81,17 +77,13 @@ impl App {
             .snapshot(&workspace)
             .await?
             .context("workspace is not indexed; call index_workspace first")?;
-        let chunks = Store::chunks(&snapshot, &workspace).await?;
-        let indexed_languages: HashSet<&str> = chunks
-            .iter()
-            .map(|hit| hit.chunk.language.as_str())
-            .collect();
+        let indexed_languages = Store::languages(&snapshot).await?;
         let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
         // A language none of whose servers is enabled is not searched, and
         // says so: its absence from `results` is not a clean "no match".
         let mut not_searched: Vec<String> = Vec::new();
         for language in indexed_languages {
-            let adapters = self.analyzer.adapters_for_language(language);
+            let adapters = self.analyzer.adapters_for_language(&language);
             let mut any_enabled = false;
             for adapter in adapters.iter().copied().filter(|adapter| adapter.enabled()) {
                 any_enabled = true;
@@ -202,9 +194,9 @@ impl App {
             .snapshot(workspace)
             .await?
             .context("workspace is not indexed; call index_workspace first")?;
-        let chunks = Store::chunks(&snapshot, workspace).await?;
+        let indexed_languages = Store::languages(&snapshot).await?;
         ensure!(
-            chunks.iter().any(|hit| hit.chunk.language == language),
+            indexed_languages.contains(language),
             "workspace index contains no {language} chunks"
         );
         Ok(())
