@@ -194,6 +194,25 @@ impl App {
         result
     }
 
+    async fn index_if_stale(&self, workspace: &Workspace) -> Result<()> {
+        let coordination = self.lock(&workspace.id).await;
+        let _write = coordination.lock.write().await;
+        // A job ahead of the watcher may already have committed the change.
+        // Scan again under the lock: the pre-debounce fingerprint can be old.
+        let root = workspace.path.clone();
+        let current = tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??;
+        let persisted = manifest::try_load(&self.config.data_dir, workspace)?;
+        if persisted.fingerprint == current {
+            return Ok(());
+        }
+        *coordination.flight_error.lock().await = None;
+        let result = self.index_locked(workspace.clone()).await;
+        if let Err(error) = &result {
+            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
+        }
+        result.map(|_| ())
+    }
+
     /// Runs the indexing pipeline for `workspace`, assuming the caller already
     /// holds the workspace write lock. Explicit indexing and automatic
     /// first-search indexing share this implementation so both coordinate
@@ -586,7 +605,7 @@ impl App {
                     _ = cancellation.cancelled() => break,
                     _ = tokio::time::sleep(debounce) => {}
                 }
-                if let Err(error) = app.index(&watched_workspace.path).await {
+                if let Err(error) = app.index_if_stale(&watched_workspace).await {
                     tracing::warn!(workspace_id = %watched_workspace.id, error = %format!("{error:#}"), "automatic reindex failed; previous index retained");
                 }
             }
