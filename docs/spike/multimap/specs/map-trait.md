@@ -178,3 +178,62 @@ tests ([contract-kit.md](contract-kit.md)).
 | Filter before fusion | A fake expansion map that returns nodes outside the filter: none reaches fusion, the rerank request (fake reranker records its documents) or the results (contract C2). |
 | Order independence of registration | Registering the extra maps in a different order gives the same fused scores (the loop sorts by `MapId`). |
 | Status to error mapping | All enabled maps `Failed` -> the same error text as today; semantic off and lexical `Ok` with no hits -> empty report, no error (`search.rs:907-931`). |
+
+## 7. S2 as built (2026-10-12)
+
+Code: crate `lci-maps` (`lci-maps/src/lib.rs`: types, `Map`, `Registry`, fusion;
+`lci-maps/src/kit.rs`: contract kit C1 and C6), the wrapped legacy maps in
+`src/app/search/legacy_maps.rs`, T0 in `src/app/search/tests/t0.rs` and two integration
+tests in `tests/cases/indexing.rs` (golden `search_code` JSON, registry against a traced
+search). The production search does not call the registry. Line references re-checked on
+`66f999d`: `search_once` `src/app/search.rs:653`, fan-out `:732`, `map_lexical_matches`
+`:1159`, `map_lsp_locations` `:1269`, `fuse_hits` `:1307` (key `:1314`), `fusion_order`
+`:337`, `source_role_prior` `src/store.rs:52`, `Store::search` `:335`.
+
+Changes to this spec, each the conservative choice where one was open:
+
+- **`Partial` carries an optional note and an optional warning** (was `Partial { note }`).
+  Today's LSP channel can keep the answers of one language server while another failed,
+  which is a warning with hits; none of the four v0 statuses could carry both. `Failed`
+  still drops its hits.
+- **The wrapped lexical and LSP maps live in the root crate**, not in `lci-maps` (3.1): the
+  code they call (`App::map_lexical_matches`, `App::provider_symbols`,
+  `App::map_lsp_locations`, `Hit::source_role_prior`) is there, and moving it would change
+  the production path. `LspMap` repeats the 40-line provider orchestration of `search_once`
+  (symbol queries, per-provider budget, query-by-query merge) because that arm is inline;
+  the integration test that compares the registry with a traced search guards against drift.
+- **No petgraph yet.** No graph map exists in S2; M-5 stands for the first graph map (W1b).
+- **Filter maps are refused at registration** (`RegisterError::FilterUnsupported`) until
+  contract C2 lands; a filter that is silently skipped would be worse.
+- **Priors are asked about the fused nodes**: after the rank lists are fused, every
+  `Prior` map gets the fused nodes as seeds and returns one hit per node with its value in
+  `score`, added unweighted. Rank lists run side by side (as the `tokio::join!` today),
+  priors after them.
+- **Registry API**: `Registry::register(Box<dyn Map + 'a>, weight, limit)` keeps entries
+  in fusion order whatever the registration order; `set_enabled(id, false)` records the call
+  as `Skipped` (silent); `run(text, budget, view)` returns every call and the fused pool.
+  `Run::warnings()` and `Run::notes()` attribute each message to its map id (the "naming"
+  in contract C1 is structural; the wrapped maps keep today's texts, which do not contain
+  the id).
+- **The registry checks every answer** and turns a bad one into `Failed` naming the map:
+  a node outside the view (or, for a prior, outside its seeds), a node twice, a rank of 0
+  or a falling rank (ties are allowed: the fusion unit cases give three hits rank 1), a
+  non-finite score, a prior without a value, more hits than the limit. A panic is `Failed`;
+  a missed deadline is `Partial` with a note.
+- `Need` gains `Ripgrep`; `Lsp` names no provider. `EdgeKind` has `QueryMatch` and `Prior`
+  only. `SnapshotView` holds the snapshot reference and the filtered universe with interned
+  NodeIds; the `EffectiveFilter` and config are not in it yet (C2).
+- A legacy hit that is not a chunk of the view is left out of a wrapped map's answer
+  (`map_hits`); with the same snapshot and filter none is. The N-5 twins (one legacy key,
+  two NodeIds) would fuse as two entries in the registry and one in `fuse_hits`; no fixture
+  and no snapshot of this repository's last 201 commits has one (`../s1-stability.md`).
+
+Section 6 status: bit-exact legacy fusion: done (36 weighting cases of the four row sets,
+the merge, alone and tie cases, by `to_bits()`, plus the live end-to-end comparison). Stored
+candidate dumps: none is committed in the repository (dumps go to `test-results/`), so the
+replay part could not run; the end-to-end test compares with a traced search's pool
+instead. Response unchanged: done (golden JSON written before `lci-maps` existed, unchanged
+after). Fail-open per map: done through the kit (failed, panic, deadline, foreign node,
+NaN). Disabled is silent: done at registry level (kit, "switched off"); the timing part
+waits for an engine. Order independence of registration: done. Filter before fusion and
+status-to-error mapping: deferred, they need C2 and the engine (S4).

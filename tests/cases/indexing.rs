@@ -3893,3 +3893,77 @@ async fn search_code_json_matches_the_golden_file() {
     assert_eq!(actual, expected, "search_code JSON changed");
     task.abort();
 }
+
+/// Spike test T0, end to end (map-trait.md, "Bit-exact legacy fusion"): the
+/// map registry with the four wrapped legacy maps, run on a real index with
+/// all three channels live (fake embedder, rg, fake C# language server),
+/// fuses the same pool as the production search's traced candidates: the
+/// same chunks in the same fused order with every `fusion_score` equal by
+/// `to_bits()`. The production search does not use the registry; this
+/// shows the wrapped maps reproduce it.
+#[tokio::test]
+async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("t0");
+    write(
+        &workspace,
+        "src/Calculator.cs",
+        "// golden_rank_4\nnamespace Acceptance;\npublic sealed class Calculator\n{\n    // golden_rank_1\n    public int Add(int a, int b) => a + b;\n}\n",
+    );
+    write(
+        &workspace,
+        "src/totals.go",
+        "package totals\n\n// CalculatorTotal sums values. golden_rank_2\nfunc CalculatorTotal(values []int) int {\n\treturn 0\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/calculator_test.py",
+        "def test_calculator_adds():\n    # golden_rank_3\n    assert 1 + 2 == 3\n",
+    );
+    let state = temp.path().join("lsp-state-t0");
+    config.lsp_search_budget_ms = 30_000;
+    config = with_fake_csharp_server(config, &state, &[], 10);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+    let report = app
+        .search_with_options(
+            &workspace,
+            "Calculator",
+            Some(10),
+            local_code_intelligence::filter::FilterRequest::default(),
+            local_code_intelligence::app::SearchOptions {
+                trace_candidates: true,
+            },
+        )
+        .await
+        .unwrap();
+    let traced = report.candidates.as_ref().expect("the pool was traced");
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    assert!(
+        traced.iter().any(|row| row.semantic_rank.is_some()
+            && row.lexical_rank.is_some()
+            && row.lsp_rank.is_some()),
+        "every channel contributed: {traced:?}"
+    );
+
+    let maps = app
+        .fuse_through_maps(&workspace, "Calculator")
+        .await
+        .unwrap();
+    assert!(maps.warnings.is_empty(), "{:?}", maps.warnings);
+    assert!(maps.notes.is_empty(), "{:?}", maps.notes);
+    assert_eq!(maps.rows.len(), traced.len());
+    for (row, trace) in maps.rows.iter().zip(traced) {
+        assert_eq!(
+            (&row.relative_file_path, row.start_line, row.end_line),
+            (&trace.relative_file_path, trace.start_line, trace.end_line)
+        );
+        assert_eq!(
+            row.fusion_score.to_bits(),
+            trace.fusion_score.to_bits(),
+            "{row:?} vs {trace:?}"
+        );
+        assert!(row.node.starts_with("chunk:"), "{}", row.node);
+    }
+    task.abort();
+}

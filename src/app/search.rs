@@ -4,6 +4,8 @@
 //! named `[search_profiles.<name>]` can override those switches and the
 //! rerank window per search (see [`App::search_in_profile`]).
 
+mod legacy_maps;
+
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
     config::{ChannelsConfig, FusionConfig, IndexFreshness, SearchSettings},
@@ -1434,6 +1436,8 @@ mod tests {
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
+
+    mod t0;
 
     thread_local! {
         pub(super) static LEXICAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
