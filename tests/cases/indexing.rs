@@ -3794,3 +3794,102 @@ async fn qt_linguist_detection_handles_a_bom_a_comment_mentioning_ts_and_an_empt
     );
     task.abort();
 }
+
+/// Spike slice S2 (map-trait.md, "Response unchanged"): the JSON `search_code`
+/// returns for the offline fixture is compared byte for byte with a golden file
+/// written from the production search before the map layer existed, so adding
+/// the map layer is shown not to change a response. Normalised before the
+/// comparison, and only these: the timings and the index wait (wall clock), the
+/// workspace path and id (per machine; backslashes in the rest of a path become
+/// `/`), and scores computed by model or library float arithmetic that may
+/// differ in the last bits between platforms (`semantic_score`,
+/// `lexical_score`, `reranker_score`), rounded to six decimals. `fusion_score`,
+/// ranks, order, warnings and notes are compared exactly. Set `BLESS_GOLDEN=1`
+/// to rewrite the file.
+#[tokio::test]
+async fn search_code_json_matches_the_golden_file() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("golden");
+    // The C# workspace of the channel tests, with a `golden_rank_<d>` marker
+    // in every chunk so the fake embedder gives each its own distance, plus a
+    // Go source and a Python test (no language server is configured for
+    // either, so no warning depends on the platform's error text).
+    write(
+        &workspace,
+        "src/Calculator.cs",
+        "// golden_rank_4\nnamespace Acceptance;\npublic sealed class Calculator\n{\n    // golden_rank_1\n    public int Add(int a, int b) => a + b;\n}\n",
+    );
+    write(
+        &workspace,
+        "src/totals.go",
+        "package totals\n\n// CalculatorTotal sums values. golden_rank_2\nfunc CalculatorTotal(values []int) int {\n\ttotal := 0\n\tfor _, v := range values {\n\t\ttotal += v\n\t}\n\treturn total\n}\n",
+    );
+    write(
+        &workspace,
+        "tests/calculator_test.py",
+        "def test_calculator_adds():\n    # golden_rank_3\n    assert 1 + 2 == 3\n",
+    );
+    let state = temp.path().join("lsp-state-golden");
+    config.lsp_search_budget_ms = 30_000;
+    config = with_fake_csharp_server(config, &state, &[], 10);
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+    app.index(&workspace).await.unwrap();
+    let report = app
+        .search_in_profile(
+            &workspace,
+            "Calculator",
+            Some(10),
+            local_code_intelligence::filter::FilterRequest::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    // What the MCP tool returns: `serde_json::to_value` of the report.
+    let mut value = serde_json::to_value(&report).unwrap();
+    let root = report.workspace.path.to_string_lossy().into_owned();
+    fn normalise(value: &mut Value, root: &str, key: Option<&str>) {
+        match value {
+            Value::Object(map) => {
+                for (name, field) in map.iter_mut() {
+                    normalise(field, root, Some(name));
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    normalise(item, root, key);
+                }
+            }
+            Value::String(text) if text.starts_with(root) => {
+                *text = format!("<workspace>{}", &text[root.len()..]).replace('\\', "/");
+            }
+            Value::Number(number)
+                if matches!(
+                    key,
+                    Some("semantic_score" | "lexical_score" | "reranker_score")
+                ) =>
+            {
+                let rounded = (number.as_f64().unwrap() * 1e6).round() / 1e6;
+                *value = json!(rounded);
+            }
+            _ => {}
+        }
+    }
+    normalise(&mut value, &root, None);
+    for field in value["timings"].as_object_mut().unwrap().values_mut() {
+        *field = json!(0.0);
+    }
+    value["index"]["wait_ms"] = json!(0.0);
+    value["workspace"]["id"] = json!("<workspace-id>");
+    let actual = serde_json::to_string_pretty(&value).unwrap() + "\n";
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/search_code_channels.json");
+    if std::env::var_os("BLESS_GOLDEN").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::write(&golden, &actual).unwrap();
+    }
+    let expected = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|error| panic!("{}: {error}; run with BLESS_GOLDEN=1", golden.display()))
+        .replace("\r\n", "\n");
+    assert_eq!(actual, expected, "search_code JSON changed");
+    task.abort();
+}
