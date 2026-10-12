@@ -29,6 +29,9 @@ pub const FORMAT: u32 = 1;
 /// Hex digits of the workspace id in the directory name, as in table names
 /// (`ws_<16 hex>`), so the path stays short on Windows.
 const WORKSPACE_DIGITS: usize = 16;
+/// How old a temporary file must be before [`BundleStore::retain`] takes
+/// it for the leftover of a killed writer and deletes it.
+pub const STALE_TEMPORARY: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Hex digits of the key hash in a file name (128 bits; the full key is in
 /// the file and checked on read, so a collision reads as missing).
 const KEY_DIGITS: usize = 32;
@@ -118,7 +121,14 @@ impl BundleStore {
         };
         match serde_json::from_slice::<Read<P>>(&bytes) {
             Ok(read) if read.format == FORMAT && read.key == *key => Ok(Some(read.payload)),
-            Ok(_) => Ok(None),
+            Ok(read) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    format = read.format,
+                    "bundle of another format or key; extracting again"
+                );
+                Ok(None)
+            }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "unreadable bundle; extracting again");
                 Ok(None)
@@ -128,7 +138,10 @@ impl BundleStore {
 
     /// Stores `payload` for `key`, replacing any previous bundle. The file
     /// is written beside its final name and renamed into place, so a reader
-    /// never sees half a bundle.
+    /// never sees half a bundle. When the rename fails but a bundle of the
+    /// same key is in place (another writer won, or Windows refused to
+    /// replace a file someone holds open), that bundle is kept: a bundle is
+    /// a function of its key, so it is the same payload.
     pub fn put<P: Serialize>(&self, key: &BundleKey, payload: &P) -> Result<()> {
         let path = self.path_of(key);
         let directory = path.parent().expect("a bundle path has a parent");
@@ -149,14 +162,21 @@ impl BundleStore {
             .with_context(|| format!("write bundle {}", temporary.display()))?;
         if let Err(error) = std::fs::rename(&temporary, &path) {
             let _ = std::fs::remove_file(&temporary);
+            if matches!(self.get::<serde_json::Value>(key), Ok(Some(_))) {
+                return Ok(());
+            }
             return Err(error).with_context(|| format!("store bundle {}", path.display()));
         }
         Ok(())
     }
 
     /// Deletes every bundle file of this store whose key is not in `keep`;
-    /// returns how many it deleted. Only files named as this store names
-    /// bundles are touched.
+    /// returns how many it deleted. `keep` must hold the keys of every
+    /// producer that uses this store: a file name does not say which producer
+    /// wrote it, so a bundle of a producer left out of `keep` is deleted (and
+    /// extracted again by that producer's next sync). Only files named as
+    /// this store names bundles are touched, plus temporary files of writes
+    /// that did not finish within [`STALE_TEMPORARY`] (a killed writer).
     pub fn retain(&self, keep: &HashSet<BundleKey>) -> Result<usize> {
         let keep: HashSet<PathBuf> = keep.iter().map(|key| self.path_of(key)).collect();
         let shards = match std::fs::read_dir(&self.root) {
@@ -170,20 +190,41 @@ impl BundleStore {
             name.len() == length && name.bytes().all(|b| b.is_ascii_hexdigit())
         };
         let mut deleted = 0;
+        let listed = |directory: &Path| format!("list bundles {}", directory.display());
         for shard in shards {
-            let shard = shard?;
+            let shard = shard.with_context(|| listed(&self.root))?;
             let shard_name = shard.file_name();
-            if !shard.file_type()?.is_dir() || !shard_name.to_str().is_some_and(|n| is_hex(n, 2)) {
+            let is_directory = shard
+                .file_type()
+                .with_context(|| listed(&shard.path()))?
+                .is_dir();
+            if !is_directory || !shard_name.to_str().is_some_and(|n| is_hex(n, 2)) {
                 continue;
             }
-            for file in std::fs::read_dir(shard.path())? {
-                let file = file?;
+            let shard_path = shard.path();
+            for file in std::fs::read_dir(&shard_path).with_context(|| listed(&shard_path))? {
+                let file = file.with_context(|| listed(&shard_path))?;
                 let path = file.path();
-                let named_as_bundle = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
+                let name = path.file_name().and_then(|name| name.to_str());
+                let named_as_bundle = name
                     .and_then(|name| name.strip_suffix(".json"))
                     .is_some_and(|stem| is_hex(stem, KEY_DIGITS - 2));
+                let stale_temporary = name
+                    .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+                    && file
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > STALE_TEMPORARY);
+                if stale_temporary {
+                    // Best effort: a writer that just finished may have
+                    // renamed it away.
+                    if std::fs::remove_file(&path).is_ok() {
+                        deleted += 1;
+                    }
+                    continue;
+                }
                 if named_as_bundle && !keep.contains(&path) {
                     std::fs::remove_file(&path)
                         .with_context(|| format!("delete bundle {}", path.display()))?;

@@ -285,9 +285,14 @@ manifest is unchanged (`VERSION = 2`).
   `{format, key, payload}`; a file of another format or key (a digest collision), or one that
   does not parse, reads as missing; a file that exists but cannot be read is an error. Writes
   go to a temporary file in the same directory and are renamed into place. The relative path
-  is 63 characters, so a `data_dir` under the 150-character limit stays under 260 on Windows.
-  `BundleStore::retain(keys)` deletes the bundle files of one workspace that no current file
-  uses, and nothing else.
+  is 63 characters (a temporary file's name is longer, up to about 70 characters), so a
+  `data_dir` under the 150-character limit stays under 260 on Windows. When the rename fails
+  but a bundle of the same key is in place (another writer, or Windows refusing to replace a
+  file held open), that bundle is kept: a bundle is a function of its key.
+  `BundleStore::retain(keys)` deletes the bundle files of one workspace whose key is not in
+  `keys`, and temporary files older than an hour (a killed writer); nothing else. A file name
+  does not say which producer wrote it, so `keys` must be the union over every producer that
+  uses the store (today only `sym.defs@1`).
 - **Producers and sync.** A `Producer` names itself with a version (`sym.defs@1`), says which
   languages it applies to, and derives a payload from an `Extraction`. `bundle::sync(store,
   producer, root, files)` visits a scan's files in path order: a stored bundle is reused

@@ -67,8 +67,9 @@ pub struct Synced<P> {
 /// Brings `store` up to `files` (a scan's or a manifest's files of the
 /// workspace at `root`) and returns every payload. A file is read only when
 /// its bundle is missing; it must still have the content and adapter the
-/// scan recorded, or the sync fails and stores nothing more, so a caller can
-/// keep its previous data (contract C3). Files are visited in path order.
+/// scan recorded, or the sync fails, so a caller can keep its previous data
+/// (contract C3); bundles stored before the failure stay and are reused
+/// later. Files are visited in path order.
 pub fn sync<P: Producer>(
     store: &BundleStore,
     producer: &P,

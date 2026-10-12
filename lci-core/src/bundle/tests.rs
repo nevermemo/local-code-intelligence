@@ -136,6 +136,29 @@ fn retain_deletes_only_unkept_bundles_of_this_store() {
 }
 
 #[test]
+fn retain_deletes_temporary_files_of_killed_writers_only_once_they_are_old() {
+    let (_temp, store) = store();
+    store.put(&key("h1"), &1u32).unwrap();
+    let shard = store.path_of(&key("h1")).parent().unwrap().to_owned();
+    let old = shard.join(".0123.999.0.tmp");
+    let fresh = shard.join(".0123.999.1.tmp");
+    std::fs::write(&old, "partial").unwrap();
+    std::fs::write(&fresh, "partial").unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - 2 * STALE_TEMPORARY;
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(two_hours_ago)
+        .unwrap();
+    let keep: HashSet<BundleKey> = [key("h1")].into();
+    assert_eq!(store.retain(&keep).unwrap(), 1);
+    assert!(!old.exists());
+    assert!(fresh.exists(), "a write in progress keeps its file");
+    assert_eq!(store.get::<u32>(&key("h1")).unwrap(), Some(1));
+}
+
+#[test]
 fn the_store_lives_under_the_data_dir_and_its_paths_stay_short() {
     let temp = tempfile::tempdir().unwrap();
     let store = BundleStore::new(temp.path(), &"ab".repeat(32));
@@ -147,9 +170,9 @@ fn the_store_lives_under_the_data_dir_and_its_paths_stay_short() {
     assert!(relative.starts_with(Path::new("bundles").join("abababababababab")));
 }
 
-mod sync {
+mod synced {
     use super::super::*;
-    use crate::{chunk::scan_incremental, manifest::CachedFile, node::NodeId};
+    use crate::{chunk::scan_incremental, manifest::CachedFile};
     use std::collections::HashMap;
 
     fn write(root: &Path, name: &str, content: &str) {
@@ -259,8 +282,29 @@ mod sync {
             symbols(&full, &second.files),
             symbols(&moved, &second.files)
         );
-        let chunk = NodeId::chunk("src/engine/core.rs", "h", 0).unwrap();
-        assert_eq!(chunk.path(), Some("src/engine/core.rs"));
+        // Reuse never reads the file: with the tree gone, the sync of the
+        // same scan still succeeds from the bundles alone.
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        let unread = sync(&store, &Declarations, root, &second.files).unwrap();
+        assert_eq!((unread.reused, unread.extracted), (2, 0));
+    }
+
+    #[test]
+    fn a_copied_file_is_extracted_once_and_joined_at_both_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        write(root, "src/a.rs", "pub fn shared() {}\n");
+        write(root, "src/b.rs", "pub fn shared() {}\n");
+        let store = BundleStore::new(data.path(), &"ab".repeat(32));
+        let scan = scan_incremental(root, &HashMap::new()).unwrap();
+        let synced = sync(&store, &Declarations, root, &scan.files).unwrap();
+        assert_eq!((synced.reused, synced.extracted), (1, 1));
+        assert_eq!(synced.keys.len(), 1);
+        assert_eq!(
+            symbols(&synced, &scan.files),
+            ["sym:rust:a::shared/fn", "sym:rust:b::shared/fn"]
+        );
     }
 
     #[test]
