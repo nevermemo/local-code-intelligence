@@ -35,7 +35,7 @@ the GitHub Actions version for the first time:
    a 60-minute job timeout cut off a run that had already passed every
    acceptance step and was just finishing evaluation/cleanup. Bumping the
    number (now 150 minutes) helps, but it's still one blind guess covering
-   ~19 steps of wildly different expected duration (a small-fixture
+   about two dozen steps of wildly different expected duration (a small-fixture
    provider-isolation check should fail fast if it's stuck; a cold
    embedding pass against a real external workspace legitimately needs
    room to run long). `cargo xtask live-acceptance` gives each step its
@@ -72,13 +72,9 @@ here.
 This command is a supervisor *outside* the process it's watching, so it can
 only ever see wall-clock time and coarse OS-level signals like CPU time --
 it has no way to see "real progress" inside an opaque blocking call that
-reports none. The genuinely "smart" fix for that lives in the product code
-itself, not in a wrapper: `lci-core/src/lsp/transport.rs`'s per-request
-LSP timeout and `lci-core/src/models.rs`'s embedding/reranker HTTP timeouts
-are the same shape of blind timeout this command works around, and the real
-fix there is resetting the deadline on genuine progress signals the
-protocol already provides (e.g. LSP's `$/progress` notifications) rather
-than one fixed wait for the whole call.
+reports none. The LSP transport in `lci-core/src/lsp/transport.rs` already
+uses an inactivity deadline; only the embedding/reranker HTTP calls in
+`lci-core/src/models.rs` keep a fixed timeout with retries.
 
 ## Usage
 

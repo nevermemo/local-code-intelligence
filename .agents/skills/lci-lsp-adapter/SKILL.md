@@ -7,7 +7,7 @@ description: Add or change an optional language-server integration in local-code
 
 Keep LSP optional and fail-open for code search while returning clear errors from direct navigation tools.
 
-Where things live: one adapter module per server under `lci-core/src/lsp/` (`rust.rs`, `csharp.rs`, `typescript.rs`, `python.rs`, `go.rs`, `java.rs`, `clangd.rs`) behind the shared trait in `adapter.rs` and the JSON-RPC transport in `transport.rs`; registration in `Manager::new` (`lci-core/src/lsp.rs`); the per-server `[<section>]` config in `lci-core/src/config.rs`; the real-server acceptance specs under `xtask/src/acceptance/`.
+Where things live: one adapter module per server under `lci-core/src/lsp/` (`rust.rs`, `csharp.rs`, `typescript.rs`, `python.rs`, `go.rs`, `java.rs`, `clangd.rs`) behind the shared trait in `adapter.rs` and the JSON-RPC transport in `transport.rs`; registration in `Manager::new` (`lci-core/src/lsp.rs`); the per-server `[<section>]` config in `lci-core/src/config.rs` (rust-analyzer: top-level `rust_analyzer_*` keys); the real-server acceptance specs under `xtask/src/acceptance/`.
 
 1. Read [the lifecycle and routing contract](references/lifecycle.md).
 2. Reuse a persistent process per compatible workspace and server configuration.
