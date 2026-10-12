@@ -19,11 +19,13 @@ pub struct McpServer {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceArgs {
     /// Absolute workspace directory. Canonicalized to a persistent workspace ID.
     pub workspace_path: String,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     pub workspace_path: String,
     pub query: String,
@@ -42,11 +44,13 @@ pub struct SearchArgs {
     pub source_roles: Option<Vec<String>>,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolArgs {
     pub workspace_path: String,
     pub query: String,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PositionArgs {
     pub workspace_path: String,
     /// Workspace-relative source path (Rust, C#, TypeScript, TSX,
@@ -58,6 +62,7 @@ pub struct PositionArgs {
     pub character: u32,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReferencesArgs {
     pub workspace_path: String,
     pub relative_file_path: String,

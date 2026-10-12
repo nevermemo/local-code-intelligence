@@ -103,6 +103,36 @@ async fn http_mcp_initialization_tools_and_health() {
         assert!(body.contains(expected), "{name}: {body}");
         assert!(!body.contains("\"isError\":true"), "{body}");
     }
+    let invalid_arguments = mcp_post(
+        &client,
+        &base,
+        Some(&session),
+        &json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
+                "name":"search_code",
+                "arguments":{
+                    "workspace_path":workspace,
+                    "query":"translator",
+                    "include_path":["nothing/**"],
+                    "topk":1
+                }
+            }
+        }),
+    )
+    .await;
+    assert!(invalid_arguments.status().is_success());
+    let invalid_arguments = rpc_response(&invalid_arguments.text().await.unwrap());
+    assert!(
+        invalid_arguments.get("error").is_some() || invalid_arguments["result"]["isError"] == true,
+        "{invalid_arguments}"
+    );
+    assert!(
+        invalid_arguments.to_string().contains("include_path"),
+        "{invalid_arguments}"
+    );
     let rejected = client
         .post(format!("{base}/mcp"))
         .header("Origin", "https://untrusted.example")
@@ -156,6 +186,20 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     ] {
         assert!(openapi["paths"][path].is_object(), "{path}: {openapi}");
     }
+    for path in [
+        "/v1/index_workspace",
+        "/v1/search_symbols",
+        "/v1/find_definition",
+        "/v1/find_references",
+        "/v1/search_code",
+    ] {
+        assert_eq!(
+            openapi["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                ["additionalProperties"],
+            false,
+            "{path}: {openapi}"
+        );
+    }
 
     let indexed = client
         .post(format!("{base}/v1/index_workspace"))
@@ -188,6 +232,31 @@ async fn rest_surface_mirrors_the_mcp_tools() {
             .as_array()
             .is_some_and(|results| !results.is_empty())
     );
+
+    let invalid_arguments = client
+        .post(format!("{base}/v1/search_code"))
+        .json(&json!({
+            "workspace_path": workspace,
+            "query": "translator",
+            "include_path": ["nothing/**"],
+            "topk": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!invalid_arguments.status().is_success());
+    let body = invalid_arguments.text().await.unwrap();
+    assert!(body.contains("include_path"), "{body}");
+
+    let invalid_query = client
+        .post(format!("{base}/v1/search_code?search_profiel=fast"))
+        .json(&json!({"workspace_path": workspace, "query": "translator"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!invalid_query.status().is_success());
+    let body = invalid_query.text().await.unwrap();
+    assert!(body.contains("search_profiel"), "{body}");
 
     let ready = client
         .get(format!("{base}/v1/service_status"))
@@ -715,6 +784,19 @@ async fn each_search_profile_has_its_own_mcp_endpoint_with_the_same_tools() {
         .iter()
         .find(|tool| tool["name"] == "search_code")
         .unwrap();
+    for name in [
+        "index_workspace",
+        "search_code",
+        "search_symbols",
+        "find_definition",
+        "find_references",
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"], false,
+            "{name}: {tool}"
+        );
+    }
     let mut arguments: Vec<&str> = search_tool["inputSchema"]["properties"]
         .as_object()
         .unwrap()

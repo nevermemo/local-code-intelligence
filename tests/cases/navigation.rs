@@ -2736,6 +2736,27 @@ async fn symbols_name_an_indexed_language_whose_only_server_is_disabled() {
     models_task.abort();
 }
 
+#[tokio::test]
+async fn symbols_reject_queries_over_16000_bytes() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let mut config = config;
+    config.csharp.disabled = true;
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let accepted = app.symbols(&workspace, &"x".repeat(16000)).await.unwrap();
+    assert!(accepted.results.is_empty());
+
+    let error = app
+        .symbols(&workspace, &"x".repeat(16001))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "query exceeds 16000 bytes");
+    models_task.abort();
+}
+
 /// The same in a mixed workspace: the language with a server that is switched
 /// off is named, and the other language is still searched.
 #[tokio::test]
