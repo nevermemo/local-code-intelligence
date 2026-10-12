@@ -204,6 +204,86 @@ fn warnings(results: &Value, arm: &str) -> usize {
     })
 }
 
+/// Rule 4's "back to back": both runs started within this many seconds.
+const BACK_TO_BACK_SECONDS: i64 = 6 * 3600;
+
+/// Seconds since the epoch of a `YYYY-MM-DDTHH:MM:SSZ` timestamp.
+fn epoch_seconds(text: &str) -> Option<i64> {
+    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    if text.len() != 20 || !text.ends_with('Z') {
+        return None;
+    }
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    // Days from civil (proleptic Gregorian).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+fn back_to_back(base: &Value, new: &Value) -> bool {
+    match (
+        base["started_at"].as_str().and_then(epoch_seconds),
+        new["started_at"].as_str().and_then(epoch_seconds),
+    ) {
+        (Some(b), Some(n)) => (n - b).abs() <= BACK_TO_BACK_SECONDS,
+        _ => false,
+    }
+}
+
+/// Per-repository and per-tag mean `rr` of the paired fusion tasks, with n;
+/// descriptive only, never a verdict.
+fn breakdown(table: &mut String, base: &Value, new: &Value) {
+    let mut groups: BTreeMap<String, (usize, f64, f64)> = BTreeMap::new();
+    let Some(tasks) = base["tasks"].as_array() else {
+        return;
+    };
+    for task in tasks {
+        let id = task["id"].as_str().unwrap_or_default();
+        let (b, n) = (arm_row(base, id, "fusion"), arm_row(new, id, "fusion"));
+        if !(scored(b) && scored(n)) {
+            continue;
+        }
+        let (rb, rn) = (metric(b.unwrap(), "rr"), metric(n.unwrap(), "rr"));
+        let mut keys = vec![format!("repo {}", task["repo"].as_str().unwrap_or("?"))];
+        keys.extend(
+            task["tags"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tag| tag.as_str().map(|tag| format!("tag {tag}"))),
+        );
+        for key in keys {
+            let entry = groups.entry(key).or_default();
+            entry.0 += 1;
+            entry.1 += rb;
+            entry.2 += rn;
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        table,
+        "\n| fusion rr by group (descriptive) | n | Base | New |"
+    );
+    let _ = writeln!(table, "| --- | --- | --- | --- |");
+    for (key, (n, rb, rn)) in &groups {
+        let count = *n as f64;
+        let _ = writeln!(
+            table,
+            "| {key} | {n} | {:.4} | {:.4} |",
+            rb / count,
+            rn / count
+        );
+    }
+}
+
 fn total_size(results: &Value) -> Option<f64> {
     let repos = results["repos"].as_array()?;
     let sizes: Vec<f64> = repos
@@ -367,7 +447,13 @@ pub fn compare(base: &Value, new: &Value, seed: u64, resamples: usize) -> Verdic
     let _ = writeln!(table, "\n| Level B | Base | New | Change |");
     let _ = writeln!(table, "| --- | --- | --- | --- |");
     let same_machine = base["machine"] == new["machine"];
-    if let (Some(b), Some(n)) = (total_size(base), total_size(new)) {
+    let back_to_back = back_to_back(base, new);
+    let judge_cost = same_machine && back_to_back;
+    let size = (total_size(base), total_size(new));
+    if size.0.is_none() || size.1.is_none() {
+        notes.push("index size: not comparable (a repository has no size on one side)".to_owned());
+    }
+    if let (Some(b), Some(n)) = size {
         let g = growth(b, n);
         let _ = writeln!(
             table,
@@ -402,8 +488,19 @@ pub fn compare(base: &Value, new: &Value, seed: u64, resamples: usize) -> Verdic
         if let (Some(pb), Some(pn)) = (percentile(b, 50.0), percentile(n, 50.0)) {
             let g = growth(pb, pn);
             let _ = writeln!(table, "| {name} | {pb:.1} | {pn:.1} | {:+.1}% |", g * 100.0);
-            // Rule 4 judges update and the fusion arm, on one machine only.
-            if index < 2 && same_machine && g > COST_GROWTH {
+            for (label, p) in [("p95", 95.0), ("max", 100.0)] {
+                if let (Some(xb), Some(xn)) = (percentile(b, p), percentile(n, p)) {
+                    let _ = writeln!(
+                        table,
+                        "| {} | {xb:.1} | {xn:.1} | {:+.1}% |",
+                        name.replace("p50", label),
+                        growth(xb, xn) * 100.0
+                    );
+                }
+            }
+            // Rule 4 judges update and the fusion arm, on one machine, back
+            // to back only.
+            if index < 2 && judge_cost && g > COST_GROWTH {
                 regressions.push(format!(
                     "rule 4: {name} grew {:+.1}% (> 25%, same machine)",
                     g * 100.0
@@ -420,7 +517,13 @@ pub fn compare(base: &Value, new: &Value, seed: u64, resamples: usize) -> Verdic
     }
     if !same_machine {
         notes.push("machines differ: costs are printed, not judged (rule 4)".to_owned());
+    } else if !back_to_back {
+        notes.push(format!(
+            "runs started more than {} h apart: costs are printed, not judged (rule 4)",
+            BACK_TO_BACK_SECONDS / 3600
+        ));
     }
+    breakdown(&mut table, base, new);
     let _ = writeln!(table, "\n### Verdict\n");
     if regressions.is_empty() {
         let _ = writeln!(table, "No regression under the pre-registered rules.");
@@ -457,6 +560,7 @@ mod tests {
             .collect();
         json!({
             "schema": RESULTS_SCHEMA,
+            "started_at": "2026-10-12T17:00:00Z",
             "bench_set": {"version": "v1"},
             "embedder": {"model": "fake"},
             "machine": {"cpu": machine},
@@ -520,9 +624,46 @@ mod tests {
         let verdict = compare(&base, &new, 42, 1000);
         assert!(verdict.regressions.iter().any(|r| r.starts_with("rule 3")));
         assert!(verdict.regressions.iter().any(|r| r.starts_with("rule 4")));
+        // Same machine but a day apart: printed, not judged.
+        let mut later = new.clone();
+        later["started_at"] = json!("2026-10-13T17:00:01Z");
+        let verdict = compare(&base, &later, 42, 1000);
+        assert!(!verdict.regressions.iter().any(|r| r.starts_with("rule 4")));
         new["machine"] = json!({"cpu": "other"});
         let verdict = compare(&base, &new, 42, 1000);
         assert!(!verdict.regressions.iter().any(|r| r.starts_with("rule 4")));
         assert!(verdict.regressions.iter().any(|r| r.starts_with("rule 3")));
+    }
+
+    #[test]
+    fn an_improvement_is_claimable_only_without_errors_or_unpaired_tasks() {
+        let base = results(&[0.5; 40], "m", 100.0);
+        let new = results(&[1.0; 40], "m", 100.0);
+        let verdict = compare(&base, &new, 42, 1000);
+        assert!(verdict.regressions.is_empty());
+        assert!(
+            verdict
+                .table
+                .contains("rule 1 mirrored (fusion): improvement")
+        );
+        assert!(
+            !verdict.table.contains("not claimable"),
+            "{}",
+            verdict.table
+        );
+        let mut short = new.clone();
+        short["tasks"].as_array_mut().unwrap().pop();
+        let mut base_more = base.clone();
+        base_more["tasks"][0]["arms"]["fusion"] = json!({"error": "boom"});
+        let verdict = compare(&base_more, &short, 42, 1000);
+        assert!(verdict.table.contains("not claimable"), "{}", verdict.table);
+    }
+
+    #[test]
+    fn epoch_seconds_reads_the_results_timestamp() {
+        assert_eq!(epoch_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(epoch_seconds("2026-10-12T17:00:00Z"), Some(1_791_824_400));
+        assert_eq!(epoch_seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(epoch_seconds("not a time"), None);
     }
 }

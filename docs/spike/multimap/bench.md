@@ -44,7 +44,8 @@ cloud runner and CI do not have. v1 therefore measures:
   in the `fusion` arm; over the top 5 *distinct files*, precision@5 = share of them in
   which the fix changed that symbol, recall@5 = share of gold symbols with such a file in
   the top 5.
-- `defs` and `navigation`: recorded as `unavailable` with the reason. They switch on when
+- `defs` and `navigation`: recorded as `unavailable` with the reason (the results'
+  `unavailable` block). They switch on when
   a build exposes `sym.defs` (a CLI or REST surface) and the runner has a language server;
   the gold for them is already in the set (section 4).
 
@@ -70,7 +71,8 @@ service that `cargo xtask bench run` starts in process on `127.0.0.1` with an ep
 port (never 8765-8770), pointed to by the run's scratch configuration. The vector of a
 text is fixed by this definition, so two machines produce the same vectors:
 
-- strip a leading query instruction up to and including the first `Query: `;
+- when the text starts with `Instruct:` (the production query template), strip it up to
+  and including the first `Query: `; any other text is embedded whole;
 - split into words at every non-alphanumeric character and at camelCase boundaries,
   lowercase, keep words of two or more characters that are not all digits;
 - each distinct word adds `1 + ln(count)` to dimension `h mod 512` with sign `+` when bit
@@ -171,7 +173,8 @@ Written before any result exists. In a `compare` verdict:
 4. **Cost (level B):** regression when p50 of `update` wall time or of the `fusion`
    arm's `total_ms` grows by more than 25%, judged only when both results files carry
    the same `machine` fingerprint (CPU model, logical cores, OS, architecture, ripgrep
-   version) and were produced back to back; otherwise printed, never judged.
+   version) and both runs started within 6 hours of each other (back to back);
+   otherwise printed, never judged.
 5. **Insufficient data:** with fewer than 30 paired tasks in an arm, rule 1 and its
    mirror give "insufficient data", not a verdict.
 
@@ -213,8 +216,9 @@ gating workflow) needs a new approval.
 
 ## 9. Open decisions
 
-- **D1:** the workflow reports a regression verdict but does not fail the job. Flip with
-  `bench compare --fail-on-regression` once the owner wants the schedule to gate.
+- **D1:** the workflow reports a regression verdict but does not fail the job. Flip by
+  adding `--fail-on-regression` to its `bench run` step once the owner wants the
+  schedule to gate.
 - **D2:** level B `defs` and `navigation` stay `unavailable` until a build exposes
   `sym.defs` and the runner has language servers (section 2.1).
 - **D3:** level C reads `evaluate` reports, not RunRecords, until the S4 harness reaches

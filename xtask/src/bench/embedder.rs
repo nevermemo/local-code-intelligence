@@ -37,9 +37,14 @@ fn words(text: &str) -> Vec<String> {
 
 /// The vector of one input text.
 pub fn embed(text: &str) -> Vec<f32> {
-    let text = text
-        .find("Query: ")
-        .map_or(text, |at| &text[at + "Query: ".len()..]);
+    // Only a leading query instruction (the production template starts with
+    // `Instruct:`); a document that merely contains `Query: ` is untouched.
+    let text = if text.starts_with("Instruct:") {
+        text.find("Query: ")
+            .map_or(text, |at| &text[at + "Query: ".len()..])
+    } else {
+        text
+    };
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
     for word in words(text) {
         *counts.entry(word).or_default() += 1;
@@ -81,10 +86,16 @@ fn answer(method: &str, path: &str, body: &[u8]) -> Vec<u8> {
             let Ok(request) = serde_json::from_slice::<Value>(body) else {
                 return respond("400 Bad Request", &json!({"error": "invalid JSON"}));
             };
-            let inputs: Vec<&str> = match &request["input"] {
-                Value::String(text) => vec![text.as_str()],
-                Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
-                _ => Vec::new(),
+            let inputs: Option<Vec<&str>> = match &request["input"] {
+                Value::String(text) => Some(vec![text.as_str()]),
+                Value::Array(items) => items.iter().map(Value::as_str).collect(),
+                _ => None,
+            };
+            let Some(inputs) = inputs else {
+                return respond(
+                    "400 Bad Request",
+                    &json!({"error": "input must be a string or an array of strings"}),
+                );
             };
             let data: Vec<Value> = inputs
                 .iter()
@@ -120,10 +131,17 @@ async fn serve_connection(stream: tokio::net::TcpStream) -> Result<()> {
             if header.is_empty() {
                 break;
             }
-            if let Some((name, value)) = header.split_once(':')
-                && name.trim().eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().context("bad content-length")?;
+            if let Some((name, value)) = header.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().context("bad content-length")?;
+                } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                    // Only Content-Length bodies are read; answer and close
+                    // rather than desynchronise the connection.
+                    let response =
+                        respond("411 Length Required", &json!({"error": "length required"}));
+                    reader.get_mut().write_all(&response).await?;
+                    return Ok(());
+                }
             }
         }
         anyhow::ensure!(length <= MAX_BODY_BYTES, "request body too large");
@@ -134,20 +152,34 @@ async fn serve_connection(stream: tokio::net::TcpStream) -> Result<()> {
     }
 }
 
-/// Start the service on `127.0.0.1` with an ephemeral port; returns the
-/// embedding URL (`http://127.0.0.1:<port>/v1`).
-pub async fn start() -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("binding the fake embedder")?;
+/// Start the service on `127.0.0.1` with an ephemeral port, on its own
+/// thread and runtime, so a caller that blocks on a child process (which
+/// asks this service for vectors) cannot starve it; returns the embedding URL
+/// (`http://127.0.0.1:<port>/v1`). The thread lives until the process exits.
+pub fn start() -> Result<String> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("binding the fake embedder")?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let _ = serve_connection(stream).await;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .context("building the fake embedder runtime")?;
+    std::thread::Builder::new()
+        .name("bench-fake-embedder".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let Ok(listener) = TcpListener::from_std(listener) else {
+                    return;
+                };
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = serve_connection(stream).await;
+                    });
+                }
             });
-        }
-    });
+        })
+        .context("starting the fake embedder thread")?;
     Ok(format!("http://{address}/v1"))
 }
 
@@ -173,6 +205,10 @@ mod tests {
     fn the_query_instruction_is_stripped_and_words_drive_similarity() {
         let query = embed("Instruct: retrieve code\nQuery: poll ready timer");
         assert_eq!(query, embed("poll ready timer"));
+        // Only a leading instruction is stripped.
+        let document = "// Query: parse header\nfn poll_ready() {}";
+        assert_ne!(embed(document), embed("parse header fn poll_ready() {}"));
+        assert_eq!(embed(document), embed("Query parse header fn poll ready"));
         let related = embed("fn poll_ready(timer: Timer) {}");
         let unrelated = embed("def parse_grammar(table): return table");
         assert!(cosine(&query, &related) > cosine(&query, &unrelated));
@@ -187,11 +223,48 @@ mod tests {
         let dimension = (hash % DIMENSION as u64) as usize;
         let sign = if hash >> 63 == 0 { 1.0 } else { -1.0 };
         assert_eq!(vector[dimension], sign);
+        // Bit 63 set, bit 62 clear: a negative sign on dimension 56.
+        assert_eq!(fnv1a(b"poll"), 0x8c18_cf0d_a882_8238);
+        assert_eq!(embed("poll")[56], -1.0);
+        // Bit 63 clear, bit 62 set: positive on dimension 210.
+        assert_eq!(embed("server")[210], 1.0);
+    }
+
+    #[test]
+    fn word_weights_are_pinned() {
+        // `1 + ln(count)` after the f32 cast, for the counts that occur in
+        // practice: a libm that differs here would change every vector.
+        let expected: [f32; 8] = [
+            1.0,
+            1.693_147_2,
+            2.098_612_3,
+            2.386_294_4,
+            2.609_438,
+            2.791_759_5,
+            2.945_910_2,
+            3.079_441_5,
+        ];
+        for (count, want) in (1u32..=8).zip(expected) {
+            assert_eq!((1.0 + f64::from(count).ln()) as f32, want, "count {count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_service_rejects_non_string_inputs() {
+        let url = start().unwrap();
+        let status = reqwest::Client::new()
+            .post(format!("{url}/embeddings"))
+            .json(&json!({"input": ["ok", 3]}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 400);
     }
 
     #[tokio::test]
     async fn the_service_answers_models_and_embeddings_in_order() {
-        let url = start().await.unwrap();
+        let url = start().unwrap();
         let client = reqwest::Client::new();
         let models: Value = client
             .get(format!("{url}/models"))

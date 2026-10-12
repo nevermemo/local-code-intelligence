@@ -52,56 +52,7 @@ pub enum BenchCommand {
     /// Run levels B and C for one frozen build against a bench set and
     /// write a results JSON. With --baseline also print (and with --table
     /// write) the comparison against an earlier results file.
-    Run {
-        /// Frozen binary (from `bench freeze`).
-        #[arg(long)]
-        bin: PathBuf,
-        /// Bench set.
-        #[arg(long, default_value = DEFAULT_SET)]
-        set: PathBuf,
-        /// Work directory: checkouts, data directories, scratch configs.
-        /// Must not be inside an indexed repository.
-        #[arg(long)]
-        work: PathBuf,
-        /// Cache of clones (default: <work>/clones).
-        #[arg(long)]
-        clones: Option<PathBuf>,
-        /// Results JSON to write.
-        #[arg(long)]
-        output: PathBuf,
-        /// Levels to run: B, C or both (comma-separated).
-        #[arg(long, default_value = "B,C")]
-        levels: String,
-        /// Arms (comma-separated): fusion, grep.
-        #[arg(long, default_value = "fusion,grep")]
-        arms: String,
-        /// Use this OpenAI-compatible embedding service instead of the fake
-        /// one (level D). Needs --embedding-model.
-        #[arg(long, requires = "embedding_model")]
-        embedding_url: Option<String>,
-        #[arg(long)]
-        embedding_model: Option<String>,
-        /// Only these repositories (repeatable).
-        #[arg(long = "repo")]
-        repos: Vec<String>,
-        /// Only these task ids (repeatable). A task run alone is indexed
-        /// from scratch at its base commit (the incremental-equals-full
-        /// check).
-        #[arg(long = "task")]
-        tasks: Vec<String>,
-        /// At most this many tasks per repository (the oldest first).
-        #[arg(long)]
-        max_per_repo: Option<usize>,
-        /// Free-text label stored in the results.
-        #[arg(long)]
-        label: Option<String>,
-        /// Earlier results file to compare against.
-        #[arg(long)]
-        baseline: Option<PathBuf>,
-        /// Write the comparison table (Markdown) here.
-        #[arg(long, requires = "baseline")]
-        table: Option<PathBuf>,
-    },
+    Run(Box<RunArgs>),
     /// Compare two results files (base, then new) under the pre-registered
     /// rules; prints a Markdown table and the verdict.
     Compare {
@@ -118,6 +69,61 @@ pub enum BenchCommand {
         #[arg(long)]
         fail_on_regression: bool,
     },
+}
+
+#[derive(clap::Args)]
+pub struct RunArgs {
+    /// Frozen binary (from `bench freeze`).
+    #[arg(long)]
+    pub bin: PathBuf,
+    /// Bench set.
+    #[arg(long, default_value = DEFAULT_SET)]
+    pub set: PathBuf,
+    /// Work directory: checkouts, data directories, scratch configs.
+    /// Must not be inside an indexed repository.
+    #[arg(long)]
+    pub work: PathBuf,
+    /// Cache of clones (default: <work>/clones).
+    #[arg(long)]
+    pub clones: Option<PathBuf>,
+    /// Results JSON to write.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Levels to run: B, C or both (comma-separated).
+    #[arg(long, default_value = "B,C")]
+    pub levels: String,
+    /// Arms (comma-separated): fusion, grep.
+    #[arg(long, default_value = "fusion,grep")]
+    pub arms: String,
+    /// Use this OpenAI-compatible embedding service instead of the fake
+    /// one (level D). Needs --embedding-model.
+    #[arg(long, requires = "embedding_model")]
+    pub embedding_url: Option<String>,
+    #[arg(long)]
+    pub embedding_model: Option<String>,
+    /// Only these repositories (repeatable).
+    #[arg(long = "repo")]
+    pub repos: Vec<String>,
+    /// Only these task ids (repeatable). A task run alone is indexed
+    /// from scratch at its base commit (the incremental-equals-full
+    /// check).
+    #[arg(long = "task")]
+    pub tasks: Vec<String>,
+    /// At most this many tasks per repository (the oldest first).
+    #[arg(long)]
+    pub max_per_repo: Option<usize>,
+    /// Free-text label stored in the results.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Earlier results file to compare against.
+    #[arg(long)]
+    pub baseline: Option<PathBuf>,
+    /// Write the comparison table (Markdown) here.
+    #[arg(long, requires = "baseline")]
+    pub table: Option<PathBuf>,
+    /// Exit 1 when the comparison with --baseline lists a regression.
+    #[arg(long, requires = "baseline")]
+    pub fail_on_regression: bool,
 }
 
 fn freeze(out: &Path) -> Result<()> {
@@ -196,23 +202,25 @@ fn split_pair(text: &str, what: &str) -> Result<(String, String)> {
 pub async fn run(command: BenchCommand) -> Result<()> {
     match command {
         BenchCommand::Freeze { out } => freeze(&out),
-        BenchCommand::Run {
-            bin,
-            set,
-            work,
-            clones,
-            output,
-            levels,
-            arms,
-            embedding_url,
-            embedding_model,
-            repos,
-            tasks,
-            max_per_repo,
-            label,
-            baseline,
-            table,
-        } => {
+        BenchCommand::Run(args) => {
+            let RunArgs {
+                bin,
+                set,
+                work,
+                clones,
+                output,
+                levels,
+                arms,
+                embedding_url,
+                embedding_model,
+                repos,
+                tasks,
+                max_per_repo,
+                label,
+                baseline,
+                table,
+                fail_on_regression,
+            } = *args;
             let levels = list(&levels, |level| match level {
                 "B" | "b" => Ok('B'),
                 "C" | "c" => Ok('C'),
@@ -245,13 +253,19 @@ pub async fn run(command: BenchCommand) -> Result<()> {
             })
             .await?;
             if let Some(baseline) = baseline {
-                print_comparison(
+                let verdict = print_comparison(
                     &baseline,
                     &output,
                     table.as_deref(),
                     compare::DEFAULT_SEED,
                     compare::DEFAULT_RESAMPLES,
                 )?;
+                if fail_on_regression && !verdict.regressions.is_empty() {
+                    bail!(
+                        "{} regression(s) under the pre-registered rules",
+                        verdict.regressions.len()
+                    );
+                }
             }
             Ok(())
         }

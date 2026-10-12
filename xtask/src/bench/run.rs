@@ -262,6 +262,15 @@ fn evaluate(
         )
     })?;
     let report: Value = serde_json::from_str(&text).context("reading the evaluate report")?;
+    parse_report(&report)
+}
+
+/// Ranked distinct files, timing and any fail-open warning per query text
+/// of an evaluate report. A search that failed is reported by `evaluate` as
+/// outcome `failure` with no timings, and a skipped query has none either:
+/// both become errors. (`failure` alone also means "ran but missed the
+/// expected file", so the outcome is not the test.)
+pub fn parse_report(report: &Value) -> Result<Vec<(String, Value)>> {
     let queries = report["queries"]
         .as_array()
         .context("evaluate report has no queries")?;
@@ -272,8 +281,6 @@ fn evaluate(
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            // A search that failed is reported as a `failure` without
-            // timings; a skipped query has none either.
             let result = if query["skipped"].as_bool() == Some(true) || query["timings"].is_null() {
                 json!({"error": format!(
                     "{}: {}",
@@ -293,7 +300,6 @@ fn evaluate(
                     "files": distinct_files(&paths, TOP_K),
                     "total_ms": query["timings"]["total_ms"],
                 });
-                // A degraded channel (fail-open) is kept visible.
                 if let Some(warning) = query["warning"].as_str() {
                     row["warning"] = json!(warning);
                 }
@@ -373,7 +379,17 @@ pub async fn run(options: Options) -> Result<()> {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .unwrap_or_else(|| json!({"commit": "unknown"}));
     let work = std::path::absolute(&options.work)?;
+    // The runner deletes checkouts and data directories under the work
+    // directory: only in one it created (marker file) or an empty one.
+    let marker = work.join(".lci-bench-work");
+    if work.exists() && !marker.exists() && std::fs::read_dir(&work)?.next().is_some() {
+        bail!(
+            "{} is not empty and was not created by `bench run`; pass a new or empty directory",
+            work.display()
+        );
+    }
     std::fs::create_dir_all(&work)?;
+    std::fs::write(&marker, "cargo xtask bench run work directory\n")?;
     let clones = match &options.clones {
         Some(dir) => std::path::absolute(dir)?,
         None => work.join("clones"),
@@ -381,7 +397,7 @@ pub async fn run(options: Options) -> Result<()> {
 
     let (url, model, embedder) = match &options.embedder {
         Embedder::Fake => (
-            super::embedder::start().await?,
+            super::embedder::start()?,
             super::embedder::MODEL.to_owned(),
             json!({"kind": "fake", "model": super::embedder::MODEL, "dimension": super::embedder::DIMENSION}),
         ),
@@ -596,6 +612,10 @@ pub async fn run(options: Options) -> Result<()> {
         "machine": machine(),
         "embedder": embedder,
         "levels": levels,
+        "unavailable": {
+            "defs": "no build on this lineage exposes sym.defs (bench.md 2.1, D2)",
+            "navigation": "the runner has no language servers (bench.md 2.1, D2)",
+        },
         "arms": options.arms.iter().map(|arm| arm.name()).collect::<Vec<_>>(),
         "started_at": started_at,
         "finished_at": utc_now(),
@@ -639,6 +659,27 @@ mod tests {
             assert_eq!(parsed["index"]["freshness"].as_str(), Some("manual"));
             assert_eq!(parsed["data_dir"].as_str(), Some("/d"));
         }
+    }
+
+    #[test]
+    fn report_parsing_turns_failed_searches_into_errors() {
+        let report = json!({"queries": [
+            {"query": {"query": "ok"}, "skipped": false, "outcome": "failure", "reason": "expected not found",
+             "evidence": [{"relative_file_path": "a.rs"}, {"relative_file_path": "a.rs"}, {"relative_file_path": "b.rs"}],
+             "timings": {"total_ms": 12.5}, "warning": "semantic channel unavailable"},
+            {"query": {"query": "broken"}, "skipped": false, "outcome": "failure",
+             "reason": "search failed: boom", "evidence": []},
+            {"query": {"query": "gone"}, "skipped": true, "outcome": "skipped", "reason": "no workspace"},
+        ]});
+        let rows = parse_report(&report).unwrap();
+        assert_eq!(rows[0].0, "ok");
+        assert_eq!(rows[0].1["files"], json!(["a.rs", "b.rs"]));
+        assert_eq!(rows[0].1["total_ms"], json!(12.5));
+        assert_eq!(rows[0].1["warning"], json!("semantic channel unavailable"));
+        assert!(rows[0].1.get("error").is_none());
+        assert_eq!(rows[1].1["error"], json!("failure: search failed: boom"));
+        assert!(rows[2].1["error"].as_str().unwrap().starts_with("skipped"));
+        assert!(parse_report(&json!({})).is_err());
     }
 
     #[test]
