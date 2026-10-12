@@ -267,7 +267,7 @@ async fn main() -> Result<()> {
             out,
             max,
         } => mine::run(repo, key, out, max),
-        Command::Bench(command) => bench::run(command),
+        Command::Bench(command) => bench::run(command).await,
     }
 }
 

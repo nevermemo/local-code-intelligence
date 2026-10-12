@@ -1,0 +1,663 @@
+//! `cargo xtask bench run`: levels B and C of the spike bench for one frozen
+//! build (`docs/spike/multimap/bench.md`, sections 2, 3 and 5).
+//!
+//! Per repository of the set: a cached clone, one `git worktree` checkout and
+//! one sibling data directory under the work directory. Tasks are replayed
+//! oldest first: check out the base commit, `index`, search with each arm
+//! through the binary's `evaluate` command, then check out the fix commit and
+//! `index` again (the update cost). Freshness is `manual`, so no search
+//! refreshes an index.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
+
+use super::score::{distinct_files, score_lookup, score_task};
+use crate::mine::git;
+
+/// Schema id of a results file.
+pub const RESULTS_SCHEMA: &str = "lci.bench-results/1";
+/// Results window of the task query (the `@10` metrics need 10).
+const TOP_K: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// Semantic plus lexical, no reranker, no LSP.
+    Fusion,
+    /// Lexical only (the grep arm): reported, never a gate.
+    Grep,
+}
+
+impl Arm {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fusion => "fusion",
+            Self::Grep => "grep",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "fusion" => Ok(Self::Fusion),
+            "grep" => Ok(Self::Grep),
+            _ => bail!("unknown arm {text:?} (fusion, grep)"),
+        }
+    }
+}
+
+/// Where the embeddings come from.
+pub enum Embedder {
+    /// The bench's own deterministic fake (levels B and C).
+    Fake,
+    /// An already running OpenAI-compatible service (level D).
+    External { url: String, model: String },
+}
+
+pub struct Options {
+    pub bin: PathBuf,
+    pub set: PathBuf,
+    pub work: PathBuf,
+    pub clones: Option<PathBuf>,
+    pub output: PathBuf,
+    pub level_b: bool,
+    pub level_c: bool,
+    pub arms: Vec<Arm>,
+    pub embedder: Embedder,
+    pub repos: Vec<String>,
+    pub max_per_repo: Option<usize>,
+    pub label: Option<String>,
+}
+
+/// UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` of now (civil-from-days, no deps).
+pub fn utc_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as i64;
+    let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// The `machine` fingerprint of rule 4: CPU model, logical cores, OS,
+/// architecture and ripgrep version. No host name, user or path.
+fn machine() -> Value {
+    let mut system = sysinfo::System::new();
+    system.refresh_cpu_all();
+    let cpu = system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_owned())
+        .unwrap_or_default();
+    let ripgrep = Command::new("rg")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    json!({
+        "cpu": cpu,
+        "logical_cores": system.cpus().len(),
+        "os": sysinfo::System::long_os_version().unwrap_or_default(),
+        "arch": std::env::consts::ARCH,
+        "ripgrep": ripgrep,
+    })
+}
+
+/// Total size in bytes of every file under `dir`.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_size(&entry.path()),
+            Ok(_) => entry.metadata().map_or(0, |m| m.len()),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// TOML literal string for a path (single quotes; paths never hold one).
+fn toml_path(path: &Path) -> Result<String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    ensure!(!text.contains('\''), "path {text} holds a quote");
+    Ok(format!("'{text}'"))
+}
+
+pub fn arm_config(arm: Arm, data_dir: &Path, url: &str, model: &str) -> Result<String> {
+    Ok(format!(
+        "data_dir = {}\nembedding_url = \"{url}\"\nembedding_model = \"{model}\"\n\n\
+         [channels]\nsemantic = {}\nlexical = true\nlsp = false\nreranker = false\n\n\
+         [index]\nfreshness = \"manual\"\n",
+        toml_path(data_dir)?,
+        arm == Arm::Fusion,
+    ))
+}
+
+fn toml_string(text: &str) -> String {
+    serde_json::to_string(text).expect("a string serializes")
+}
+
+/// One evaluation query: text, expected paths, tag.
+pub struct Query {
+    pub text: String,
+    pub expected: Vec<String>,
+    pub tag: &'static str,
+}
+
+pub fn definition(queries: &[Query]) -> String {
+    let mut out = String::from("[[workspaces]]\nkey = \"task\"\nrequired = true\n");
+    for query in queries {
+        let expected: Vec<String> = query.expected.iter().map(|p| toml_string(p)).collect();
+        out.push_str(&format!(
+            "\n[[queries]]\nworkspace = \"task\"\nquery = {}\ntop_k = {TOP_K}\nexpected_paths = [{}]\ntags = [\"{}\"]\n",
+            toml_string(&query.text),
+            expected.join(", "),
+            query.tag,
+        ));
+    }
+    out
+}
+
+/// The binary, run with a scratch configuration and no inherited `LCI_*`
+/// variables, so nothing on the machine changes what is measured.
+fn lci(bin: &Path, config: &Path) -> Command {
+    let mut command = Command::new(bin);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("LCI_") {
+            command.env_remove(&name);
+        }
+    }
+    command.arg("--config").arg(config).arg("--no-local-config");
+    command
+}
+
+fn run_json(mut command: Command, what: &str) -> Result<(Value, f64)> {
+    let start = Instant::now();
+    let output = command
+        .output()
+        .with_context(|| format!("running {what}"))?;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    if !output.status.success() {
+        bail!(
+            "{what} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+    let value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    Ok((value, ms))
+}
+
+fn index(bin: &Path, config: &Path, checkout: &Path) -> Result<Value> {
+    let mut command = lci(bin, config);
+    command.arg("index").arg(checkout);
+    let (report, ms) = run_json(command, "lci index")?;
+    Ok(json!({
+        "ms": ms,
+        "files": report["files"],
+        "chunks": report["chunks"],
+        "embedded_chunks": report["embedded_chunks"],
+        "reused_chunks": report["reused_chunks"],
+    }))
+}
+
+/// Ranked evidence paths and timing per query text, from an evaluate report.
+fn evaluate(
+    bin: &Path,
+    config: &Path,
+    checkout: &Path,
+    definition_path: &Path,
+    report_path: &Path,
+) -> Result<Vec<(String, Value)>> {
+    let _ = std::fs::remove_file(report_path);
+    let mut command = lci(bin, config);
+    command
+        .arg("evaluate")
+        .arg(definition_path)
+        .arg("--workspace")
+        .arg(format!("task={}", checkout.display()))
+        .arg("--output")
+        .arg(report_path);
+    let output = command.output().context("running lci evaluate")?;
+    let text = std::fs::read_to_string(report_path).with_context(|| {
+        format!(
+            "lci evaluate wrote no report ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )
+    })?;
+    let report: Value = serde_json::from_str(&text).context("reading the evaluate report")?;
+    let queries = report["queries"]
+        .as_array()
+        .context("evaluate report has no queries")?;
+    Ok(queries
+        .iter()
+        .map(|query| {
+            let text = query["query"]["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            // A search that failed is reported as a `failure` without
+            // timings; a skipped query has none either.
+            let result = if query["skipped"].as_bool() == Some(true) || query["timings"].is_null() {
+                json!({"error": format!(
+                    "{}: {}",
+                    query["outcome"].as_str().unwrap_or("skipped"),
+                    query["reason"].as_str().unwrap_or_default()
+                )})
+            } else {
+                let paths: Vec<String> = query["evidence"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| row["relative_file_path"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut row = json!({
+                    "files": distinct_files(&paths, TOP_K),
+                    "total_ms": query["timings"]["total_ms"],
+                });
+                // A degraded channel (fail-open) is kept visible.
+                if let Some(warning) = query["warning"].as_str() {
+                    row["warning"] = json!(warning);
+                }
+                row
+            };
+            (text, result)
+        })
+        .collect())
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The clone of `url` under `clones/key`, fetched with blobs on demand.
+fn ensure_clone(clones: &Path, key: &str, url: &str, snapshot: &str) -> Result<PathBuf> {
+    let clone = clones.join(key);
+    if !clone.join(".git").exists() && !clone.join("HEAD").exists() {
+        std::fs::create_dir_all(clones)?;
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--filter=blob:none",
+                "--no-checkout",
+                url,
+            ])
+            .arg(&clone)
+            .status()
+            .context("running git clone")?;
+        ensure!(status.success(), "git clone {url} failed");
+    }
+    if git(
+        &clone,
+        &["cat-file", "-e", &format!("{snapshot}^{{commit}}")],
+    )
+    .is_err()
+    {
+        git(&clone, &["fetch", "--quiet", "origin", snapshot])?;
+    }
+    Ok(clone)
+}
+
+fn checkout(worktree: &Path, commit: &str) -> Result<()> {
+    git(
+        worktree,
+        &["checkout", "--quiet", "--force", "--detach", commit],
+    )?;
+    git(worktree, &["clean", "--quiet", "-fdx"])?;
+    Ok(())
+}
+
+pub async fn run(options: Options) -> Result<()> {
+    let started = Instant::now();
+    let started_at = utc_now();
+    let set: Value = serde_json::from_str(
+        &std::fs::read_to_string(&options.set)
+            .with_context(|| format!("reading {}", options.set.display()))?,
+    )?;
+    ensure!(
+        set["schema"] == super::mine::SET_SCHEMA,
+        "{} is not a bench set",
+        options.set.display()
+    );
+    let bin = std::path::absolute(&options.bin)?;
+    ensure!(bin.is_file(), "no binary at {}", bin.display());
+    let build = std::fs::read_to_string(bin.with_extension("json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({"commit": "unknown"}));
+    let work = std::path::absolute(&options.work)?;
+    std::fs::create_dir_all(&work)?;
+    let clones = match &options.clones {
+        Some(dir) => std::path::absolute(dir)?,
+        None => work.join("clones"),
+    };
+
+    let (url, model, embedder) = match &options.embedder {
+        Embedder::Fake => (
+            super::embedder::start().await?,
+            super::embedder::MODEL.to_owned(),
+            json!({"kind": "fake", "model": super::embedder::MODEL, "dimension": super::embedder::DIMENSION}),
+        ),
+        Embedder::External { url, model } => (
+            url.clone(),
+            model.clone(),
+            json!({"kind": "external", "model": model}),
+        ),
+    };
+
+    let mut repos_out = Vec::new();
+    let mut tasks_out = Vec::new();
+    for repo in set["repos"].as_array().context("set has no repos")? {
+        let key = repo["key"].as_str().context("repo key")?;
+        if !options.repos.is_empty() && !options.repos.iter().any(|r| r == key) {
+            continue;
+        }
+        let mut tasks: Vec<&Value> = set["tasks"]
+            .as_array()
+            .context("set has no tasks")?
+            .iter()
+            .filter(|task| task["repo"] == key)
+            .collect();
+        if let Some(max) = options.max_per_repo {
+            tasks.truncate(max);
+        }
+        if tasks.is_empty() {
+            continue;
+        }
+        let clone = ensure_clone(
+            &clones,
+            key,
+            repo["url"].as_str().context("repo url")?,
+            repo["snapshot"].as_str().context("repo snapshot")?,
+        )?;
+        let root = work.join(key);
+        let worktree = root.join("checkout");
+        let data = root.join("data");
+        if worktree.exists() {
+            let _ = git(
+                &clone,
+                &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+            );
+            let _ = std::fs::remove_dir_all(&worktree);
+        }
+        let _ = git(&clone, &["worktree", "prune"]);
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&root)?;
+        let first_base = tasks[0]["base_commit"].as_str().context("base commit")?;
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                "--force",
+                &worktree.to_string_lossy(),
+                first_base,
+            ],
+        )?;
+        let mut configs = Vec::new();
+        for arm in &options.arms {
+            let path = root.join(format!("{}.toml", arm.name()));
+            std::fs::write(&path, arm_config(*arm, &data, &url, &model)?)?;
+            configs.push((*arm, path));
+        }
+        let index_config = &configs[0].1;
+
+        eprintln!("{key}: {} tasks", tasks.len());
+        let mut repo_index = Value::Null;
+        for (position, task) in tasks.iter().enumerate() {
+            let id = task["id"].as_str().context("task id")?;
+            let base = task["base_commit"].as_str().context("base commit")?;
+            let fix = task["fix_commit"].as_str().context("fix commit")?;
+            let gold = strings(&task["gold_files"]);
+            checkout(&worktree, base)?;
+            let refresh = match index(&bin, index_config, &worktree) {
+                Ok(report) => report,
+                Err(error) => {
+                    tasks_out.push(json!({"id": id, "repo": key, "tags": task["tags"], "error": format!("{error:#}")}));
+                    continue;
+                }
+            };
+            if position == 0 {
+                repo_index = json!({
+                    "ms": refresh["ms"],
+                    "files": refresh["files"],
+                    "chunks": refresh["chunks"],
+                    "size_bytes": dir_size(&data),
+                });
+            }
+
+            let mut arms = serde_json::Map::new();
+            let mut lookup = Vec::new();
+            for (arm, config) in &configs {
+                let mut queries = vec![Query {
+                    text: task["query"].as_str().unwrap_or_default().to_owned(),
+                    expected: gold.clone(),
+                    tag: "task",
+                }];
+                let mut symbols: Vec<(String, Vec<String>)> = Vec::new();
+                if options.level_b && *arm == Arm::Fusion {
+                    for symbol in task["gold_symbols"].as_array().into_iter().flatten() {
+                        let name = symbol["name"].as_str().unwrap_or_default().to_owned();
+                        let path = symbol["path"].as_str().unwrap_or_default().to_owned();
+                        match symbols.iter_mut().find(|(n, _)| *n == name) {
+                            Some((_, paths)) => paths.push(path),
+                            None => symbols.push((name, vec![path])),
+                        }
+                    }
+                    // A symbol named exactly like the task query would pair
+                    // with the wrong row; skip it.
+                    symbols.retain(|(name, _)| *name != queries[0].text);
+                    queries.extend(symbols.iter().map(|(name, paths)| Query {
+                        text: name.clone(),
+                        expected: paths.clone(),
+                        tag: "lookup",
+                    }));
+                }
+                if !options.level_c && symbols.is_empty() {
+                    continue;
+                }
+                let definition_path = root.join(format!("{}-definition.toml", arm.name()));
+                std::fs::write(&definition_path, definition(&queries))?;
+                let report_path = root.join(format!("{}-report.json", arm.name()));
+                let results = evaluate(&bin, config, &worktree, &definition_path, &report_path);
+                let find = |text: &str| -> Value {
+                    match &results {
+                        Ok(rows) => rows.iter().find(|(query, _)| query == text).map_or_else(
+                            || json!({"error": "query missing from the report"}),
+                            |(_, v)| v.clone(),
+                        ),
+                        Err(error) => json!({"error": format!("{error:#}")}),
+                    }
+                };
+                if options.level_c {
+                    let mut row = find(&queries[0].text);
+                    if row.get("error").is_none() {
+                        let files = strings(&row["files"]);
+                        let score = score_task(&files, &gold);
+                        row["rr"] = json!(score.rr);
+                        row["hit1"] = json!(score.hit1);
+                        row["hit5"] = json!(score.hit5);
+                        row["hit10"] = json!(score.hit10);
+                        row["recall10"] = json!(score.recall10);
+                    }
+                    arms.insert(arm.name().to_owned(), row);
+                }
+                for (name, paths) in &symbols {
+                    let mut row = find(name);
+                    if row.get("error").is_none() {
+                        let (hit5, precision5) = score_lookup(&strings(&row["files"]), paths);
+                        row["hit5"] = json!(hit5);
+                        row["precision5"] = json!(precision5);
+                    }
+                    row["name"] = json!(name);
+                    row["gold_files"] = json!(paths);
+                    lookup.push(row);
+                }
+            }
+
+            let update = if options.level_b {
+                checkout(&worktree, fix)?;
+                match index(&bin, index_config, &worktree) {
+                    Ok(report) => report,
+                    Err(error) => json!({"error": format!("{error:#}")}),
+                }
+            } else {
+                Value::Null
+            };
+            eprintln!(
+                "  {id}: fusion rr {} grep rr {}",
+                arms.get("fusion").map_or(Value::Null, |a| a["rr"].clone()),
+                arms.get("grep").map_or(Value::Null, |a| a["rr"].clone()),
+            );
+            tasks_out.push(json!({
+                "id": id,
+                "repo": key,
+                "tags": task["tags"],
+                "arms": arms,
+                "lookup": if options.level_b { json!(lookup) } else { Value::Null },
+                "refresh": refresh,
+                "update": update,
+            }));
+        }
+        repos_out.push(json!({
+            "key": key,
+            "tasks": tasks.len(),
+            "index": repo_index,
+        }));
+        let _ = git(
+            &clone,
+            &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+        );
+    }
+
+    let levels: Vec<&str> = [("B", options.level_b), ("C", options.level_c)]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(level, _)| *level)
+        .collect();
+    let results = json!({
+        "schema": RESULTS_SCHEMA,
+        "label": options.label,
+        "bench_set": {"version": set["version"], "tasks": set["tasks"].as_array().map_or(0, Vec::len)},
+        "build": build,
+        "binary": bin.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "machine": machine(),
+        "embedder": embedder,
+        "levels": levels,
+        "arms": options.arms.iter().map(|arm| arm.name()).collect::<Vec<_>>(),
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "wall_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "repos": repos_out,
+        "tasks": tasks_out,
+    });
+    if let Some(parent) = options.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = serde_json::to_string_pretty(&results)?;
+    text.push('\n');
+    std::fs::write(&options.output, text)
+        .with_context(|| format!("writing {}", options.output.display()))?;
+    eprintln!("wrote {}", options.output.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_now_has_the_rfc3339_shape() {
+        let now = utc_now();
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
+        assert!(now.as_str() >= "2026-01-01T00:00:00Z", "{now}");
+    }
+
+    #[test]
+    fn arm_configs_switch_only_the_semantic_channel() {
+        let fusion =
+            arm_config(Arm::Fusion, Path::new("/d"), "http://127.0.0.1:1/v1", "m").unwrap();
+        let grep = arm_config(Arm::Grep, Path::new("/d"), "http://127.0.0.1:1/v1", "m").unwrap();
+        assert!(fusion.contains("semantic = true") && grep.contains("semantic = false"));
+        for config in [&fusion, &grep] {
+            let parsed: toml::Value = toml::from_str(config).unwrap();
+            assert_eq!(parsed["channels"]["reranker"].as_bool(), Some(false));
+            assert_eq!(parsed["channels"]["lsp"].as_bool(), Some(false));
+            assert_eq!(parsed["index"]["freshness"].as_str(), Some("manual"));
+            assert_eq!(parsed["data_dir"].as_str(), Some("/d"));
+        }
+    }
+
+    #[test]
+    fn definitions_parse_and_quote_queries() {
+        let text = definition(&[
+            Query {
+                text: "fix \"quoted\" path\\thing".into(),
+                expected: vec!["src/a.rs".into()],
+                tag: "task",
+            },
+            Query {
+                text: "poll_ready".into(),
+                expected: vec!["src/a.rs".into(), "src/b.rs".into()],
+                tag: "lookup",
+            },
+        ]);
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let queries = parsed["queries"].as_array().unwrap();
+        assert_eq!(
+            queries[0]["query"].as_str(),
+            Some("fix \"quoted\" path\\thing")
+        );
+        assert_eq!(queries[0]["top_k"].as_integer(), Some(10));
+        assert_eq!(queries[1]["expected_paths"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["workspaces"][0]["key"].as_str(), Some("task"));
+    }
+}
