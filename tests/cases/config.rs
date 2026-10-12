@@ -605,12 +605,32 @@ impl Serve {
     }
 }
 
-fn nothing_listens_on(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(500),
-    )
-    .is_err()
+/// What the tests rely on [`ClosedPort`] for: a connection to its port is
+/// refused, not left waiting, and (except on macOS, see [`ClosedPort`]) no
+/// other socket can take the port while it lives, even one that sets
+/// `SO_REUSEADDR` (as the standard library's and tokio's listeners do on
+/// Unix).
+#[tokio::test]
+async fn a_closed_port_refuses_connections_and_cannot_be_taken() {
+    let closed = ClosedPort::new();
+    // No timeout: a refusal takes about 2 s on Windows, and a dropped
+    // connection would end, much later, at the system's connect timeout as a
+    // `TimedOut` error, which fails the assertion.
+    let error = TcpStream::connect(("127.0.0.1", closed.port)).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{error}"
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(TcpListener::bind(("127.0.0.1", closed.port)).is_err());
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", closed.port))
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tokio::test]
@@ -648,7 +668,15 @@ async fn serve_binds_the_port_the_overlay_sets_and_the_openapi_document_names_it
 #[tokio::test]
 async fn serve_port_beats_lci_port_which_beats_the_overlay() {
     let sandbox = Sandbox::new("");
-    let [overlay_port, env_port, flag_port] = free_ports();
+    // The overlay's port stays held, so a server that chose it would fail to
+    // bind and never become healthy on the port it should have chosen. (An
+    // assertion that nothing listens on a port released earlier could see
+    // another test's socket there.)
+    let overlay = ClosedPort::new();
+    let overlay_port = overlay.port;
+    // Held before `free_ports` chooses, so it cannot land on a chosen port.
+    let second_env = ClosedPort::new();
+    let [env_port, flag_port] = free_ports();
     std::fs::write(sandbox.overlay(), format!("port = {overlay_port}\n")).unwrap();
     let env_port_text = env_port.to_string();
     let flag_port_text = flag_port.to_string();
@@ -661,9 +689,10 @@ async fn serve_port_beats_lci_port_which_beats_the_overlay() {
             &[("LCI_PORT", env_port_text.as_str())],
         );
         server.wait_healthy(env_port, &reqwest::Client::new()).await;
-        assert!(nothing_listens_on(overlay_port));
     }
-    // The flag beats both.
+    // The flag beats both. `LCI_PORT` names another held port here: the
+    // first server's port is free again and could be anyone's by now.
+    let env_port_text = second_env.port.to_string();
     let mut server = Serve::spawn(
         &sandbox,
         &["serve", "--port", flag_port_text.as_str()],
@@ -672,8 +701,6 @@ async fn serve_port_beats_lci_port_which_beats_the_overlay() {
     server
         .wait_healthy(flag_port, &reqwest::Client::new())
         .await;
-    assert!(nothing_listens_on(overlay_port));
-    assert!(nothing_listens_on(env_port));
 }
 
 #[test]
@@ -739,20 +766,40 @@ struct InitBox {
     temp: tempfile::TempDir,
     config: PathBuf,
     bin: PathBuf,
-    /// The `port` the configuration file names: free when chosen.
+    /// The `port` the configuration file names: free when chosen by
+    /// [`Self::new`], or one the test holds itself ([`Self::on_port`]).
     port: u16,
+    /// The ports [`Self::new`] and [`Self::on_port`] name in the model URLs,
+    /// held for as long as the box lives.
+    _model_ports: Vec<ClosedPort>,
 }
 
 impl InitBox {
-    /// A configuration whose model URLs name ports nothing listens on, so a
-    /// probe that slipped through would find nothing and never a real service.
+    /// A configuration whose model URLs name ports that refuse connections,
+    /// so a probe that slipped through would find nothing and never a real
+    /// service.
     fn new(extra: &str) -> Self {
-        let [embedder, reranker] = free_ports();
-        Self::with_urls(
-            &format!("http://127.0.0.1:{embedder}/v1"),
-            &format!("http://127.0.0.1:{reranker}/rerank"),
+        // The model ports are held before `free_ports` chooses, so neither
+        // can land on the chosen port.
+        let model_ports = [ClosedPort::new(), ClosedPort::new()];
+        let [port] = free_ports();
+        Self::with_model_ports(port, extra, model_ports)
+    }
+
+    /// [`Self::new`] with the given `port`: one a test holds itself.
+    fn on_port(port: u16, extra: &str) -> Self {
+        Self::with_model_ports(port, extra, [ClosedPort::new(), ClosedPort::new()])
+    }
+
+    fn with_model_ports(port: u16, extra: &str, [embedder, reranker]: [ClosedPort; 2]) -> Self {
+        let mut init = Self::build(
+            &format!("http://127.0.0.1:{}/v1", embedder.port),
+            &format!("http://127.0.0.1:{}/rerank", reranker.port),
+            port,
             extra,
-        )
+        );
+        init._model_ports = vec![embedder, reranker];
+        init
     }
 
     fn with_urls(embedding_url: &str, reranker_url: &str, extra: &str) -> Self {
@@ -777,6 +824,7 @@ impl InitBox {
             config,
             bin,
             port,
+            _model_ports: Vec::new(),
         }
     }
 
@@ -1463,11 +1511,18 @@ async fn init_cannot_be_made_to_write_a_setting_by_what_a_service_lists() {
 
 #[test]
 fn init_checks_the_port_by_binding_and_never_writes_it() {
-    // Free.
-    let init = InitBox::new("");
-    let output = init.run(&["init", "--no-probe", "--json"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report = parse(&output);
+    // Free. The port was free when chosen, but `init` has to bind it itself,
+    // so it cannot stay held: another test's ephemeral bind may take it in
+    // between. A port reported in use is retried with a fresh one, twice.
+    let (init, report) = (0..3)
+        .find_map(|_| {
+            let init = InitBox::new("");
+            let output = init.run(&["init", "--no-probe", "--json"]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let report = parse(&output);
+            (report["probes"]["port"]["state"] != "in_use").then_some((init, report))
+        })
+        .expect("three freshly chosen ports were all reported in use");
     assert_eq!(report["probes"]["port"]["state"], "free");
     assert!(
         init.overlay_text()
@@ -1478,9 +1533,11 @@ fn init_checks_the_port_by_binding_and_never_writes_it() {
     assert!(!init.overlay_sets("port"));
 
     // In use, with --no-probe: reported, and the holder is not contacted.
-    let holder = TcpListener::bind(("127.0.0.1", init.port)).unwrap();
+    // The holder binds first, so the port is never released in between.
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
     holder.set_nonblocking(true).unwrap();
-    let output = init.run(&["init", "--no-probe", "--force", "--json"]);
+    let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
+    let output = init.run(&["init", "--no-probe", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let report = parse(&output);
     assert_eq!(report["probes"]["port"]["state"], "in_use");
@@ -1497,11 +1554,10 @@ fn init_checks_the_port_by_binding_and_never_writes_it() {
 
 #[tokio::test]
 async fn init_tells_a_running_lci_from_another_process_on_the_port() {
-    // An LCI answering `/health`.
-    let init = InitBox::new("");
-    let holder = tokio::net::TcpListener::bind(("127.0.0.1", init.port))
-        .await
-        .unwrap();
+    // An LCI answering `/health`. Each holder binds before the box names its
+    // port, so the port is never released in between.
+    let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
     let router = Router::new().route(
         "/health",
         get(|| async {
@@ -1531,10 +1587,8 @@ async fn init_tells_a_running_lci_from_another_process_on_the_port() {
         Router::new(),
         Router::new().route("/health", get(|| async { Json(json!({"status": "ok"})) })),
     ] {
-        let init = InitBox::new("");
-        let holder = tokio::net::TcpListener::bind(("127.0.0.1", init.port))
-            .await
-            .unwrap();
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
         let task = tokio::spawn(async move {
             axum::serve(holder, router).await.unwrap();
         });

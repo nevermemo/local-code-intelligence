@@ -1621,11 +1621,9 @@ async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
 #[tokio::test]
 async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
     let (temp, mut config, _fake, task) = fixture().await;
-    // A port nothing listens on: bind to learn a free one, then release it.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed_address = closed.local_addr().unwrap();
-    drop(closed);
-    config.reranker_url = format!("http://{closed_address}/rerank");
+    // A port that refuses connections, held for the whole test.
+    let closed = ClosedPort::new();
+    config.reranker_url = format!("http://127.0.0.1:{}/rerank", closed.port);
     let workspace = temp.path().join("unreachable-reranker");
     write(
         &workspace,

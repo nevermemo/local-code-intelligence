@@ -25,6 +25,44 @@ use std::{
     time::Duration,
 };
 
+/// A loopback port that refuses connections for as long as this value lives.
+/// Its socket is bound but never listens: a connection to it is refused, as
+/// to a port nothing holds, and no other socket can take the port meanwhile,
+/// neither another test's `127.0.0.1:0` bind nor a server that wrongly chose
+/// it. Binding a listener to learn a free port and dropping it guarantees
+/// neither: the next ephemeral bind of any test may get that port.
+///
+/// On macOS a connection to a bound socket that does not listen is not
+/// refused: the system drops it and the client waits for its timeout. There
+/// the port is 1 (`tcpmux`) and nothing is held: no service listens on it and
+/// an ephemeral bind never returns it, though a test cannot stop another
+/// process from binding it.
+struct ClosedPort {
+    #[cfg(not(target_os = "macos"))]
+    _socket: tokio::net::TcpSocket,
+    port: u16,
+}
+
+impl ClosedPort {
+    #[cfg(not(target_os = "macos"))]
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            _socket: socket,
+            port,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new() -> Self {
+        Self { port: 1 }
+    }
+}
+
 #[derive(Default)]
 struct FakeModels {
     documents: AtomicUsize,
