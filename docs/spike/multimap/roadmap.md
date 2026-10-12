@@ -108,4 +108,5 @@ S1 then S2 tonight, each gated by `cargo fmt --all --check`, clippy as in
 `docs/development/testing.md`, `cargo xtask test --suite Full` and
 `cargo xtask lint-machine-paths`, then an independent read-only review. S3 can start in the
 cloud before the A/B result for the hook and `sym.defs` only. S4 to S6 start after the A/B.
-After the trim (2026-10-12), nothing in S3b to S6 starts before the A/B.
+After the trim (2026-10-12), nothing in S3b to S6 starts before the A/B. What a merge of S2 or S3a
+must change first: [merge-conditions.md](merge-conditions.md).
