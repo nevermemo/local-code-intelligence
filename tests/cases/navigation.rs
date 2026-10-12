@@ -2037,8 +2037,7 @@ impl Drop for SigtermServe {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn sigterm_shuts_down_the_running_language_server() {
+async fn signal_shuts_down_the_running_language_server(signal_name: &str, expected_exit_code: i32) {
     let (temp, mut config, _models, models_task) = fixture().await;
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(workspace.join("src")).unwrap();
@@ -2132,21 +2131,21 @@ async fn sigterm_shuts_down_the_running_language_server() {
     assert!(process_is_running(pid).await);
 
     let signal = tokio::process::Command::new("kill")
-        .args(["-TERM", &serve.child.id().to_string()])
+        .args([&format!("-{signal_name}"), &serve.child.id().to_string()])
         .status()
         .await
         .unwrap();
-    assert!(signal.success(), "could not send SIGTERM to serve");
-    let server_exited = tokio::time::timeout(Duration::from_secs(15), async {
+    assert!(signal.success(), "could not send {signal_name} to serve");
+    let status = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if serve.child.try_wait().unwrap().is_some() {
-                return;
+            if let Some(status) = serve.child.try_wait().unwrap() {
+                return status;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .is_ok();
+    .unwrap_or_else(|_| panic!("serve did not exit within 15 s after SIGTERM"));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while process_is_running(pid).await && tokio::time::Instant::now() < deadline {
@@ -2154,11 +2153,27 @@ async fn sigterm_shuts_down_the_running_language_server() {
     }
     let language_server_exited = !process_is_running(pid).await;
     drop(models_task);
-    assert!(server_exited, "serve did not exit after SIGTERM");
+    assert_eq!(
+        status.code(),
+        Some(expected_exit_code),
+        "serve exit status after {signal_name}: {status}"
+    );
     assert!(
         language_server_exited,
-        "language server process {pid} survived SIGTERM"
+        "language server process {pid} survived {signal_name}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_shuts_down_the_running_language_server() {
+    signal_shuts_down_the_running_language_server("TERM", 143).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_shuts_down_the_running_language_server() {
+    signal_shuts_down_the_running_language_server("INT", 130).await;
 }
 
 /// A command-line command that starts a language server, stopped by SIGTERM
@@ -2169,6 +2184,8 @@ async fn sigterm_shuts_down_the_running_language_server() {
 /// directory and returns the command's arguments.
 #[cfg(unix)]
 async fn sigterm_during_a_command_ends_its_language_server(
+    signal_name: &str,
+    expected_exit_code: i32,
     args: impl FnOnce(&std::path::Path, &std::path::Path) -> Vec<String>,
 ) {
     let (temp, mut config, _models, models_task) = fixture().await;
@@ -2253,11 +2270,14 @@ async fn sigterm_during_a_command_ends_its_language_server(
     assert!(process_is_running(pid).await);
 
     let signal = tokio::process::Command::new("kill")
-        .args(["-TERM", &command.child.id().to_string()])
+        .args([&format!("-{signal_name}"), &command.child.id().to_string()])
         .status()
         .await
         .unwrap();
-    assert!(signal.success(), "could not send SIGTERM to the command");
+    assert!(
+        signal.success(),
+        "could not send {signal_name} to the command"
+    );
     let exited = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(status) = command.child.try_wait().unwrap() {
@@ -2274,7 +2294,8 @@ async fn sigterm_during_a_command_ends_its_language_server(
     let language_server_exited = !process_is_running(pid).await;
     drop(models_task);
     let log = std::fs::read_to_string(&log).unwrap_or_default();
-    let status = exited.unwrap_or_else(|_| panic!("the command did not exit after SIGTERM: {log}"));
+    let status =
+        exited.unwrap_or_else(|_| panic!("the command did not exit after {signal_name}: {log}"));
     assert!(
         language_server_exited,
         "language server process {pid} survived SIGTERM ({status}): {log}"
@@ -2283,12 +2304,30 @@ async fn sigterm_during_a_command_ends_its_language_server(
         log.contains("stopped by a shutdown signal"),
         "the command must say why it stopped ({status}): {log}"
     );
+    assert_eq!(
+        status.code(),
+        Some(expected_exit_code),
+        "the command's exit status after {signal_name}: {status}; {log}"
+    );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_search_ends_its_language_server() {
-    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+    sigterm_during_a_command_ends_its_language_server("TERM", 143, |workspace, _| {
+        vec![
+            "search".to_owned(),
+            workspace.display().to_string(),
+            "Calculator".to_owned(),
+        ]
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_during_search_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server("INT", 130, |workspace, _| {
         vec![
             "search".to_owned(),
             workspace.display().to_string(),
@@ -2301,7 +2340,7 @@ async fn sigterm_during_search_ends_its_language_server() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_evaluate_ends_its_language_server() {
-    sigterm_during_a_command_ends_its_language_server(|workspace, temp| {
+    sigterm_during_a_command_ends_its_language_server("TERM", 143, |workspace, temp| {
         let definition = temp.join("definition.toml");
         std::fs::write(
             &definition,
@@ -2321,7 +2360,7 @@ async fn sigterm_during_evaluate_ends_its_language_server() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_symbols_ends_its_language_server() {
-    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+    sigterm_during_a_command_ends_its_language_server("TERM", 143, |workspace, _| {
         vec![
             "symbols".to_owned(),
             workspace.display().to_string(),
@@ -2334,7 +2373,7 @@ async fn sigterm_during_symbols_ends_its_language_server() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_definition_ends_its_language_server() {
-    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+    sigterm_during_a_command_ends_its_language_server("TERM", 143, |workspace, _| {
         vec![
             "definition".to_owned(),
             workspace.display().to_string(),
@@ -2349,7 +2388,7 @@ async fn sigterm_during_definition_ends_its_language_server() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_references_ends_its_language_server() {
-    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+    sigterm_during_a_command_ends_its_language_server("TERM", 143, |workspace, _| {
         vec![
             "references".to_owned(),
             workspace.display().to_string(),

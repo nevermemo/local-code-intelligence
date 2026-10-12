@@ -157,21 +157,22 @@ async fn sigterm_ends_serve_while_a_reindex_waits_for_another_process_lock() {
         .await
         .unwrap();
     assert!(signal.success(), "could not send SIGTERM to serve");
-    let exited = tokio::time::timeout(Duration::from_secs(10), async {
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if serve.0.try_wait().unwrap().is_some() {
-                return;
+            if let Some(status) = serve.0.try_wait().unwrap() {
+                return status;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .is_ok();
+    .unwrap_or_else(|_| {
+        panic!(
+            "serve did not exit within 10 s of SIGTERM while the lock stayed held: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        )
+    });
     drop(models_task);
-    assert!(
-        exited,
-        "serve did not exit within 10 s of SIGTERM while the lock stayed held: {}",
-        std::fs::read_to_string(&log).unwrap_or_default()
-    );
+    assert_eq!(status.code(), Some(143), "serve exit status: {status}");
     drop(lock);
 }
