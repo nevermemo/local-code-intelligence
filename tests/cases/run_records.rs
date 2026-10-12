@@ -155,6 +155,11 @@ async fn a_run_record_carries_no_machine_paths_urls_or_unasked_code() {
         config.embedding_url.clone(),
         config.reranker_url.clone(),
         config.embedding_url.trim_end_matches("/v1").to_owned(),
+        config
+            .embedding_url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1")
+            .to_owned(),
     ];
     if let Ok(resolved) = std::fs::canonicalize(temp.path()) {
         forbidden.push(resolved.to_string_lossy().into_owned());
@@ -162,11 +167,18 @@ async fn a_run_record_carries_no_machine_paths_urls_or_unasked_code() {
     forbidden.extend(config.csharp.path.clone());
     // A query that names the machine's paths and a service URL: the record
     // stores the query text, so only redaction keeps them out.
+    let host = config
+        .embedding_url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1")
+        .to_owned();
     let query = format!(
-        "Calculator {} {} {}",
+        "Calculator {} {} {} file://{}/src {}",
         workspace.display(),
         config.data_dir.display(),
-        config.embedding_url
+        config.embedding_url,
+        workspace.display(),
+        host
     );
     for embedding_fails in [false, true] {
         fake.embed_fails.store(embedding_fails, Ordering::SeqCst);
@@ -190,7 +202,9 @@ async fn a_run_record_carries_no_machine_paths_urls_or_unasked_code() {
             }
             let (text, lines) = read_lines(&recorded.record.unwrap());
             assert!(
-                text.contains("Calculator <workspace> <data_dir> <embedding_url>"),
+                text.contains(
+                    "Calculator <workspace> <data_dir> <embedding_url> <workspace>/src <embedding_host>"
+                ),
                 "{text}"
             );
             for secret in &forbidden {

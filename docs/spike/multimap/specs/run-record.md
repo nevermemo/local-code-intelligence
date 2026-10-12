@@ -53,11 +53,16 @@ one-shot search records steps for all of them and never pauses.
 - No service URLs: embedding and reranker identities are recorded as SHA-256 hex.
 - Code text only as `snippet` (the existing bounded snippet: cut at 400 bytes plus a 3-byte
   ellipsis, `src/store.rs:56-73`), and only when `capture.snippets` is true.
-- Redaction (S3): before a line is written, every occurrence of the workspace path (as
-  given and resolved), the data directory (both forms), the embedding and reranker URLs and
-  every absolute executable path in the configuration is replaced by a placeholder
-  (`<workspace>`, `<data_dir>`, `<embedding_url>`, `<reranker_url>`, `<executable>`) in
-  every string, the query text included. Evidence `detail` is cut to 200 characters.
+- Redaction (S3): before a line is written, the workspace path and the data directory (as
+  given when absolute, and resolved; each also with `/` separators, as a `file://` URI and
+  with spaces as `%20`), the embedding and reranker URLs and their `host:port`, and every
+  absolute executable path in the configuration are replaced by a placeholder
+  (`<workspace>`, `<data_dir>`, `<embedding_url>`, `<embedding_host>`, `<reranker_url>`,
+  `<reranker_host>`, `<executable>`) in every string, the query text included. A match
+  counts only where the secret stands on its own (no letter, digit, `_`, `-` or `.` before
+  it; no letter, digit, `_` or `-` after it), so a workspace at `/src` never rewrites the
+  repository path `lib/src/x.rs` inside a NodeId. A relative path is never a secret.
+  Evidence `detail` is cut to 200 characters.
 - Private gold sets: `item.set` is an opaque id; records of private items stay outside the
   repository, like every report (`test-results/`, `AGENTS.md`, Working method).
 
@@ -100,6 +105,13 @@ what `search_code` returns with the reranker off. The registry path has no reran
 writes no `rerank` step. A call's `cost.elapsed_ms` is the wall time the registry measured
 around it (`MapCall::engine_ms`), so a failure the registry decided (panic, deadline) still
 has a time.
+The `fuse` step's `engine_cost.elapsed_ms` is the registry's time after the fan-out
+(priors and fusion), so the two steps do not count the fan-out twice.
+
+`Registry::run` is one call, so the registry path writes its steps after the run returns:
+a process killed while the maps run leaves only the `run` line. The writer itself is crash
+safe (whole lines, one write each; tested by killing a writer process after step 2); steps
+written as they happen need the S5 engine.
 
 ### 3.4 Where records go
 

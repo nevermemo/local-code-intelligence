@@ -122,9 +122,10 @@ fn an_unwritable_directory_is_an_error_not_a_panic() {
 #[test]
 fn redaction_replaces_every_secret_longest_first() {
     let mut value = json!({
-        "a": "failed at /work/repo/src/x.rs and /work/repo",
-        "b": ["see http://127.0.0.1:9/v1/embeddings"],
+        "a": "failed at /work/repo/src/x.rs and /work/repo.",
+        "b": ["see http://127.0.0.1:9/v1/embeddings", "connect 127.0.0.1:9 refused"],
         "c": 3,
+        "d": "file:///work/repo/lib.rs, \"/work/repo\"",
     });
     redact(
         &mut value,
@@ -132,17 +133,33 @@ fn redaction_replaces_every_secret_longest_first() {
             ("/work".to_owned(), "<root>"),
             ("/work/repo".to_owned(), "<workspace>"),
             ("http://127.0.0.1:9/v1".to_owned(), "<embedding_url>"),
+            ("127.0.0.1:9".to_owned(), "<embedding_host>"),
             (String::new(), "<never>"),
         ],
     );
     assert_eq!(
         value,
         json!({
-            "a": "failed at <workspace>/src/x.rs and <workspace>",
-            "b": ["see <embedding_url>/embeddings"],
+            "a": "failed at <workspace>/src/x.rs and <workspace>.",
+            "b": ["see <embedding_url>/embeddings", "connect <embedding_host> refused"],
             "c": 3,
+            "d": "file://<workspace>/lib.rs, \"<workspace>\"",
         })
     );
+}
+
+/// A secret that is also a repository-relative path segment (a workspace
+/// at `/src`) never corrupts NodeIds or other paths.
+#[test]
+fn redaction_leaves_repository_paths_and_numbers_alone() {
+    let original = json!({
+        "node": "chunk:lib/src/a.rs@00ff#0",
+        "via": "file:src/b.rs",
+        "other": "/srcs/x and /src-old/y",
+    });
+    let mut value = original.clone();
+    redact(&mut value, &[("/src".to_owned(), "<workspace>")]);
+    assert_eq!(value, original);
 }
 
 fn chunk(path: &str, start_line: u32) -> Chunk {

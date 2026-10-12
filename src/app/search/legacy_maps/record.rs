@@ -116,26 +116,46 @@ impl App {
     }
 
     /// Strings no record may contain (run-record.md 3.2), each with its
-    /// placeholder: the workspace path as given and as resolved, the data
-    /// directory, the service URLs and every absolute executable path.
+    /// placeholder: the workspace and the data directory (as given when
+    /// absolute, and resolved), each also with `/` separators, as a
+    /// `file://` URI and with spaces percent-encoded; the service URLs and
+    /// their `host:port`; and every absolute executable path in the
+    /// configuration. A relative path is never a secret: it could match
+    /// repository paths.
     fn record_secrets(&self, path: &Path) -> Vec<(String, &'static str)> {
         let config = &self.config;
-        let text = |path: &Path| path.to_string_lossy().into_owned();
-        let mut secrets = vec![
-            (text(path), "<workspace>"),
-            (text(&config.data_dir), "<data_dir>"),
-            (config.embedding_url.clone(), "<embedding_url>"),
-            (config.reranker_url.clone(), "<reranker_url>"),
-        ];
-        for resolved in [
-            dunce::canonicalize(path),
-            dunce::canonicalize(&config.data_dir),
-        ]
-        .into_iter()
-        .zip(["<workspace>", "<data_dir>"])
-        {
-            if let (Ok(resolved), placeholder) = resolved {
-                secrets.push((text(&resolved), placeholder));
+        let mut secrets = Vec::new();
+        let mut add_path = |path: &Path, placeholder: &'static str| {
+            let candidates = [Some(path.to_path_buf()), dunce::canonicalize(path).ok()];
+            for candidate in candidates.into_iter().flatten() {
+                if !candidate.is_absolute() {
+                    continue;
+                }
+                let raw = candidate.to_string_lossy().into_owned();
+                let slashed = raw.replace('\\', "/");
+                let uri = if slashed.starts_with('/') {
+                    format!("file://{slashed}")
+                } else {
+                    format!("file:///{slashed}")
+                };
+                for form in [raw, slashed.replace(' ', "%20"), uri, slashed] {
+                    secrets.push((form, placeholder));
+                }
+            }
+        };
+        add_path(path, "<workspace>");
+        add_path(&config.data_dir, "<data_dir>");
+        for (url, placeholder, host_placeholder) in [
+            (&config.embedding_url, "<embedding_url>", "<embedding_host>"),
+            (&config.reranker_url, "<reranker_url>", "<reranker_host>"),
+        ] {
+            secrets.push((url.clone(), placeholder));
+            if let Some(host) = url
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split('/').next())
+                .filter(|host| !host.is_empty())
+            {
+                secrets.push((host.to_owned(), host_placeholder));
             }
         }
         let executables = [
@@ -151,6 +171,7 @@ impl App {
         for executable in executables.into_iter().flatten() {
             if Path::new(executable).is_absolute() {
                 secrets.push((executable.clone(), "<executable>"));
+                secrets.push((executable.replace('\\', "/"), "<executable>"));
             }
         }
         secrets
@@ -333,7 +354,11 @@ impl App {
             "at_ms": ms(timing.clock, timing.registry_finished),
             "kind": "fuse", "yield": "none",
             "map_calls": calls_json(&priors),
-            "engine_cost": { "elapsed_ms": ms(timing.registry_started, timing.registry_finished) },
+            // The priors and the fusion: the registry's time after the
+            // fan-out step.
+            "engine_cost": {
+                "elapsed_ms": (ms(timing.registry_started, timing.registry_finished) - fan_out_ms).max(0.0)
+            },
             "frontier": { "size": pool, "rows": fused_rows },
             "warnings": fuse_warnings,
             "notes": fuse_notes,

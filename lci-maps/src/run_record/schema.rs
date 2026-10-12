@@ -89,8 +89,16 @@ fn is_date_time(value: &str) -> bool {
         return false;
     }
     let number = |range: std::ops::Range<usize>| value[range].parse::<u32>().unwrap_or(99);
-    if !(1..=12).contains(&number(5..7))
-        || !(1..=31).contains(&number(8..10))
+    let (year, month) = (number(0..4), number(5..7));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=days).contains(&number(8..10))
         || number(11..13) > 23
         || number(14..16) > 59
         || number(17..19) > 60
@@ -107,7 +115,12 @@ fn is_date_time(value: &str) -> bool {
     }
     match rest.as_bytes() {
         [b'Z' | b'z'] => true,
-        [b'+' | b'-', h1, h2, b':', m1, m2] => [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()),
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            let two = |a: &u8, b: &u8| {
+                (a.is_ascii_digit() && b.is_ascii_digit()).then(|| (a - b'0') * 10 + (b - b'0'))
+            };
+            two(h1, h2).is_some_and(|h| h <= 23) && two(m1, m2).is_some_and(|m| m <= 59)
+        }
         _ => false,
     }
 }
@@ -356,6 +369,15 @@ mod tests {
             "k": "a", "c": "x", "d": "abc", "xs": [1.5, null]
         });
         s.validate(&good).unwrap();
+        for time in [
+            "2024-02-29T00:00:00Z",
+            "2026-10-12T13:30:00+05:30",
+            "2026-04-30T23:59:60-00:00",
+        ] {
+            let mut instance = good.clone();
+            instance["t"] = json!(time);
+            s.validate(&instance).unwrap();
+        }
         for (field, bad) in [
             ("id", json!("0123456789ABCDEF")),
             ("id", json!("0123")),
@@ -363,6 +385,10 @@ mod tests {
             ("n", json!(1.5)),
             ("t", json!("2026-13-12T13:30:00Z")),
             ("t", json!("2026-10-12 13:30:00Z")),
+            ("t", json!("2026-02-30T13:30:00Z")),
+            ("t", json!("2025-02-29T13:30:00Z")),
+            ("t", json!("2026-10-12T13:30:00+24:00")),
+            ("t", json!("2026-10-12T13:30:00+01:60")),
             ("k", json!("z")),
             ("c", json!("y")),
             ("d", json!("abcd")),

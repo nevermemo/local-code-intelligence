@@ -47,15 +47,20 @@ pub const DEFAULT_FRONTIER_ROWS: usize = 50;
 /// The longest `detail` of an evidence item, in characters.
 pub const DETAIL_MAX_CHARS: usize = 200;
 
-/// The parsed RunRecord schema.
-pub fn schema() -> &'static Schema {
-    static SCHEMA: OnceLock<Schema> = OnceLock::new();
-    SCHEMA.get_or_init(|| Schema::parse(SCHEMA_JSON).expect("the checked-in schema is valid"))
+/// The parsed RunRecord schema, or why the checked-in file does not load
+/// (a test keeps it loading; a writer reports the error instead of
+/// panicking).
+pub fn schema() -> Result<&'static Schema, String> {
+    static SCHEMA: OnceLock<Result<Schema, String>> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| Schema::parse(SCHEMA_JSON))
+        .as_ref()
+        .map_err(|error| format!("the RunRecord schema does not load: {error}"))
 }
 
 /// Checks one line against the schema.
 pub fn validate_line(line: &Value) -> Result<(), String> {
-    schema().validate(line)
+    schema()?.validate(line)
 }
 
 /// Crockford's base32 alphabet, as ULIDs use it.
@@ -116,19 +121,47 @@ pub fn utc_rfc3339(at: SystemTime) -> String {
     )
 }
 
-/// Replaces every occurrence of each secret (an absolute path, a service
-/// URL) in every string of `value` with its placeholder. Longer secrets are
-/// replaced first, so a path inside another is never half-replaced. Empty
-/// secrets are ignored.
+/// Replaces each secret (an absolute path, a service URL, a `host:port`) in
+/// every string of `value` with its placeholder, wherever it stands on its
+/// own: the character before it is not a letter, digit, `_`, `-` or `.`,
+/// and the one after it is not a letter, digit, `_` or `-`. So a secret
+/// `/src` redacts `/src/x.rs` and `"/src"` but leaves the repository path
+/// `lib/src/x.rs` (and so the NodeIds) alone. Longer secrets are replaced
+/// first, so a path inside another is never half-replaced. Empty secrets
+/// are ignored.
 pub fn redact(value: &mut Value, secrets: &[(String, &str)]) {
     let mut ordered: Vec<&(String, &str)> = secrets.iter().filter(|(s, _)| !s.is_empty()).collect();
     ordered.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
+    fn word(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '-'
+    }
+    fn replace(text: &str, secret: &str, placeholder: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = 0;
+        let mut from = 0;
+        while let Some(found) = text[from..].find(secret) {
+            let start = from + found;
+            let end = start + secret.len();
+            let before = text[..start].chars().next_back();
+            let after = text[end..].chars().next();
+            if before.is_some_and(|c| word(c) || c == '.') || after.is_some_and(word) {
+                from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+                continue;
+            }
+            out.push_str(&text[rest..start]);
+            out.push_str(placeholder);
+            rest = end;
+            from = end;
+        }
+        out.push_str(&text[rest..]);
+        out
+    }
     fn walk(value: &mut Value, secrets: &[&(String, &str)]) {
         match value {
             Value::String(text) => {
                 for (secret, placeholder) in secrets {
                     if text.contains(secret.as_str()) {
-                        *text = text.replace(secret.as_str(), placeholder);
+                        *text = replace(text, secret, placeholder);
                     }
                 }
             }
