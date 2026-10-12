@@ -741,18 +741,28 @@ struct InitBox {
     bin: PathBuf,
     /// The `port` the configuration file names: free when chosen.
     port: u16,
+    /// Listeners held for this box's lifetime so its model URLs remain bound
+    /// and unreachable without racing parallel tests for ephemeral ports.
+    _listeners: Vec<TcpListener>,
 }
 
 impl InitBox {
-    /// A configuration whose model URLs name ports nothing listens on, so a
-    /// probe that slipped through would find nothing and never a real service.
+    /// A configuration whose model URLs name listeners that never accept, so
+    /// a probe finds them unreachable without racing parallel tests for ports.
     fn new(extra: &str) -> Self {
-        let [embedder, reranker] = free_ports();
-        Self::with_urls(
-            &format!("http://127.0.0.1:{embedder}/v1"),
-            &format!("http://127.0.0.1:{reranker}/rerank"),
+        let embedder = listener();
+        let reranker = listener();
+        let embedder_port = embedder.local_addr().unwrap().port();
+        let reranker_port = reranker.local_addr().unwrap().port();
+        let [port] = free_ports();
+        let mut init = Self::build(
+            &format!("http://127.0.0.1:{embedder_port}/v1"),
+            &format!("http://127.0.0.1:{reranker_port}/rerank"),
+            port,
             extra,
-        )
+        );
+        init._listeners = vec![embedder, reranker];
+        init
     }
 
     fn with_urls(embedding_url: &str, reranker_url: &str, extra: &str) -> Self {
@@ -777,6 +787,7 @@ impl InitBox {
             config,
             bin,
             port,
+            _listeners: Vec::new(),
         }
     }
 
