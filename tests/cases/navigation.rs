@@ -1101,6 +1101,48 @@ async fn a_server_that_stops_reading_fails_the_write_within_the_timeout() {
     client.shutdown(Duration::from_secs(1)).await;
 }
 
+/// A write that queued behind a write which then ran out of time does not
+/// start: the earlier message may be half written, and the checks before the
+/// wait for the lock cannot know that. Here the second call arrives 1.5 s after
+/// the first, while the first holds the pipe, and its own bound would end 1.5 s
+/// after the first's; it fails when the first one gives up, with the refusal
+/// and not with its own timeout.
+#[tokio::test]
+async fn a_write_that_waited_behind_a_timed_out_write_does_not_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _state) =
+        fake_client(&temp, &["--never-read-stdin"], Duration::from_secs(3)).await;
+    let first = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .request(
+                    "workspace/symbol",
+                    json!({"query": "x".repeat(4 * 1024 * 1024)}),
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.request("workspace/symbol", json!({"query": "x"})),
+    )
+    .await
+    .expect("a queued write must not wait on a pipe nobody reads")
+    .unwrap_err();
+    assert!(
+        format!("{second:#}").contains("stopped reading its input"),
+        "{second:#}"
+    );
+    let first = first.await.unwrap().unwrap_err();
+    assert!(
+        format!("{first:#}").contains("did not take a message within 3 seconds"),
+        "{first:#}"
+    );
+    client.shutdown(Duration::from_secs(1)).await;
+}
+
 /// The same deaf server through the manager: the write that cannot finish is a
 /// transport failure, so the session is discarded and one fresh server serves
 /// the call, instead of the call failing or hanging.

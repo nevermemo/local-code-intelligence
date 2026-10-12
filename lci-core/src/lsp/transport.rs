@@ -507,25 +507,35 @@ struct Writer {
 }
 
 impl Writer {
-    /// Writes one Content-Length-framed JSON-RPC message as a single buffer.
-    /// Fails with a timeout error when the server does not take it within
-    /// `bound`, and from then on fails at once.
-    async fn write_framed(&self, value: &Value) -> Result<()> {
+    fn ensure_not_broken(&self) -> Result<()> {
         ensure!(
             !self.broken.load(Ordering::Acquire),
             "{} stopped reading its input: an earlier write did not finish",
             self.label
         );
+        Ok(())
+    }
+
+    /// Writes one Content-Length-framed JSON-RPC message as a single buffer.
+    /// Fails with a timeout error when the server does not take it within
+    /// `bound`, and from then on fails at once.
+    async fn write_framed(&self, value: &Value) -> Result<()> {
+        self.ensure_not_broken()?;
         let body = serde_json::to_vec(value)?;
         let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         frame.extend_from_slice(&body);
         let write = async {
             let mut stdin = self.stdin.lock().await;
+            // The check above came before the wait for the lock, and the write
+            // ahead of this one may have run out of time meanwhile: its message
+            // is half written, so nothing goes after it.
+            self.ensure_not_broken()?;
             stdin.write_all(&frame).await?;
-            stdin.flush().await
+            stdin.flush().await?;
+            Ok::<(), anyhow::Error>(())
         };
         match tokio::time::timeout(self.bound, write).await {
-            Ok(written) => Ok(written?),
+            Ok(written) => written,
             Err(_) => {
                 self.broken.store(true, Ordering::Release);
                 bail!(
@@ -651,6 +661,12 @@ async fn read_frame<R: AsyncBufRead + Unpin>(
         }
         let header = std::str::from_utf8(&line).context("LSP header is not UTF-8")?;
         if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+            // Two lengths cannot both be right, and taking the last would read
+            // part of a body as the next message.
+            ensure!(
+                content_length.is_none(),
+                "LSP message with more than one Content-Length"
+            );
             content_length = Some(value.trim().parse::<usize>()?);
         }
     }
@@ -832,5 +848,29 @@ mod tests {
         assert!(bad.is_err());
         let (not_utf8, _) = frame_of(b"X: \xff\r\n\r\n", MAX_FRAME_BYTES).await;
         assert!(format!("{:#}", not_utf8.unwrap_err()).contains("UTF-8"));
+    }
+
+    /// A second Content-Length is refused, whatever it says, and before the
+    /// body: with the last one winning, `100` then `1` would read one byte of
+    /// the body and take the rest for the next message.
+    #[tokio::test]
+    async fn a_second_content_length_is_refused_before_the_body_is_read() {
+        for headers in [
+            "Content-Length: 100\r\nContent-Length: 1\r\n",
+            "Content-Length: 1\r\nX: y\r\ncontent-length: 1\r\n",
+        ] {
+            let message = format!("{headers}\r\nBODY");
+            let (outcome, rest) = frame_of(message.as_bytes(), MAX_FRAME_BYTES).await;
+            let error = outcome.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("more than one Content-Length"),
+                "{headers:?}: {error:#}"
+            );
+            // Only the header lines were read: the blank line and the body are left.
+            assert_eq!(
+                rest, b"\r\nBODY",
+                "{headers:?}: the body must not be consumed"
+            );
+        }
     }
 }
