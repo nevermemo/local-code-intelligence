@@ -1,4 +1,26 @@
 use super::*;
+use std::fmt::Write as _;
+use std::sync::Mutex;
+use tracing::{field::Field, field::Visit, Subscriber};
+use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt};
+
+struct LogCapture(Arc<Mutex<Vec<String>>>);
+
+impl<S: Subscriber> Layer<S> for LogCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = String::new();
+        event.record(&mut LogFields(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct LogFields<'a>(&'a mut String);
+
+impl Visit for LogFields<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let _ = write!(self.0, "{field}={value:?} ");
+    }
+}
 
 #[tokio::test]
 async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings() {
@@ -1406,6 +1428,31 @@ async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
             .collect()
     };
     assert_eq!(order(&first), order(&second));
+    task.abort();
+}
+
+#[tokio::test]
+async fn refused_reranker_url_credentials_are_not_reported_or_logged() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_address = closed.local_addr().unwrap();
+    drop(closed);
+    config.reranker_url = format!("http://{closed_address}/rerank?api_key=marker");
+    let workspace = temp.path().join("reranker-url-credential");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(LogCapture(logs.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let report = app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    let warning = report.warning.as_deref().unwrap();
+    assert!(!warning.contains("marker"), "{warning}");
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("reranker failed"), "{logs}");
+    assert!(!logs.contains("marker"), "{logs}");
     task.abort();
 }
 
