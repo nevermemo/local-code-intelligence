@@ -146,7 +146,11 @@ fn record_text(run: &Run, view: &SnapshotView<'_>, rows: usize) -> String {
         .iter()
         .take(rows)
         .enumerate()
-        .map(|(at, fused)| Value::Object(record::fused_row(fused, at + 1, view)))
+        .map(|(at, fused)| {
+            let mut row = record::fused_row(fused, at + 1, view);
+            row.insert("source_role".into(), json!("source"));
+            Value::Object(row)
+        })
         .collect();
     let lines = [
         json!({
@@ -257,6 +261,11 @@ async fn the_replay_refuses_a_record_off_by_one_bit_or_out_of_order() {
         edit(&raw, 2, |fuse| {
             fuse["map_calls"][0]["hits"][0]["score"] = json!(0.005);
         }),
+        // A call recorded as failed keeps its hits out of the fusion.
+        edit(&raw, 1, |fan_out| {
+            fan_out["map_calls"][0]["status"] = json!("failed")
+        }),
+        edit(&raw, 2, |fuse| fuse["frontier"]["rows"] = json!([])),
     ];
     for (index, raw) in tampered.iter().enumerate() {
         let parsed = RunRecordFile::parse(raw).unwrap();
@@ -360,7 +369,9 @@ async fn a_record_is_scored_with_the_evaluation_metrics() {
     let second = paths[1];
     let metrics = parsed.score(&gold(second)).unwrap();
     assert_eq!(metrics.first_expected_rank, Some(2));
-    assert_eq!(metrics, query_metrics(&gold(second), &evidence, false));
+    assert!(metrics.hit && !metrics.hit_at_1 && metrics.hit_at_3);
+    assert_eq!(metrics.reciprocal_rank, 0.5);
+    assert_eq!(metrics.window, 3);
     assert!(!parsed.score(&gold("nowhere.rs")).unwrap().hit);
 
     let mut other = gold(second);
@@ -369,6 +380,31 @@ async fn a_record_is_scored_with_the_evaluation_metrics() {
     let mut snippet = gold(second);
     snippet.required_snippet = Some("fn".into());
     assert!(parsed.score(&snippet).is_err(), "no snippets were captured");
+    let mut window = gold(second);
+    window.top_k = Some(3);
+    assert!(
+        parsed.score(&window).is_err(),
+        "the record's plan has no top_k 3"
+    );
+    let failed = RunRecordFile::parse(&edit(&record_text(&run, &view, 50), 3, |end| {
+        end["outcome"] = json!("failed");
+    }))
+    .unwrap();
+    assert!(
+        failed.score(&gold(second)).is_err(),
+        "a failed run is not scored"
+    );
+    let roleless = RunRecordFile::parse(&edit(&record_text(&run, &view, 50), 3, |end| {
+        end["results"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_role");
+    }))
+    .unwrap();
+    assert!(
+        roleless.result_evidence().is_err(),
+        "a result without a role"
+    );
 }
 
 #[tokio::test]

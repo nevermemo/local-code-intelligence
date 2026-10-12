@@ -155,7 +155,7 @@ written as they happen need the S5 engine.
 | One-shot equivalence | For a one-shot run, `end.results` equals `SearchReport.results` of the same search (NodeIds, order, `fusion_score` bits) and the steps' frontier rows match the `CandidateTrace` rows of a traced search. |
 | Crash safety | Kill a run after step 2: the file holds a valid `run` line and two valid `step` lines; the harness reports `outcome` missing, not a parse error. S3 kills a real writer process (the test binary re-run as a child that writes three lines and waits), since a map panic is caught by the registry and never stops a run. |
 | Privacy | A writer test asserts that no string field contains the workspace's absolute path, the data directory, or the configured service URLs, and that snippets are absent when `capture.snippets` is false. |
-| Replay | Re-running fusion from the recorded `map_calls` hits and the plan's weights reproduces each `fuse` step's scores bit for bit (extends `src/evaluate/replay.rs` beyond three channels). |
+| Replay | Re-running fusion from the recorded `map_calls` hits and the plan's weights reproduces each `fuse` step's scores bit for bit. S3 built this as a new module, `src/evaluate/run_record.rs` (section 6), beside `replay.rs`, which still replays candidate dumps over the three legacy channels. |
 | Fail-open writer | Point the writer at an unwritable path: the search succeeds, a log warning is emitted, nothing else changes. |
 
 ## 6. Offline harness as built (S3 branch, ahead of S4)
@@ -167,17 +167,23 @@ written as they happen need the S5 engine.
   line (a writer killed mid-write) is dropped and reported as `torn_tail`; a record without
   `end` reads as a prefix, and asking for its results is the error "outcome missing", never
   a parse error.
-- Scoring: `end.results` become `evaluate`'s `ResultEvidence` (path from the NodeId; the
-  language is not recorded, and no metric reads it) and are scored with `query_metrics`. A
-  gold query for another text, or one with `required_snippet` against a record without
-  snippets, is refused. Records are paired with gold queries by query text
+- Scoring: `end.results` become `evaluate`'s `ResultEvidence` (path from the NodeId;
+  `source_role` required; `snippet` required when snippets were captured; the language is
+  not recorded, and no metric reads it) and are scored with `query_metrics`, unreranked.
+  Refused: a gold query for another text, one with `required_snippet` against a record
+  without snippets, one with filters (registry runs are unfiltered), one whose `top_k`
+  differs from `plan.top_k`, and a run whose `outcome` is not `completed`. Records are paired with gold queries by query text
   (`gold_query`), not yet by `item`.
 - Replay: every `fuse` step is recomputed from the preceding `fan_out` step's used calls and
   the plan's weights and `rrf_k`, then the step's own prior calls, in `f32` and in recorded
   order, and compared with the frontier bit for bit (scores and every contribution), with
   the pool size, the ranks, the fused order (ties by path, lines and content hash), and,
-  for a capped row list, that no left-out node belongs before the last row (on a tie only
-  the path can be compared: a left-out node's lines are not recorded).
+  for a capped row list, that no left-out node belongs before the last row (by score, and on
+  a tie by path only: a left-out node's lines are not recorded, so a left-out chunk of the
+  same file with a lower start line is not caught). A frontier with nodes but no rows is
+  refused (nothing would be checked). The pool of a `fuse` step is the hits of the last
+  `fan_out` step before it; an engine that accumulates pools across steps (S5) needs a
+  different replay.
 - C5 offline: every used hit carries evidence whose labels are on its map's plan entry.
 
 Tested on the offline fixture with the public gold file `tests/fixtures/run_records/gold.toml`
@@ -189,7 +195,14 @@ rows their capped ranks and shortlist (with `max_chunks_per_file = 1` and
 ranks equal the traced channel ranks, the replay checks every row, and the record's metrics
 equal those computed from the search's own results.
 
-Not built: the `evaluation` block on `end` (the harness returns metrics and writes nothing),
+Not built: offline replay of the `cap_cut` step and a check that `end.results` are its
+first `min(top_k, rerank_candidate_count)` rows (both are checked only against production
+in the integration test); `reranked` is always false (no `rerank` step yet); blank lines and
+a byte-order mark are refused as "not JSON", and a complete last line without its newline
+is treated as torn; `read_dir` fails the whole directory on one broken record; the
+`evaluation` block on `end` (the harness returns metrics and writes nothing),
 `first_gold_step`, `unique_gold_by_map`, the leak scan, and pairing by `(item.set, item.id,
-arm)` for paired comparison; replay of a reranked run (no `rerank` step exists yet).
+arm)` for paired comparison (a gold query whose text names a redacted secret cannot pair
+by text); replay of a reranked run (no `rerank` step exists yet). One-shot equivalence is
+shown for the default search profile with the reranker off.
 

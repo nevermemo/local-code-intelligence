@@ -116,7 +116,7 @@ RunRecord decisions to confirm or change (run-record.md, section 4):
 - [ ] R-1 JSON Lines; R-6 ULID run ids.
 - [ ] R-2 query text in full (private items stay outside the repository) or hashed.
 - [ ] R-3 frontier rows capped (default 50, `size` exact); replay checks the rows present
-      and that no left-out node outranks them.
+      and that no left-out node belongs before them (by score, and by path only on a tie).
 - [ ] R-4 map hits stored per call (needed by the `fuse` replay and leave-one-map-out).
 - [ ] R-8 fingerprint fallback, R-9 hand-written schema checker versus a validator crate (a
       new dependency needs approval), R-10 no switch on the production path, R-11 redaction
@@ -129,4 +129,12 @@ RunRecord decisions to confirm or change (run-record.md, section 4):
 - [ ] `cost.elapsed_ms` of a call is the registry's wall time; `per_map` and
       `engine_cost` meanings.
 - [ ] The `evaluation` block on `end` is written by the harness only (not written yet).
+- [ ] Which row fields are required: the harness needs `source_role`, `snippet` (when
+      captured) and `fused_rank`; `language` is not recorded at all.
+- [ ] Harness parity rules: a gold query is scored only against a completed, unfiltered
+      run with the same `top_k`; pairing by query text or by `(item.set, item.id, arm)`.
+- [ ] The float invariant the bit-for-bit replay rests on: every recorded score is an
+      `f32` widened to `f64` (`run_record::number`).
+- [ ] One-shot equivalence is shown for the default profile with the reranker off; a
+      profile and a `rerank` step are still to come.
 

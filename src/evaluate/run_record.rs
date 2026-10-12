@@ -179,9 +179,11 @@ impl RunRecordFile {
     }
 
     /// The final results as the evidence `evaluate` scores: rank, path (from
-    /// the NodeId), lines, source role and snippet. The language is not
-    /// recorded and is left empty; no metric reads it.
+    /// the NodeId), lines, source role (required) and snippet (required when
+    /// the run captured snippets). The language is not recorded and is left
+    /// empty; no metric reads it.
     pub fn result_evidence(&self) -> Result<Vec<ResultEvidence>> {
+        let snippets = self.run["capture"]["snippets"].as_bool().unwrap_or(false);
         array(self.end()?, "results")?
             .iter()
             .enumerate()
@@ -196,14 +198,21 @@ impl RunRecordFile {
                         .and_then(|n| u32::try_from(n).ok())
                         .with_context(|| format!("result {node}: no {name}"))
                 };
+                let snippet = match row.get("snippet").and_then(Value::as_str) {
+                    Some(snippet) => snippet.to_owned(),
+                    None if snippets => bail!("result {node}: snippets were captured, not here"),
+                    None => String::new(),
+                };
                 Ok(ResultEvidence {
                     rank: index + 1,
                     relative_file_path: path.to_owned(),
                     language: String::new(),
-                    source_role: row["source_role"].as_str().unwrap_or_default().to_owned(),
+                    source_role: text(row, "source_role")
+                        .with_context(|| format!("result {node}"))?
+                        .to_owned(),
                     start_line: line("start_line")?,
                     end_line: line("end_line")?,
-                    snippet: row["snippet"].as_str().unwrap_or_default().to_owned(),
+                    snippet,
                     reranker_score: None,
                 })
             })
@@ -225,6 +234,23 @@ impl RunRecordFile {
             query.required_snippet.is_none() || snippets,
             "the query expects a snippet but the record has none (capture.snippets is off)"
         );
+        let outcome = text(self.end()?, "outcome")?;
+        ensure!(
+            outcome == "completed",
+            "the run ended {outcome:?}; only a completed run is scored"
+        );
+        ensure!(
+            query.filters.is_none(),
+            "the query has filters; recorded registry runs are unfiltered"
+        );
+        if let Some(top_k) = query.top_k {
+            let planned = self.run["plan"]["top_k"].as_u64();
+            ensure!(
+                planned == Some(top_k as u64),
+                "the query asks for top_k {top_k}, the run used {planned:?}"
+            );
+        }
+        // The registry path has no reranker (no `rerank` step yet).
         Ok(query_metrics(query, &self.result_evidence()?, false))
     }
 
@@ -385,6 +411,10 @@ fn replay_step(
         pool.len()
     );
     let rows = array(frontier, "rows")?;
+    ensure!(
+        size == 0 || !rows.is_empty(),
+        "the frontier holds {size} nodes but no rows, so nothing can be checked"
+    );
     let mut seen = HashSet::new();
     let mut previous: Option<(f32, TieKey)> = None;
     for (index, row) in rows.iter().enumerate() {

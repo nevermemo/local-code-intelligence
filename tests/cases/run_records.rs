@@ -300,6 +300,8 @@ async fn recorded_runs_reproduce_search_code_replay_bit_for_bit_and_score_like_e
             .await
             .unwrap();
         let record = RunRecordFile::read(&recorded.record.unwrap()).unwrap();
+        assert_eq!(record.run["item"]["id"], query.query.as_str());
+        assert_eq!(record.run["item"]["set"], "run-records-fixture");
         let report = app
             .search_with_options(
                 &workspace,
