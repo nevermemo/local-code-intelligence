@@ -976,6 +976,9 @@ pub fn resolve(spec: &ResolveSpec) -> Result<Resolved> {
 }
 
 #[cfg(test)]
+mod properties;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
