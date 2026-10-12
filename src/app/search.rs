@@ -1431,11 +1431,7 @@ mod tests {
         filter::SourceRole,
         store::{Hit, source_role_prior},
     };
-    use std::{
-        collections::{HashMap, HashSet},
-        ffi::OsString,
-        path::PathBuf,
-    };
+    use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
 
@@ -1493,7 +1489,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lexical_path_lookup_keeps_unix_backslashes_in_the_filename() {
-        let file_ids = HashMap::from([
+        let file_ids = std::collections::HashMap::from([
             (r"a\b.rs".to_owned(), vec![0]),
             ("a/b.rs".to_owned(), vec![1]),
         ]);
