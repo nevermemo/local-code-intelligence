@@ -47,7 +47,7 @@ use anyhow::{Context, Result, bail, ensure};
 /// `lci-core` because that would compile every Tree-sitter grammar for each
 /// `cargo xtask` run. The `extensions_match_the_language_registry` test fails
 /// when the two drift apart.
-const SUPPORTED_EXTENSIONS: &[&str] = &[
+pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "cs", "go", "java", "c", "cpp", "hpp",
 ];
 
@@ -55,7 +55,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// mass renames, vendoring) with no usable single-topic query.
 const MAX_TOUCHED_FILES: usize = 10;
 /// Shorter subjects ("Fix bug", "wip") carry no retrievable intent.
-const MIN_SUBJECT_WORDS: usize = 4;
+pub(crate) const MIN_SUBJECT_WORDS: usize = 4;
 /// Upper bound on query text, in characters.
 const MAX_QUERY_CHARS: usize = 300;
 /// A body paragraph is appended only when it contributes at least this many
@@ -65,8 +65,8 @@ const MIN_NEW_BODY_WORDS: usize = 3;
 /// not bounded by `top_k`.
 const MINED_TOP_K: usize = 10;
 
-const TAG_KEYWORD: &str = "keyword";
-const TAG_KEYWORD_AGNOSTIC: &str = "keyword-agnostic";
+pub(crate) const TAG_KEYWORD: &str = "keyword";
+pub(crate) const TAG_KEYWORD_AGNOSTIC: &str = "keyword-agnostic";
 const TAG_GOLD_DRIFT: &str = "gold-drift";
 const TAG_SHORT_QUERY: &str = "short-query";
 const TAG_LONG_QUERY: &str = "long-query";
@@ -374,7 +374,7 @@ fn is_excluded_path(path: &str) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
-fn is_eligible_path(path: &str) -> bool {
+pub(crate) fn is_eligible_path(path: &str) -> bool {
     has_supported_extension(path) && !is_excluded_path(path)
 }
 
@@ -392,7 +392,7 @@ fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
 /// Split identifiers and prose into lowercase words: at every non-alphanumeric
 /// character and at camelCase boundaries, so `SourceRole`, `source_role`,
 /// `source-role.rs` and "source role" all yield `[source, role]`.
-fn split_words(text: &str) -> Vec<String> {
+pub(crate) fn split_words(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut words = Vec::new();
     let mut current = String::new();
@@ -424,7 +424,7 @@ fn split_words(text: &str) -> Vec<String> {
 }
 
 /// Strip a trailing `(#123)` pull-request reference.
-fn clean_subject(subject: &str) -> &str {
+pub(crate) fn clean_subject(subject: &str) -> &str {
     let subject = subject.trim();
     subject
         .rfind(" (#")
@@ -481,7 +481,7 @@ fn truncate_words(text: &str, max: usize) -> String {
 /// The query text for a commit: the subject, followed by the first body
 /// paragraph when that paragraph adds at least [`MIN_NEW_BODY_WORDS`]
 /// distinct words, capped at [`MAX_QUERY_CHARS`] characters.
-fn query_text(subject: &str, body: &str) -> String {
+pub(crate) fn query_text(subject: &str, body: &str) -> String {
     let subject = clean_subject(subject);
     let text = match first_paragraph(body) {
         Some(paragraph) if adds_words(subject, &paragraph) => {
@@ -528,7 +528,7 @@ fn file_stem(path: &str) -> &str {
 /// Whether the query text names one of the touched files: the words of a
 /// distinctive file stem appear in the query, in order and adjacent, however
 /// they are spelled (`source_role`, `SourceRole`, "source role").
-fn names_a_touched_file<S: AsRef<str>>(query: &str, touched: &[S]) -> bool {
+pub(crate) fn names_a_touched_file<S: AsRef<str>>(query: &str, touched: &[S]) -> bool {
     let query_words = split_words(query);
     touched.iter().any(|path| {
         let stem_words = split_words(file_stem(path.as_ref()));
@@ -571,7 +571,7 @@ const PROPER_NOUNS: &[&str] = &[
 ///   word (`HTTPServer`). A capitalised first letter, an all-caps acronym, a
 ///   plural acronym (`APIs`) and the [`PROPER_NOUNS`] spellings are ordinary
 ///   prose.
-fn has_identifier_shape(text: &str) -> bool {
+pub(crate) fn has_identifier_shape(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     let at = |index: Option<usize>| index.and_then(|index| chars.get(index)).copied();
     // `\w`: letters, digits and the underscore.
@@ -664,7 +664,7 @@ impl Skip {
     }
 }
 
-fn is_merge_subject(subject: &str) -> bool {
+pub(crate) fn is_merge_subject(subject: &str) -> bool {
     let subject = subject.to_ascii_lowercase();
     [
         "merge branch",
@@ -693,7 +693,7 @@ fn is_revert(commit: &Commit) -> bool {
 
 /// Whether the subject says the commit only reformatted, linted or fixed a
 /// typo: no retrievable intent, and the touched files are incidental.
-fn is_noise_subject(subject: &str) -> bool {
+pub(crate) fn is_noise_subject(subject: &str) -> bool {
     tokens(subject).any(|token| NOISE_WORDS.contains(&token.as_str()))
 }
 
@@ -928,7 +928,7 @@ fn render_toml(key: &str, head: &str, max: usize, queries: &[MinedQuery]) -> Str
 // Command
 // ---------------------------------------------------------------------------
 
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)

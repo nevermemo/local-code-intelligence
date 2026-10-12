@@ -1,0 +1,1674 @@
+{
+  "filter": {
+    "fix_words": [
+      "fix",
+      "fixes",
+      "fixed",
+      "fixing",
+      "bug",
+      "bugfix",
+      "regression"
+    ],
+    "gold_symbols": "names from git's built-in rust/golang/python diff driver hunk headers of git diff -U0 base..fix",
+    "max_gold_files": 3,
+    "min_subject_words": 4,
+    "only_modified_source_files": true,
+    "per_repo_max": 20,
+    "query": "commit subject plus the first body paragraph when it adds 3 or more words, at most 300 characters",
+    "skip": [
+      "merge commits",
+      "reverts",
+      "formatting, lint or typo fixes",
+      "duplicate query text"
+    ],
+    "source_files": "supported extension, not excluded (vendored, generated, lockfile), not a test path",
+    "supported_extensions": [
+      "rs",
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "py",
+      "cs",
+      "go",
+      "java",
+      "c",
+      "cpp",
+      "hpp"
+    ],
+    "walk": "git log --first-parent from the snapshot commit, newest first"
+  },
+  "repos": [
+    {
+      "commits_scanned": 317,
+      "key": "tokio",
+      "license": "MIT",
+      "skipped": {
+        "adds, deletes or renames a non-test source file": 1,
+        "formatting, lint or typo fix": 11,
+        "merge commit": 8,
+        "message does not say fix or bug": 245,
+        "modifies more than 3 non-test source files": 3,
+        "modifies no non-test source file": 13,
+        "revert": 1,
+        "subject under 4 words": 15
+      },
+      "snapshot": "e279adbfcd8831412c3f19edf2e16d28345f0f95",
+      "url": "https://github.com/tokio-rs/tokio"
+    },
+    {
+      "commits_scanned": 88,
+      "key": "caddy",
+      "license": "Apache-2.0",
+      "skipped": {
+        "adds, deletes or renames a non-test source file": 3,
+        "message does not say fix or bug": 64,
+        "modifies more than 3 non-test source files": 1
+      },
+      "snapshot": "d293dcfe86c1282e548b6cab94132be409d7300f",
+      "url": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "commits_scanned": 157,
+      "key": "black",
+      "license": "MIT",
+      "skipped": {
+        "formatting, lint or typo fix": 22,
+        "message does not say fix or bug": 97,
+        "modifies more than 3 non-test source files": 1,
+        "modifies no non-test source file": 7,
+        "subject under 4 words": 10
+      },
+      "snapshot": "11cff1312bf96e02bce9a467d0b5a2dd65300642",
+      "url": "https://github.com/psf/black"
+    }
+  ],
+  "schema": "lci.bench-set/1",
+  "tasks": [
+    {
+      "base_commit": "d81e8f0acbdd7d866bce4f733b3545fd834c7840",
+      "date": "2026-02-23T22:50:27+01:00",
+      "fix_commit": "f21f2693f02aec9a876ac2bd21566c85e15b682e",
+      "gold_files": [
+        "tokio/src/runtime/blocking/pool.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "run",
+          "path": "tokio/src/runtime/blocking/pool.rs"
+        }
+      ],
+      "id": "tokio-f21f2693f02a",
+      "query": "runtime: fix race condition during the blocking pool shutdown",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "f21f2693f02aec9a876ac2bd21566c85e15b682e",
+      "date": "2026-02-23T20:49:37-08:00",
+      "fix_commit": "d18e5dfbb0cdc28725bebb28cde80a6c11ee32bc",
+      "gold_files": [
+        "tokio-test/src/io.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "poll_write",
+          "path": "tokio-test/src/io.rs"
+        }
+      ],
+      "id": "tokio-d18e5dfbb0cd",
+      "query": "io: fix race in `Mock::poll_write`",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "d18e5dfbb0cdc28725bebb28cde80a6c11ee32bc",
+      "date": "2026-02-24T16:30:53+01:00",
+      "fix_commit": "03fe44c10302fdb55c29dbe5b08d4f8769c80272",
+      "gold_files": [
+        "tokio/src/runtime/builder.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "global_queue_interval",
+          "path": "tokio/src/runtime/builder.rs"
+        }
+      ],
+      "id": "tokio-03fe44c10302",
+      "query": "runtime: fix `event_interval` doc",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "6752f50154025a1aa2c231b643cdb78bb4c3892f",
+      "date": "2026-03-31T13:52:02+02:00",
+      "fix_commit": "9f132172dbb00b1f6b6bda64bb9b194382079499",
+      "gold_files": [
+        "tokio/src/sync/notify.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "poll_notified",
+          "path": "tokio/src/sync/notify.rs"
+        }
+      ],
+      "id": "tokio-9f132172dbb0",
+      "query": "sync: fix `notify_waiters` priority in `Notify`. Previously, if a `notify_waiters()` was followed by a `notify_one()`, an unpolled `Notified` future created before the `notify_waiters()` call would consume the `NOTIFIED` permit created by the `notify_one()` call.",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "c79121391db8f8d36d4213feeb25381caee110c7",
+      "date": "2026-04-08T07:59:54+00:00",
+      "fix_commit": "3ea11e2a5fb4139ca21b441044d98994a2b126c5",
+      "gold_files": [
+        "tokio/src/sync/batch_semaphore.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "forget_permits",
+          "path": "tokio/src/sync/batch_semaphore.rs"
+        }
+      ],
+      "id": "tokio-3ea11e2a5fb4",
+      "query": "sync: fix semaphore reopens after forget",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "daa653d94f51422d7a6c7caf115a44a9bcac6418",
+      "date": "2026-06-19T22:32:30+02:00",
+      "fix_commit": "66e29121b333d1ba5bde803f570e421524d4431e",
+      "gold_files": [
+        "tokio/src/time/timeout.rs"
+      ],
+      "gold_symbols": [],
+      "id": "tokio-66e29121b333",
+      "query": "time: fix reversed poll order in timeout doc. The timeout doc said the timeout is checked before polling the future, but the impl polls the future first and only then checks the delay (see the Future impl for Timeout, which calls me.value.poll before poll_delay). Reverse the clause to match the",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "dc3a883b99f8255cad5409458be95a0bcec2320c",
+      "date": "2026-06-23T09:49:54+02:00",
+      "fix_commit": "f59aae423eaf7131d6923085c1c66b50a49bb4e2",
+      "gold_files": [
+        "tokio-stream/src/stream_map.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "size_hint",
+          "path": "tokio-stream/src/stream_map.rs"
+        }
+      ],
+      "id": "tokio-f59aae423eaf",
+      "query": "stream: fix overflow in `StreamMap::size_hint`",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "962420a4f3561ebcd818f7594879e1d4c870d0a4",
+      "date": "2026-07-06T14:15:51+02:00",
+      "fix_commit": "e06f16259df3c72b00b6d176e86c7d4a150c6e99",
+      "gold_files": [
+        "tokio/src/sync/mpsc/chan.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "drop",
+          "path": "tokio/src/sync/mpsc/chan.rs"
+        }
+      ],
+      "id": "tokio-e06f16259df3",
+      "query": "sync: reset Chan::rx_waker in chan::Rx's Drop impl. I recently fixed a memory leak in an application where tokio's RawTask storage was being kept alive by a leaked Waker. The task itself was polling an `mpsc::Receiver` before then being aborted. During cleanup, all references to the RawTask were",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "a46338401b9e0ffc9bd68c31100ee99cee717481",
+      "date": "2026-07-20T18:32:46+08:00",
+      "fix_commit": "91d3b4c0bccf2234fc3ed19e605e2cd402f19437",
+      "gold_files": [
+        "tokio/src/runtime/time_alt/entry.rs",
+        "tokio/src/runtime/time_alt/wheel/mod.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "register_cancel_tx",
+          "path": "tokio/src/runtime/time_alt/entry.rs"
+        },
+        {
+          "name": "wake",
+          "path": "tokio/src/runtime/time_alt/entry.rs"
+        },
+        {
+          "name": "elapsed",
+          "path": "tokio/src/runtime/time_alt/wheel/mod.rs"
+        },
+        {
+          "name": "insert",
+          "path": "tokio/src/runtime/time_alt/wheel/mod.rs"
+        }
+      ],
+      "id": "tokio-91d3b4c0bccf",
+      "query": "time: fix alt timer cancellation and insertion race",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "eb4988dc2ecb85d2617971fbbabc84938c141bfd",
+      "date": "2026-07-20T19:04:08+02:00",
+      "fix_commit": "ae9d01121377cdbef32b9d5e8559843cce9f927e",
+      "gold_files": [
+        "tokio/src/signal/windows/sys.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "index",
+          "path": "tokio/src/signal/windows/sys.rs"
+        },
+        {
+          "name": "new",
+          "path": "tokio/src/signal/windows/sys.rs"
+        }
+      ],
+      "id": "tokio-ae9d01121377",
+      "query": "signal: restore MSRV by removing OnceLock::wait from the Windows handler. OnceLock::wait was stabilized in Rust 1.86, so its use in the Windows console ctrl handler broke tokio's declared rust-version of 1.71 on windows targets in 1.53.0 (any cargo check with a 1.71..1.86 toolchain fails with",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "e10d614cb96de0cd618a6828c7c310df323cf68b",
+      "date": "2026-08-09T17:31:23+02:00",
+      "fix_commit": "b6ed00435dc48be944f2373a34b07b7a11fd6900",
+      "gold_files": [
+        "tokio-util/src/codec/length_delimited.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "new_codec",
+          "path": "tokio-util/src/codec/length_delimited.rs"
+        },
+        {
+          "name": "num_skip",
+          "path": "tokio-util/src/codec/length_delimited.rs"
+        }
+      ],
+      "id": "tokio-b6ed00435dc4",
+      "query": "codec: fix broken length_delimited builder doc examples. The Builder::new, new_codec, and new_read doc examples combined length_adjustment(0) with num_skip(0). This leaves the length header bytes in the buffer without accounting for them, so decoding returns a frame that includes the raw header at",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "011f7f4b470463cf7141f2da944316a599639a07",
+      "date": "2026-08-09T18:06:29+02:00",
+      "fix_commit": "d4fb4bb9e6e78f740ce64e0b1729fa25fba6ab12",
+      "gold_files": [
+        "tokio/src/sync/notify.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "atomic_inc_num_notify_waiters_calls",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "drop_notified",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "inner_notify_waiters",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "lock_waiter_list",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "notified",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "notified_owned",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "notify_locked",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "notify_with_strategy",
+          "path": "tokio/src/sync/notify.rs"
+        },
+        {
+          "name": "poll_notified",
+          "path": "tokio/src/sync/notify.rs"
+        }
+      ],
+      "id": "tokio-d4fb4bb9e6e7",
+      "query": "sync: use acquire/release orderings in `Notify`. Every atomic operation on `Notify::state` used `SeqCst`. Nothing needs the global total order: every lock-avoidance decision is made by an RMW, which always reads the latest value in that atomic's modification order, and every stale load is",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "231a8faf20d2c24d01d36bd15ed7c3aed24b06a9",
+      "date": "2026-09-04T11:33:54+00:00",
+      "fix_commit": "89f4d133ba376834bba9dce016b4414dc8aaaf43",
+      "gold_files": [
+        "tokio/src/io/util/lines.rs",
+        "tokio/src/io/util/read_line.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Lines",
+          "path": "tokio/src/io/util/lines.rs"
+        },
+        {
+          "name": "lines",
+          "path": "tokio/src/io/util/lines.rs"
+        },
+        {
+          "name": "poll_next_line",
+          "path": "tokio/src/io/util/lines.rs"
+        },
+        {
+          "name": "finish_string_read",
+          "path": "tokio/src/io/util/read_line.rs"
+        }
+      ],
+      "id": "tokio-89f4d133ba37",
+      "query": "io: read lines as bytes so a partial line survives an I/O error. `Lines` accumulated into a `String`, so a partial line interrupted by an I/O error could not be kept when it ended mid multi-byte character. The next poll then tripped `debug_assert!(output.is_empty())`, or underflowed `vector.len()",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "060cc4e46aedc40b0a44dcbc31deb0df39abdb4e",
+      "date": "2026-09-06T20:02:36+08:00",
+      "fix_commit": "787697f76f1feff719f24f06ea97f4c5f12de011",
+      "gold_files": [
+        "tokio/src/runtime/driver.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "signal",
+          "path": "tokio/src/runtime/driver.rs"
+        }
+      ],
+      "id": "tokio-787697f76f1f",
+      "query": "runtime: fix misleading signal driver panic message",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "13d4800fb72ccb9677117d9668bdbed9df4c725e",
+      "date": "2026-09-08T09:27:02+00:00",
+      "fix_commit": "13094519876096fcc014aa0e876785d6a9870fa0",
+      "gold_files": [
+        "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+        "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "dec_num_unparked",
+          "path": "tokio/src/runtime/scheduler/multi_thread/idle.rs"
+        },
+        {
+          "name": "transition_worker_to_parked",
+          "path": "tokio/src/runtime/scheduler/multi_thread/idle.rs"
+        },
+        {
+          "name": "transition_from_parked",
+          "path": "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+        },
+        {
+          "name": "transition_to_parked",
+          "path": "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+        }
+      ],
+      "id": "tokio-130945198760",
+      "query": "runtime: fix idle bookkeeping when a task dump wakes parked workers. Requesting a task dump calls `notify_all`, which unparks every worker thread directly rather than going through `Idle`. A worker that was parked at that point is woken to be traced while the scheduler still counts it as a sleeper.",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "03f1f6bacf5f632929a18014236757e2b5235277",
+      "date": "2026-09-10T10:41:10+00:00",
+      "fix_commit": "d3587dac4bd40e3379d8d91c2bc799d3e70ef0ac",
+      "gold_files": [
+        "tokio/src/blocking.rs",
+        "tokio/src/task/coop/mod.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "spawn_blocking",
+          "path": "tokio/src/blocking.rs"
+        },
+        {
+          "name": "is_unconstrained",
+          "path": "tokio/src/task/coop/mod.rs"
+        }
+      ],
+      "id": "tokio-d3587dac4bd4",
+      "query": "fs: fix coop for emscripten fs shim",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "2ebac75c369d7f6b9e899862ae7302113513c395",
+      "date": "2026-09-23T07:40:09+02:00",
+      "fix_commit": "e43fb07c7ca1cec1a34a9feb387d727f2ce85029",
+      "gold_files": [
+        "tokio/src/runtime/context/runtime.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "enter_runtime",
+          "path": "tokio/src/runtime/context/runtime.rs"
+        }
+      ],
+      "id": "tokio-e43fb07c7ca1",
+      "query": "rt: suggest `.await` in nested `block_on` panic. Point callers at `.await` when `block_on` is invoked from an async context, and assert the hint in the nesting test.",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "2746c3ae26f8ac0af6023843a7f23d419c334efe",
+      "date": "2026-10-03T00:42:53+02:00",
+      "fix_commit": "86678437268b2a34cc72b3cff6ef2148c75e23af",
+      "gold_files": [
+        "tokio/src/runtime/task/mod.rs",
+        "tokio/src/runtime/task/state.rs",
+        "tokio/src/runtime/task/trace/mod.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "task_meta",
+          "path": "tokio/src/runtime/task/mod.rs"
+        },
+        {
+          "name": "transition_to_notified_by_ref",
+          "path": "tokio/src/runtime/task/state.rs"
+        },
+        {
+          "name": "transition_to_notified_for_tracing",
+          "path": "tokio/src/runtime/task/state.rs"
+        },
+        {
+          "name": "trace_owned",
+          "path": "tokio/src/runtime/task/trace/mod.rs"
+        }
+      ],
+      "id": "tokio-86678437268b",
+      "query": "rt: skip non-idle tasks during taskdumps. Task dumps currently assume that if no worker threads are running tasks, then all tasks are idle. However, when `block_in_place` is used, this assumption is false. This leads to a panic inside the scheduler.",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "86678437268b2a34cc72b3cff6ef2148c75e23af",
+      "date": "2026-10-03T11:22:39+02:00",
+      "fix_commit": "11d1ca0948874a75a75c484522c132b0f0897dc4",
+      "gold_files": [
+        "tokio-util/src/sync/cancellation_token/tree_node.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "cancel",
+          "path": "tokio-util/src/sync/cancellation_token/tree_node.rs"
+        }
+      ],
+      "id": "tokio-11d1ca094887",
+      "query": "sync: notify `CancellationToken` descendants after releasing locks. Currently, `tree_node::cancel` calls `notify_waiters()` on cancelled children and grandchildren while still holding the mutexes of their parent and grandparent nodes. If a descendant's waker synchronously operates on an ancestor",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "5ec9e6b8d5a7111fe9cd35a637bd8b4e4eb1e483",
+      "date": "2026-10-09T14:37:06+02:00",
+      "fix_commit": "8705c87040c67dc410169ff1da4c37a6ace9876b",
+      "gold_files": [
+        "tokio/src/net/unix/ucred.rs"
+      ],
+      "gold_symbols": [
+        {
+          "name": "get_peer_cred",
+          "path": "tokio/src/net/unix/ucred.rs"
+        }
+      ],
+      "id": "tokio-8705c87040c6",
+      "query": "net: fix peer credentials on NetBSD",
+      "query_source": "commit-message",
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "af29f9ea919603408faf33c0f45af53d61db89a5",
+      "date": "2026-09-03T07:48:22+10:00",
+      "fix_commit": "2cb7ebca45913da5824b7b2b4ef845d7e80da41d",
+      "gold_files": [
+        "caddyconfig/caddyfile/importgraph.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "removeNode",
+          "path": "caddyconfig/caddyfile/importgraph.go"
+        },
+        {
+          "name": "willCycle",
+          "path": "caddyconfig/caddyfile/importgraph.go"
+        }
+      ],
+      "id": "caddy-2cb7ebca4591",
+      "query": "caddyfile: fix importGraph self-loop and stale-edge bugs",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "8e90c9a0e1b5c2c2f7e83a7488fba672b204bdd0",
+      "date": "2026-09-05T12:39:37+00:00",
+      "fix_commit": "f7d58438b08c1ff613ab2f93b5aaf01c6d692319",
+      "gold_files": [
+        "admin.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "checkHost",
+          "path": "admin.go"
+        }
+      ],
+      "id": "caddy-f7d58438b08c",
+      "query": "admin: fix host allow-list comparison to be case-insensitive. The admin host check compared r.Host against the allowed URL's Host with byte-for-byte equality. url.Parse does not normalize host case, so an allowed 'http://Example.com:2019' rejected a client Host of 'example.com:2019' with 'host not",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "425a3381fdf65c826dd991c92e78eaf6ef24941e",
+      "date": "2026-09-13T12:08:09+10:00",
+      "fix_commit": "a75817f5500c5210a3892a21e4e712477b2fdadc",
+      "gold_files": [
+        "cmd/packagesfuncs.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "getModules",
+          "path": "cmd/packagesfuncs.go"
+        }
+      ],
+      "id": "caddy-a75817f5500c",
+      "query": "fix: require module path boundaries when matching packages",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "a75817f5500c5210a3892a21e4e712477b2fdadc",
+      "date": "2026-09-13T12:08:21+10:00",
+      "fix_commit": "56e3a88efe39be6e380496778e7b94cb97f60c00",
+      "gold_files": [
+        "modules/caddyhttp/staticresp.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/staticresp.go"
+        }
+      ],
+      "id": "caddy-56e3a88efe39",
+      "query": "caddyhttp: only replace known placeholders in respond headers. The respond directive expanded header field names and values with repl.ReplaceAll, which blanks any {...} the replacer does not recognize",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "15ee32d50c2da0ce1655cd1a4db36c2bfe4258ac",
+      "date": "2026-09-16T10:10:24+00:00",
+      "fix_commit": "9be8fb279444ec633ae2eea4590a180e1143c8f6",
+      "gold_files": [
+        "modules/caddyhttp/reverseproxy/streaming.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "copyFromBackend",
+          "path": "modules/caddyhttp/reverseproxy/streaming.go"
+        },
+        {
+          "name": "copyToBackend",
+          "path": "modules/caddyhttp/reverseproxy/streaming.go"
+        },
+        {
+          "name": "handleUpgradeResponse",
+          "path": "modules/caddyhttp/reverseproxy/streaming.go"
+        },
+        {
+          "name": "switchProtocolCopier",
+          "path": "modules/caddyhttp/reverseproxy/streaming.go"
+        }
+      ],
+      "id": "caddy-9be8fb279444",
+      "query": "reverseproxy: propagate TCP half-close on upgraded streams",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "c798d4c23831dc5aff4198519defb78c8dffad9a",
+      "date": "2026-09-23T14:09:48-06:00",
+      "fix_commit": "7ee4441f9261d649eed215f27331352c1ab5a746",
+      "gold_files": [
+        "modules/caddyhttp/reverseproxy/reverseproxy.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "prepareRequest",
+          "path": "modules/caddyhttp/reverseproxy/reverseproxy.go"
+        },
+        {
+          "name": "proxyLoopIteration",
+          "path": "modules/caddyhttp/reverseproxy/reverseproxy.go"
+        }
+      ],
+      "id": "caddy-7ee4441f9261",
+      "query": "reverseproxy: Move websocket header normalization later",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "4845150fa663f9c854282dee7e74bd340a8f9d08",
+      "date": "2026-09-25T22:36:28+10:00",
+      "fix_commit": "89db4b75c3ba8d6362ba1d51909063cd55481aa2",
+      "gold_files": [
+        "modules/caddyhttp/reverseproxy/reverseproxy.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "finalizeResponse",
+          "path": "modules/caddyhttp/reverseproxy/reverseproxy.go"
+        }
+      ],
+      "id": "caddy-89db4b75c3ba",
+      "query": "reverseproxy: Fix partial response not flushed to clients",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "89db4b75c3ba8d6362ba1d51909063cd55481aa2",
+      "date": "2026-09-25T16:01:50+00:00",
+      "fix_commit": "54937914234be0911a9d22a8d1f5560c1ca59fd2",
+      "gold_files": [
+        "modules/caddyhttp/errors.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Unwrap",
+          "path": "modules/caddyhttp/errors.go"
+        },
+        {
+          "name": "randString",
+          "path": "modules/caddyhttp/errors.go"
+        }
+      ],
+      "id": "caddy-54937914234b",
+      "query": "caddyhttp: fix randString sameCase dictionary to match its docs",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "54937914234be0911a9d22a8d1f5560c1ca59fd2",
+      "date": "2026-09-26T18:50:06+10:00",
+      "fix_commit": "81a0b6d838721c31283977c8f816a7fd1306051d",
+      "gold_files": [
+        "modules/caddyhttp/requestbody/requestbody.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/requestbody/requestbody.go"
+        }
+      ],
+      "id": "caddy-81a0b6d83872",
+      "query": "requestbody: replace only known placeholders in the set body. The set body is user-supplied and commonly JSON, but it was expanded with ReplaceAll, which blanks any {...} the replacer does not recognize, so a plain JSON body was sent empty and a body mixing JSON with a real placeholder was mangled",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "81a0b6d838721c31283977c8f816a7fd1306051d",
+      "date": "2026-09-26T18:51:36+10:00",
+      "fix_commit": "fbc88ae2322082b55aef52e0209a0bc56166eca6",
+      "gold_files": [
+        "internal/logs.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "MaxSizeSubjectsListForLog",
+          "path": "internal/logs.go"
+        }
+      ],
+      "id": "caddy-fbc88ae23220",
+      "query": "internal: fix `MaxSizeSubjectsListForLog` off-by-one when `maxToDisplay` is `0`",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "fbc88ae2322082b55aef52e0209a0bc56166eca6",
+      "date": "2026-09-26T18:52:53+10:00",
+      "fix_commit": "69ec5dfedf5ba8f7d042f8f2ff41baa5ce576ce8",
+      "gold_files": [
+        "modules/caddyhttp/caddyauth/basicauth.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Provision",
+          "path": "modules/caddyhttp/caddyauth/basicauth.go"
+        }
+      ],
+      "id": "caddy-69ec5dfedf5b",
+      "query": "caddyauth: only replace known placeholders in basic auth credentials. The basic auth provider expanded account usernames and passwords with repl.ReplaceAll, which blanks any {...} the replacer does not recognize",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "ea1e94b89972b83b189cbb946352abd9acec0f8c",
+      "date": "2026-09-28T22:19:51+10:00",
+      "fix_commit": "256df3c8ad4ed93c58a7e83470a7f15ef8cb1b94",
+      "gold_files": [
+        "modules/caddyhttp/map/map.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Provision",
+          "path": "modules/caddyhttp/map/map.go"
+        }
+      ],
+      "id": "caddy-256df3c8ad4e",
+      "query": "map: reject malformed destination placeholders. Provision previously only checked for a single opening brace at the start of a destination, so values like {result}suffix, {result, and {result}} passed validation. strings.Trim(dest, \"{}\") then silently stored a wrong placeholder name (e.g.",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "90ccea768fc192ba0feff7a8df4344916eb7331f",
+      "date": "2026-09-30T11:15:18-06:00",
+      "fix_commit": "ff112bb2309f12838558d24615649ca07bfd4606",
+      "gold_files": [
+        "modules/caddyhttp/app.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Stop",
+          "path": "modules/caddyhttp/app.go"
+        },
+        {
+          "name": "httpsPort",
+          "path": "modules/caddyhttp/app.go"
+        }
+      ],
+      "id": "caddy-ff112bb2309f",
+      "query": "caddyhttp: wait for servers from previous configs on exit. Track pending HTTP server shutdowns across configuration reloads so termination waits for responses still served by an older configuration. Bound that wait by the terminating app's grace period and retain each reload's grace context until",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "ab7e6b6d81cfc42eaabd5ffb172fd912bb7624cf",
+      "date": "2026-10-03T01:06:18-04:00",
+      "fix_commit": "72dd0fb067f6d7826c7f79907670ba4a713bfe37",
+      "gold_files": [
+        "modules/caddyhttp/idletimeout.go",
+        "modules/caddyhttp/server.go",
+        "modules/caddyhttp/timeouts/timeouts.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "IdleTimeoutWriter",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "ReadFrom",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "Write",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "clearDeadlineLocked",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "next",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "resetDeadline",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/server.go"
+        },
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/timeouts/timeouts.go"
+        }
+      ],
+      "id": "caddy-72dd0fb067f6",
+      "query": "timeouts: fix idle writer terminate h2 response writers between writes",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "c8341d5b69e9e56e887c8add3903b8b3a54d3bd9",
+      "date": "2026-10-03T22:18:42+10:00",
+      "fix_commit": "8f549e6df151f6a947bc183200c5d26baefa8666",
+      "gold_files": [
+        "modules/caddyhttp/idletimeout.go",
+        "modules/caddyhttp/server.go",
+        "modules/caddyhttp/timeouts/timeouts.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "FlushError",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "HandlerDone",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "next",
+          "path": "modules/caddyhttp/idletimeout.go"
+        },
+        {
+          "name": "PrepareRequest",
+          "path": "modules/caddyhttp/server.go"
+        },
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/server.go"
+        },
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/timeouts/timeouts.go"
+        },
+        {
+          "name": "Timeouts",
+          "path": "modules/caddyhttp/timeouts/timeouts.go"
+        },
+        {
+          "name": "init",
+          "path": "modules/caddyhttp/timeouts/timeouts.go"
+        }
+      ],
+      "id": "caddy-8f549e6df151",
+      "query": "timeouts: take precedence over server-wide and enclosing idle timeouts",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "8f549e6df151f6a947bc183200c5d26baefa8666",
+      "date": "2026-10-03T23:38:05+10:00",
+      "fix_commit": "04fe16102872eba7c017b495a9006fddae4dbdc4",
+      "gold_files": [
+        "modules/caddyhttp/encode/encode.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "ServeHTTP",
+          "path": "modules/caddyhttp/encode/encode.go"
+        }
+      ],
+      "id": "caddy-04fe16102872",
+      "query": "encode: fix ETag list matching",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "700d60327d77d56ba81455acb989a698f1819640",
+      "date": "2026-10-07T03:05:50+00:00",
+      "fix_commit": "c1acb2fcbac9c659f601ad3a920653ac959ff952",
+      "gold_files": [
+        "caddyconfig/caddyfile/parse.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "doImport",
+          "path": "caddyconfig/caddyfile/parse.go"
+        }
+      ],
+      "id": "caddy-c1acb2fcbac9",
+      "query": "caddyfile: surface OS error when an import file is inaccessible",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "6727b2f3a92bfc20f897ea9a24e88a4013274d55",
+      "date": "2026-10-08T14:02:20+10:00",
+      "fix_commit": "221ebc4503398fa8c87d95a52d43d0d93a6aeef4",
+      "gold_files": [
+        "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go",
+        "modules/caddyhttp/reverseproxy/reverseproxy.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "RoundTrip",
+          "path": "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go"
+        },
+        {
+          "name": "DialError",
+          "path": "modules/caddyhttp/reverseproxy/reverseproxy.go"
+        }
+      ],
+      "id": "caddy-221ebc450339",
+      "query": "fix: preserve FastCGI dial errors for retry. Wrap backend dial failures as reverseproxy.DialError so non-GET requests can be retried when no connection was made.",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "7c7456353e52d1f6056f22538b1eb05b02708e57",
+      "date": "2026-10-09T21:22:40+00:00",
+      "fix_commit": "d588d5c8f0a48a44851a218bbfc3d6edc0e4be17",
+      "gold_files": [
+        "cmd/commandfuncs.go",
+        "logging.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "cmdRun",
+          "path": "cmd/commandfuncs.go"
+        },
+        {
+          "name": "BufferedLog",
+          "path": "logging.go"
+        }
+      ],
+      "id": "caddy-d588d5c8f0a4",
+      "query": "cmd: unbuffer default logger on startup failure",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "f2c20fb8107a5497d6276ed33f5a454c64329ce5",
+      "date": "2026-10-12T20:49:24+10:00",
+      "fix_commit": "6ae02b5ccbd9c3ac4c0db2cfc1789cc1ada4e54a",
+      "gold_files": [
+        "caddyconfig/httpcaddyfile/directives.go"
+      ],
+      "gold_symbols": [
+        {
+          "name": "sortRoutes",
+          "path": "caddyconfig/httpcaddyfile/directives.go"
+        }
+      ],
+      "id": "caddy-6ae02b5ccbd9",
+      "query": "httpcaddyfile: keep source order for vars with non-comparable matchers. Use i/j swap instead of !sortByPath for vars, so matchers that can't be compared keep their Caddyfile order. Path matchers still sort with the more specific one later. Fixes the vars ordering part of #8187.",
+      "query_source": "commit-message",
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "6cf262f7174e4b7c52768aeffcf77fc5dd90b293",
+      "date": "2026-06-10T16:58:45-05:00",
+      "fix_commit": "00cd1e4a6b306679dca12730873fa49fb9c06343",
+      "gold_files": [
+        "src/black/linegen.py",
+        "src/black/lines.py",
+        "src/black/mode.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_maybe_split_omitting_optional_parens",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "can_be_split",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "can_omit_invisible_parens",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "Preview",
+          "path": "src/black/mode.py"
+        }
+      ],
+      "id": "black-00cd1e4a6b30",
+      "query": "Fix unnecessary parentheses in indexed assignment RHS",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "bf83d5f10563ed454b57fd88de63c6e8062453c0",
+      "date": "2026-06-24T14:40:37-05:00",
+      "fix_commit": "46c2abc37cd74a974cf9820ab07c98274d2a267e",
+      "gold_files": [
+        "src/black/lines.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "is_line_short_enough",
+          "path": "src/black/lines.py"
+        }
+      ],
+      "id": "black-46c2abc37cd7",
+      "query": "avoid quadratic multiline-string context scan in is_line_short_enough",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "ea5e8f85e1f4b2d3dfc13d1633b57f0a9d6b97dc",
+      "date": "2026-07-02T22:24:17-05:00",
+      "fix_commit": "2d174df7cb16f5dbdbb188da15fdb2059adb30d6",
+      "gold_files": [
+        "src/black/__init__.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "read_pyproject_toml",
+          "path": "src/black/__init__.py"
+        }
+      ],
+      "id": "black-2d174df7cb16",
+      "query": "Validate include and force-exclude config types",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "56ba38a484dae93f9793e70c4a136331284bdcc5",
+      "date": "2026-07-03T11:36:28-05:00",
+      "fix_commit": "0a6396ba56d2d7fac4ce4fef5ea15c97e82b299b",
+      "gold_files": [
+        "src/black/ranges.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_TopLevelStatementsVisitor",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "__init__",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "_convert_node_to_standalone_comment",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "_convert_nodes_to_standalone_comment",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "_convert_unchanged_line_by_line",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "convert_unchanged_lines",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "visit_simple_stmt",
+          "path": "src/black/ranges.py"
+        },
+        {
+          "name": "visit_suite",
+          "path": "src/black/ranges.py"
+        }
+      ],
+      "id": "black-0a6396ba56d2",
+      "query": "batch --line-ranges node conversion to avoid quadratic removal",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "e46a84dab42c54d3b5f71fd37d1d3d3deab99755",
+      "date": "2026-07-20T19:04:43-05:00",
+      "fix_commit": "308e2ee7dce7435f844ef3517cfe41f7b05f023c",
+      "gold_files": [
+        "src/black/lines.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "Line",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "is_complex_subscript",
+          "path": "src/black/lines.py"
+        }
+      ],
+      "id": "black-308e2ee7dce7",
+      "query": "avoid quadratic per-leaf subtree walk in is_complex_subscript",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "74371e2041a3120a049ced8f1cab0e7a6bc8ecd3",
+      "date": "2026-08-17T13:51:25-06:00",
+      "fix_commit": "bd622eda1aab7c8c6604282e2fa78381ee6370f3",
+      "gold_files": [
+        "src/black/linegen.py",
+        "src/black/mode.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_is_parenthesized_lambda_or_ternary",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "maybe_make_parens_invisible_in_atom",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "visit_atom",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "visit_power",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "Preview",
+          "path": "src/black/mode.py"
+        }
+      ],
+      "id": "black-bd622eda1aab",
+      "query": "Remove redundant generator parentheses",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "ef60933a73efec306e7cef8ef8775e86676c728e",
+      "date": "2026-08-18T19:56:53-05:00",
+      "fix_commit": "3224f36a0fcad002d3aa32f61ab21e14598aded9",
+      "gold_files": [
+        "src/black/lines.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_line_is_module_docstring",
+          "path": "src/black/lines.py"
+        }
+      ],
+      "id": "black-3224f36a0fca",
+      "query": "Fix --line-ranges inserting a blank line after a docstring",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "64631f6623868d9cecdb6c98586522316ccb8dc3",
+      "date": "2026-09-22T08:12:13-06:00",
+      "fix_commit": "b5b1eb6f60ce9febc473c6cb49f935954d108678",
+      "gold_files": [
+        "action/main.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "read_version_specifier_from_pyproject",
+          "path": "action/main.py"
+        }
+      ],
+      "id": "black-b5b1eb6f60ce",
+      "query": "Support version specifiers in `tool.black.required-version` for GitHub Action (fixes #4406)",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "9f9c675f27fa96f2a901fb0cb8ac3b5d8d579c79",
+      "date": "2026-09-24T15:35:29-06:00",
+      "fix_commit": "601c629e1107afe11c984e89ac0209307e3d4739",
+      "gold_files": [
+        "src/blib2to3/pgen2/conv.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "parse_graminit_c",
+          "path": "src/blib2to3/pgen2/conv.py"
+        },
+        {
+          "name": "parse_graminit_h",
+          "path": "src/blib2to3/pgen2/conv.py"
+        }
+      ],
+      "id": "black-601c629e1107",
+      "query": "Fix unclosed file handles in Converter.parse_graminit_h/_c",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "5f4516d267e705f73a648a713cf1b25cb0c9d019",
+      "date": "2026-09-24T15:52:37-06:00",
+      "fix_commit": "42047e102f6df3847a14524c875e02b00a8f0c6b",
+      "gold_files": [
+        "src/black/linegen.py",
+        "src/black/trans.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "should_split_funcdef_with_rhs",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "StringParenWrapper",
+          "path": "src/black/trans.py"
+        },
+        {
+          "name": "_return_match",
+          "path": "src/black/trans.py"
+        },
+        {
+          "name": "do_splitter_match",
+          "path": "src/black/trans.py"
+        },
+        {
+          "name": "do_transform",
+          "path": "src/black/trans.py"
+        }
+      ],
+      "id": "black-42047e102f6d",
+      "query": "Fix splitting stringified return annotations with parameters",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "1e6d48e43718ca534da4da600c9f591e949b2c17",
+      "date": "2026-10-03T12:51:19-06:00",
+      "fix_commit": "5fe7881e6e40ceeed3c9e3212cbc70a040adea28",
+      "gold_files": [
+        "src/black/lines.py",
+        "src/black/mode.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_maybe_empty_lines_for_class_or_def",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "Preview",
+          "path": "src/black/mode.py"
+        }
+      ],
+      "id": "black-5fe7881e6e40",
+      "query": "Fix preview blank lines after a stub method",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "5fe7881e6e40ceeed3c9e3212cbc70a040adea28",
+      "date": "2026-10-03T14:36:14-06:00",
+      "fix_commit": "34bfc69e57d05c6429673a445b402826695e8be5",
+      "gold_files": [
+        "src/black/trans.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "_remove_backslash_line_continuation_chars",
+          "path": "src/black/trans.py"
+        },
+        {
+          "name": "_transform_to_new_line",
+          "path": "src/black/trans.py"
+        }
+      ],
+      "id": "black-34bfc69e57d0",
+      "query": "Fix duplicated comments when string_processing rewrites a line",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "34bfc69e57d05c6429673a445b402826695e8be5",
+      "date": "2026-10-03T15:30:52-06:00",
+      "fix_commit": "e1c478359c087b76a6c4830a84c7e78ac93d8a6c",
+      "gold_files": [
+        "src/black/files.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "best_effort_relative_path",
+          "path": "src/black/files.py"
+        },
+        {
+          "name": "resolves_outside_root_or_cannot_stat",
+          "path": "src/black/files.py"
+        }
+      ],
+      "id": "black-e1c478359c08",
+      "query": "Fix --force-exclude for paths containing ..",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    },
+    {
+      "base_commit": "d078e8eee2824b01e1c4b841f0affc273e198d35",
+      "date": "2026-10-03T18:00:26-06:00",
+      "fix_commit": "2f3f992a9827e7ed7c4e68c34c35a5a34b75f4c2",
+      "gold_files": [
+        "src/black/concurrency.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "schedule_formatting",
+          "path": "src/black/concurrency.py"
+        }
+      ],
+      "id": "black-2f3f992a9827",
+      "query": "Fix superlinear runtime growth with the number of input files",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "30664d8f17b29658aa72e44a1bfe23eede12db99",
+      "date": "2026-10-04T21:17:02-06:00",
+      "fix_commit": "315a796590d112d15cf74b941ca83b53bb331068",
+      "gold_files": [
+        "action/main.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "find_black_version_in_array",
+          "path": "action/main.py"
+        }
+      ],
+      "id": "black-315a796590d1",
+      "query": "Fix GitHub Action crash on dependency-group includes",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "99d9cbfd80e76f8581d1d370c1063cf4abe6c9b3",
+      "date": "2026-10-04T21:46:21-06:00",
+      "fix_commit": "f4f6cd9becdafb8e88dfff171ad4bb91427864c8",
+      "gold_files": [
+        "src/black/handle_ipynb_magics.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "unmask_cell",
+          "path": "src/black/handle_ipynb_magics.py"
+        }
+      ],
+      "id": "black-f4f6cd9becda",
+      "query": "Fix long notebook magic assignments being wrapped in parentheses",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "e74a32413083a97bb7a96588708423be0c880227",
+      "date": "2026-10-04T22:23:45-06:00",
+      "fix_commit": "d9d091de04dd5872a308c8a60ca03b093c500e14",
+      "gold_files": [
+        "src/black/linegen.py",
+        "src/black/lines.py",
+        "src/black/mode.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "delimiter_split",
+          "path": "src/black/linegen.py"
+        },
+        {
+          "name": "append",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "can_omit_invisible_parens",
+          "path": "src/black/lines.py"
+        },
+        {
+          "name": "Preview",
+          "path": "src/black/mode.py"
+        }
+      ],
+      "id": "black-d9d091de04dd",
+      "query": "Fix unnecessary line breaks for expressions with comments under preview (#4026, #3713)",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic",
+        "names-symbol"
+      ]
+    },
+    {
+      "base_commit": "ee05651742abc47ec807c0fb34247ac6f4f3c5fc",
+      "date": "2026-10-05T11:32:32-06:00",
+      "fix_commit": "97fb59f06a076fa34c68b2922b4d3da583adfa90",
+      "gold_files": [
+        "src/black/__init__.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "reformat_one",
+          "path": "src/black/__init__.py"
+        }
+      ],
+      "id": "black-97fb59f06a07",
+      "query": "Fix check passing after a line ranges run",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "97fb59f06a076fa34c68b2922b4d3da583adfa90",
+      "date": "2026-10-05T11:42:52-06:00",
+      "fix_commit": "77c0cae18bcc82257882afc7bbb9a5cd95cba16c",
+      "gold_files": [
+        "src/black/__init__.py",
+        "src/black/ranges.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "f",
+          "path": "src/black/__init__.py"
+        },
+        {
+          "name": "_calculate_lines_mappings",
+          "path": "src/black/ranges.py"
+        }
+      ],
+      "id": "black-77c0cae18bcc",
+      "query": "Fix line-range mapping for a changed start of file",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ]
+    },
+    {
+      "base_commit": "eb8835829969f82c2567119f528b188769f3ac6d",
+      "date": "2026-10-07T12:52:43-06:00",
+      "fix_commit": "c9b1148b5b8799758756cbec7c0d1ac187d37f1a",
+      "gold_files": [
+        "src/black/linegen.py"
+      ],
+      "gold_symbols": [
+        {
+          "name": "visit_STRING",
+          "path": "src/black/linegen.py"
+        }
+      ],
+      "id": "black-c9b1148b5b87",
+      "query": "Fix module docstring last_line_length when docstring ends with newline",
+      "query_source": "commit-message",
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ]
+    }
+  ],
+  "version": "v1"
+}

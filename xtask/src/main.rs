@@ -1,4 +1,5 @@
 mod acceptance;
+mod bench;
 mod build;
 mod env;
 mod lint;
@@ -86,6 +87,10 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         max: usize,
     },
+    /// The multimap spike bench: mine a bench set, freeze a build, run levels
+    /// B and C, compare two results files. See docs/spike/multimap/bench.md.
+    #[command(subcommand)]
+    Bench(bench::BenchCommand),
 }
 
 #[derive(Subcommand)]
@@ -262,6 +267,7 @@ async fn main() -> Result<()> {
             out,
             max,
         } => mine::run(repo, key, out, max),
+        Command::Bench(command) => bench::run(command),
     }
 }
 
