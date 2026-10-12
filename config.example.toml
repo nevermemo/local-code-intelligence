@@ -93,7 +93,7 @@ lsp_search_budget_ms = 1500
 # building its symbol index or serving a call is never released. The next call
 # after a release starts a fresh server, which pays the cold start and priming
 # again, so a search right after a release can hit lsp_search_budget_ms and
-# note it. Values below 60 are meant for tests.
+# note it. Allowed: 0-86400; values below 60 are meant for tests.
 lsp_idle_timeout_seconds = 1800
 
 # Seconds a language server may answer nothing but transient "ask again"
@@ -103,7 +103,7 @@ lsp_idle_timeout_seconds = 1800
 # server ends it. A server that is still loading answers them for minutes and a
 # restarted one starts the load over, so keep this above the longest load you
 # expect. 0 never replaces a session for this.
-# Values below 60 are meant for tests.
+# Allowed: 0-86400; values below 60 are meant for tests.
 lsp_stuck_seconds = 900
 
 # Optional C# language server (csharp-ls). C# tooling is optional and

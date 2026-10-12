@@ -2218,7 +2218,7 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
     write_csharp_workspace(&workspace);
     let other = temp.path().join("other-workspace");
     std::fs::create_dir_all(&other).unwrap();
-    let app = App::open(with_fake_csharp_server(config, &state, &[]))
+    let app = App::open(with_fake_csharp_server(config, &state, &[], 5))
         .await
         .unwrap();
     let providers = [
@@ -2645,6 +2645,7 @@ async fn shutting_the_service_down_finishes_within_the_shutdown_bound_for_a_serv
         config,
         &state,
         &["--ignore-shutdown"],
+        5,
     ))
     .await
     .unwrap();

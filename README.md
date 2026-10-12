@@ -137,8 +137,8 @@ Before the first build, the defaults below are what `lci config --json` would re
 | `lsp_timeout_seconds` | 60 (allowed: 1–86400; the longest a request to a language server may go without a sign of life from it) |
 | `lsp_candidate_count` | 40 |
 | `lsp_search_budget_ms` | 1500 (allowed: 100–60000; the most one search waits for the language-server channel, see below) |
-| `lsp_idle_timeout_seconds` | 1800 (a language server unused this long is shut down; `0` keeps servers until the service stops; values below 60 are meant for tests; see below) |
-| `lsp_stuck_seconds` | 900 (a language server that has answered nothing but transient "ask again" errors this long is replaced; `0` never replaces it; values below 60 are meant for tests; see below) |
+| `lsp_idle_timeout_seconds` | 1800 (allowed: 0–86400; a language server unused this long is shut down; `0` keeps servers until the service stops; values below 60 are meant for tests; see below) |
+| `lsp_stuck_seconds` | 900 (allowed: 0–86400; a language server that has answered nothing but transient "ask again" errors this long is replaced; `0` never replaces it; values below 60 are meant for tests; see below) |
 | `index.freshness` | `on-search` (allowed: `manual`, `on-search`, `watch`) |
 | `index.stale_check_interval_seconds` | 10 |
 | `index.wait_for_existing_job_seconds` | 120 |
