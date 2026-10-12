@@ -143,8 +143,6 @@ fn chunks_with_adapter(
     source: &str,
     adapter: &language::LanguageAdapter,
 ) -> Result<Vec<Chunk>> {
-    #[cfg(test)]
-    tests::record_fixture(path, source);
     let mut parser = Parser::new();
     parser.set_language(&adapter.grammar())?;
     let tree = parser
@@ -346,34 +344,8 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
 }
 
 #[cfg(test)]
-#[path = "/tmp/chunk_delta.rs"]
-mod zz_delta;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static FIXTURES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
-
-    pub(super) fn record_fixture(path: &str, source: &str) {
-        FIXTURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap()
-            .insert((path.into(), source.into()));
-    }
-
-    pub(super) fn fixture_inputs() -> Vec<(String, String)> {
-        FIXTURES
-            .get()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect()
-    }
 
     pub(super) fn assert_uncovered_bytes_are_expected(
         adapter: &language::LanguageAdapter,
