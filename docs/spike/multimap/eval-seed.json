@@ -1,0 +1,2019 @@
+{
+  "schema_version": 1,
+  "generated": "2026-10-12T04:22Z",
+  "base_commit": "7f9c636",
+  "repository": "self",
+  "questions": [
+    {
+      "id": "q01",
+      "question": "One REST endpoint served by LCI has no MCP tool counterpart. Which endpoint is it, which App method does its handler call, which lci-core registry method actually stops the language servers, and which integration tests exercise it over HTTP and directly?",
+      "maps": [
+        "entrypoint_rest",
+        "entrypoint_mcp",
+        "call_graph",
+        "test_link"
+      ],
+      "hops": [
+        "List the REST routes in the router and the #[tool] methods of the MCP server; diff the two sets.",
+        "Follow the REST-only handler to the App method it calls.",
+        "Follow the App method into the lci-core LSP Manager.",
+        "Find tests that call the endpoint path or the App method."
+      ],
+      "answer": [
+        {
+          "path": "src/rest.rs",
+          "symbol": "release_workspace",
+          "lines": "70-79",
+          "role": "rest_handler"
+        },
+        {
+          "path": "src/rest.rs",
+          "symbol": "routes",
+          "lines": "262-279",
+          "role": "route_registration"
+        },
+        {
+          "path": "src/server.rs",
+          "symbol": "impl McpServer (#[tool_router])",
+          "lines": "89-200",
+          "role": "mcp_tool_list_without_counterpart"
+        },
+        {
+          "path": "src/app/navigation.rs",
+          "symbol": "App::release_language_servers",
+          "lines": "54-67",
+          "role": "app_method"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "Manager::release",
+          "lines": "656-667",
+          "role": "core_function"
+        },
+        {
+          "path": "tests/cases/mcp.rs",
+          "symbol": "rest_release_workspace_stops_the_language_servers_of_that_workspace",
+          "lines": "233-368",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "analyzers_running_has_an_entry_per_language_server_and_follows_the_session",
+          "lines": "2214-2299",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'route\\(' src/rest.rs (11 /v1 routes incl. /v1/release_workspace); rg -n '#\\[tool' src/server.rs (10 tools, no release)"
+        },
+        {
+          "method": "read",
+          "detail": "src/rest.rs 70-79 (doc comment: REST only, no MCP tool); src/app/navigation.rs 54-67; lci-core/src/lsp.rs 656-667"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'release_workspace|release_language_servers' tests (mcp.rs 233-368, navigation.rs 2281/2292)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q02",
+      "question": "AGENTS.md tells Windows users to keep data_dir below a length limit and says /ready degrades above it. Where is the numeric limit defined, which function builds the readiness component, where is it wired into the readiness report with a compile-time platform check, which HTTP route exposes the report, and which tests pin the rule?",
+      "maps": [
+        "agent_instructions",
+        "doc_to_code",
+        "build_graph",
+        "call_graph",
+        "entrypoint_rest",
+        "test_link"
+      ],
+      "hops": [
+        "Read the AGENTS.md Working method bullet about data_dir length.",
+        "Find the constant holding the limit and the component builder in the readiness module.",
+        "Find the call inside App::service_status that passes cfg!(windows).",
+        "Find the /ready route in the server router that serialises service_status.",
+        "Find unit and integration tests for the component."
+      ],
+      "answer": [
+        {
+          "path": "AGENTS.md",
+          "symbol": "Working method: Running LCI locally (data_dir length)",
+          "lines": "116-119",
+          "role": "doc_statement"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "WINDOWS_DATA_DIR_LENGTH_LIMIT",
+          "lines": "69-69",
+          "role": "constant"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "data_dir_length_component",
+          "lines": "76-91",
+          "role": "component_builder"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "App::service_status",
+          "lines": "98-278",
+          "role": "caller (line 195 passes cfg!(windows))"
+        },
+        {
+          "path": "src/server.rs",
+          "symbol": "router (/ready route)",
+          "lines": "271-282",
+          "role": "http_route"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "tests::data_dir_length_warns_only_on_windows_above_the_limit",
+          "lines": "446-472",
+          "role": "test"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "tests::data_dir_length_counts_characters_not_bytes",
+          "lines": "475-484",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/readiness.rs",
+          "symbol": "readiness_lists_the_data_dir_length_component_as_optional",
+          "lines": "120-149",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "AGENTS.md 114-119"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'data_dir_length_component|WINDOWS_DATA_DIR' src/app/readiness.rs (69, 76, 195, tests 447-478)"
+        },
+        {
+          "method": "read",
+          "detail": "src/server.rs 271-282 (/ready returns 503 when !report.ready)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n data_dir_path_length tests/cases/readiness.rs (130, 146)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q03",
+      "question": "When the command-line search is given a search profile name that is not configured, what code path produces the failure, where is the error message built, and which integration test runs the real binary to check it?",
+      "maps": [
+        "entrypoint_cli",
+        "call_graph",
+        "config_key",
+        "error_string",
+        "test_link"
+      ],
+      "hops": [
+        "Find the clap flag for the profile on the Search subcommand.",
+        "Follow the Search match arm in main() to the App method it calls.",
+        "Follow the App method to the Config method that resolves the profile and raises.",
+        "Find the integration test that spawns the CLI with an unknown profile."
+      ],
+      "answer": [
+        {
+          "path": "src/main.rs",
+          "symbol": "Command::Search (search_profile flag)",
+          "lines": "98-118",
+          "role": "cli_flag"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "main (Command::Search arm)",
+          "lines": "713-736",
+          "role": "cli_handler"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "App::search_in_profile",
+          "lines": "583-601",
+          "role": "app_method"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::search_settings",
+          "lines": "880-895",
+          "role": "raise_site"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "the_command_line_search_takes_a_search_profile_and_names_the_configured_ones_when_it_is_unknown",
+          "lines": "3175-3263",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'search-profile' src/main.rs (116)"
+        },
+        {
+          "method": "read",
+          "detail": "src/main.rs 713-736; src/app/search.rs 583-601 (line 591 calls config.search_settings)"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/config.rs 880-895 (two bail! messages)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'unknown search profile' tests/cases/indexing.rs (3049, 3258)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q04",
+      "question": "Which configuration key decides whether rust-analyzer may run repository build scripts and use the network, which adapter methods read it, where does the LSP manager hand those environment overrides to the spawned process, which unit tests cover both settings, and which commit introduced it?",
+      "maps": [
+        "config_key",
+        "trait_impl",
+        "call_graph",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find the boolean field on Config and its default.",
+        "Find RustServer::new and the LspAdapter methods that branch on it.",
+        "Find the caller that passes adapter.environment() to the transport.",
+        "Find the unit tests in the Rust adapter module.",
+        "Find the commit with git log -S on the key."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::rust_analyzer_trusted",
+          "lines": "299-299",
+          "role": "config_field"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "RustServer::new",
+          "lines": "28-34",
+          "role": "reader"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "RustServer::environment",
+          "lines": "69-83",
+          "role": "reader"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "RustServer::initialize_params",
+          "lines": "85-110",
+          "role": "reader"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "GenericClient::spawn",
+          "lines": "66-85",
+          "role": "caller (line 72)"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "tests::default_initialization_disables_repository_execution",
+          "lines": "162-209",
+          "role": "test"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "tests::trusted_initialization_restores_server_defaults_and_inherited_environment",
+          "lines": "212-234",
+          "role": "test"
+        },
+        {
+          "path": "8888858",
+          "symbol": "commit: N36: rust-analyzer starts with repository execution and network access off",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n rust_analyzer_trusted lci-core src README.md config.example.toml"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/lsp/rust.rs 1-140 and 160-235"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n '\\.environment\\(\\)' lci-core/src/lsp.rs (72)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log -S rust_analyzer_trusted --oneline; git show --stat 8888858"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q05",
+      "question": "The LspAdapter trait has an optional hook that runs before a definition or references request on a specific file. Which implementations override it, which two implementations rely on the default no-op, and where does the manager call the hook?",
+      "maps": [
+        "trait_impl",
+        "lsp_symbol",
+        "call_graph"
+      ],
+      "hops": [
+        "Read the trait and find the default method.",
+        "List every impl LspAdapter for ... and check which define the hook.",
+        "Find the manager call sites of the hook."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/lsp/adapter.rs",
+          "symbol": "LspAdapter::before_position_request (default)",
+          "lines": "78-85",
+          "role": "trait_default"
+        },
+        {
+          "path": "lci-core/src/lsp/go.rs",
+          "symbol": "GoServer::before_position_request",
+          "lines": "123-154",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/typescript.rs",
+          "symbol": "TypeScriptServer::before_position_request",
+          "lines": "123-157",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/python.rs",
+          "symbol": "PythonServer::before_position_request",
+          "lines": "125-156",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/java.rs",
+          "symbol": "JavaServer::before_position_request",
+          "lines": "221-245",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/clangd.rs",
+          "symbol": "ClangdServer::before_position_request",
+          "lines": "122-153",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "impl LspAdapter for RustServer",
+          "lines": "38-155",
+          "role": "uses_default"
+        },
+        {
+          "path": "lci-core/src/lsp/csharp.rs",
+          "symbol": "impl LspAdapter for CSharpServer",
+          "lines": "152-190",
+          "role": "uses_default"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "Manager::position_request",
+          "lines": "808-853",
+          "role": "call_site (lines 826, 847)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'impl LspAdapter for|fn before_position_request' lci-core/src/lsp (7 impls, 5 overrides)"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/lsp/adapter.rs 14-86"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'before_position_request' lci-core/src/lsp.rs (826, 847 inside position_request 808-853)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q06",
+      "question": "Exactly one language-server adapter overrides both the hook that classifies a JSON-RPC error as 'still loading' and the hook that supplies child-process environment overrides. Which adapter, where are those two hooks consumed in the LSP manager, and which test pins the loading-error rule?",
+      "maps": [
+        "trait_impl",
+        "call_graph",
+        "lsp_reference",
+        "test_link"
+      ],
+      "hops": [
+        "Read the LspAdapter defaults for is_loading_error and environment.",
+        "Grep all adapter files for overrides of both.",
+        "Find where the manager calls is_loading_error (via is_transient) and environment (spawn).",
+        "Find the unit test for the override."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/lsp/adapter.rs",
+          "symbol": "LspAdapter::environment (default)",
+          "lines": "39-41",
+          "role": "trait_default"
+        },
+        {
+          "path": "lci-core/src/lsp/adapter.rs",
+          "symbol": "LspAdapter::is_loading_error (default)",
+          "lines": "63-65",
+          "role": "trait_default"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "RustServer::is_loading_error",
+          "lines": "119-126",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "RustServer::environment",
+          "lines": "69-83",
+          "role": "override"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "is_transient",
+          "lines": "186-188",
+          "role": "consumer"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "send_with_repeats",
+          "lines": "979-1027",
+          "role": "consumer (line 1003)"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "GenericClient::spawn",
+          "lines": "66-85",
+          "role": "consumer (line 72)"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "tests::file_not_found_is_a_loading_error_only_before_quiescence",
+          "lines": "244-255",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'fn is_loading_error|fn environment' lci-core/src/lsp (only adapter.rs and rust.rs)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'is_loading_error|\\.environment\\(\\)|is_transient\\(' lci-core/src/lsp.rs (72, 187, 393, 1003)"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/lsp/rust.rs 119-126, 244-255; lci-core/src/lsp/adapter.rs 39-41 and 52-65"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q07",
+      "question": "A file with the TypeScript extension that is really a Qt Linguist translation catalog is not indexed. Which language-registry method detects it, where during the workspace scan is the file diverted to a skipped list, which tests cover it at unit and integration level, and which commit added the behaviour?",
+      "maps": [
+        "language_map",
+        "call_graph",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find the ts LanguageAdapter and its non-source check.",
+        "Find the caller in the chunk scanner.",
+        "Find unit tests in language.rs and the integration test in indexing.rs.",
+        "Find the commit via its N-number in the roadmap or git log."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "LanguageAdapter::non_source",
+          "lines": "60-65",
+          "role": "detector"
+        },
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "qt_linguist",
+          "lines": "414-423",
+          "role": "detector"
+        },
+        {
+          "path": "lci-core/src/chunk.rs",
+          "symbol": "sources",
+          "lines": "204-249",
+          "role": "caller (line 229 pushes SkippedFile)"
+        },
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "tests::qt_linguist_catalogs_are_recognized_by_their_xml_start",
+          "lines": "628-646",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "a_qt_linguist_ts_file_is_skipped_while_typescript_is_indexed",
+          "lines": "3281-3343",
+          "role": "test"
+        },
+        {
+          "path": "df1255c",
+          "symbol": "commit: N11: Qt Linguist .ts catalogs are skipped instead of parsed as TypeScript",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'non_source\\(' lci-core src (chunk.rs 229)"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/language.rs 55-66, 404-423; lci-core/src/chunk.rs 204-249"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log --oneline | rg N11; git show --stat df1255c (chunk.rs, language.rs, tests/cases/indexing.rs)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q08",
+      "question": "The file that defines the JSON-RPC client used to talk to every language server: which test file has changed together with it most often in git history, and which test-support file is its most frequent support co-change? Give the counts.",
+      "maps": [
+        "lsp_symbol",
+        "module_graph",
+        "git_cochange",
+        "test_link"
+      ],
+      "hops": [
+        "Locate the JsonRpcClient definition (the transport module).",
+        "List every commit touching that file and count co-touched files.",
+        "Pick the top test file and the top tests/support file."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/lsp/transport.rs",
+          "symbol": "JsonRpcClient",
+          "lines": "142-142",
+          "role": "subject_file"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "",
+          "lines": "",
+          "role": "cochange_test (9 of 10 commits)"
+        },
+        {
+          "path": "tests/support/fake_lsp.rs",
+          "symbol": "",
+          "lines": "",
+          "role": "cochange_support (7 of 10 commits)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'pub struct JsonRpcClient' lci-core (transport.rs 142)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log --format=%h -- lci-core/src/lsp/transport.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> tests/cases/navigation.rs 9/10; tests/support/fake_lsp.rs 7/10 (tied with lci-core/src/config.rs 7 and docs/development/roadmap.md 7); lci-core/src/lsp.rs 6/10; 10 commits touch the file (no --follow), full history of 191 commits"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q09",
+      "question": "Which source file changes most often together with the language registry (the module mapping file extensions to Tree-sitter grammars and identifiers), how many of the registry's commits include it, and which function in that file looks languages up per path during the workspace scan?",
+      "maps": [
+        "language_map",
+        "git_cochange",
+        "call_graph"
+      ],
+      "hops": [
+        "Identify the registry module (ADAPTERS, for_extension, for_path).",
+        "Count co-changed files across the registry's commits.",
+        "Confirm the static call from the top co-change back into the registry."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "ADAPTERS / for_path",
+          "lines": "561-565",
+          "role": "subject_file"
+        },
+        {
+          "path": "lci-core/src/chunk.rs",
+          "symbol": "sources",
+          "lines": "204-249",
+          "role": "cochange_source (7 of 8 commits; calls language::for_path at line 219)"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "",
+          "lines": "",
+          "role": "cochange_test (6 of 8 commits)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "git_log",
+          "detail": "git log --format=%h -- lci-core/src/language.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> chunk.rs 7, tests/cases/indexing.rs 6, README.md 5, lci-core/Cargo.toml 5, Cargo.lock 5; 8 commits (no --follow; with --follow 12, because the file moved from src/language.rs)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'language::for_path' lci-core/src/chunk.rs (219)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "easy"
+    },
+    {
+      "id": "q10",
+      "question": "Which non-documentation source file changes most often together with the search pipeline module (the one holding App::search_in_profile), what are the counts, and through which two methods of that file does a search obtain its per-query settings?",
+      "maps": [
+        "git_cochange",
+        "config_key",
+        "call_graph"
+      ],
+      "hops": [
+        "Locate the module that defines App::search_in_profile.",
+        "Count co-changed files over its history; skip README/docs.",
+        "Find the calls from the search module into the top co-changed file."
+      ],
+      "answer": [
+        {
+          "path": "src/app/search.rs",
+          "symbol": "App::search_with_options / App::search_in_profile",
+          "lines": "560-601",
+          "role": "subject_file (lines 568, 591)"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::base_search_settings",
+          "lines": "867-873",
+          "role": "cochange_source (9 of 15 commits)"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::search_settings",
+          "lines": "880-895",
+          "role": "cochange_source"
+        },
+        {
+          "path": "config.example.toml",
+          "symbol": "",
+          "lines": "",
+          "role": "cochange_config (9 of 15, tie)"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "",
+          "lines": "",
+          "role": "cochange_test (9 of 15, tie)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "git_log",
+          "detail": "git log --format=%h -- src/app/search.rs | xargs -n1 git show --format= --name-only | sort | uniq -c | sort -rn -> README.md 14, tests/cases/indexing.rs 9, lci-core/src/config.rs 9, config.example.toml 9; 15 commits (no --follow)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'search_settings' src/app/search.rs (568, 591)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q11",
+      "question": "Without RUST_LOG set, why do events from the lci-core crate (LSP restarts, JSON-RPC reader events) appear in the server log? Name the constant, where main() applies it, the test that pins it, and the commit that changed it.",
+      "maps": [
+        "git_commit_message",
+        "config_key",
+        "entrypoint_cli",
+        "test_link"
+      ],
+      "hops": [
+        "Find the default env-filter string in the binary.",
+        "Find where main() falls back to it when RUST_LOG is absent.",
+        "Find the unit test that parses the filter.",
+        "Find the fixing commit with git log -S on the filter text."
+      ],
+      "answer": [
+        {
+          "path": "src/main.rs",
+          "symbol": "DEFAULT_LOG_FILTER",
+          "lines": "606-607",
+          "role": "constant"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "main",
+          "lines": "609-617",
+          "role": "reader (EnvFilter::try_from_default_env fallback)"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "tests::default_log_filter_enables_app_and_core_at_info",
+          "lines": "884-904",
+          "role": "test"
+        },
+        {
+          "path": "182c062",
+          "symbol": "commit: N10: the default log filter keeps lci_core events",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n DEFAULT_LOG_FILTER src/main.rs (607, 614, 864, 885)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log -S 'lci_core=info' --oneline -> 182c062 (fix) and 6e73914 (roadmap row)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "easy"
+    },
+    {
+      "id": "q12",
+      "question": "A huge lsp_timeout_seconds value used to make the first LSP request panic. Where is the value now rejected, what upper bound is used, what second guard keeps the request deadline from overflowing, which tests cover both, and which commit made the change?",
+      "maps": [
+        "config_key",
+        "error_string",
+        "call_graph",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find the bound constant and the validate() check on Config.",
+        "Find the transport request deadline computation and its cap.",
+        "Find the config unit test and the navigation integration test.",
+        "Find the commit through git log on the transport file."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::MAX_LSP_TIMEOUT_SECONDS",
+          "lines": "672-672",
+          "role": "constant (86400)"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::validate",
+          "lines": "683-863",
+          "role": "raise_site (lines 733-737)"
+        },
+        {
+          "path": "lci-core/src/lsp/transport.rs",
+          "symbol": "LONGEST_WAIT",
+          "lines": "40-40",
+          "role": "constant"
+        },
+        {
+          "path": "lci-core/src/lsp/transport.rs",
+          "symbol": "JsonRpcClient::request",
+          "lines": "313-379",
+          "role": "guard (line 351)"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "tests::an_lsp_timeout_that_cannot_be_added_to_the_clock_is_rejected",
+          "lines": "1027-1037",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "a_transport_timeout_too_long_for_the_clock_does_not_panic_a_request",
+          "lines": "1099-1108",
+          "role": "test"
+        },
+        {
+          "path": "ab7de12",
+          "symbol": "commit: N52, N51: answer server requests with a string id; bound lsp_timeout_seconds and the request deadline",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'lsp_timeout_seconds|MAX_LSP' lci-core/src/config.rs (672, 733-737, 1028)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n LONGEST_WAIT lci-core/src/lsp/transport.rs (40, 349-351)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log --oneline -- lci-core/src/lsp/transport.rs; git show --stat ab7de12 (config.rs, transport.rs, tests/cases/navigation.rs, tests/support/fake_lsp.rs)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q13",
+      "question": "Which test sources does `cargo xtask test --suite Lsp` execute, and how do the cargo filters it passes map onto crate modules and the integration-test binary?",
+      "maps": [
+        "entrypoint_xtask",
+        "build_graph",
+        "module_graph",
+        "test_link"
+      ],
+      "hops": [
+        "Find the Suite::Lsp arm in the xtask test module.",
+        "Map the --lib filter lsp:: to modules (lci-core exports pub mod lsp; the root crate has none).",
+        "Map the integration filter navigation:: through tests/integration.rs to its #[path] file."
+      ],
+      "answer": [
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "run (Suite::Lsp arm)",
+          "lines": "108-139",
+          "role": "suite_definition (lines 128-131)"
+        },
+        {
+          "path": "lci-core/src/lib.rs",
+          "symbol": "pub mod lsp",
+          "lines": "6-6",
+          "role": "module_root"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "mod tests and lsp/* submodule tests",
+          "lines": "",
+          "role": "unit_tests (lsp::)"
+        },
+        {
+          "path": "tests/integration.rs",
+          "symbol": "mod navigation (#[path = \"cases/navigation.rs\"])",
+          "lines": "11-12",
+          "role": "test_binary_module"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "",
+          "lines": "",
+          "role": "integration_tests (navigation::)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "xtask/src/test.rs 108-139"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'mod lsp' src lci-core/src/lib.rs (only lci-core/src/lib.rs:6)"
+        },
+        {
+          "method": "read",
+          "detail": "tests/integration.rs 1-16"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q14",
+      "question": "AGENTS.md states that focused test suites fail when their filter matches zero tests. Which xtask function enforces this, how does it count executed tests, and which unit tests pin the counting? Is the rule limited to the --lib unit suites?",
+      "maps": [
+        "agent_instructions",
+        "entrypoint_xtask",
+        "call_graph",
+        "test_link"
+      ],
+      "hops": [
+        "Read the AGENTS.md Build-and-test bullet.",
+        "Find the xtask function that streams cargo output and bails on zero.",
+        "Find the summary-line parser and its tests.",
+        "Check which suites route through it (both --lib and integration filters do)."
+      ],
+      "answer": [
+        {
+          "path": "AGENTS.md",
+          "symbol": "Working method: Build and test",
+          "lines": "120-126",
+          "role": "doc_statement"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "invoke_focused",
+          "lines": "62-86",
+          "role": "enforcer"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "executed_in_summary",
+          "lines": "46-58",
+          "role": "counter"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "run",
+          "lines": "108-139",
+          "role": "caller (every focused suite, incl. integration filters)"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "tests::a_filter_that_matches_nothing_counts_zero",
+          "lines": "178-185",
+          "role": "test"
+        },
+        {
+          "path": "tests/AGENTS.md",
+          "symbol": "Every focused suite fails if its filter matches zero tests",
+          "lines": "18-19",
+          "role": "doc_statement"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "AGENTS.md 120-126; xtask/src/test.rs 1-192"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'ran no tests' xtask/src/test.rs (80-83)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "easy"
+    },
+    {
+      "id": "q15",
+      "question": "What does `cargo xtask lint-machine-paths` scan and how? Name the dispatch, the module entry, how it enumerates files, the directory it exempts, the optional local pattern file, and the other xtask command that runs it automatically.",
+      "maps": [
+        "entrypoint_xtask",
+        "module_graph",
+        "call_graph",
+        "config_key",
+        "doc_to_code"
+      ],
+      "hops": [
+        "Find the LintMachinePaths subcommand and its dispatch in xtask main.",
+        "Follow lint::run to scan_repo and tracked_files.",
+        "Find the exempt prefix and the extra pattern file constant.",
+        "Find which test suite calls lint::run."
+      ],
+      "answer": [
+        {
+          "path": "xtask/src/main.rs",
+          "symbol": "Command::LintMachinePaths",
+          "lines": "64-69",
+          "role": "subcommand"
+        },
+        {
+          "path": "xtask/src/lint.rs",
+          "symbol": "run",
+          "lines": "294-315",
+          "role": "entry"
+        },
+        {
+          "path": "xtask/src/lint.rs",
+          "symbol": "scan_repo",
+          "lines": "268-292",
+          "role": "scanner (skips EXEMPT_PREFIX at 271)"
+        },
+        {
+          "path": "xtask/src/lint.rs",
+          "symbol": "tracked_files",
+          "lines": "233-256",
+          "role": "file_enumeration (git ls-files -z)"
+        },
+        {
+          "path": "xtask/src/lint.rs",
+          "symbol": "EXEMPT_PREFIX",
+          "lines": "26-26",
+          "role": "exemption (.agents/skills/rust-skills/)"
+        },
+        {
+          "path": "xtask/src/lint.rs",
+          "symbol": "EXTRA_PATTERNS_FILE / load_extra",
+          "lines": "24-24, 72-79",
+          "role": "local_pattern_file"
+        },
+        {
+          "path": "xtask/src/test.rs",
+          "symbol": "run (Suite::Full arm)",
+          "lines": "132-138",
+          "role": "automatic_caller"
+        },
+        {
+          "path": "docs/development/machine-values.md",
+          "symbol": "## Lint",
+          "lines": "166-166",
+          "role": "doc"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "xtask/src/main.rs 60-70, 258; xtask/src/lint.rs 1-60, 233-315"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'lint::run' xtask/src (main.rs 258, test.rs 134)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q16",
+      "question": "During `cargo xtask live-acceptance`, how does a step get reported as skipped rather than passed, which acceptance engines emit the signal, how does --require-all change the outcome, which test pins it, and which commit introduced the SKIPPED reporting?",
+      "maps": [
+        "error_string",
+        "call_graph",
+        "entrypoint_xtask",
+        "test_link",
+        "git_commit_message",
+        "doc_to_code"
+      ],
+      "hops": [
+        "Find the stdout marker parsed by the orchestrator.",
+        "Find which acceptance run functions print that marker.",
+        "Follow write_summary and the --require-all flag from xtask main.",
+        "Find the unit test and the commit; cross-check the docs."
+      ],
+      "answer": [
+        {
+          "path": "xtask/src/live_acceptance.rs",
+          "symbol": "completed_status",
+          "lines": "52-63",
+          "role": "marker_consumer"
+        },
+        {
+          "path": "xtask/src/live_acceptance.rs",
+          "symbol": "write_summary",
+          "lines": "65-94",
+          "role": "require_all_logic"
+        },
+        {
+          "path": "xtask/src/live_acceptance.rs",
+          "symbol": "run",
+          "lines": "312-506",
+          "role": "orchestrator"
+        },
+        {
+          "path": "xtask/src/main.rs",
+          "symbol": "Command::LiveAcceptance (require_all)",
+          "lines": "46-58",
+          "role": "cli_flag"
+        },
+        {
+          "path": "xtask/src/acceptance/lsp_full.rs",
+          "symbol": "run",
+          "lines": "145-191",
+          "role": "raise_site (line 154)"
+        },
+        {
+          "path": "xtask/src/acceptance/recovery.rs",
+          "symbol": "run",
+          "lines": "190-266",
+          "role": "raise_site (line 202)"
+        },
+        {
+          "path": "xtask/src/acceptance/csharp_lsp/mod.rs",
+          "symbol": "run",
+          "lines": "40-63",
+          "role": "raise_site (line 53)"
+        },
+        {
+          "path": "xtask/src/live_acceptance.rs",
+          "symbol": "tests::skipped_step_is_listed_and_requires_all_to_fail",
+          "lines": "546-572",
+          "role": "test"
+        },
+        {
+          "path": "docs/development/live-acceptance-ci.md",
+          "symbol": "",
+          "lines": "101-102",
+          "role": "doc"
+        },
+        {
+          "path": "102f118",
+          "symbol": "commit: N56: a skipped live-acceptance step reads as SKIPPED, and --require-all fails on it",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n PREREQUISITE_UNAVAILABLE xtask/src"
+        },
+        {
+          "method": "read",
+          "detail": "xtask/src/live_acceptance.rs 20-94"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log --oneline -- xtask/src/live_acceptance.rs; git show --stat 102f118"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q17",
+      "question": "Trace Go support end to end: from the .go extension to its language identifier, the LSP adapter that serves it, the config section that enables it, where the adapter is registered, and the xtask acceptance command (plus its live-acceptance step) that proves real navigation as the language-adapter skill requires.",
+      "maps": [
+        "language_map",
+        "trait_impl",
+        "config_key",
+        "entrypoint_xtask",
+        "agent_instructions",
+        "lsp_symbol"
+      ],
+      "hops": [
+        "Find the go entry in the language ADAPTERS table.",
+        "Find the LspAdapter impl whose languages() is go and its config type.",
+        "Find Manager::new registration.",
+        "Find the xtask go-lsp subcommand, its module, the shared engine and the live-acceptance step.",
+        "Map to row 14 of the skill's acceptance reference."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "ADAPTERS (go entry)",
+          "lines": "518-524",
+          "role": "extension_map"
+        },
+        {
+          "path": "lci-core/src/lsp/go.rs",
+          "symbol": "impl LspAdapter for GoServer",
+          "lines": "46-155",
+          "role": "lsp_adapter"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "GoLspConfig / Config::go",
+          "lines": "486-509",
+          "role": "config_section ([go] path/args/disabled; field at 347)"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "Manager::new",
+          "lines": "552-577",
+          "role": "registration"
+        },
+        {
+          "path": "xtask/src/main.rs",
+          "symbol": "AcceptanceCommand::GoLsp",
+          "lines": "151-154",
+          "role": "xtask_subcommand (dispatch line 237)"
+        },
+        {
+          "path": "xtask/src/acceptance/go_lsp.rs",
+          "symbol": "run",
+          "lines": "16-57",
+          "role": "acceptance_spec"
+        },
+        {
+          "path": "xtask/src/acceptance/lsp_full.rs",
+          "symbol": "run",
+          "lines": "145-191",
+          "role": "shared_engine"
+        },
+        {
+          "path": "xtask/src/live_acceptance.rs",
+          "symbol": "run (step list)",
+          "lines": "383-383",
+          "role": "live_step"
+        },
+        {
+          "path": ".agents/skills/lci-language-adapter/references/acceptance.md",
+          "symbol": "row 14",
+          "lines": "28-28",
+          "role": "acceptance_bar"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "lci-core/src/language.rs 515-525; lci-core/src/lsp/go.rs 1-70; lci-core/src/config.rs 486-509"
+        },
+        {
+          "method": "read",
+          "detail": "xtask/src/acceptance/go_lsp.rs 1-57"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'go-lsp|GoLsp' xtask/src (main.rs 151, 237; live_acceptance.rs 383)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q18",
+      "question": "AGENTS.md says an embedding-identity change must make search fail rather than serve old vectors. What goes into the identity, where does a search under manual/watch freshness raise the error, where does the on-search path turn a failed refresh into a hard error instead of a warning, and which integration test asserts it?",
+      "maps": [
+        "agent_instructions",
+        "config_key",
+        "error_string",
+        "call_graph",
+        "test_link"
+      ],
+      "hops": [
+        "Read the hard rule in AGENTS.md.",
+        "Find Config::embedding_identity and its inputs.",
+        "Find the identity comparison in resolve_index_for_search.",
+        "Follow the on-search branch to refresh_stale_snapshot and stale_refresh_fallback.",
+        "Find the test that reopens the App with a different model under Manual freshness."
+      ],
+      "answer": [
+        {
+          "path": "AGENTS.md",
+          "symbol": "Hard rules: index freshness / embedding-identity exception",
+          "lines": "30-37",
+          "role": "doc_statement"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::embedding_identity",
+          "lines": "921-936",
+          "role": "identity (url|model|chunk::DOCUMENT_FORMAT_VERSION[|doc=hash])"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "App::resolve_index_for_search",
+          "lines": "1022-1123",
+          "role": "raise_site (lines 1096-1108)"
+        },
+        {
+          "path": "src/app/indexing.rs",
+          "symbol": "App::refresh_stale_snapshot",
+          "lines": "306-396",
+          "role": "on_search_path"
+        },
+        {
+          "path": "src/app/indexing.rs",
+          "symbol": "App::stale_refresh_fallback",
+          "lines": "402-419",
+          "role": "raise_site"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "persistence_incremental_isolation_deletion_and_fail_open",
+          "lines": "565-726",
+          "role": "test (Manual freshness, lines 719-723)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "AGENTS.md 30-37; lci-core/src/config.rs 915-936"
+        },
+        {
+          "method": "read",
+          "detail": "src/app/search.rs 1094-1123; src/app/indexing.rs 300-330, 395-419"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'embedding_model = ' tests/cases/indexing.rs (720); read 565-574 (freshness = Manual)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q19",
+      "question": "The ordering of fused search hits with equal scores is implemented in two places that must agree. Where are they, which CLI subcommand depends on the second copy, which tests pin each, and which commit last changed both together?",
+      "maps": [
+        "call_graph",
+        "git_commit_message",
+        "entrypoint_cli",
+        "test_link"
+      ],
+      "hops": [
+        "Find the comparator used by hits.sort_by in the search pipeline.",
+        "Find the replay module's comparator.",
+        "Find the replay CLI entry in main.rs.",
+        "Find the commit touching both (git log on replay.rs)."
+      ],
+      "answer": [
+        {
+          "path": "src/app/search.rs",
+          "symbol": "fusion_order",
+          "lines": "337-344",
+          "role": "comparator (used at 941)"
+        },
+        {
+          "path": "src/evaluate/replay.rs",
+          "symbol": "fused_order",
+          "lines": "331-338",
+          "role": "comparator_copy"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "run_replay",
+          "lines": "282-296",
+          "role": "cli_handler (Command::Replay at 168)"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "tests::equal_score_chunks_with_the_same_path_and_start_line_have_a_stable_order",
+          "lines": "1802-1841",
+          "role": "test"
+        },
+        {
+          "path": "src/evaluate/replay.rs",
+          "symbol": "tests::equal_score_candidates_with_the_same_path_and_start_line_have_a_stable_order",
+          "lines": "1199-1227",
+          "role": "test"
+        },
+        {
+          "path": "879a1cb",
+          "symbol": "commit: N53: equal-score fused chunks get one stable order",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'fusion_order|fused_order' src (search.rs 337/941, replay.rs 331)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git log --oneline -- src/evaluate/replay.rs (2 commits); git show --stat 879a1cb (search.rs + replay.rs + evaluate/tests.rs)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q20",
+      "question": "When an MCP search_code call asks for more results than the search can return, the response says so in notes rather than warnings. Which config value caps the result count, where is the note text built and appended, where does the MCP tool argument document it, which tests cover it, and which commit added it?",
+      "maps": [
+        "entrypoint_mcp",
+        "config_key",
+        "call_graph",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find the top_k argument doc on the MCP SearchArgs.",
+        "Find the cap config field.",
+        "Find the note builder and the call site in search_once.",
+        "Find unit and integration tests and the commit."
+      ],
+      "answer": [
+        {
+          "path": "src/server.rs",
+          "symbol": "SearchArgs::top_k",
+          "lines": "30-34",
+          "role": "mcp_argument_doc"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::rerank_candidate_count",
+          "lines": "280-284",
+          "role": "config_field"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "pool_cut_note",
+          "lines": "462-471",
+          "role": "note_builder"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "App::search_once",
+          "lines": "637-1015",
+          "role": "call_site (lines 963-971)"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "tests::a_note_names_top_k_and_the_window_only_when_the_cut_leaves_fewer_results_than_asked",
+          "lines": "1429-1442",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "a_top_k_above_the_rerank_window_is_named_in_a_note",
+          "lines": "2875-2951",
+          "role": "test"
+        },
+        {
+          "path": "cf15de4",
+          "symbol": "commit: N69: a search whose top_k is above the rerank window says so in `notes`",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n pool_cut_note src/app/search.rs (462, 968, tests 1430-1441)"
+        },
+        {
+          "method": "read",
+          "detail": "src/app/search.rs 455-471, 955-975; src/server.rs 28-35"
+        },
+        {
+          "method": "git_log",
+          "detail": "git show --stat cf15de4 (search.rs, server.rs, config.rs, tests/cases/indexing.rs)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q21",
+      "question": "If a workspace has indexed files in a language whose only language server is disabled, how does the search_symbols MCP tool tell the caller, and where is that decided? Include the registry lookup used and the integration tests.",
+      "maps": [
+        "entrypoint_mcp",
+        "call_graph",
+        "lsp_symbol",
+        "error_string",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find the search_symbols tool and the App method it calls.",
+        "Find where App::symbols groups adapters per indexed language and collects not-searched languages into warnings.",
+        "Find Manager::adapters_for_language.",
+        "Find the integration tests (git show of the commit that added them)."
+      ],
+      "answer": [
+        {
+          "path": "src/server.rs",
+          "symbol": "McpServer::search_symbols",
+          "lines": "129-138",
+          "role": "mcp_tool"
+        },
+        {
+          "path": "src/app/navigation.rs",
+          "symbol": "App::symbols",
+          "lines": "76-161",
+          "role": "decision (not_searched 92-115, warnings 150-155)"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "Manager::adapters_for_language",
+          "lines": "585-590",
+          "role": "registry_lookup"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "symbols_name_an_indexed_language_whose_only_server_is_disabled",
+          "lines": "2400-2424",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "symbols_still_search_the_enabled_language_when_another_one_is_disabled",
+          "lines": "2429-2449",
+          "role": "test"
+        },
+        {
+          "path": "3bac689",
+          "symbol": "commit: N26 (a): search_symbols names each indexed language that no enabled server searches",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "src/server.rs 129-138; src/app/navigation.rs 76-161; lci-core/src/lsp.rs 583-590"
+        },
+        {
+          "method": "git_log",
+          "detail": "git show 3bac689 -- tests/cases/navigation.rs | rg '^\\+.*fn '"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q22",
+      "question": "How does a [search_profiles.<name>] table in the config become its own MCP endpoint? Name the config field, the name validation, the functions that build and mount the endpoint, and the integration tests for both a known and an unknown profile path.",
+      "maps": [
+        "config_key",
+        "entrypoint_mcp",
+        "call_graph",
+        "test_link"
+      ],
+      "hops": [
+        "Find the search_profiles field and name validation in Config.",
+        "Find mcp_path and the router fold over search_profiles.",
+        "Find mcp_service, which binds search_code to the profile.",
+        "Find the MCP integration tests for /mcp/<name>."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::search_profiles",
+          "lines": "366-366",
+          "role": "config_field"
+        },
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "is_valid_search_profile_name",
+          "lines": "141-149",
+          "role": "validation (used in validate at 797-801)"
+        },
+        {
+          "path": "src/server.rs",
+          "symbol": "mcp_path",
+          "lines": "213-218",
+          "role": "path_builder"
+        },
+        {
+          "path": "src/server.rs",
+          "symbol": "mcp_service",
+          "lines": "224-251",
+          "role": "endpoint_builder"
+        },
+        {
+          "path": "src/server.rs",
+          "symbol": "router",
+          "lines": "253-307",
+          "role": "mount (fold at 297-306)"
+        },
+        {
+          "path": "tests/cases/mcp.rs",
+          "symbol": "each_search_profile_has_its_own_mcp_endpoint_with_the_same_tools",
+          "lines": "641-772",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/mcp.rs",
+          "symbol": "an_unknown_mcp_profile_path_is_not_found_and_a_session_stays_on_its_endpoint",
+          "lines": "775-836",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "src/server.rs 210-307; lci-core/src/config.rs 134-149, 795-801"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n '/mcp/' tests/cases/mcp.rs (658-812)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q23",
+      "question": "Which config key releases a language server nobody has used for a while, where is the background sweeper started (and when is it not), and which integration tests cover release, the zero setting, and a server that is still priming?",
+      "maps": [
+        "config_key",
+        "call_graph",
+        "test_link",
+        "doc_to_code"
+      ],
+      "hops": [
+        "Find the config field and its default.",
+        "Find Manager::new, which conditionally spawns the sweeper.",
+        "Find spawn_idle_sweeper.",
+        "Find navigation tests that set the key."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/config.rs",
+          "symbol": "Config::lsp_idle_timeout_seconds",
+          "lines": "318-318",
+          "role": "config_field (default 1800 at 653)"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "Manager::new",
+          "lines": "552-577",
+          "role": "reader (lines 564-569)"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "spawn_idle_sweeper",
+          "lines": "1088-1133",
+          "role": "sweeper"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "an_idle_session_is_shut_down_and_restarted_on_the_next_call",
+          "lines": "2009-2057",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "idle_timeout_zero_never_releases",
+          "lines": "2062-2083",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/navigation.rs",
+          "symbol": "the_idle_sweep_leaves_a_server_alone_while_it_is_priming",
+          "lines": "2737-2773",
+          "role": "test"
+        },
+        {
+          "path": "README.md",
+          "symbol": "LSP lifecycle paragraph",
+          "lines": "254-254",
+          "role": "doc"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n lsp_idle_timeout_seconds lci-core/src tests/cases (config.rs 318/653, lsp.rs 564-567, navigation.rs 2012/2065/2709/2741)"
+        },
+        {
+          "method": "read",
+          "detail": "lci-core/src/lsp.rs 549-577, 1088-1133"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q24",
+      "question": "On Windows, language servers run inside a Job Object. Which build-graph entry makes this Windows-only, how is the module gated, where in process spawning is it applied, and what is logged (and where) when a job cannot be created or assigned?",
+      "maps": [
+        "build_graph",
+        "module_graph",
+        "call_graph",
+        "error_string"
+      ],
+      "hops": [
+        "Find the target-specific dependency in lci-core/Cargo.toml.",
+        "Find the #[cfg(windows)] mod declaration and the transport import.",
+        "Find JsonRpcClient::spawn calling job::prepare and job::adopt, and its caller.",
+        "Find the warn-once log site."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/Cargo.toml",
+          "symbol": "[target.'cfg(windows)'.dependencies] windows-sys",
+          "lines": "42-49",
+          "role": "build_graph"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "#[cfg(windows)] mod job",
+          "lines": "39-40",
+          "role": "module_gate"
+        },
+        {
+          "path": "lci-core/src/lsp/transport.rs",
+          "symbol": "JsonRpcClient::spawn",
+          "lines": "179-274",
+          "role": "apply_site (lines 185-193)"
+        },
+        {
+          "path": "lci-core/src/lsp/job.rs",
+          "symbol": "prepare",
+          "lines": "103-114",
+          "role": "job_create"
+        },
+        {
+          "path": "lci-core/src/lsp/job.rs",
+          "symbol": "adopt",
+          "lines": "124-145",
+          "role": "job_assign"
+        },
+        {
+          "path": "lci-core/src/lsp/job.rs",
+          "symbol": "warn_unconfined",
+          "lines": "266-275",
+          "role": "log_site"
+        },
+        {
+          "path": "lci-core/src/lsp.rs",
+          "symbol": "GenericClient::spawn",
+          "lines": "66-85",
+          "role": "caller"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "lci-core/Cargo.toml 33-49; lci-core/src/lsp/job.rs 1-30, 100-145, 262-275"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'cfg\\(windows\\)|job::' lci-core/src/lsp.rs lci-core/src/lsp/transport.rs"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q25",
+      "question": "A search filter naming an unregistered language fails with a message listing the valid identifiers. Where is the error raised and rendered, which registry function produces the list, which identifier used to appear twice and why, and which tests and commit fixed it?",
+      "maps": [
+        "error_string",
+        "language_map",
+        "call_graph",
+        "test_link",
+        "git_commit_message"
+      ],
+      "hops": [
+        "Find FilterError::UnknownLanguage and where from_request returns it.",
+        "Find the Display impl that renders the identifiers.",
+        "Find language::identifiers and the ADAPTERS rows that share an identifier.",
+        "Find the tests and commit (git show --stat)."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/filter/request.rs",
+          "symbol": "EffectiveFilter::from_request",
+          "lines": "224-271",
+          "role": "raise_site (line 234)"
+        },
+        {
+          "path": "lci-core/src/filter/request.rs",
+          "symbol": "impl fmt::Display for FilterError",
+          "lines": "177-218",
+          "role": "message (lines 184-190)"
+        },
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "identifiers",
+          "lines": "569-579",
+          "role": "registry_list"
+        },
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "ADAPTERS (cpp and hpp both map to cpp)",
+          "lines": "539-552",
+          "role": "duplicate_source"
+        },
+        {
+          "path": "src/app/search.rs",
+          "symbol": "App::search_once",
+          "lines": "637-1015",
+          "role": "caller (line 655)"
+        },
+        {
+          "path": "lci-core/src/filter/tests.rs",
+          "symbol": "the_unknown_language_message_names_each_identifier_once",
+          "lines": "570-587",
+          "role": "test"
+        },
+        {
+          "path": "lci-core/src/language.rs",
+          "symbol": "tests::each_identifier_is_listed_once_in_registration_order",
+          "lines": "703-720",
+          "role": "test"
+        },
+        {
+          "path": "33f6995",
+          "symbol": "commit: N71: the unknown-language error lists each identifier once",
+          "lines": "",
+          "role": "commit"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n UnknownLanguage lci-core/src/filter (162, 184, 234)"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'identifier: \"cpp\"' -B2 lci-core/src/language.rs (540 cpp, 547 hpp)"
+        },
+        {
+          "method": "git_log",
+          "detail": "git show --stat 33f6995"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    },
+    {
+      "id": "q26",
+      "question": "Among the seven LspAdapter implementations, which adapter source files have not been modified since the commit that split lci-core out of the main crate, and which were modified most recently?",
+      "maps": [
+        "trait_impl",
+        "git_recency"
+      ],
+      "hops": [
+        "List the impl LspAdapter for ... files.",
+        "Run git log -1 per file and compare with the crate-split commit."
+      ],
+      "answer": [
+        {
+          "path": "lci-core/src/lsp/csharp.rs",
+          "symbol": "impl LspAdapter for CSharpServer",
+          "lines": "152-190",
+          "role": "unchanged_since_split (0729d9a)"
+        },
+        {
+          "path": "lci-core/src/lsp/python.rs",
+          "symbol": "impl LspAdapter for PythonServer",
+          "lines": "44-157",
+          "role": "unchanged_since_split (0729d9a)"
+        },
+        {
+          "path": "lci-core/src/lsp/typescript.rs",
+          "symbol": "impl LspAdapter for TypeScriptServer",
+          "lines": "49-158",
+          "role": "unchanged_since_split (0729d9a)"
+        },
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "symbol": "impl LspAdapter for RustServer",
+          "lines": "38-155",
+          "role": "most_recent (8888858)"
+        }
+      ],
+      "verification": [
+        {
+          "method": "grep",
+          "detail": "rg -n 'impl LspAdapter for' lci-core/src/lsp"
+        },
+        {
+          "method": "git_log",
+          "detail": "for f in lci-core/src/lsp/*.rs; do git log -1 --format='%h %ad' --date=iso -- $f; done -> csharp/python/typescript 0729d9a (Split lci-core out of the main crate); go 9c15e3d; java 58ae2c2; clangd 2edf919; rust/adapter/transport 8888858"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "easy"
+    },
+    {
+      "id": "q27",
+      "question": "Which commit introduced the Windows data_dir length limit, what index-table naming change came with it, where does the store still read and later drop tables with the old name, and which integration tests did that commit add?",
+      "maps": [
+        "git_blame",
+        "call_graph",
+        "test_link",
+        "doc_to_code"
+      ],
+      "hops": [
+        "Run git log -S on the limit constant.",
+        "Read the commit's stat; find table_name and legacy_table_name.",
+        "Find Store methods that use the legacy name.",
+        "List the test functions the commit added."
+      ],
+      "answer": [
+        {
+          "path": "866541c",
+          "symbol": "commit: Shorten LanceDB table names so longer data_dir paths work on Windows",
+          "lines": "",
+          "role": "commit"
+        },
+        {
+          "path": "lci-core/src/workspace.rs",
+          "symbol": "Workspace::table_name",
+          "lines": "40-44",
+          "role": "new_name (ws_ + 16 hex)"
+        },
+        {
+          "path": "lci-core/src/workspace.rs",
+          "symbol": "Workspace::legacy_table_name",
+          "lines": "48-50",
+          "role": "old_name (ws_ + full id)"
+        },
+        {
+          "path": "src/store.rs",
+          "symbol": "Store::snapshot",
+          "lines": "126-173",
+          "role": "legacy_reader"
+        },
+        {
+          "path": "src/store.rs",
+          "symbol": "Store::drop_legacy_table",
+          "lines": "318-329",
+          "role": "legacy_drop (called from Store::replace at 306)"
+        },
+        {
+          "path": "src/app/readiness.rs",
+          "symbol": "WINDOWS_DATA_DIR_LENGTH_LIMIT",
+          "lines": "69-69",
+          "role": "constant"
+        },
+        {
+          "path": "tests/cases/indexing.rs",
+          "symbol": "legacy_long_table_name_is_searchable_and_migrated_on_refresh",
+          "lines": "1442-1510",
+          "role": "test"
+        },
+        {
+          "path": "tests/cases/readiness.rs",
+          "symbol": "readiness_lists_the_data_dir_length_component_as_optional",
+          "lines": "120-149",
+          "role": "test"
+        }
+      ],
+      "verification": [
+        {
+          "method": "git_log",
+          "detail": "git log -S WINDOWS_DATA_DIR_LENGTH_LIMIT --oneline -> 866541c; git show --stat 866541c"
+        },
+        {
+          "method": "git_log",
+          "detail": "git show 866541c -- tests/cases/indexing.rs tests/cases/readiness.rs | rg '^\\+.*fn '"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'legacy_table_name|table_name\\(\\)' src/store.rs (129, 133, 302, 319)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "hard"
+    },
+    {
+      "id": "q28",
+      "question": "tests/AGENTS.md says the fake language server is built as a separate binary. Which manifest declares it, how does that binary reuse the fake's logic, and how do integration tests point the C# server configuration at it?",
+      "maps": [
+        "agent_instructions",
+        "build_graph",
+        "module_graph",
+        "test_link"
+      ],
+      "hops": [
+        "Read tests/AGENTS.md.",
+        "Find the [[bin]] target in the root Cargo.toml.",
+        "Read fake_lsp_bin.rs (#[path] module plus main) and run_from_env.",
+        "Find the CARGO_BIN_EXE_fake-lsp-server use in tests/support."
+      ],
+      "answer": [
+        {
+          "path": "tests/AGENTS.md",
+          "symbol": "Shared fakes and fixtures",
+          "lines": "3-8",
+          "role": "doc_statement"
+        },
+        {
+          "path": "Cargo.toml",
+          "symbol": "[[bin]] fake-lsp-server",
+          "lines": "36-38",
+          "role": "build_target"
+        },
+        {
+          "path": "tests/support/fake_lsp_bin.rs",
+          "symbol": "main",
+          "lines": "12-17",
+          "role": "binary_entry (#[path = \"fake_lsp.rs\"] at 7-9)"
+        },
+        {
+          "path": "tests/support/fake_lsp.rs",
+          "symbol": "run_from_env",
+          "lines": "163-258",
+          "role": "shared_logic"
+        },
+        {
+          "path": "tests/support/mod.rs",
+          "symbol": "with_fake_csharp_server",
+          "lines": "242-255",
+          "role": "test_wiring"
+        }
+      ],
+      "verification": [
+        {
+          "method": "read",
+          "detail": "tests/AGENTS.md 1-12; Cargo.toml 36-38; tests/support/fake_lsp_bin.rs 1-17"
+        },
+        {
+          "method": "grep",
+          "detail": "rg -n 'CARGO_BIN_EXE_fake-lsp-server' tests (support/mod.rs 245, support/fake_lsp.rs 777, cases/config.rs 801)"
+        }
+      ],
+      "needs_model_service": false,
+      "difficulty": "medium"
+    }
+  ]
+}
