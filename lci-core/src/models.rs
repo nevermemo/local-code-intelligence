@@ -172,7 +172,7 @@ fn is_connection_dropped(error: &reqwest::Error) -> bool {
 }
 
 /// A model service answered with a non-success HTTP status. Carries the
-/// status and the (bounded) response body, which is usually the only place
+/// status and the (bounded, credential-redacted) response body, which is usually the only place
 /// the service says *why* -- e.g. vLLM's "maximum context length is 8192
 /// tokens" for an oversized embedding input.
 #[derive(Debug)]
@@ -231,7 +231,59 @@ async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Res
     })
 }
 
-async fn check_status(response: reqwest::Response, label: &str) -> Result<reqwest::Response> {
+fn redact_error_body(body: &str, endpoint: &str) -> String {
+    let mut values = Vec::new();
+    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
+        if let Some(query) = url.query() {
+            values.extend(
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_owned())),
+            );
+        }
+        values.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
+        if let Some(password) = url.password().map(str::to_owned) {
+            values.push(password.clone());
+            // Decode userinfo with the existing URL parser, keeping literal
+            // '+' and '&' from becoming form-query syntax.
+            url.set_query(Some(&format!(
+                "value={}",
+                password.replace('+', "%2B").replace('&', "%26")
+            )));
+            values.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
+        }
+    }
+    values.retain(|value| !value.is_empty());
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+
+    // Match the original text once (longest value first), never the inserted
+    // marker. Redact before capping so the cap cannot expose a secret's prefix.
+    let mut remaining = body.trim();
+    let mut redacted = String::new();
+    let mut written = 0;
+    while !remaining.is_empty() && written < MAX_ERROR_BODY_CHARS {
+        if let Some(value) = values
+            .iter()
+            .find(|value| remaining.starts_with(value.as_str()))
+        {
+            redacted.push_str("[redacted]");
+            remaining = &remaining[value.len()..];
+            written += "[redacted]".len();
+        } else {
+            let character = remaining.chars().next().unwrap();
+            redacted.push(character);
+            remaining = &remaining[character.len_utf8()..];
+            written += 1;
+        }
+    }
+    redacted.chars().take(MAX_ERROR_BODY_CHARS).collect()
+}
+
+async fn check_status(
+    response: reqwest::Response,
+    label: &str,
+    endpoint: &str,
+) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -242,11 +294,7 @@ async fn check_status(response: reqwest::Response, label: &str) -> Result<reqwes
             bytes: Vec::new(),
             truncated: false,
         });
-    let mut body: String = String::from_utf8_lossy(&bounded.bytes)
-        .trim()
-        .chars()
-        .take(MAX_ERROR_BODY_CHARS)
-        .collect();
+    let mut body = redact_error_body(&String::from_utf8_lossy(&bounded.bytes), endpoint);
     if bounded.truncated {
         body.push_str(" [truncated]");
     }
@@ -344,7 +392,7 @@ impl Models {
             })
             .await?;
         let bounded = read_limited_body(
-            check_status(response, "embedding service").await?,
+            check_status(response, "embedding service", url.as_str()).await?,
             MAX_RESPONSE_BODY_BYTES,
         )
         .await
@@ -445,7 +493,7 @@ impl Models {
             }
         };
         let bounded = read_limited_body(
-            check_status(response, "reranker").await?,
+            check_status(response, "reranker", &self.config.reranker_url).await?,
             MAX_RESPONSE_BODY_BYTES,
         )
         .await
@@ -506,6 +554,8 @@ mod tests {
         Reply,
         /// Answer HTTP 500.
         ServerError,
+        /// Reject the request and echo its request line and a password.
+        EchoError(u16, &'static str),
         /// Answer HTTP 500 with a body larger than the model response limit.
         OversizedError,
         /// Answer with a valid embedding response followed by enough
@@ -611,7 +661,7 @@ mod tests {
             let Some(target) = read_request(&mut stream).await else {
                 return;
             };
-            request_targets.lock().unwrap().push(target);
+            request_targets.lock().unwrap().push(target.clone());
             requests.fetch_add(1, Ordering::SeqCst);
             let (status, headers, body) = match step {
                 Step::Reply => (
@@ -645,6 +695,15 @@ mod tests {
                     "500 Internal Server Error",
                     String::new(),
                     r#"{"error":"boom"}"#.to_owned(),
+                ),
+                Step::EchoError(status, password) => (
+                    if status == 401 {
+                        "401 Unauthorized"
+                    } else {
+                        "500 Internal Server Error"
+                    },
+                    String::new(),
+                    format!("rejected {target}; userinfo: {password}; retry later"),
                 ),
                 Step::Close | Step::Reset => return,
             };
@@ -771,6 +830,155 @@ mod tests {
         assert!(
             error.downcast_ref::<HttpStatusError>().is_some(),
             "{error:#}"
+        );
+    }
+
+    fn assert_redacted_http_error(
+        error: &anyhow::Error,
+        status: u16,
+        label: &str,
+        body: &str,
+        secrets: &[&str],
+    ) {
+        let http = error.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http.status, status);
+        assert_eq!(http.body, body);
+        let chain = format!("{error:#}");
+        assert_eq!(
+            chain,
+            format!("{label} HTTP error: HTTP status {status}: {body}")
+        );
+        let debug = format!("{error:?}");
+        assert!(debug.contains(body), "{debug}");
+        for secret in secrets {
+            assert!(!chain.contains(secret), "{chain}");
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_http_error_body_redacts_query_values() {
+        for status in [401, 500] {
+            let server = FakeModelServer::start(vec![vec![Step::EchoError(status, "none")]]).await;
+            let mut models = server.models();
+            models
+                .config
+                .embedding_url
+                .push_str("?api_key=n89-marker&other=n89-other&again=n89-marker&empty=&flag");
+            for error in [
+                models.embed(&documents()).await.unwrap_err(),
+                models.query("query").await.unwrap_err(),
+            ] {
+                assert_redacted_http_error(
+                    &error,
+                    status,
+                    "embedding service",
+                    "rejected POST /v1/embeddings?api_key=[redacted]&other=[redacted]&again=[redacted]&empty=&flag HTTP/1.1; userinfo: none; retry later",
+                    &["n89-marker", "n89-other"],
+                );
+            }
+            assert_eq!(server.requests(), 2, "HTTP errors must not be retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_http_error_body_redacts_query_values() {
+        for status in [401, 500] {
+            let server = FakeModelServer::start(vec![vec![Step::EchoError(status, "none")]]).await;
+            let mut models = server.models();
+            models.config.reranker_url.push_str("?api_key=n89-marker");
+            let error = models.rerank("query", &documents()).await.unwrap_err();
+            assert_redacted_http_error(
+                &error,
+                status,
+                "reranker",
+                "rejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: none; retry later",
+                &["n89-marker"],
+            );
+            assert_eq!(server.requests(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_http_error_body_redacts_userinfo_password() {
+        for (status, password) in [(401, "n89-password"), (500, "n89+p&ass word")] {
+            let server =
+                FakeModelServer::start(vec![vec![Step::EchoError(status, password)]]).await;
+            let mut url = reqwest::Url::parse(&format!("http://{}/v1", server.address)).unwrap();
+            url.set_username("user").unwrap();
+            url.set_password(Some(password)).unwrap();
+            let encoded_password = url.password().unwrap().to_owned();
+            let embedding_url = url.to_string();
+            url.set_path("/rerank");
+            let config = Config {
+                embedding_url,
+                reranker_url: url.to_string(),
+                ..Config::default()
+            };
+            let models = Models::new(&config).unwrap();
+            let errors = [
+                (
+                    models.embed(&documents()).await.unwrap_err(),
+                    "embedding service",
+                    "/v1/embeddings",
+                ),
+                (
+                    models.rerank("query", &documents()).await.unwrap_err(),
+                    "reranker",
+                    "/rerank",
+                ),
+            ];
+            for (error, label, path) in errors {
+                assert_redacted_http_error(
+                    &error,
+                    status,
+                    label,
+                    &format!("rejected POST {path} HTTP/1.1; userinfo: [redacted]; retry later"),
+                    &[password, &encoded_password],
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_http_error_body_redacts_encoded_and_overlapping_values() {
+        let server =
+            FakeModelServer::start(vec![vec![Step::EchoError(500, "n89 encoded+value")]]).await;
+        let mut models = server.models();
+        models.config.reranker_url.push_str(
+            "?api_key=n89%20encoded%2Bvalue&short=n89-overlap&long=n89-overlap-long&literal=redacted",
+        );
+        let error = models.rerank("query", &documents()).await.unwrap_err();
+        assert_redacted_http_error(
+            &error,
+            500,
+            "reranker",
+            "rejected POST /rerank?api_key=[redacted]&short=[redacted]&long=[redacted]&literal=[redacted] HTTP/1.1; userinfo: [redacted]; retry later",
+            &["n89%20encoded%2Bvalue", "n89 encoded+value", "n89-overlap"],
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_http_error_body_redacts_before_truncation() {
+        let server = FakeModelServer::start(vec![vec![Step::EchoError(401, "none")]]).await;
+        let mut models = server.models();
+        let path = format!("/{}", "x".repeat(546));
+        let secret = "n89-long-query-value-crossing-the-character-limit";
+        models.config.embedding_url = format!("http://{}{path}?api_key={secret}", server.address);
+        let error = models.embed(&documents()).await.unwrap_err();
+        let expected: String = format!(
+            "rejected POST {path}/embeddings?api_key=[redacted] HTTP/1.1; userinfo: none; retry later"
+        )
+        .chars()
+        .take(MAX_ERROR_BODY_CHARS)
+        .collect();
+        assert!(expected.contains("[redacted]"));
+        assert_redacted_http_error(
+            &error,
+            401,
+            "embedding service",
+            &expected,
+            &[secret, "n89-long"],
         );
     }
 

@@ -1637,6 +1637,52 @@ async fn a_refused_reranker_url_credential_is_not_reported() {
 }
 
 #[tokio::test]
+async fn a_reranker_http_error_body_credential_is_not_reported() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let router = Router::new().route(
+        "/rerank",
+        post(|uri: axum::http::Uri| async move {
+            assert_eq!(
+                uri.path_and_query().unwrap().as_str(),
+                "/rerank?api_key=n89-marker"
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("rejected {}; retry later", uri.path_and_query().unwrap()),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reranker_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    config.reranker_url = format!("http://{address}/rerank?api_key=n89-marker");
+    let workspace = temp.path().join("reranker-body-credential");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    assert!(!report.reranked);
+    assert!(
+        !report.results.is_empty(),
+        "reranker failure must fail open"
+    );
+    let warning = report.warning.as_deref().unwrap();
+    assert!(
+        warning.contains(
+            "Reranker unavailable or invalid response; fusion-ranked results returned: reranker HTTP error: HTTP status 401: rejected /rerank?api_key=[redacted]; retry later"
+        ),
+        "{warning}"
+    );
+    assert!(!warning.contains("n89-marker"), "{warning}");
+    reranker_task.abort();
+    task.abort();
+}
+
+#[tokio::test]
 async fn a_reranker_error_status_is_retried_by_the_next_search() {
     let (temp, config, fake, task) = fixture().await;
     let workspace = temp.path().join("failing-reranker");
