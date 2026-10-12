@@ -78,6 +78,31 @@ pub fn bounded_snippet(code: &str) -> String {
     out
 }
 
+/// The most rows a filtered semantic search fetches while looking for
+/// chunks that pass its filter (160 rows times 4 to the third).
+pub const MAX_FILTERED_SEMANTIC_ROWS: usize = 10_240;
+
+/// What [`Store::search`] found.
+pub struct SemanticHits {
+    pub hits: Vec<Hit>,
+    /// Set when the filter left fewer hits than asked for after the largest
+    /// fetch, [`MAX_FILTERED_SEMANTIC_ROWS`] rows: chunks that pass the
+    /// filter but lie farther from the query were not considered.
+    pub capped_at_rows: Option<usize>,
+}
+
+impl SemanticHits {
+    /// The search warning for a fetch the row cap stopped, if it was.
+    pub fn cap_warning(&self) -> Option<String> {
+        self.capped_at_rows.map(|rows| {
+            format!(
+                "Semantic retrieval checked the {rows} nearest chunks and only {} matched the filters; matching chunks farther from the query were not considered",
+                self.hits.len()
+            )
+        })
+    }
+}
+
 pub struct Snapshot {
     pub table: Table,
     pub identity: String,
@@ -345,43 +370,107 @@ impl Store {
         }
     }
 
+    /// The `limit` nearest chunks that pass `filters`, nearest first.
+    /// `matching` is how many chunks in the snapshot pass `filters` (the
+    /// caller has counted them), so a search stops once it has found them all.
+    ///
+    /// LanceDB cannot express every shared glob/role predicate, so rows are
+    /// filtered here after a nearest-row fetch. The first fetch asks for
+    /// `min(limit * 4, 160)` rows. Only when the filter rejected one of them
+    /// and fewer than `min(limit, matching)` passed is the fetch repeated with
+    /// four times as many rows, up to [`MAX_FILTERED_SEMANTIC_ROWS`]; a search
+    /// whose filter rejects nothing (every unfiltered search) runs the first
+    /// fetch alone.
     pub async fn search(
         snapshot: &Snapshot,
         workspace: &Workspace,
         vector: &[f32],
         limit: usize,
         filters: &EffectiveFilter,
-    ) -> Result<Vec<Hit>> {
+        matching: usize,
+    ) -> Result<SemanticHits> {
+        Self::search_within(
+            snapshot,
+            workspace,
+            vector,
+            limit,
+            filters,
+            matching,
+            MAX_FILTERED_SEMANTIC_ROWS,
+        )
+        .await
+    }
+
+    async fn search_within(
+        snapshot: &Snapshot,
+        workspace: &Workspace,
+        vector: &[f32],
+        limit: usize,
+        filters: &EffectiveFilter,
+        matching: usize,
+        max_rows: usize,
+    ) -> Result<SemanticHits> {
         ensure!(
             vector.len() == snapshot.dimension,
             "query embedding dimension differs from index; reindex workspace"
         );
-        // LanceDB cannot express every shared glob/role predicate. Keep the
-        // fallback bounded while allowing selective filters more headroom.
-        let oversampled_limit = limit.saturating_mul(4).min(160);
-        let batches = snapshot
-            .table
-            .query()
-            .nearest_to(vector)?
-            .distance_type(DistanceType::Cosine)
-            .limit(oversampled_limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+        let mut fetch = limit.saturating_mul(4).min(160);
+        loop {
+            let batches = snapshot
+                .table
+                .query()
+                .nearest_to(vector)?
+                .distance_type(DistanceType::Cosine)
+                .limit(fetch)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let (hits, rows, rejected) = Self::filtered_hits(&batches, workspace, limit, filters)?;
+            // `rows < fetch` means the table is exhausted: LanceDB scans every
+            // row (no vector index is built), so a fetch returns fewer rows
+            // only when there are no more. An approximate index would break
+            // this and must revisit it.
+            if hits.len() >= limit.min(matching) || rejected == 0 || rows < fetch {
+                return Ok(SemanticHits {
+                    hits,
+                    capped_at_rows: None,
+                });
+            }
+            if fetch >= max_rows {
+                return Ok(SemanticHits {
+                    hits,
+                    capped_at_rows: Some(fetch),
+                });
+            }
+            fetch = fetch.saturating_mul(4).min(max_rows);
+        }
+    }
+
+    /// The hits among `batches` (nearest first) that pass `filters`, at most
+    /// `limit`, with how many rows were read and how many the filter rejected.
+    fn filtered_hits(
+        batches: &[RecordBatch],
+        workspace: &Workspace,
+        limit: usize,
+        filters: &EffectiveFilter,
+    ) -> Result<(Vec<Hit>, usize, usize)> {
         let mut hits = Vec::new();
+        let (mut rows, mut rejected) = (0, 0);
         for batch in batches {
             for i in 0..batch.num_rows() {
+                rows += 1;
                 let text = |name| -> Result<String> {
-                    Ok(column::<StringArray>(&batch, name)?.value(i).into())
+                    Ok(column::<StringArray>(batch, name)?.value(i).into())
                 };
                 let path = text("relative_file_path")?;
                 let language = text("language")?;
                 let source_role = classify_source_role(&path);
                 if !filters.matches(&language, &path, source_role) {
+                    rejected += 1;
                     continue;
                 }
-                let distance = column::<Float32Array>(&batch, "_distance")?.value(i);
+                let distance = column::<Float32Array>(batch, "_distance")?.value(i);
                 ensure!(distance.is_finite(), "nonfinite semantic distance");
                 let rank = hits.len() + 1;
                 hits.push(Hit {
@@ -389,8 +478,8 @@ impl Store {
                     chunk: Chunk {
                         relative_file_path: path,
                         language,
-                        start_line: column::<UInt32Array>(&batch, "start_line")?.value(i),
-                        end_line: column::<UInt32Array>(&batch, "end_line")?.value(i),
+                        start_line: column::<UInt32Array>(batch, "start_line")?.value(i),
+                        end_line: column::<UInt32Array>(batch, "end_line")?.value(i),
                         code: text("code")?,
                         content_hash: text("content_hash")?,
                     },
@@ -407,11 +496,11 @@ impl Store {
                     source_role_prior: source_role_prior(source_role),
                 });
                 if hits.len() == limit {
-                    return Ok(hits);
+                    return Ok((hits, rows, rejected));
                 }
             }
         }
-        Ok(hits)
+        Ok((hits, rows, rejected))
     }
 
     pub async fn languages(snapshot: &Snapshot) -> Result<HashSet<String>> {
@@ -589,9 +678,11 @@ mod tests {
             &[1.0, 0.0, 0.0],
             8,
             &EffectiveFilter::from_request(&Default::default()).unwrap(),
+            1,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.code, "fn previous_snapshot() {}");
         let current = store.snapshot(&workspace).await.unwrap().unwrap();
@@ -797,5 +888,245 @@ mod tests {
             matches!(error, lancedb::Error::TableNotFound { .. }),
             "{error:?}"
         );
+    }
+
+    /// Commits one chunk per `(path, vector)` row, in order.
+    async fn commit_rows(store: &Store, workspace: &Workspace, rows: &[(String, Vec<f32>)]) {
+        let chunks: Vec<Chunk> = rows
+            .iter()
+            .map(|(path, _)| Chunk {
+                relative_file_path: path.clone(),
+                language: "rust".into(),
+                start_line: 1,
+                end_line: 1,
+                code: format!("fn in_{}() {{}}", path.replace(['/', '.'], "_")),
+                content_hash: crate::workspace::hash(path),
+            })
+            .collect();
+        let vectors: Vec<_> = rows.iter().map(|(_, vector)| vector.clone()).collect();
+        store
+            .replace(workspace, &chunks, &vectors, "identity", 3)
+            .await
+            .unwrap();
+    }
+
+    /// A unit vector `step` milliradians from the query `[1, 0, 0]`: a larger
+    /// step is farther from the query, so row order is distance order.
+    fn at_angle(step: usize) -> Vec<f32> {
+        let angle = step as f32 * 0.005;
+        vec![angle.cos(), angle.sin(), 0.0]
+    }
+
+    fn include(pattern: &str) -> EffectiveFilter {
+        EffectiveFilter::from_request(&crate::filter::FilterRequest {
+            include_paths: Some(vec![pattern.to_owned()]),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_path_filter_finds_matching_chunks_beyond_the_first_nearest_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = workspace_at("/filtered");
+        // 200 rows nearer the query than every row the filter keeps: more
+        // than the 160 rows the first fetch asks for at limit 40.
+        let mut rows: Vec<_> = (0..200)
+            .map(|i| (format!("noise/f{i}.rs"), at_angle(i)))
+            .collect();
+        rows.extend((200..205).map(|i| (format!("wanted/f{i}.rs"), at_angle(i))));
+        commit_rows(&store, &workspace, &rows).await;
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        let found = Store::search(
+            &snapshot,
+            &workspace,
+            &[1.0, 0.0, 0.0],
+            40,
+            &include("wanted/**"),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.capped_at_rows, None);
+        let hits = found.hits;
+        let paths: Vec<_> = hits
+            .iter()
+            .map(|h| h.chunk.relative_file_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "wanted/f200.rs",
+                "wanted/f201.rs",
+                "wanted/f202.rs",
+                "wanted/f203.rs",
+                "wanted/f204.rs"
+            ]
+        );
+        let ranks: Vec<_> = hits.iter().map(|h| h.semantic_rank).collect();
+        assert_eq!(ranks, [Some(1), Some(2), Some(3), Some(4), Some(5)]);
+    }
+
+    #[tokio::test]
+    async fn a_filtered_fetch_stops_at_its_row_cap_and_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = workspace_at("/capped");
+        let mut rows: Vec<_> = (0..700)
+            .map(|i| (format!("noise/f{i}.rs"), at_angle(i % 300)))
+            .collect();
+        rows.push(("wanted/far.rs".to_owned(), at_angle(310)));
+        commit_rows(&store, &workspace, &rows).await;
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        let query = [1.0, 0.0, 0.0];
+        let filter = include("wanted/**");
+
+        // A cap of 640 rows: 160, then 640, and the one match lies beyond.
+        let capped =
+            Store::search_within(&snapshot, &workspace, &query, 40, &filter, usize::MAX, 640)
+                .await
+                .unwrap();
+        assert!(capped.hits.is_empty());
+        assert_eq!(capped.capped_at_rows, Some(640));
+        assert_eq!(
+            capped.cap_warning().as_deref(),
+            Some(
+                "Semantic retrieval checked the 640 nearest chunks and only 0 matched the filters; matching chunks farther from the query were not considered"
+            )
+        );
+
+        // The production cap reaches it, and the table is exhausted before
+        // the cap, so nothing is reported as capped.
+        let found = Store::search(&snapshot, &workspace, &query, 40, &filter, 1)
+            .await
+            .unwrap();
+        let paths: Vec<_> = found
+            .hits
+            .iter()
+            .map(|h| h.chunk.relative_file_path.as_str())
+            .collect();
+        assert_eq!(paths, ["wanted/far.rs"]);
+        assert_eq!(found.capped_at_rows, None);
+        assert_eq!(found.cap_warning(), None);
+    }
+
+    #[tokio::test]
+    async fn a_filtered_fetch_stops_once_every_matching_chunk_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = workspace_at("/all-found");
+        // The one matching chunk lies between rows 200 and 201, inside the
+        // 640-row second fetch; 700 farther rows follow it.
+        let mut rows: Vec<_> = (0..900)
+            .map(|i| (format!("noise/f{i}.rs"), at_angle(i)))
+            .collect();
+        rows.push(("wanted/near.rs".to_owned(), at_angle(200)));
+        commit_rows(&store, &workspace, &rows).await;
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        let query = [1.0, 0.0, 0.0];
+        let filter = include("wanted/**");
+
+        // Knowing one chunk matches, the 640-row fetch that finds it ends the
+        // search, though the 640-row cap was reached and 40 hits were asked.
+        let found = Store::search_within(&snapshot, &workspace, &query, 40, &filter, 1, 640)
+            .await
+            .unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.capped_at_rows, None);
+        // Without that count the same search reports the cap.
+        let unknown =
+            Store::search_within(&snapshot, &workspace, &query, 40, &filter, usize::MAX, 640)
+                .await
+                .unwrap();
+        assert_eq!(unknown.hits.len(), 1);
+        assert_eq!(unknown.capped_at_rows, Some(640));
+    }
+
+    /// What `Store::search` returned before filtered fetches could widen:
+    /// one fetch of `min(limit * 4, 160)` nearest rows, the first `limit`
+    /// kept, as (path, score, rank).
+    async fn single_fetch_reference(
+        snapshot: &Snapshot,
+        vector: &[f32],
+        limit: usize,
+    ) -> Vec<(String, f32, usize)> {
+        let batches = snapshot
+            .table
+            .query()
+            .nearest_to(vector)
+            .unwrap()
+            .distance_type(DistanceType::Cosine)
+            .limit(limit.saturating_mul(4).min(160))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let paths = column::<StringArray>(batch, "relative_file_path").unwrap();
+            let distances = column::<Float32Array>(batch, "_distance").unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((paths.value(i).to_owned(), 1.0 - distances.value(i)));
+            }
+        }
+        rows.into_iter()
+            .take(limit)
+            .enumerate()
+            .map(|(i, (path, score))| (path, score, i + 1))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_search_returns_exactly_the_single_fetch_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = workspace_at("/unfiltered");
+        // 300 rows at distinct distances, more than the 160-row first fetch.
+        let rows: Vec<_> = (0..300)
+            .map(|i| (format!("src/f{i}.rs"), at_angle((i * 7) % 300)))
+            .collect();
+        commit_rows(&store, &workspace, &rows).await;
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        // No filter, an empty exclude list, and an include glob that keeps
+        // every path: none rejects a row, so none may widen the fetch.
+        let filters = [
+            EffectiveFilter::from_request(&Default::default()).unwrap(),
+            EffectiveFilter::from_request(&crate::filter::FilterRequest {
+                exclude_paths: Some(vec![]),
+                ..Default::default()
+            })
+            .unwrap(),
+            include("**"),
+        ];
+        for (unfiltered, query) in filters
+            .iter()
+            .flat_map(|f| [[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 1.0, 0.0]].map(|q| (f, q)))
+        {
+            // 41 and above ask for fewer than 4 * limit rows; above 160 the
+            // single fetch returns fewer than `limit` hits.
+            for limit in [1, 10, 40, 41, 100, 160, 161, 200] {
+                let found =
+                    Store::search(&snapshot, &workspace, &query, limit, unfiltered, rows.len())
+                        .await
+                        .unwrap();
+                assert_eq!(found.capped_at_rows, None);
+                let actual: Vec<_> = found
+                    .hits
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.chunk.relative_file_path.clone(),
+                            h.semantic_score.unwrap(),
+                            h.semantic_rank.unwrap(),
+                        )
+                    })
+                    .collect();
+                let expected = single_fetch_reference(&snapshot, &query, limit).await;
+                assert_eq!(actual, expected, "query {query:?}, limit {limit}");
+            }
+        }
     }
 }

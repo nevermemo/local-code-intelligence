@@ -858,27 +858,38 @@ impl App {
                 report.timings.query_embedding_ms = query_ms;
                 let semantic_timer = Instant::now();
                 let hits = match query_vector {
-                    Ok(vector) => match Store::search(
-                        &snapshot,
-                        &report.workspace,
-                        &vector,
-                        self.config.semantic_candidate_count,
-                        &filters,
-                    )
-                    .await
-                    {
-                        Ok(hits) => hits,
-                        Err(error) => {
-                            let message = format!("Semantic retrieval unavailable: {error:#}");
-                            report.warning = Some(
-                                report
-                                    .warning
-                                    .take()
-                                    .map_or(message.clone(), |w| format!("{w}; {message}")),
-                            );
-                            vec![]
+                    Ok(vector) => {
+                        match Store::search(
+                            &snapshot,
+                            &report.workspace,
+                            &vector,
+                            self.config.semantic_candidate_count,
+                            &filters,
+                            all_chunks.len(),
+                        )
+                        .await
+                        {
+                            Ok(found) => {
+                                if let Some(message) = found.cap_warning() {
+                                    report.warning =
+                                        Some(report.warning.take().map_or(message.clone(), |w| {
+                                            format!("{w}; {message}")
+                                        }));
+                                }
+                                found.hits
+                            }
+                            Err(error) => {
+                                let message = format!("Semantic retrieval unavailable: {error:#}");
+                                report.warning = Some(
+                                    report
+                                        .warning
+                                        .take()
+                                        .map_or(message.clone(), |w| format!("{w}; {message}")),
+                                );
+                                vec![]
+                            }
                         }
-                    },
+                    }
                     Err(error) => {
                         let message = format!(
                             "Query embedding unavailable; results from the other enabled channels used: {error:#}"

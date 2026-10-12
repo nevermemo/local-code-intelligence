@@ -257,6 +257,51 @@ async fn filters_without_matching_chunks_skip_retrieval_channels() {
 }
 
 #[tokio::test]
+async fn a_path_filter_gets_semantic_hits_beyond_the_nearest_unfiltered_rows() {
+    use local_code_intelligence::filter::FilterRequest;
+
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("filtered-far");
+    // The fake embeds every chunk that mentions "translator" as the query's
+    // own vector: these 170 chunks are the nearest rows, more than the 160
+    // the semantic channel's first fetch asks for at the default 40
+    // candidates. The one chunk the filter keeps is farther away and shares
+    // no query term, so only the semantic channel can find it.
+    for i in 0..170 {
+        write(
+            &workspace,
+            &format!("noise/n{i}.rs"),
+            &format!("fn translator_{i}() {{}}\n"),
+        );
+    }
+    write(&workspace, "wanted/target.rs", "fn far_away() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let found = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(5),
+            FilterRequest {
+                include_paths: Some(vec!["wanted/**".to_owned()]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let hit = found
+        .results
+        .iter()
+        .find(|hit| hit.chunk.relative_file_path == "wanted/target.rs")
+        .unwrap_or_else(|| panic!("no hit: {:?}", found.warning));
+    assert!(hit.semantic_score.is_some());
+    assert_eq!(found.warning, None);
+    task.abort();
+}
+
+#[tokio::test]
 async fn go_source_is_indexed_and_searchable() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("go-service");
