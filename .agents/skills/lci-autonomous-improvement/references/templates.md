@@ -210,7 +210,7 @@ Active run: <yes (since <date>; what) | no>
 FIRST AFTER ANY COMPACTION: run the post-compaction check script; call get_usage; read this file; read the roadmap "In progress" section and `git status`.
 
 ## Standing mandate
-<what the owner asked for; pause at 90% of the 5-hour window, stop at 90% of the weekly window; pointer to the memory file holding the preferences>
+<what the owner asked for; stop starting new work at 90% of either the 5-hour or the weekly window; pointer to the memory file holding the preferences>
 
 ## Approvals
 - <date>: "<verbatim scope>". Does not cover: <...>
