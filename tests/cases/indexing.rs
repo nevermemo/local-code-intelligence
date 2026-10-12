@@ -49,6 +49,72 @@ async fn search_creates_reuses_and_reopens_an_index_without_duplicate_embeddings
 }
 
 #[tokio::test]
+async fn filters_without_matching_chunks_skip_retrieval_channels() {
+    use local_code_intelligence::filter::FilterRequest;
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("filtered-empty");
+    write(&workspace, "src/lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    let queries = fake.queries.load(Ordering::SeqCst);
+    let rerank_requests = fake.rerank_requests.load(Ordering::SeqCst);
+
+    let no_paths = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(1),
+            FilterRequest {
+                include_paths: Some(vec![]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(no_paths.results.is_empty());
+
+    let no_language = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(1),
+            FilterRequest {
+                languages: Some(vec!["python".to_owned()]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(no_language.results.is_empty());
+    assert_eq!(fake.queries.load(Ordering::SeqCst), queries);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst),
+        rerank_requests
+    );
+
+    let matching = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(1),
+            FilterRequest {
+                include_paths: Some(vec!["src/lib.rs".to_owned()]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matching.results.iter().any(|hit| hit.chunk.code.contains("translator")));
+    assert_eq!(fake.queries.load(Ordering::SeqCst), queries + 1);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst),
+        rerank_requests + 1
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn go_source_is_indexed_and_searchable() {
     let (temp, config, _fake, task) = fixture().await;
     let workspace = temp.path().join("go-service");
