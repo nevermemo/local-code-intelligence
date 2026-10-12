@@ -141,7 +141,9 @@ impl BundleStore {
     /// never sees half a bundle. When the rename fails but a bundle of the
     /// same key is in place (another writer won, or Windows refused to
     /// replace a file someone holds open), that bundle is kept: a bundle is
-    /// a function of its key, so it is the same payload.
+    /// a function of its key, so it is the same payload. When the file in
+    /// the way is not a valid bundle of the key, it is removed and the
+    /// rename tried once more.
     pub fn put<P: Serialize>(&self, key: &BundleKey, payload: &P) -> Result<()> {
         let path = self.path_of(key);
         let directory = path.parent().expect("a bundle path has a parent");
@@ -160,14 +162,28 @@ impl BundleStore {
         ));
         std::fs::write(&temporary, &bytes)
             .with_context(|| format!("write bundle {}", temporary.display()))?;
-        if let Err(error) = std::fs::rename(&temporary, &path) {
+        let Err(error) = std::fs::rename(&temporary, &path) else {
+            return Ok(());
+        };
+        // A valid bundle of this key is already in place: keep it.
+        if matches!(self.get::<serde_json::Value>(key), Ok(Some(_))) {
             let _ = std::fs::remove_file(&temporary);
-            if matches!(self.get::<serde_json::Value>(key), Ok(Some(_))) {
+            return Ok(());
+        }
+        // An invalid file is in the way (a bundle `get` reads as missing):
+        // remove it and try the rename once more, so it is repaired rather
+        // than failing every later sync.
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            if std::fs::rename(&temporary, &path).is_ok() {
                 return Ok(());
             }
-            return Err(error).with_context(|| format!("store bundle {}", path.display()));
+            if matches!(self.get::<serde_json::Value>(key), Ok(Some(_))) {
+                let _ = std::fs::remove_file(&temporary);
+                return Ok(());
+            }
         }
-        Ok(())
+        let _ = std::fs::remove_file(&temporary);
+        Err(error).with_context(|| format!("store bundle {}", path.display()))
     }
 
     /// Deletes every bundle file of this store whose key is not in `keep`;

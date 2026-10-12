@@ -29,7 +29,8 @@ pub trait Refreshable: Map {
     fn data_snapshot(&self) -> Option<&SnapshotRef>;
 
     /// Brings the data to `target`, incrementally where it can. On an
-    /// error (its text is returned) the previous data must stay as it was.
+    /// error (its text is returned) or a panic the previous data must stay
+    /// as it was: build the new data aside and swap it in only on success.
     fn refresh(&mut self, target: &Target<'_>) -> Result<(), String>;
 }
 
@@ -52,6 +53,12 @@ pub enum Prepared {
 }
 
 /// Brings `map` to `target` as `mode` allows (contract C3), for a search.
+///
+/// A panic in `refresh` is caught and reported, but `prepare` cannot roll
+/// back state the map changed before panicking: keeping the previous data
+/// is the map's own duty (`Refreshable::refresh` builds the new data aside
+/// and swaps it in only on success, as `SymDefs::build` does). The C3 kit
+/// rejects a map that clears its data and then fails or panics.
 /// The explicit index command and the watcher refresh stored maps through
 /// their own path, which is S4's (decision K-7).
 pub fn prepare(map: &mut dyn Refreshable, mode: IndexFreshness, target: &Target<'_>) -> Prepared {

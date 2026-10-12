@@ -334,6 +334,7 @@ stored in a bundle. Taken as the conservative reading where the decision left a 
 | # | Decision taken here | Alternative | Revisit at |
 | --- | --- | --- | --- |
 | N-13 | The root crate's files keep their S1 path without a crate-name prefix (`src/app/search.rs` -> `app::search`), as `crate::app::search` is written inside the crate; only the directory prefix of a non-root crate is replaced. | Prefix every file with its crate name (`local_code_intelligence::app::search`), which changes every root-crate symbol id. | S4 trait freeze. |
+| N-15 | A crate name that another crate also uses, or that is itself some crate's directory, is not applied: those crates keep the directory form, so two crates never share a first segment and resolving an id twice gives the same id. | A discriminator suffix on colliding names. | First workspace with such a collision. |
 | N-14 | A crate directory without a readable `[package].name` (no manifest, `name.workspace = true`) keeps the directory form. | Fall back to the directory name with `-` turned into `_`. | First workspace with inherited names. |
 
 S1's own key function (`Declaration::key`, `rust_module_path`) is unchanged; the crate name is

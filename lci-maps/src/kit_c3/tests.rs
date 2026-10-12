@@ -169,6 +169,9 @@ enum Flaw {
     /// Answers nothing while its data is stale (the old snapshot is not
     /// searchable).
     EmptyWhenStale,
+    /// Clears its data and then panics when a refresh fails (state mutated
+    /// before the failure, no rollback).
+    ClearsThenPanics,
 }
 
 #[async_trait::async_trait]
@@ -205,6 +208,10 @@ impl Refreshable for Broken {
         let result = self.inner.refresh(target);
         if result.is_err() && self.flaw == Flaw::DropsDataOnFailure {
             self.inner = SymDefs::new(self.store.clone());
+        }
+        if result.is_err() && self.flaw == Flaw::ClearsThenPanics {
+            self.inner = SymDefs::new(self.store.clone());
+            panic!("refresh failed after clearing the data");
         }
         result
     }

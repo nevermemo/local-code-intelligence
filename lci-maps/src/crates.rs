@@ -13,7 +13,7 @@
 
 use lci_core::{manifest::CachedFile, node::NodeId};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
 };
 
@@ -71,8 +71,8 @@ impl CrateNames {
     /// of `files`, from `<root>/<directory>/Cargo.toml`. A directory whose
     /// manifest is missing or names no package keeps the directory form.
     pub fn read(root: &Path, files: &HashMap<String, CachedFile>) -> Self {
-        let mut by_directory = BTreeMap::new();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut named = BTreeMap::new();
+        let mut directories = BTreeSet::new();
         for (path, file) in files {
             if file.language != "rust" {
                 continue;
@@ -80,7 +80,7 @@ impl CrateNames {
             let Some(directory) = crate_directory(path) else {
                 continue;
             };
-            if !seen.insert(directory.clone()) {
+            if !directories.insert(directory.clone()) {
                 continue;
             }
             let manifest = root.join(&directory).join("Cargo.toml");
@@ -89,20 +89,42 @@ impl CrateNames {
                 .as_deref()
                 .and_then(package_name)
             {
-                by_directory.insert(directory, name);
+                named.insert(directory, name);
             }
         }
-        Self { by_directory }
+        Self::unambiguous(named, &directories)
     }
 
-    /// From explicit pairs (tests).
+    /// From explicit pairs (tests); every pair's directory counts as a
+    /// crate directory.
     pub fn from_pairs<'p>(pairs: impl IntoIterator<Item = (&'p str, &'p str)>) -> Self {
-        Self {
-            by_directory: pairs
-                .into_iter()
-                .map(|(directory, name)| (directory.to_owned(), name.to_owned()))
-                .collect(),
+        let named: BTreeMap<String, String> = pairs
+            .into_iter()
+            .map(|(directory, name)| (directory.to_owned(), name.to_owned()))
+            .collect();
+        let directories = named.keys().cloned().collect();
+        Self::unambiguous(named, &directories)
+    }
+
+    /// Keeps only the names that cannot merge two crates or chain: a name
+    /// that another crate also uses, or that is itself some crate's
+    /// directory, is dropped, and those crates keep the directory form.
+    /// With no name equal to a directory, [`CrateNames::canonical`] is
+    /// idempotent and maps distinct crates to distinct first segments.
+    fn unambiguous(named: BTreeMap<String, String>, directories: &BTreeSet<String>) -> Self {
+        let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in named.values() {
+            *uses.entry(name.as_str()).or_default() += 1;
         }
+        let by_directory = named
+            .iter()
+            .filter(|(directory, name)| {
+                uses[name.as_str()] == 1
+                    && (!directories.contains(name.as_str()) || directory == name)
+            })
+            .map(|(directory, name)| (directory.clone(), name.clone()))
+            .collect();
+        Self { by_directory }
     }
 
     /// The canonical id of `id`: a Rust symbol whose module path starts with
@@ -144,6 +166,49 @@ mod tests {
         assert_eq!(package_name("[[bin]]\nname = \"tool\"\n"), None);
         assert_eq!(package_name("[package]\nname.workspace = true\n"), None);
         assert_eq!(package_name(""), None);
+    }
+
+    #[test]
+    fn names_that_would_merge_or_chain_crates_are_dropped_and_canonical_is_idempotent() {
+        let id = |text: &str| -> NodeId { text.parse().unwrap() };
+        // foo's name is bar's directory: foo keeps its directory form, so
+        // foo and bar never share a namespace and bar's name does not chain.
+        let crates = CrateNames::from_pairs([("foo", "bar"), ("bar", "baz")]);
+        assert_eq!(
+            crates.canonical(id("sym:rust:foo::f/fn")),
+            id("sym:rust:foo::f/fn")
+        );
+        assert_eq!(
+            crates.canonical(id("sym:rust:bar::f/fn")),
+            id("sym:rust:baz::f/fn")
+        );
+        // Two crates with one package name keep their directory forms.
+        let crates =
+            CrateNames::from_pairs([("a", "same"), ("b", "same"), ("lci-core", "lci_core")]);
+        assert_eq!(
+            crates.canonical(id("sym:rust:a::f/fn")),
+            id("sym:rust:a::f/fn")
+        );
+        assert_eq!(
+            crates.canonical(id("sym:rust:b::f/fn")),
+            id("sym:rust:b::f/fn")
+        );
+        // Idempotent on every id, canonical or alias.
+        for text in [
+            "sym:rust:lci-core::chunk::f/fn",
+            "sym:rust:lci_core::chunk::f/fn",
+            "sym:rust:a::f/fn",
+            "sym:rust:same::f/fn",
+        ] {
+            let once = crates.canonical(id(text));
+            assert_eq!(crates.canonical(once.clone()), once, "{text}");
+        }
+        // A directory whose own name is its directory is fine.
+        let crates = CrateNames::from_pairs([("tools", "tools")]);
+        assert_eq!(
+            crates.canonical(id("sym:rust:tools::f/fn")),
+            id("sym:rust:tools::f/fn")
+        );
     }
 
     #[test]

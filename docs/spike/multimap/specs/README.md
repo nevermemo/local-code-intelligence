@@ -1,7 +1,12 @@
 # Multimap traversal: interface specs (v0, pre-freeze)
 
-Written 2026-10-12T10:10Z (`date -u`) at slice S0. Docs only: no code exists for anything
-specified here. Every spec is **v0, pre-freeze**. The Map trait and the types it touches
+Written 2026-10-12T10:10Z (`date -u`) at slice S0, when no code existed for anything
+specified here. Since then parts are built (not frozen): NodeId (S1, node-id.md section 7),
+the Map trait, registry and kit C1/C6 (S2, map-trait.md 7, contract-kit.md 6), and the
+extraction hook, bundle sidecar, `sym.defs` and kit C3/C4 (S3a, node-id.md 8, map-trait.md
+8, contract-kit.md 7). Each "as built" section says what changed against the design text
+above it; RunRecord, steering ops and map cards are still design only. Every spec is **v0,
+pre-freeze**. The Map trait and the types it touches
 freeze at the S4 gate, after the first end-to-end slice (lexical map plus a symbols map
 through NodeId, extraction and the harness); until then signatures may change, while the
 properties in each spec's "How a test proves it" should not.

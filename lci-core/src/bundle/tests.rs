@@ -343,3 +343,20 @@ mod synced {
         assert!(format!("{error:#}").contains("rust-chunks-v0"), "{error:#}");
     }
 }
+
+#[test]
+fn put_repairs_an_invalid_bundle_in_place() {
+    let (_temp, store) = store();
+    let path = store.path_of(&key("h1"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{truncated").unwrap();
+    assert_eq!(store.get::<u32>(&key("h1")).unwrap(), None);
+    store.put(&key("h1"), &5u32).unwrap();
+    assert_eq!(store.get::<u32>(&key("h1")).unwrap(), Some(5));
+    let shard = path.parent().unwrap();
+    assert_eq!(
+        std::fs::read_dir(shard).unwrap().count(),
+        1,
+        "no temporary file left"
+    );
+}
