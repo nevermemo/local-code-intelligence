@@ -1,0 +1,90 @@
+name: spike-bench
+
+# The multimap spike bench, levels B and C (docs/spike/multimap/bench.md):
+# freezes the head build of a spike branch, runs it against bench set v1 with
+# the bench's own deterministic fake embedder (no model services, no GPU, no
+# ports 8765-8767), compares it with the stored baseline results file under
+# the pre-registered rules, prints the table in the job summary, and uploads
+# the results as an artifact. It pushes nothing to any branch and does not
+# fail on a regression (open decision D1); it fails only when the bench
+# itself cannot run.
+#
+# A schedule fires only from the workflow file on the default branch; until
+# this file is there, run it by hand (workflow_dispatch) on a branch that has
+# `cargo xtask bench`. The scheduled run benches the branch in the repository
+# variable SPIKE_BENCH_REF, else cloud/spike-s1s2.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to bench (default: the branch this run was started on)"
+        required: false
+        default: ""
+      baseline:
+        description: "Baseline results file in the checked-out tree"
+        required: false
+        default: "docs/spike/multimap/bench/results/baseline-bc.json"
+
+permissions:
+  contents: read
+
+env:
+  RUST_PIN: 1.99.0
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event_name == 'schedule' && (vars.SPIKE_BENCH_REF || 'cloud/spike-s1s2') || (inputs.ref || github.ref) }}
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (the toolchain is the `toolchain` input)
+        with:
+          toolchain: ${{ env.RUST_PIN }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install protoc, cmake and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake ripgrep
+
+      - name: Check ripgrep
+        run: rg --version
+
+      - name: Freeze the head build
+        run: cargo xtask bench freeze --out "$RUNNER_TEMP/lci-head"
+
+      - name: Run levels B and C and compare with the baseline
+        env:
+          BASELINE: ${{ inputs.baseline || 'docs/spike/multimap/bench/results/baseline-bc.json' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cargo xtask bench run \
+            --bin "$RUNNER_TEMP/lci-head" \
+            --work "$RUNNER_TEMP/bench" \
+            --output "$RUNNER_TEMP/out/results-bc.json" \
+            --label "workflow run ${{ github.run_id }}" \
+            --baseline "$BASELINE" \
+            --table "$RUNNER_TEMP/out/comparison.md"
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/out/comparison.md" ]; then
+            cat "$RUNNER_TEMP/out/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The bench did not produce a comparison." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spike-bench-${{ github.run_id }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+          retention-days: 90
