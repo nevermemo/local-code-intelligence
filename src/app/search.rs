@@ -1412,8 +1412,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, head_within,
-        fusion_order, pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
+        App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, fusion_order,
+        head_within, pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
     };
     use crate::{
         chunk::Chunk,
@@ -1559,12 +1559,7 @@ mod tests {
     fn fuse(rrf_k: f32, weights: &FusionConfig, rows: &[Row]) -> Vec<Hit> {
         let (semantic, lexical, lsp) = channels(rows);
         let mut hits = App::fuse_hits(rrf_k, weights, semantic, lexical, lsp);
-        hits.sort_by(|a, b| {
-            b.fusion_score
-                .total_cmp(&a.fusion_score)
-                .then_with(|| a.chunk.relative_file_path.cmp(&b.chunk.relative_file_path))
-                .then(a.chunk.start_line.cmp(&b.chunk.start_line))
-        });
+        hits.sort_by(fusion_order);
         hits
     }
 
@@ -2158,13 +2153,16 @@ mod tests {
                     row.relative_file_path
                 );
             }
-            // The rows are in the fused order: score descending, then path.
+            // The rows are in the fused order: score descending, then the
+            // stable path and chunk identity keys.
             let mut resorted = traced.clone();
             resorted.sort_by(|a, b| {
                 b.fusion_score
                     .total_cmp(&a.fusion_score)
                     .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
                     .then(a.start_line.cmp(&b.start_line))
+                    .then(a.end_line.cmp(&b.end_line))
+                    .then(a.content_hash.cmp(&b.content_hash))
             });
             assert_eq!(traced, resorted);
             assert_eq!(
@@ -2179,11 +2177,19 @@ mod tests {
         let hits = fused_order(&INTERLEAVED);
         let mut rows = trace_candidates(&hits, 2, 4, 1024);
         record_rerank_scores(&mut rows, &[(0, 0.75), (1, 0.25), (2, 0.5), (3, 0.125)]);
+        assert_eq!(rows[0].content_hash, hits[0].chunk.content_hash);
         let json = serde_json::to_string(&rows).unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<CandidateTrace>>(&json).unwrap(),
             rows
         );
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy_json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_hash");
+        let legacy: Vec<CandidateTrace> = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy[0].content_hash, "");
         assert_eq!(
             serde_json::to_string(&[
                 RerankOutcome::Scored,

@@ -15,7 +15,7 @@
 //!    `fused_rank` order, and that the dumped per-file cap reproduces
 //!    `capped_rank` and `shortlisted`. A query that fails is refused.
 //! 2. **Re-sort** the pool under the replayed arm: score descending, then
-//!    path, then start line.
+//!    path, start line, end line, and content hash.
 //! 3. **Cap** (demote a file's chunks beyond `cap`, stably) when
 //!    `--cap-stage` is `shortlist`, the production behaviour.
 //! 4. **Cut the window**: the first `window` rows.

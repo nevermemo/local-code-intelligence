@@ -1897,6 +1897,8 @@ fn dumped_query(
             .total_cmp(&a.fusion_score)
             .then_with(|| a.relative_file_path.cmp(&b.relative_file_path))
             .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.content_hash.cmp(&b.content_hash))
     });
     for (index, row) in rows.iter_mut().enumerate() {
         row.fused_rank = index + 1;
