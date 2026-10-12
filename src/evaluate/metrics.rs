@@ -317,6 +317,7 @@ fn ndcg_at_10(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence]) -> f64 {
     }
 
     let mut expected_claimed = vec![false; expected.len()];
+    let mut expected_files_claimed = BTreeSet::new();
     let mut preferred_claimed = vec![false; preferred.len()];
     let dcg: f64 = evidence
         .iter()
@@ -324,13 +325,22 @@ fn ndcg_at_10(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence]) -> f64 {
         .enumerate()
         .map(|(index, row)| {
             let path = row.relative_file_path.as_str();
-            let gain = match claim_pattern(expected, &mut expected_claimed, path) {
-                Claim::Claimed => EXPECTED_GAIN,
-                Claim::Duplicate => 0.0,
-                Claim::Unmatched => match claim_pattern(preferred, &mut preferred_claimed, path) {
-                    Claim::Claimed => PREFERRED_GAIN,
-                    Claim::Unmatched | Claim::Duplicate => 0.0,
-                },
+            let gain = if expected_files_claimed.contains(path) {
+                0.0
+            } else {
+                match claim_pattern(expected, &mut expected_claimed, path) {
+                    Claim::Claimed => {
+                        expected_files_claimed.insert(path.to_owned());
+                        EXPECTED_GAIN
+                    }
+                    Claim::Duplicate => 0.0,
+                    Claim::Unmatched => {
+                        match claim_pattern(preferred, &mut preferred_claimed, path) {
+                            Claim::Claimed => PREFERRED_GAIN,
+                            Claim::Unmatched | Claim::Duplicate => 0.0,
+                        }
+                    }
+                }
             };
             discounted(gain, index + 1)
         })

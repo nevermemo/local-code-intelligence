@@ -67,8 +67,8 @@ pub struct EvalQuery {
     /// expected hit. Empty means no role expectation.
     #[serde(default)]
     pub expected_roles: Vec<String>,
-    /// A snippet that must appear in the first expected hit's bounded
-    /// snippet; `None` means no snippet expectation.
+    /// A snippet that must appear in any returned chunk's bounded snippet;
+    /// `None` means no snippet expectation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_snippet: Option<String>,
     /// Free-form labels that stratify the aggregate: the report carries one

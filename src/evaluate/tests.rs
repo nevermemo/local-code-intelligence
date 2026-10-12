@@ -646,6 +646,15 @@ fn ndcg_credits_each_gold_pattern_once_and_stops_at_rank_ten() {
 }
 
 #[test]
+fn ndcg_does_not_credit_duplicate_chunks_for_overlapping_expected_patterns() {
+    let query = query_with(&["src/a.rs", "src/**"]);
+    let single = query_metrics(&query, &rows(&["src/a.rs"]), false);
+    let duplicate = query_metrics(&query, &rows(&["src/a.rs", "src/a.rs"]), false);
+
+    assert_close(single.ndcg_at_10, duplicate.ndcg_at_10);
+}
+
+#[test]
 fn recall_counts_distinct_expected_patterns_within_k() {
     let query = query_with(&["src/a.rs", "src/b.rs"]);
 
