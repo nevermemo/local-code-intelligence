@@ -85,9 +85,23 @@ fn used(call: &Value) -> bool {
 
 impl RunRecordFile {
     pub fn read(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let raw = std::fs::read(path)
             .with_context(|| format!("failed to read RunRecord {}", path.display()))?;
-        Self::parse(&raw).with_context(|| format!("RunRecord {}", path.display()))
+        Self::parse_bytes(&raw).with_context(|| format!("RunRecord {}", path.display()))
+    }
+
+    /// [`Self::parse`] over raw bytes. Only the whole lines must be UTF-8: a
+    /// writer killed mid-write can cut its last line inside a multibyte
+    /// character, and that torn tail is dropped like any other.
+    pub fn parse_bytes(raw: &[u8]) -> Result<Self> {
+        let whole = raw
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |last| last + 1);
+        let body = std::str::from_utf8(&raw[..whole]).context("a whole line is not UTF-8")?;
+        let mut record = Self::parse(body)?;
+        record.torn_tail = whole < raw.len();
+        Ok(record)
     }
 
     /// Every `*.jsonl` record in `dir`, in file-name (run id, so start
@@ -416,7 +430,7 @@ fn replay_step(
         "the frontier holds {size} nodes but no rows, so nothing can be checked"
     );
     let mut seen = HashSet::new();
-    let mut previous: Option<(f32, TieKey)> = None;
+    let mut previous: Option<(f32, TieKey, usize)> = None;
     for (index, row) in rows.iter().enumerate() {
         let node = text(row, "node")?;
         let rank = field(row, "fused_rank")?.as_u64().unwrap_or_default();
@@ -458,10 +472,15 @@ fn replay_step(
             );
         }
         let key = TieKey::of(node, row)?;
-        if let Some((score, before)) = &previous {
+        // The registry's sort is stable: nodes equal on score and tie key
+        // (same-line twins, N-5) keep their order of first contribution.
+        let inserted = position[node];
+        if let Some((score, before, before_inserted)) = &previous {
             let in_order = match score.total_cmp(&replayed.score) {
                 Ordering::Greater => true,
-                Ordering::Equal => before.cmp(&key) == Ordering::Less,
+                Ordering::Equal => {
+                    before.cmp(&key).then(before_inserted.cmp(&inserted)) == Ordering::Less
+                }
                 Ordering::Less => false,
             };
             ensure!(
@@ -470,9 +489,9 @@ fn replay_step(
                 index + 1
             );
         }
-        previous = Some((replayed.score, key));
+        previous = Some((replayed.score, key, inserted));
     }
-    if let Some((last, last_key)) = previous {
+    if let Some((last, last_key, _)) = previous {
         for left_out in pool.iter().filter(|r| !seen.contains(r.node)) {
             // A left-out node may tie the last row only if it sorts after
             // it. Its lines are not recorded, so on a tie only the path

@@ -433,3 +433,59 @@ async fn a_label_off_the_card_or_a_hit_without_one_fails_the_offline_c5_check() 
             .is_err()
     );
 }
+
+/// Same-line twins (N-5): two chunks with the same path, lines and content
+/// hash differ only by NodeId ordinal. The registry's stable sort keeps
+/// them in order of first contribution, which here is ordinal 1 first.
+#[tokio::test]
+async fn tied_twins_replay_in_order_of_first_contribution() {
+    let chunks = [
+        chunk("a.rs", 1, "0000000000000009"),
+        chunk("a.rs", 1, "0000000000000009"),
+        chunk("b.rs", 1, "0000000000000001"),
+    ];
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    assert_ne!(view.ids()[0], view.ids()[1], "twins get distinct ordinals");
+    let mut registry = Registry::new(RRF_K);
+    registry
+        .register(
+            fixed(
+                &view,
+                "one",
+                Contribution::RankList,
+                SourceLabel::Lexical,
+                &[(1, 1, None), (0, 1, None), (2, 2, None)],
+            ),
+            WEIGHTS[0].1,
+            10,
+        )
+        .unwrap();
+    let run = registry
+        .run(Some("query"), Duration::from_secs(5), &view)
+        .await;
+    assert_eq!(run.fused[0].node, view.ids()[1], "insertion order kept");
+    assert_eq!(run.fused[0].score.to_bits(), run.fused[1].score.to_bits());
+    let parsed = RunRecordFile::parse(&record_text(&run, &view, 50)).unwrap();
+    assert_eq!(parsed.replay_fuse().unwrap().rows_checked, 3);
+}
+
+/// A writer killed inside a multibyte character leaves a tail that is not
+/// UTF-8; the whole lines before it are still read.
+#[tokio::test]
+async fn a_tail_torn_inside_a_multibyte_character_is_dropped() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let run = registry_run(&view).await;
+    let mut raw = record_text(&run, &view, 50).into_bytes();
+    let end = raw.iter().rposition(|&b| b == b'\n').unwrap();
+    let start = raw[..end].iter().rposition(|&b| b == b'\n').unwrap() + 1;
+    raw.truncate(start);
+    raw.extend_from_slice("{\"type\":\"end\",\"error\":\"caf\u{e9}".as_bytes());
+    raw.pop(); // cut the two-byte character in half
+    assert!(std::str::from_utf8(&raw).is_err());
+    let parsed = RunRecordFile::parse_bytes(&raw).unwrap();
+    assert!(parsed.torn_tail && parsed.end.is_none());
+    assert_eq!(parsed.steps.len(), 2);
+    let whole = RunRecordFile::parse_bytes(record_text(&run, &view, 50).as_bytes()).unwrap();
+    assert!(!whole.torn_tail && whole.end.is_some());
+}
