@@ -1161,8 +1161,36 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
             .or_else(|| item.get("targetSelectionRange"))
             .or_else(|| item.get("targetRange"));
         let Some(range) = range else { continue };
-        let url = reqwest::Url::parse(uri)?;
+        let Ok(url) = reqwest::Url::parse(uri) else {
+            continue;
+        };
         let Ok(file_path) = url.to_file_path() else {
+            continue;
+        };
+        let Some(start_line) = range["start"]["line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())
+            .and_then(|line| line.checked_add(1))
+        else {
+            continue;
+        };
+        let Some(start_character) = range["start"]["character"]
+            .as_u64()
+            .and_then(|character| u32::try_from(character).ok())
+        else {
+            continue;
+        };
+        let Some(end_line) = range["end"]["line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())
+            .and_then(|line| line.checked_add(1))
+        else {
+            continue;
+        };
+        let Some(end_character) = range["end"]["character"]
+            .as_u64()
+            .and_then(|character| u32::try_from(character).ok())
+        else {
             continue;
         };
         let relative_file_path = file_path
@@ -1178,10 +1206,10 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
         output.push(Location {
             file_path,
             relative_file_path: Some(relative_file_path),
-            start_line: range["start"]["line"].as_u64().unwrap_or(0) as u32 + 1,
-            start_character: range["start"]["character"].as_u64().unwrap_or(0) as u32,
-            end_line: range["end"]["line"].as_u64().unwrap_or(0) as u32 + 1,
-            end_character: range["end"]["character"].as_u64().unwrap_or(0) as u32,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
             name: item.get("name").and_then(Value::as_str).map(str::to_owned),
             kind: item.get("kind").and_then(Value::as_u64),
             language: detected_language,
@@ -1222,6 +1250,85 @@ mod tests {
         assert_eq!(result[0].language.as_deref(), Some("rust"));
         assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
+    }
+
+    #[test]
+    fn skips_locations_with_out_of_range_positions_or_invalid_uris() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            id: "test".into(),
+            path: dunce::canonicalize(temp.path()).unwrap(),
+        };
+        let file = workspace.path.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        let result = locations_for(
+            json!([
+                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"line":4294967295u64,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
+                {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}
+            ]),
+            &workspace,
+            "rust-analyzer",
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].relative_file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(result[0].start_line, 1);
+    }
+
+    /// `locations_for` over `items`, where each item is built from the
+    /// `uri` of a file in a temporary workspace.
+    fn locations_in_temp_workspace(items: impl Fn(&str) -> Value) -> Vec<Location> {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            id: "test".into(),
+            path: dunce::canonicalize(temp.path()).unwrap(),
+        };
+        let file = workspace.path.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        locations_for(items(&uri), &workspace, "rust-analyzer").unwrap()
+    }
+
+    #[test]
+    fn a_character_that_does_not_fit_u32_drops_only_its_location() {
+        let result = locations_in_temp_workspace(|uri| {
+            json!([
+                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"line":0,"character":4294967296u64},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
+            ])
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].end_character, 1);
+    }
+
+    #[test]
+    fn a_missing_or_negative_position_drops_only_its_location() {
+        let result = locations_in_temp_workspace(|uri| {
+            json!([
+                {"uri":uri,"range":{"start":{"line":2,"character":3},"end":{"line":2,"character":5}}},
+                {"uri":uri,"range":{"start":{"line":-1,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"character":0},"end":{"line":0,"character":1}}},
+            ])
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_line, 3);
+    }
+
+    #[test]
+    fn a_uri_that_does_not_parse_drops_only_its_location() {
+        let result = locations_in_temp_workspace(|uri| {
+            json!([
+                {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+            ])
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].relative_file_path.as_deref(), Some("src/lib.rs"));
     }
 
     #[test]
