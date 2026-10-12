@@ -1,0 +1,633 @@
+[
+  {
+    "id": "bug-001",
+    "row": "N12",
+    "fix_commit": "05780cfd2899408c4ba5621b11d09b44f6e5d32d",
+    "base_commit": "f4968561d023a39672abb484de27adeac443ce32",
+    "question": "In a mixed-language workspace, a workspace-symbol query with no matches fails with HTTP 500 \"all applicable language servers failed\" whenever a language server for some other language has crashed, even though the server for the relevant language answered correctly with nothing.",
+    "gold_files": [
+      "src/app/navigation.rs"
+    ],
+    "gold_symbols": [
+      "App::symbols"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": ""
+  },
+  {
+    "id": "bug-002",
+    "row": "N10",
+    "fix_commit": "182c06295e76fb20a8ca22f5be900f2b4ccb9078",
+    "base_commit": "41c9a92e16e46c78c0cf28fadd58e0fee71394c3",
+    "question": "With the default logging configuration nothing from the core library is ever logged: language-server restarts, readiness timeouts and JSON-RPC reader failures leave no trace in the service log.",
+    "gold_files": [
+      "src/main.rs"
+    ],
+    "gold_symbols": [
+      "main::main"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: src/main.rs."
+  },
+  {
+    "id": "bug-003",
+    "row": "N11",
+    "fix_commit": "df1255c3a6215d79b5c48771076da2daeb15d804",
+    "base_commit": "aba0f66dca34a886f975568d1d2d37e1be6a91c3",
+    "question": "In a C++ repository that ships Qt Linguist translation files (*.ts, XML), those files are parsed and split as TypeScript; in one large project that is about 100 files and 14 MB of XML whose long pieces slow embedding down.",
+    "gold_files": [
+      "lci-core/src/chunk.rs",
+      "lci-core/src/language.rs",
+      "src/app/indexing.rs"
+    ],
+    "gold_symbols": [
+      "chunk::fingerprint",
+      "chunk::scan_incremental",
+      "chunk::sources",
+      "App::index_locked"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: LanguageAdapter::non_source, NonSource::identifier, language::is_catalog_start, language::qt_linguist. Item-level (non-function) changes too in: lci-core/src/chunk.rs, lci-core/src/language.rs, src/app/indexing.rs."
+  },
+  {
+    "id": "bug-004",
+    "row": "N13",
+    "fix_commit": "04043acc920e3cb41d56988c0b4bd7c09c5befb0",
+    "base_commit": "df1255c3a6215d79b5c48771076da2daeb15d804",
+    "question": "A workspace-symbol lookup that comes back empty looks exactly like a genuine \"no match\" even when one of the workspace's language servers has crashed; the answer carries no hint that a provider failed, so the caller cannot tell whether to trust the empty result.",
+    "gold_files": [
+      "src/app/navigation.rs"
+    ],
+    "gold_symbols": [
+      "App::definition",
+      "App::references",
+      "App::symbols"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": false,
+    "notes": "Reworded after verification: the original question also blamed jump-to-declaration and find-usages, which already returned an error for a crashed server at base_commit. Their bodies changed (they gained the new warnings field), so they stay gold symbols. Item-level (non-function) changes too in: src/app/navigation.rs."
+  },
+  {
+    "id": "bug-005",
+    "row": "N9",
+    "fix_commit": "10d771e329e4b3248192527ce61d091f23cb8b37",
+    "base_commit": "5996fa5b5ebe88fc7c697f3e2c9f220f3aa65976",
+    "question": "During a slow rust-analyzer warm-up, two go-to-declaration calls left three orphaned rust-analyzer processes (about 530 MB each) running, and error replies such as \"content modified\" while the server is still loading make the service cold-start yet another server.",
+    "gold_files": [
+      "lci-core/src/config.rs",
+      "lci-core/src/lsp.rs",
+      "lci-core/src/lsp/adapter.rs",
+      "lci-core/src/lsp/rust.rs",
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "Manager::discard",
+      "Manager::position_request",
+      "Manager::request",
+      "JsonRpcClient::drop",
+      "JsonRpcClient::request",
+      "JsonRpcClient::shutdown",
+      "JsonRpcClient::spawn",
+      "transport::read_messages"
+    ],
+    "change_kind": "resource",
+    "name_leak": true,
+    "notes": "Large change: also adds Windows process-tree handling in a file that does not exist at base_commit. Fix also adds: Manager::send, RepeatPolicy::may_start, RepeatPolicy::wait_before, lsp::is_transient_code, lsp::log_final_answer, lsp::send_with_repeats, LspAdapter::is_loading_error, Job::new, Job::raw, Job::terminate, job::adopt, job::prepare, job::resume_suspended_process, job::resume_thread, job::warn_unconfined, RustServer::is_loading_error, JsonRpcClient::terminate_tree, RpcError::fmt, RpcError::from_response, transport::response_outcome. New file in the fix (not gold): lci-core/src/lsp/job.rs. Item-level (non-function) changes too in: lci-core/src/config.rs, lci-core/src/lsp.rs, lci-core/src/lsp/adapter.rs, lci-core/src/lsp/job.rs, lci-core/src/lsp/rust.rs, lci-core/src/lsp/transport.rs. Leaked tokens: rust."
+  },
+  {
+    "id": "bug-006",
+    "row": "N35",
+    "fix_commit": "3c92aac66e535fb18b6c788d00019efac6b0a423",
+    "base_commit": "610749705baf3b3b13a7d8494a473ccfb3b7ee7d",
+    "question": "A language server that answers every call by a transient error (ContentModified, ServerCancelled or RequestFailed) is never replaced: each call fails after a few retries and the broken server stays in use until the whole service is restarted.",
+    "gold_files": [
+      "lci-core/src/config.rs",
+      "lci-core/src/lsp.rs",
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "Config::default",
+      "Manager::new",
+      "Manager::position_request",
+      "Manager::request",
+      "Manager::send",
+      "Manager::session",
+      "Session::begin",
+      "lsp::send_with_repeats",
+      "JsonRpcClient::spawn",
+      "transport::read_messages"
+    ],
+    "change_kind": "other",
+    "name_leak": true,
+    "notes": "Fix also adds: Session::note_answer, Session::stuck, TransientStreak::answered, TransientStreak::transient, lsp::is_transient, JsonRpcClient::progress_count. Item-level (non-function) changes too in: lci-core/src/config.rs, lci-core/src/lsp.rs, lci-core/src/lsp/transport.rs. Leaked tokens: request."
+  },
+  {
+    "id": "bug-007",
+    "row": "N23",
+    "fix_commit": "7b87d3360ef9090d363337d48839ad3091616229",
+    "base_commit": "55cdbd95e12a8514f10b4f543e831846dd49d61e",
+    "question": "The embedding and reranker HTTP client: it follows 307/308 redirects (re-posting repository code to another host or port), an endpoint configured using a query string gets \"/embeddings\" appended inside the query, and an arbitrarily large error or success body is read into memory whole.",
+    "gold_files": [
+      "lci-core/src/models.rs"
+    ],
+    "gold_symbols": [
+      "Models::embed_with",
+      "Models::new",
+      "Models::rerank",
+      "models::check_status"
+    ],
+    "change_kind": "other",
+    "name_leak": false,
+    "notes": "Three hardening problems in one row. Fix also adds: models::read_limited_body. Item-level (non-function) changes too in: lci-core/src/models.rs."
+  },
+  {
+    "id": "bug-008",
+    "row": "N40",
+    "fix_commit": "6146858045a0afd2938b51d45ec028c87ef47658",
+    "base_commit": "9b34c068ea38237ca99355a4425b6418d90e8a56",
+    "question": "A language server that announces a huge Content-Length makes the service try to allocate that much memory (and abort), and a server that stops draining its stdin blocks the call, and every later call on that session, forever.",
+    "gold_files": [
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "AbandonedRequest::drop",
+      "JsonRpcClient::request",
+      "JsonRpcClient::spawn",
+      "JsonRpcClient::write",
+      "transport::read_messages",
+      "transport::write_framed"
+    ],
+    "change_kind": "hang-or-timeout",
+    "name_leak": false,
+    "notes": "Fix also adds: Writer::write_framed, transport::read_frame. Item-level (non-function) changes too in: lci-core/src/lsp/transport.rs."
+  },
+  {
+    "id": "bug-009",
+    "row": "N67",
+    "fix_commit": "e6d00501ab62c0a5586686c16f9580888401942e",
+    "base_commit": "6146858045a0afd2938b51d45ec028c87ef47658",
+    "question": "A language server that finishes loading just after the stuck-time limit and then replies to a call normally is still shut down and restarted from cold at the end of that call.",
+    "gold_files": [
+      "lci-core/src/lsp.rs"
+    ],
+    "gold_symbols": [
+      "Session::note_answer"
+    ],
+    "change_kind": "other",
+    "name_leak": false,
+    "notes": "Fix also adds: Session::answered. Item-level (non-function) changes too in: lci-core/src/lsp.rs."
+  },
+  {
+    "id": "bug-010",
+    "row": "N75, N76",
+    "fix_commit": "d7a28c5117353a10a1b5b0fa1fbc5d4a9c5a4fe5",
+    "base_commit": "e60e3dcb180abadf475a59a4dc378d404a6c767e",
+    "question": "Two framing problems on the language-server pipe: a message that queued behind a timed-out write is still written after the half-written frame, putting the stream out of step; and a frame with two Content-Length headers (100, then 1) reads one body byte and misparses the rest as the start of the next message.",
+    "gold_files": [
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "Writer::write_framed",
+      "transport::read_frame"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": true,
+    "notes": "Two rows in one commit. Fix also adds: Writer::ensure_not_broken. Item-level (non-function) changes too in: lci-core/src/lsp/transport.rs. Leaked tokens: frame, read, write."
+  },
+  {
+    "id": "bug-011",
+    "row": "N52, N51",
+    "fix_commit": "ab7de12fc4d6df30529c7282d89f0af8d7530e06",
+    "base_commit": "d7a28c5117353a10a1b5b0fa1fbc5d4a9c5a4fe5",
+    "question": "A server-initiated message with a string id (for example pyright's workspace/configuration) is never answered and is treated like a notification; separately, lsp_timeout_seconds = 18446744073709551615 is accepted at startup and then panics on the first language-server call.",
+    "gold_files": [
+      "lci-core/src/config.rs",
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "Config::validate",
+      "JsonRpcClient::request",
+      "transport::read_messages"
+    ],
+    "change_kind": "panic",
+    "name_leak": false,
+    "notes": "Two rows in one commit; the string-id part is a wrong-result, the timeout part a panic. Item-level (non-function) changes too in: lci-core/src/config.rs, lci-core/src/lsp/transport.rs."
+  },
+  {
+    "id": "bug-012",
+    "row": "N74",
+    "fix_commit": "789b18dc10965751d11d59093fcb9a8b1b38bdd1",
+    "base_commit": "3bac689172ebc1b513c750e393e5eb1a22d0a324",
+    "question": "Workspace-symbol results merged from several language servers come back in a different order from run to run when two hits share a file and line, and duplicate entries are not always removed.",
+    "gold_files": [
+      "src/app/navigation.rs"
+    ],
+    "gold_symbols": [
+      "App::symbols"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: navigation::order_symbols. Item-level (non-function) changes too in: src/app/navigation.rs."
+  },
+  {
+    "id": "bug-013",
+    "row": "N71",
+    "fix_commit": "33f699510e92af3f47fcb49160319466681a0b9e",
+    "base_commit": "789b18dc10965751d11d59093fcb9a8b1b38bdd1",
+    "question": "When a search filter names an unknown language, the error message that lists the accepted language names shows \"cpp\" twice.",
+    "gold_files": [
+      "lci-core/src/language.rs"
+    ],
+    "gold_symbols": [
+      "language::identifiers"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": true,
+    "notes": "Item-level (non-function) changes too in: lci-core/src/language.rs. Leaked tokens: language."
+  },
+  {
+    "id": "bug-014",
+    "row": "N68",
+    "fix_commit": "7dbc354a7b80546d47a9d6ab122272258e219f30",
+    "base_commit": "19a83928d35c5010fb9a0cea55a3ade31a20beae",
+    "question": "If the workspace's on-disk ledger of previously processed sources exists but cannot be read (a permission error, a sharing violation, or a directory at that path), the workspace is silently reported as stale with nothing listed instead of reporting the read failure.",
+    "gold_files": [
+      "lci-core/src/manifest.rs",
+      "src/app/indexing.rs"
+    ],
+    "gold_symbols": [
+      "manifest::load",
+      "App::index_locked",
+      "App::indexed_files",
+      "App::status"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": false,
+    "notes": "Fix also adds: manifest::try_load. Item-level (non-function) changes too in: lci-core/src/manifest.rs."
+  },
+  {
+    "id": "bug-015",
+    "row": "N69",
+    "fix_commit": "cf15de44e574bb7b1a9f0df5bcd517c04a8f4f50",
+    "base_commit": "b15553d664b1cdf7383685cc557ff4c4c4bdb3a0",
+    "question": "Asking for 40 results returns at most 24 (and asking for 10 with a candidate window of 5 returns 5), and nothing in the response says the answer was cut short.",
+    "gold_files": [
+      "lci-core/src/config.rs",
+      "src/app/search.rs",
+      "src/server.rs"
+    ],
+    "gold_symbols": [
+      "App::search_once"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: search::pool_cut_note. Item-level (non-function) changes too in: lci-core/src/config.rs, src/app/search.rs, src/server.rs."
+  },
+  {
+    "id": "bug-016",
+    "row": "N22",
+    "fix_commit": "d2fd1932f5772428ea819096c725350d96acb1a5",
+    "base_commit": "f5648a00a3d26d148cfcfc0f6396b217ced372d7",
+    "question": "Retrieved code snippets of very large expressions, argument lists or object literals are missing the tokens between pieces: for example the '+' in emit(\"<3500 chars>\" + \"<3500 chars>\") or the separating commas appear in no snippet at all.",
+    "gold_files": [
+      "lci-core/src/chunk.rs",
+      "lci-core/src/language.rs",
+      "lci-core/src/manifest.rs"
+    ],
+    "gold_symbols": [
+      "chunk::chunks_with_adapter",
+      "chunk::ranges",
+      "ManifestV1::migrate"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: lci-core/src/language.rs."
+  },
+  {
+    "id": "bug-017",
+    "row": "N36",
+    "fix_commit": "888885887504c457770e4a2e05adf05e37d9309e",
+    "base_commit": "d2fd1932f5772428ea819096c725350d96acb1a5",
+    "question": "Searching or navigating an untrusted Rust repository with the shipped defaults can execute that repository's build scripts and procedural macros, run cargo check, and fetch crates from the network, all with the user's rights.",
+    "gold_files": [
+      "lci-core/src/config.rs",
+      "lci-core/src/lsp.rs",
+      "lci-core/src/lsp/adapter.rs",
+      "lci-core/src/lsp/rust.rs",
+      "lci-core/src/lsp/transport.rs"
+    ],
+    "gold_symbols": [
+      "Config::default",
+      "GenericClient::spawn",
+      "RustServer::initialize_params",
+      "RustServer::new",
+      "JsonRpcClient::spawn"
+    ],
+    "change_kind": "other",
+    "name_leak": true,
+    "notes": "Security hardening rather than a functional failure. Fix also adds: LspAdapter::environment, RustServer::environment, TransportConfig::command. Item-level (non-function) changes too in: lci-core/src/config.rs, lci-core/src/lsp/adapter.rs, lci-core/src/lsp/rust.rs, lci-core/src/lsp/transport.rs. Leaked tokens: default, rust."
+  },
+  {
+    "id": "bug-018",
+    "row": "N55",
+    "fix_commit": "1a1206a95a150cbeac4e40e445e031f2e74a91e8",
+    "base_commit": "888885887504c457770e4a2e05adf05e37d9309e",
+    "question": "The C# end-to-end scenario for an absent language server passes even when code search returns no results, because the query text echoed back in the response satisfies the check.",
+    "gold_files": [
+      "xtask/src/acceptance/missing.rs"
+    ],
+    "gold_symbols": [
+      "missing::checks"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: missing::search_returns_calculator."
+  },
+  {
+    "id": "bug-019",
+    "row": "N54",
+    "fix_commit": "4008e0de46621493931e54bfaa3aeee5007e60c0",
+    "base_commit": "1a1206a95a150cbeac4e40e445e031f2e74a91e8",
+    "question": "Include/exclude wildcards such as 'a:b' or 'x:y*' are refused as if they were drive-letter locations on Unix, and './src/**' is accepted but never matches src/main.rs.",
+    "gold_files": [
+      "lci-core/src/filter/request.rs",
+      "lci-core/src/filter/source_role.rs"
+    ],
+    "gold_symbols": [
+      "GlobPattern::compile",
+      "request::is_absolute_pattern",
+      "source_role::normalize_path"
+    ],
+    "change_kind": "validation",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: lci-core/src/filter/source_role.rs."
+  },
+  {
+    "id": "bug-020",
+    "row": "N53",
+    "fix_commit": "879a1cb39810a8cd7dabef854a05650aadf0129f",
+    "base_commit": "4008e0de46621493931e54bfaa3aeee5007e60c0",
+    "question": "Two chunks that start on the same line of the same file and tie on combined score come out ranked differently from process to process, so which of them survives the result cut or the per-file cap changes between runs.",
+    "gold_files": [
+      "src/app/search.rs",
+      "src/evaluate/replay.rs"
+    ],
+    "gold_symbols": [
+      "App::search_once",
+      "search::trace_candidates",
+      "replay::fused_order"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: search::fusion_order. Item-level (non-function) changes too in: src/app/search.rs, src/evaluate/replay.rs."
+  },
+  {
+    "id": "bug-021",
+    "row": "N56",
+    "fix_commit": "102f1186736a35a91e14450ded589d5b4a28ca10",
+    "base_commit": "879a1cb39810a8cd7dabef854a05650aadf0129f",
+    "question": "When a language server is not installed, the nightly end-to-end suite prints PREREQUISITE_UNAVAILABLE for that stage yet counts it as passed and ends with \"All steps passed.\"",
+    "gold_files": [
+      "xtask/src/live_acceptance.rs",
+      "xtask/src/main.rs"
+    ],
+    "gold_symbols": [
+      "Status::label",
+      "live_acceptance::run",
+      "live_acceptance::run_step",
+      "main::main"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": true,
+    "notes": "Fix also adds: live_acceptance::completed_status, live_acceptance::write_summary. Item-level (non-function) changes too in: xtask/src/live_acceptance.rs, xtask/src/main.rs. Leaked tokens: step."
+  },
+  {
+    "id": "bug-022",
+    "row": "N49",
+    "fix_commit": "2422df5efc479a68fc9ae2d864bcfe187a08b513",
+    "base_commit": "7f9c636cc291bce098c04d0aae8b4ccd896071b2",
+    "question": "A Qt Linguist .ts translation file that begins with an XML comment (or a DOCTYPE) before its <TS> root element is still parsed and chunked as TypeScript.",
+    "gold_files": [
+      "lci-core/src/language.rs"
+    ],
+    "gold_symbols": [
+      "language::is_catalog_start"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: language::skip_doctype. Item-level (non-function) changes too in: lci-core/src/language.rs."
+  },
+  {
+    "id": "bug-023",
+    "row": "N50",
+    "fix_commit": "bc3c7457f1b7273873c2f94a489232ee48a259b0",
+    "base_commit": "5c313690d727669c6fae670d8281bda32017e288",
+    "question": "A navigation reply with a position whose line is 4294967295 panics in a debug build (and wraps to line 0 in release), and one entry with an unparsable uri makes the whole reply fail, discarding the valid entries.",
+    "gold_files": [
+      "lci-core/src/lsp.rs"
+    ],
+    "gold_symbols": [
+      "lsp::locations_for"
+    ],
+    "change_kind": "panic",
+    "name_leak": false,
+    "notes": ""
+  },
+  {
+    "id": "bug-024",
+    "row": "N84",
+    "fix_commit": "6c3fa842538161f08ff7ce8ab58892527438d2a5",
+    "base_commit": "c4641ed3473335c83662090cf131742b9e9daa4c",
+    "question": "A plain-text (ripgrep) query that hits one line in each of tens of thousands of indexed files spends a very long time before returning eight results: every hit path is compared against every indexed file.",
+    "gold_files": [
+      "src/app/search.rs"
+    ],
+    "gold_symbols": [
+      "App::map_lexical_matches"
+    ],
+    "change_kind": "resource",
+    "name_leak": false,
+    "notes": "Fix also adds: search::lookup_lexical_files."
+  },
+  {
+    "id": "bug-025",
+    "row": "N85",
+    "fix_commit": "25f2ca5940fbd83af583d8de327eed68dbf88240",
+    "base_commit": "9191c40c958902b14473225c9fa3791a6de6c989",
+    "question": "A query whose filter excludes every chunk (an empty path include list, or a language nothing is indexed under) still embeds the query and runs ripgrep over the workspace, so with a slow embedder it can stall until the embedder times out before returning an empty answer.",
+    "gold_files": [
+      "src/app/search.rs"
+    ],
+    "gold_symbols": [
+      "App::search_once"
+    ],
+    "change_kind": "hang-or-timeout",
+    "name_leak": false,
+    "notes": ""
+  },
+  {
+    "id": "bug-026",
+    "row": "N61",
+    "fix_commit": "cb7b5659e1cde175acff26f7a6f3a37a6bb5280d",
+    "base_commit": "18e5dc4bc64299a03cbdfc0e7907470f25aa2bb3",
+    "question": "Calling the public eval library entry point from code, passing a hand-built eval file whose query names an undeclared workspace panics, saying \"no entry found for key\" instead of returning an error.",
+    "gold_files": [
+      "src/evaluate/runner.rs"
+    ],
+    "gold_symbols": [
+      "runner::run_evaluation_with_options"
+    ],
+    "change_kind": "panic",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: src/evaluate/runner.rs."
+  },
+  {
+    "id": "bug-027",
+    "row": "N73",
+    "fix_commit": "83e11640446ba19fbeb1f16fdfdc2dbe6af25baa",
+    "base_commit": "cb7b5659e1cde175acff26f7a6f3a37a6bb5280d",
+    "question": "A file saved with a UTF-8 byte order mark gets different retrieval snippets and content hashes from the same file without the mark: the BOM stays in the first snippet's text or becomes a snippet of its own.",
+    "gold_files": [
+      "lci-core/src/chunk.rs"
+    ],
+    "gold_symbols": [
+      "chunk::decode_source"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: lci-core/src/chunk.rs."
+  },
+  {
+    "id": "bug-028",
+    "row": "N80",
+    "fix_commit": "4737e7737b731d172654b4ff713aa7cb17b2758b",
+    "base_commit": "6ebf3c54f379b78751c03fd197af46fb7335d88f",
+    "question": "If another process already listens on the end-to-end harness port, the harness-owned service process exits on the bind failure but the scenarios carry on and talk to the other process's /health and /ready endpoints.",
+    "gold_files": [
+      "xtask/src/acceptance/lsp.rs",
+      "xtask/src/acceptance/missing.rs",
+      "xtask/src/acceptance/mod.rs",
+      "xtask/src/acceptance/recovery.rs"
+    ],
+    "gold_symbols": [
+      "lsp::run_inner",
+      "missing::checks",
+      "ManagedServer::spawn",
+      "acceptance::wait_http_ok",
+      "recovery::checks"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Fix also adds: acceptance::ensure_port_free. Item-level (non-function) changes too in: xtask/src/acceptance/mod.rs."
+  },
+  {
+    "id": "bug-029",
+    "row": "N72",
+    "fix_commit": "fcd4f5cd39bf30e837ea1f3831b609c1e7895166",
+    "base_commit": "4737e7737b731d172654b4ff713aa7cb17b2758b",
+    "question": "A long run of comments after the last declaration in a class or module becomes a snippet of its own that ignores the size target.",
+    "gold_files": [
+      "lci-core/src/chunk.rs",
+      "lci-core/src/language.rs"
+    ],
+    "gold_symbols": [
+      "chunk::ranges"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: lci-core/src/language.rs."
+  },
+  {
+    "id": "bug-030",
+    "row": "N77",
+    "fix_commit": "a47e9b5a8694852c6e99ee4e41d2651a5f7994a9",
+    "base_commit": "55ac407709e2d64c28195833c8065b92f710e438",
+    "question": "With jdtls correctly configured, the service health report always marks the Java language server unavailable (\"start <dir>\" under degraded), because it tries to execute the jdtls installation directory with --version.",
+    "gold_files": [
+      "lci-core/src/lsp/adapter.rs",
+      "lci-core/src/lsp/java.rs",
+      "src/app/readiness.rs"
+    ],
+    "gold_symbols": [
+      "JavaServer::find_launcher_jar",
+      "App::probe_subprocess_version",
+      "App::service_status"
+    ],
+    "change_kind": "wrong-result",
+    "name_leak": true,
+    "notes": "Fix also adds: LspAdapter::probe_readiness, adapter::probe_subprocess_version, JavaServer::probe_readiness. Item-level (non-function) changes too in: lci-core/src/lsp/adapter.rs, src/app/readiness.rs. Leaked tokens: java, server, service, version."
+  },
+  {
+    "id": "bug-031",
+    "row": "N45",
+    "fix_commit": "e17b09f752bc16d7d19dca6b1ffa91ddd19a7641",
+    "base_commit": "a47e9b5a8694852c6e99ee4e41d2651a5f7994a9",
+    "question": "After a first search failed with error X, an explicitly requested rebuild fails with error Y, and a search that was waiting on that rebuild reports \"indexing failed while waiting: X\", the stale cause.",
+    "gold_files": [
+      "src/app/indexing.rs",
+      "src/app/mod.rs",
+      "src/app/search.rs"
+    ],
+    "gold_symbols": [
+      "App::index",
+      "App::resolve_index_for_search"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": true,
+    "notes": "Item-level (non-function) changes too in: src/app/mod.rs. Leaked tokens: index, indexing, search."
+  },
+  {
+    "id": "bug-032",
+    "row": "N60",
+    "fix_commit": "4437685fdfc9c640b1975284b862ff63aea0f957",
+    "base_commit": "82e8478bac7a26cb9cdf0f9bafc856c71372a35f",
+    "question": "An eval TOML file with a misspelled key (expected_path instead of expected_paths, or [[query]] instead of [[queries]]) loads without complaint and the affected query just scores 0 recall, silently skewing published numbers.",
+    "gold_files": [
+      "src/evaluate/definition.rs",
+      "src/evaluate/types.rs"
+    ],
+    "gold_symbols": [
+      "definition::validate_definition"
+    ],
+    "change_kind": "validation",
+    "name_leak": false,
+    "notes": "Item-level (non-function) changes too in: src/evaluate/types.rs."
+  },
+  {
+    "id": "bug-033",
+    "row": "N38",
+    "fix_commit": "13fe9f2ed953aaecb2efd5e25391f6e10f705c88",
+    "base_commit": "c9f8e2da6825b75aab677551c58d00827b7a046f",
+    "question": "When a model endpoint URL carries a credential in its query string (?api_key=...), a failed reranker call puts the full URL, credential included, into the warning returned to REST and MCP callers.",
+    "gold_files": [
+      "lci-core/src/models.rs"
+    ],
+    "gold_symbols": [
+      "Models::send_with_retry"
+    ],
+    "change_kind": "error-reporting",
+    "name_leak": false,
+    "notes": ""
+  },
+  {
+    "id": "bug-034",
+    "row": "N86",
+    "fix_commit": "96cecf6aac6ac5df3ef57624ebacb40c21d20012",
+    "base_commit": "2547c12e37814ce5c0971dd7e090c347c75542f5",
+    "question": "On a large index every workspace-symbol, go-to-declaration and find-usages call is slow before any language server is asked, because the service first reads every stored chunk, code included, just to learn which languages are indexed.",
+    "gold_files": [
+      "src/app/navigation.rs",
+      "src/store.rs"
+    ],
+    "gold_symbols": [
+      "App::ensure_indexed_language",
+      "App::symbols"
+    ],
+    "change_kind": "resource",
+    "name_leak": true,
+    "notes": "Fix also adds: Store::languages. Item-level (non-function) changes too in: src/app/navigation.rs, src/store.rs. Leaked tokens: indexed, language, store."
+  }
+]
