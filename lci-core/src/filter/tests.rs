@@ -1,4 +1,5 @@
 use super::*;
+use super::source_role::normalize_path;
 use std::str::FromStr;
 
 // -- SourceRole parsing / display ------------------------------------
@@ -451,6 +452,35 @@ fn glob_rejects_absolute_windows() {
         GlobPattern::compile("C:/projects/foo"),
         Err(FilterError::AbsolutePath { .. })
     ));
+}
+
+#[test]
+fn glob_accepts_colon_in_relative_pattern() {
+    let pattern = GlobPattern::compile("a:b").unwrap();
+    assert!(pattern.matches("a:b"));
+}
+
+#[test]
+fn glob_rejects_windows_drive_absolute_patterns() {
+    assert!(matches!(
+        GlobPattern::compile("C:/x"),
+        Err(FilterError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        GlobPattern::compile(r"C:\x"),
+        Err(FilterError::AbsolutePath { .. })
+    ));
+}
+
+#[test]
+fn glob_dot_components_are_removed() {
+    let pattern = GlobPattern::compile("./src/**").unwrap();
+    assert!(pattern.matches("src/main.rs"));
+}
+
+#[test]
+fn normalize_path_removes_dot_components() {
+    assert_eq!(normalize_path("src/./lib.rs"), "src/lib.rs");
 }
 
 #[test]
