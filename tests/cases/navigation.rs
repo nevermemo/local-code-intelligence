@@ -3187,6 +3187,46 @@ async fn fake_typescript_lsp_maps_symbols_definitions_and_references() {
 }
 
 #[tokio::test]
+async fn a_file_above_the_did_open_cap_is_navigated_without_sending_its_text() {
+    use local_code_intelligence::lsp::adapter::MAX_DID_OPEN_BYTES;
+    let did_opens = |state: &std::path::Path| {
+        std::fs::read_to_string(state.join("did_open_seen.txt"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) = fake_typescript_fixture(&temp, "definition");
+    let cap = MAX_DID_OPEN_BYTES as usize;
+    write(&workspace.path, "src/AtCap.ts", &"x".repeat(cap));
+    write(&workspace.path, "src/Generated.ts", &"x".repeat(cap + 1));
+    let manager = Manager::new(&config);
+    let adapter = typescript_adapter(&manager);
+    let at_cap = workspace.path.join("src/AtCap.ts");
+    let above_cap = workspace.path.join("src/Generated.ts");
+
+    // A file of exactly the cap is still opened, which also shows the count
+    // below is not vacuously unchanged. At least one: a restart after a slow
+    // first attempt runs the hook again.
+    let results = manager
+        .definition(&adapter, &workspace, &at_cap, "src/AtCap.ts", 1, 1)
+        .await
+        .unwrap();
+    assert!(!results.is_empty());
+    let opened = did_opens(&state);
+    assert!(opened >= 1, "a file of exactly the cap is opened");
+
+    let results = manager
+        .definition(&adapter, &workspace, &above_cap, "src/Generated.ts", 1, 1)
+        .await
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "the request is still sent and answered"
+    );
+    assert_eq!(did_opens(&state), opened, "the oversized file was not sent");
+}
+
+#[tokio::test]
 async fn fake_python_lsp_maps_symbols_definitions_and_references() {
     for (mode, operation) in [
         ("workspace-symbols", "symbols"),

@@ -11,9 +11,9 @@
 //! blocks further work until that reply arrives).
 
 use crate::config::PythonLspConfig;
-use crate::lsp::adapter::LspAdapter;
+use crate::lsp::adapter::{LspAdapter, read_for_did_open};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -128,9 +128,9 @@ impl LspAdapter for PythonServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .with_context(|| format!("read {relative} to open in pyright"))?;
+        let Some(content) = read_for_did_open(file, relative, "pyright").await? else {
+            return Ok(());
+        };
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();

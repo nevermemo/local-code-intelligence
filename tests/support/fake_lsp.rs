@@ -524,6 +524,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             {
                 write_message(&mut stdout, &json_response(id, serde_json::Value::Null))?;
             }
+        } else if method == Some("textDocument/didOpen") {
+            // A notification: nothing to answer, only counted.
+            record_event(config.state_dir.as_deref(), "did_open_seen.txt");
         } else if method == Some("exit") {
             record_event(config.state_dir.as_deref(), "exit_seen.txt");
             if !config.ignore_shutdown {
