@@ -1193,6 +1193,43 @@ fn untagged_runs_omit_by_tag_and_old_reports_still_load() {
     assert_eq!(back.queries[0].query.tags, ["keyword"]);
 }
 
+#[tokio::test]
+async fn run_evaluation_rejects_undeclared_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = crate::app::App::open(crate::config::Config {
+        data_dir: temp.path().join("data"),
+        embedding_url: format!("http://{address}/v1"),
+        reranker_url: format!("http://{address}/rerank"),
+        ..crate::config::Config::default()
+    })
+    .await
+    .unwrap();
+    let mut query = query_with(&["src/metric.rs"]);
+    query.workspace = "missing-workspace".to_owned();
+    let file = EvaluationFile {
+        workspaces: Vec::new(),
+        queries: vec![query],
+    };
+
+    let error = run_evaluation(&app, &file, &[])
+        .await
+        .expect_err("an undeclared workspace must return an error");
+    assert!(error.to_string().contains("missing-workspace"), "{error}");
+
+    // The definition rules are the command line's for every caller: mapping the
+    // undeclared key does not make the file valid.
+    let mapped = [WorkspaceMapping {
+        key: "missing-workspace".to_owned(),
+        path: temp.path().to_path_buf(),
+    }];
+    let error = run_evaluation(&app, &file, &mapped)
+        .await
+        .expect_err("a mapped but undeclared workspace must return an error");
+    assert!(error.to_string().contains("missing-workspace"), "{error}");
+}
+
 #[test]
 fn checked_in_definitions_load_and_validate() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("evaluations");

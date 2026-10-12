@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::app::{App, IndexAction, SearchOptions, SearchReport};
 
+use super::definition::validate_definition;
 use super::metrics::aggregate;
 use super::types::{
     AggregateReport, CandidateArm, EvalTimings, EvaluationFile, IndexLifecycleAction, QueryReport,
@@ -104,6 +105,8 @@ pub async fn run_evaluation_with_options(
     workspaces: &[WorkspaceMapping],
     options: RunOptions,
 ) -> Result<AggregateReport> {
+    validate_definition(file)?;
+
     // Build a key → path lookup from the CLI mappings.
     let mut provided: BTreeMap<&str, &Path> = BTreeMap::new();
     for mapping in workspaces {
