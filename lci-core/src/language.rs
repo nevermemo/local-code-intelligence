@@ -405,12 +405,13 @@ const UTF16_PREFIX_UNITS: usize = 512;
 /// (with or without a byte-order mark) or in UTF-16 with a byte-order mark
 /// (little or big endian; a UTF-16 file without a mark is not guessed).
 ///
-/// After the mark and whitespace the text must start with either an XML
-/// declaration (`<?xml`, which no TypeScript statement or expression can
-/// start with) or a `<TS` root element that carries an attribute
-/// (`<TS version="2.1" ...>`). Both encodings share that one rule
-/// ([`is_catalog_start`]): a UTF-16 file is decoded to ASCII bytes first, and
-/// only as far as the rule needs, never the whole file.
+/// After the mark and whitespace, leading XML comments and a DOCTYPE are
+/// skipped before checking for an XML declaration (`<?xml`, which no
+/// TypeScript statement or expression can start with) or a `<TS` root element
+/// that carries an attribute (`<TS version="2.1" ...>`). Both encodings share
+/// that one rule ([`is_catalog_start`]): a UTF-16 file is decoded to
+/// ASCII-compatible bytes first, and only as far as the rule needs, never the
+/// whole file.
 fn qt_linguist(content: &[u8]) -> Option<NonSource> {
     let catalog = if let Some(units) = content.strip_prefix(b"\xFF\xFE") {
         is_catalog_start(&utf16_ascii_prefix(units, u16::from_le_bytes))
@@ -445,7 +446,24 @@ fn utf16_ascii_prefix(units: &[u8], decode: fn([u8; 2]) -> u16) -> Vec<u8> {
 /// valid TypeScript (a type assertion and a generic arrow function), so the
 /// element must be followed by `name=`.
 fn is_catalog_start(text: &[u8]) -> bool {
-    let text = text.trim_ascii_start();
+    let mut text = text.trim_ascii_start();
+    loop {
+        if let Some(after_comment) = text.strip_prefix(b"<!--") {
+            let Some(comment_end) = after_comment.windows(3).position(|window| window == b"-->")
+            else {
+                return false;
+            };
+            text = &after_comment[comment_end + 3..];
+        } else if text.starts_with(b"<!DOCTYPE") {
+            let Some(after_doctype) = skip_doctype(text) else {
+                return false;
+            };
+            text = after_doctype;
+        } else {
+            break;
+        }
+        text = text.trim_ascii_start();
+    }
     if text.starts_with(b"<?xml") {
         return true;
     }
@@ -463,6 +481,32 @@ fn is_catalog_start(text: &[u8]) -> bool {
         })
         .count();
     name_len > 0 && attributes[name_len..].trim_ascii_start().first() == Some(&b'=')
+}
+
+fn skip_doctype(text: &[u8]) -> Option<&[u8]> {
+    let after_keyword = text.strip_prefix(b"<!DOCTYPE")?;
+    if !after_keyword.first().is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut subset_depth = 0_usize;
+    for (index, &byte) in after_keyword.iter().enumerate() {
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => subset_depth += 1,
+            b']' => subset_depth = subset_depth.saturating_sub(1),
+            b'>' if subset_depth == 0 => return Some(&after_keyword[index + 1..]),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub const ADAPTERS: &[LanguageAdapter] = &[
