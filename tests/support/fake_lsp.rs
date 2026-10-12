@@ -117,6 +117,12 @@ pub struct FakeLspConfig {
     /// scenario (`--ready-notification`), the way `Initialized` always does:
     /// for an adapter whose readiness predicate matches it.
     pub ready_notification: bool,
+    /// After `initialized`, sends two requests whose ids are strings
+    /// (`--string-id-server-requests`): `custom/ready` with the id `ready-1`
+    /// and `workspace/configuration` (two items) with the id `cfg-1`. Each
+    /// answer the client gives is appended to `server_request_replies.txt` in
+    /// the state directory as `<id> <result>`.
+    pub string_id_server_requests: bool,
 }
 
 /// An error response the fake sends instead of an answer: `code` and
@@ -246,6 +252,7 @@ pub fn run_from_env() -> io::Result<()> {
         never_read_stdin: cli.iter().any(|arg| arg == "--never-read-stdin"),
         spawn_grandchild: cli.iter().any(|arg| arg == "--spawn-grandchild"),
         ready_notification: cli.iter().any(|arg| arg == "--ready-notification"),
+        string_id_server_requests: cli.iter().any(|arg| arg == "--string-id-server-requests"),
     };
     run_server(config)
 }
@@ -390,6 +397,23 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         let method = request.get("method").and_then(serde_json::Value::as_str);
         let id = request.get("id").and_then(serde_json::Value::as_u64);
 
+        // The client's answer to a request this server sent
+        // (`--string-id-server-requests`): keep its id and result for the test
+        // and do not take it for a request.
+        if method.is_none()
+            && let Some(reply_id) = request.get("id").filter(|id| id.is_string())
+        {
+            if let Some(path) = &config.state_dir
+                && let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.join("server_request_replies.txt"))
+            {
+                let _ = file.write_all(format!("{reply_id} {}\n", request["result"]).as_bytes());
+            }
+            continue;
+        }
+
         // Capture the workspace root URI from the initialize request so that
         // scenario responses can reference files inside the actual workspace.
         // `locations_for` drops results whose URI is outside the workspace, so
@@ -445,6 +469,16 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 write_message(
                     &mut stdout,
                     &json_notification("custom/ready", json!({"ready": true})),
+                )?;
+            }
+            if config.string_id_server_requests {
+                write_message(
+                    &mut stdout,
+                    &json!({"jsonrpc": "2.0", "id": "ready-1", "method": "custom/ready", "params": {"ready": true}}),
+                )?;
+                write_message(
+                    &mut stdout,
+                    &json!({"jsonrpc": "2.0", "id": "cfg-1", "method": "workspace/configuration", "params": {"items": [{}, {}]}}),
                 )?;
             }
             // Alive but deaf: nothing more is read from the input, so the

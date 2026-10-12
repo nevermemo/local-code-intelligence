@@ -290,6 +290,8 @@ pub struct Config {
     pub watch_poll_milliseconds: u64,
     pub watch_debounce_milliseconds: u64,
     pub rust_analyzer_path: String,
+    /// Seconds one request to a language server may go without any sign of
+    /// life from it before it fails (1..=86400).
     pub lsp_timeout_seconds: u64,
     pub lsp_candidate_count: usize,
     /// Most milliseconds one search waits for the language-server channel.
@@ -657,6 +659,10 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The longest `lsp_timeout_seconds` accepted: one day. The value is added
+    /// to the clock for every request, and an absurd one (`u64::MAX`) cannot be.
+    pub const MAX_LSP_TIMEOUT_SECONDS: u64 = 86_400;
+
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let config: Self = match path {
             Some(p) => toml::from_str(&std::fs::read_to_string(p).context("read configuration")?)?,
@@ -714,6 +720,12 @@ impl Config {
         ensure!(
             !self.rust_analyzer_path.trim().is_empty() && self.lsp_timeout_seconds > 0,
             "rust-analyzer path must be nonempty and LSP timeout must be positive"
+        );
+        ensure!(
+            self.lsp_timeout_seconds <= Self::MAX_LSP_TIMEOUT_SECONDS,
+            "lsp_timeout_seconds must be 1..={} (got {})",
+            Self::MAX_LSP_TIMEOUT_SECONDS,
+            self.lsp_timeout_seconds
         );
         ensure!(
             (100..=60_000).contains(&self.lsp_search_budget_ms),
@@ -1001,6 +1013,19 @@ mod tests {
         assert_eq!(config.lsp_timeout_seconds, 60);
         assert_eq!(config.lsp_candidate_count, 40);
         assert!(!config.csharp.enabled());
+    }
+
+    #[test]
+    fn an_lsp_timeout_that_cannot_be_added_to_the_clock_is_rejected() {
+        for seconds in [Config::MAX_LSP_TIMEOUT_SECONDS + 1, u64::MAX] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_timeout_seconds = seconds;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("lsp_timeout_seconds"), "{error}");
+        }
+        let mut config: Config = toml::from_str(&base_toml()).unwrap();
+        config.lsp_timeout_seconds = Config::MAX_LSP_TIMEOUT_SECONDS;
+        config.validate().unwrap();
     }
 
     #[test]

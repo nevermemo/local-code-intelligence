@@ -67,6 +67,8 @@ rrf_k = 60.0
 watch_poll_milliseconds = 2000
 watch_debounce_milliseconds = 750
 rust_analyzer_path = "rust-analyzer"
+# Seconds a request to a language server may go without any sign of life from
+# it (1-86400).
 lsp_timeout_seconds = 60
 lsp_candidate_count = 40
 # Most milliseconds one search waits for the language-server channel

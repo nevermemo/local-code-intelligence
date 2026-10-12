@@ -935,6 +935,16 @@ async fn fake_client(
     extra: &[&str],
     timeout: Duration,
 ) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
+    fake_client_with(temp, extra, timeout, Box::new(|_| false)).await
+}
+
+/// [`fake_client`] with a readiness predicate.
+async fn fake_client_with(
+    temp: &tempfile::TempDir,
+    extra: &[&str],
+    timeout: Duration,
+    ready: Box<dyn Fn(&serde_json::Value) -> bool + Send>,
+) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
     let state = temp.path().join("state");
     let mut args = fake_args(&["--mode", "workspace-symbols", "--state"]);
     args.push(state.to_string_lossy().into_owned());
@@ -946,9 +956,7 @@ async fn fake_client(
         timeout,
         label: "fake".to_owned(),
     };
-    let client = JsonRpcClient::spawn(&transport, Box::new(|_| false))
-        .await
-        .unwrap();
+    let client = JsonRpcClient::spawn(&transport, ready).await.unwrap();
     client
         .request(
             "initialize",
@@ -1048,6 +1056,55 @@ async fn a_server_that_announces_a_huge_frame_is_replaced_once() {
             "request {at_request}: one restart"
         );
     }
+}
+
+/// A request that the server makes with a string for an id (JSON-RPC allows
+/// one) is a request, not a notification: it is answered with the same id, and
+/// a `custom/ready` that arrives as a request does not make the client ready
+/// (the predicate is for notifications).
+#[tokio::test]
+async fn a_server_request_with_a_string_id_is_answered_with_that_id_and_is_not_a_notification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, state) = fake_client_with(
+        &temp,
+        &["--string-id-server-requests"],
+        Duration::from_secs(30),
+        Box::new(|message| message["method"] == "custom/ready"),
+    )
+    .await;
+    let replies = state.join("server_request_replies.txt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let text = std::fs::read_to_string(&replies).unwrap_or_default();
+        if text.lines().count() >= 2 || std::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [r#""ready-1" null"#, r#""cfg-1" [null,null]"#],
+        "the client's answers, with the ids as the server wrote them"
+    );
+    assert!(
+        !client.is_ready(),
+        "a request is not the ready notification"
+    );
+    client.shutdown(Duration::from_secs(1)).await;
+}
+
+/// A timeout too long to add to the clock (`Duration::MAX`) is a request that
+/// is never given up on for inactivity, not a panic of the calling task.
+#[tokio::test]
+async fn a_transport_timeout_too_long_for_the_clock_does_not_panic_a_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _state) = fake_client(&temp, &[], Duration::MAX).await;
+    let answer = client
+        .request("workspace/symbol", json!({"query": "x"}))
+        .await
+        .unwrap();
+    assert!(answer.is_array(), "{answer}");
+    client.shutdown(Duration::from_secs(1)).await;
 }
 
 /// A server that is alive but has stopped reading its input: a request big

@@ -34,6 +34,11 @@ const KILL_REAP_BOUND: Duration = Duration::from_millis(500);
 /// failed.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// The longest the deadline of one request is put after its last sign of life,
+/// whatever the timeout says: a year cannot overflow the clock, and no
+/// configured timeout comes near it (`Config::MAX_LSP_TIMEOUT_SECONDS`).
+const LONGEST_WAIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Longest header line the reader accepts, terminator included. Real headers
 /// are `Content-Length: N` and `Content-Type: ...`.
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
@@ -332,7 +337,9 @@ impl JsonRpcClient {
         tokio::pin!(receiver);
         let outcome = loop {
             let last_activity = *self.last_activity.lock().unwrap();
-            let deadline = last_activity.max(started) + self.timeout;
+            // At most `LONGEST_WAIT` on: a timeout too long for the clock
+            // (`Duration::MAX`) must not make the sum panic.
+            let deadline = last_activity.max(started) + self.timeout.min(LONGEST_WAIT);
             let now = Instant::now();
             if now >= deadline {
                 self.pending.lock().await.remove(&id);
@@ -581,7 +588,13 @@ async fn read_messages(
         // server-initiated request -- is evidence the server is alive and
         // doing something, which is what `request`'s idle timeout keys off.
         *last_activity.lock().unwrap() = Instant::now();
-        let id = message.get("id").and_then(Value::as_u64);
+        // JSON-RPC allows a number or a string as an id. A response to one of
+        // our requests always has a number (ours); a server's own request may
+        // have either, and its id is echoed as it came.
+        let request_id = message
+            .get("id")
+            .filter(|id| id.is_number() || id.is_string());
+        let id = request_id.and_then(Value::as_u64);
         let method = message.get("method").and_then(Value::as_str);
         // A message with both an id and a method is a request FROM the
         // server (e.g. pyright's `workspace/configuration`, or
@@ -592,7 +605,7 @@ async fn read_messages(
         // with the conservative "no special configuration/capability"
         // shape each known method expects; anything unrecognized gets a
         // bare null result, which every server observed so far accepts.
-        if let (Some(id), Some(method)) = (id, method) {
+        if let (Some(request_id), Some(method)) = (request_id, method) {
             let result = match method {
                 "workspace/configuration" => {
                     let count = message["params"]["items"].as_array().map_or(1, Vec::len);
@@ -600,17 +613,17 @@ async fn read_messages(
                 }
                 _ => Value::Null,
             };
-            let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+            let response = json!({"jsonrpc": "2.0", "id": request_id, "result": result});
             if let Err(error) = writer.write_framed(&response).await {
                 tracing::warn!(error = %error, %method, "failed to answer server-initiated request");
             }
             continue;
         }
-        if id.is_none() && method == Some("$/progress") {
+        if request_id.is_none() && method == Some("$/progress") {
             progress.fetch_add(1, Ordering::Relaxed);
         }
         // Notifications (no id): evaluate readiness predicate.
-        if id.is_none() && ready_predicate(&message) {
+        if request_id.is_none() && ready_predicate(&message) {
             is_ready.store(true, Ordering::Release);
             ready.notify_waiters();
             ready.notify_one();

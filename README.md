@@ -133,7 +133,7 @@ Before the first build, the defaults below are what `lci config --json` would re
 | `[clangd].path` | unset (disabled) |
 | `[clangd].args` | `[]` (clangd needs no forced leading flag, like gopls; e.g. `--compile-commands-dir=...` for a workspace with a real build system) |
 | `[clangd].disabled` | `false` |
-| `lsp_timeout_seconds` | 60 |
+| `lsp_timeout_seconds` | 60 (allowed: 1–86400; the longest a request to a language server may go without a sign of life from it) |
 | `lsp_candidate_count` | 40 |
 | `lsp_search_budget_ms` | 1500 (allowed: 100–60000; the most one search waits for the language-server channel, see below) |
 | `lsp_idle_timeout_seconds` | 1800 (a language server unused this long is shut down; `0` keeps servers until the service stops; values below 60 are meant for tests; see below) |
