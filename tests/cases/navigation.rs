@@ -467,13 +467,16 @@ async fn a_server_that_keeps_answering_a_transient_error_is_answered_with_it_and
 /// down, and the next call starts a fresh one, whose span starts over.
 ///
 /// The span counts every error response, each repeat's too: one failed call
-/// is three answers over about 2 s (the repeats wait 0.5 s and 1.5 s), so a
-/// limit of 4 s is reached during the second call, not the first.
+/// is three answers over about 2 s (the repeats wait 0.5 s and 1.5 s, and a
+/// repeat may start at most 5 s after the call's first answer, however late the
+/// timers run), so a limit of 6 s cannot be reached during the first call, and
+/// is reached by the first answer of the second call after a pause of 4.1 s
+/// (2 s + 4.1 s at the least).
 #[tokio::test]
 async fn a_server_that_answers_only_transient_errors_for_the_stuck_span_is_replaced() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
-    config.lsp_stuck_seconds = 4;
+    config.lsp_stuck_seconds = 6;
     config
         .csharp
         .args
@@ -493,9 +496,10 @@ async fn a_server_that_answers_only_transient_errors_for_the_stuck_span_is_repla
     assert!(manager.running("csharp-ls", &workspace.id).await);
     assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
 
-    // The second call's answers end about 5 s after the first call's first:
-    // the caller still gets the server's error, and the session is discarded.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The second call's first answer comes at least 6.1 s after the first
+    // call's first: the caller still gets the server's error, and the session is
+    // discarded.
+    tokio::time::sleep(Duration::from_millis(4100)).await;
     let error = manager
         .symbols(&adapter, &workspace, "Calculator")
         .await
@@ -529,6 +533,48 @@ async fn a_server_that_answers_only_transient_errors_for_the_stuck_span_is_repla
     assert_eq!(state_count(&state, "spawn_count.txt"), 2);
     assert!(manager.running("csharp-ls", &workspace.id).await);
     assert_eq!(event_count(&state, "shutdown_seen.txt"), 1);
+}
+
+/// A server that crosses the stuck span and then answers with a result is not
+/// wedged: the result takes the mark back, and its session is kept (one spawn,
+/// no shutdown) instead of being discarded with the load the server has just
+/// finished. The first call's three errors start the span; the second call's
+/// first answer (at least 6.1 s after the first call's first, over the 6 s
+/// limit) marks the session, and its repeat (the 6th `workspace/symbol`, the
+/// priming request counted) is a result.
+#[tokio::test]
+async fn a_server_that_answers_with_a_result_after_the_stuck_span_keeps_its_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
+    config.lsp_stuck_seconds = 6;
+    config.csharp.args.extend(fake_args(&[
+        "--symbol-error",
+        "-32801:content modified",
+        "--symbol-ok-at",
+        "6",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+
+    let error = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RpcError>().map(|e| e.code),
+        Some(-32801)
+    );
+    tokio::time::sleep(Duration::from_millis(4100)).await;
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    // initialize, initialized, priming, three answers, then an error and a result.
+    assert_eq!(state_count(&state, "request_count.txt"), 8);
+    assert!(manager.running("csharp-ls", &workspace.id).await);
+    assert_eq!(event_count(&state, "shutdown_seen.txt"), 0);
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
 }
 
 /// A call that is cancelled before its repeats end (a search past its latency

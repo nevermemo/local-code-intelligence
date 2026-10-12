@@ -276,12 +276,15 @@ struct Session {
     /// is marked [`Session::stuck`]. `None` never marks it.
     stuck_after: Option<Duration>,
     /// Set once the server has answered nothing but transient errors for
-    /// `stuck_after`. A stuck session is replaced by the next caller that asks
-    /// for its key ([`Manager::session`]), or at once by the call that
-    /// noticed ([`Manager::send`]). A flag and not a discard made on the spot,
-    /// because a request is cancelled as often as it finishes (a search past its
-    /// latency budget drops the call before the repeats end), and a cancelled
-    /// call must still count.
+    /// `stuck_after`, and taken back by the next answer that is a result or an
+    /// error that is not transient (a server that answers is not wedged, and
+    /// replacing it would throw away the load it has just finished). A stuck
+    /// session is replaced by the next caller that asks for its key
+    /// ([`Manager::session`]), or at once by the call that noticed
+    /// ([`Manager::send`]). A flag and not a discard made on the spot, because a
+    /// request is cancelled as often as it finishes (a search past its latency
+    /// budget drops the call before the repeats end), and a cancelled call must
+    /// still count.
     stuck: AtomicBool,
 }
 
@@ -376,14 +379,14 @@ impl Session {
         result: &Result<Value>,
     ) {
         let response = match result {
-            Ok(_) => return self.streak.lock().unwrap().answered(),
+            Ok(_) => return self.answered(),
             Err(error) => match error.downcast_ref::<RpcError>() {
                 Some(response) => response,
                 None => return,
             },
         };
         if !is_transient(adapter, response, client.rpc.is_ready()) {
-            return self.streak.lock().unwrap().answered();
+            return self.answered();
         }
         let Some(limit) = self.stuck_after else {
             return;
@@ -408,8 +411,15 @@ impl Session {
         }
     }
 
+    /// The server gave a result or an error that is not transient: the span
+    /// ends, and a stuck mark that the span had set is taken back.
+    fn answered(&self) {
+        self.streak.lock().unwrap().answered();
+        self.stuck.store(false, Ordering::Relaxed);
+    }
+
     /// Whether the server has answered nothing but transient errors for
-    /// `lsp_stuck_seconds`.
+    /// `lsp_stuck_seconds`, and has not answered anything else since.
     fn stuck(&self) -> bool {
         self.stuck.load(Ordering::Relaxed)
     }
@@ -754,7 +764,9 @@ impl Manager {
     /// waiting, discards the session like a transport failure but without a
     /// retry (it still returns the server's own error), and otherwise the next
     /// caller for the key replaces it ([`Self::session`]). Repeating on a fresh
-    /// server would only hand this caller another cold start.
+    /// server would only hand this caller another cold start. A server that
+    /// answers with a result after the span has passed is not wedged after all:
+    /// the result takes the mark back and the session is kept.
     async fn send(
         &self,
         adapter: &Arc<dyn LspAdapter>,
