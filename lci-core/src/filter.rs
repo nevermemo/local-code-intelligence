@@ -12,4 +12,6 @@ pub use request::{
 pub use source_role::{SourceRole, SourceRoleError, classify_source_role};
 
 #[cfg(test)]
+mod properties;
+#[cfg(test)]
 mod tests;
