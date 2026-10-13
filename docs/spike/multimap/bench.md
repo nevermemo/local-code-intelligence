@@ -44,10 +44,30 @@ cloud runner and CI do not have. v1 therefore measures:
   in the `fusion` arm; over the top 5 *distinct files*, precision@5 = share of them in
   which the fix changed that symbol, recall@5 = share of gold symbols with such a file in
   the top 5.
-- `defs` and `navigation`: recorded as `unavailable` with the reason (the results'
-  `unavailable` block). They switch on when
-  a build exposes `sym.defs` (a CLI or REST surface) and the runner has a language server;
-  the gold for them is already in the set (section 4).
+- `defs` (added 2026-10-12 on `cloud/spike-bench-runs`, before any `defs` result
+  existed): `sym.defs` (built on `cloud/spike-s3a`) is registered for tests and the
+  contract kit only, so no frozen binary can be asked. `cargo xtask bench freeze-defs
+  --src <tree> --out <probe>` builds a small probe (`xtask/bench-defs-probe/main.rs`)
+  against the `lci-core` and `lci-maps` of the frozen commit's own tree, resolved
+  offline from a copy of that tree's `Cargo.lock` (cargo prunes the entries the probe
+  does not use, so `--locked` cannot be passed; a probe whose lock names a version
+  missing from the tree's lock is not that tree's); `bench run --defs-probe <probe>`
+  runs it once per task at the
+  base commit. The probe scans the checkout with the core scanner, builds `sym.defs`
+  from the declaration bundles (its bundle store persists across a repository's tasks,
+  so unchanged files reuse their bundles) and asks the map, through its own ranking
+  (`symdefs::answer`, up to 50 hits), for each gold symbol's bare name. Scoring is the
+  lookup proxy's: over the top 5 distinct files, `hit5` (a file whose changed
+  declaration has that name) and `precision5`. A name the probe does not answer, or a
+  task whose probe failed, is counted as an error, never as a miss. Results also carry
+  the probe's scan and build time and the reused/extracted bundle counts. This
+  measures the map's library code at the frozen commit, not a production search path
+  (no production search runs `sym.defs` at `b466f7f`). Reported only: no
+  pre-registered rule judges `defs` (section 6), so a drop is a question, not a
+  verdict.
+- `navigation`: recorded as `unavailable` with the reason (the results' `unavailable`
+  block; `defs` is listed there too when no probe was given). It switches on when the
+  runner has a language server; the gold is already in the set (section 4).
 
 Latency in B is wall clock on whatever machine ran it; it is judged only under rule 4
 (section 6).
@@ -94,7 +114,24 @@ cargo xtask bench run --bin <scratch>/lci-new  --work <scratch>/run-new  --outpu
 cargo xtask bench compare <scratch>/base.json <scratch>/new.json
 ```
 
-`freeze` writes `<out>` (the binary) and `<out>.json` (commit, dirty flag, profile).
+For level B `defs` on a tree with `sym.defs` (2.1), freeze the probe from the same
+checkout and pass it to that build's run:
+
+```bash
+cargo xtask bench freeze-defs --src <checkout of new-commit> --out <scratch>/defs-new
+cargo xtask bench run --bin <scratch>/lci-new --defs-probe <scratch>/defs-new ...
+```
+
+`freeze` writes `<out>` (the binary) and `<out>.json` (commit, dirty flag, profile);
+`freeze-defs` writes the same two files for the probe and leaves its package (manifest,
+lock, and `target/` unless `CARGO_TARGET_DIR` is set) in `<out>.src/`.
+
+A commit without `bench freeze` (a spike head) is frozen by hand the same way: in its own
+worktree, `cargo build --locked --bin local-code-intelligence`, copy the binary, write
+the same sidecar. Never point two worktrees at one `CARGO_TARGET_DIR` without first
+touching every file of the second: cargo keys a workspace crate on its relative path and
+file times, so it can reuse the first tree's build for the second (seen 2026-10-13,
+caught by comparing the binaries' hashes).
 Each run has its own work directory: one checkout per repository (a `git worktree` of a
 cached clone) and, as its sibling and never inside it, one data directory per
 repository. Freshness is `manual`, so no search refreshes an index; the runner calls
@@ -219,8 +256,9 @@ gating workflow) needs a new approval.
 - **D1:** the workflow reports a regression verdict but does not fail the job. Flip by
   adding `--fail-on-regression` to its `bench run` step once the owner wants the
   schedule to gate.
-- **D2:** level B `defs` and `navigation` stay `unavailable` until a build exposes
-  `sym.defs` and the runner has language servers (section 2.1).
+- **D2:** level B `navigation` stays `unavailable` until the runner has language
+  servers; `defs` is measured through the `sym.defs` probe (section 2.1) on builds whose
+  tree has `lci-maps/src/symdefs.rs`, and is `unavailable` on the others.
 - **D3:** level C reads `evaluate` reports, not RunRecords, until the S4 harness reaches
   this lineage (section 2.2).
 - **D4:** queries come from commit messages only, not linked issues.

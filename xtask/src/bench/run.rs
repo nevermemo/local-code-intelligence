@@ -22,6 +22,9 @@ use crate::mine::git;
 pub const RESULTS_SCHEMA: &str = "lci.bench-results/1";
 /// Results window of the task query (the `@10` metrics need 10).
 const TOP_K: usize = 10;
+/// Hits asked of `sym.defs` per name: enough chunks for 5 distinct files
+/// when one file declares a name several times.
+const DEFS_HITS: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
@@ -71,6 +74,8 @@ pub struct Options {
     pub tasks: Vec<String>,
     pub max_per_repo: Option<usize>,
     pub label: Option<String>,
+    /// Frozen `sym.defs` probe (`bench freeze-defs`) for level B `defs`.
+    pub defs_probe: Option<PathBuf>,
 }
 
 /// UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` of now (civil-from-days, no deps).
@@ -142,7 +147,7 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// TOML literal string for a path (single quotes; paths never hold one).
-fn toml_path(path: &Path) -> Result<String> {
+pub(crate) fn toml_path(path: &Path) -> Result<String> {
     let text = path.to_string_lossy().replace('\\', "/");
     ensure!(!text.contains('\''), "path {text} holds a quote");
     Ok(format!("'{text}'"))
@@ -229,6 +234,52 @@ fn index(bin: &Path, config: &Path, checkout: &Path) -> Result<Value> {
         "embedded_chunks": report["embedded_chunks"],
         "reused_chunks": report["reused_chunks"],
     }))
+}
+
+/// The `sym.defs` probe's report for `symbols` at the checkout's current
+/// commit, and its wall time.
+fn run_defs_probe(
+    probe: &Path,
+    checkout: &Path,
+    store: &Path,
+    symbols: &[(String, Vec<String>)],
+) -> Result<(Value, f64)> {
+    use std::io::Write;
+    let names: String = symbols
+        .iter()
+        .map(|(name, _)| format!("{name}\n"))
+        .collect();
+    let start = Instant::now();
+    let mut child = Command::new(probe)
+        .arg(checkout)
+        .arg(store)
+        .arg(DEFS_HITS.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running the defs probe")?;
+    child
+        .stdin
+        .take()
+        .context("defs probe stdin")?
+        .write_all(names.as_bytes())?;
+    let output = child.wait_with_output()?;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    if !output.status.success() {
+        bail!(
+            "defs probe failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+    let report = serde_json::from_slice(&output.stdout).context("reading the defs probe report")?;
+    Ok((report, ms))
 }
 
 /// Ranked evidence paths and timing per query text, from an evaluate report.
@@ -322,6 +373,63 @@ fn strings(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Level B `defs` rows for a task whose probe never answered: one error row
+/// per gold name, so a failure counts in the same unit as the scored names.
+pub fn defs_error_rows(symbols: &[(String, Vec<String>)], reason: &str) -> Vec<Value> {
+    symbols
+        .iter()
+        .map(|(name, paths)| json!({"name": name, "gold_files": paths, "error": reason}))
+        .collect()
+}
+
+/// A task's gold symbols grouped by bare name, in set order: each name with
+/// the gold files whose changed declaration it is.
+pub fn gold_symbols(task: &Value) -> Vec<(String, Vec<String>)> {
+    let mut symbols: Vec<(String, Vec<String>)> = Vec::new();
+    for symbol in task["gold_symbols"].as_array().into_iter().flatten() {
+        let name = symbol["name"].as_str().unwrap_or_default().to_owned();
+        let path = symbol["path"].as_str().unwrap_or_default().to_owned();
+        match symbols.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, paths)) => paths.push(path),
+            None => symbols.push((name, vec![path])),
+        }
+    }
+    symbols
+}
+
+/// Level B `defs` rows from a `sym.defs` probe report: per gold symbol name,
+/// the distinct files of the map's answer in rank order, scored like the
+/// lookup proxy (hit and precision over the top 5 distinct files). A name
+/// the report does not answer is an error row, never a zero.
+pub fn defs_rows(report: &Value, symbols: &[(String, Vec<String>)]) -> Vec<Value> {
+    let answers = report["answers"].as_array().map_or(&[][..], Vec::as_slice);
+    symbols
+        .iter()
+        .map(|(name, paths)| {
+            let mut row = json!({"name": name, "gold_files": paths});
+            match answers
+                .iter()
+                .find(|answer| answer["name"] == name.as_str())
+            {
+                Some(answer) => {
+                    let hits: Vec<String> = strings(&answer["files"])
+                        .into_iter()
+                        .filter(|path| !path.is_empty())
+                        .collect();
+                    let files = distinct_files(&hits, TOP_K);
+                    let (hit5, precision5) = score_lookup(&files, paths);
+                    row["files"] = json!(files);
+                    row["hit5"] = json!(hit5);
+                    row["precision5"] = json!(precision5);
+                    row["ms"] = answer["ms"].clone();
+                }
+                None => row["error"] = json!("name missing from the probe report"),
+            }
+            row
+        })
+        .collect()
+}
+
 /// The clone of `url` under `clones/key`, fetched with blobs on demand.
 fn ensure_clone(clones: &Path, key: &str, url: &str, snapshot: &str) -> Result<PathBuf> {
     let clone = clones.join(key);
@@ -378,6 +486,30 @@ pub async fn run(options: Options) -> Result<()> {
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .unwrap_or_else(|| json!({"commit": "unknown"}));
+    // Absolute, so a bare file name is never looked up on PATH.
+    let probe = options
+        .defs_probe
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()?;
+    let defs_probe = match &probe {
+        Some(probe) => {
+            ensure!(probe.is_file(), "no defs probe at {}", probe.display());
+            ensure!(options.level_b, "--defs-probe needs level B");
+            let sidecar = std::fs::read_to_string(probe.with_extension("json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .unwrap_or_else(|| json!({"commit": "unknown"}));
+            if sidecar["commit"] != build["commit"] {
+                eprintln!(
+                    "warning: the defs probe ({}) and the binary ({}) are not frozen from one commit",
+                    sidecar["commit"], build["commit"]
+                );
+            }
+            sidecar
+        }
+        None => Value::Null,
+    };
     let work = std::path::absolute(&options.work)?;
     // The runner deletes checkouts and data directories under the work
     // directory: only in one it created (marker file) or an empty one.
@@ -448,6 +580,7 @@ pub async fn run(options: Options) -> Result<()> {
         }
         let _ = git(&clone, &["worktree", "prune"]);
         let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(root.join("defs-store"));
         std::fs::create_dir_all(&root)?;
         let first_base = tasks[0]["base_commit"].as_str().context("base commit")?;
         git(
@@ -481,7 +614,18 @@ pub async fn run(options: Options) -> Result<()> {
             let refresh = match index(&bin, index_config, &worktree) {
                 Ok(report) => report,
                 Err(error) => {
-                    tasks_out.push(json!({"id": id, "repo": key, "tags": task["tags"], "error": format!("{error:#}")}));
+                    let error = format!("{error:#}");
+                    let mut row =
+                        json!({"id": id, "repo": key, "tags": task["tags"], "error": error});
+                    // Every gold name the probe would have answered stays
+                    // counted, as an error.
+                    if options.defs_probe.is_some() && options.level_b {
+                        row["defs"] = json!(defs_error_rows(
+                            &gold_symbols(task),
+                            &format!("index failed: {error}")
+                        ));
+                    }
+                    tasks_out.push(row);
                     continue;
                 }
             };
@@ -504,14 +648,7 @@ pub async fn run(options: Options) -> Result<()> {
                 }];
                 let mut symbols: Vec<(String, Vec<String>)> = Vec::new();
                 if options.level_b && *arm == Arm::Fusion {
-                    for symbol in task["gold_symbols"].as_array().into_iter().flatten() {
-                        let name = symbol["name"].as_str().unwrap_or_default().to_owned();
-                        let path = symbol["path"].as_str().unwrap_or_default().to_owned();
-                        match symbols.iter_mut().find(|(n, _)| *n == name) {
-                            Some((_, paths)) => paths.push(path),
-                            None => symbols.push((name, vec![path])),
-                        }
-                    }
+                    symbols = gold_symbols(task);
                     // A symbol named exactly like the task query would pair
                     // with the wrong row; skip it.
                     symbols.retain(|(name, _)| *name != queries[0].text);
@@ -563,6 +700,39 @@ pub async fn run(options: Options) -> Result<()> {
                 }
             }
 
+            // `sym.defs` at the base commit, through the probe frozen from
+            // the same tree (level B `defs`); its bundle store persists
+            // across the repository's tasks, as a map's data would.
+            let (defs, defs_build) = match (&probe, options.level_b) {
+                (Some(probe), true) => {
+                    let symbols = gold_symbols(task);
+                    match run_defs_probe(probe, &worktree, &root.join("defs-store"), &symbols) {
+                        Ok((report, ms)) => (
+                            json!(defs_rows(&report, &symbols)),
+                            json!({
+                                "ms": ms,
+                                "files": report["files"],
+                                "chunks": report["chunks"],
+                                "declarations": report["declarations"],
+                                "scan_ms": report["scan_ms"],
+                                "build_ms": report["build_ms"],
+                                "reused": report["reused"],
+                                "extracted": report["extracted"],
+                            }),
+                        ),
+                        Err(error) => {
+                            let error = format!("{error:#}");
+                            (
+                                // `run_defs_probe` already names the probe.
+                                json!(defs_error_rows(&symbols, &error)),
+                                json!({"error": error}),
+                            )
+                        }
+                    }
+                }
+                _ => (Value::Null, Value::Null),
+            };
+
             let update = if options.level_b {
                 checkout(&worktree, fix)?;
                 match index(&bin, index_config, &worktree) {
@@ -583,6 +753,8 @@ pub async fn run(options: Options) -> Result<()> {
                 "tags": task["tags"],
                 "arms": arms,
                 "lookup": if options.level_b { json!(lookup) } else { Value::Null },
+                "defs": defs,
+                "defs_build": defs_build,
                 "refresh": refresh,
                 "update": update,
             }));
@@ -598,6 +770,17 @@ pub async fn run(options: Options) -> Result<()> {
         );
     }
 
+    let mut unavailable = serde_json::Map::new();
+    if options.defs_probe.is_none() {
+        unavailable.insert(
+            "defs".to_owned(),
+            json!("no sym.defs probe was given (bench.md 2.1, D2)"),
+        );
+    }
+    unavailable.insert(
+        "navigation".to_owned(),
+        json!("the runner has no language servers (bench.md 2.1, D2)"),
+    );
     let levels: Vec<&str> = [("B", options.level_b), ("C", options.level_c)]
         .iter()
         .filter(|(_, on)| *on)
@@ -612,10 +795,8 @@ pub async fn run(options: Options) -> Result<()> {
         "machine": machine(),
         "embedder": embedder,
         "levels": levels,
-        "unavailable": {
-            "defs": "no build on this lineage exposes sym.defs (bench.md 2.1, D2)",
-            "navigation": "the runner has no language servers (bench.md 2.1, D2)",
-        },
+        "defs_probe": defs_probe,
+        "unavailable": unavailable,
         "arms": options.arms.iter().map(|arm| arm.name()).collect::<Vec<_>>(),
         "started_at": started_at,
         "finished_at": utc_now(),
@@ -680,6 +861,81 @@ mod tests {
         assert_eq!(rows[1].1["error"], json!("failure: search failed: boom"));
         assert!(rows[2].1["error"].as_str().unwrap().starts_with("skipped"));
         assert!(parse_report(&json!({})).is_err());
+    }
+
+    #[test]
+    fn gold_symbols_group_paths_by_name_in_set_order() {
+        let task = json!({"gold_symbols": [
+            {"name": "poll", "path": "a.rs"},
+            {"name": "Inner", "path": "a.rs"},
+            {"name": "poll", "path": "b.rs"},
+        ]});
+        assert_eq!(
+            gold_symbols(&task),
+            vec![
+                (
+                    "poll".to_owned(),
+                    vec!["a.rs".to_owned(), "b.rs".to_owned()]
+                ),
+                ("Inner".to_owned(), vec!["a.rs".to_owned()]),
+            ]
+        );
+        assert!(gold_symbols(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn defs_rows_score_the_maps_distinct_files_against_the_gold() {
+        let report = json!({"answers": [
+            // Two chunks of one file count once; the unknown chunk ("")
+            // is not a file.
+            {"name": "poll", "files": ["x.rs", "x.rs", "", "a.rs", "y.rs"], "ms": 0.5},
+            {"name": "Inner", "files": ["p.rs", "q.rs", "r.rs", "s.rs", "t.rs", "a.rs"], "ms": 0.1},
+            {"name": "absent", "files": [], "ms": 0.1},
+        ]});
+        let symbols = vec![
+            ("poll".to_owned(), vec!["a.rs".to_owned()]),
+            ("Inner".to_owned(), vec!["a.rs".to_owned()]),
+            ("absent".to_owned(), vec!["a.rs".to_owned()]),
+            ("unanswered".to_owned(), vec!["a.rs".to_owned()]),
+        ];
+        let rows = defs_rows(&report, &symbols);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["files"], json!(["x.rs", "a.rs", "y.rs"]));
+        assert_eq!(rows[0]["hit5"], json!(true));
+        assert!((rows[0]["precision5"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-12);
+        // The gold file sixth among distinct files is outside the top 5.
+        assert_eq!(rows[1]["hit5"], json!(false));
+        assert_eq!(rows[1]["precision5"], json!(0.0));
+        // An empty answer is scored (a miss); a missing one is an error.
+        assert_eq!(
+            (rows[2]["hit5"].clone(), rows[2].get("error")),
+            (json!(false), None)
+        );
+        assert!(rows[3]["error"].is_string());
+        assert!(rows[3].get("hit5").is_none());
+        for (row, (name, gold)) in rows.iter().zip(&symbols) {
+            assert_eq!(row["name"], json!(name));
+            assert_eq!(row["gold_files"], json!(gold));
+        }
+    }
+
+    #[test]
+    fn a_task_the_probe_never_answered_has_one_error_row_per_gold_name() {
+        let symbols = vec![
+            (
+                "poll".to_owned(),
+                vec!["a.rs".to_owned(), "b.rs".to_owned()],
+            ),
+            ("Inner".to_owned(), vec!["a.rs".to_owned()]),
+        ];
+        let rows = defs_error_rows(&symbols, "defs probe failed: boom");
+        assert_eq!(rows.len(), 2);
+        for (row, (name, gold)) in rows.iter().zip(&symbols) {
+            assert_eq!(row["name"], json!(name));
+            assert_eq!(row["gold_files"], json!(gold));
+            assert_eq!(row["error"], json!("defs probe failed: boom"));
+            assert!(row.get("hit5").is_none() && row.get("precision5").is_none());
+        }
     }
 
     #[test]

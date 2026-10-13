@@ -49,6 +49,17 @@ pub enum BenchCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Build the `sym.defs` probe (`xtask/bench-defs-probe`) against the
+    /// `lci-core` and `lci-maps` of the source tree `--src` (a checkout of
+    /// the commit being benched) and copy it to `--out`, with `<out>.json`
+    /// recording the tree's commit. No build exposes `sym.defs` through a
+    /// CLI, so level B `defs` measures the map through this probe.
+    FreezeDefs {
+        #[arg(long)]
+        src: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run levels B and C for one frozen build against a bench set and
     /// write a results JSON. With --baseline also print (and with --table
     /// write) the comparison against an earlier results file.
@@ -115,6 +126,10 @@ pub struct RunArgs {
     /// Free-text label stored in the results.
     #[arg(long)]
     pub label: Option<String>,
+    /// Frozen `sym.defs` probe (`bench freeze-defs`), frozen from the same
+    /// commit as --bin: level B then scores `defs`.
+    #[arg(long)]
+    pub defs_probe: Option<PathBuf>,
     /// Earlier results file to compare against.
     #[arg(long)]
     pub baseline: Option<PathBuf>,
@@ -166,6 +181,80 @@ fn freeze(out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Source of the `sym.defs` probe, built outside the workspace.
+const DEFS_PROBE_SOURCE: &str = include_str!("../../bench-defs-probe/main.rs");
+/// Name of the probe's package and binary.
+const DEFS_PROBE: &str = "bench-defs-probe";
+
+/// Manifest of the probe's scratch package: path dependencies on the
+/// frozen tree's crates, its own empty workspace.
+pub fn defs_probe_manifest(src: &Path) -> Result<String> {
+    Ok(format!(
+        "[package]\nname = \"{DEFS_PROBE}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [[bin]]\nname = \"{DEFS_PROBE}\"\npath = \"src/main.rs\"\n\n\
+         [dependencies]\nlci-core = {{ path = {} }}\nlci-maps = {{ path = {} }}\nserde_json = \"1\"\n\n\
+         [workspace]\n",
+        run::toml_path(&src.join("lci-core"))?,
+        run::toml_path(&src.join("lci-maps"))?,
+    ))
+}
+
+fn freeze_defs(src: &Path, out: &Path) -> Result<()> {
+    let src = std::path::absolute(src)?;
+    let out = std::path::absolute(out)?;
+    if !src.join("lci-maps/src/symdefs.rs").is_file() {
+        bail!(
+            "{} has no sym.defs (lci-maps/src/symdefs.rs)",
+            src.display()
+        );
+    }
+    // The package lives beside the output, never inside the frozen tree.
+    let package = out.with_extension("src");
+    std::fs::create_dir_all(package.join("src"))?;
+    std::fs::write(package.join("Cargo.toml"), defs_probe_manifest(&src)?)?;
+    std::fs::write(package.join("src/main.rs"), DEFS_PROBE_SOURCE)?;
+    // The tree's lock pins every shared dependency to the frozen versions.
+    std::fs::copy(src.join("Cargo.lock"), package.join("Cargo.lock"))
+        .context("copying the tree's Cargo.lock")?;
+    // Absolute, so cargo (run in the package) and the copy below agree.
+    let target = std::path::absolute(
+        std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| package.join("target")),
+    )?;
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(&package)
+        .args(["build", "--offline", "--bin", DEFS_PROBE])
+        .env("CARGO_TARGET_DIR", &target);
+    use_local_protoc(&mut build);
+    let status = build.status().context("running cargo build")?;
+    anyhow::ensure!(
+        status.success(),
+        "cargo build of the defs probe failed: {status}"
+    );
+    let built = target
+        .join("debug")
+        .join(format!("{DEFS_PROBE}{}", std::env::consts::EXE_SUFFIX));
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&built, &out)
+        .with_context(|| format!("copying {} to {}", built.display(), out.display()))?;
+    let commit = git(&src, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let dirty = !git(&src, &["status", "--porcelain", "--untracked-files=no"])?
+        .trim()
+        .is_empty();
+    let sidecar = json!({"commit": commit, "dirty": dirty, "profile": "debug", "kind": DEFS_PROBE});
+    std::fs::write(out.with_extension("json"), format!("{sidecar:#}\n"))?;
+    eprintln!(
+        "froze the defs probe of {commit}{} to {}",
+        if dirty { " (dirty)" } else { "" },
+        out.display()
+    );
+    Ok(())
+}
+
 fn print_comparison(
     base: &Path,
     new: &Path,
@@ -202,6 +291,7 @@ fn split_pair(text: &str, what: &str) -> Result<(String, String)> {
 pub async fn run(command: BenchCommand) -> Result<()> {
     match command {
         BenchCommand::Freeze { out } => freeze(&out),
+        BenchCommand::FreezeDefs { src, out } => freeze_defs(&src, &out),
         BenchCommand::Run(args) => {
             let RunArgs {
                 bin,
@@ -217,6 +307,7 @@ pub async fn run(command: BenchCommand) -> Result<()> {
                 tasks,
                 max_per_repo,
                 label,
+                defs_probe,
                 baseline,
                 table,
                 fail_on_regression,
@@ -250,6 +341,7 @@ pub async fn run(command: BenchCommand) -> Result<()> {
                 tasks,
                 max_per_repo,
                 label,
+                defs_probe,
             })
             .await?;
             if let Some(baseline) = baseline {
@@ -313,5 +405,31 @@ pub async fn run(command: BenchCommand) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             mine::run(sources, max, &version, &out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_defs_probe_package_depends_only_on_the_frozen_trees_crates() {
+        let manifest = defs_probe_manifest(Path::new("/frozen/tree")).unwrap();
+        let parsed: toml::Value = toml::from_str(&manifest).unwrap();
+        let dependencies = parsed["dependencies"].as_table().unwrap();
+        assert_eq!(
+            dependencies["lci-core"]["path"].as_str(),
+            Some("/frozen/tree/lci-core")
+        );
+        assert_eq!(
+            dependencies["lci-maps"]["path"].as_str(),
+            Some("/frozen/tree/lci-maps")
+        );
+        assert_eq!(dependencies.len(), 3, "{manifest}");
+        // Its own workspace, so cargo never joins it to another one.
+        assert!(parsed["workspace"].as_table().unwrap().is_empty());
+        assert_eq!(parsed["bin"][0]["name"].as_str(), Some(DEFS_PROBE));
+        // The probe answers through the map's own ranking.
+        assert!(DEFS_PROBE_SOURCE.contains("symdefs::{SymDefs, answer}"));
     }
 }
