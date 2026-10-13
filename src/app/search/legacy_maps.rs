@@ -506,13 +506,10 @@ pub(crate) fn legacy_registry<'a>(
         (lsp, weights.lsp_weight, config.lsp_candidate_count),
         (prior, 1.0, usize::MAX),
     ] {
-        // Contract C5: every answer is checked against the map's labels.
+        // Contract C5: `Registry::run` checks every answer against the
+        // map's labels (merge condition M6), so no wrapper is needed.
         registry
-            .register(
-                Box::new(lci_maps::labels::Labelled::new(map)),
-                weight,
-                limit,
-            )
+            .register(map, weight, limit)
             .expect("the legacy maps have distinct ids and no filter");
     }
     assert!(registry.set_enabled(SEMANTIC, channels.semantic));

@@ -315,7 +315,13 @@ async fn sym_defs_passes_contracts_c1_and_c6_and_fuses_in_a_registry() {
             node: node.clone(),
             rank: rank as u32 + 1,
             score: None,
-            evidence: vec![],
+            // The control shares sym.defs's card, which lists `tags`.
+            evidence: vec![Evidence {
+                via: None,
+                edge: EdgeKind::QueryMatch,
+                label: SourceLabel::Tags,
+                detail: None,
+            }],
         })
         .collect();
     let control = || -> Box<dyn Map> {

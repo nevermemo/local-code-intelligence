@@ -36,6 +36,16 @@ fn descriptor(id: MapId, contribution: Contribution) -> MapDescriptor {
     }
 }
 
+/// Evidence with the one label the test cards list (contract C5).
+fn heuristic() -> Evidence {
+    Evidence {
+        via: None,
+        edge: EdgeKind::QueryMatch,
+        label: SourceLabel::Heuristic,
+        detail: None,
+    }
+}
+
 fn hits(view: &SnapshotView<'_>, positions: &[usize], score: Option<f32>) -> Vec<MapHit> {
     positions
         .iter()
@@ -44,7 +54,7 @@ fn hits(view: &SnapshotView<'_>, positions: &[usize], score: Option<f32>) -> Vec
             node: view.ids()[position].clone(),
             rank: rank as u32 + 1,
             score,
-            evidence: vec![],
+            evidence: vec![heuristic()],
         })
         .collect()
 }
@@ -341,7 +351,7 @@ impl Map for Drifting {
             node: self.2[call % self.2.len()].clone(),
             rank: 1,
             score: None,
-            evidence: vec![],
+            evidence: vec![heuristic()],
         });
         response
     }
@@ -524,6 +534,72 @@ async fn the_injected_panic_fails_the_map_without_running_the_panic_hook() {
         0,
         "the injected panic"
     );
+}
+
+/// Contract C5 inside the registry (merge condition M6): a map registered
+/// bare, without `labels::Labelled`, whose answer carries a label its card
+/// does not list, or a hit with no evidence, is refused by `Registry::run`
+/// itself: one warning naming the map, and the control's pool alone.
+#[tokio::test]
+async fn the_registry_refuses_an_answer_off_its_card_without_a_wrapper() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let run_with = |maps: Vec<Box<dyn Map + 'static>>| {
+        let view = &view;
+        async move {
+            let mut registry = Registry::new(60.0);
+            for map in maps {
+                registry.register(map, 1.0, 40).unwrap();
+            }
+            registry.run(Some("q"), Duration::from_secs(5), view).await
+        }
+    };
+    let control = || fixed(&view, "control", Contribution::RankList, &[0, 1], None);
+    let alone = run_with(vec![control()]).await;
+    assert!(alone.warnings().is_empty());
+    let relabelled = |id, label: Option<SourceLabel>| -> Box<dyn Map + 'static> {
+        let mut hits = hits(&view, &[2, 3], None);
+        for hit in &mut hits {
+            hit.evidence = label
+                .map(|label| Evidence {
+                    via: None,
+                    edge: EdgeKind::QueryMatch,
+                    label,
+                    detail: None,
+                })
+                .into_iter()
+                .collect();
+        }
+        Box::new(FixedMap {
+            descriptor: descriptor(id, Contribution::RankList),
+            hits,
+        })
+    };
+    for (id, label, reason) in [
+        ("mislabelled", Some(SourceLabel::Vector), "label vector"),
+        ("unlabelled", None, "no evidence"),
+    ] {
+        let run = run_with(vec![relabelled(id, label), control()]).await;
+        assert_eq!(run.fused, alone.fused, "{id}");
+        let warnings = run.warnings();
+        assert_eq!(warnings.len(), 1, "{id}: {warnings:?}");
+        assert_eq!(warnings[0].0, id);
+        assert!(
+            warnings[0]
+                .1
+                .starts_with(&format!("map {id} returned an invalid answer: "))
+                && warnings[0].1.contains(reason),
+            "{warnings:?}"
+        );
+    }
+    // A well-labelled map is kept: the card lists `heuristic`.
+    let run = run_with(vec![
+        relabelled("labelled", Some(SourceLabel::Heuristic)),
+        control(),
+    ])
+    .await;
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+    assert_eq!(run.fused.len(), 4);
 }
 
 #[test]

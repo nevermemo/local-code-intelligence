@@ -656,10 +656,18 @@ async fn call<'a>(
         Ok(Err(_)) => failed(format!("map {} panicked", descriptor.id)),
         Ok(Ok(response)) => match check(descriptor, &response, entry.limit, view, &allowed) {
             Ok(()) => response,
-            Err(reason) => failed(format!(
-                "map {} returned an invalid answer: {reason}",
-                descriptor.id
-            )),
+            Err(reason) => {
+                let mut warning =
+                    format!("map {} returned an invalid answer: {reason}", descriptor.id);
+                // Keep what a partial answer said about itself.
+                if let MapStatus::Partial { note, warning: own } = &response.status {
+                    for text in [own, note].into_iter().flatten() {
+                        warning.push_str("; ");
+                        warning.push_str(text);
+                    }
+                }
+                failed(warning)
+            }
         },
     };
     record(response)
@@ -668,8 +676,11 @@ async fn call<'a>(
 /// The registry's checks on an answer with hits: a partial answer names
 /// what is missing, every node is a chunk of
 /// the view (and, for a prior, one of its seeds), no node twice, ranks
-/// are at least 1 and never fall, scores are finite, a prior carries its value, and
-/// no more than `limit` hits.
+/// are at least 1 and never fall, scores are finite, a prior carries its value,
+/// no more than `limit` hits, and every hit carries evidence whose labels the
+/// map's card lists (contract C5, [`labels::check_labels`]; merge condition
+/// M6 moved it here from the `labels::Labelled` wrapper, so a map registered
+/// without the wrapper is checked too).
 fn check(
     descriptor: &MapDescriptor,
     response: &MapResponse,
@@ -719,7 +730,7 @@ fn check(
             _ => {}
         }
     }
-    Ok(())
+    labels::check_labels(descriptor, response)
 }
 
 #[cfg(test)]

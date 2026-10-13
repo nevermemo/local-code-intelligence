@@ -1,9 +1,10 @@
 //! Contract C5, source labels (`docs/spike/multimap/specs/contract-kit.md`,
 //! C5): the closed vocabulary of [`SourceLabel`] with its wire names,
 //! versioned with the RunRecord schema that carries them; the check of an
-//! answer against the labels its map's card lists; [`Labelled`], which
-//! applies that check to every answer a registry gets from a map; and the
-//! kit's C5 check.
+//! answer against the labels its map's card lists, which `Registry::run`
+//! applies to every answer (merge condition M6); [`Labelled`], the wrapper
+//! that applied it before that and still does for a caller without a
+//! registry; and the kit's C5 check.
 //!
 //! The vocabulary is closed by construction in Rust (an enum); on the wire
 //! the schema's `label` enum closes it, and a test ties the two together.
@@ -11,7 +12,7 @@
 //! does not list, which is what [`check_labels`] refuses.
 
 use crate::{
-    Map, MapDescriptor, MapRequest, MapResponse, MapStatus, Registry, SnapshotView, SourceLabel,
+    Budget, Map, MapDescriptor, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
     kit::{ContractFailure, Factory, Fixture},
 };
 
@@ -95,7 +96,9 @@ pub fn check_labels(descriptor: &MapDescriptor, response: &MapResponse) -> Resul
 /// A map whose answers go through [`check_labels`]: an answer with a label
 /// its card does not list becomes `Failed`, with a warning naming the map,
 /// so the registry drops its hits and the run goes on (contract C1).
-/// Otherwise the answer is passed on unchanged.
+/// Otherwise the answer is passed on unchanged. `Registry::run` makes the
+/// same check on every answer since merge condition M6, so a registry does
+/// not need this wrapper.
 pub struct Labelled<'a> {
     inner: Box<dyn Map + 'a>,
 }
@@ -137,53 +140,57 @@ impl Map for Labelled<'_> {
     }
 }
 
-/// The kit's contract C5: runs the subject beside the control and checks
-/// every answer the registry got, the subject's and the control's, against
-/// its card. A failure names the map and the label. The check must bite: a
-/// subject that returns no used hit (an empty or failed answer, or one the
-/// registry refused) is a kit failure, not a pass.
+/// The kit's contract C5: asks the subject and the control for their
+/// answers to the fixture and checks each against its card. A failure names
+/// the map and the label. The maps are asked directly, not through a
+/// registry: `Registry::run` refuses a mislabelled answer itself (merge
+/// condition M6), and the kit must still see what the map said. The check
+/// must bite: a subject that returns no used hit (an empty or failed
+/// answer) is a kit failure, not a pass.
 pub async fn check_source_labels<'a>(
     subject: Factory<'_, 'a>,
     control: Factory<'_, 'a>,
     fixture: &Fixture<'_, 'a>,
 ) -> Result<(), ContractFailure> {
-    let maps = [subject(), control()];
-    let descriptors: Vec<MapDescriptor> = maps.iter().map(|m| m.describe().clone()).collect();
-    let mut registry = Registry::new(fixture.rrf_k);
-    for map in maps {
-        registry
-            .register(map, 1.0, 40)
-            .map_err(|error| ContractFailure {
+    let params = serde_json::Value::Null;
+    let mut answers = Vec::new();
+    for map in [subject(), control()] {
+        let request = MapRequest {
+            text: Some(fixture.text),
+            seeds: &[],
+            limit: 40,
+            budget: Budget {
+                deadline: std::time::Instant::now() + fixture.budget,
+                max_external_calls: u32::MAX,
+                max_nodes_touched: u64::MAX,
+            },
+            params: &params,
+            as_of: None,
+        };
+        let response = tokio::time::timeout(fixture.budget, map.query(&request, fixture.view))
+            .await
+            .map_err(|_| ContractFailure {
                 contract: "kit",
-                detail: error.to_string(),
+                detail: format!("map {} did not answer within the budget", map.describe().id),
             })?;
+        answers.push((map.describe().clone(), response));
     }
-    let run = registry
-        .run(Some(fixture.text), fixture.budget, fixture.view)
-        .await;
-    let subject_id = descriptors[0].id;
-    let exercised = run.calls.iter().any(|call| {
-        call.id == subject_id
-            && matches!(
-                call.response.status,
-                MapStatus::Ok | MapStatus::Partial { .. }
-            )
-            && !call.response.hits.is_empty()
-    });
+    let (subject, response) = &answers[0];
+    let exercised = matches!(response.status, MapStatus::Ok | MapStatus::Partial { .. })
+        && !response.hits.is_empty();
     if !exercised {
         return Err(ContractFailure {
             contract: "kit",
-            detail: format!("map {subject_id} returned no used hit, so C5 was not exercised"),
+            detail: format!(
+                "map {} returned no used hit, so C5 was not exercised",
+                subject.id
+            ),
         });
     }
-    for call in &run.calls {
-        let descriptor = descriptors
-            .iter()
-            .find(|d| d.id == call.id)
-            .expect("registered");
-        check_labels(descriptor, &call.response).map_err(|reason| ContractFailure {
+    for (descriptor, response) in &answers {
+        check_labels(descriptor, response).map_err(|reason| ContractFailure {
             contract: "C5",
-            detail: format!("map {}: {reason}", call.id),
+            detail: format!("map {}: {reason}", descriptor.id),
         })?;
     }
     Ok(())
@@ -193,7 +200,8 @@ pub async fn check_source_labels<'a>(
 mod tests {
     use super::*;
     use crate::{
-        Contribution, EdgeKind, Evidence, FreshnessModel, MapHit, SnapshotRef, kit::FixedMap,
+        Contribution, EdgeKind, Evidence, FreshnessModel, MapHit, Registry, SnapshotRef,
+        kit::FixedMap,
     };
     use lci_core::chunk::Chunk;
     use std::time::Duration;
