@@ -47,7 +47,7 @@ pub struct App {
     workspace_locks: Mutex<HashMap<String, Arc<WorkspaceCoordination>>>,
     // Bound concurrent model traffic from different indexing clients.
     index_lock: Mutex<()>,
-    watchers: Mutex<HashMap<String, CancellationToken>>,
+    watchers: Mutex<HashMap<String, (crate::workspace::Workspace, CancellationToken)>>,
     analyzer: lsp::Manager,
     /// File every search appends its candidate dump line to (see
     /// [`CANDIDATE_DUMP_ENV`]); `None` writes nothing.

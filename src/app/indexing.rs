@@ -628,7 +628,10 @@ impl App {
             });
         }
         let cancellation = CancellationToken::new();
-        watchers.insert(workspace.id.clone(), cancellation.clone());
+        watchers.insert(
+            workspace.id.clone(),
+            (workspace.clone(), cancellation.clone()),
+        );
         drop(watchers);
 
         let app = Arc::clone(self);
@@ -645,10 +648,19 @@ impl App {
                     _ = interval.tick() => {}
                 }
                 let root = watched_workspace.path.clone();
-                let current = match tokio::task::spawn_blocking(move || chunk::fingerprint(&root))
-                    .await
+                let current = match tokio::task::spawn_blocking(move || {
+                    if !root.try_exists()? {
+                        return Ok(None);
+                    }
+                    chunk::fingerprint(&root).map(Some)
+                })
+                .await
                 {
-                    Ok(Ok(value)) => value,
+                    Ok(Ok(Some(value))) => value,
+                    Ok(Ok(None)) => {
+                        tracing::warn!(workspace_id = %watched_workspace.id, "watched workspace disappeared; stopping watcher");
+                        break;
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(workspace_id = %watched_workspace.id, error = %error, "watch scan failed");
                         continue;
@@ -670,6 +682,12 @@ impl App {
                     tracing::warn!(workspace_id = %watched_workspace.id, error = %format!("{error:#}"), "automatic reindex failed; previous index retained");
                 }
             }
+            let mut watchers = app.watchers.lock().await;
+            // Unwatch cancels under this lock; an old task must not remove a replacement.
+            if !cancellation.is_cancelled() {
+                watchers.remove(&watched_workspace.id);
+                cancellation.cancel();
+            }
         });
         Ok(WatchReport {
             workspace,
@@ -679,10 +697,21 @@ impl App {
     }
 
     pub async fn unwatch(&self, path: &Path) -> Result<WatchReport> {
-        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
-        let cancellation = self.watchers.lock().await.remove(&workspace.id);
+        let mut watchers = self.watchers.lock().await;
+        let workspace = match Workspace::resolve(path, &self.config.data_dir) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                let absolute = std::path::absolute(path)?;
+                watchers
+                    .values()
+                    .find(|(workspace, _)| workspace.path == absolute)
+                    .map(|(workspace, _)| workspace.clone())
+                    .ok_or(error)?
+            }
+        };
+        let cancellation = watchers.remove(&workspace.id);
         let already_in_requested_state = cancellation.is_none();
-        if let Some(token) = cancellation {
+        if let Some((_, token)) = cancellation {
             token.cancel();
         }
         Ok(WatchReport {
