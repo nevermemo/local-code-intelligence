@@ -134,7 +134,7 @@ async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
     assert_eq!(repeat.chunks, report.chunks);
     assert_eq!(repeat.embedded_chunks, 0);
     assert_eq!(repeat.reused_chunks, report.chunks);
-    // The reopened process has observed no embedding width, so it sends one
+    // The reopened App has observed no embedding width, so it sends one
     // probe document (N43); no chunk is embedded again.
     assert_eq!(
         fake.documents.load(Ordering::SeqCst),
@@ -1914,10 +1914,9 @@ async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
 #[tokio::test]
 async fn a_refused_reranker_url_credential_is_not_reported() {
     let (temp, mut config, _fake, task) = fixture().await;
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed_address = closed.local_addr().unwrap();
-    drop(closed);
-    config.reranker_url = format!("http://{closed_address}/rerank?api_key=marker");
+    // A port that refuses connections, held for the whole test.
+    let closed = ClosedPort::new();
+    config.reranker_url = format!("http://127.0.0.1:{}/rerank?api_key=marker", closed.port);
     let workspace = temp.path().join("reranker-url-credential");
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = App::open(config).await.unwrap();
