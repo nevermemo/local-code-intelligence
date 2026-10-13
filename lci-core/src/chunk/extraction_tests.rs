@@ -1,7 +1,10 @@
 //! The extraction hook ([`extract_with_adapter`]) must not change today's
 //! chunk output: on the fixture trees, its chunks are byte-identical to
 //! [`chunks_with_adapter`]'s, in the same order, and its declarations equal
-//! the S1 extractor's own parse.
+//! the S1 extractor's own parse. Since merge condition M2 both are one
+//! function (`extract`), so the chunk comparison is with itself; the record
+//! of the every-language tree (`golden/every_language_chunks.json`) is what
+//! pins the chunk output.
 
 use super::*;
 use crate::node::rust_declarations;

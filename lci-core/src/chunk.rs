@@ -161,34 +161,7 @@ fn chunks_with_adapter(
     source: &str,
     adapter: &language::LanguageAdapter,
 ) -> Result<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser.set_language(&adapter.grammar())?;
-    let tree = parser
-        .parse(source, None)
-        .context("Tree-sitter parse cancelled")?;
-    let mut spans = Vec::new();
-    ranges(adapter, tree.root_node(), &mut spans);
-    let mut chunks = Vec::new();
-    for &(start, end) in &spans {
-        let raw = &source[start..end];
-        let code = raw.trim();
-        if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
-            continue;
-        }
-        let begin = start + raw.len() - raw.trim_start().len();
-        let finish = begin + code.len();
-        chunks.push(Chunk {
-            relative_file_path: path.into(),
-            language: adapter.identifier().into(),
-            start_line: source[..begin].bytes().filter(|&b| b == b'\n').count() as u32 + 1,
-            end_line: source[..finish].bytes().filter(|&b| b == b'\n').count() as u32 + 1,
-            code: code.into(),
-            content_hash: hash(code),
-        });
-    }
-    #[cfg(test)]
-    tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
-    Ok(chunks)
+    Ok(extract(path, source, adapter, false)?.chunks)
 }
 
 /// What one parse of a file yields (the extraction hook of the multimap
@@ -209,15 +182,25 @@ pub fn extract_for_path(path: &str, source: &str) -> Result<Extraction> {
     extract_with_adapter(path, source, adapter)
 }
 
-/// The extraction hook beside `chunks_with_adapter`: one parse, then the
-/// same chunking steps on that tree and the declaration walk on it. Nothing
-/// on the scan or search path calls it yet, so today's chunk output cannot
-/// change; `extraction_tests` keeps the two byte-identical on the fixture
-/// trees until S4 makes `chunks_with_adapter` call this.
+/// [`chunks_with_adapter`] plus the declarations, from one parse (the
+/// extraction hook).
 pub fn extract_with_adapter(
     path: &str,
     source: &str,
     adapter: &language::LanguageAdapter,
+) -> Result<Extraction> {
+    extract(path, source, adapter, true)
+}
+
+/// The one chunker: parses `source`, cuts the tree into chunks, and walks
+/// the declarations only when `with_declarations` asks for them (and the
+/// language has an extractor), so a caller that wants chunks alone pays
+/// for no declaration walk.
+fn extract(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+    with_declarations: bool,
 ) -> Result<Extraction> {
     let mut parser = Parser::new();
     parser.set_language(&adapter.grammar())?;
@@ -246,7 +229,7 @@ pub fn extract_with_adapter(
     }
     #[cfg(test)]
     tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
-    let declarations = (adapter.identifier() == "rust")
+    let declarations = (with_declarations && adapter.identifier() == "rust")
         .then(|| crate::node::rust_declarations_in(tree.root_node(), source));
     Ok(Extraction {
         chunks,
