@@ -55,7 +55,7 @@ impl GlobPattern {
         }
         let normalized = trimmed
             .split('/')
-            .filter(|component| *component != ".")
+            .filter(|component| !component.is_empty() && *component != ".")
             .collect::<Vec<_>>()
             .join("/");
         if normalized.is_empty() {
