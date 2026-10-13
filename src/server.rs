@@ -309,6 +309,81 @@ pub fn router(
             )
         })
         .with_state(ready_app)
+        .layer(axum::middleware::from_fn(validate_mcp_arguments))
+}
+
+async fn validate_mcp_arguments(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Method,
+        response::IntoResponse,
+    };
+
+    // RMCP maps invalid tool parameters to HTTP 404 for pre-2026 protocol peers.
+    let path = request.uri().path();
+    let is_mcp_path = path == "/mcp" || path == "/mcp/" || path.starts_with("/mcp/");
+    if request.method() != Method::POST || !is_mcp_path {
+        return next.run(request).await;
+    }
+
+    let (parts, body) = request.into_parts();
+    let Ok(body) = to_bytes(body, 4 * 1024 * 1024).await else {
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(serde_json::json!({"error": "MCP request body exceeds 4 MiB"})),
+        )
+            .into_response();
+    };
+    let request = axum::extract::Request::from_parts(parts, Body::from(body.clone()));
+    if let Ok(message) = serde_json::from_slice::<serde_json::Value>(&body)
+        && let Some(error) = unknown_mcp_argument_error(&message)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": error})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn unknown_mcp_argument_error(message: &serde_json::Value) -> Option<String> {
+    use serde::de::DeserializeOwned;
+
+    fn unknown_field<T: DeserializeOwned>(arguments: serde_json::Value) -> Option<String> {
+        serde_json::from_value::<T>(arguments)
+            .err()
+            .map(|error| error.to_string())
+            .filter(|error| error.starts_with("unknown field"))
+    }
+
+    fn check_call(call: &serde_json::Value) -> Option<String> {
+        let method = call.get("method")?.as_str()?;
+        if method != "tools/call" {
+            return None;
+        }
+        let params = call.get("params")?;
+        let name = params.get("name")?.as_str()?;
+        let arguments = params.get("arguments")?.clone();
+        match name {
+            "index_workspace" | "index_status" | "list_indexed_files" | "watch_workspace"
+            | "unwatch_workspace" => unknown_field::<WorkspaceArgs>(arguments),
+            "search_code" => unknown_field::<SearchArgs>(arguments),
+            "search_symbols" => unknown_field::<SymbolArgs>(arguments),
+            "find_definition" => unknown_field::<PositionArgs>(arguments),
+            "find_references" => unknown_field::<ReferencesArgs>(arguments),
+            _ => None,
+        }
+    }
+
+    if let Some(calls) = message.as_array() {
+        calls.iter().find_map(check_call)
+    } else {
+        check_call(message)
+    }
 }
 
 /// The only browser origins allowed to call this server: its own loopback
