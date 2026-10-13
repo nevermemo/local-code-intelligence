@@ -342,11 +342,12 @@ fn is_configuration(dirs: &[&str], file_name: &str) -> bool {
 
 /// Normalize a repository-relative path to use `/` separators.
 ///
-/// Backslashes are converted to forward slashes. Leading and trailing
-/// separators and `.` components are removed. Repeated separators are
-/// collapsed.
+/// Backslashes are separators on Windows and ordinary filename characters on
+/// Unix. Leading and trailing separators and `.` components are removed.
+/// Repeated separators are collapsed.
 pub(super) fn normalize_path(path: &str) -> String {
-    path.split(['/', '\\'])
+    crate::path::normalize_path_separators(path)
+        .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
         .collect::<Vec<_>>()
         .join("/")

@@ -33,8 +33,77 @@ where
             true
         }
         Err(error) => {
-            tracing::error!(%error, "shutdown signal wait failed; continuing to serve");
+            tracing::error!(%error, "shutdown signal wait failed; continuing without it");
             false
+        }
+    }
+}
+
+/// Resolves on Ctrl+C, or on SIGTERM on Unix, after cancelling
+/// `cancellation`. A signal whose wait fails is logged and never resolves
+/// (see [`cancel_on_signal`]), so the process keeps running instead of
+/// stopping at once.
+async fn shutdown_signal(cancellation: tokio_util::sync::CancellationToken) {
+    let ctrl_c = async {
+        if !cancel_on_signal(tokio::signal::ctrl_c(), cancellation.clone()).await {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let signal = async {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            terminate
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("SIGTERM signal stream closed"))
+        };
+        if !cancel_on_signal(signal, cancellation.clone()).await {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Stops the language servers cleanly instead of leaving it to the process
+/// exit killing them. Their shutdowns run side by side, each bounded by twice
+/// the grace period, so this budget (the grace period twice over plus a
+/// second, 5 s today) is a backstop; exceeding it only logs a warning and the
+/// rest are killed on exit.
+async fn release_language_servers(app: &App) {
+    let budget = 2 * lsp::SHUTDOWN_GRACE + Duration::from_secs(1);
+    match tokio::time::timeout(budget, app.shutdown_language_servers()).await {
+        Ok(released) => tracing::info!(released, "language servers released at shutdown"),
+        Err(_) => tracing::warn!(
+            budget_s = budget.as_secs(),
+            "language server shutdown did not finish in time; the rest are killed on exit"
+        ),
+    }
+}
+
+/// Runs a command that may start language servers (`search`, `evaluate`,
+/// `symbols`, `definition`, `references`) until it ends or a shutdown signal
+/// arrives. On a signal the command is dropped, the language servers are
+/// released, and an error is returned, so `main` returns and the runtime's
+/// shutdown ends whatever was still starting (a server's process is killed
+/// when its handle drops). Without this the signal's default action ends the
+/// process at once, and a server that outlives its client stays behind.
+async fn until_shutdown_signal<T>(
+    app: &App,
+    command: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        result = command => result,
+        () = shutdown_signal(tokio_util::sync::CancellationToken::new()) => {
+            release_language_servers(app).await;
+            anyhow::bail!("stopped by a shutdown signal")
         }
     }
 }
@@ -737,17 +806,20 @@ async fn main() -> Result<()> {
             source_roles,
             search_profile,
         } => serde_json::to_value(
-            app.search_in_profile(
-                &workspace,
-                &query,
-                top_k,
-                local_code_intelligence::filter::FilterRequest {
-                    languages: (!languages.is_empty()).then_some(languages),
-                    include_paths: (!include_paths.is_empty()).then_some(include_paths),
-                    exclude_paths: (!exclude_paths.is_empty()).then_some(exclude_paths),
-                    source_roles: (!source_roles.is_empty()).then_some(source_roles),
-                },
-                search_profile.as_deref(),
+            until_shutdown_signal(
+                &app,
+                app.search_in_profile(
+                    &workspace,
+                    &query,
+                    top_k,
+                    local_code_intelligence::filter::FilterRequest {
+                        languages: (!languages.is_empty()).then_some(languages),
+                        include_paths: (!include_paths.is_empty()).then_some(include_paths),
+                        exclude_paths: (!exclude_paths.is_empty()).then_some(exclude_paths),
+                        source_roles: (!source_roles.is_empty()).then_some(source_roles),
+                    },
+                    search_profile.as_deref(),
+                ),
             )
             .await?,
         )?,
@@ -762,24 +834,35 @@ async fn main() -> Result<()> {
         } => {
             let definition = evaluate::load_definition(&definition)?;
             let workspaces = evaluate::parse_workspace_mappings(&workspaces)?;
-            let report = evaluate::run_evaluation_with_options(
-                &app,
-                &definition,
-                &workspaces,
-                RunOptions { dump_candidates },
-            )
+            output_path = output;
+            // The comparison is inside the guarded future too: once the signal
+            // handlers are installed they stay for the life of the process, so
+            // a step after `until_shutdown_signal` could not be interrupted.
+            // It runs on a blocking thread so a signal is seen meanwhile.
+            let (report, comparison) = until_shutdown_signal(&app, async {
+                let report = evaluate::run_evaluation_with_options(
+                    &app,
+                    &definition,
+                    &workspaces,
+                    RunOptions { dump_candidates },
+                )
+                .await?;
+                Ok(tokio::task::spawn_blocking(move || {
+                    let comparison = baseline_report.map(|(path, baseline)| {
+                        let options = CompareOptions {
+                            seed: seed.unwrap_or(DEFAULT_SEED),
+                            resamples: resamples.unwrap_or(DEFAULT_RESAMPLES),
+                        };
+                        let mut comparison = evaluate::compare(&baseline, &report, &options);
+                        comparison.baseline_source = Some(path.display().to_string());
+                        comparison
+                    });
+                    (report, comparison)
+                })
+                .await?)
+            })
             .await?;
             evaluation_failed = evaluate::has_failures(&report);
-            output_path = output;
-            let comparison = baseline_report.map(|(path, baseline)| {
-                let options = CompareOptions {
-                    seed: seed.unwrap_or(DEFAULT_SEED),
-                    resamples: resamples.unwrap_or(DEFAULT_RESAMPLES),
-                };
-                let mut comparison = evaluate::compare(&baseline, &report, &options);
-                comparison.baseline_source = Some(path.display().to_string());
-                comparison
-            });
             if let Some(comparison) = &comparison {
                 // Stderr, so a report on stdout stays valid JSON.
                 eprint!("{}", comparison.render_summary());
@@ -790,17 +873,20 @@ async fn main() -> Result<()> {
         Command::Init { .. } => unreachable!("init returns before the application opens"),
         Command::Compare { .. } => unreachable!("compare returns before the application opens"),
         Command::Replay { .. } => unreachable!("replay returns before the application opens"),
-        Command::Symbols { workspace, query } => {
-            serde_json::to_value(app.symbols(&workspace, &query).await?)?
-        }
+        Command::Symbols { workspace, query } => serde_json::to_value(
+            until_shutdown_signal(&app, app.symbols(&workspace, &query)).await?,
+        )?,
         Command::Definition {
             workspace,
             relative_file_path,
             line,
             character,
         } => serde_json::to_value(
-            app.definition(&workspace, &relative_file_path, line, character)
-                .await?,
+            until_shutdown_signal(
+                &app,
+                app.definition(&workspace, &relative_file_path, line, character),
+            )
+            .await?,
         )?,
         Command::References {
             workspace,
@@ -809,12 +895,15 @@ async fn main() -> Result<()> {
             character,
             include_declaration,
         } => serde_json::to_value(
-            app.references(
-                &workspace,
-                &relative_file_path,
-                line,
-                character,
-                include_declaration,
+            until_shutdown_signal(
+                &app,
+                app.references(
+                    &workspace,
+                    &relative_file_path,
+                    line,
+                    character,
+                    include_declaration,
+                ),
             )
             .await?,
         )?,
@@ -841,49 +930,10 @@ async fn main() -> Result<()> {
                 );
             }
             let served = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let ctrl_c = async {
-                        if !cancel_on_signal(tokio::signal::ctrl_c(), cancellation.clone()).await {
-                            std::future::pending::<()>().await;
-                        }
-                    };
-                    #[cfg(unix)]
-                    let terminate = async {
-                        let signal = async {
-                            let mut terminate = tokio::signal::unix::signal(
-                                tokio::signal::unix::SignalKind::terminate(),
-                            )?;
-                            terminate.recv().await.ok_or_else(|| {
-                                std::io::Error::other("SIGTERM signal stream closed")
-                            })
-                        };
-                        if !cancel_on_signal(signal, cancellation.clone()).await {
-                            std::future::pending::<()>().await;
-                        }
-                    };
-                    #[cfg(unix)]
-                    tokio::select! {
-                        () = ctrl_c => {}
-                        () = terminate => {}
-                    }
-                    #[cfg(not(unix))]
-                    ctrl_c.await;
-                })
+                .with_graceful_shutdown(shutdown_signal(cancellation))
                 .await;
-            // The server has stopped, gracefully (Ctrl+C) or not: stop the
-            // language servers cleanly instead of leaving it to the process
-            // exit killing them. Their shutdowns run side by side, each
-            // bounded by twice the grace period, so this budget (the grace
-            // period twice over plus a second, 5 s today) is a backstop;
-            // exceeding it only logs a warning and the rest are killed on exit.
-            let budget = 2 * lsp::SHUTDOWN_GRACE + Duration::from_secs(1);
-            match tokio::time::timeout(budget, app.shutdown_language_servers()).await {
-                Ok(released) => tracing::info!(released, "language servers released at shutdown"),
-                Err(_) => tracing::warn!(
-                    budget_s = budget.as_secs(),
-                    "language server shutdown did not finish in time; the rest are killed on exit"
-                ),
-            }
+            // The server has stopped, gracefully (Ctrl+C or SIGTERM) or not.
+            release_language_servers(&app).await;
             served?;
             return Ok(());
         }

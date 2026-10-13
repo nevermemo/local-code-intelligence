@@ -10,7 +10,7 @@
 ## Persistence
 
 - A parse-affecting adapter change invalidates only that language's parse cache.
-- Keep parser compatibility separate from embedding identity. Reuse an existing vector when exact chunk text and embedding identity are unchanged.
+- Keep parser compatibility separate from embedding identity. Reuse an existing vector when exact chunk text and embedding identity (and the service's vector width) are unchanged.
 - Removed files and removed chunks must disappear from the next committed snapshot.
 - Build a complete replacement snapshot before committing it. A scan, parse, or embedding failure must leave the previous snapshot searchable.
 - Existing manifests and LanceDB tables must migrate safely, be deliberately marked incompatible, or fail with an actionable message. Never allow an obscure missing-column failure.

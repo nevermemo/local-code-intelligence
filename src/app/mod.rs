@@ -103,14 +103,25 @@ fn ms(start: Instant) -> f64 {
 /// across processes.
 const INDEX_LOCK_FILE: &str = "index.lock";
 
+/// How often a wait for another process's data-directory index lock tries
+/// the lock again.
+const INDEX_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Cross-process counterpart of `App::index_lock`: takes an exclusive OS
-/// file lock on `<data_dir>/index.lock` (blocking until any other holder
+/// file lock on `<data_dir>/index.lock` (waiting until any other holder
 /// releases it) and returns the handle that holds it; dropping the handle
 /// releases the lock. Held for a whole index pass, so two processes sharing
 /// a data directory -- e.g. a running server and a CLI `index` or
 /// `evaluate` -- serialize their snapshot commits instead of interleaving
 /// LanceDB table overwrites and manifest writes. Reads never take it.
-fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::fs::File> {
+///
+/// The wait tries the lock every [`INDEX_LOCK_RETRY`] on this task instead of
+/// blocking in `lock()` on a blocking thread: dropping the future ends the
+/// wait. A blocking wait could not be cancelled, and the runtime's shutdown
+/// waits for blocking threads, so a `serve` stopped by a signal while a
+/// watcher's reindex waited here stayed alive until the other process let
+/// go of the lock.
+async fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::fs::File> {
     use anyhow::Context;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -118,34 +129,34 @@ fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::fs::Fil
         .write(true)
         .open(data_dir.join(INDEX_LOCK_FILE))
         .context("open data-directory index lock")?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            tracing::info!(
-                data_dir = %data_dir.display(),
-                "another process is committing an index in this data directory; waiting for it"
-            );
-            file.lock().context("acquire data-directory index lock")?;
-        }
-        Err(std::fs::TryLockError::Error(error)) => {
-            return Err(error).context("acquire data-directory index lock");
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !announced {
+                    tracing::info!(
+                        data_dir = %data_dir.display(),
+                        "another process is committing an index in this data directory; waiting for it"
+                    );
+                    announced = true;
+                }
+                tokio::time::sleep(INDEX_LOCK_RETRY).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("acquire data-directory index lock");
+            }
         }
     }
-    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{INDEX_LOCK_FILE, lock_data_dir_for_indexing};
-    use std::{
-        fs::OpenOptions,
-        sync::mpsc::{self, RecvTimeoutError},
-        thread,
-        time::Duration,
-    };
+    use std::{fs::OpenOptions, time::Duration};
 
-    #[test]
-    fn data_dir_index_lock_waits_for_another_holder() {
+    #[tokio::test]
+    async fn data_dir_index_lock_waits_for_another_holder() {
         let temp = tempfile::tempdir().unwrap();
         let holder = OpenOptions::new()
             .create(true)
@@ -156,31 +167,20 @@ mod tests {
         holder.lock().unwrap();
 
         let data_dir = temp.path().to_path_buf();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (returned_tx, returned_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = lock_data_dir_for_indexing(&data_dir);
-            let _ = returned_tx.send(result);
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the worker must signal before attempting the lock");
+        let mut waiter = tokio::spawn(async move { lock_data_dir_for_indexing(&data_dir).await });
         assert!(
-            matches!(
-                returned_rx.recv_timeout(Duration::from_millis(500)),
-                Err(RecvTimeoutError::Timeout)
-            ),
+            tokio::time::timeout(Duration::from_millis(500), &mut waiter)
+                .await
+                .is_err(),
             "lock_data_dir_for_indexing returned while another holder held the lock"
         );
 
         drop(holder);
-        let acquired = returned_rx
-            .recv_timeout(Duration::from_secs(5))
+        let acquired = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
             .expect("lock_data_dir_for_indexing must return promptly after the lock is released")
+            .unwrap()
             .unwrap();
-        worker.join().unwrap();
         let contender = OpenOptions::new()
             .write(true)
             .open(temp.path().join(INDEX_LOCK_FILE))

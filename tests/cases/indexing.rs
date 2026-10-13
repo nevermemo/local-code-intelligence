@@ -73,6 +73,76 @@ async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
     task.abort();
 }
 
+#[tokio::test]
+async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
+    const CHILD: &str = "LCI_TEST_DEEP_INDEX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexing::deeply_nested_modules_index_and_reuse_without_stack_overflow",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "deep indexing failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("deep-modules");
+    let source = format!(
+        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+        "mod m {\n".repeat(32768),
+        "}\n".repeat(32768)
+    );
+    write(&workspace, "lib.rs", &source);
+    let app = App::open(config.clone()).await.unwrap();
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    assert_eq!(report.parsed_files, 1);
+    assert!(report.chunks > 0);
+    assert!(report.embedded_chunks > 0);
+    assert!(report.embedded_chunks <= report.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks
+    );
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].relative_file_path, "lib.rs");
+    assert_eq!(indexed.files[0].chunks, report.chunks);
+
+    drop(app);
+    let reopened = App::open(config).await.unwrap();
+    let repeat = reopened.index(&workspace).await.unwrap();
+    assert_eq!(repeat.parsed_files, 0);
+    assert_eq!(repeat.unchanged_files, 1);
+    assert_eq!(repeat.chunks, report.chunks);
+    assert_eq!(repeat.embedded_chunks, 0);
+    assert_eq!(repeat.reused_chunks, report.chunks);
+    // The reopened process has observed no embedding width, so it sends one
+    // probe document (N43); no chunk is embedded again.
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks + 1
+    );
+    task.abort();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_backslashes_preserve_indexed_names_and_result_paths() {
@@ -253,6 +323,51 @@ async fn filters_without_matching_chunks_skip_retrieval_channels() {
         fake.rerank_requests.load(Ordering::SeqCst),
         rerank_requests + 1
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_path_filter_gets_semantic_hits_beyond_the_nearest_unfiltered_rows() {
+    use local_code_intelligence::filter::FilterRequest;
+
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("filtered-far");
+    // The fake embeds every chunk that mentions "translator" as the query's
+    // own vector: these 170 chunks are the nearest rows, more than the 160
+    // the semantic channel's first fetch asks for at the default 40
+    // candidates. The one chunk the filter keeps is farther away and shares
+    // no query term, so only the semantic channel can find it.
+    for i in 0..170 {
+        write(
+            &workspace,
+            &format!("noise/n{i}.rs"),
+            &format!("fn translator_{i}() {{}}\n"),
+        );
+    }
+    write(&workspace, "wanted/target.rs", "fn far_away() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let found = app
+        .search_with_filters(
+            &workspace,
+            "translator",
+            Some(5),
+            FilterRequest {
+                include_paths: Some(vec!["wanted/**".to_owned()]),
+                ..FilterRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let hit = found
+        .results
+        .iter()
+        .find(|hit| hit.chunk.relative_file_path == "wanted/target.rs")
+        .unwrap_or_else(|| panic!("no hit: {:?}", found.warning));
+    assert!(hit.semantic_score.is_some());
+    assert_eq!(found.warning, None);
     task.abort();
 }
 
@@ -920,6 +1035,115 @@ async fn a_path_document_template_embeds_per_path_and_reuses_unchanged_chunks() 
 
     // Only the two searches above were classified as queries.
     assert_eq!(fake.queries.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+/// The semantic score of the chunk a one-result "translator" search ranks
+/// first, and the search warning. `None` means semantic retrieval served
+/// nothing, for example because the index vectors have another width.
+async fn translator_semantic_score(app: &App, workspace: &Path) -> (Option<f32>, Option<String>) {
+    let found = app.search(workspace, "translator", Some(1)).await.unwrap();
+    let value = serde_json::to_value(&found).unwrap();
+    let warning = value["warning"].as_str().map(str::to_owned);
+    (
+        found.results.first().and_then(|hit| hit.semantic_score),
+        warning,
+    )
+}
+
+#[tokio::test]
+async fn a_changed_embedding_width_under_the_same_identity_is_repaired_by_the_next_index_run() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Manual;
+    // No language server, so a search warning can only come from retrieval.
+    config.channels.lsp = false;
+    let workspace = temp.path().join("width-change");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    write(&workspace, "other.rs", "fn unrelated() {}\n");
+    let app = App::open(config.clone()).await.unwrap();
+    let first = app.index(&workspace).await.unwrap();
+    assert_eq!(first.embedded_chunks, first.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(3)
+    );
+    drop(app);
+
+    // A restart against a service that now returns 4-wide vectors under the
+    // same URL and model name. Nothing changed on disk, so every chunk is a
+    // vector-cache hit; reusing them would commit the old width again.
+    fake.embedding_width.store(4, Ordering::SeqCst);
+    let app = App::open(config.clone()).await.unwrap();
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let restarted = app.index(&workspace).await.unwrap();
+    assert_eq!(restarted.embedded_chunks, restarted.chunks);
+    assert_eq!(restarted.reused_chunks, 0);
+    // One probe document, then every chunk once.
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst) - documents,
+        1 + restarted.chunks
+    );
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(4)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+    assert_eq!(warning, None);
+
+    // In the running process the width changes again and one file changes:
+    // the run that embeds it re-embeds the cached vectors of the old width.
+    fake.embedding_width.store(5, Ordering::SeqCst);
+    write(&workspace, "other.rs", "fn unrelated_changed() {}\n");
+    let changed = app.index(&workspace).await.unwrap();
+    assert_eq!(changed.embedded_chunks, changed.chunks);
+    assert_eq!(changed.reused_chunks, 0);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(5)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+
+    // A search that meets another width warns and serves no semantic hits;
+    // the index run it asks for repairs the index with nothing changed.
+    fake.embedding_width.store(6, Ordering::SeqCst);
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert_eq!(score, None);
+    assert!(
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("dimension differs from index")),
+        "{warning:?}"
+    );
+    let repaired = app.index(&workspace).await.unwrap();
+    assert_eq!(repaired.embedded_chunks, repaired.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(6)
+    );
+    let (score, warning) = translator_semantic_score(&app, &workspace).await;
+    assert!((score.unwrap() - 1.0).abs() < 0.001, "{warning:?}");
+
+    // An unchanged index run with the width unchanged still embeds nothing.
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let unchanged = app.index(&workspace).await.unwrap();
+    assert_eq!(unchanged.embedded_chunks, 0);
+    assert_eq!(unchanged.reused_chunks, unchanged.chunks);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents);
+    drop(app);
+
+    // After a restart with the service down, the failed probe only warns:
+    // the unchanged run reuses every cached vector, as it did before probes.
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let app = App::open(config).await.unwrap();
+    let offline = app.index(&workspace).await.unwrap();
+    assert_eq!(offline.embedded_chunks, 0);
+    assert_eq!(offline.reused_chunks, offline.chunks);
+    assert_eq!(
+        app.status(&workspace).await.unwrap().embedding_dimension,
+        Some(6)
+    );
     task.abort();
 }
 
@@ -1621,11 +1845,9 @@ async fn a_hung_reranker_is_tried_once_and_keeps_earlier_warnings() {
 #[tokio::test]
 async fn an_unreachable_reranker_fails_open_fast_and_is_then_skipped_briefly() {
     let (temp, mut config, _fake, task) = fixture().await;
-    // A port nothing listens on: bind to learn a free one, then release it.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed_address = closed.local_addr().unwrap();
-    drop(closed);
-    config.reranker_url = format!("http://{closed_address}/rerank");
+    // A port that refuses connections, held for the whole test.
+    let closed = ClosedPort::new();
+    config.reranker_url = format!("http://127.0.0.1:{}/rerank", closed.port);
     let workspace = temp.path().join("unreachable-reranker");
     write(
         &workspace,
@@ -1706,6 +1928,52 @@ async fn a_refused_reranker_url_credential_is_not_reported() {
     let warning = report.warning.as_deref().unwrap();
     assert!(warning.contains("reranker request failed"), "{warning}");
     assert!(!warning.contains("marker"), "{warning}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_reranker_http_error_body_credential_is_not_reported() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let router = Router::new().route(
+        "/rerank",
+        post(|uri: axum::http::Uri| async move {
+            assert_eq!(
+                uri.path_and_query().unwrap().as_str(),
+                "/rerank?api_key=n89-marker"
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("rejected {}; retry later", uri.path_and_query().unwrap()),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reranker_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    config.reranker_url = format!("http://{address}/rerank?api_key=n89-marker");
+    let workspace = temp.path().join("reranker-body-credential");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    assert!(!report.reranked);
+    assert!(
+        !report.results.is_empty(),
+        "reranker failure must fail open"
+    );
+    let warning = report.warning.as_deref().unwrap();
+    assert!(
+        warning.contains(
+            "Reranker unavailable or invalid response; fusion-ranked results returned: reranker HTTP error: HTTP status 401: rejected /rerank?api_key=[redacted]; retry later"
+        ),
+        "{warning}"
+    );
+    assert!(!warning.contains("n89-marker"), "{warning}");
+    reranker_task.abort();
     task.abort();
 }
 

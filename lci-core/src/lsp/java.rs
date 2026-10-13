@@ -21,7 +21,7 @@
 //! processes.
 
 use crate::config::JavaLspConfig;
-use crate::lsp::adapter::LspAdapter;
+use crate::lsp::adapter::{LspAdapter, read_for_did_open};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use crate::workspace;
 use anyhow::{Context, Result, anyhow};
@@ -244,9 +244,9 @@ impl LspAdapter for JavaServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .with_context(|| format!("read {relative} to open in jdtls"))?;
+        let Some(content) = read_for_did_open(file, relative, "jdtls").await? else {
+            return Ok(());
+        };
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();

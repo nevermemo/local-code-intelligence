@@ -182,52 +182,19 @@ pub enum IndexAction {
 }
 
 impl App {
-    pub async fn index(&self, path: &Path) -> Result<IndexReport> {
-        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
-        let coordination = self.lock(&workspace.id).await;
-        let _write = coordination.lock.write().await;
-        *coordination.flight_error.lock().await = None;
-        let result = self.index_locked(workspace).await;
-        if let Err(error) = &result {
-            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
-        }
-        result
-    }
-
-    /// Runs the indexing pipeline for `workspace`, assuming the caller already
-    /// holds the workspace write lock. Explicit indexing and automatic
-    /// first-search indexing share this implementation so both coordinate
-    /// through the same locks.
-    pub(super) async fn index_locked(&self, workspace: Workspace) -> Result<IndexReport> {
-        let start = Instant::now();
-        let _index = self.index_lock.lock().await;
-        let data_dir = self.config.data_dir.clone();
-        let _data_dir_lock =
-            tokio::task::spawn_blocking(move || super::lock_data_dir_for_indexing(&data_dir))
-                .await??;
-        let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
-        let root = workspace.path.clone();
-        let prior_files = prior_manifest.files;
-        let scan =
-            tokio::task::spawn_blocking(move || chunk::scan_incremental(&root, &prior_files))
-                .await??;
-        let chunks = scan.chunks;
-        let previous = self.store.snapshot(&workspace).await?;
-        let identity = self.config.embedding_identity();
+    /// Embeds every chunk whose vector key `cache` lacks (each key once) and
+    /// adds the vectors to `cache`; returns how many it embedded. Chunks the
+    /// service accepted only as a shortened prefix are recorded in
+    /// `truncated_for_embedding`.
+    async fn embed_missing(
+        &self,
+        workspace: &Workspace,
+        chunks: &[chunk::Chunk],
+        key_of: &impl Fn(&chunk::Chunk) -> String,
+        cache: &mut HashMap<String, Vec<f32>>,
+        truncated_for_embedding: &mut Vec<String>,
+    ) -> Result<usize> {
         let template = &self.config.embedding_document_template;
-        // A template that embeds the file path makes a vector depend on the
-        // file as well as the code, so the vector cache is keyed by both.
-        let uses_path = template.contains("{path}");
-        let key_of =
-            |c: &chunk::Chunk| vector_key(uses_path, &c.content_hash, &c.relative_file_path);
-        let mut cache = match &previous {
-            Some(s) if s.identity == identity => Store::cached_vectors(s, uses_path).await?,
-            _ => HashMap::new(),
-        };
-        let reused_chunks = chunks
-            .iter()
-            .filter(|&c| cache.contains_key(&key_of(c)))
-            .count();
         let mut seen = HashSet::new();
         let missing: Vec<_> = chunks
             .iter()
@@ -236,8 +203,6 @@ impl App {
                 !cache.contains_key(&key) && seen.insert(key)
             })
             .collect();
-        let embedded_chunks = missing.len();
-        let mut truncated_for_embedding = Vec::new();
         for (i, batch) in missing.chunks(self.config.embedding_batch_size).enumerate() {
             let texts: Vec<_> = batch.iter().map(|c| document_text(template, c)).collect();
             let (vectors, shortened) = embed_isolating_oversized(&self.models, &texts)
@@ -260,6 +225,121 @@ impl App {
             }
             tracing::info!(workspace_id = %workspace.id, completed = ((i+1)*self.config.embedding_batch_size).min(missing.len()), total = missing.len(), "embedding chunks");
         }
+        Ok(missing.len())
+    }
+
+    /// The vector width the embedding service returns now, from embedding a
+    /// prefix of the first chunk (at most `MIN_EMBED_PREFIX_BYTES`, which the
+    /// service accepts whenever it accepts any chunk) with one attempt. `None`
+    /// when there is no chunk or the request fails: a failed probe only warns,
+    /// and the run keeps the cached vectors as it would without the probe
+    /// (fail-open), without paying index-time retries or backoff.
+    async fn probe_dimension(
+        &self,
+        workspace: &Workspace,
+        chunks: &[chunk::Chunk],
+    ) -> Option<usize> {
+        let text = document_text(&self.config.embedding_document_template, chunks.first()?);
+        let mut end = text.len().min(MIN_EMBED_PREFIX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        match self.models.embed_once(&[text[..end].to_owned()]).await {
+            Ok(vectors) => vectors.first().map(Vec::len),
+            Err(error) => {
+                tracing::warn!(workspace_id = %workspace.id, error = %format!("{error:#}"), "could not check the embedding width; reusing the cached vectors");
+                None
+            }
+        }
+    }
+
+    pub async fn index(&self, path: &Path) -> Result<IndexReport> {
+        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
+        let coordination = self.lock(&workspace.id).await;
+        let _write = coordination.lock.write().await;
+        *coordination.flight_error.lock().await = None;
+        let result = self.index_locked(workspace).await;
+        if let Err(error) = &result {
+            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    /// Runs the indexing pipeline for `workspace`, assuming the caller already
+    /// holds the workspace write lock. Explicit indexing and automatic
+    /// first-search indexing share this implementation so both coordinate
+    /// through the same locks.
+    pub(super) async fn index_locked(&self, workspace: Workspace) -> Result<IndexReport> {
+        let start = Instant::now();
+        let _index = self.index_lock.lock().await;
+        let _data_dir_lock = super::lock_data_dir_for_indexing(&self.config.data_dir).await?;
+        let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
+        let root = workspace.path.clone();
+        let prior_files = prior_manifest.files;
+        let scan =
+            tokio::task::spawn_blocking(move || chunk::scan_incremental(&root, &prior_files))
+                .await??;
+        let chunks = scan.chunks;
+        let previous = self.store.snapshot(&workspace).await?;
+        let identity = self.config.embedding_identity();
+        let template = &self.config.embedding_document_template;
+        // A template that embeds the file path makes a vector depend on the
+        // file as well as the code, so the vector cache is keyed by both.
+        let uses_path = template.contains("{path}");
+        let key_of =
+            |c: &chunk::Chunk| vector_key(uses_path, &c.content_hash, &c.relative_file_path);
+        let mut cache = match &previous {
+            Some(s) if s.identity == identity => Store::cached_vectors(s, uses_path).await?,
+            _ => HashMap::new(),
+        };
+        let mut cached_keys: HashSet<String> = cache.keys().cloned().collect();
+        let mut truncated_for_embedding = Vec::new();
+        let mut embedded_chunks = self
+            .embed_missing(
+                &workspace,
+                &chunks,
+                &key_of,
+                &mut cache,
+                &mut truncated_for_embedding,
+            )
+            .await?;
+        // The identity names the URL and model, not the width: a service can
+        // start returning another width under both. Cached vectors of another
+        // width than the service returns now are embedded again; mixing widths
+        // would fail the commit, and an index of the old width fails every
+        // search. The width comes from this process's latest embedding
+        // response; a probe is sent only when there was none and the cache is
+        // not empty (a first index never probes), so an unchanged run in a
+        // process that has embedded before still sends no request.
+        // Known gap: a width change seen by no request since this process's
+        // last one (no search, no changed chunk) is found by the next search,
+        // which warns, and the index run after it repairs.
+        if !cached_keys.is_empty() {
+            let current = match self.models.observed_dimension() {
+                Some(dimension) => Some(dimension),
+                None => self.probe_dimension(&workspace, &chunks).await,
+            };
+            if let Some(current) = current
+                && cache.values().any(|vector| vector.len() != current)
+            {
+                tracing::warn!(workspace_id = %workspace.id, dimension = current, "the embedding service returns another vector width than the cached vectors; embedding them again");
+                cache.retain(|_, vector| vector.len() == current);
+                cached_keys.retain(|key| cache.contains_key(key));
+                embedded_chunks += self
+                    .embed_missing(
+                        &workspace,
+                        &chunks,
+                        &key_of,
+                        &mut cache,
+                        &mut truncated_for_embedding,
+                    )
+                    .await?;
+            }
+        }
+        let reused_chunks = chunks
+            .iter()
+            .filter(|&c| cached_keys.contains(&key_of(c)))
+            .count();
         let vectors: Vec<_> = chunks.iter().map(|c| cache[&key_of(c)].clone()).collect();
         let dimension = vectors
             .first()

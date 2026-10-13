@@ -16,9 +16,9 @@
 //! (`--compile-commands-dir=...`); this adapter does not generate one.
 
 use crate::config::ClangdLspConfig;
-use crate::lsp::adapter::LspAdapter;
+use crate::lsp::adapter::{LspAdapter, read_for_did_open};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -125,9 +125,9 @@ impl LspAdapter for ClangdServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .with_context(|| format!("read {relative} to open in clangd"))?;
+        let Some(content) = read_for_did_open(file, relative, "clangd").await? else {
+            return Ok(());
+        };
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();

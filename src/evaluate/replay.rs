@@ -1159,6 +1159,9 @@ pub fn replay_file(path: &Path, options: &ReplayOptions) -> Result<ReplayReport>
 }
 
 #[cfg(test)]
+mod fusion_properties;
+
+#[cfg(test)]
 mod tests {
     use super::{Scored, fused_order};
     use crate::{app::CandidateTrace, filter::SourceRole};

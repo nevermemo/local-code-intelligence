@@ -1863,10 +1863,23 @@ async fn concurrent_requests_share_one_language_server_start() {
     for results in [first, second, third, fourth, fifth] {
         assert_eq!(results.unwrap()[0].name.as_deref(), Some("Calculator"));
     }
+    // `spawns` holds one entry per start, claimed atomically, so it counts
+    // overlapping starts that `spawn_count.txt` (last writer wins) can hide.
     assert_eq!(
-        state_count(&state, "spawn_count.txt"),
+        std::fs::read_dir(state.join("spawns")).unwrap().count(),
         1,
         "five callers that arrived while the server was starting must share that one start"
+    );
+    let served: std::collections::BTreeSet<String> =
+        std::fs::read_to_string(state.join("symbol_request_pids.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(
+        served.len(),
+        1,
+        "one server process must answer every symbol request: {served:?}"
     );
 }
 
@@ -2146,6 +2159,206 @@ async fn sigterm_shuts_down_the_running_language_server() {
         language_server_exited,
         "language server process {pid} survived SIGTERM"
     );
+}
+
+/// A command-line command that starts a language server, stopped by SIGTERM
+/// while the server is still answering `initialize`: the command must exit
+/// and take the server with it. The fake server keeps running at stdin EOF
+/// and answers `initialize` only after a minute, so it outlives a client that
+/// the signal ends at once. `args` gets the workspace and the temporary
+/// directory and returns the command's arguments.
+#[cfg(unix)]
+async fn sigterm_during_a_command_ends_its_language_server(
+    args: impl FnOnce(&std::path::Path, &std::path::Path) -> Vec<String>,
+) {
+    let (temp, mut config, _models, models_task) = fixture().await;
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let state = temp.path().join("lsp-state");
+    config.csharp = CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: fake_args(&[
+            "--mode",
+            "workspace-symbols",
+            "--state",
+            &state.to_string_lossy(),
+            "--keep-alive-on-eof",
+            "--initialize-delay-ms",
+            "60000",
+        ]),
+        disabled: false,
+    };
+    config.lsp_timeout_seconds = 120;
+    // `search` and `evaluate` would otherwise stop waiting for the server
+    // after the default 1.5 s and end on their own.
+    config.lsp_search_budget_ms = 60_000;
+    let config_path = temp.path().join("cli.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let cli = |args: &[String]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        strip_lci_env(&mut command);
+        command
+    };
+
+    // `symbols`, `definition` and `references` need an index. The command
+    // runs off the runtime, which serves the fake model service.
+    let mut index = cli(&["index".to_owned(), workspace.display().to_string()]);
+    let indexed = tokio::task::spawn_blocking(move || index.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(
+        !state.join("pid.txt").exists(),
+        "indexing must not start the language server"
+    );
+
+    let log = temp.path().join("cli.log");
+    let child = cli(&args(&workspace, temp.path()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut command = SigtermServe {
+        child,
+        language_server_pid_file: state.join("pid.txt"),
+    };
+    let started = std::time::Instant::now();
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&command.language_server_pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            command.child.try_wait().unwrap().is_none(),
+            "the command ended before starting its language server: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the language server never received initialize"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(process_is_running(pid).await);
+
+    let signal = tokio::process::Command::new("kill")
+        .args(["-TERM", &command.child.id().to_string()])
+        .status()
+        .await
+        .unwrap();
+    assert!(signal.success(), "could not send SIGTERM to the command");
+    let exited = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = command.child.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process_is_running(pid).await && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let language_server_exited = !process_is_running(pid).await;
+    drop(models_task);
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    let status = exited.unwrap_or_else(|_| panic!("the command did not exit after SIGTERM: {log}"));
+    assert!(
+        language_server_exited,
+        "language server process {pid} survived SIGTERM ({status}): {log}"
+    );
+    assert!(
+        log.contains("stopped by a shutdown signal"),
+        "the command must say why it stopped ({status}): {log}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_search_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+        vec![
+            "search".to_owned(),
+            workspace.display().to_string(),
+            "Calculator".to_owned(),
+        ]
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_evaluate_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server(|workspace, temp| {
+        let definition = temp.join("definition.toml");
+        std::fs::write(
+            &definition,
+            "[[workspaces]]\nkey = \"ws\"\nrequired = true\n\n[[queries]]\nworkspace = \"ws\"\nquery = \"Calculator\"\ntop_k = 3\nexpected_paths = [\"src/Calculator.cs\"]\n",
+        )
+        .unwrap();
+        vec![
+            "evaluate".to_owned(),
+            definition.display().to_string(),
+            "--workspace".to_owned(),
+            format!("ws={}", workspace.display()),
+        ]
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_symbols_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+        vec![
+            "symbols".to_owned(),
+            workspace.display().to_string(),
+            "Calculator".to_owned(),
+        ]
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_definition_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+        vec![
+            "definition".to_owned(),
+            workspace.display().to_string(),
+            "src/CallSite.cs".to_owned(),
+            "1".to_owned(),
+            "60".to_owned(),
+        ]
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_references_ends_its_language_server() {
+    sigterm_during_a_command_ends_its_language_server(|workspace, _| {
+        vec![
+            "references".to_owned(),
+            workspace.display().to_string(),
+            "src/Calculator.cs".to_owned(),
+            "1".to_owned(),
+            "20".to_owned(),
+        ]
+    })
+    .await;
 }
 
 /// Checks liveness only while the answer is pending: after it returns, an idle
@@ -3184,6 +3397,46 @@ async fn fake_typescript_lsp_maps_symbols_definitions_and_references() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_file_above_the_did_open_cap_is_navigated_without_sending_its_text() {
+    use local_code_intelligence::lsp::adapter::MAX_DID_OPEN_BYTES;
+    let did_opens = |state: &std::path::Path| {
+        std::fs::read_to_string(state.join("did_open_seen.txt"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state) = fake_typescript_fixture(&temp, "definition");
+    let cap = MAX_DID_OPEN_BYTES as usize;
+    write(&workspace.path, "src/AtCap.ts", &"x".repeat(cap));
+    write(&workspace.path, "src/Generated.ts", &"x".repeat(cap + 1));
+    let manager = Manager::new(&config);
+    let adapter = typescript_adapter(&manager);
+    let at_cap = workspace.path.join("src/AtCap.ts");
+    let above_cap = workspace.path.join("src/Generated.ts");
+
+    // A file of exactly the cap is still opened, which also shows the count
+    // below is not vacuously unchanged. At least one: a restart after a slow
+    // first attempt runs the hook again.
+    let results = manager
+        .definition(&adapter, &workspace, &at_cap, "src/AtCap.ts", 1, 1)
+        .await
+        .unwrap();
+    assert!(!results.is_empty());
+    let opened = did_opens(&state);
+    assert!(opened >= 1, "a file of exactly the cap is opened");
+
+    let results = manager
+        .definition(&adapter, &workspace, &above_cap, "src/Generated.ts", 1, 1)
+        .await
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "the request is still sent and answered"
+    );
+    assert_eq!(did_opens(&state), opened, "the oversized file was not sent");
 }
 
 #[tokio::test]

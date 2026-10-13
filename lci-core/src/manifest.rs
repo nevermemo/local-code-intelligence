@@ -176,6 +176,9 @@ pub fn save(data_dir: &Path, manifest: &Manifest) -> Result<()> {
 }
 
 #[cfg(test)]
+mod properties;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{chunk, workspace::hash};

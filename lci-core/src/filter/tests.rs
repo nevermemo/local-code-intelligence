@@ -236,7 +236,6 @@ fn classifies_rust_test_files_by_name() {
         "src/config_test.rs",
         "src/config_tests.rs",
         "lci-core/src/app/search_tests.rs",
-        r"src\evaluate\tests.rs",
     ] {
         assert_eq!(classify_source_role(path), SourceRole::Test, "{path}");
     }
@@ -382,9 +381,40 @@ fn contest_and_latest_are_not_test_or_generated() {
 }
 
 #[test]
+#[cfg(windows)]
 fn backslash_separators_are_normalized() {
     assert_eq!(classify_source_role(r"tests\foo.rs"), SourceRole::Test);
     assert_eq!(classify_source_role(r"src\lib.rs"), SourceRole::Source);
+    assert_eq!(
+        classify_source_role(r"src\evaluate\tests.rs"),
+        SourceRole::Test
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_backslashes_are_filename_characters_in_filters_and_source_roles() {
+    let include = EffectiveFilter::from_request(&FilterRequest {
+        include_paths: Some(vec!["a/b.rs".into()]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(!include.matches("rust", r"a\b.rs", SourceRole::Source));
+
+    let exclude = EffectiveFilter::from_request(&FilterRequest {
+        exclude_paths: Some(vec!["a/b.rs".into()]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(exclude.matches("rust", r"a\b.rs", SourceRole::Source));
+
+    let root_file = EffectiveFilter::from_request(&FilterRequest {
+        include_paths: Some(vec!["*.rs".into()]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(root_file.matches("rust", r"a\b.rs", SourceRole::Source));
+    assert_eq!(classify_source_role(r"tests\lib.rs"), SourceRole::Source);
 }
 
 // -- GlobPattern -------------------------------------------------------

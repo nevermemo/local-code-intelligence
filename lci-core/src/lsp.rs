@@ -1196,7 +1196,7 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
             .strip_prefix(&workspace.path)
             .ok()
             .and_then(Path::to_str)
-            .map(|p| p.replace('\\', "/"));
+            .map(crate::path::normalize_path_separators);
         let Some(relative_file_path) = relative_file_path else {
             continue;
         };
@@ -1249,6 +1249,37 @@ mod tests {
         assert_eq!(result[0].language.as_deref(), Some("rust"));
         assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn location_preserves_backslash_in_unix_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            id: "test".into(),
+            path: dunce::canonicalize(temp.path()).unwrap(),
+        };
+        let file = workspace.path.join(r"a\b.rs");
+        std::fs::write(&file, "fn item() {}\n").unwrap();
+        std::fs::create_dir_all(workspace.path.join("a")).unwrap();
+        std::fs::write(workspace.path.join("a/b.rs"), "fn sibling() {}\n").unwrap();
+        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        let result = locations_for(
+            json!([{
+                "name":"item",
+                "kind":12,
+                "location":{
+                    "uri":uri,
+                    "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}
+                }
+            }]),
+            &workspace,
+            "rust-analyzer",
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].relative_file_path.as_deref(), Some(r"a\b.rs"));
     }
 
     #[test]

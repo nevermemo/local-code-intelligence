@@ -25,6 +25,44 @@ use std::{
     time::Duration,
 };
 
+/// A loopback port that refuses connections for as long as this value lives.
+/// Its socket is bound but never listens: a connection to it is refused, as
+/// to a port nothing holds, and no other socket can take the port meanwhile,
+/// neither another test's `127.0.0.1:0` bind nor a server that wrongly chose
+/// it. Binding a listener to learn a free port and dropping it guarantees
+/// neither: the next ephemeral bind of any test may get that port.
+///
+/// On macOS a connection to a bound socket that does not listen is not
+/// refused: the system drops it and the client waits for its timeout. There
+/// the port is 1 (`tcpmux`) and nothing is held: no service listens on it and
+/// an ephemeral bind never returns it, though a test cannot stop another
+/// process from binding it.
+struct ClosedPort {
+    #[cfg(not(target_os = "macos"))]
+    _socket: tokio::net::TcpSocket,
+    port: u16,
+}
+
+impl ClosedPort {
+    #[cfg(not(target_os = "macos"))]
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            _socket: socket,
+            port,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new() -> Self {
+        Self { port: 1 }
+    }
+}
+
 #[derive(Default)]
 struct FakeModels {
     documents: AtomicUsize,
@@ -45,6 +83,10 @@ struct FakeModels {
     rerank_requests: AtomicUsize,
     /// Longest single document (in bytes) any rerank request has carried.
     max_rerank_document_bytes: AtomicUsize,
+    /// When nonzero, every embedding is padded with zeros to this many
+    /// dimensions (the default vectors have three), as if the service behind
+    /// the same URL and model name started returning another width.
+    embedding_width: AtomicUsize,
 }
 
 fn evaluation_query() -> EvalQuery {
@@ -117,13 +159,17 @@ async fn embed(
             state.documents.fetch_add(1, Ordering::SeqCst);
             assert!(!text.starts_with("Instruct:"));
         }
-        let vector = if text.contains("translator") {
+        let mut vector = if text.contains("translator") {
             vec![1.0, 0.0, 0.0]
         } else if text.contains("buildProductionTelemetryPipeline") {
             vec![0.0, 1.0, 0.0]
         } else {
             vec![0.1, 0.1, 1.0]
         };
+        let width = state.embedding_width.load(Ordering::SeqCst);
+        if width > vector.len() {
+            vector.resize(width, 0.0);
+        }
         data.push(json!({"index":index, "embedding":vector}));
     }
     // OpenAI-compatible services may return embeddings out of order.
