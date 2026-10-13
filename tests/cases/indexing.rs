@@ -73,6 +73,74 @@ async fn search_reuses_previous_snapshot_before_held_index_job_finishes() {
     task.abort();
 }
 
+#[tokio::test]
+async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
+    const CHILD: &str = "LCI_TEST_DEEP_INDEX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexing::deeply_nested_modules_index_and_reuse_without_stack_overflow",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "deep indexing failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("deep-modules");
+    let source = format!(
+        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+        "mod m {\n".repeat(32768),
+        "}\n".repeat(32768)
+    );
+    write(&workspace, "lib.rs", &source);
+    let app = App::open(config.clone()).await.unwrap();
+    let report = app.index(&workspace).await.unwrap();
+    assert_eq!(report.files, 1);
+    assert_eq!(report.parsed_files, 1);
+    assert!(report.chunks > 0);
+    assert!(report.embedded_chunks > 0);
+    assert!(report.embedded_chunks <= report.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks
+    );
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(indexed.files.len(), 1);
+    assert_eq!(indexed.files[0].relative_file_path, "lib.rs");
+    assert_eq!(indexed.files[0].chunks, report.chunks);
+
+    drop(app);
+    let reopened = App::open(config).await.unwrap();
+    let repeat = reopened.index(&workspace).await.unwrap();
+    assert_eq!(repeat.parsed_files, 0);
+    assert_eq!(repeat.unchanged_files, 1);
+    assert_eq!(repeat.chunks, report.chunks);
+    assert_eq!(repeat.embedded_chunks, 0);
+    assert_eq!(repeat.reused_chunks, report.chunks);
+    assert_eq!(
+        fake.documents.load(Ordering::SeqCst),
+        report.embedded_chunks
+    );
+    task.abort();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_backslashes_preserve_indexed_names_and_result_paths() {
@@ -1706,6 +1774,52 @@ async fn a_refused_reranker_url_credential_is_not_reported() {
     let warning = report.warning.as_deref().unwrap();
     assert!(warning.contains("reranker request failed"), "{warning}");
     assert!(!warning.contains("marker"), "{warning}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_reranker_http_error_body_credential_is_not_reported() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let router = Router::new().route(
+        "/rerank",
+        post(|uri: axum::http::Uri| async move {
+            assert_eq!(
+                uri.path_and_query().unwrap().as_str(),
+                "/rerank?api_key=n89-marker"
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("rejected {}; retry later", uri.path_and_query().unwrap()),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reranker_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    config.reranker_url = format!("http://{address}/rerank?api_key=n89-marker");
+    let workspace = temp.path().join("reranker-body-credential");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+    app.index(&workspace).await.unwrap();
+
+    let report = app.search(&workspace, "translator", Some(1)).await.unwrap();
+
+    assert!(!report.reranked);
+    assert!(
+        !report.results.is_empty(),
+        "reranker failure must fail open"
+    );
+    let warning = report.warning.as_deref().unwrap();
+    assert!(
+        warning.contains(
+            "Reranker unavailable or invalid response; fusion-ranked results returned: reranker HTTP error: HTTP status 401: rejected /rerank?api_key=[redacted]; retry later"
+        ),
+        "{warning}"
+    );
+    assert!(!warning.contains("n89-marker"), "{warning}");
+    reranker_task.abort();
     task.abort();
 }
 
