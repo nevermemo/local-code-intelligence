@@ -1,7 +1,10 @@
 # Multimap traversal: idea catalogue
 
-Status: green-lit MVP. Every idea here is a candidate to build and benchmark. Benchmarks track improvement over time.
-Nothing here has to beat plain text search to be worth building.
+Status: a catalogue of candidates, not a plan. An idea is built only after a measurement shows its premise holds
+(the owner's working principle in `docs/development/roadmap.md`, "Strategy checkpoint": measure a premise before
+designing on it, prefer small falsification tests to idea volume). The agent A/B (I-10) decides first whether any of
+it is pursued; on CONTINUE, each map or interface is measured against native tools plus git and a language server,
+and only the winners are built (the roadmap's "Long-range map", branch 2).
 
 Sources:
 - the owner's design;

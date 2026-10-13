@@ -66,7 +66,7 @@ condition, so the tactic can be retried when the condition changes. No baseline 
 
 | Date (`date -u`) | Tactic | Condition observed | Runs (RunRecord ids) | Retry when |
 | --- | --- | --- | --- | --- |
-| (none yet) | | | | |
+| 2026-10-12 | Relation-as-rotation embeddings (RotatE, QuatE) as a link-suggestion map | On this Rust repository they tie Tree-sitter tags on held-out edges and lose to cheap heuristics on combined queries; fold-in does not unlearn removed edges. Parked by owner decision (2026-10-12T18:08Z), not by the two-run rule below. | none (experiment P1 of the representation research, not RunRecords: `representations-results.md` on `cloud/spike-repr` at `7fc2e86`) | A language lacks a cheap call parser, or edges must be predicted across repositories |
 
 Open decision (P-1): "two consecutive runs" and "no gain" (a paired 95% interval against the
 map's own control that includes zero) are taken here; the alternative is a pre-registered

@@ -10,6 +10,39 @@ additive: the production search path does not change, so they can merge as infra
 or sit unused whatever the A/B decides. Every later slice waits for the A/B unless its row
 says otherwise.
 
+**The checkpoint this spike overrides, and what it has answered.** The override sets aside
+the 2026-10-11 strategy checkpoint (`docs/development/roadmap.md`, "Strategy checkpoint
+(2026-10-11)"), whose independent sanity check found three things: (1) the premise that
+richer retrieval makes coding agents better has never been measured (I-10); (2) the
+retrieval sets no longer discriminate designs (the gold file is already in the top-24 pool
+for 44 of 46 queries, on one 92-file repository); (3) the earlier design run's
+pre-registered spikes falsified its strong synergy claims (tag edges, cards as reranker
+input, semantic hops, co-change weighting, neighbour injection, an embedder-free fast mode),
+and what survived (stable symbol identity, per-file derivation) is infrastructure that
+resembles existing systems. The spike has answered neither (1) nor (2): no slice measures an
+agent outcome, and its two new sets ([eval-seed.md](eval-seed.md),
+[gold-bugloc.md](gold-bugloc.md)) were written around maps by one author, as both say. On
+(3) it rebuilt the surviving half on this tree and measured it here, without re-testing any
+falsified claim: symbol identity ([s1-stability.md](s1-stability.md): the Rust symbol key is
+injective over 2,524 declarations; chunk ids kept 100% over 200 commit pairs, a measurement
+of this history, and 53 of 4,118 checked chunks in files with a repeated text were
+re-pointed) and per-file derivation (S3a's C4 auditor on
+`cloud/spike-s3a`, equal to a full rebuild at the replayed commits). [lessons.md](lessons.md)
+L9 to L12 carry the falsified results as conditions, not as new results. The independent
+sanity review of the spike (2026-10-12, `reports/sanity-spike.md` on `cloud/sanity-spike`)
+gave TRIM; the owner accepted it the same day.
+
+**Status after the trim (owner decision, 2026-10-12T18:08Z).** S1, S2 and S3a stay on their
+branches, unmerged, until the A/B result. Two pieces of work started outside this roadmap's
+gate, each under an owner decision, and are now trimmed: S3b (the RunRecord writer and C5, gated
+below to CONTINUE, and the S4 offline harness, gated to after the A/B; the owner's
+mandate at 13:25Z was "More work. Most importantly on multimap spike.", and the cloud monitor
+chose this scope under it; first commit 13:55Z on `cloud/spike-s3b`, where commit `5ddbc05` edited that branch's copy of the S4 row
+to "offline harness only" after the harness was built) and the map-representation research
+(`cloud/spike-repr`, owner decision 13:46Z, first commit 13:58Z; its pre-registration and results stay as documents, no
+further experiments before the A/B). No further S3b or S4 work, no S4 to S6 spec
+elaboration and no new idea lists start before the A/B.
+
 Where a slice can run:
 
 - **cloud**: no GPU, no model services, fake model service and fake LSP only
@@ -29,8 +62,8 @@ narrow to a fast fusion-only default, navigation ergonomics and robustness; shel
 | S0 | v0 specs, lessons, inventory | `docs/spike/multimap/` | cloud | no | done (cloud/spike-s0) |
 | S1 | `NodeId`: canonical strings, chunk ids `(path, content_hash, ordinal)`, symbol keys with the impl header; derived from scan output; stability measured on this repository's history | `lci-core/src/node.rs`, an `lci-core` example, `docs/spike/multimap/s1-stability.md` | cloud | no (owner override) | **yes** |
 | S2 | `lci-maps` crate: `Map` trait, request/response/cost/freshness, registry with fail-open, fusion loop; the three legacy channels and the source-role prior wrapped as maps; T0; contract-kit skeleton | `lci-maps/`, a wrapper module beside `src/app/search.rs` | cloud | no (owner override) | **yes** |
-| S3 | Extraction hook beside `chunks_with_adapter`, path-free per-file bundle sidecar, first stored map (`sym.defs`, declarations), RunRecord writer; contract kit C3, C4 (commit-replay auditor), C5 | `lci-core/src/chunk.rs` (hook), `lci-maps/` | cloud | no for the hook and `sym.defs`; RunRecord writer only on CONTINUE (Inferred) | no |
-| S4 | First end-to-end slice and trait freeze: lexical map plus `sym.defs` through NodeId, extraction and the harness; offline harness scoring of RunRecords | `lci-maps/`, `src/evaluate/` | cloud for the offline harness; owner for live rows | yes | no |
+| S3 | Extraction hook beside `chunks_with_adapter`, path-free per-file bundle sidecar, first stored map (`sym.defs`, declarations), RunRecord writer; contract kit C3, C4 (commit-replay auditor), C5 | `lci-core/src/chunk.rs` (hook), `lci-maps/` | cloud | no for the hook and `sym.defs`; RunRecord writer only on CONTINUE (Inferred) | S3a (hook, bundles, `sym.defs`, C3, C4) built on `cloud/spike-s3a`, kept unmerged; S3b (RunRecord writer, C5) built on `cloud/spike-s3b` outside this gate by owner decision, trimmed |
+| S4 | First end-to-end slice and trait freeze: lexical map plus `sym.defs` through NodeId, extraction and the harness; offline harness scoring of RunRecords | `lci-maps/`, `src/evaluate/` | cloud for the offline harness; owner for live rows | yes | offline harness built on `cloud/spike-s3b` outside this gate by owner decision, trimmed; nothing further before the A/B |
 | S5 | Traversal engine with yield points and resumable handles; `traverse_*` MCP tools and REST mirrors; `node_id` in `CandidateTrace`; non-chunk results (M-4) | `src/app/`, `src/server.rs`, `src/rest.rs` | cloud for offline tests; owner for agent studies | yes | no |
 | S6 (Inferred: no spec names it) | Measured map cards from RunRecords; C7 controls; the first expansion map (W1b) against its own no-graph and random controls | `docs/spike/multimap/cards/`, `lci-maps/` | owner (gold sets, live models) | yes, CONTINUE only | no |
 
@@ -77,3 +110,5 @@ S1 then S2 tonight, each gated by `cargo fmt --all --check`, clippy as in
 `docs/development/testing.md`, `cargo xtask test --suite Full` and
 `cargo xtask lint-machine-paths`, then an independent read-only review. S3 can start in the
 cloud before the A/B result for the hook and `sym.defs` only. S4 to S6 start after the A/B.
+After the trim (2026-10-12), nothing in S3b to S6 starts before the A/B. What a merge of S2 or S3a
+must change first: [merge-conditions.md](merge-conditions.md).
