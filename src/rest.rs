@@ -169,11 +169,16 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 /// `servers` names the loopback port the service is configured to listen on
 /// (`Config::port`), so the document is right for any port, not only 8768.
 fn openapi_document(port: u16) -> Value {
-    let workspace_schema = serde_json::to_value(schema_for!(WorkspaceArgs)).unwrap();
-    let search_schema = serde_json::to_value(schema_for!(SearchArgs)).unwrap();
-    let symbol_schema = serde_json::to_value(schema_for!(SymbolArgs)).unwrap();
-    let position_schema = serde_json::to_value(schema_for!(PositionArgs)).unwrap();
-    let references_schema = serde_json::to_value(schema_for!(ReferencesArgs)).unwrap();
+    let request_schema = |schema| {
+        let mut schema = serde_json::to_value(schema).unwrap();
+        schema.as_object_mut().unwrap().remove("$schema");
+        schema
+    };
+    let workspace_schema = request_schema(schema_for!(WorkspaceArgs));
+    let search_schema = request_schema(schema_for!(SearchArgs));
+    let symbol_schema = request_schema(schema_for!(SymbolArgs));
+    let position_schema = request_schema(schema_for!(PositionArgs));
+    let references_schema = request_schema(schema_for!(ReferencesArgs));
 
     let result_schema = json!({
         "type": "object",
@@ -202,6 +207,22 @@ fn openapi_document(port: u16) -> Value {
                     "500": {
                         "description": "Application error (mirrors the MCP tool's error text)",
                         "content": {"application/json": {"schema": error_schema}}
+                    },
+                    "400": {
+                        "description": "Invalid request body or query parameter (axum extractor rejection)",
+                        "content": {"text/plain": {"schema": {"type": "string"}}}
+                    },
+                    "415": {
+                        "description": "Unsupported request media type (axum extractor rejection)",
+                        "content": {"text/plain": {"schema": {"type": "string"}}}
+                    },
+                    "422": {
+                        "description": "Request body failed deserialization (axum extractor rejection)",
+                        "content": {"text/plain": {"schema": {"type": "string"}}}
+                    },
+                    "403": {
+                        "description": "Request rejected by the loopback guard",
+                        "content": {"application/json": {"schema": error_schema}}
                     }
                 }
             }
@@ -225,7 +246,7 @@ fn openapi_document(port: u16) -> Value {
     }]);
 
     json!({
-        "openapi": "3.0.3",
+        "openapi": "3.1.0",
         "info": {
             "title": "local-code-intelligence",
             "version": env!("CARGO_PKG_VERSION"),
@@ -251,6 +272,10 @@ fn openapi_document(port: u16) -> Value {
                         "200": {
                             "description": "Success",
                             "content": {"application/json": {"schema": result_schema}}
+                        },
+                        "403": {
+                            "description": "Request rejected by the loopback guard",
+                            "content": {"application/json": {"schema": error_schema}}
                         }
                     }
                 }

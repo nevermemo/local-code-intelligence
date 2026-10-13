@@ -141,22 +141,37 @@ async fn rest_surface_mirrors_the_mcp_tools() {
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(openapi["openapi"], "3.0.3");
-    for path in [
-        "/v1/index_workspace",
-        "/v1/index_status",
-        "/v1/list_indexed_files",
-        "/v1/watch_workspace",
-        "/v1/unwatch_workspace",
-        "/v1/search_symbols",
-        "/v1/find_definition",
-        "/v1/find_references",
-        "/v1/search_code",
-        "/v1/service_status",
+    assert_eq!(openapi["openapi"], "3.1.0");
+    for (path, method) in [
+        ("/v1/index_workspace", "post"),
+        ("/v1/index_status", "post"),
+        ("/v1/list_indexed_files", "post"),
+        ("/v1/watch_workspace", "post"),
+        ("/v1/unwatch_workspace", "post"),
+        ("/v1/release_workspace", "post"),
+        ("/v1/search_symbols", "post"),
+        ("/v1/find_definition", "post"),
+        ("/v1/find_references", "post"),
+        ("/v1/search_code", "post"),
+        ("/v1/service_status", "get"),
     ] {
-        assert!(openapi["paths"][path].is_object(), "{path}: {openapi}");
+        let operation = &openapi["paths"][path][method];
+        assert!(operation.is_object(), "{path}: {openapi}");
+        assert!(
+            operation["responses"]["403"].is_object(),
+            "{path}: {operation}"
+        );
+        if method == "post" {
+            let schema = &operation["requestBody"]["content"]["application/json"]["schema"];
+            assert!(schema.get("$schema").is_none(), "{path}: {schema}");
+            for status in ["400", "415", "422"] {
+                assert!(
+                    operation["responses"][status]["content"]["text/plain"].is_object(),
+                    "{path} response {status}: {operation}"
+                );
+            }
+        }
     }
-
     let indexed = client
         .post(format!("{base}/v1/index_workspace"))
         .json(&json!({"workspace_path": workspace}))
