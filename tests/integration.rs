@@ -12,6 +12,8 @@ mod mcp;
 mod navigation;
 #[path = "cases/readiness.rs"]
 mod readiness;
+// Calls `App::record_through_maps`, which exists only with this feature.
+#[cfg(feature = "spike-maps")]
 #[path = "cases/run_records.rs"]
 mod run_records;
 #[path = "cases/watching.rs"]
