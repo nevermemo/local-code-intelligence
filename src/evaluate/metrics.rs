@@ -1,8 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
-
 use crate::filter::GlobPattern;
 
 use super::types::{
