@@ -373,6 +373,19 @@ fn strings(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A probe scores the build only when both are frozen from one known
+/// commit: otherwise `defs` would describe another tree.
+pub fn check_probe_commit(probe: &Value, build: &Value) -> Result<()> {
+    match (probe["commit"].as_str(), build["commit"].as_str()) {
+        (Some(probe), Some(build)) if probe == build && probe != "unknown" => Ok(()),
+        _ => bail!(
+            "the defs probe ({}) and the binary ({}) are not frozen from one known commit",
+            probe["commit"],
+            build["commit"]
+        ),
+    }
+}
+
 /// Level B `defs` rows for a task whose probe never answered: one error row
 /// per gold name, so a failure counts in the same unit as the scored names.
 pub fn defs_error_rows(symbols: &[(String, Vec<String>)], reason: &str) -> Vec<Value> {
@@ -500,12 +513,7 @@ pub async fn run(options: Options) -> Result<()> {
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                 .unwrap_or_else(|| json!({"commit": "unknown"}));
-            if sidecar["commit"] != build["commit"] {
-                eprintln!(
-                    "warning: the defs probe ({}) and the binary ({}) are not frozen from one commit",
-                    sidecar["commit"], build["commit"]
-                );
-            }
+            check_probe_commit(&sidecar, &build)?;
             sidecar
         }
         None => Value::Null,
@@ -917,6 +925,18 @@ mod tests {
             assert_eq!(row["name"], json!(name));
             assert_eq!(row["gold_files"], json!(gold));
         }
+    }
+
+    #[test]
+    fn a_probe_from_another_or_an_unknown_commit_is_refused() {
+        let build = json!({"commit": "abc", "dirty": false});
+        assert!(check_probe_commit(&json!({"commit": "abc"}), &build).is_ok());
+        assert!(check_probe_commit(&json!({"commit": "def"}), &build).is_err());
+        // A missing sidecar reads as "unknown" on either side.
+        let unknown = json!({"commit": "unknown"});
+        assert!(check_probe_commit(&unknown, &build).is_err());
+        assert!(check_probe_commit(&unknown, &unknown).is_err());
+        assert!(check_probe_commit(&json!({}), &json!({})).is_err());
     }
 
     #[test]

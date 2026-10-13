@@ -51,10 +51,10 @@ cloud runner and CI do not have. v1 therefore measures:
   against the `lci-core` and `lci-maps` of the frozen commit's own tree, resolved
   offline from a copy of that tree's `Cargo.lock` (cargo prunes the entries the probe
   does not use, so `--locked` cannot be passed; `freeze-defs` instead refuses a probe
-  whose lock names a version missing from the tree's lock); `bench run --defs-probe <probe>`
-  runs it once per task at the
-  base commit. The probe scans the checkout with the core scanner, builds `sym.defs`
-  from the declaration bundles (its bundle store persists across a repository's tasks,
+  whose lock names a version missing from the tree's lock); `bench run --defs-probe
+  <probe>` runs it once per task at the base commit, and refuses a probe whose sidecar
+  commit is not the binary's (or is unknown). The probe scans the checkout with the
+  core scanner, builds `sym.defs` from the declaration bundles (its bundle store persists across a repository's tasks,
   so unchanged files reuse their bundles) and asks the map, through its own ranking
   (`symdefs::answer`, up to 50 hits), for each gold symbol's bare name. Scoring is the
   lookup proxy's: over the top 5 distinct files, `hit5` (a file whose changed
