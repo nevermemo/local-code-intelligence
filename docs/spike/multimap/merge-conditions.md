@@ -20,6 +20,24 @@ duplication. S2 repeats the production LSP arm in `LspMap`; S3a repeats the chun
 in `extract_with_adapter`; both put spike entry points on the public `App` facade. Each
 duplicate is kept equal by a test today. That is right for a spike and wrong for a merge.
 
+## Status on `cloud/spike-int` (2026-10-13)
+
+The integration branch `cloud/spike-int` carries S1, S2, S3a, the trim and S3b (merge commits
+`6f73fb9`, `97f0bff`, `2a09464`; the S3b merge makes S3b a merge candidate there, so the
+conditions that name it now apply). Integrator run 2 worked the conditions on it, one commit
+each. Nothing is merged into `fix/verified-bugs`; the "When" above still holds. Evidence:
+the commit messages, and `reports/spike-int.md` on `cloud/reports-spike-int`.
+
+| Condition | Status | Commit |
+| --- | --- | --- |
+| M1 one LSP orchestration | met | `a396aba` |
+| M2 one chunker | met | `2bdd0cb` (record), `da988f6` (switch) |
+| M3 entry points behind a test feature | met (owner's 2026-10-13 pick: test feature) | `de44a0c` |
+| M4 `SnapshotView::new` timed | partly met: timed on this repository in the cloud; the mined-set timing beside the end-to-end search p50 needs the owner's machine, and the acceptable share is the owner's to set | `cc3e5b1` |
+| M5 `spawn_blocking` for stored maps | met | `66b0710` |
+| M6 C5 check in `Registry::run` | met | `394faba` |
+| M7 hand-written schema checker kept | met (checked, nothing to change) | - |
+
 ## Conditions
 
 Each condition names what must be true in the merge candidate and how to check it. "T0"
@@ -46,6 +64,16 @@ Check:
 - `cargo xtask test --suite Lsp` passes.
 - Mutation spot check: change the shared function's warning text or budget; both a
   production-path test and a map-path test fail.
+
+Status (2026-10-13): **met** in `a396aba`. `App::applicable_lsp_adapters`,
+`lsp_symbol_queries`, `App::lsp_channel`, `App::lsp_over_budget_note` and
+`lsp_failure_warning` (`src/app/search.rs`) are called by both `search_once` and `LspMap`;
+`git grep -n "lsp_search_budget_ms" -- src/app` finds the budget read and the note text once.
+Lsp suite, the golden test, both traced-search tests and T0 pass with no expected value
+edited. Mutation: a zero budget in `App::lsp_channel` fails two production-path tests
+(`navigation::csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation`,
+`indexing::a_traced_search_records_the_rank_each_channel_gave_every_candidate`) and both
+traced-search tests.
 
 ### M2. One chunker (S3a)
 
@@ -74,6 +102,18 @@ Check:
   walk, time a full scan of this repository before and after on the same machine and record
   both; otherwise the declaration walk stays opt-in for callers that ask for it.
 
+Status (2026-10-13): **met**. `2bdd0cb` records the every-language tree's 44 chunks in
+`lci-core/src/chunk/golden/every_language_chunks.json` and adds
+`chunks_of_a_tree_of_every_language_match_the_record` (red with an empty record, green on the
+code before the switch); `da988f6` makes `chunks_with_adapter` and `extract_with_adapter`
+calls of one private `extract` (one `hash(code)`, one `ranges` walk). The record test passes
+after the switch; dropping the `trim` in `extract` fails it. The Chunk suite and the golden
+test pass. `node_stability --rev 66f999d --commits 200` prints the numbers of
+`s1-stability.md`. The declaration walk stays opt-in (`extract_with_adapter` only), so
+`chunks_for_path` pays nothing new and no scan timing was needed. After the switch the two
+hook-against-chunker tests compare a function with itself, as foreseen above; the
+whole-repository test still checks declarations and uncovered bytes.
+
 ### M3. Spike entry points behind a test feature (S2, S3b)
 
 `App::fuse_through_maps` (`src/app/search/legacy_maps.rs` line 615) and, on S3b,
@@ -99,6 +139,15 @@ Check:
 - `src/app/AGENTS.md` (preserve public paths) is satisfied: the default build adds no public
   path.
 
+Status (2026-10-13): **met** in `de44a0c`, with the owner's 2026-10-13 pick (test feature).
+Feature `spike-maps` on the root crate; `legacy_maps` (with `record.rs`) is
+`#[cfg(any(test, feature = "spike-maps"))]`; the two traced-search tests and
+`tests/cases/run_records.rs` are gated on it; `cargo xtask test --suite Full` (test and
+clippy) and `--suite Indexing` pass `--features local-code-intelligence/spike-maps`, and an
+xtask test checks that Full does. Without the feature, a probe calling both methods fails with
+E0599 and clippy on all targets is clean; with it, Full reported 812 tests, the 811 of the
+commit before plus the new xtask test.
+
 ### M4. `SnapshotView::new` timed on a realistic set (S2)
 
 `SnapshotView::new` (`lci-maps/src/lib.rs` lines 141-162) derives Chunk NodeIds for the
@@ -115,6 +164,16 @@ Check:
   beside the same queries' end-to-end search p50 (the E4 per-stage format).
 - The acceptable share of search latency is the owner's to set before the measurement, not
   after it.
+
+Status (2026-10-13): **partly met** in `cc3e5b1`. The example
+`lci-maps/examples/snapshot_view_timing.rs` times `SnapshotView::new` over a scan of a tree.
+On the cloud machine (4 cores), 50 runs each, release build: this repository, 4048 chunks,
+p50 3.94 ms, p95 4.24 ms, max 5.60 ms; the same chunks ten times (40480), p50 74.67 ms,
+p95 89.75 ms, max 91.88 ms. Debug build: 22.18 / 26.03 / 28.49 ms and 246.67 / 293.69 /
+339.35 ms. Ten times the chunks cost about nineteen times as much. Not met: the per-query
+timing over `evaluations/mined/self.toml` and the A/B's largest repository beside those
+queries' end-to-end search p50 (owner's machine, live embedder), and the acceptable share,
+which the owner sets before that measurement.
 
 ### M5. `spawn_blocking` for stored maps (S3a)
 
@@ -138,6 +197,19 @@ Check:
 - The bound on detached blocking work (a timed-out `spawn_blocking` task keeps running) is
   written down, with the maximum number in flight.
 
+Status (2026-10-13): **met** in `66b0710`, inside the map. `lci_maps::off_thread` runs a
+stored map's work with `tokio::task::spawn_blocking` and awaits it (a panic resumes in the
+map, so the registry reports it); `sym.defs` runs its token match there and projects onto
+the view afterwards. Kit case
+`a_stored_map_blocking_off_thread_misses_its_deadline_without_stalling_the_run`: work that
+blocks for twice the time to its deadline passes C1 with a 300 ms budget and a 250 ms slack,
+answers `Partial` with one note, and the control's answer is kept; with the work run inline it
+fails ("kept the run for 600.28ms, past 550ms"). Refresh: `Registry::run` never calls
+`Refreshable::refresh` or `fresh::prepare`, so it is not on the request path (wiring
+`prepare` into a search is S4's, K-10). Bound on detached work (`off_thread`'s doc): at
+most one task per stored map and search, and Tokio runs at most `max_blocking_threads` (512
+by default) at once, queueing the rest.
+
 ### M6. C5 check in `Registry::run` (S3b; owner decision 2026-10-12T18:08Z, B)
 
 S3b checks contract C5 (closed label vocabulary) by wrapping each registered map in
@@ -152,6 +224,15 @@ Check:
 - An `lci-maps` test registers a map with an unknown label directly (no wrapper) and
   `Registry::run` refuses its answer, naming the map; the existing three C5 tests pass.
 
+Status (2026-10-13): **met** in `394faba`. The registry's answer check ends with
+`labels::check_labels`; the legacy maps are registered bare (`git grep -n "Labelled::new" --
+src` finds nothing). New test `the_registry_refuses_an_answer_off_its_card_without_a_wrapper`
+(a bare mislabelled map and a bare evidence-less map each give the control's pool and one
+warning naming the map; red before). The three existing C5 tests pass unchanged; the kit's
+`check_source_labels` now asks the maps directly, since the registry refuses the answers it
+must still see. A refused partial answer keeps its own note and warning in the refusal, for
+every reason, not only a label.
+
 ### M7. Hand-written schema checker kept (S3b; owner decision 2026-10-12T18:08Z, B)
 
 S3b validates RunRecord lines with its own checker (`lci-maps/src/run_record/schema.rs`)
@@ -163,6 +244,10 @@ Check:
 - The merge's `Cargo.lock` diff adds no schema-validation crate (`git diff
   <base>..<candidate> -- Cargo.lock` lists `lci-maps` and nothing for JSON Schema).
 - The checker's tests in `lci-maps/src/run_record/tests.rs` pass.
+
+Status (2026-10-13): **met** on `cloud/spike-int` (checked, nothing changed). `git diff
+origin/fix/verified-bugs..cloud/spike-int -- Cargo.lock` adds the `lci-maps` package and its
+use by the root crate, and no schema-validation crate; the checker's tests pass in Full.
 
 ## Notes (not conditions of this merge)
 
