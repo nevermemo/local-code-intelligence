@@ -338,7 +338,12 @@ fn defs_means(results: &Value, repo: Option<&str>) -> Option<(f64, f64, usize, u
         .collect();
     let failed = tasks
         .iter()
-        .filter(|task| !task["defs"].is_array() && task["defs_build"].get("error").is_some())
+        .filter(|task| {
+            // Without per-name rows (an older file, or no gold names) a
+            // failed probe counts once.
+            task["defs"].as_array().is_none_or(Vec::is_empty)
+                && task["defs_build"].get("error").is_some()
+        })
         .count();
     let errors = rows.len() - scored.len() + failed;
     let n = scored.len();
@@ -805,6 +810,10 @@ mod tests {
         // A file from before per-name error rows: the failed task counts once.
         tasks[1]["repo"] = json!("caddy");
         tasks[1]["defs_build"] = json!({"error": "boom"});
+        // A failed task with no gold names has no rows: it counts once too.
+        tasks[2]["repo"] = json!("black");
+        tasks[2]["defs"] = json!([]);
+        tasks[2]["defs_build"] = json!({"error": "boom"});
         let verdict = compare(&base, &new, 7, 200);
         let row = |prefix: &str| {
             verdict
@@ -825,7 +834,12 @@ mod tests {
             verdict.table
         );
         assert!(
-            row("| defs hit@5").contains("| no scored names (errors=3) |"),
+            row("| defs black ").contains("| no scored names (errors=1) |"),
+            "{}",
+            verdict.table
+        );
+        assert!(
+            row("| defs hit@5").contains("| no scored names (errors=4) |"),
             "{}",
             verdict.table
         );
