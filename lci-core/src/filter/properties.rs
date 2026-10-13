@@ -165,13 +165,9 @@ fn glob_patterns_answer_the_same_for_every_spelling() {
     glob_patterns_answer_the_same(false);
 }
 
-/// Finding C1 (batch-c report, proposed roadmap row): `GlobPattern::compile`
-/// keeps a doubled separator, so `src//*.rs` compiles but matches no path,
-/// while `normalize_path` collapses repeated separators in the paths it is
-/// matched against. Ignored until the owner decides the row; `cargo test --
-/// --ignored doubled_separators` shows the failure.
+/// Finding C1: doubled separators in a glob pattern should be equivalent to
+/// single separators, as they are in normalized paths.
 #[test]
-#[ignore = "finding C1: a doubled separator in a glob pattern compiles but never matches"]
 fn glob_patterns_with_doubled_separators_answer_the_same() {
     let single = GlobPattern::compile("src/*.rs").unwrap();
     let doubled = GlobPattern::compile("src//*.rs").unwrap();

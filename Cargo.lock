@@ -6712,6 +6712,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "lci-core",
  "reqwest 0.13.5",
  "serde_json",
  "sha2 0.11.0",

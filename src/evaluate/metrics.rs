@@ -1,8 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
-
 use crate::filter::GlobPattern;
 
 use super::types::{
@@ -13,17 +11,7 @@ use super::types::{
 // Pure metrics
 // ---------------------------------------------------------------------------
 
-/// Validate a repository-relative path pattern.
-///
-/// Patterns must be non-empty, use `/` separators, and stay inside the
-/// repository: no backslashes, no absolute or drive/UNC paths, no `.` or
-/// `..` components, and no leading `/`. Glob metacharacters `*`, `?`, and
-/// `[...]` are allowed.
-pub fn validate_pattern(pattern: &str) -> Result<()> {
-    GlobPattern::compile(pattern)
-        .map(|_| ())
-        .map_err(Into::into)
-}
+pub use lci_core::evaluation::validate_pattern;
 
 /// Whether a repository-relative glob pattern matches a result path.
 ///
@@ -317,6 +305,7 @@ fn ndcg_at_10(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence]) -> f64 {
     }
 
     let mut expected_claimed = vec![false; expected.len()];
+    let mut expected_files_claimed = BTreeSet::new();
     let mut preferred_claimed = vec![false; preferred.len()];
     let dcg: f64 = evidence
         .iter()
@@ -324,13 +313,22 @@ fn ndcg_at_10(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence]) -> f64 {
         .enumerate()
         .map(|(index, row)| {
             let path = row.relative_file_path.as_str();
-            let gain = match claim_pattern(expected, &mut expected_claimed, path) {
-                Claim::Claimed => EXPECTED_GAIN,
-                Claim::Duplicate => 0.0,
-                Claim::Unmatched => match claim_pattern(preferred, &mut preferred_claimed, path) {
-                    Claim::Claimed => PREFERRED_GAIN,
-                    Claim::Unmatched | Claim::Duplicate => 0.0,
-                },
+            let gain = if expected_files_claimed.contains(path) {
+                0.0
+            } else {
+                match claim_pattern(expected, &mut expected_claimed, path) {
+                    Claim::Claimed => {
+                        expected_files_claimed.insert(path.to_owned());
+                        EXPECTED_GAIN
+                    }
+                    Claim::Duplicate => 0.0,
+                    Claim::Unmatched => {
+                        match claim_pattern(preferred, &mut preferred_claimed, path) {
+                            Claim::Claimed => PREFERRED_GAIN,
+                            Claim::Unmatched | Claim::Duplicate => 0.0,
+                        }
+                    }
+                }
             };
             discounted(gain, index + 1)
         })

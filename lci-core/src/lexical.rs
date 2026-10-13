@@ -50,6 +50,7 @@ pub struct LexicalMatch {
 pub struct LexicalSearch {
     pub terms: Vec<String>,
     pub matches: Vec<LexicalMatch>,
+    pub warning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -541,10 +542,21 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
         )
     })?;
     ensure!(
-        output.status.success() || output.status.code() == Some(1),
-        "ripgrep failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        output.status.code().is_some(),
+        "ripgrep terminated without an exit code: {}",
+        output.status
     );
+    let warning = output
+        .status
+        .code()
+        .filter(|&code| !matches!(code, 0 | 1))
+        .map(|code| {
+            let tail = &output.stderr[output.stderr.len().saturating_sub(512)..];
+            format!(
+                "Lexical retrieval incomplete: ripgrep exited with code {code}: {}",
+                String::from_utf8_lossy(tail).trim()
+            )
+        });
     let matcher = TermMatcher::new(&terms);
     // ripgrep repeats a file's path on each of its lines; resolving a path
     // touches the file system, so each distinct path is resolved once.
@@ -588,7 +600,11 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
             term_mask,
         });
     }
-    Ok(LexicalSearch { terms, matches })
+    Ok(LexicalSearch {
+        terms,
+        matches,
+        warning,
+    })
 }
 
 /// `reported` (as ripgrep printed it) relative to `root`, with `/` separators.
@@ -771,6 +787,111 @@ mod tests {
 
         // ripgrep reports absolute paths, so take the canonicalizing branch.
         assert_eq!(relative_to_root(&root, &root.join(r"a\b.rs")), r"a\b.rs");
+    }
+
+    #[cfg(unix)]
+    fn fake_ripgrep(temp: &TempDir, stdout: &str, stderr: &str, exit: i32) -> PathBuf {
+        let executable = temp.path().join("rg");
+        write_script(
+            &executable,
+            &format!(
+                "#!/bin/sh\ncat <<'STDOUT'\n{stdout}\nSTDOUT\ncat >&2 <<'STDERR'\n{stderr}\nSTDERR\nexit {exit}\n"
+            ),
+        );
+        executable
+    }
+
+    /// Writes an executable script and waits until it can be executed. A
+    /// child that another test thread forks while the file is open for
+    /// writing inherits that descriptor until its own exec, and executing
+    /// the script meanwhile fails with ETXTBSY; once one exec succeeds no
+    /// process can still hold it open for writing.
+    #[cfg(unix)]
+    fn write_script(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(path).output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_ripgrep_output_keeps_matches_and_warns() {
+        let temp = TempDir::new().unwrap();
+        let stderr = format!(
+            "{}\nblocked: Permission denied (os error 13)",
+            "x".repeat(2048)
+        );
+        let rg = fake_ripgrep(
+            &temp,
+            r#"{"type":"match","data":{"path":{"text":"lib.rs"},"lines":{"text":"fn needle() {}\n"},"line_number":7}}"#,
+            &stderr,
+            2,
+        );
+        let found = search(rg.to_str().unwrap(), temp.path(), "needle")
+            .await
+            .unwrap();
+        assert_eq!(found.terms, ["needle"]);
+        assert_eq!(found.matches.len(), 1);
+        assert_eq!(found.matches[0].relative_path, "lib.rs");
+        assert_eq!(found.matches[0].line, 7);
+        assert_eq!(found.matches[0].term_mask, 1);
+        let warning = found.warning.unwrap();
+        assert!(warning.contains("Permission denied (os error 13)"));
+        assert!(warning.len() < 600, "stderr warning is not bounded");
+
+        let rg = fake_ripgrep(&temp, "not JSON", "Permission denied", 2);
+        let error = search(rg.to_str().unwrap(), temp.path(), "needle")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid ripgrep JSON"));
+
+        write_script(&rg, "#!/bin/sh\nkill -TERM $$\n");
+        assert!(
+            search(rg.to_str().unwrap(), temp.path(), "needle")
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_ripgrep_output_without_matches_still_warns() {
+        let temp = TempDir::new().unwrap();
+        let rg = fake_ripgrep(&temp, "", "blocked: Permission denied (os error 13)", 2);
+        let found = search(rg.to_str().unwrap(), temp.path(), "needle")
+            .await
+            .unwrap();
+        assert!(found.matches.is_empty());
+        assert!(found.warning.unwrap().contains("Permission denied"));
+
+        for exit in [0, 1] {
+            let rg = fake_ripgrep(&temp, "", "", exit);
+            let found = search(rg.to_str().unwrap(), temp.path(), "needle")
+                .await
+                .unwrap();
+            assert!(found.matches.is_empty());
+            assert!(found.warning.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ripgrep_spawn_failure_still_fails() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing-ripgrep");
+        let error = search(missing.to_str().unwrap(), temp.path(), "needle")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("start ripgrep"));
+        assert!(error.to_string().contains("set ripgrep_path explicitly"));
     }
 
     #[test]

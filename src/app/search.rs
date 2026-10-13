@@ -911,8 +911,16 @@ impl App {
         if let Some((lexical_matches, lexical_ms)) = lexical_result {
             report.timings.lexical_search_ms = lexical_ms;
             match lexical_matches {
-                Ok(lexical_search) => {
+                Ok(mut lexical_search) => {
                     lexical_or_lsp_ran = true;
+                    if let Some(message) = lexical_search.warning.take() {
+                        report.warning = Some(
+                            report
+                                .warning
+                                .take()
+                                .map_or(message.clone(), |w| format!("{w}; {message}")),
+                        );
+                    }
                     lexical_hits = Self::map_lexical_matches(
                         &all_chunks,
                         lexical_search,
@@ -1530,6 +1538,7 @@ mod tests {
                     line: 1,
                     term_mask: 1,
                 }],
+                warning: None,
             },
             8,
         );
@@ -1566,6 +1575,7 @@ mod tests {
             crate::lexical::LexicalSearch {
                 terms: vec!["needle".into()],
                 matches,
+                warning: None,
             },
             8,
         );

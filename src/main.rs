@@ -39,15 +39,50 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+}
+
+impl ShutdownSignal {
+    const fn exit_code(self) -> u8 {
+        match self {
+            #[cfg(unix)]
+            Self::Interrupt => 130,
+            #[cfg(not(unix))]
+            Self::Interrupt => {
+                // Windows has no SIGTERM; Ctrl+C and Ctrl+Break both use 130.
+                130
+            }
+            #[cfg(unix)]
+            Self::Terminate => 143,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownSignalError(ShutdownSignal);
+
+impl std::fmt::Display for ShutdownSignalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stopped by a shutdown signal")
+    }
+}
+
+impl std::error::Error for ShutdownSignalError {}
+
 /// Resolves on Ctrl+C, or on SIGTERM on Unix, after cancelling
 /// `cancellation`. A signal whose wait fails is logged and never resolves
 /// (see [`cancel_on_signal`]), so the process keeps running instead of
 /// stopping at once.
-async fn shutdown_signal(cancellation: tokio_util::sync::CancellationToken) {
+async fn shutdown_signal(cancellation: tokio_util::sync::CancellationToken) -> ShutdownSignal {
     let ctrl_c = async {
         if !cancel_on_signal(tokio::signal::ctrl_c(), cancellation.clone()).await {
             std::future::pending::<()>().await;
         }
+        ShutdownSignal::Interrupt
     };
     #[cfg(unix)]
     let terminate = async {
@@ -62,14 +97,17 @@ async fn shutdown_signal(cancellation: tokio_util::sync::CancellationToken) {
         if !cancel_on_signal(signal, cancellation.clone()).await {
             std::future::pending::<()>().await;
         }
+        ShutdownSignal::Terminate
     };
     #[cfg(unix)]
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
+    {
+        tokio::select! {
+            signal = ctrl_c => signal,
+            signal = terminate => signal,
+        }
     }
     #[cfg(not(unix))]
-    ctrl_c.await;
+    ctrl_c.await
 }
 
 /// Stops the language servers cleanly instead of leaving it to the process
@@ -101,9 +139,9 @@ async fn until_shutdown_signal<T>(
 ) -> Result<T> {
     tokio::select! {
         result = command => result,
-        () = shutdown_signal(tokio_util::sync::CancellationToken::new()) => {
+        signal = shutdown_signal(tokio_util::sync::CancellationToken::new()) => {
             release_language_servers(app).await;
-            anyhow::bail!("stopped by a shutdown signal")
+            Err(ShutdownSignalError(signal).into())
         }
     }
 }
@@ -693,7 +731,20 @@ async fn run_init(config_path: Option<PathBuf>, options: init::Options, json: bo
 const DEFAULT_LOG_FILTER: &str = "local_code_intelligence=info,lci_core=info";
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
+    match run().await {
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
+        Err(error) => match error.downcast_ref::<ShutdownSignalError>() {
+            Some(signal) => {
+                eprintln!("Error: {error:#}");
+                Ok(std::process::ExitCode::from(signal.0.exit_code()))
+            }
+            None => Err(error),
+        },
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -929,13 +980,18 @@ async fn main() -> Result<()> {
                     profile_endpoints.join(", ")
                 );
             }
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let shutdown = async move {
+                let signal = shutdown_signal(cancellation).await;
+                let _ = shutdown_tx.send(signal);
+            };
             let served = axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown_signal(cancellation))
+                .with_graceful_shutdown(shutdown)
                 .await;
             // The server has stopped, gracefully (Ctrl+C or SIGTERM) or not.
             release_language_servers(&app).await;
             served?;
-            return Ok(());
+            return Err(ShutdownSignalError(shutdown_rx.await?).into());
         }
     };
     let json = serde_json::to_string_pretty(&output)?;
@@ -952,11 +1008,24 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LOG_FILTER, cancel_on_signal};
+    use super::{DEFAULT_LOG_FILTER, ShutdownSignal, cancel_on_signal};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 
     struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_exit_codes_follow_unix_conventions() {
+        assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
+        assert_eq!(ShutdownSignal::Terminate.exit_code(), 143);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_c_exit_code_uses_the_sigint_convention() {
+        assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
+    }
 
     #[tokio::test]
     async fn a_shutdown_signal_error_does_not_cancel() {

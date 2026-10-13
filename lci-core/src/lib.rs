@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod config;
+pub mod evaluation;
 pub mod filter;
 pub mod language;
 pub mod lexical;

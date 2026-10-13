@@ -673,12 +673,20 @@ impl Config {
     pub const MAX_LSP_TIMEOUT_SECONDS: u64 = 86_400;
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let config: Self = match path {
+        let mut config: Self = match path {
             Some(p) => toml::from_str(&std::fs::read_to_string(p).context("read configuration")?)?,
             None => Self::default(),
         };
+        config.trim_model_settings();
         config.validate()?;
         Ok(config)
+    }
+
+    fn trim_model_settings(&mut self) {
+        self.embedding_url = self.embedding_url.trim().to_owned();
+        self.embedding_model = self.embedding_model.trim().to_owned();
+        self.reranker_url = self.reranker_url.trim().to_owned();
+        self.reranker_model = self.reranker_model.trim().to_owned();
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -869,8 +877,12 @@ impl Config {
             );
         }
         ensure!(
-            !self.embedding_model.is_empty() && !self.reranker_model.is_empty(),
-            "model names must be nonempty"
+            !self.embedding_model.trim().is_empty(),
+            "embedding_model must be nonempty"
+        );
+        ensure!(
+            !self.reranker_model.trim().is_empty(),
+            "reranker_model must be nonempty"
         );
         Ok(())
     }
@@ -1018,6 +1030,30 @@ mod tests {
         assert!(config.csharp.path.is_none());
         assert!(config.csharp.args.is_empty());
         assert!(!config.csharp.disabled);
+    }
+
+    #[test]
+    fn whitespace_only_model_names_are_rejected_during_validation() {
+        for (name, config) in [
+            (
+                "embedding_model",
+                Config {
+                    embedding_model: " \t\n ".to_owned(),
+                    ..Config::default()
+                },
+            ),
+            (
+                "reranker_model",
+                Config {
+                    reranker_model: " \t\n ".to_owned(),
+                    ..Config::default()
+                },
+            ),
+        ] {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("nonempty"), "{error}");
+        }
     }
 
     #[test]
