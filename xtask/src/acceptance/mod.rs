@@ -645,15 +645,33 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
-    fn free_port_check_rejects_listener_and_accepts_after_drop() {
+    fn free_port_check_rejects_listener() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(
-            ensure_port_free(port).is_err(),
-            "an occupied loopback port must be rejected"
+        let error = ensure_port_free(port).expect_err("an occupied loopback port must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!("acceptance server port {port} is already in use")
         );
-        drop(listener);
-        assert!(ensure_port_free(port).is_ok());
+    }
+
+    #[test]
+    fn free_port_check_accepts_unoccupied_port() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            // Another test may claim the released port, so retry with a fresh one.
+            match ensure_port_free(port) {
+                Ok(()) => return,
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no unoccupied loopback port passed the check within 500 ms: {error}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
