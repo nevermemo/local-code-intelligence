@@ -199,6 +199,34 @@ pub fn defs_probe_manifest(src: &Path) -> Result<String> {
     ))
 }
 
+/// `name version` of every package in the probe's lock that the tree's
+/// lock does not hold (the probe's own package aside).
+pub fn foreign_lock_packages(tree: &str, probe: &str) -> Result<Vec<String>> {
+    fn packages(lock: &str) -> Result<Vec<(String, String)>> {
+        let lock: toml::Value = toml::from_str(lock).context("reading a Cargo.lock")?;
+        Ok(lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|package| {
+                let field = |key| package.get(key).and_then(toml::Value::as_str);
+                (
+                    field("name").unwrap_or_default().to_owned(),
+                    field("version").unwrap_or_default().to_owned(),
+                )
+            })
+            .collect())
+    }
+    let tree = packages(tree)?;
+    Ok(packages(probe)?
+        .into_iter()
+        .filter(|(name, _)| name != DEFS_PROBE)
+        .filter(|package| !tree.contains(package))
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect())
+}
+
 fn freeze_defs(src: &Path, out: &Path) -> Result<()> {
     let src = std::path::absolute(src)?;
     let out = std::path::absolute(out)?;
@@ -232,6 +260,17 @@ fn freeze_defs(src: &Path, out: &Path) -> Result<()> {
     anyhow::ensure!(
         status.success(),
         "cargo build of the defs probe failed: {status}"
+    );
+    // `--locked` cannot be passed (cargo prunes the copy), so check that
+    // the resolved lock holds only versions of the tree's lock.
+    let foreign = foreign_lock_packages(
+        &std::fs::read_to_string(src.join("Cargo.lock"))?,
+        &std::fs::read_to_string(package.join("Cargo.lock"))?,
+    )?;
+    anyhow::ensure!(
+        foreign.is_empty(),
+        "the defs probe resolved packages outside the tree's Cargo.lock: {}",
+        foreign.join(", ")
     );
     let built = target
         .join("debug")
@@ -411,6 +450,21 @@ pub async fn run(command: BenchCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_lock_with_a_version_the_tree_lacks_is_named() {
+        let tree = "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.1\"\n\n\
+                    [[package]]\nname = \"lci-core\"\nversion = \"0.1.0\"\n";
+        let same = "version = 4\n\n[[package]]\nname = \"bench-defs-probe\"\nversion = \"0.0.0\"\n\n\
+                    [[package]]\nname = \"serde\"\nversion = \"1.0.1\"\n";
+        assert!(foreign_lock_packages(tree, same).unwrap().is_empty());
+        let newer = same.replace("1.0.1", "1.0.2");
+        assert_eq!(
+            foreign_lock_packages(tree, &newer).unwrap(),
+            vec!["serde 1.0.2".to_owned()]
+        );
+        assert!(foreign_lock_packages("not toml [", same).is_err());
+    }
 
     #[test]
     fn the_defs_probe_package_depends_only_on_the_frozen_trees_crates() {

@@ -50,8 +50,8 @@ cloud runner and CI do not have. v1 therefore measures:
   --src <tree> --out <probe>` builds a small probe (`xtask/bench-defs-probe/main.rs`)
   against the `lci-core` and `lci-maps` of the frozen commit's own tree, resolved
   offline from a copy of that tree's `Cargo.lock` (cargo prunes the entries the probe
-  does not use, so `--locked` cannot be passed; a probe whose lock names a version
-  missing from the tree's lock is not that tree's); `bench run --defs-probe <probe>`
+  does not use, so `--locked` cannot be passed; `freeze-defs` instead refuses a probe
+  whose lock names a version missing from the tree's lock); `bench run --defs-probe <probe>`
   runs it once per task at the
   base commit. The probe scans the checkout with the core scanner, builds `sym.defs`
   from the declaration bundles (its bundle store persists across a repository's tasks,
