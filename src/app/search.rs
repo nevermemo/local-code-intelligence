@@ -1538,6 +1538,7 @@ mod tests {
                     line: 1,
                     term_mask: 1,
                 }],
+                warning: None,
             },
             8,
         );
