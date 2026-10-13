@@ -791,18 +791,35 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_ripgrep(temp: &TempDir, stdout: &str, stderr: &str, exit: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let executable = temp.path().join("rg");
-        std::fs::write(
+        write_script(
             &executable,
-            format!(
+            &format!(
                 "#!/bin/sh\ncat <<'STDOUT'\n{stdout}\nSTDOUT\ncat >&2 <<'STDERR'\n{stderr}\nSTDERR\nexit {exit}\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         executable
+    }
+
+    /// Writes an executable script and waits until it can be executed. A
+    /// child that another test thread forks while the file is open for
+    /// writing inherits that descriptor until its own exec, and executing
+    /// the script meanwhile fails with ETXTBSY; once one exec succeeds no
+    /// process can still hold it open for writing.
+    #[cfg(unix)]
+    fn write_script(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(path).output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -837,7 +854,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("invalid ripgrep JSON"));
 
-        std::fs::write(&rg, "#!/bin/sh\nkill -TERM $$\n").unwrap();
+        write_script(&rg, "#!/bin/sh\nkill -TERM $$\n");
         assert!(
             search(rg.to_str().unwrap(), temp.path(), "needle")
                 .await
