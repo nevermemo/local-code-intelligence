@@ -201,10 +201,7 @@ impl App {
     pub(super) async fn index_locked(&self, workspace: Workspace) -> Result<IndexReport> {
         let start = Instant::now();
         let _index = self.index_lock.lock().await;
-        let data_dir = self.config.data_dir.clone();
-        let _data_dir_lock =
-            tokio::task::spawn_blocking(move || super::lock_data_dir_for_indexing(&data_dir))
-                .await??;
+        let _data_dir_lock = super::lock_data_dir_for_indexing(&self.config.data_dir).await?;
         let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let root = workspace.path.clone();
         let prior_files = prior_manifest.files;

@@ -340,6 +340,34 @@ fn record_event(state_dir: Option<&Path>, name: &str) {
     }
 }
 
+/// Claims the lowest free start ordinal: creates `spawns/<n>` with
+/// `create_new`, which only one process can do for a given `n`, so servers
+/// started together each get their own ordinal (a read, increment and write
+/// of one counter file would let two of them both see 0 and both write 1).
+/// The ordinals have no gaps, so the number of entries in `spawns` is the
+/// number of starts. Also writes the ordinal to `spawn_count.txt`, which the
+/// tests whose starts never overlap read; when two starts overlap it holds
+/// whichever ordinal was written last, so a test about concurrent starts
+/// counts the entries in `spawns` instead.
+fn claim_spawn_ordinal(state_dir: &Path) -> io::Result<u64> {
+    let spawns = state_dir.join("spawns");
+    fs::create_dir_all(&spawns)?;
+    let mut ordinal = 1u64;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(spawns.join(ordinal.to_string()))
+        {
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => ordinal += 1,
+            Err(err) => return Err(err),
+        }
+    }
+    fs::write(state_dir.join("spawn_count.txt"), ordinal.to_string())?;
+    Ok(ordinal)
+}
+
 pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut stdin = io::stdin();
     let stdout = io::stdout();
@@ -357,15 +385,12 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
         request_count = value.trim().parse().unwrap_or(0);
     }
 
-    // Increment the spawn counter once per process invocation so tests can
-    // observe how many times the fake binary was started (e.g. to verify a
-    // single fresh retry after a failure).
+    // Count this process's start so tests can observe how many times the fake
+    // binary was started (e.g. to verify a single fresh retry after a
+    // failure). `spawn_count` is this process's ordinal (1 for the first).
     let mut spawn_count = 1u64;
     if let Some(path) = &config.state_dir {
-        let spawn_file = path.join("spawn_count.txt");
-        let current = fs::read_to_string(&spawn_file).unwrap_or_default();
-        spawn_count = current.trim().parse::<u64>().unwrap_or(0) + 1;
-        fs::write(&spawn_file, spawn_count.to_string())?;
+        spawn_count = claim_spawn_ordinal(path)?;
     }
 
     let mut symbol_requests = 0u64;
@@ -545,6 +570,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     Some("workspace/symbol"),
                 ) => {
                     symbol_requests += 1;
+                    // One line per `workspace/symbol` request (priming
+                    // included), so a test can tell which processes served.
+                    record_event(config.state_dir.as_deref(), "symbol_request_pids.txt");
                     if symbol_requests == config.exit_on_symbol_request && spawn_count == 1 {
                         process::exit(0);
                     }
