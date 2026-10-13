@@ -42,3 +42,6 @@ Base: a730ef1e6a38 (stored baseline (levels B, C)) at 2026-10-12T18:08:05Z; new:
 
 No regression under the pre-registered rules.
 - note: runs started more than 6 h apart: costs are printed, not judged (rule 4)
+
+<!-- Added by hand on 2026-10-13, not compare output. -->
+Cost (owner decision, 2026-10-13): this run and the baseline ran in different containers with the same machine fingerprint, so costs are reported and never judged under rule 4.

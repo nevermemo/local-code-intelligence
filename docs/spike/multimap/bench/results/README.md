@@ -70,10 +70,13 @@ commits have no `bench freeze`; each in its own worktree, binary hashes checked)
 | --- | --- | --- | --- |
 | `b87b16a` | `cloud/spike-s1s2` (S2) | the baseline's (`a730ef1` differs only in `xtask/`, docs, the workflow) | none: the tree has no `sym.defs` |
 | `b466f7f` | `cloud/spike-s3a` (S3a) | S2 plus the S3a maps | frozen from `b466f7f` |
-| `6f73fb9` | `cloud/spike-int` at 04:12Z | identical to `b466f7f` (`git diff` empty; same binary hash) | frozen from `6f73fb9` |
-| `2a09464` | `cloud/spike-int` at 04:58Z (trim and S3b merged) | S3a plus the trim and S3b | frozen from `2a09464` |
+| `6f73fb9` | `cloud/spike-int` head as seen at 04:12Z | identical to `b466f7f` (`git diff` empty; same binary hash) | frozen from `6f73fb9` |
+| `2a09464` | `cloud/spike-int` head as seen at 04:58Z (trim and S3b merged) | S3a plus the trim and S3b | frozen from `2a09464` |
 
-Commands (runner `xtask` frozen from `5661b1c` on `cloud/spike-bench-runs`; `<scratch>`
+Commands (`bench run` and `bench compare` from an `xtask` binary frozen at `5661b1c` on
+`cloud/spike-bench-runs`; the probes of `b466f7f` and `6f73fb9` were frozen by the same
+`freeze-defs` code before it was committed as `b23e597`, with their locks checked by
+hand, and the probe of `2a09464` by `d1c51ce`, which checks the lock itself; `<scratch>`
 is a directory outside the repository, `<tree>` a worktree of the build's commit):
 
 ```bash
@@ -91,7 +94,7 @@ cargo xtask bench run --bin <scratch>/bin/lci-<build> [--defs-probe <scratch>/bi
   --baseline docs/spike/multimap/bench/results/baseline-bc.json \
   --table <scratch>/out/<file>-vs-baseline.md
 # between iterations
-cargo xtask bench compare <older>-bc.json <newer>-bc.json
+cargo xtask bench compare <older>-bc.json <newer>-bc.json > <older>-vs-<newer>.md
 ```
 
 Stored files: `<file>-bc.json` (results), `<file>-vs-baseline.md` (comparison with the
@@ -101,7 +104,8 @@ twice: the same-build rerun).
 
 **Cost (rule 4):** every comparison with the baseline is printed, never judged on cost:
 the runs started more than 6 h after it, and by the owner's decision of 2026-10-13 runs
-from different containers are never judged on cost even with the same fingerprint. The
+from different containers are never judged on cost even with the same fingerprint. Each
+`-vs-baseline.md` ends with a hand-added footer (marked as such) that says so. The
 iteration comparisons ran in one container within 6 h, so rule 4 applies to them.
 
 ### `s2-b87b16a-bc.json`: S2 `b87b16a`, 04:46:24Z to 04:53:09Z (wall 406 s)
@@ -115,7 +119,7 @@ Level B: index size 93.9 MB (+1.0%), update p50 1329 ms, lookup proxy recall@5 0
 precision@5 0.136 (119 names), `defs` unavailable. Same files as the baseline on 60 of
 60 tasks in both arms. Verdict: no regression.
 
-### `s3a-b466f7f-bc.json`: S3a `b466f7f`, 04:57:45Z to 05:11:47Z (wall 842 s, of which the probe about 7 min)
+### `s3a-b466f7f-bc.json`: S3a `b466f7f`, 04:57:45Z to 05:11:47Z (wall 842 s; the probe's own time summed over tasks: 468 s)
 
 | Arm | MRR (rr) | hit@1 | hit@10 | recall@10 | total_ms p50 | rr delta vs baseline [95% CI] | W/L/T |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -125,7 +129,8 @@ precision@5 0.136 (119 names), `defs` unavailable. Same files as the baseline on
 Level B: index size 92.8 MB (-0.1%), update p50 1434 ms, lookup proxy 0.681 / 0.136.
 `defs` (hit@5 / precision@5, 0 errors): all 0.218 / 0.183 (n=119); tokio 0.703 / 0.588
 (n=37); caddy 0.000 / 0.000 (n=36); black 0.000 / 0.000 (n=46). Probe on tokio: 8,566
-declarations, about 8.6 s per task (scan plus build). Verdict: no regression.
+declarations at the first base commit (up to 9,430 later), about 8.6 s per task (scan
+plus build). Verdict: no regression.
 
 ### `int-6f73fb9-bc.json`: spike-int `6f73fb9`, 05:27:53Z to 05:41:51Z (wall 838 s)
 
@@ -169,8 +174,9 @@ Level B: index size 93.8 MB (+1.0%), update p50 1429 ms, lookup proxy 0.681 / 0.
   repository where it can score; caddy and black score 0 by construction, which pulls
   the three-repository mean down to 0.218 / 0.183. On tokio's 37 gold names it finds a
   changed declaration's file in the top 5 for 0.703 of names (the lookup proxy, a search
-  for the bare name: 0.730) with precision@5 0.588 (lookup: 0.146): about the same
-  recall, four times the precision, because it returns declarations, not text matches.
+  for the bare name: 0.730) with precision@5 0.588 (lookup: 0.146). The two instruments
+  score different things (the map's declaration files against a full-text search), so
+  these figures are reported side by side, not compared.
   `defs` did not change from S3a to `2a09464`. These are the map's library answers
   through the probe, not a production search path.
 - **Not measured:** level D (real embedder; network policy), `navigation` (no language
