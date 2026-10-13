@@ -239,7 +239,13 @@ reversed registration; the randomised thread pool is not done yet, and three cal
 catch a map that drifts only every fourth call or later. `check_real_failure` (added after
 the S2 review) runs the subject configured to fail for real and requires the control-only
 pool plus exactly one warning or note naming it: the injected faults never call the map, so
-without it a map that hides its error behind an empty `Ok` would pass C1.
+without it a map that hides its error behind an empty `Ok` would pass C1. The injected panic
+unwinds with `std::panic::resume_unwind` (changed 2026-10-13 on `cloud/spike-int`): the
+registry catches it as it catches `panic!`, but the panic hook does not run. With
+`RUST_BACKTRACE` set the hook captures and symbolises a backtrace, CPU work that ran inside
+the timed run and on a loaded machine took more than the slack (2.6 s in one Full gate). A
+real `panic!` map is still tested against the registry
+(`the_injected_panic_fails_the_map_without_running_the_panic_hook`).
 
 The kit's own tests (`lci-maps/src/tests.rs`): a known-good rank list and prior pass both; a
 map that blocks its thread past the deadline fails C1 (the registry's timeout cannot preempt

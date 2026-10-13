@@ -469,6 +469,9 @@ impl Map for Panicking {
 #[tokio::test]
 async fn the_injected_panic_fails_the_map_without_running_the_panic_hook() {
     static HOOKED: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    // Chained to the previous hook and never restored: restoring it would
+    // race with other tests of this binary that panic in parallel, and the
+    // chained hook behaves as the previous one for every other payload.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
