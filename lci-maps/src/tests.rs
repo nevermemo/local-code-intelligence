@@ -335,6 +335,26 @@ impl Map for Blocking {
     }
 }
 
+/// A stored map that does its work through `off_thread` (merge condition
+/// M5); here the work blocks its thread for twice the time to the deadline.
+struct OffThread(MapDescriptor);
+
+#[async_trait::async_trait]
+impl Map for OffThread {
+    fn describe(&self) -> &MapDescriptor {
+        &self.0
+    }
+
+    async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        let wait = request
+            .budget
+            .deadline
+            .saturating_duration_since(Instant::now());
+        crate::off_thread(move || std::thread::sleep(wait * 2)).await;
+        MapResponse::empty(&self.0, view, MapStatus::Ok)
+    }
+}
+
 /// Known-bad for C6: its answer depends on how often it was asked.
 struct Drifting(MapDescriptor, AtomicU32, Vec<NodeId>);
 
@@ -455,6 +475,46 @@ async fn the_kit_rejects_a_map_that_swallows_its_failure() {
         .await
         .unwrap_err();
     assert_eq!(failure.contract, "C1", "{failure:?}");
+}
+
+/// Merge condition M5: a stored map whose work blocks for twice its
+/// deadline, run through `off_thread`, does not stall the run. The run
+/// ends within the deadline plus the slack (250 ms; the work takes 600 ms,
+/// so the same work inline would end past it), the map's answer is a
+/// partial one with a note naming it, and the other map's answer is kept.
+#[tokio::test]
+async fn a_stored_map_blocking_off_thread_misses_its_deadline_without_stalling_the_run() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let fixture = Fixture {
+        view: &view,
+        text: "query",
+        budget: Duration::from_millis(300),
+        slack: Duration::from_millis(250),
+        rrf_k: 60.0,
+    };
+    let control = || fixed(&view, "control", Contribution::RankList, &[0, 1], None);
+    let subject =
+        || -> Box<dyn Map> { Box::new(OffThread(descriptor("stored", Contribution::RankList))) };
+    check_fail_open(&subject, &control, &fixture).await.unwrap();
+    let mut registry = Registry::new(60.0);
+    registry.register(subject(), 1.0, 40).unwrap();
+    registry.register(control(), 1.0, 40).unwrap();
+    let mut alone = Registry::new(60.0);
+    alone.register(control(), 1.0, 40).unwrap();
+    let alone = alone.run(Some("query"), fixture.budget, &view).await;
+    let started = Instant::now();
+    let run = registry.run(Some("query"), fixture.budget, &view).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= fixture.budget + fixture.slack,
+        "the run took {elapsed:?}"
+    );
+    assert_eq!(run.fused, alone.fused);
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+    let notes = run.notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].0, "stored");
 }
 
 /// A map whose query panics through `panic!`, so the panic hook runs.

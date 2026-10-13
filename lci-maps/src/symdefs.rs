@@ -22,6 +22,7 @@ use lci_core::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
     time::Instant,
 };
 
@@ -193,8 +194,15 @@ pub fn descriptor() -> MapDescriptor {
 /// that match one ignoring case; by symbol within each class. A chunk is
 /// listed once, at its best declaration.
 pub fn answer(index: &SymIndex, text: &str, limit: usize, view: &SnapshotView<'_>) -> Vec<MapHit> {
+    project(index, &ranked(index, text), limit, view)
+}
+
+/// The positions in `index.entries` of the declarations that match `text`,
+/// best first (the order of [`answer`]). Needs no view, so it can run off
+/// the async workers.
+fn ranked(index: &SymIndex, text: &str) -> Vec<usize> {
     let tokens = tokens(text);
-    let mut matched: Vec<(u8, &Entry)> = Vec::new();
+    let mut matched: Vec<(u8, &Entry, usize)> = Vec::new();
     let mut taken = HashSet::new();
     for token in &tokens {
         for &position in index
@@ -210,14 +218,30 @@ pub fn answer(index: &SymIndex, text: &str, limit: usize, view: &SnapshotView<'_
                 } else {
                     1
                 };
-                matched.push((class, entry));
+                matched.push((class, entry, position));
             }
         }
     }
-    matched.sort();
+    // Stable, by class and entry only: equal entries keep the order they
+    // were matched in.
+    matched.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    matched
+        .into_iter()
+        .map(|(_, _, position)| position)
+        .collect()
+}
+
+/// `ranked` projected onto the chunks of `view`, at most `limit` hits.
+fn project(
+    index: &SymIndex,
+    ranked: &[usize],
+    limit: usize,
+    view: &SnapshotView<'_>,
+) -> Vec<MapHit> {
     let mut hits: Vec<MapHit> = Vec::new();
     let mut listed = HashSet::new();
-    for (_, entry) in matched {
+    for &position in ranked {
+        let entry = &index.entries[position];
         if hits.len() == limit {
             break;
         }
@@ -259,7 +283,8 @@ pub struct SymDefs<P: Producer<Payload = Vec<StoredDeclaration>> = Declarations>
     descriptor: MapDescriptor,
     store: BundleStore,
     producer: P,
-    data: Option<SymIndex>,
+    /// Shared with the blocking half of `query` (`crate::off_thread`).
+    data: Option<Arc<SymIndex>>,
     /// What the last refresh found: (reused, extracted) bundles.
     pub last_sync: Option<(usize, usize)>,
     /// Why the last build could not delete unused bundles, if it could not.
@@ -291,7 +316,7 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>>> SymDefs<P> {
     }
 
     pub fn data(&self) -> Option<&SymIndex> {
-        self.data.as_ref()
+        self.data.as_deref()
     }
 
     /// Builds the data of `target` from the bundles, extracting the missing
@@ -300,12 +325,12 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>>> SymDefs<P> {
     pub fn build(&mut self, target: &Target<'_>) -> Result<(), String> {
         let synced = sync(&self.store, &self.producer, target.root, target.files)
             .map_err(|error| format!("{error:#}"))?;
-        self.data = Some(SymIndex::join(
+        self.data = Some(Arc::new(SymIndex::join(
             target.snapshot.clone(),
             target.files,
             &synced.payloads,
             CrateNames::read(target.root, target.files),
-        ));
+        )));
         self.last_sync = Some((synced.reused, synced.extracted));
         // `synced.keys` are this producer's only: the store must hold no
         // other producer's bundles (`BundleStore::retain`); today
@@ -349,7 +374,12 @@ impl<P: Producer<Payload = Vec<StoredDeclaration>>> Map for SymDefs<P> {
         };
         let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
         if let Some(text) = request.text {
-            response.hits = answer(data, text, request.limit, view);
+            // The match over every declaration runs off the async workers
+            // (merge condition M5); the projection onto the view borrows
+            // it, so it runs here.
+            let (index, owned) = (Arc::clone(data), text.to_owned());
+            let ranked = crate::off_thread(move || ranked(&index, &owned)).await;
+            response.hits = project(data, &ranked, request.limit, view);
         }
         response.freshness.snapshot = data.snapshot.clone();
         response.freshness.stale = data.snapshot != view.snapshot;

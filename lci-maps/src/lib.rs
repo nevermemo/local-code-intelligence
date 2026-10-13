@@ -568,6 +568,33 @@ impl<'a> Registry<'a> {
     }
 }
 
+/// Runs a stored map's CPU or file work on Tokio's blocking pool
+/// (`tokio::task::spawn_blocking`) and waits for it, so the work does not
+/// hold an async worker (merge condition M5). A map calls it from `query`
+/// for the part that needs no borrowed request or view data; the rest
+/// (projection onto the view, the limit) stays in `query`.
+///
+/// The registry's timeout pre-empts the wait: past the deadline the map's
+/// future, and this wait with it, is dropped and the run goes on with a
+/// note. The work itself cannot be stopped; it runs to its end, detached.
+/// Bound on that detached work: a map calls this at most once per query,
+/// so at most one task per stored map and search is in flight, and Tokio
+/// runs at most `max_blocking_threads` of them at once (512 unless the
+/// runtime sets another number), queueing the rest.
+///
+/// A panic in `work` resumes in the caller, so the registry reports it as
+/// the map's own panic.
+pub async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) => match error.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            // Only a runtime shutting down cancels a blocking task.
+            Err(error) => panic!("the blocking work of a map was cancelled: {error}"),
+        },
+    }
+}
+
 /// Today's `fusion_order`: score descending, then path, start line, end
 /// line and content hash of the chunk; the NodeId string only when a node
 /// is not a chunk of the view (contract C6).
