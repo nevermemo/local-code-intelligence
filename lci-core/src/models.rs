@@ -4,7 +4,10 @@ use serde::Deserialize;
 use std::{
     error::Error as _,
     io::ErrorKind,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -26,6 +29,11 @@ pub struct Models {
     /// doubles for each further one. A field so the tests need not wait a
     /// real second.
     initial_backoff: Duration,
+    /// Shared by every clone: the width of the vectors in the latest
+    /// successful embedding response (documents or a query), 0 before the
+    /// first one. Indexing compares it with the cached vectors' width, since
+    /// a service can change its width under an unchanged URL and model name.
+    observed_dimension: Arc<AtomicUsize>,
 }
 
 #[derive(Deserialize)]
@@ -343,7 +351,17 @@ impl Models {
             config: config.clone(),
             reranker_breaker: Arc::new(ConnectBreaker::new(RERANKER_DOWN_WINDOW)),
             initial_backoff: INITIAL_BACKOFF,
+            observed_dimension: Arc::default(),
         })
+    }
+
+    /// The vector width of the latest successful embedding response this
+    /// process received, or `None` before the first one.
+    pub fn observed_dimension(&self) -> Option<usize> {
+        match self.observed_dimension.load(Ordering::Relaxed) {
+            0 => None,
+            dimension => Some(dimension),
+        }
     }
     pub fn client(&self) -> &reqwest::Client {
         &self.client
@@ -393,6 +411,12 @@ impl Models {
     /// and dropped connections (see [`RetryPolicy`]).
     pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_with(inputs, RetryPolicy::Retry).await
+    }
+
+    /// Embeds documents with one attempt (see [`RetryPolicy::FailFast`]),
+    /// for an advisory request whose failure the caller tolerates.
+    pub async fn embed_once(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with(inputs, RetryPolicy::FailFast).await
     }
 
     async fn embed_with(&self, inputs: &[String], policy: RetryPolicy) -> Result<Vec<Vec<f32>>> {
@@ -457,10 +481,14 @@ impl Models {
             dimension = Some(item.embedding.len());
             ordered[item.index] = Some(item.embedding);
         }
-        ordered
+        let vectors = ordered
             .into_iter()
             .map(|v| v.context("missing embedding index"))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(dimension) = dimension {
+            self.observed_dimension.store(dimension, Ordering::Relaxed);
+        }
+        Ok(vectors)
     }
 
     /// The text embedded for `query`: `embedding_query_template` with its

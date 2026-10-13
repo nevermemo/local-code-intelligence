@@ -83,6 +83,10 @@ struct FakeModels {
     rerank_requests: AtomicUsize,
     /// Longest single document (in bytes) any rerank request has carried.
     max_rerank_document_bytes: AtomicUsize,
+    /// When nonzero, every embedding is padded with zeros to this many
+    /// dimensions (the default vectors have three), as if the service behind
+    /// the same URL and model name started returning another width.
+    embedding_width: AtomicUsize,
 }
 
 fn evaluation_query() -> EvalQuery {
@@ -155,13 +159,17 @@ async fn embed(
             state.documents.fetch_add(1, Ordering::SeqCst);
             assert!(!text.starts_with("Instruct:"));
         }
-        let vector = if text.contains("translator") {
+        let mut vector = if text.contains("translator") {
             vec![1.0, 0.0, 0.0]
         } else if text.contains("buildProductionTelemetryPipeline") {
             vec![0.0, 1.0, 0.0]
         } else {
             vec![0.1, 0.1, 1.0]
         };
+        let width = state.embedding_width.load(Ordering::SeqCst);
+        if width > vector.len() {
+            vector.resize(width, 0.0);
+        }
         data.push(json!({"index":index, "embedding":vector}));
     }
     // OpenAI-compatible services may return embeddings out of order.
