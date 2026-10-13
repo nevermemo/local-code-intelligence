@@ -15,12 +15,11 @@
 
 mod record;
 
-use super::{App, LspChannel};
+use super::{App, lsp_failure_warning, lsp_symbol_queries};
 use crate::{
     config::Config,
     filter::EffectiveFilter,
     lexical,
-    lsp::adapter::LspAdapter,
     store::{Hit, Snapshot, Store},
     workspace::Workspace,
 };
@@ -31,7 +30,6 @@ use lci_maps::{
 };
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -367,40 +365,14 @@ impl Map for LexicalMap<'_> {
 
 /// `lsp.symbols`: `workspace/symbol` queries to every applicable language
 /// server under `lsp_search_budget_ms`, merged query by query and mapped
-/// onto the snapshot's chunks. The orchestration repeats the LSP arm of
-/// `search_once` (which stays inline there so the production path is
-/// unchanged); the integration test that compares this registry with a
-/// traced search guards the two against drifting apart.
+/// onto the snapshot's chunks. Provider selection, the symbol queries, the
+/// budgeted fan-out and merge, and the note and warning texts are the
+/// functions the LSP arm of `search_once` calls.
 pub(crate) struct LspMap<'a> {
     pub(crate) app: &'a App,
     pub(crate) workspace: &'a Workspace,
     pub(crate) universe: &'a [Hit],
     pub(crate) descriptor: MapDescriptor,
-}
-
-impl LspMap<'_> {
-    /// The providers that apply to the universe's languages, enabled, one
-    /// per provider name (as `search_once` picks them).
-    fn applicable(&self) -> Vec<Arc<dyn LspAdapter>> {
-        let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
-        let languages: std::collections::HashSet<&str> = self
-            .universe
-            .iter()
-            .map(|hit| hit.chunk.language.as_str())
-            .collect();
-        for language in languages {
-            for adapter in self.app.analyzer.adapters_for_language(language) {
-                if adapter.enabled() {
-                    applicable
-                        .entry(adapter.provider())
-                        .or_insert_with(|| Arc::clone(adapter));
-                }
-            }
-        }
-        let mut providers: Vec<_> = applicable.into_values().collect();
-        providers.sort_by_key(|adapter| adapter.provider());
-        providers
-    }
 }
 
 #[lci_maps::async_trait]
@@ -411,7 +383,7 @@ impl Map for LspMap<'_> {
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
         let started = Instant::now();
-        let providers = self.applicable();
+        let providers = self.app.applicable_lsp_adapters(self.universe);
         if providers.is_empty() {
             return response(
                 &self.descriptor,
@@ -424,61 +396,17 @@ impl Map for LspMap<'_> {
                 0,
             );
         }
-        let mut symbol_queries = Vec::new();
-        for term in lexical::terms(request.text.unwrap_or_default()) {
-            if term.ends_with('s') && term.len() > 4 {
-                symbol_queries.push(format!("{}#", &term[..term.len() - 1]));
-            }
-            symbol_queries.push(format!("{term}#"));
-        }
-        symbol_queries.dedup();
-        symbol_queries.truncate(8);
-        let budget = Duration::from_millis(self.app.config.lsp_search_budget_ms);
-        let (app, workspace, queries) = (self.app, self.workspace, &symbol_queries);
-        let answers = futures::future::join_all(providers.iter().map(|adapter| async move {
-            let gathered = std::sync::Mutex::new(Vec::new());
-            let answer = tokio::time::timeout(
-                budget,
-                app.provider_symbols(adapter, workspace, queries, &gathered),
-            )
+        let symbol_queries = lsp_symbol_queries(request.text.unwrap_or_default());
+        let channel = self
+            .app
+            .lsp_channel(&providers, self.workspace, &symbol_queries)
             .await;
-            let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
-            (adapter.provider(), gathered, answer)
-        }))
-        .await;
-        let mut channel = LspChannel::default();
-        let mut per_provider = Vec::new();
-        for (provider, gathered, answer) in answers {
-            per_provider.push(gathered);
-            match answer {
-                Ok(failure) => channel.failures.extend(failure),
-                Err(_) => channel.over_budget.push(provider),
-            }
-        }
-        for index in 0..symbol_queries.len() {
-            for locations in &mut per_provider {
-                if let Some(found) = locations.get_mut(index) {
-                    channel.locations.append(found);
-                }
-            }
-        }
         let calls = (providers.len() * symbol_queries.len()) as u32;
         let hits = App::map_lsp_locations(self.universe, channel.locations, request.limit);
-        let note = (!channel.over_budget.is_empty()).then(|| {
-            format!(
-                "LSP still starting or slow; symbol results from {} are missing or incomplete \
-                 for this search (lsp_search_budget_ms = {}). The server keeps starting in the \
-                 background.",
-                channel.over_budget.join(", "),
-                self.app.config.lsp_search_budget_ms
-            )
-        });
-        let warning = (!channel.failures.is_empty()).then(|| {
-            format!(
-                "Optional LSP provider unavailable: {}",
-                channel.failures.join("; ")
-            )
-        });
+        let note = (!channel.over_budget.is_empty())
+            .then(|| self.app.lsp_over_budget_note(&channel.over_budget));
+        let warning =
+            (!channel.failures.is_empty()).then(|| lsp_failure_warning(&channel.failures));
         let status = lsp_status(
             note,
             warning,
