@@ -310,6 +310,60 @@ fn lookup_means(results: &Value) -> Option<(f64, f64, usize)> {
     Some((recall, precision, rows.len()))
 }
 
+/// Level B `defs` (the `sym.defs` probe): (hit@5, precision@5, scored
+/// names, errored names), over the tasks of `repo` or all; a failed probe
+/// without per-name rows counts once. `None` when the results carry no
+/// probe.
+fn defs_means(results: &Value, repo: Option<&str>) -> Option<(f64, f64, usize, usize)> {
+    let tasks = results["tasks"].as_array()?;
+    if !tasks
+        .iter()
+        .any(|task| task["defs"].is_array() || !task["defs_build"].is_null())
+    {
+        return None;
+    }
+    let tasks: Vec<&Value> = tasks
+        .iter()
+        .filter(|task| repo.is_none_or(|repo| task["repo"] == repo))
+        .collect();
+    let rows: Vec<&Value> = tasks
+        .iter()
+        .filter_map(|task| task["defs"].as_array())
+        .flatten()
+        .collect();
+    let scored: Vec<&Value> = rows
+        .iter()
+        .copied()
+        .filter(|row| row.get("error").is_none() && row["precision5"].is_number())
+        .collect();
+    let failed = tasks
+        .iter()
+        .filter(|task| !task["defs"].is_array() && task["defs_build"].get("error").is_some())
+        .count();
+    let errors = rows.len() - scored.len() + failed;
+    let n = scored.len();
+    if n == 0 {
+        return Some((0.0, 0.0, 0, errors));
+    }
+    let hit = scored.iter().filter(|r| r["hit5"] == true).count() as f64 / n as f64;
+    let precision = scored.iter().map(|r| metric(r, "precision5")).sum::<f64>() / n as f64;
+    Some((hit, precision, n, errors))
+}
+
+/// One side of the `defs` row: its means, or why there are none.
+fn fmt_defs(side: Option<(f64, f64, usize, usize)>) -> String {
+    side.map_or_else(
+        || "unavailable".to_owned(),
+        |(hit, precision, n, errors)| {
+            if n == 0 {
+                format!("no scored names (errors={errors})")
+            } else {
+                format!("{hit:.3} / {precision:.3} (n={n}, errors={errors})")
+            }
+        },
+    )
+}
+
 pub struct Verdict {
     pub table: String,
     pub regressions: Vec<String>,
@@ -515,6 +569,40 @@ pub fn compare(base: &Value, new: &Value, seed: u64, resamples: usize) -> Verdic
             b.2, n.2, b.0, b.1, n.0, n.1
         );
     }
+    let (defs_base, defs_new) = (defs_means(base, None), defs_means(new, None));
+    if defs_base.is_some() || defs_new.is_some() {
+        let _ = writeln!(
+            table,
+            "| defs hit@5 / precision@5 (sym.defs probe) | {} | {} | reported only |",
+            fmt_defs(defs_base),
+            fmt_defs(defs_new)
+        );
+        let mut repos: Vec<&str> = [base, new]
+            .iter()
+            .filter_map(|results| results["tasks"].as_array())
+            .flatten()
+            .filter_map(|task| task["repo"].as_str())
+            .collect();
+        repos.sort_unstable();
+        repos.dedup();
+        for repo in repos {
+            let _ = writeln!(
+                table,
+                "| defs {repo} | {} | {} | reported only |",
+                fmt_defs(defs_means(base, Some(repo))),
+                fmt_defs(defs_means(new, Some(repo)))
+            );
+        }
+        for (side, results) in [("base", base), ("new", new)] {
+            let probe = &results["defs_probe"];
+            if probe.is_object() && probe["commit"] != results["build"]["commit"] {
+                notes.push(format!(
+                    "{side}: the defs probe is not frozen from the build's commit ({} against {})",
+                    probe["commit"], results["build"]["commit"]
+                ));
+            }
+        }
+    }
     if !same_machine {
         notes.push("machines differ: costs are printed, not judged (rule 4)".to_owned());
     } else if !back_to_back {
@@ -657,6 +745,98 @@ mod tests {
         base_more["tasks"][0]["arms"]["fusion"] = json!({"error": "boom"});
         let verdict = compare(&base_more, &short, 42, 1000);
         assert!(verdict.table.contains("not claimable"), "{}", verdict.table);
+    }
+
+    #[test]
+    fn defs_are_reported_beside_an_unavailable_side_and_never_judged() {
+        let base = results(&[0.5; 40], "m", 100.0);
+        let mut new = results(&[0.5; 40], "m", 100.0);
+        let tasks = new["tasks"].as_array_mut().unwrap();
+        tasks[0]["defs"] = json!([
+            {"name": "a", "hit5": true, "precision5": 0.5},
+            {"name": "b", "hit5": false, "precision5": 0.0},
+            {"name": "c", "error": "name missing from the probe report"},
+        ]);
+        tasks[1]["defs"] = json!([{"name": "d", "hit5": true, "precision5": 1.0}]);
+        tasks[2]["defs_build"] = json!({"error": "probe failed"});
+        tasks[0]["repo"] = json!("tokio");
+        tasks[1]["repo"] = json!("caddy");
+        tasks[2]["repo"] = json!("caddy");
+        let verdict = compare(&base, &new, 7, 200);
+        // Per repository too: a map may cover one language only.
+        let repo_row = |repo: &str| {
+            verdict
+                .table
+                .lines()
+                .find(|line| line.starts_with(&format!("| defs {repo} ")))
+                .unwrap_or_else(|| panic!("no defs {repo} row in\n{}", verdict.table))
+                .to_owned()
+        };
+        assert!(repo_row("tokio").contains("0.500 / 0.250 (n=2, errors=1)"));
+        assert!(repo_row("caddy").contains("1.000 / 1.000 (n=1, errors=1)"));
+        let row = verdict
+            .table
+            .lines()
+            .find(|line| line.starts_with("| defs "))
+            .unwrap_or_else(|| panic!("no defs row in\n{}", verdict.table));
+        assert!(row.contains("| unavailable |"), "{row}");
+        assert!(row.contains("0.667 / 0.500 (n=3, errors=2)"), "{row}");
+        assert!(row.ends_with("| reported only |"), "{row}");
+        assert!(verdict.regressions.is_empty(), "{:?}", verdict.regressions);
+        // No probe on either side: no row.
+        assert!(!compare(&base, &base, 7, 200).table.contains("| defs "));
+    }
+
+    #[test]
+    fn defs_count_a_failed_probe_once_per_name_and_flag_a_foreign_probe() {
+        let base = results(&[0.5; 40], "m", 100.0);
+        let mut new = results(&[0.5; 40], "m", 100.0);
+        new["build"] = json!({"commit": "b"});
+        new["defs_probe"] = json!({"commit": "p"});
+        let tasks = new["tasks"].as_array_mut().unwrap();
+        // A failed probe on a task with two gold names: two error rows
+        // beside the build error, counted as two, not three.
+        tasks[0]["repo"] = json!("tokio");
+        tasks[0]["defs"] = json!([
+            {"name": "a", "error": "defs probe failed: boom"},
+            {"name": "b", "error": "defs probe failed: boom"},
+        ]);
+        tasks[0]["defs_build"] = json!({"error": "boom"});
+        // A file from before per-name error rows: the failed task counts once.
+        tasks[1]["repo"] = json!("caddy");
+        tasks[1]["defs_build"] = json!({"error": "boom"});
+        let verdict = compare(&base, &new, 7, 200);
+        let row = |prefix: &str| {
+            verdict
+                .table
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix} row in\n{}", verdict.table))
+                .to_owned()
+        };
+        assert!(
+            row("| defs tokio ").contains("| no scored names (errors=2) |"),
+            "{}",
+            verdict.table
+        );
+        assert!(
+            row("| defs caddy ").contains("| no scored names (errors=1) |"),
+            "{}",
+            verdict.table
+        );
+        assert!(
+            row("| defs hit@5").contains("| no scored names (errors=3) |"),
+            "{}",
+            verdict.table
+        );
+        assert!(
+            verdict
+                .table
+                .contains("new: the defs probe is not frozen from the build's commit"),
+            "{}",
+            verdict.table
+        );
+        assert!(verdict.regressions.is_empty(), "{:?}", verdict.regressions);
     }
 
     #[test]

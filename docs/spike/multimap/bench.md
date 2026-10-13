@@ -219,8 +219,8 @@ An improvement is claimed only by rule 1 mirrored (interval entirely above zero)
 zero errored and zero unpaired tasks on either side, and the W/L/T beside it.
 
 Never a regression by itself: the `grep` arm (measured and reported, never a gate),
-`hit10` and `recall10`, the `lookup` proxy (a drop is a question, not a verdict), chunk
-counts, and any interval that contains zero.
+`hit10` and `recall10`, the `lookup` proxy (a drop is a question, not a verdict), the
+`defs` probe (same), chunk counts, and any interval that contains zero.
 
 Level D: a same-build rerun comes first. Its interval must contain zero (the noise
 floor, as for the reranker-off semantic arm in the evaluation workflow) before a
