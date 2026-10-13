@@ -171,3 +171,34 @@ fn hook_keeps_the_scan_order_of_chunks() {
         serde_json::to_string(&scanned).unwrap()
     );
 }
+
+/// The chunks of the every-language tree, recorded from `chunks_with_adapter`
+/// while it still had its own body (merge condition M2). Once the chunker is
+/// the hook, comparing the two compares a function with itself; this record
+/// is what keeps today's chunk output pinned. Change it only with an
+/// intended chunking change, and say so in the commit.
+const EVERY_LANGUAGE_CHUNKS: &str = include_str!("golden/every_language_chunks.json");
+
+#[test]
+fn chunks_of_a_tree_of_every_language_match_the_record() {
+    let temp = tempfile::tempdir().unwrap();
+    write_multilanguage_tree(temp.path());
+    let mut today = Vec::new();
+    let mut hooked = Vec::new();
+    for file in sources(temp.path()).unwrap().files {
+        let path = &file.relative_path;
+        today.extend(chunks_with_adapter(path, &file.source, file.adapter).unwrap());
+        hooked.extend(
+            extract_with_adapter(path, &file.source, file.adapter)
+                .unwrap()
+                .chunks,
+        );
+    }
+    let recorded: Vec<Chunk> = serde_json::from_str(EVERY_LANGUAGE_CHUNKS).unwrap();
+    assert!(recorded.len() >= 24, "{} recorded chunks", recorded.len());
+    // Pretty JSON, one field per line: byte identity of every field and of
+    // the order, with a readable difference on failure.
+    let text = |chunks: &[Chunk]| serde_json::to_string_pretty(chunks).unwrap();
+    assert_eq!(text(&today), text(&recorded), "chunks_with_adapter");
+    assert_eq!(text(&hooked), text(&recorded), "extract_with_adapter");
+}
