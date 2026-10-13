@@ -32,8 +32,8 @@
 //! The result is evaluation data, never ranking input: it is generated, not
 //! hand-edited, and must not be used to tune retrieval.
 //!
-//! Everything except [`run`] is pure (text in, text out) so it is tested on
-//! synthetic `git log` output without a repository.
+//! History parsing and mining are pure (text in, text out), tested on synthetic
+//! `git log` output; command tests also exercise temporary repositories.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -41,12 +41,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
+use lci_core::evaluation::{EvaluationFile, validate_definition};
 
 /// Extensions LCI indexes (exact, lowercase). Mirrors the `extension` fields
-/// of `ADAPTERS` in `lci-core/src/language.rs`; xtask does not depend on
-/// `lci-core` because that would compile every Tree-sitter grammar for each
-/// `cargo xtask` run. The `extensions_match_the_language_registry` test fails
-/// when the two drift apart.
+/// of `ADAPTERS` in `lci-core/src/language.rs`. The
+/// `extensions_match_the_language_registry` test fails when the two drift apart.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "cs", "go", "java", "c", "cpp", "hpp",
 ];
@@ -356,7 +355,7 @@ fn has_supported_extension(path: &str) -> bool {
 /// Lockfiles, vendored and generated paths, and paths that cannot be written
 /// as an exact evaluation pattern (glob metacharacters, backslashes).
 fn is_excluded_path(path: &str) -> bool {
-    if path.contains(['*', '?', '[', ']', '\\']) {
+    if path.contains(['*', '?', '[', ']', '{', '}', '\\']) {
         return true;
     }
     let mut parts: Vec<&str> = path.split('/').collect();
@@ -946,6 +945,18 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn write_definition(out: &Path, rendered: &str) -> Result<()> {
+    let definition: EvaluationFile =
+        toml::from_str(rendered).context("failed to parse mined evaluation definition")?;
+    validate_definition(&definition).context("invalid mined evaluation definition")?;
+
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(out, rendered).with_context(|| format!("failed to write {}", out.display()))
+}
+
 pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
     ensure!(!key.trim().is_empty(), "--key must not be empty");
     ensure!(max > 0, "--max must be at least 1");
@@ -976,6 +987,7 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
             "log",
             "--no-merges",
             "--name-status",
+            "-M",
             "--no-color",
             "--no-show-signature",
             "--encoding=UTF-8",
@@ -1023,12 +1035,7 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
         mined.scanned
     );
 
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::write(&out, render_toml(&key, &head, max, &mined.queries))
-        .with_context(|| format!("failed to write {}", out.display()))?;
+    write_definition(&out, &render_toml(&key, &head, max, &mined.queries))?;
 
     let count = |tag: &str| {
         mined
@@ -1063,6 +1070,30 @@ pub fn run(repo: PathBuf, key: String, out: PathBuf, max: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lci_core::evaluation::{EvaluationFile, validate_definition};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "xtask-mine-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn change(status: char, path: &str) -> Change {
         Change {
@@ -2061,6 +2092,91 @@ mod tests {
     }
 
     // -- paths ----------------------------------------------------------------
+
+    #[test]
+    fn brace_paths_are_excluded() {
+        for path in ["src/{id}/page.tsx", "src/{id/page.tsx", "src/id}/page.tsx"] {
+            assert!(is_excluded_path(path), "{path}");
+            assert!(!is_eligible_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn invalid_rendered_definition_is_not_written() {
+        let tmp = TempDir::new();
+        let query = MinedQuery {
+            commit: "0123456789abcdef".to_owned(),
+            subject: "Handle dynamic route pages correctly".to_owned(),
+            query: "Handle dynamic route pages correctly".to_owned(),
+            expected_paths: vec!["src/{id/page.tsx".to_owned()],
+            tags: vec!["keyword-agnostic"],
+        };
+        let rendered = render_toml("fixture", "deadbeef", 1, &[query]);
+        let definition: EvaluationFile = toml::from_str(&rendered).unwrap();
+        assert!(validate_definition(&definition).is_err());
+
+        let out = tmp.0.join("output/queries.toml");
+        let error = write_definition(&out, &rendered).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid mined evaluation definition")
+        );
+        assert!(!out.parent().unwrap().exists());
+
+        let existing = tmp.0.join("existing.toml");
+        std::fs::write(&existing, "existing definition").unwrap();
+        assert!(write_definition(&existing, &rendered).is_err());
+        assert_eq!(
+            std::fs::read_to_string(existing).unwrap(),
+            "existing definition"
+        );
+    }
+
+    #[test]
+    fn follows_git_renames_when_config_disables_detection() {
+        let tmp = TempDir::new();
+        let repo = tmp.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        git(&repo, &["config", "--local", "diff.renames", "false"]).unwrap();
+        std::fs::write(repo.join("old.rs"), "fn retrieve() {}\n").unwrap();
+        git(&repo, &["add", "old.rs"]).unwrap();
+        let commit_fixture = |subject: &str| {
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    subject,
+                ],
+            )
+            .unwrap();
+        };
+        let subject = "Handle retrieval requests without blocking";
+        commit_fixture(subject);
+        git(&repo, &["mv", "old.rs", "new.rs"]).unwrap();
+        commit_fixture("Move retrieval into another module");
+
+        let out = tmp.0.join("queries.toml");
+        run(repo, "fixture".to_owned(), out.clone(), 10).unwrap();
+        let definition: EvaluationFile =
+            toml::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
+        validate_definition(&definition).unwrap();
+        let original = definition
+            .queries
+            .iter()
+            .find(|query| query.query == subject)
+            .expect("the original commit must survive the later rename");
+        assert_eq!(original.expected_paths, ["new.rs"]);
+    }
 
     #[test]
     fn extension_and_path_rules() {

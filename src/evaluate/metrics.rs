@@ -1,8 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
-
 use crate::filter::GlobPattern;
 
 use super::types::{
@@ -13,17 +11,7 @@ use super::types::{
 // Pure metrics
 // ---------------------------------------------------------------------------
 
-/// Validate a repository-relative path pattern.
-///
-/// Patterns must be non-empty, use `/` separators, and stay inside the
-/// repository: no backslashes, no absolute or drive/UNC paths, no `.` or
-/// `..` components, and no leading `/`. Glob metacharacters `*`, `?`, and
-/// `[...]` are allowed.
-pub fn validate_pattern(pattern: &str) -> Result<()> {
-    GlobPattern::compile(pattern)
-        .map(|_| ())
-        .map_err(Into::into)
-}
+pub use lci_core::evaluation::validate_pattern;
 
 /// Whether a repository-relative glob pattern matches a result path.
 ///
