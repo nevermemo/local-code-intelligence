@@ -215,6 +215,8 @@ under `tests/` with the fake model service and fake LSP (`tests/support/mod.rs`,
 | K-4 | Random control is size-matched per query from the filtered universe. | Degree-matched random (same seed degree), closer to the map's structure. | First expansion map (W1b). |
 | K-5 | C5 vocabulary is closed and versioned with the RunRecord schema. | Free-form labels with a registry. | S4 freeze. |
 | K-6 | A map failing a contract is kept out of the default registry but may still be benchmarked as an opt-in arm with the failure recorded. | Block it entirely until it passes. | First failing map. |
+| K-7 | C5 refuses a used hit with no evidence (it has no source label); a map card must list every label its evidence uses. A hit may carry several evidence items with different labels, each on the card ("exactly one label" is read per evidence item). (S3) | Allow label-less hits and label them by the map's first card label. | S4 freeze. |
+| K-8 | C5 is applied at run time by wrapping each map in `labels::Labelled` (the registry path wraps the four legacy maps), not inside `Registry::run`, because `lib.rs` was out of scope for S3. A mislabelled answer becomes `Failed` with one warning (C1), keeping a partial answer's own note or warning. The kit's C1 and C6 runs (`kit.rs`, also out of scope) register maps bare, so labels are checked by `check_source_labels`, not "in every contract run" as section 2 asks. (S3) | Check labels in `Registry::run`'s own answer check. | S4 freeze. |
 
 ## 5. How a test proves it
 
@@ -341,10 +343,33 @@ not for its time. Run against the path-in-bundle producer, it fails at the move 
 first differing symbol (`lci-core::chunk::chunk::Chunk/struct`, the old module path joined
 under the new one).
 
-Open decisions added here:
+Open decisions added here (numbered K-7 to K-9 on `cloud/spike-s3a`; renumbered K-10 to K-12
+when `cloud/spike-s3b`, which had already used K-7 and K-8, was merged):
 
 | # | Decision taken here | Alternative | Revisit at |
 | --- | --- | --- | --- |
-| K-7 | The C3 policy is a function (`fresh::prepare`) the engine calls per stored map, after the core snapshot is resolved; stored maps follow the core snapshot and never probe the tree themselves. | Each stored map probes the tree and refreshes itself under the mode. | S4 engine. |
-| K-8 | The C4 adapter bump is simulated by relabelling and perturbing the stored state. | Build a second adapter version into test builds. | When a second chunker version exists. |
-| K-9 | The commit replay runs in an ignored test, outside `Full`, because CI has no history. | Fetch the needed commits in CI (`fetch-depth: 0`) and run it in `Full` (about 20 s). | When CI's checkout depth is next changed. |
+| K-10 | The C3 policy is a function (`fresh::prepare`) the engine calls per stored map, after the core snapshot is resolved; stored maps follow the core snapshot and never probe the tree themselves. | Each stored map probes the tree and refreshes itself under the mode. | S4 engine. |
+| K-11 | The C4 adapter bump is simulated by relabelling and perturbing the stored state. | Build a second adapter version into test builds. | When a second chunker version exists. |
+| K-12 | The commit replay runs in an ignored test, outside `Full`, because CI has no history. | Fetch the needed commits in CI (`fetch-depth: 0`) and run it in `Full` (about 20 s). | When CI's checkout depth is next changed. |
+
+## 8. S3 as built: C5 (2026-10-12, branch `cloud/spike-s3b`)
+
+`lci-maps/src/labels.rs`: the wire names of `SourceLabel` (`SourceLabel::ALL`, `as_str`,
+`from_wire`) with `LABELS_VERSION` equal to the RunRecord schema id; a test requires the
+checked-in schema's `label` enum to list exactly `SourceLabel::ALL`, in order, so a label is
+added or renamed only with a new schema id (K-5). `check_labels` refuses an `Ok` or
+`Partial` answer with a hit without evidence (K-7) or an evidence label the map's card
+(`MapDescriptor::source_labels`) does not list. `Labelled` applies it to every answer a
+registry gets (K-8); `App::fuse_through_maps` and `App::record_through_maps` register the
+legacy maps through it, and the T0 and golden tests stay bit-exact. The kit's
+`check_source_labels` runs a subject beside a control and checks both answers; its tests
+reject a map whose card lists `lexical` while it emits `vector`, a map whose hits carry no
+evidence, and a mislabelled control, and show `Labelled` turning the mislabelled answer into
+one warning with the control-only pool. The kit check refuses to pass vacuously: a subject
+with no used hit is a `kit` failure. Offline, the harness's `RunRecordFile::check_labels`
+(`src/evaluate/run_record.rs`, added with the offline harness on the same branch) checks
+every used call in a record against the labels its plan lists.
+
+Not done: the `derived_from: scip` refusal (no gold-set field carries it yet,
+`src/evaluate/types.rs`), and benchmark rows split by label (no live rows in the cloud).
+

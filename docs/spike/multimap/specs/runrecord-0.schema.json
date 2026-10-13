@@ -1,0 +1,306 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lci.runrecord/0",
+  "description": "One line of a RunRecord (run-record.md). v0, pre-freeze. Validated by the hand-written checker in lci-maps/src/run_record/schema.rs, which refuses any keyword or pattern it does not implement.",
+  "oneOf": [
+    { "$ref": "#/$defs/run" },
+    { "$ref": "#/$defs/step" },
+    { "$ref": "#/$defs/end" }
+  ],
+  "$defs": {
+    "nodeId": { "type": "string", "pattern": "^(file|chunk|sym|commit|test|cfg|doc|str):" },
+    "mapId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$" },
+    "runId": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$", "description": "ULID; sortable by start time" },
+    "utc": { "type": "string", "format": "date-time", "description": "RFC 3339, UTC, from the system clock" },
+    "hex": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
+    "label": { "enum": ["vector", "lexical", "lsp", "scip", "tags", "heuristic", "git", "config", "doc", "agent", "prior"] },
+    "yield": { "enum": ["Y1", "Y2", "Y3", "Y4", "none"] },
+    "cost": {
+      "type": "object",
+      "required": ["elapsed_ms"],
+      "properties": {
+        "elapsed_ms": { "type": "number", "minimum": 0 },
+        "external_calls": { "type": "integer", "minimum": 0 },
+        "nodes_touched": { "type": "integer", "minimum": 0 },
+        "bytes_read": { "type": "integer", "minimum": 0 },
+        "est_tokens": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["indexed_at", "fingerprint"],
+      "properties": {
+        "indexed_at": { "type": "string" },
+        "fingerprint": { "$ref": "#/$defs/hex" },
+        "embedding_identity_sha256": { "$ref": "#/$defs/hex" },
+        "index_action": { "enum": ["reused", "created", "waited_for_existing_job", "refreshed_incrementally"] },
+        "wait_ms": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["edge", "label"],
+      "properties": {
+        "via": { "$ref": "#/$defs/nodeId" },
+        "edge": { "type": "string" },
+        "label": { "$ref": "#/$defs/label" },
+        "detail": { "type": "string", "maxLength": 200 }
+      },
+      "additionalProperties": false
+    },
+    "mapHit": {
+      "type": "object",
+      "required": ["node", "rank"],
+      "properties": {
+        "node": { "$ref": "#/$defs/nodeId" },
+        "rank": { "type": "integer", "minimum": 1 },
+        "score": { "type": ["number", "null"] },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } }
+      },
+      "additionalProperties": false
+    },
+    "mapCall": {
+      "type": "object",
+      "required": ["map", "version", "status", "cost", "freshness", "hits"],
+      "properties": {
+        "map": { "$ref": "#/$defs/mapId" },
+        "version": { "type": "integer", "minimum": 0 },
+        "request": {
+          "type": "object",
+          "properties": {
+            "text": { "type": "boolean", "description": "true when the query text was sent; the text itself is in the run line" },
+            "seeds": { "type": "array", "items": { "$ref": "#/$defs/nodeId" } },
+            "limit": { "type": "integer", "minimum": 0 },
+            "as_of": { "type": "string" },
+            "params_sha256": { "$ref": "#/$defs/hex" }
+          },
+          "additionalProperties": false
+        },
+        "status": { "enum": ["ok", "partial", "skipped", "failed"] },
+        "message": { "type": "string" },
+        "cost": { "$ref": "#/$defs/cost" },
+        "freshness": {
+          "type": "object",
+          "required": ["model", "observed"],
+          "properties": {
+            "model": { "enum": ["per-file", "per-commit", "live", "global"] },
+            "observed": { "enum": ["snapshot", "live-tree", "as-of"] },
+            "stale": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "hits": { "type": "array", "items": { "$ref": "#/$defs/mapHit" } }
+      },
+      "additionalProperties": false
+    },
+    "frontierRow": {
+      "type": "object",
+      "required": ["node", "score", "contributions"],
+      "properties": {
+        "node": { "$ref": "#/$defs/nodeId" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "source_role": { "type": "string" },
+        "score": { "type": "number" },
+        "contributions": { "type": "object", "additionalProperties": { "type": "number" } },
+        "fused_rank": { "type": "integer", "minimum": 1 },
+        "capped_rank": { "type": "integer", "minimum": 1 },
+        "shortlisted": { "type": "boolean" },
+        "rerank_rank": { "type": ["integer", "null"] },
+        "reranker_score": { "type": ["number", "null"] },
+        "est_tokens": { "type": ["integer", "null"] },
+        "state": { "enum": ["frontier", "pinned", "pruned", "seen"] },
+        "snippet": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "run": {
+      "type": "object",
+      "required": ["type", "schema", "run_id", "started_at", "build", "workspace_id", "snapshot", "query", "plan"],
+      "properties": {
+        "type": { "const": "run" },
+        "schema": { "const": "lci.runrecord/0" },
+        "run_id": { "$ref": "#/$defs/runId" },
+        "parent_run_id": { "$ref": "#/$defs/runId", "description": "set for a fork (S4 counterfactual replay, N2 fork/join)" },
+        "started_at": { "$ref": "#/$defs/utc" },
+        "build": {
+          "type": "object",
+          "required": ["version"],
+          "properties": {
+            "version": { "type": "string", "description": "CARGO_PKG_VERSION" },
+            "commit": { "type": "string" },
+            "dirty": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "workspace_id": { "$ref": "#/$defs/hex" },
+        "tree_commit": { "type": "string", "description": "HEAD of the indexed tree when known" },
+        "snapshot": { "$ref": "#/$defs/snapshot" },
+        "endpoint": { "type": "string", "description": "/mcp, /mcp/<profile>, /v1, cli or harness" },
+        "search_profile": { "type": "string" },
+        "query": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": { "type": "string" },
+            "shape": { "type": "array", "items": { "type": "string" }, "description": "keyword, descriptive, short-query, long-query, ... (lesson L13)" }
+          },
+          "additionalProperties": false
+        },
+        "filters": { "type": "object" },
+        "plan": {
+          "type": "object",
+          "required": ["maps", "policy"],
+          "properties": {
+            "maps": {
+              "type": "array",
+              "description": "in fusion order",
+              "items": {
+                "type": "object",
+                "required": ["map", "version", "weight"],
+                "properties": {
+                  "map": { "$ref": "#/$defs/mapId" },
+                  "version": { "type": "integer", "minimum": 0 },
+                  "contribution": { "enum": ["rank_list", "prior", "filter", "expansion"] },
+                  "weight": { "type": "number" },
+                  "limit": { "type": "integer", "minimum": 0 },
+                  "enabled": { "type": "boolean" },
+                  "labels": { "type": "array", "items": { "$ref": "#/$defs/label" }, "description": "the labels the map's card lists (contract C5)" },
+                  "card_sha256": { "$ref": "#/$defs/hex" },
+                  "params": { "type": "object" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "rrf_k": { "type": "number" },
+            "max_chunks_per_file": { "type": "integer", "minimum": 0 },
+            "rerank_candidate_count": { "type": "integer", "minimum": 0 },
+            "top_k": { "type": "integer", "minimum": 1 },
+            "policy": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": {
+                "kind": { "enum": ["one-shot", "scripted", "agent"] },
+                "script": { "type": "string", "description": "id and version of a scripted steering policy" },
+                "pause_at": { "type": "array", "items": { "$ref": "#/$defs/yield" } }
+              },
+              "additionalProperties": false
+            },
+            "budget": {
+              "type": "object",
+              "properties": {
+                "deadline_ms": { "type": "integer", "minimum": 0 },
+                "max_steps": { "type": "integer", "minimum": 0 },
+                "max_nodes": { "type": "integer", "minimum": 0 },
+                "max_engine_tokens": { "type": "integer", "minimum": 0 },
+                "max_agent_tokens": { "type": "integer", "minimum": 0 }
+              },
+              "additionalProperties": false
+            },
+            "seed": { "type": "integer", "description": "RNG seed for random controls" },
+            "arm": { "type": "string", "description": "harness arm name, e.g. map-on, no-graph, random, churn, reference" }
+          },
+          "additionalProperties": false
+        },
+        "item": {
+          "type": "object",
+          "required": ["set", "id"],
+          "properties": {
+            "set": { "type": "string", "description": "public set name or an opaque id for a private set" },
+            "id": { "type": "string" },
+            "base_commit": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "capture": {
+          "type": "object",
+          "properties": {
+            "snippets": { "type": "boolean" },
+            "frontier_rows": { "type": "integer", "minimum": 0, "description": "most frontier rows written per step" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": ["type", "run_id", "seq", "at_ms", "kind", "yield"],
+      "properties": {
+        "type": { "const": "step" },
+        "run_id": { "$ref": "#/$defs/runId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "at_ms": { "type": "number", "minimum": 0, "description": "ms since started_at, monotonic clock" },
+        "kind": { "enum": ["resolve", "fan_out", "fuse", "cap_cut", "rerank", "expand", "pause", "steer", "resume", "end"] },
+        "yield": { "$ref": "#/$defs/yield" },
+        "snapshot": { "$ref": "#/$defs/snapshot", "description": "present when the step re-resolved the snapshot (every resume)" },
+        "drift": {
+          "type": "object",
+          "description": "nodes dropped or remapped after a snapshot change",
+          "properties": {
+            "dropped": { "type": "array", "items": { "$ref": "#/$defs/nodeId" } },
+            "remapped": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "ops": { "type": "array", "items": { "type": "object" }, "description": "validated steering ops applied before this step (steering-ops.md)" },
+        "agent_tokens": { "type": "integer", "minimum": 0, "description": "tokens the agent reported spending to decide the ops" },
+        "map_calls": { "type": "array", "items": { "$ref": "#/$defs/mapCall" } },
+        "engine_cost": { "$ref": "#/$defs/cost" },
+        "rerank_outcome": { "enum": ["scored", "failed", "off", "not_run"] },
+        "frontier": {
+          "type": "object",
+          "required": ["size"],
+          "properties": {
+            "size": { "type": "integer", "minimum": 0 },
+            "rows": { "type": "array", "items": { "$ref": "#/$defs/frontierRow" } }
+          },
+          "additionalProperties": false
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "end": {
+      "type": "object",
+      "required": ["type", "run_id", "finished_at", "outcome", "results", "totals"],
+      "properties": {
+        "type": { "const": "end" },
+        "run_id": { "$ref": "#/$defs/runId" },
+        "finished_at": { "$ref": "#/$defs/utc" },
+        "outcome": { "enum": ["completed", "expired", "cancelled", "failed"] },
+        "error": { "type": "string" },
+        "results": { "type": "array", "items": { "$ref": "#/$defs/frontierRow" } },
+        "totals": {
+          "type": "object",
+          "required": ["elapsed_ms", "steps"],
+          "properties": {
+            "elapsed_ms": { "type": "number", "minimum": 0 },
+            "steps": { "type": "integer", "minimum": 0 },
+            "engine": { "$ref": "#/$defs/cost" },
+            "agent_tokens": { "type": "integer", "minimum": 0 },
+            "per_map": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cost" } }
+          },
+          "additionalProperties": false
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "array", "items": { "type": "string" } },
+        "evaluation": {
+          "type": "object",
+          "description": "filled by the harness, never by the engine",
+          "properties": {
+            "metrics": { "type": "object", "additionalProperties": { "type": "number" } },
+            "first_gold_step": { "type": ["integer", "null"] },
+            "unique_gold_by_map": { "type": "object", "additionalProperties": { "type": "integer" } },
+            "leak_scan": { "enum": ["passed", "failed", "not_applicable"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

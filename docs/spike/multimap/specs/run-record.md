@@ -1,6 +1,8 @@
 # Spec: RunRecord (trace log per traversal)
 
 Status: **v0, pre-freeze.** Written 2026-10-12T10:06Z (`date -u`) at slice S0. Docs only.
+Updated at S3 (2026-10-12, branch `cloud/spike-s3b`): schema checked in, registry steps,
+redaction, open decisions R-8 to R-11.
 Schema id `lci.runrecord/0`; the first frozen version will be `/1`.
 
 Code read at spike head `df7faaa` (code of `7f9c636`). Labels: **Read** = in the code or docs at
@@ -51,290 +53,79 @@ one-shot search records steps for all of them and never pauses.
 - No service URLs: embedding and reranker identities are recorded as SHA-256 hex.
 - Code text only as `snippet` (the existing bounded snippet: cut at 400 bytes plus a 3-byte
   ellipsis, `src/store.rs:56-73`), and only when `capture.snippets` is true.
+- Redaction (S3): before a line is written, the workspace path and the data directory (as
+  given when absolute, and resolved; trailing separators dropped; each also with `/`
+  separators, as a `file://` URI and with spaces as `%20`, and on Windows lower-cased and
+  with the drive colon as `%3A`), the embedding and reranker URLs and their `host:port` (only
+  when the URL names a port), and every
+  absolute executable path in the configuration are replaced by a placeholder
+  (`<workspace>`, `<data_dir>`, `<embedding_url>`, `<embedding_host>`, `<reranker_url>`,
+  `<reranker_host>`, `<executable>`) in every string, the query text included. A match
+  counts only where the secret stands on its own (no letter, digit, `_`, `-` or `.` before
+  it; no letter, digit, `_` or `-` after it), so a workspace at `/src` never rewrites the
+  repository path `lib/src/x.rs`. NodeId fields (`node`, `via`) are never rewritten: they are
+  repository-relative by construction. A relative path is never a secret.
+  Evidence `detail` is cut to 200 characters.
 - Private gold sets: `item.set` is an opaque id; records of private items stay outside the
   repository, like every report (`test-results/`, `AGENTS.md`, Working method).
 
 ### 3.3 JSON Schema
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "lci.runrecord/0",
-  "oneOf": [
-    { "$ref": "#/$defs/run" },
-    { "$ref": "#/$defs/step" },
-    { "$ref": "#/$defs/end" }
-  ],
-  "$defs": {
-    "nodeId": { "type": "string", "pattern": "^(file|chunk|sym|commit|test|cfg|doc|str):" },
-    "mapId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$" },
-    "utc": { "type": "string", "format": "date-time", "description": "RFC 3339, UTC, from the system clock" },
-    "hex": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
-    "label": { "enum": ["vector", "lexical", "lsp", "scip", "tags", "heuristic", "git", "config", "doc", "agent", "prior"] },
-    "yield": { "enum": ["Y1", "Y2", "Y3", "Y4", "none"] },
-    "cost": {
-      "type": "object",
-      "required": ["elapsed_ms"],
-      "properties": {
-        "elapsed_ms": { "type": "number", "minimum": 0 },
-        "external_calls": { "type": "integer", "minimum": 0 },
-        "nodes_touched": { "type": "integer", "minimum": 0 },
-        "bytes_read": { "type": "integer", "minimum": 0 },
-        "est_tokens": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "snapshot": {
-      "type": "object",
-      "required": ["indexed_at", "fingerprint"],
-      "properties": {
-        "indexed_at": { "type": "string" },
-        "fingerprint": { "$ref": "#/$defs/hex" },
-        "embedding_identity_sha256": { "$ref": "#/$defs/hex" },
-        "index_action": { "enum": ["reused", "created", "waited_for_existing_job", "refreshed_incrementally"] },
-        "wait_ms": { "type": "number", "minimum": 0 }
-      }
-    },
-    "mapCall": {
-      "type": "object",
-      "required": ["map", "version", "status", "cost", "freshness", "hits"],
-      "properties": {
-        "map": { "$ref": "#/$defs/mapId" },
-        "version": { "type": "integer", "minimum": 0 },
-        "request": {
-          "type": "object",
-          "properties": {
-            "text": { "type": "boolean", "description": "true when the query text was sent; the text itself is in the run line" },
-            "seeds": { "type": "array", "items": { "$ref": "#/$defs/nodeId" } },
-            "limit": { "type": "integer" },
-            "as_of": { "type": "string" },
-            "params_sha256": { "$ref": "#/$defs/hex" }
-          }
-        },
-        "status": { "enum": ["ok", "partial", "skipped", "failed"] },
-        "message": { "type": "string" },
-        "cost": { "$ref": "#/$defs/cost" },
-        "freshness": {
-          "type": "object",
-          "required": ["model", "observed"],
-          "properties": {
-            "model": { "enum": ["per-file", "per-commit", "live", "global"] },
-            "observed": { "enum": ["snapshot", "live-tree", "as-of"] },
-            "stale": { "type": "boolean" }
-          }
-        },
-        "hits": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["node", "rank"],
-            "properties": {
-              "node": { "$ref": "#/$defs/nodeId" },
-              "rank": { "type": "integer", "minimum": 1 },
-              "score": { "type": ["number", "null"] },
-              "evidence": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "required": ["label"],
-                  "properties": {
-                    "via": { "$ref": "#/$defs/nodeId" },
-                    "edge": { "type": "string" },
-                    "label": { "$ref": "#/$defs/label" },
-                    "detail": { "type": "string", "maxLength": 200 }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "frontierRow": {
-      "type": "object",
-      "required": ["node", "score", "contributions"],
-      "properties": {
-        "node": { "$ref": "#/$defs/nodeId" },
-        "start_line": { "type": "integer" },
-        "end_line": { "type": "integer" },
-        "source_role": { "type": "string" },
-        "score": { "type": "number" },
-        "contributions": { "type": "object", "additionalProperties": { "type": "number" } },
-        "fused_rank": { "type": "integer" },
-        "capped_rank": { "type": "integer" },
-        "shortlisted": { "type": "boolean" },
-        "rerank_rank": { "type": ["integer", "null"] },
-        "reranker_score": { "type": ["number", "null"] },
-        "est_tokens": { "type": ["integer", "null"] },
-        "state": { "enum": ["frontier", "pinned", "pruned", "seen"] },
-        "snippet": { "type": "string" }
-      }
-    },
-    "run": {
-      "type": "object",
-      "required": ["type", "schema", "run_id", "started_at", "build", "workspace_id", "snapshot", "query", "plan"],
-      "properties": {
-        "type": { "const": "run" },
-        "schema": { "const": "lci.runrecord/0" },
-        "run_id": { "type": "string", "description": "ULID; sortable by start time" },
-        "parent_run_id": { "type": "string", "description": "set for a fork (S4 counterfactual replay, N2 fork/join)" },
-        "started_at": { "$ref": "#/$defs/utc" },
-        "build": {
-          "type": "object",
-          "required": ["version"],
-          "properties": {
-            "version": { "type": "string", "description": "CARGO_PKG_VERSION" },
-            "commit": { "type": "string" },
-            "dirty": { "type": "boolean" }
-          }
-        },
-        "workspace_id": { "$ref": "#/$defs/hex" },
-        "tree_commit": { "type": "string", "description": "HEAD of the indexed tree when known" },
-        "snapshot": { "$ref": "#/$defs/snapshot" },
-        "endpoint": { "type": "string", "description": "/mcp, /mcp/<profile>, /v1, cli or harness" },
-        "search_profile": { "type": "string" },
-        "query": {
-          "type": "object",
-          "required": ["text"],
-          "properties": {
-            "text": { "type": "string" },
-            "shape": { "type": "array", "items": { "type": "string" }, "description": "keyword, descriptive, short-query, long-query, ... (lesson L13)" }
-          }
-        },
-        "filters": { "type": "object" },
-        "plan": {
-          "type": "object",
-          "required": ["maps", "policy"],
-          "properties": {
-            "maps": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["map", "version", "weight"],
-                "properties": {
-                  "map": { "$ref": "#/$defs/mapId" },
-                  "version": { "type": "integer" },
-                  "weight": { "type": "number" },
-                  "card_sha256": { "$ref": "#/$defs/hex" },
-                  "params": { "type": "object" }
-                }
-              }
-            },
-            "rrf_k": { "type": "number" },
-            "max_chunks_per_file": { "type": "integer" },
-            "rerank_candidate_count": { "type": "integer" },
-            "policy": {
-              "type": "object",
-              "required": ["kind"],
-              "properties": {
-                "kind": { "enum": ["one-shot", "scripted", "agent"] },
-                "script": { "type": "string", "description": "id and version of a scripted steering policy" },
-                "pause_at": { "type": "array", "items": { "$ref": "#/$defs/yield" } }
-              }
-            },
-            "budget": {
-              "type": "object",
-              "properties": {
-                "deadline_ms": { "type": "integer" },
-                "max_steps": { "type": "integer" },
-                "max_nodes": { "type": "integer" },
-                "max_engine_tokens": { "type": "integer" },
-                "max_agent_tokens": { "type": "integer" }
-              }
-            },
-            "seed": { "type": "integer", "description": "RNG seed for random controls" },
-            "arm": { "type": "string", "description": "harness arm name, e.g. map-on, no-graph, random, churn, reference" }
-          }
-        },
-        "item": {
-          "type": "object",
-          "required": ["set", "id"],
-          "properties": {
-            "set": { "type": "string", "description": "public set name or an opaque id for a private set" },
-            "id": { "type": "string" },
-            "base_commit": { "type": "string" }
-          }
-        },
-        "capture": {
-          "type": "object",
-          "properties": {
-            "snippets": { "type": "boolean" },
-            "frontier_rows": { "type": "integer", "description": "most frontier rows written per step" }
-          }
-        }
-      }
-    },
-    "step": {
-      "type": "object",
-      "required": ["type", "run_id", "seq", "at_ms", "kind", "yield"],
-      "properties": {
-        "type": { "const": "step" },
-        "run_id": { "type": "string" },
-        "seq": { "type": "integer", "minimum": 1 },
-        "at_ms": { "type": "number", "description": "ms since started_at, monotonic clock" },
-        "kind": { "enum": ["resolve", "fan_out", "fuse", "cap_cut", "rerank", "expand", "pause", "steer", "resume", "end"] },
-        "yield": { "$ref": "#/$defs/yield" },
-        "snapshot": { "$ref": "#/$defs/snapshot", "description": "present when the step re-resolved the snapshot (every resume)" },
-        "drift": { "type": "object", "description": "nodes dropped or remapped after a snapshot change", "properties": { "dropped": { "type": "array", "items": { "$ref": "#/$defs/nodeId" } }, "remapped": { "type": "integer" } } },
-        "ops": { "type": "array", "items": { "type": "object" }, "description": "validated steering ops applied before this step (steering-ops.md)" },
-        "agent_tokens": { "type": "integer", "minimum": 0, "description": "tokens the agent reported spending to decide the ops" },
-        "map_calls": { "type": "array", "items": { "$ref": "#/$defs/mapCall" } },
-        "engine_cost": { "$ref": "#/$defs/cost" },
-        "rerank_outcome": { "enum": ["scored", "failed", "off", "not_run"] },
-        "frontier": {
-          "type": "object",
-          "required": ["size"],
-          "properties": {
-            "size": { "type": "integer" },
-            "rows": { "type": "array", "items": { "$ref": "#/$defs/frontierRow" } }
-          }
-        },
-        "warnings": { "type": "array", "items": { "type": "string" } },
-        "notes": { "type": "array", "items": { "type": "string" } }
-      }
-    },
-    "end": {
-      "type": "object",
-      "required": ["type", "run_id", "finished_at", "outcome", "results", "totals"],
-      "properties": {
-        "type": { "const": "end" },
-        "run_id": { "type": "string" },
-        "finished_at": { "$ref": "#/$defs/utc" },
-        "outcome": { "enum": ["completed", "expired", "cancelled", "failed"] },
-        "error": { "type": "string" },
-        "results": { "type": "array", "items": { "$ref": "#/$defs/frontierRow" } },
-        "totals": {
-          "type": "object",
-          "required": ["elapsed_ms", "steps"],
-          "properties": {
-            "elapsed_ms": { "type": "number" },
-            "steps": { "type": "integer" },
-            "engine": { "$ref": "#/$defs/cost" },
-            "agent_tokens": { "type": "integer" },
-            "per_map": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cost" } }
-          }
-        },
-        "evaluation": {
-          "type": "object",
-          "description": "filled by the harness, never by the engine",
-          "properties": {
-            "metrics": { "type": "object", "additionalProperties": { "type": "number" } },
-            "first_gold_step": { "type": ["integer", "null"] },
-            "unique_gold_by_map": { "type": "object", "additionalProperties": { "type": "integer" } },
-            "leak_scan": { "enum": ["passed", "failed", "not_applicable"] }
-          }
-        }
-      }
-    }
-  }
-}
-```
+The schema is checked in as [runrecord-0.schema.json](runrecord-0.schema.json) (S3) and
+compiled into `lci-maps` (`run_record::SCHEMA_JSON`); the writer refuses any line it rejects.
+It replaces the inline draft that stood here at S0. Changes against that draft, all made at S3
+because the implementation showed the draft too loose to catch a wrong line (Inferred):
+
+- `additionalProperties: false` on every object with a fixed shape (lines, plan, map entry,
+  map call, request, freshness, hit, evidence, frontier row, cost, snapshot, totals,
+  capture, item, budget, policy, drift, evaluation), so a misspelt field is an error.
+- `runId` definition (ULID pattern) used by `run_id` and `parent_run_id` on every line.
+- `mapHit` and `evidence` definitions; `edge` is required on evidence.
+- `plan.maps[]` gains `contribution`, `limit`, `enabled` and `labels` (the labels the map's
+  card lists, contract C5); `plan` gains `top_k`.
+- `end` gains `warnings` and `notes` (every map's, in fusion order).
+- `minimum` on counts, ranks, lines and times.
+
+The checker is hand-written (`lci-maps/src/run_record/schema.rs`; no JSON Schema validator
+is in `Cargo.lock`). It implements `$ref`, `oneOf`, `type`, `required`, `properties`,
+`additionalProperties`, `items`, `enum`, `const`, `pattern` (only the four patterns the
+schema uses), `minimum`, `maxLength` and `format: date-time`, and refuses to load a schema
+with any other keyword, pattern or reference.
+
+#### Steps of a registry run (S3, Read in the code)
+
+The registry path (`App::record_through_maps`, the recording twin of `fuse_through_maps`)
+writes, after the `run` line:
+
+| seq | `kind` | `yield` | Content |
+| --- | --- | --- | --- |
+| 1 | `fan_out` | `Y1` | The rank-list calls in fusion order, with hits, status, cost and freshness. |
+| 2 | `fuse` | `none` | The prior calls (asked about the fused nodes) and the fused pool as frontier rows: node, lines, source role, score, contributions per map, `fused_rank`. |
+| 3 | `cap_cut` | `Y2` | The pool in capped order (the production `cap_by_file`), with `capped_rank` and `shortlisted`. |
+
+The `end` line's `results` are the first `min(top_k, rerank_candidate_count)` capped rows:
+what `search_code` returns with the reranker off. The registry path has no reranker, so it
+writes no `rerank` step. A call's `cost.elapsed_ms` is the wall time the registry measured
+around it (`MapCall::engine_ms`), so a failure the registry decided (panic, deadline) still
+has a time.
+The `fuse` step's `engine_cost.elapsed_ms` is the registry's time after the fan-out
+(priors and fusion), so the two steps do not count the fan-out twice.
+
+`Registry::run` is one call, so the registry path writes its steps after the run returns:
+a process killed while the maps run leaves only the `run` line. The writer itself is crash
+safe (whole lines, one write each; tested by killing a writer process after step 2); steps
+written as they happen need the S5 engine.
 
 ### 3.4 Where records go
 
 - Engine: off by default. A config switch or an environment variable (like
   `LCI_CANDIDATE_DUMP`, `search.rs:97`) names a JSONL file or directory; one file per run
   (`<run_id>.jsonl`) under `test-results/` for the harness. Fail-open like the dump.
+- Registry path (S3): only `App::record_through_maps`, which takes the directory as an
+  argument; no environment variable or config switch exists yet, and the production search
+  never writes a record. One file per run, `<dir>/<run_id>.jsonl`, created new (never
+  overwritten). A record that cannot be written is a log warning and an error beside the
+  result; the run's answer is unchanged.
 - Handle tools: the `end` line is also summarised in the `traverse_*` tool response
   ([steering-ops.md](steering-ops.md)); the full record is never sent to the client unless
   asked, because the frontier rows are large (the dump is about 100 KB per query,
@@ -351,6 +142,10 @@ one-shot search records steps for all of them and never pauses.
 | R-5 | `agent_tokens` are self-reported by the caller of `traverse_steer`. | Measure from the agent client's own logs in the harness. | Map-to-map study. |
 | R-6 | ULID run ids. | UUIDv7. Same properties; ULID chosen for shorter strings. | none |
 | R-7 | Engine timings are per map and per step; the legacy 7-field `Timings` is a projection for `search_code`. | Extend `Timings` with a map-keyed object. | S5. |
+| R-8 | `snapshot.fingerprint` is the manifest's fingerprint; when the manifest has none (written before fingerprints existed), SHA-256 of `indexed_at` and the embedding identity stands in. | Omit the snapshot, or make `fingerprint` optional. | S4 freeze. |
+| R-9 | Schema validity is checked by a hand-written checker that refuses unknown keywords and patterns. | A JSON Schema crate as a dev-dependency (needs owner approval: a new dependency). | S4 freeze. |
+| R-10 | The registry path writes records only when called with a directory; no switch reaches the production search. | An environment variable like `LCI_CANDIDATE_DUMP`. | S5 (engine). |
+| R-11 | Secrets are redacted by string replacement of known values. | A structural rule (no field may hold an absolute path), checked by the writer. | S4 freeze. |
 
 ## 5. How a test proves it
 
@@ -358,7 +153,56 @@ one-shot search records steps for all of them and never pauses.
 | --- | --- |
 | Schema validity | Every RunRecord the offline test suites write validates against the schema above (a JSON Schema validator as a dev-dependency, or a hand-written checker in the harness if no validator is already in the tree). |
 | One-shot equivalence | For a one-shot run, `end.results` equals `SearchReport.results` of the same search (NodeIds, order, `fusion_score` bits) and the steps' frontier rows match the `CandidateTrace` rows of a traced search. |
-| Crash safety | Kill a run after step 2 (fault-injected map panic in the writer test): the file holds a valid `run` line and two valid `step` lines; the harness reports `outcome` missing, not a parse error. |
+| Crash safety | Kill a run after step 2: the file holds a valid `run` line and two valid `step` lines; the harness reports `outcome` missing, not a parse error. S3 kills a real writer process (the test binary re-run as a child that writes three lines and waits), since a map panic is caught by the registry and never stops a run. |
 | Privacy | A writer test asserts that no string field contains the workspace's absolute path, the data directory, or the configured service URLs, and that snippets are absent when `capture.snippets` is false. |
-| Replay | Re-running fusion from the recorded `map_calls` hits and the plan's weights reproduces each `fuse` step's scores bit for bit (extends `src/evaluate/replay.rs` beyond three channels). |
+| Replay | Re-running fusion from the recorded `map_calls` hits and the plan's weights reproduces each `fuse` step's scores bit for bit. S3 built this as a new module, `src/evaluate/run_record.rs` (section 6), beside `replay.rs`, which still replays candidate dumps over the three legacy channels. |
 | Fail-open writer | Point the writer at an unwritable path: the search succeeds, a log warning is emitted, nothing else changes. |
+
+## 6. Offline harness as built (S3 branch, ahead of S4)
+
+`src/evaluate/run_record.rs` (`RunRecordFile`, re-exported from `evaluate`), no live models:
+
+- Reading: every whole line must pass the schema; the first is `run`, then `step` lines with
+  `seq` 1, 2, ..., at most one `end`, nothing after it, one `run_id`. An unterminated last
+  line (a writer killed mid-write) is dropped and reported as `torn_tail`; a record without
+  `end` reads as a prefix, and asking for its results is the error "outcome missing", never
+  a parse error.
+- Scoring: `end.results` become `evaluate`'s `ResultEvidence` (path from the NodeId;
+  `source_role` required; `snippet` required when snippets were captured; the language is
+  not recorded, and no metric reads it) and are scored with `query_metrics`, unreranked.
+  Refused: a gold query for another text, one with `required_snippet` against a record
+  without snippets, one with filters (registry runs are unfiltered), one whose `top_k`
+  differs from `plan.top_k`, and a run whose `outcome` is not `completed`. Records are paired with gold queries by query text
+  (`gold_query`), not yet by `item`.
+- Replay: every `fuse` step is recomputed from the preceding `fan_out` step's used calls and
+  the plan's weights and `rrf_k`, then the step's own prior calls, in `f32` and in recorded
+  order, and compared with the frontier bit for bit (scores and every contribution), with
+  the pool size, the ranks, the fused order (ties by path, lines and content hash), and,
+  for a capped row list, that no left-out node belongs before the last row (by score, and on
+  a tie by path only: a left-out node's lines are not recorded, so a left-out chunk of the
+  same file with a lower start line is not caught). A frontier with nodes but no rows is
+  refused (nothing would be checked). The pool of a `fuse` step is the hits of the last
+  `fan_out` step before it; an engine that accumulates pools across steps (S5) needs a
+  different replay.
+- C5 offline: every used hit carries evidence whose labels are on its map's plan entry.
+
+Tested on the offline fixture with the public gold file `tests/fixtures/run_records/gold.toml`
+(three queries; the private gold sets are not used): for each query the record's results
+equal `search_code`'s with the reranker off (path, lines, order, source role, `fusion_score`
+bits), its `fuse` rows equal the traced candidates (rank, lines, score bits), its `cap_cut`
+rows their capped ranks and shortlist (with `max_chunks_per_file = 1` and
+`rerank_candidate_count = 3`, so the cap reorders and the cut drops), each map's recorded
+ranks equal the traced channel ranks, the replay checks every row, and the record's metrics
+equal those computed from the search's own results.
+
+Not built: offline replay of the `cap_cut` step and a check that `end.results` are its
+first `min(top_k, rerank_candidate_count)` rows (both are checked only against production
+in the integration test); `reranked` is always false (no `rerank` step yet); blank lines and
+a byte-order mark are refused as "not JSON", and a complete last line without its newline
+is treated as torn; `read_dir` fails the whole directory on one broken record; the
+`evaluation` block on `end` (the harness returns metrics and writes nothing),
+`first_gold_step`, `unique_gold_by_map`, the leak scan, and pairing by `(item.set, item.id,
+arm)` for paired comparison (a gold query whose text names a redacted secret cannot pair
+by text); replay of a reranked run (no `rerank` step exists yet). One-shot equivalence is
+shown for the default search profile with the reranker off.
+

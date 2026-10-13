@@ -12,5 +12,7 @@ mod mcp;
 mod navigation;
 #[path = "cases/readiness.rs"]
 mod readiness;
+#[path = "cases/run_records.rs"]
+mod run_records;
 #[path = "cases/watching.rs"]
 mod watching;

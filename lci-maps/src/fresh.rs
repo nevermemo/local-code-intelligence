@@ -60,7 +60,7 @@ pub enum Prepared {
 /// and swaps it in only on success, as `SymDefs::build` does). The C3 kit
 /// rejects a map that clears its data and then fails or panics.
 /// The explicit index command and the watcher refresh stored maps through
-/// their own path, which is S4's (decision K-7).
+/// their own path, which is S4's (decision K-10).
 pub fn prepare(map: &mut dyn Refreshable, mode: IndexFreshness, target: &Target<'_>) -> Prepared {
     let done = match map.data_snapshot() {
         Some(snapshot) if snapshot == target.snapshot => return Prepared::Current,

@@ -253,6 +253,12 @@ language server failing while another answers) are compared with a traced search
 waits for an engine. Order independence of registration: done. Filter before fusion and
 status-to-error mapping: deferred, they need C2 and the engine (S4).
 
+S3 change (branch `cloud/spike-s3b`, after review on PR #62): the registry's answer check
+now refuses `Partial { note: None, warning: None }`, the one shape the type's own contract
+forbids. Such an answer would add its hits while hiding what is missing. It becomes `Failed`
+with one warning naming the map (contract C1). No wrapped legacy map produces it; T0 and
+the golden test are unchanged.
+
 ## 8. S3 as built (2026-10-12, slice S3a)
 
 Code: `lci-maps/src/symdefs.rs` (the `sym.defs` map), `lci-maps/src/fresh.rs` (`Target`,

@@ -538,3 +538,55 @@ fn set_enabled_reports_an_unknown_id() {
     assert!(registry.set_enabled("x", false));
     assert!(!registry.set_enabled("typo", false));
 }
+
+/// A map that answers `Partial` with neither a note nor a warning.
+struct SilentPartial(MapDescriptor, Vec<MapHit>);
+
+#[async_trait::async_trait]
+impl Map for SilentPartial {
+    fn describe(&self) -> &MapDescriptor {
+        &self.0
+    }
+
+    async fn query(&self, _request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        let mut response = MapResponse::empty(
+            &self.0,
+            view,
+            MapStatus::Partial {
+                note: None,
+                warning: None,
+            },
+        );
+        response.hits = self.1.clone();
+        response
+    }
+}
+
+/// `MapStatus::Partial` promises a note or a warning: a silent partial
+/// answer would add hits while hiding that part of it is missing, so the
+/// registry fails it with a warning naming the map.
+#[tokio::test]
+async fn a_partial_answer_that_names_nothing_missing_is_invalid() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let mut registry = Registry::new(60.0);
+    registry
+        .register(
+            Box::new(SilentPartial(
+                descriptor("silent", Contribution::RankList),
+                hits(&view, &[0, 1], None),
+            )),
+            1.0,
+            10,
+        )
+        .unwrap();
+    let run = registry.run(Some("q"), Duration::from_secs(5), &view).await;
+    assert!(run.fused.is_empty());
+    let warnings = run.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].0, "silent");
+    assert!(
+        warnings[0].1.contains("neither a note nor a warning"),
+        "{warnings:?}"
+    );
+}
