@@ -68,7 +68,8 @@ Check:
 Status (2026-10-13): **met** in `a396aba`. `App::applicable_lsp_adapters`,
 `lsp_symbol_queries`, `App::lsp_channel`, `App::lsp_over_budget_note` and
 `lsp_failure_warning` (`src/app/search.rs`) are called by both `search_once` and `LspMap`;
-`git grep -n "lsp_search_budget_ms" -- src/app` finds the budget read and the note text once.
+`git grep -n "lsp_search_budget_ms" -- src/app` finds the config field read only in the
+shared functions (the budget, the debug log, the note text), not in `search_once` or `LspMap`.
 Lsp suite, the golden test, both traced-search tests and T0 pass with no expected value
 edited. Mutation: a zero budget in `App::lsp_channel` fails two production-path tests
 (`navigation::csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation`,
@@ -146,7 +147,9 @@ Feature `spike-maps` on the root crate; `legacy_maps` (with `record.rs`) is
 clippy) and `--suite Indexing` pass `--features local-code-intelligence/spike-maps`, and an
 xtask test checks that Full does. Without the feature, a probe calling both methods fails with
 E0599 and clippy on all targets is clean; with it, Full reported 812 tests, the 811 of the
-commit before plus the new xtask test.
+commit before plus the new xtask test. The condition's `compile_fail` doctest was not added:
+Full runs doctests with the feature on, where the methods exist, so such a doctest would fail
+there; the absence without the feature rests on the `#[cfg]` and the probe above.
 
 ### M4. `SnapshotView::new` timed on a realistic set (S2)
 
@@ -170,7 +173,9 @@ Status (2026-10-13): **partly met** in `cc3e5b1`. The example
 On the cloud machine (4 cores), 50 runs each, release build: this repository, 4048 chunks,
 p50 3.94 ms, p95 4.24 ms, max 5.60 ms; the same chunks ten times (40480), p50 74.67 ms,
 p95 89.75 ms, max 91.88 ms. Debug build: 22.18 / 26.03 / 28.49 ms and 246.67 / 293.69 /
-339.35 ms. Ten times the chunks cost about nineteen times as much. Not met: the per-query
+339.35 ms. In release, ten times the chunks cost about nineteen times as much (debug: about
+eleven times). The 50 constructions run back to back on the same input, so caches are warm;
+one construction per search may cost more than these p50s. Not met: the per-query
 timing over `evaluations/mined/self.toml` and the A/B's largest repository beside those
 queries' end-to-end search p50 (owner's machine, live embedder), and the acceptable share,
 which the owner sets before that measurement.

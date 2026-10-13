@@ -144,7 +144,11 @@ impl Map for Labelled<'_> {
 /// answers to the fixture and checks each against its card. A failure names
 /// the map and the label. The maps are asked directly, not through a
 /// registry: `Registry::run` refuses a mislabelled answer itself (merge
-/// condition M6), and the kit must still see what the map said. The check
+/// condition M6), and the kit must still see what the map said. Outside a
+/// registry, a panic in a map unwinds through this check, and an answer the
+/// registry would refuse for a structural reason (over the limit, a node
+/// outside the view) is judged on its labels only; contract C1 covers both.
+/// The check
 /// must bite: a subject that returns no used hit (an empty or failed
 /// answer) is a kit failure, not a pass.
 pub async fn check_source_labels<'a>(

@@ -216,7 +216,7 @@ under `tests/` with the fake model service and fake LSP (`tests/support/mod.rs`,
 | K-5 | C5 vocabulary is closed and versioned with the RunRecord schema. | Free-form labels with a registry. | S4 freeze. |
 | K-6 | A map failing a contract is kept out of the default registry but may still be benchmarked as an opt-in arm with the failure recorded. | Block it entirely until it passes. | First failing map. |
 | K-7 | C5 refuses a used hit with no evidence (it has no source label); a map card must list every label its evidence uses. A hit may carry several evidence items with different labels, each on the card ("exactly one label" is read per evidence item). (S3) | Allow label-less hits and label them by the map's first card label. | S4 freeze. |
-| K-8 | C5 is applied at run time by wrapping each map in `labels::Labelled` (the registry path wraps the four legacy maps), not inside `Registry::run`, because `lib.rs` was out of scope for S3. A mislabelled answer becomes `Failed` with one warning (C1), keeping a partial answer's own note or warning. The kit's C1 and C6 runs (`kit.rs`, also out of scope) register maps bare, so labels are checked by `check_source_labels`, not "in every contract run" as section 2 asks. (S3) | Check labels in `Registry::run`'s own answer check. | S4 freeze. |
+| K-8 | C5 is applied at run time by wrapping each map in `labels::Labelled` (the registry path wraps the four legacy maps), not inside `Registry::run`, because `lib.rs` was out of scope for S3. A mislabelled answer becomes `Failed` with one warning (C1), keeping a partial answer's own note or warning. The kit's C1 and C6 runs (`kit.rs`, also out of scope) register maps bare, so labels are checked by `check_source_labels`, not "in every contract run" as section 2 asks. (S3) | Check labels in `Registry::run`'s own answer check. | S4 freeze. Resolved 2026-10-13 on `cloud/spike-int` (merge condition M6, `394faba`): the check is in `Registry::run`'s answer check, so every registry run checks labels, the kit's C1 and C6 runs included; the legacy maps are registered bare; `Labelled` stays for a caller without a registry. |
 
 ## 5. How a test proves it
 
@@ -375,6 +375,15 @@ one warning with the control-only pool. The kit check refuses to pass vacuously:
 with no used hit is a `kit` failure. Offline, the harness's `RunRecordFile::check_labels`
 (`src/evaluate/run_record.rs`, added with the offline harness on the same branch) checks
 every used call in a record against the labels its plan lists.
+
+Since merge condition M6 (2026-10-13, `cloud/spike-int`, `394faba`) the paragraph above is
+history for three points: `Registry::run` applies `check_labels` to every answer itself (a
+refused partial answer keeps its own note and warning in the refusal); the legacy maps are
+registered without `Labelled`; and `check_source_labels` asks the subject and the control
+directly, outside a registry, because the registry now refuses the answers the kit must
+still see. A panic in a subject therefore unwinds through the kit's C5 check, and an answer
+the registry would refuse for a structural reason (over the limit, a foreign node) is judged
+on its labels only; contract C1 covers both.
 
 Not done: the `derived_from: scip` refusal (no gold-set field carries it yet,
 `src/evaluate/types.rs`), and benchmark rows split by label (no live rows in the cloud).

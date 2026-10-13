@@ -200,9 +200,11 @@ Changes to this spec, each the conservative choice where one was open:
 - **The wrapped lexical and LSP maps live in the root crate**, not in `lci-maps` (3.1): the
   code they call (`App::map_lexical_matches`, `App::provider_symbols`,
   `App::map_lsp_locations`, `Hit::source_role_prior`) is there, and moving it would change
-  the production path. `LspMap` repeats the 40-line provider orchestration of `search_once`
-  (symbol queries, per-provider budget, query-by-query merge) because that arm is inline;
-  the integration test that compares the registry with a traced search guards against drift.
+  the production path. `LspMap` repeated the 40-line provider orchestration of `search_once`
+  (symbol queries, per-provider budget, query-by-query merge) because that arm was inline;
+  since merge condition M1 (2026-10-13, `cloud/spike-int`, `a396aba`) both call the same
+  functions in `src/app/search.rs`, and the integration test that compares the registry with
+  a traced search still guards the map path.
 - **No petgraph yet.** No graph map exists in S2; M-5 stands for the first graph map (W1b).
 - **Filter maps are refused at registration** (`RegisterError::FilterUnsupported`) until
   contract C2 lands; a filter that is silently skipped would be worse.
