@@ -447,6 +447,82 @@ async fn the_kit_rejects_a_map_that_swallows_its_failure() {
     assert_eq!(failure.contract, "C1", "{failure:?}");
 }
 
+/// A map whose query panics through `panic!`, so the panic hook runs.
+struct Panicking(MapDescriptor);
+
+#[async_trait::async_trait]
+impl Map for Panicking {
+    fn describe(&self) -> &MapDescriptor {
+        &self.0
+    }
+
+    async fn query(&self, _: &MapRequest<'_>, _: &SnapshotView<'_>) -> MapResponse {
+        panic!("real panic in {}", self.0.id)
+    }
+}
+
+/// The registry turns a real panic and the kit's injected panic into the
+/// same failure, but only the real one runs the panic hook. The hook prints
+/// the panic, and with `RUST_BACKTRACE` set it also captures and symbolises
+/// a backtrace: CPU work that ran inside the timed C1 run and, on a loaded
+/// machine, took more than the slack (2.6 s in a Full gate).
+#[tokio::test]
+async fn the_injected_panic_fails_the_map_without_running_the_panic_hook() {
+    static HOOKED: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        for (counter, text) in HOOKED
+            .iter()
+            .zip(["real panic in hook.real", "hook.injected"])
+        {
+            if payload.contains(text) {
+                counter.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+        previous(info);
+    }));
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let mut registry = Registry::new(60.0);
+    registry
+        .register(
+            Box::new(Panicking(descriptor("hook.real", Contribution::RankList))),
+            1.0,
+            40,
+        )
+        .unwrap();
+    registry
+        .register(
+            Box::new(kit::FaultInjector {
+                inner: fixed(&view, "hook.injected", Contribution::RankList, &[0], None),
+                fault: kit::Fault::Panic,
+            }),
+            1.0,
+            40,
+        )
+        .unwrap();
+    let run = registry.run(Some("q"), Duration::from_secs(5), &view).await;
+    assert_eq!(
+        run.warnings(),
+        vec![
+            ("hook.injected", "map hook.injected panicked"),
+            ("hook.real", "map hook.real panicked"),
+        ]
+    );
+    assert_eq!(HOOKED[0].load(AtomicOrdering::SeqCst), 1, "the real panic");
+    assert_eq!(
+        HOOKED[1].load(AtomicOrdering::SeqCst),
+        0,
+        "the injected panic"
+    );
+}
+
 #[test]
 fn set_enabled_reports_an_unknown_id() {
     let chunks = universe();

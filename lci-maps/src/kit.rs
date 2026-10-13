@@ -106,7 +106,15 @@ impl Map for FaultInjector<'_> {
                     warning: format!("{} failed (injected)", self.describe().id),
                 };
             }
-            Fault::Panic => panic!("injected panic in {}", self.describe().id),
+            // An unwinding panic that skips the panic hook. With
+            // `RUST_BACKTRACE` set the hook symbolises a backtrace, CPU work
+            // that would run inside the timed C1 run and, on a loaded
+            // machine, take more than the slack. The registry catches this
+            // unwind as it catches `panic!`.
+            Fault::Panic => std::panic::resume_unwind(Box::new(format!(
+                "injected panic in {}",
+                self.describe().id
+            ))),
             Fault::PastDeadline => {
                 let wait = request
                     .budget
