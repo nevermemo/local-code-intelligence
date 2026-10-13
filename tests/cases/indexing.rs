@@ -134,9 +134,11 @@ async fn deeply_nested_modules_index_and_reuse_without_stack_overflow() {
     assert_eq!(repeat.chunks, report.chunks);
     assert_eq!(repeat.embedded_chunks, 0);
     assert_eq!(repeat.reused_chunks, report.chunks);
+    // The reopened process has observed no embedding width, so it sends one
+    // probe document (N43); no chunk is embedded again.
     assert_eq!(
         fake.documents.load(Ordering::SeqCst),
-        report.embedded_chunks
+        report.embedded_chunks + 1
     );
     task.abort();
 }
