@@ -63,23 +63,36 @@ fn pattern(rng: &mut Rng) -> String {
 }
 
 /// Another spelling of the same repository-relative path: any separator may be
-/// a backslash or doubled, `.` components may appear anywhere, and a leading
-/// or trailing separator may be added.
+/// doubled (or, on Windows, a backslash), `.` components may appear anywhere,
+/// and a leading or trailing separator may be added. On Unix a backslash is a
+/// file-name character (N90), so it is not another spelling there.
 /// The leading separator pins current behaviour: `normalize_path` treats a
 /// rooted path (`/src/a.rs`) as the relative one (`src/a.rs`).
 fn respell(rng: &mut Rng, path: &str) -> String {
     let mut out = String::new();
     if rng.below(3) == 0 {
-        out.push_str(rng.pick::<&str>(&["./", "/", "\\", ".\\"]));
+        out.push_str(rng.pick::<&str>(if cfg!(windows) {
+            &["./", "/", "\\", ".\\"]
+        } else {
+            &["./", "/"]
+        }));
     }
     for (index, component) in path.split('/').enumerate() {
         if index > 0 {
-            out.push_str(rng.pick::<&str>(&["/", "\\", "//", "/./", "\\.\\"]));
+            out.push_str(rng.pick::<&str>(if cfg!(windows) {
+                &["/", "\\", "//", "/./", "\\.\\"]
+            } else {
+                &["/", "//", "/./"]
+            }));
         }
         out.push_str(component);
     }
     if rng.below(3) == 0 {
-        out.push_str(rng.pick::<&str>(&["/", "\\", "/."]));
+        out.push_str(rng.pick::<&str>(if cfg!(windows) {
+            &["/", "\\", "/."]
+        } else {
+            &["/", "/."]
+        }));
     }
     out
 }
