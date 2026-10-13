@@ -463,6 +463,11 @@ mod tests {
             foreign_lock_packages(tree, &newer).unwrap(),
             vec!["serde 1.0.2".to_owned()]
         );
+        let unknown = same.replace("\"serde\"", "\"left-pad\"");
+        assert_eq!(
+            foreign_lock_packages(tree, &unknown).unwrap(),
+            vec!["left-pad 1.0.1".to_owned()]
+        );
         assert!(foreign_lock_packages("not toml [", same).is_err());
     }
 
