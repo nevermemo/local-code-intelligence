@@ -94,6 +94,47 @@ pub trait LspAdapter: Send + Sync {
     }
 }
 
+/// The largest file a `before_position_request` hook reads and sends whole in
+/// `textDocument/didOpen`. While it is sent the text is held about three
+/// times over (the read, the JSON value the transport clones, and the frame),
+/// so a huge generated file would cost several times its size in memory.
+/// Above the cap the hook skips the `didOpen` and the request goes out
+/// anyway; a server that needs the file open answers it empty or with an
+/// error, and navigation fails open on either. A constant until indexing has
+/// a per-file size cap to share (roadmap N18 part f).
+pub const MAX_DID_OPEN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads `file` for a `textDocument/didOpen` to `server`, or `None` when it is
+/// larger than [`MAX_DID_OPEN_BYTES`]. The read itself stops one byte past
+/// the cap, so no separate size check is needed (and a file that grows
+/// while it is read cannot get past it).
+pub async fn read_for_did_open(
+    file: &Path,
+    relative: &str,
+    server: &str,
+) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let context = || format!("read {relative} to open in {server}");
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(file)
+        .await
+        .with_context(context)?
+        .take(MAX_DID_OPEN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(context)?;
+    if bytes.len() as u64 > MAX_DID_OPEN_BYTES {
+        tracing::warn!(
+            server,
+            file = relative,
+            limit_bytes = MAX_DID_OPEN_BYTES,
+            "file too large to open in the language server; sending the request without it"
+        );
+        return Ok(None);
+    }
+    String::from_utf8(bytes).map(Some).with_context(context)
+}
+
 /// Checks a configured executable with a bounded `--version` invocation.
 pub async fn probe_subprocess_version(resolved: &Path, timeout: Duration) -> Result<()> {
     let mut command = tokio::process::Command::new(resolved);
