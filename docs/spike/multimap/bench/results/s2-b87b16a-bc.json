@@ -1,0 +1,5991 @@
+{
+  "arms": [
+    "fusion",
+    "grep"
+  ],
+  "bench_set": {
+    "tasks": 60,
+    "version": "v1"
+  },
+  "binary": "lci-s2",
+  "build": {
+    "commit": "b87b16a409171c0e6f2d2a5dd6c7c87fc81174ff",
+    "dirty": false,
+    "profile": "debug"
+  },
+  "defs_probe": null,
+  "embedder": {
+    "dimension": 512,
+    "kind": "fake",
+    "model": "lci-bench-fake-hash-512"
+  },
+  "finished_at": "2026-10-13T04:53:09Z",
+  "label": "S2 b87b16a (levels B, C)",
+  "levels": [
+    "B",
+    "C"
+  ],
+  "machine": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "logical_cores": 4,
+    "os": "Linux (Ubuntu 24.04)",
+    "ripgrep": "ripgrep 14.1.0"
+  },
+  "repos": [
+    {
+      "index": {
+        "chunks": 17704,
+        "files": 763,
+        "ms": 13491.750956,
+        "size_bytes": 51153108
+      },
+      "key": "tokio",
+      "tasks": 20
+    },
+    {
+      "index": {
+        "chunks": 4614,
+        "files": 344,
+        "ms": 6196.349354,
+        "size_bytes": 16371996
+      },
+      "key": "caddy",
+      "tasks": 20
+    },
+    {
+      "index": {
+        "chunks": 6998,
+        "files": 320,
+        "ms": 14261.329478,
+        "size_bytes": 26325238
+      },
+      "key": "black",
+      "tasks": 20
+    }
+  ],
+  "schema": "lci.bench-results/1",
+  "started_at": "2026-10-13T04:46:24Z",
+  "tasks": [
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/runtime/blocking/mod.rs",
+            "tokio/src/runtime/runtime.rs",
+            "tokio/src/runtime/local_runtime/runtime.rs",
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/builder.rs",
+            "tokio/src/runtime/tests/loom_multi_thread.rs",
+            "tokio/src/runtime/scheduler/multi_thread/mod.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 572.851851
+        },
+        "grep": {
+          "files": [
+            "tokio/src/runtime/blocking/mod.rs",
+            "tokio/src/net/tcp/stream.rs",
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/builder.rs",
+            "tokio/src/runtime/runtime.rs",
+            "tokio/src/sync/mpsc/bounded.rs",
+            "tokio/src/sync/mpsc/unbounded.rs",
+            "tokio/src/runtime/local_runtime/runtime.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 465.281652
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-f21f2693f02a",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio-util/src/future/with_cancellation_token.rs",
+            "tokio-util/src/sync/mod.rs",
+            "tokio/tests/time_pause.rs",
+            "tokio/src/fs/mocks.rs",
+            "tokio/src/process/unix/pidfd_reaper.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/blocking/pool.rs"
+          ],
+          "hit5": true,
+          "name": "run",
+          "precision5": 0.2,
+          "total_ms": 464.611303
+        }
+      ],
+      "refresh": {
+        "chunks": 17704,
+        "embedded_chunks": 12095,
+        "files": 763,
+        "ms": 13491.750956,
+        "reused_chunks": 0
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 17706,
+        "embedded_chunks": 3,
+        "files": 763,
+        "ms": 1743.7157220000001,
+        "reused_chunks": 17703
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-test/src/io.rs",
+            "tokio/src/io/async_write.rs",
+            "tokio/src/io/util/async_write_ext.rs",
+            "tokio/src/fs/mocks.rs",
+            "tokio/src/net/tcp/stream.rs",
+            "tokio/src/net/unix/stream.rs",
+            "tokio/src/fs/open_options/mock_open_options.rs",
+            "tokio/src/process/mod.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 638.6753219999999
+        },
+        "grep": {
+          "files": [
+            "tokio-test/src/io.rs",
+            "tokio/src/fs/mocks.rs",
+            "tokio/src/fs/open_options/mock_open_options.rs",
+            "tokio/src/process/mod.rs",
+            "tokio/src/runtime/metrics/mod.rs",
+            "tokio/src/runtime/scheduler/multi_thread/mod.rs",
+            "tokio/src/process/unix/reap.rs",
+            "tokio-test/src/lib.rs",
+            "tokio-test/src/task.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 445.176033
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-d18e5dfbb0cd",
+      "lookup": [
+        {
+          "files": [
+            "tokio-util/src/io/mod.rs",
+            "tokio-util/src/either.rs",
+            "tokio/src/net/tcp/stream.rs",
+            "tokio/src/net/unix/stream.rs",
+            "tokio-util/src/compat.rs",
+            "tokio/src/net/tcp/split.rs",
+            "tokio/src/net/unix/split.rs",
+            "tokio/src/io/uring/mod.rs"
+          ],
+          "gold_files": [
+            "tokio-test/src/io.rs"
+          ],
+          "hit5": false,
+          "name": "poll_write",
+          "precision5": 0.0,
+          "total_ms": 531.045929
+        }
+      ],
+      "refresh": {
+        "chunks": 17706,
+        "embedded_chunks": 0,
+        "files": 763,
+        "ms": 1809.006145,
+        "reused_chunks": 17706
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 17706,
+        "embedded_chunks": 1,
+        "files": 763,
+        "ms": 1855.166599,
+        "reused_chunks": 17705
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-util/src/context.rs",
+            "tokio/src/lib.rs",
+            "tokio/src/runtime/builder.rs",
+            "tokio/src/runtime/runtime.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio-stream/src/wrappers/interval.rs",
+            "tokio/src/runtime/scheduler/multi_thread/stats.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 544.9503460000001
+        },
+        "grep": {
+          "files": [
+            "tokio/src/runtime/builder.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio-stream/src/wrappers/interval.rs",
+            "tokio/src/runtime/scheduler/multi_thread/stats.rs",
+            "tokio/src/runtime/config.rs",
+            "tokio/src/time/interval.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 389.328398
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-03fe44c10302",
+      "lookup": [],
+      "refresh": {
+        "chunks": 17706,
+        "embedded_chunks": 0,
+        "files": 763,
+        "ms": 1833.348031,
+        "reused_chunks": 17706
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 17706,
+        "embedded_chunks": 1,
+        "files": 763,
+        "ms": 1888.7495880000001,
+        "reused_chunks": 17705
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "benches/sync_notify.rs",
+            "tokio/src/sync/watch.rs",
+            "tokio/src/sync/tests/loom_notify.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/set_once.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 983.18434
+        },
+        "grep": {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/sync/watch.rs",
+            "tokio/src/sync/tests/loom_notify.rs",
+            "benches/sync_notify.rs",
+            "tokio/tests/sync_notify.rs",
+            "tokio/tests/sync_notify_owned.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 835.984823
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-9f132172dbb0",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/tests/sync_notify.rs",
+            "tokio/tests/sync_notify_owned.rs",
+            "tokio/src/process/unix/pidfd_reaper.rs",
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "poll_notified",
+          "precision5": 0.2,
+          "total_ms": 582.212014
+        }
+      ],
+      "refresh": {
+        "chunks": 17841,
+        "embedded_chunks": 99,
+        "files": 769,
+        "ms": 2063.056527,
+        "reused_chunks": 17726
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 17842,
+        "embedded_chunks": 2,
+        "files": 769,
+        "ms": 1924.127559,
+        "reused_chunks": 17840
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/tests/tracing_sync.rs",
+            "tokio/src/sync/rwlock/read_guard.rs",
+            "tokio/src/sync/rwlock/write_guard.rs",
+            "tokio/src/sync/semaphore.rs",
+            "tokio/src/sync/rwlock/write_guard_mapped.rs",
+            "tokio-util/src/lib.rs",
+            "tokio-util/src/loom.rs",
+            "tokio/src/io/stdin.rs",
+            "tokio/src/sync/once_cell.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 559.455527
+        },
+        "grep": {
+          "files": [
+            "tokio/src/sync/semaphore.rs",
+            "tokio/src/sync/once_cell.rs",
+            "tokio-util/src/sync/poll_semaphore.rs",
+            "tokio/src/sync/batch_semaphore.rs",
+            "tokio/src/sync/mpsc/chan.rs",
+            "tokio/src/sync/tests/semaphore_batch.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 496.03575
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-3ea11e2a5fb4",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/sync/semaphore.rs",
+            "tokio/src/sync/tests/semaphore_batch.rs",
+            "tokio/tests/sync_semaphore.rs",
+            "tokio/tests/sync_semaphore_owned.rs",
+            "tokio/src/sync/mpsc/chan.rs",
+            "tokio/src/runtime/io/driver.rs",
+            "tokio/src/runtime/mod.rs",
+            "tokio/src/util/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/batch_semaphore.rs"
+          ],
+          "hit5": false,
+          "name": "forget_permits",
+          "precision5": 0.0,
+          "total_ms": 449.981525
+        }
+      ],
+      "refresh": {
+        "chunks": 17927,
+        "embedded_chunks": 185,
+        "files": 773,
+        "ms": 3074.8540110000004,
+        "reused_chunks": 17730
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 17931,
+        "embedded_chunks": 5,
+        "files": 773,
+        "ms": 1870.7265309999998,
+        "reused_chunks": 17926
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/time/timeout.rs",
+            "tokio/src/task/coop/mod.rs",
+            "tokio/src/time/interval.rs",
+            "tokio-test/src/task.rs",
+            "tokio-util/src/sync/cancellation_token.rs",
+            "tokio-util/src/time/mod.rs",
+            "tokio-util/src/time/delay_queue.rs",
+            "tokio/src/future/maybe_done.rs",
+            "tokio/src/process/mod.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 1160.860487
+        },
+        "grep": {
+          "files": [
+            "tokio/src/time/timeout.rs",
+            "tokio/src/time/interval.rs",
+            "tokio-util/src/time/mod.rs",
+            "tokio-util/src/time/delay_queue.rs",
+            "tokio/src/task/coop/mod.rs",
+            "tokio/src/time/mod.rs",
+            "tokio-stream/src/lib.rs",
+            "tokio/src/net/tcp/socket.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 1068.633161
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-66e29121b333",
+      "lookup": [],
+      "refresh": {
+        "chunks": 18334,
+        "embedded_chunks": 675,
+        "files": 784,
+        "ms": 4954.352148,
+        "reused_chunks": 17591
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18334,
+        "embedded_chunks": 1,
+        "files": 784,
+        "ms": 2497.359432,
+        "reused_chunks": 18333
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-stream/tests/stream_stream_map.rs",
+            "tokio-stream/src/lib.rs",
+            "tokio-stream/src/stream_ext/fuse.rs",
+            "tokio-stream/tests/join_set_stream.rs",
+            "tokio-stream/src/stream_map.rs",
+            "tokio-stream/tests/mpsc_bounded_stream.rs",
+            "tokio-stream/src/iter.rs",
+            "tokio-stream/src/once.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 644.744162
+        },
+        "grep": {
+          "files": [
+            "tokio-stream/src/iter.rs",
+            "tokio-stream/src/once.rs",
+            "tokio-stream/src/stream_ext/chain.rs",
+            "tokio-stream/src/stream_ext/filter.rs",
+            "tokio-stream/src/stream_ext/filter_map.rs",
+            "tokio-stream/src/stream_ext/map.rs",
+            "tokio-stream/src/stream_ext/merge.rs",
+            "tokio-test/src/task.rs",
+            "tokio-util/src/task/join_map.rs",
+            "tokio-stream/src/stream_ext/skip.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 561.162108
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-f59aae423eaf",
+      "lookup": [
+        {
+          "files": [
+            "tokio-stream/src/iter.rs",
+            "tokio-stream/src/stream_ext/chain.rs",
+            "tokio-stream/src/once.rs",
+            "tokio-stream/src/stream_ext/merge.rs",
+            "tokio-stream/src/stream_ext/map.rs",
+            "tokio-stream/src/stream_ext/filter.rs",
+            "tokio-test/src/task.rs",
+            "tokio-stream/src/stream_ext/filter_map.rs",
+            "tokio-util/src/task/join_map.rs",
+            "tokio-stream/src/stream_ext/map_while.rs"
+          ],
+          "gold_files": [
+            "tokio-stream/src/stream_map.rs"
+          ],
+          "hit5": false,
+          "name": "size_hint",
+          "precision5": 0.0,
+          "total_ms": 511.210694
+        }
+      ],
+      "refresh": {
+        "chunks": 18333,
+        "embedded_chunks": 1,
+        "files": 784,
+        "ms": 2085.1260639999996,
+        "reused_chunks": 18332
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 18334,
+        "embedded_chunks": 2,
+        "files": 784,
+        "ms": 2098.6073539999998,
+        "reused_chunks": 18332
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/runtime/task/raw.rs",
+            "tokio/src/runtime/task/abort.rs",
+            "tokio/src/runtime/task/waker.rs",
+            "tokio/src/sync/mpsc/chan.rs",
+            "tokio/src/runtime/task/join.rs",
+            "tokio/src/runtime/park.rs",
+            "tokio/src/sync/mpsc/bounded.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 1263.8134750000002
+        },
+        "grep": {
+          "files": [
+            "tokio/src/sync/mpsc/chan.rs",
+            "tokio/src/sync/mpsc/bounded.rs",
+            "tokio/src/sync/mpsc/unbounded.rs",
+            "tokio/src/runtime/task/abort.rs",
+            "tokio/src/runtime/task/harness.rs",
+            "tokio/src/runtime/task/join.rs",
+            "tokio/src/runtime/task/mod.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 1228.4298709999998
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-e06f16259df3",
+      "lookup": [
+        {
+          "files": [
+            "tokio-util/src/sync/cancellation_token.rs",
+            "tokio-util/src/sync/reusable_box.rs",
+            "tokio/src/runtime/task/harness.rs",
+            "tokio/src/runtime/io/driver/uring.rs",
+            "tokio/src/runtime/task/waker.rs",
+            "tokio/src/util/idle_notified_set.rs",
+            "tokio-util/src/sync/cancellation_token/guard_ref.rs",
+            "tokio/src/util/linked_list.rs",
+            "tokio/src/process/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/mpsc/chan.rs"
+          ],
+          "hit5": false,
+          "name": "drop",
+          "precision5": 0.0,
+          "total_ms": 500.42652
+        }
+      ],
+      "refresh": {
+        "chunks": 18485,
+        "embedded_chunks": 248,
+        "files": 789,
+        "ms": 3895.9236280000005,
+        "reused_chunks": 18212
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 18486,
+        "embedded_chunks": 2,
+        "files": 789,
+        "ms": 2580.058108,
+        "reused_chunks": 18484
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/runtime/scheduler/util/time_alt.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/util/mod.rs",
+            "tokio/src/runtime/time/mod.rs",
+            "tokio/src/runtime/time_alt/timer.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 605.685488
+        },
+        "grep": {
+          "files": [
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/util/time_alt.rs",
+            "tokio/src/runtime/time/mod.rs",
+            "tokio/src/runtime/time_alt/context.rs",
+            "tokio/src/runtime/builder.rs",
+            "tokio/src/runtime/mod.rs",
+            "tokio/src/runtime/scheduler/util/mod.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 431.658449
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-91d3b4c0bccf",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/time_alt/entry.rs",
+            "tokio/src/runtime/time_alt/wheel/mod.rs",
+            "tokio/src/runtime/time_alt/tests.rs",
+            "tokio/src/process/unix/orphan.rs",
+            "tokio/src/sync/mpsc/chan.rs",
+            "tokio/src/runtime/time/mod.rs",
+            "tokio/src/runtime/scheduler/util/time_alt.rs",
+            "tokio/src/sync/mpsc/list.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/time_alt/entry.rs"
+          ],
+          "hit5": true,
+          "name": "register_cancel_tx",
+          "precision5": 0.2,
+          "total_ms": 472.051534
+        },
+        {
+          "files": [
+            "tokio/src/runtime/time/wheel/mod.rs",
+            "tokio-util/src/time/delay_queue.rs",
+            "tokio/src/time/error.rs",
+            "tokio-util/src/time/wheel/mod.rs",
+            "tokio-stream/src/stream_map.rs",
+            "tokio-stream/src/stream_ext/collect.rs",
+            "tokio-util/tests/time_delay_queue.rs",
+            "tokio/src/task/join_set.rs",
+            "tokio-stream/tests/stream_stream_map.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/time_alt/wheel/mod.rs"
+          ],
+          "hit5": false,
+          "name": "insert",
+          "precision5": 0.0,
+          "total_ms": 440.581703
+        }
+      ],
+      "refresh": {
+        "chunks": 18519,
+        "embedded_chunks": 60,
+        "files": 790,
+        "ms": 2966.079326,
+        "reused_chunks": 18459
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 18522,
+        "embedded_chunks": 8,
+        "files": 790,
+        "ms": 2021.508887,
+        "reused_chunks": 18514
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/signal/windows.rs",
+            "tokio/src/signal/windows/sys.rs",
+            "tokio/src/loom/std/atomic_u64_static_once_cell.rs",
+            "tokio/src/signal/registry.rs",
+            "tokio/src/signal/ctrl_c.rs",
+            "tokio/src/signal/unix.rs",
+            "tokio/src/io/uring/open.rs",
+            "tokio/src/runtime/task/raw.rs",
+            "tokio-stream/src/wrappers/signal_windows.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 1078.281265
+        },
+        "grep": {
+          "files": [
+            "tokio/src/signal/windows/sys.rs",
+            "tokio/src/signal/windows.rs",
+            "tokio/src/signal/ctrl_c.rs",
+            "tokio/src/loom/std/atomic_u64_static_once_cell.rs",
+            "tokio/src/signal/registry.rs",
+            "tokio/src/signal/unix.rs",
+            "tokio-util/src/io/read_arc.rs",
+            "tokio/src/macros/join.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 883.114592
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-ae9d01121377",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/io/bsd/poll_aio.rs",
+            "tokio/src/process/unix/mod.rs",
+            "tokio/src/process/unix/pidfd_reaper.rs",
+            "tokio/src/signal/registry.rs",
+            "tokio/src/runtime/signal/mod.rs",
+            "tokio/src/signal/windows/sys.rs"
+          ],
+          "gold_files": [
+            "tokio/src/signal/windows/sys.rs"
+          ],
+          "hit5": false,
+          "name": "REGISTRY",
+          "precision5": 0.0,
+          "total_ms": 422.939809
+        },
+        {
+          "files": [
+            "tokio/src/sync/mpsc/block.rs",
+            "tokio-util/src/time/delay_queue.rs",
+            "tokio/src/runtime/io/driver/uring.rs",
+            "tokio/src/signal/windows/sys.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio-util/src/util/memchr.rs",
+            "tokio/src/util/memchr.rs"
+          ],
+          "gold_files": [
+            "tokio/src/signal/windows/sys.rs"
+          ],
+          "hit5": true,
+          "name": "index",
+          "precision5": 0.2,
+          "total_ms": 438.689132
+        },
+        {
+          "files": [
+            "tokio-util/src/task/join_queue.rs",
+            "tokio/src/runtime/park.rs",
+            "tokio/src/process/unix/orphan.rs",
+            "tokio-test/src/task.rs",
+            "tokio/src/util/try_lock.rs",
+            "tokio/src/runtime/time/entry.rs",
+            "tokio/src/runtime/time/wheel/mod.rs",
+            "tokio/src/runtime/tests/loom_multi_thread/queue.rs"
+          ],
+          "gold_files": [
+            "tokio/src/signal/windows/sys.rs"
+          ],
+          "hit5": false,
+          "name": "new",
+          "precision5": 0.0,
+          "total_ms": 483.543566
+        }
+      ],
+      "refresh": {
+        "chunks": 18522,
+        "embedded_chunks": 1,
+        "files": 790,
+        "ms": 1939.4730220000001,
+        "reused_chunks": 18521
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18523,
+        "embedded_chunks": 4,
+        "files": 790,
+        "ms": 1970.966621,
+        "reused_chunks": 18519
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-util/src/codec/length_delimited.rs",
+            "tokio-util/tests/length_delimited.rs",
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio-util/src/codec/mod.rs",
+            "tokio-util/src/codec/bytes_codec.rs",
+            "tokio-util/src/codec/any_delimiter_codec.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 1054.522887
+        },
+        "grep": {
+          "files": [
+            "tokio-util/src/codec/length_delimited.rs",
+            "tokio-util/src/codec/mod.rs",
+            "tokio-util/tests/length_delimited.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 879.889684
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-b6ed00435dc4",
+      "lookup": [],
+      "refresh": {
+        "chunks": 18586,
+        "embedded_chunks": 174,
+        "files": 791,
+        "ms": 3521.086157,
+        "reused_chunks": 18407
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18586,
+        "embedded_chunks": 3,
+        "files": 791,
+        "ms": 2036.532498,
+        "reused_chunks": 18583
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/runtime/io/registration_set.rs",
+            "tokio/src/runtime/scheduler/inject/shared.rs",
+            "tokio/src/runtime/tests/loom_current_thread.rs",
+            "tokio/tests/sync_mpsc_weak.rs",
+            "tokio/src/sync/oneshot.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 1161.874677
+        },
+        "grep": {
+          "files": [
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/notify.rs",
+            "tokio/src/runtime/io/registration_set.rs",
+            "tokio-util/src/task/task_tracker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/park.rs",
+            "tokio/src/runtime/scheduler/current_thread/mod.rs",
+            "tokio/src/runtime/scheduler/inject/shared.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 1079.5233070000002
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-d4fb4bb9e6e7",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/runtime/scheduler/multi_thread/counters.rs",
+            "tokio/src/sync/watch.rs",
+            "benches/sync_notify.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio-test/src/io.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "atomic_inc_num_notify_waiters_calls",
+          "precision5": 0.2,
+          "total_ms": 596.465586
+        },
+        {
+          "files": [
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/sync/notify.rs",
+            "tokio-util/src/sync/reusable_box.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/task/harness.rs",
+            "tokio/src/runtime/task/waker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/util/idle_notified_set.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "drop_notified",
+          "precision5": 0.2,
+          "total_ms": 512.1922979999999
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/sync/watch.rs",
+            "benches/sync_notify.rs",
+            "tokio-test/src/io.rs",
+            "tokio/src/io/split.rs",
+            "tokio/src/runtime/scheduler/multi_thread/queue.rs",
+            "tokio/src/runtime/time/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "inner_notify_waiters",
+          "precision5": 0.2,
+          "total_ms": 497.660366
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/runtime/io/scheduled_io.rs",
+            "tokio/src/runtime/scheduler/lock.rs",
+            "tokio/src/sync/batch_semaphore.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/mpsc/mod.rs",
+            "tokio-stream/src/stream_ext/collect.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "lock_waiter_list",
+          "precision5": 0.2,
+          "total_ms": 547.8494969999999
+        },
+        {
+          "files": [
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/sync/notify.rs",
+            "tokio/src/runtime/task/mod.rs",
+            "tokio-util/src/sync/cancellation_token/tree_node.rs",
+            "tokio/tests/sync_notify.rs",
+            "tokio/tests/sync_notify_owned.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "notified",
+          "precision5": 0.2,
+          "total_ms": 453.928261
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/runtime/task/trace/mod.rs",
+            "tokio/tests/sync_notify_owned.rs",
+            "tokio/tests/async_send_sync.rs",
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/fs/mocks.rs",
+            "tokio/src/io/uring/utils.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "notified_owned",
+          "precision5": 0.2,
+          "total_ms": 472.790899
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/sync/watch.rs",
+            "benches/sync_notify.rs",
+            "tokio/tests/sync_notify.rs",
+            "tokio/tests/sync_notify_owned.rs",
+            "tokio/src/sync/broadcast.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "notify_locked",
+          "precision5": 0.2,
+          "total_ms": 426.095642
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/src/io/uring/mod.rs",
+            "tokio/src/io/uring/open.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/set_once.rs",
+            "tokio/src/sync/watch.rs",
+            "tokio/src/time/interval.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "notify_with_strategy",
+          "precision5": 0.2,
+          "total_ms": 432.794731
+        },
+        {
+          "files": [
+            "tokio/src/sync/notify.rs",
+            "tokio/tests/sync_notify.rs",
+            "tokio/tests/sync_notify_owned.rs",
+            "tokio/src/process/unix/pidfd_reaper.rs",
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+          ],
+          "gold_files": [
+            "tokio/src/sync/notify.rs"
+          ],
+          "hit5": true,
+          "name": "poll_notified",
+          "precision5": 0.2,
+          "total_ms": 555.8608
+        }
+      ],
+      "refresh": {
+        "chunks": 18588,
+        "embedded_chunks": 7,
+        "files": 791,
+        "ms": 2056.535378,
+        "reused_chunks": 18574
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18588,
+        "embedded_chunks": 10,
+        "files": 791,
+        "ms": 2643.84986,
+        "reused_chunks": 18578
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio/src/io/util/async_buf_read_ext.rs",
+            "tokio/src/io/util/lines.rs",
+            "tokio/src/io/util/read_line.rs",
+            "tokio-util/src/io/stream_reader.rs",
+            "tokio/src/io/blocking.rs",
+            "tokio/src/sync/mpsc/list.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 1385.49926
+        },
+        "grep": {
+          "files": [
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio/src/io/util/async_buf_read_ext.rs",
+            "tokio-stream/src/wrappers/lines.rs",
+            "tokio/src/io/util/lines.rs",
+            "tokio-util/tests/codecs.rs",
+            "tokio/tests/async_send_sync.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 0.25,
+          "total_ms": 1151.35577
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-89f4d133ba37",
+      "lookup": [
+        {
+          "files": [
+            "tokio-stream/src/wrappers/lines.rs",
+            "tokio/src/io/util/async_buf_read_ext.rs",
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio/src/io/util/lines.rs",
+            "tokio-util/src/codec/mod.rs",
+            "tokio-stream/src/wrappers.rs",
+            "examples/chat.rs"
+          ],
+          "gold_files": [
+            "tokio/src/io/util/lines.rs"
+          ],
+          "hit5": true,
+          "name": "Lines",
+          "precision5": 0.2,
+          "total_ms": 439.443567
+        },
+        {
+          "files": [
+            "tokio-stream/src/wrappers/lines.rs",
+            "tokio/src/io/util/async_buf_read_ext.rs",
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio/src/io/util/lines.rs",
+            "tokio-util/src/codec/mod.rs",
+            "tokio-stream/src/wrappers.rs",
+            "examples/chat.rs"
+          ],
+          "gold_files": [
+            "tokio/src/io/util/lines.rs"
+          ],
+          "hit5": true,
+          "name": "lines",
+          "precision5": 0.2,
+          "total_ms": 546.482173
+        },
+        {
+          "files": [
+            "tokio-stream/src/wrappers/lines.rs",
+            "tokio/src/process/unix/pidfd_reaper.rs",
+            "tokio/src/io/util/lines.rs",
+            "tokio-stream/src/stream_ext.rs",
+            "tokio-util/src/codec/framed.rs",
+            "tokio-util/src/codec/lines_codec.rs",
+            "tokio-util/src/codec/framed_read.rs",
+            "tests-integration/src/bin/test-cat.rs"
+          ],
+          "gold_files": [
+            "tokio/src/io/util/lines.rs"
+          ],
+          "hit5": true,
+          "name": "poll_next_line",
+          "precision5": 0.2,
+          "total_ms": 552.134548
+        },
+        {
+          "files": [
+            "tokio/src/io/util/read_to_string.rs",
+            "tokio/src/io/util/async_read_ext.rs",
+            "tokio/src/fs/mod.rs",
+            "tokio/src/io/util/read_line.rs",
+            "tokio/src/io/util/read_int.rs",
+            "tokio-stream/src/stream_ext/collect.rs"
+          ],
+          "gold_files": [
+            "tokio/src/io/util/read_line.rs"
+          ],
+          "hit5": true,
+          "name": "finish_string_read",
+          "precision5": 0.2,
+          "total_ms": 696.232588
+        },
+        {
+          "files": [
+            "tokio/src/io/util/lines.rs",
+            "tokio/src/io/util/async_buf_read_ext.rs",
+            "tokio/src/io/util/read_to_string.rs",
+            "tokio/src/io/util/read_line.rs",
+            "tokio/src/io/uring/mod.rs",
+            "tokio/src/io/uring/read.rs",
+            "tokio/src/util/cacheline.rs"
+          ],
+          "gold_files": [
+            "tokio/src/io/util/read_line.rs"
+          ],
+          "hit5": true,
+          "name": "read_line_internal",
+          "precision5": 0.2,
+          "total_ms": 638.50042
+        }
+      ],
+      "refresh": {
+        "chunks": 18695,
+        "embedded_chunks": 153,
+        "files": 793,
+        "ms": 3194.301279,
+        "reused_chunks": 18508
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 18706,
+        "embedded_chunks": 14,
+        "files": 793,
+        "ms": 2140.206628,
+        "reused_chunks": 18691
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/runtime/driver.rs",
+            "tokio/src/process/unix/orphan.rs",
+            "tokio/src/runtime/process.rs",
+            "tokio/src/runtime/io/driver/signal.rs",
+            "tokio/src/runtime/scheduler/current_thread/mod.rs",
+            "tokio/src/runtime/scheduler/multi_thread/park.rs",
+            "tokio/src/runtime/signal/mod.rs",
+            "tokio-util/src/context.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 710.6711730000001
+        },
+        "grep": {
+          "files": [
+            "tokio/src/runtime/driver.rs",
+            "tokio/src/process/unix/orphan.rs",
+            "tokio/src/runtime/io/driver/signal.rs",
+            "tokio/src/runtime/process.rs",
+            "tokio/src/runtime/signal/mod.rs",
+            "tokio/src/runtime/io/driver.rs",
+            "tokio/src/signal/unix.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 488.762509
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-787697f76f1f",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/lib.rs",
+            "tokio/src/signal/unix.rs",
+            "tokio/src/signal/windows/sys.rs",
+            "tokio/src/runtime/io/driver.rs",
+            "tokio/src/runtime/driver.rs",
+            "tokio-stream/src/wrappers/signal_unix.rs",
+            "tokio/src/process/unix/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/driver.rs"
+          ],
+          "hit5": true,
+          "name": "signal",
+          "precision5": 0.2,
+          "total_ms": 510.234098
+        }
+      ],
+      "refresh": {
+        "chunks": 18728,
+        "embedded_chunks": 171,
+        "files": 796,
+        "ms": 2978.062525,
+        "reused_chunks": 18515
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 18728,
+        "embedded_chunks": 1,
+        "files": 796,
+        "ms": 2386.110027,
+        "reused_chunks": 18727
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/runtime/park.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/park.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/metrics/runtime.rs",
+            "tokio/src/runtime/blocking/sharded.rs",
+            "tokio/src/runtime/scheduler/multi_thread/counters.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 935.431816
+        },
+        "grep": {
+          "files": [
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/park.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/counters.rs",
+            "tokio/src/runtime/scheduler/multi_thread/park.rs",
+            "tokio/src/runtime/blocking/sharded.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 689.828259
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-130945198760",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/scheduler/multi_thread/stats.rs",
+            "tokio/tests/rt_threaded.rs",
+            "tokio/tests/rt_unstable_metrics.rs",
+            "tokio-util/src/udp/frame.rs",
+            "tokio/src/runtime/scheduler/mod.rs",
+            "tokio/src/task/blocking.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs"
+          ],
+          "hit5": true,
+          "name": "dec_num_unparked",
+          "precision5": 0.2,
+          "total_ms": 534.829045
+        },
+        {
+          "files": [
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/time_alt/timer.rs",
+            "tokio/src/runtime/metrics/batch.rs",
+            "tokio-stream/src/stream_ext.rs",
+            "tokio-stream/src/stream_ext/skip.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs"
+          ],
+          "hit5": true,
+          "name": "transition_worker_to_parked",
+          "precision5": 0.2,
+          "total_ms": 459.290445
+        },
+        {
+          "files": [
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio-stream/src/wrappers/broadcast.rs",
+            "tokio-stream/src/wrappers/mpsc_bounded.rs",
+            "tokio-stream/src/wrappers/watch.rs",
+            "tokio/src/io/stderr.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/scheduler/multi_thread/stats.rs",
+            "tokio/src/runtime/metrics/batch.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs"
+          ],
+          "hit5": true,
+          "name": "transition_from_parked",
+          "precision5": 0.2,
+          "total_ms": 479.0371970000001
+        }
+      ],
+      "refresh": {
+        "chunks": 18773,
+        "embedded_chunks": 108,
+        "files": 796,
+        "ms": 2851.551494,
+        "reused_chunks": 18651
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18787,
+        "embedded_chunks": 15,
+        "files": 796,
+        "ms": 2155.289115,
+        "reused_chunks": 18772
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/lib.rs",
+            "tokio-test/src/task.rs",
+            "tokio/src/blocking.rs",
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/context.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/watch.rs",
+            "tokio/src/task/coop/mod.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 510.49513300000007
+        },
+        "grep": {
+          "files": [
+            "tokio/src/blocking.rs",
+            "tokio/src/runtime/blocking/pool.rs",
+            "tokio/src/runtime/context.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/sync/broadcast.rs",
+            "tokio/src/sync/watch.rs",
+            "tokio/src/task/coop/mod.rs",
+            "tokio/src/task/coop/unconstrained.rs",
+            "tokio-stream/src/empty.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 331.2519
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-d3587dac4bd4",
+      "lookup": [
+        {
+          "files": [
+            "tokio-util/src/task/abort_on_drop.rs",
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/runtime/local_runtime/runtime.rs",
+            "tokio/src/runtime/runtime.rs",
+            "tokio/src/task/join_set.rs",
+            "tokio/src/task/blocking.rs",
+            "tokio/src/task/spawn.rs",
+            "tokio/src/fs/file.rs",
+            "tokio/src/fs/read_dir.rs",
+            "tokio/src/runtime/tests/task_combinations.rs"
+          ],
+          "gold_files": [
+            "tokio/src/blocking.rs"
+          ],
+          "hit5": false,
+          "name": "JoinHandle",
+          "precision5": 0.0,
+          "total_ms": 548.9720209999999
+        },
+        {
+          "files": [
+            "tokio/src/fs/file.rs",
+            "benches/spawn_blocking.rs",
+            "tokio/src/runtime/blocking/mod.rs",
+            "tokio/src/fs/mod.rs",
+            "tokio/src/fs/read_dir.rs",
+            "tokio-test/src/task.rs"
+          ],
+          "gold_files": [
+            "tokio/src/blocking.rs"
+          ],
+          "hit5": false,
+          "name": "spawn_blocking",
+          "precision5": 0.0,
+          "total_ms": 497.693361
+        },
+        {
+          "files": [
+            "tokio/src/task/coop/mod.rs",
+            "tokio/src/task/coop/unconstrained.rs",
+            "tokio-util/src/time/wheel/level.rs",
+            "tokio/src/runtime/scheduler/multi_thread/queue.rs",
+            "tokio-stream/src/stream_ext/chain.rs",
+            "tokio-stream/src/stream_ext/merge.rs",
+            "tokio-util/src/io/simplex.rs",
+            "tokio/src/task/join_set.rs"
+          ],
+          "gold_files": [
+            "tokio/src/task/coop/mod.rs"
+          ],
+          "hit5": true,
+          "name": "is_unconstrained",
+          "precision5": 0.2,
+          "total_ms": 399.694203
+        }
+      ],
+      "refresh": {
+        "chunks": 18810,
+        "embedded_chunks": 71,
+        "files": 797,
+        "ms": 2725.212822,
+        "reused_chunks": 18739
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 18810,
+        "embedded_chunks": 6,
+        "files": 797,
+        "ms": 2120.0086420000002,
+        "reused_chunks": 18804
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/tests/rt_threaded.rs",
+            "tokio-util/src/util/memchr.rs",
+            "tokio/src/util/memchr.rs",
+            "tokio/src/runtime/dump.rs",
+            "tokio/src/runtime/context/current.rs",
+            "tokio/src/runtime/task/error.rs",
+            "tokio/src/runtime/io/scheduled_io.rs",
+            "tokio-stream/src/iter.rs",
+            "tokio-stream/src/stream_ext/chain.rs",
+            "tokio-stream/src/stream_ext/filter.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 1097.428992
+        },
+        "grep": {
+          "files": [
+            "tokio-util/src/util/memchr.rs",
+            "tokio/src/util/memchr.rs",
+            "tokio/src/runtime/dump.rs",
+            "tokio/src/runtime/context/current.rs",
+            "tokio/src/runtime/task/error.rs",
+            "tokio/src/runtime/io/scheduled_io.rs",
+            "tokio-stream/src/iter.rs",
+            "tokio-stream/src/stream_ext/chain.rs",
+            "tokio-stream/src/stream_ext/filter.rs",
+            "tokio-stream/src/stream_ext/filter_map.rs"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 1179.502038
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-e43fb07c7ca1",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/context/blocking.rs",
+            "tokio/src/runtime/context/runtime.rs",
+            "tokio/src/runtime/context/runtime_mt.rs",
+            "tokio/src/runtime/runtime.rs",
+            "tokio/src/runtime/local_runtime/runtime.rs",
+            "tokio/src/runtime/scheduler/multi_thread/mod.rs",
+            "tokio/src/runtime/context.rs",
+            "tokio/src/runtime/handle.rs",
+            "tokio-util/src/context.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/context/runtime.rs"
+          ],
+          "hit5": true,
+          "name": "enter_runtime",
+          "precision5": 0.2,
+          "total_ms": 580.931892
+        }
+      ],
+      "refresh": {
+        "chunks": 18972,
+        "embedded_chunks": 208,
+        "files": 799,
+        "ms": 3118.483402,
+        "reused_chunks": 18760
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 18972,
+        "embedded_chunks": 2,
+        "files": 799,
+        "ms": 2589.1666349999996,
+        "reused_chunks": 18970
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/task/blocking.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/runtime/task/list.rs",
+            "tokio-util/src/util/maybe_dangling.rs",
+            "tokio/src/util/idle_notified_set.rs",
+            "tokio/src/task/yield_now.rs",
+            "tokio/src/util/ptr_expose.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.3333333333333333,
+          "rr": 0.5,
+          "total_ms": 1068.371652
+        },
+        "grep": {
+          "files": [
+            "tokio-util/src/util/maybe_dangling.rs",
+            "tokio/src/util/ptr_expose.rs",
+            "tokio/src/runtime/scheduler/block_in_place.rs",
+            "tokio/src/task/blocking.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/scheduler/multi_thread/worker.rs",
+            "tokio/src/util/idle_notified_set.rs",
+            "tokio-test/src/task.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.3333333333333333,
+          "rr": 0.2,
+          "total_ms": 879.319823
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-86678437268b",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/task/mod.rs",
+            "tokio/src/runtime/task/state.rs",
+            "tokio/src/runtime/task/harness.rs",
+            "tokio-macros/src/entry.rs",
+            "tokio/src/net/addr.rs",
+            "tokio/src/net/unix/mod.rs",
+            "tokio/src/process/unix/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/runtime/task/state.rs"
+          ],
+          "hit5": true,
+          "name": "transition_to_notified_for_tracing",
+          "precision5": 0.2,
+          "total_ms": 532.5654
+        }
+      ],
+      "refresh": {
+        "chunks": 19158,
+        "embedded_chunks": 295,
+        "files": 808,
+        "ms": 3909.143396,
+        "reused_chunks": 18853
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 19159,
+        "embedded_chunks": 4,
+        "files": 808,
+        "ms": 2271.982532,
+        "reused_chunks": 19155
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio-util/src/sync/cancellation_token/tree_node.rs",
+            "tokio-util/src/sync/cancellation_token.rs",
+            "tokio-util/src/future.rs",
+            "tokio-util/src/sync/cancellation_token/guard.rs",
+            "tokio-util/src/sync/cancellation_token/guard_ref.rs",
+            "tokio-util/src/sync/tests/loom_cancellation_token.rs",
+            "tokio/src/runtime/scheduler/current_thread/mod.rs",
+            "tokio/src/runtime/scheduler/multi_thread/trace.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 707.042829
+        },
+        "grep": {
+          "files": [
+            "tokio-util/src/sync/cancellation_token/tree_node.rs",
+            "tokio-util/src/sync/cancellation_token.rs",
+            "tokio/src/sync/notify.rs",
+            "tokio-util/src/sync/cancellation_token/guard.rs",
+            "tokio-util/src/future.rs",
+            "tokio-util/src/future/with_cancellation_token.rs"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 508.65136
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-11d1ca094887",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/runtime/driver/op.rs",
+            "tokio-util/src/sync/cancellation_token.rs",
+            "tokio/src/runtime/time_alt/entry.rs",
+            "tokio/src/runtime/time_alt/timer.rs",
+            "tokio/src/runtime/time_alt/tests.rs",
+            "tokio/src/io/uring/read.rs",
+            "tokio/src/runtime/task/error.rs"
+          ],
+          "gold_files": [
+            "tokio-util/src/sync/cancellation_token/tree_node.rs"
+          ],
+          "hit5": false,
+          "name": "cancel",
+          "precision5": 0.0,
+          "total_ms": 494.142192
+        }
+      ],
+      "refresh": {
+        "chunks": 19159,
+        "embedded_chunks": 0,
+        "files": 808,
+        "ms": 2102.00614,
+        "reused_chunks": 19159
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 19160,
+        "embedded_chunks": 2,
+        "files": 808,
+        "ms": 2171.990702,
+        "reused_chunks": 19158
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tokio/src/lib.rs",
+            "tokio/src/net/unix/stream.rs",
+            "tokio-util/src/io/stream_reader.rs",
+            "tokio/src/net/unix/ucred.rs",
+            "tokio-util/src/either.rs",
+            "tokio/src/io/mod.rs",
+            "tokio-util/src/lib.rs",
+            "tokio/src/io/util/sink.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 521.05587
+        },
+        "grep": {
+          "files": [
+            "tokio/src/net/unix/stream.rs",
+            "tokio/src/net/unix/ucred.rs",
+            "tokio/src/io/mod.rs",
+            "tokio/src/net/udp.rs",
+            "tokio/src/net/tcp/stream.rs",
+            "tokio/src/net/unix/datagram/socket.rs",
+            "tokio/src/net/tcp/split.rs"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 434.239266
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "tokio-8705c87040c6",
+      "lookup": [
+        {
+          "files": [
+            "tokio/src/net/unix/ucred.rs",
+            "tests-integration/tests/macros_main.rs",
+            "tokio-util/src/codec/length_delimited.rs",
+            "tokio/src/runtime/scheduler/multi_thread/idle.rs",
+            "tokio/src/runtime/scheduler/multi_thread/queue.rs",
+            "tokio/src/runtime/scheduler/multi_thread/counters.rs",
+            "tokio/src/util/error.rs"
+          ],
+          "gold_files": [
+            "tokio/src/net/unix/ucred.rs"
+          ],
+          "hit5": true,
+          "name": "SOL_LOCAL",
+          "precision5": 0.2,
+          "total_ms": 525.996417
+        },
+        {
+          "files": [
+            "tokio/src/net/unix/stream.rs",
+            "tokio/src/net/unix/ucred.rs",
+            "examples/chat.rs",
+            "tokio/src/net/unix/mod.rs",
+            "tokio/src/sync/once_cell.rs",
+            "tokio/src/sync/set_once.rs",
+            "tokio/src/runtime/scheduler/current_thread/mod.rs",
+            "tokio/src/signal/unix.rs",
+            "tokio/src/task/coop/mod.rs"
+          ],
+          "gold_files": [
+            "tokio/src/net/unix/ucred.rs"
+          ],
+          "hit5": true,
+          "name": "get_peer_cred",
+          "precision5": 0.2,
+          "total_ms": 589.595378
+        }
+      ],
+      "refresh": {
+        "chunks": 19237,
+        "embedded_chunks": 178,
+        "files": 808,
+        "ms": 3750.828668,
+        "reused_chunks": 19056
+      },
+      "repo": "tokio",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 19240,
+        "embedded_chunks": 7,
+        "files": 808,
+        "ms": 2135.222355,
+        "reused_chunks": 19233
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "caddyconfig/caddyfile/importgraph.go",
+            "caddyconfig/caddyfile/formatter_fuzz.go",
+            "cmd/removebinary.go",
+            "internal/logs.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/push/link.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/filestorage/filestorage.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 358.913559
+        },
+        "grep": {
+          "files": [
+            "caddyconfig/caddyfile/importgraph.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/encode/encode.go",
+            "modules.go",
+            "caddyconfig/caddyfile/dispenser.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 283.80037899999996
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-2cb7ebca4591",
+      "lookup": [
+        {
+          "files": [
+            "caddyconfig/caddyfile/importgraph.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/writer.go"
+          ],
+          "gold_files": [
+            "caddyconfig/caddyfile/importgraph.go"
+          ],
+          "hit5": true,
+          "name": "removeNode",
+          "precision5": 0.2,
+          "total_ms": 269.339434
+        },
+        {
+          "files": [
+            "caddyconfig/caddyfile/importgraph.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "context.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "caddyconfig/load.go",
+            "modules/caddyevents/eventsconfig/caddyfile.go",
+            "modules/caddyhttp/templates/frontmatter.go",
+            "modules/caddyhttp/caddyauth/basicauth.go"
+          ],
+          "gold_files": [
+            "caddyconfig/caddyfile/importgraph.go"
+          ],
+          "hit5": true,
+          "name": "willCycle",
+          "precision5": 0.2,
+          "total_ms": 261.168287
+        }
+      ],
+      "refresh": {
+        "chunks": 4614,
+        "embedded_chunks": 4318,
+        "files": 344,
+        "ms": 6196.349354,
+        "reused_chunks": 0
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4618,
+        "embedded_chunks": 4,
+        "files": 345,
+        "ms": 1048.088497,
+        "reused_chunks": 4614
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "admin.go",
+            "admin_origin_case_test.go",
+            "modules/caddyhttp/urlpatternmatcher.go",
+            "caddyconfig/httploader.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "caddy.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 872.074726
+        },
+        "grep": {
+          "files": [
+            "admin.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/urlpatternmatcher.go",
+            "caddy.go",
+            "modules/caddytls/connpolicy.go",
+            "modules/caddyhttp/matchers.go",
+            "modules/caddytls/capools.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 792.709982
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-f7d58438b08c",
+      "lookup": [
+        {
+          "files": [
+            "admin.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "modules/caddyhttp/templates/tplcontext.go",
+            "modules/caddyhttp/reverseproxy/selectionpolicies.go",
+            "caddyconfig/httpcaddyfile/addresses_test.go",
+            "caddyconfig/httpcaddyfile/directives.go",
+            "modules/caddyhttp/reverseproxy/selectionpolicies_test.go",
+            "caddyconfig/httpcaddyfile/addresses.go"
+          ],
+          "gold_files": [
+            "admin.go"
+          ],
+          "hit5": true,
+          "name": "checkHost",
+          "precision5": 0.2,
+          "total_ms": 302.14409800000004
+        }
+      ],
+      "refresh": {
+        "chunks": 4627,
+        "embedded_chunks": 20,
+        "files": 345,
+        "ms": 1169.9648650000001,
+        "reused_chunks": 4607
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4630,
+        "embedded_chunks": 3,
+        "files": 346,
+        "ms": 1047.103578,
+        "reused_chunks": 4627
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "cmd/packagesfuncs.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/matchers.go",
+            "modules/logging/filters_test.go",
+            "modules/caddyhttp/encode/brotli/brotli_precompressed.go",
+            "cmd/commandfuncs.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 377.128783
+        },
+        "grep": {
+          "files": [
+            "cmd/packagesfuncs.go",
+            "modules/caddytls/tls.go",
+            "cmd/commands.go",
+            "modules/caddytls/connpolicy.go",
+            "cmd/commandfuncs.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/matchers.go",
+            "modules/caddyhttp/server.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 310.925036
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-a75817f5500c",
+      "lookup": [
+        {
+          "files": [
+            "modules.go",
+            "cmd/packagesfuncs.go",
+            "modules_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "admin.go",
+            "modules/caddyhttp/celmatcher.go",
+            "modules/logging/filewriter.go"
+          ],
+          "gold_files": [
+            "cmd/packagesfuncs.go"
+          ],
+          "hit5": true,
+          "name": "getModules",
+          "precision5": 0.2,
+          "total_ms": 302.91161300000005
+        },
+        {
+          "files": [
+            "modules/caddytls/matchers.go",
+            "caddyconfig/httpcaddyfile/shorthands.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "caddytest/caddytest.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/headers/headers.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/matchers.go"
+          ],
+          "gold_files": [
+            "cmd/packagesfuncs.go"
+          ],
+          "hit5": false,
+          "name": "moduleContainsPackage",
+          "precision5": 0.0,
+          "total_ms": 344.494517
+        }
+      ],
+      "refresh": {
+        "chunks": 4694,
+        "embedded_chunks": 89,
+        "files": 350,
+        "ms": 1313.3712019999998,
+        "reused_chunks": 4605
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 4696,
+        "embedded_chunks": 3,
+        "files": 350,
+        "ms": 1201.4512530000002,
+        "reused_chunks": 4693
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "replacer.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/matchers.go",
+            "modules/caddyhttp/headers/headers.go",
+            "modules/caddyhttp/staticresp.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/push/handler.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": false,
+          "recall10": 1.0,
+          "rr": 0.16666666666666666,
+          "total_ms": 555.970007
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "replacer.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/headers/headers.go",
+            "modules/caddyhttp/push/handler.go",
+            "modules/caddyhttp/staticresp.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/matchers.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": false,
+          "recall10": 1.0,
+          "rr": 0.16666666666666666,
+          "total_ms": 533.9244480000001
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-56e3a88efe39",
+      "lookup": [
+        {
+          "files": [
+            "modules/metrics/adminmetrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "admin.go",
+            "modules/caddyhttp/tracing/module.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/subroute.go",
+            "modules/caddyhttp/tracing/tracer.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddypki/acmeserver/acmeserver.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/staticresp.go"
+          ],
+          "hit5": false,
+          "name": "ServeHTTP",
+          "precision5": 0.0,
+          "total_ms": 433.550208
+        }
+      ],
+      "refresh": {
+        "chunks": 4696,
+        "embedded_chunks": 0,
+        "files": 350,
+        "ms": 1008.742078,
+        "reused_chunks": 4696
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4698,
+        "embedded_chunks": 3,
+        "files": 350,
+        "ms": 1277.719345,
+        "reused_chunks": 4695
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "metrics.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/reverseproxy/metrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "modules/caddyhttp/celmatcher.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 334.63337
+        },
+        "grep": {
+          "files": [
+            "metrics.go",
+            "modules/caddyhttp/reverseproxy/metrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "modules/caddyhttp/celmatcher.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "caddyconfig/caddyfile/dispenser.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 297.584944
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-9be8fb279444",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/reverseproxy/healthchecks.go",
+            "logging.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/responsewriter.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/streaming.go"
+          ],
+          "hit5": true,
+          "name": "copyFromBackend",
+          "precision5": 0.2,
+          "total_ms": 286.025749
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/reverseproxy/healthchecks.go",
+            "modules/caddyhttp/reverseproxy/streaming_test.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "caddytest/integration/proxyprotocol_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/streaming.go"
+          ],
+          "hit5": true,
+          "name": "copyToBackend",
+          "precision5": 0.2,
+          "total_ms": 272.316318
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/hopheaders_test.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddypki/acmeserver/challenges.go",
+            "cmd/packagesfuncs.go",
+            "modules/caddyhttp/encode/encode.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/streaming.go"
+          ],
+          "hit5": true,
+          "name": "handleUpgradeResponse",
+          "precision5": 0.2,
+          "total_ms": 318.802213
+        }
+      ],
+      "refresh": {
+        "chunks": 4703,
+        "embedded_chunks": 6,
+        "files": 351,
+        "ms": 1135.689467,
+        "reused_chunks": 4697
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 4712,
+        "embedded_chunks": 14,
+        "files": 351,
+        "ms": 1116.730505,
+        "reused_chunks": 4698
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "modules/caddyhttp/reverseproxy/buffering_test.go",
+            "modules/caddyhttp/reverseproxy/client_disconnect_test.go",
+            "modules/caddyhttp/reverseproxy/headers_test.go",
+            "modules/caddyhttp/reverseproxy/hopheaders_test.go",
+            "modules/caddyhttp/reverseproxy/httptransport_test.go",
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "modules/caddyhttp/reverseproxy/streaming_test.go",
+            "modules/caddyhttp/reverseproxy/upstreams_test.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 380.428
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/matchers.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/encode/encode.go",
+            "admin.go",
+            "metrics.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 333.939812
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-7ee4441f9261",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/reverseproxy/prepare_request_bench_test.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/writer.go",
+            "modules/caddyhttp/ip_range.go",
+            "caddytest/caddytest.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/celmatcher.go",
+            "modules/caddyhttp/routes.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go"
+          ],
+          "hit5": false,
+          "name": "prepareRequest",
+          "precision5": 0.0,
+          "total_ms": 309.106743
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "modules/internal/network/networkproxy.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "modules/internal/network/networkproxy_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/reverseproxy/healthchecks.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go"
+          ],
+          "hit5": true,
+          "name": "proxyLoopIteration",
+          "precision5": 0.2,
+          "total_ms": 298.60961299999997
+        }
+      ],
+      "refresh": {
+        "chunks": 4728,
+        "embedded_chunks": 29,
+        "files": 354,
+        "ms": 1428.042755,
+        "reused_chunks": 4699
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4729,
+        "embedded_chunks": 4,
+        "files": 354,
+        "ms": 1266.6550889999999,
+        "reused_chunks": 4725
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/encode/sse_test.go",
+            "metrics.go",
+            "modules/caddyhttp/caddyauth/caddyauth_test.go",
+            "modules/caddyhttp/encode/zstd/zstd.go",
+            "modules/caddyhttp/intercept/intercept.go",
+            "modules/caddyhttp/responsewriter.go",
+            "modules/caddyhttp/fileserver/staticfiles.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 354.633533
+        },
+        "grep": {
+          "files": [
+            "modules/caddytls/ech.go",
+            "modules/logging/nopencoder.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddytls/connpolicy.go",
+            "modules/caddyhttp/encode/zstd/zstd.go",
+            "metrics.go",
+            "modules.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 270.001834
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-89db4b75c3ba",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/hopheaders_test.go",
+            "modules/logging/filters.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "modules/caddyhttp/reverseproxy/copyresponse.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/fileserver/caddyfile.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go"
+          ],
+          "hit5": false,
+          "name": "finalizeResponse",
+          "precision5": 0.0,
+          "total_ms": 316.58458499999995
+        }
+      ],
+      "refresh": {
+        "chunks": 4743,
+        "embedded_chunks": 25,
+        "files": 354,
+        "ms": 1361.827235,
+        "reused_chunks": 4718
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4744,
+        "embedded_chunks": 3,
+        "files": 354,
+        "ms": 1150.331176,
+        "reused_chunks": 4741
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/errors.go",
+            "replacer.go",
+            "modules/caddyhttp/server.go",
+            "cmd/cobra.go",
+            "caddy.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/caddyauth/argon2id.go",
+            "modules/caddyhttp/ip_matchers.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 536.2412439999999
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/errors.go",
+            "cmd/cobra.go",
+            "caddy.go",
+            "modules/caddyhttp/caddyauth/argon2id.go",
+            "modules/caddytls/sessiontickets.go",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/responsewriter.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 440.07893
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-54937914234b",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/errors.go",
+            "caddyconfig/caddyfile/importgraph.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "modules/caddyhttp/caddyauth/argon2id.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go",
+            "modules/caddytls/sessiontickets.go",
+            "cmd/main.go",
+            "modules.go",
+            "modules/logging/netwriter.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/errors.go"
+          ],
+          "hit5": true,
+          "name": "randString",
+          "precision5": 0.2,
+          "total_ms": 373.719488
+        }
+      ],
+      "refresh": {
+        "chunks": 4744,
+        "embedded_chunks": 0,
+        "files": 354,
+        "ms": 1071.88261,
+        "reused_chunks": 4744
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 4748,
+        "embedded_chunks": 3,
+        "files": 355,
+        "ms": 1123.7668409999999,
+        "reused_chunks": 4745
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/replacer.go",
+            "replacer.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/reverseproxy/active_health_test.go",
+            "modules/caddyhttp/requestbody/requestbody.go",
+            "modules/caddyhttp/rewrite/rewrite.go",
+            "modules/caddyhttp/caddyauth/basicauth.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 608.8641580000001
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/replacer.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "modules/caddyhttp/vars.go",
+            "replacer.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/internal/network/networkproxy.go",
+            "modules/caddyhttp/celmatcher.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 614.966679
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-81a0b6d83872",
+      "lookup": [
+        {
+          "files": [
+            "modules/metrics/adminmetrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "admin.go",
+            "modules/caddyhttp/tracing/module.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/subroute.go",
+            "modules/caddyhttp/tracing/tracer.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddypki/acmeserver/acmeserver.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/requestbody/requestbody.go"
+          ],
+          "hit5": false,
+          "name": "ServeHTTP",
+          "precision5": 0.0,
+          "total_ms": 384.907925
+        }
+      ],
+      "refresh": {
+        "chunks": 4748,
+        "embedded_chunks": 0,
+        "files": 355,
+        "ms": 1061.0024039999998,
+        "reused_chunks": 4748
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4754,
+        "embedded_chunks": 6,
+        "files": 356,
+        "ms": 999.636812,
+        "reused_chunks": 4748
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "internal/logs.go",
+            "modules/caddytls/tls.go",
+            "modules/caddyhttp/autohttps.go",
+            "modules/caddytls/automation.go",
+            "modules/caddyhttp/caddyauth/basicauth.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/requestbody/requestbody.go",
+            "modules/caddytls/capools.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 426.339568
+        },
+        "grep": {
+          "files": [
+            "internal/logs.go",
+            "modules/caddytls/tls.go",
+            "modules/caddyhttp/autohttps.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddytls/automation.go",
+            "caddyconfig/httpcaddyfile/tlsapp.go",
+            "modules/caddyhttp/fileserver/browsetplcontext.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 385.053806
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-fbc88ae23220",
+      "lookup": [
+        {
+          "files": [
+            "internal/logs.go",
+            "modules/caddytls/automation.go",
+            "modules/caddyhttp/autohttps.go",
+            "modules/caddyhttp/requestbody/caddyfile.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go",
+            "caddy.go",
+            "modules/caddytls/tls.go",
+            "modules/caddytls/capools.go"
+          ],
+          "gold_files": [
+            "internal/logs.go"
+          ],
+          "hit5": true,
+          "name": "MaxSizeSubjectsListForLog",
+          "precision5": 0.2,
+          "total_ms": 342.566964
+        }
+      ],
+      "refresh": {
+        "chunks": 4754,
+        "embedded_chunks": 0,
+        "files": 356,
+        "ms": 1022.633552,
+        "reused_chunks": 4754
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 4757,
+        "embedded_chunks": 2,
+        "files": 357,
+        "ms": 965.70849,
+        "reused_chunks": 4755
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "replacer.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/caddyauth/basicauth.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "modules/caddyhttp/caddyauth/caddyauth_test.go",
+            "modules/caddyhttp/matchers.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 447.875751
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/caddyauth/basicauth.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/vars.go",
+            "replacer.go",
+            "modules/caddyhttp/caddyauth/caddyfile.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "modules/caddytls/acmeissuer.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 428.267482
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-69ec5dfedf5b",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/routes.go",
+            "admin_test.go",
+            "modules/caddyhttp/push/handler.go",
+            "modules/caddyhttp/matchers.go",
+            "caddytest/integration/mockdns_test.go",
+            "modules/caddypki/pki.go",
+            "modules/caddyhttp/server_test.go",
+            "modules/caddyhttp/caddyhttp.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/caddyauth/basicauth.go"
+          ],
+          "hit5": false,
+          "name": "Provision",
+          "precision5": 0.0,
+          "total_ms": 265.16756499999997
+        }
+      ],
+      "refresh": {
+        "chunks": 4757,
+        "embedded_chunks": 0,
+        "files": 357,
+        "ms": 1029.4796939999999,
+        "reused_chunks": 4757
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4764,
+        "embedded_chunks": 7,
+        "files": 358,
+        "ms": 1001.685266,
+        "reused_chunks": 4757
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/map/map.go",
+            "cmd/packagesfuncs.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/replacer.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/map/caddyfile.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/celmatcher.go",
+            "caddyconfig/caddyfile/dispenser.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 521.06592
+        },
+        "grep": {
+          "files": [
+            "cmd/packagesfuncs.go",
+            "modules/caddyhttp/map/map.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/map/caddyfile.go",
+            "caddyconfig/caddyfile/dispenser.go",
+            "modules/caddytls/zerosslissuer.go",
+            "caddytest/caddytest.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 449.286416
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-256df3c8ad4e",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/routes.go",
+            "admin_test.go",
+            "modules/caddyhttp/push/handler.go",
+            "modules/caddyhttp/matchers.go",
+            "caddytest/integration/mockdns_test.go",
+            "modules/caddypki/pki.go",
+            "modules/caddyhttp/server_test.go",
+            "modules/caddyhttp/caddyhttp.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/map/map.go"
+          ],
+          "hit5": false,
+          "name": "Provision",
+          "precision5": 0.0,
+          "total_ms": 268.939553
+        }
+      ],
+      "refresh": {
+        "chunks": 4765,
+        "embedded_chunks": 3,
+        "files": 358,
+        "ms": 896.9434560000001,
+        "reused_chunks": 4762
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 4767,
+        "embedded_chunks": 3,
+        "files": 358,
+        "ms": 949.6353290000001,
+        "reused_chunks": 4764
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/app.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "modules/caddytls/ech.go",
+            "listen_unix.go",
+            "modules/caddyhttp/server.go",
+            "metrics.go",
+            "caddy.go",
+            "modules/caddyhttp/encode/encode.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 607.615079
+        },
+        "grep": {
+          "files": [
+            "listen_unix.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "metrics.go",
+            "modules/caddyhttp/encode/encode.go",
+            "notify/notify_windows.go",
+            "modules/caddyhttp/app.go",
+            "modules/caddytls/ech.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": false,
+          "recall10": 1.0,
+          "rr": 0.16666666666666666,
+          "total_ms": 560.460449
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-ff112bb2309f",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddytls/sessiontickets.go",
+            "modules/caddypki/pki.go",
+            "modules/caddyevents/app.go",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyfs/filesystem.go",
+            "modules/caddyhttp/app.go",
+            "modules/caddytls/tls.go",
+            "caddy.go",
+            "admin_test.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/app.go"
+          ],
+          "hit5": false,
+          "name": "Stop",
+          "precision5": 0.0,
+          "total_ms": 279.051647
+        }
+      ],
+      "refresh": {
+        "chunks": 4770,
+        "embedded_chunks": 15,
+        "files": 358,
+        "ms": 1200.905716,
+        "reused_chunks": 4755
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 4775,
+        "embedded_chunks": 7,
+        "files": 358,
+        "ms": 1029.044892,
+        "reused_chunks": 4768
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/responsewriter_test.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.6666666666666666,
+          "rr": 1.0,
+          "total_ms": 407.210779
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/idletimeout.go",
+            "listeners.go",
+            "modules/caddytls/sessiontickets.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "caddyconfig/httpcaddyfile/directives.go",
+            "logging.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.6666666666666666,
+          "rr": 1.0,
+          "total_ms": 297.098427
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-72dd0fb067f6",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/responsewriter.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/writer.go",
+            "modules/caddyhttp/reverseproxy/streaming.go",
+            "modules/caddyhttp/encode/encode_test.go",
+            "modules/caddyhttp/encode/sse_test.go",
+            "modules/caddyhttp/encode/encode_harness_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": false,
+          "name": "FlushError",
+          "precision5": 0.0,
+          "total_ms": 354.59811
+        },
+        {
+          "files": [
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/timeouts/timeouts_test.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/logging/filewriter.go",
+            "modules/logging/netwriter.go",
+            "logging.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": true,
+          "name": "IdleTimeoutWriter",
+          "precision5": 0.2,
+          "total_ms": 334.31098
+        },
+        {
+          "files": [
+            "modules/caddyhttp/responsewriter.go",
+            "modules/caddyhttp/responsewriter_test.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddyhttp/caddyauth/caddyauth_test.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": false,
+          "name": "ReadFrom",
+          "precision5": 0.0,
+          "total_ms": 290.22031999999996
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/fastcgi/writer.go",
+            "modules/caddyhttp/fileserver/staticfiles.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "logging.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/idletimeout.go",
+            "metrics.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": false,
+          "name": "Write",
+          "precision5": 0.0,
+          "total_ms": 283.797211
+        },
+        {
+          "files": [
+            "modules/caddyhttp/idletimeout.go",
+            "listen.go",
+            "modules/caddyhttp/timeouts/timeouts_test.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/templates/templates.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": true,
+          "name": "resetDeadline",
+          "precision5": 0.2,
+          "total_ms": 298.7522
+        },
+        {
+          "files": [
+            "modules/metrics/adminmetrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "admin.go",
+            "modules/caddyhttp/tracing/module.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/subroute.go",
+            "modules/caddyhttp/tracing/tracer.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddypki/acmeserver/acmeserver.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/timeouts/timeouts.go"
+          ],
+          "hit5": false,
+          "name": "ServeHTTP",
+          "precision5": 0.0,
+          "total_ms": 417.57278
+        }
+      ],
+      "refresh": {
+        "chunks": 4895,
+        "embedded_chunks": 164,
+        "files": 363,
+        "ms": 1681.9314359999998,
+        "reused_chunks": 4731
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4902,
+        "embedded_chunks": 16,
+        "files": 363,
+        "ms": 1285.2035079999998,
+        "reused_chunks": 4886
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/timeouts/caddyfile.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/app.go",
+            "modules/caddytls/matchers.go",
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddypki/acmeserver/caddyfile.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.6666666666666666,
+          "rr": 1.0,
+          "total_ms": 379.07923
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/app.go",
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "caddyconfig/caddyfile/lexer.go",
+            "modules/caddyhttp/metrics.go",
+            "modules/caddyhttp/timeouts/caddyfile.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.6666666666666666,
+          "rr": 1.0,
+          "total_ms": 345.06090900000004
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-8f549e6df151",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "caddyconfig/httpcaddyfile/tlsapp.go",
+            "modules/caddyhttp/fileserver/staticfiles.go",
+            "admin.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "caddytest/caddytest.go",
+            "modules/caddytls/automation.go",
+            "modules/caddyhttp/fileserver/browse.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": false,
+          "name": "Override",
+          "precision5": 0.0,
+          "total_ms": 251.260868
+        },
+        {
+          "files": [
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "caddytest/caddytest.go",
+            "modules/caddyhttp/idletimeout.go",
+            "modules/caddyevents/app.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "modules/caddyhttp/app.go",
+            "modules/caddyhttp/caddyauth/caddyauth.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/encode/gzip/gzip.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": true,
+          "name": "idleOverride",
+          "precision5": 0.2,
+          "total_ms": 272.843306
+        },
+        {
+          "files": [
+            "modules/caddyhttp/timeouts/timeouts.go",
+            "modules/caddyhttp/timeouts/caddyfile.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/idletimeout.go",
+            "caddytest/caddytest.go",
+            "modules/caddyevents/app.go",
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "modules/caddyhttp/app.go",
+            "modules/caddyhttp/encode/encode.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/idletimeout.go"
+          ],
+          "hit5": true,
+          "name": "idleTimeouts",
+          "precision5": 0.2,
+          "total_ms": 265.130913
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "modules/caddyhttp/reverseproxy/incremental_test.go",
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/reverseproxy/prepare_request_bench_test.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/writer.go",
+            "modules/caddyhttp/ip_range.go",
+            "caddytest/caddytest.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go",
+            "modules/caddyhttp/celmatcher.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/server.go"
+          ],
+          "hit5": true,
+          "name": "PrepareRequest",
+          "precision5": 0.2,
+          "total_ms": 398.627796
+        },
+        {
+          "files": [
+            "modules/metrics/adminmetrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "admin.go",
+            "modules/caddyhttp/tracing/module.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/subroute.go",
+            "modules/caddyhttp/tracing/tracer.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddypki/acmeserver/acmeserver.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/server.go",
+            "modules/caddyhttp/timeouts/timeouts.go"
+          ],
+          "hit5": false,
+          "name": "ServeHTTP",
+          "precision5": 0.0,
+          "total_ms": 478.794697
+        }
+      ],
+      "refresh": {
+        "chunks": 4916,
+        "embedded_chunks": 14,
+        "files": 366,
+        "ms": 1068.572279,
+        "reused_chunks": 4902
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4934,
+        "embedded_chunks": 23,
+        "files": 366,
+        "ms": 1184.6105499999999,
+        "reused_chunks": 4911
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddytls/tls.go",
+            "modules/caddyhttp/routes.go",
+            "modules/caddyhttp/encode/encode_conformance_test.go",
+            "modules/caddyhttp/fileserver/staticfiles.go",
+            "admin.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddyhttp/reverseproxy/selectionpolicies.go",
+            "modules/caddytls/certselection.go",
+            "modules.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": false,
+          "recall10": 1.0,
+          "rr": 0.16666666666666666,
+          "total_ms": 338.451468
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/fileserver/staticfiles.go",
+            "admin.go",
+            "modules/caddyhttp/encode/encode.go",
+            "modules/caddytls/tls.go",
+            "modules/caddytls/certselection.go",
+            "modules.go",
+            "modules/caddytls/pemloader.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 317.96096
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-04fe16102872",
+      "lookup": [
+        {
+          "files": [
+            "modules/metrics/adminmetrics.go",
+            "modules/caddyhttp/caddyhttp.go",
+            "admin.go",
+            "modules/caddyhttp/tracing/module.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/subroute.go",
+            "modules/caddyhttp/tracing/tracer.go",
+            "modules/caddyhttp/invoke.go",
+            "modules/caddypki/acmeserver/acmeserver.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/encode/encode.go"
+          ],
+          "hit5": false,
+          "name": "ServeHTTP",
+          "precision5": 0.0,
+          "total_ms": 405.67658
+        }
+      ],
+      "refresh": {
+        "chunks": 4934,
+        "embedded_chunks": 0,
+        "files": 366,
+        "ms": 1021.0639699999999,
+        "reused_chunks": 4934
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 4935,
+        "embedded_chunks": 3,
+        "files": 366,
+        "ms": 1054.284985,
+        "reused_chunks": 4932
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "cmd/removebinary.go",
+            "internal/filesystems/os.go",
+            "caddy.go",
+            "modules/filestorage/filestorage.go",
+            "caddyconfig/caddyfile/parse.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "cmd/commandfuncs.go",
+            "filepath.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 485.512076
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/app_test.go",
+            "caddytest/integration/proxyprotocol_test.go",
+            "modules/caddyhttp/idletimeout_test.go",
+            "caddytest/integration/panic_test.go"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 445.438314
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-c1acb2fcbac9",
+      "lookup": [
+        {
+          "files": [
+            "caddyconfig/caddyfile/formatter_fuzz.go",
+            "caddyconfig/caddyfile/parse.go",
+            "caddyconfig/warning/warning.go",
+            "cmd/removebinary.go",
+            "internal/logs.go",
+            "modules/caddyhttp/push/link.go",
+            "caddyconfig/caddyfile/importgraph.go",
+            "filepath_windows.go",
+            "filesystem.go"
+          ],
+          "gold_files": [
+            "caddyconfig/caddyfile/parse.go"
+          ],
+          "hit5": true,
+          "name": "doImport",
+          "precision5": 0.2,
+          "total_ms": 349.839171
+        }
+      ],
+      "refresh": {
+        "chunks": 5087,
+        "embedded_chunks": 211,
+        "files": 372,
+        "ms": 1764.9742310000001,
+        "reused_chunks": 4876
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 5088,
+        "embedded_chunks": 3,
+        "files": 372,
+        "ms": 1051.245281,
+        "reused_chunks": 5085
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go",
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "caddytest/integration/ech_test.go",
+            "modules/caddyhttp/reverseproxy/dynamic_upstreams_test.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 726.754506
+        },
+        "grep": {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/client.go",
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "modules/caddyhttp/reverseproxy/metrics.go",
+            "modules/caddyhttp/reverseproxy/healthchecks.go",
+            "modules/caddyhttp/server_test.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 819.661407
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-221ebc450339",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/httptransport.go",
+            "modules/caddyhttp/reverseproxy/incremental_test.go",
+            "cmd/packagesfuncs_test.go",
+            "modules/caddyhttp/reverseproxy/retries_test.go",
+            "modules/caddyhttp/reverseproxy/selectionpolicies.go",
+            "modules/caddyhttp/reverseproxy/fastcgi/incremental_test.go",
+            "modules/caddyhttp/encode/encode_conformance_test.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go"
+          ],
+          "hit5": false,
+          "name": "RoundTrip",
+          "precision5": 0.0,
+          "total_ms": 332.470665
+        },
+        {
+          "files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "modules/caddyhttp/reverseproxy/hosts.go",
+            "modules/logging/netwriter.go",
+            "modules/caddyhttp/reverseproxy/selectionpolicies_test.go",
+            "modules/caddyhttp/reverseproxy/upstreams.go",
+            "caddytest/caddytest.go",
+            "modules/caddyhttp/reverseproxy/active_health_test.go",
+            "modules/caddyhttp/reverseproxy/httptransport_test.go"
+          ],
+          "gold_files": [
+            "modules/caddyhttp/reverseproxy/reverseproxy.go"
+          ],
+          "hit5": true,
+          "name": "NewDialError",
+          "precision5": 0.2,
+          "total_ms": 523.048003
+        }
+      ],
+      "refresh": {
+        "chunks": 5214,
+        "embedded_chunks": 152,
+        "files": 377,
+        "ms": 1363.737532,
+        "reused_chunks": 5062
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 5216,
+        "embedded_chunks": 4,
+        "files": 377,
+        "ms": 1192.351513,
+        "reused_chunks": 5212
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "cmd/cobra.go",
+            "cmd/commands.go",
+            "modules/caddyhttp/caddyauth/command.go",
+            "modules/caddyhttp/reverseproxy/passive_health_test.go",
+            "cmd/commandfuncs.go",
+            "logging.go",
+            "cmd/packagesfuncs.go",
+            "modules/caddytls/certmanagers.go"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 453.765581
+        },
+        "grep": {
+          "files": [
+            "cmd/commandfuncs.go",
+            "cmd/packagesfuncs.go",
+            "cmd/removebinary_windows.go",
+            "modules/caddypki/command.go",
+            "modules/caddyhttp/caddyauth/command.go",
+            "modules/caddyhttp/fileserver/command.go",
+            "cmd/storagefuncs.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 1.0,
+          "total_ms": 370.036959
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-d588d5c8f0a4",
+      "lookup": [
+        {
+          "files": [
+            "cmd/packagesfuncs.go",
+            "cmd/cobra.go",
+            "modules/caddyhttp/fileserver/command.go",
+            "cmd/commands.go",
+            "cmd/commandfactory.go",
+            "modules/caddypki/command.go",
+            "cmd/removebinary_windows.go",
+            "cmd/commandfuncs.go"
+          ],
+          "gold_files": [
+            "cmd/commandfuncs.go"
+          ],
+          "hit5": false,
+          "name": "cmdRun",
+          "precision5": 0.0,
+          "total_ms": 339.44561600000003
+        },
+        {
+          "files": [
+            "logging.go",
+            "modules/caddyhttp/reverseproxy/reverseproxy.go",
+            "internal/filesystems/map.go",
+            "modules/caddyhttp/fileserver/browse.go",
+            "modules/metrics/metrics.go",
+            "modules/caddyhttp/caddyauth/argon2id.go",
+            "modules/caddyhttp/push/link.go",
+            "modules/caddytls/sessiontickets.go"
+          ],
+          "gold_files": [
+            "logging.go"
+          ],
+          "hit5": true,
+          "name": "UnbufferDefaultLogger",
+          "precision5": 0.2,
+          "total_ms": 391.799579
+        }
+      ],
+      "refresh": {
+        "chunks": 5232,
+        "embedded_chunks": 31,
+        "files": 379,
+        "ms": 1558.411045,
+        "reused_chunks": 5201
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 5236,
+        "embedded_chunks": 7,
+        "files": 379,
+        "ms": 1186.8182510000001,
+        "reused_chunks": 5229
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "caddyconfig/httpcaddyfile/directives.go",
+            "modules/caddyhttp/vars.go",
+            "modules/caddyhttp/matchers.go",
+            "modules/caddyhttp/fileserver/browsetplcontext.go",
+            "modules/caddyhttp/fileserver/browse.go",
+            "modules/caddyhttp/fileserver/staticfiles.go",
+            "modules/logging/filters.go",
+            "admin.go",
+            "modules/caddyhttp/replacer.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 718.113579
+        },
+        "grep": {
+          "files": [
+            "caddyconfig/httpcaddyfile/directives.go",
+            "modules/caddyhttp/replacer.go",
+            "modules/caddyhttp/fileserver/browsetplcontext.go",
+            "modules/caddyhttp/reverseproxy/caddyfile.go",
+            "modules/caddyhttp/celmatcher.go",
+            "modules/caddyhttp/intercept/intercept.go",
+            "modules/caddyhttp/vars.go"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 644.612907
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "caddy-6ae02b5ccbd9",
+      "lookup": [
+        {
+          "files": [
+            "modules/caddyhttp/fileserver/browsetplcontext.go",
+            "caddyconfig/httpcaddyfile/httptype.go",
+            "admin_test.go",
+            "caddyconfig/httpcaddyfile/directives.go",
+            "modules/logging/filters.go",
+            "modules/caddyhttp/encode/testdata/caddy_asciinema_player.js",
+            "modules/caddyhttp/fileserver/browse.go"
+          ],
+          "gold_files": [
+            "caddyconfig/httpcaddyfile/directives.go"
+          ],
+          "hit5": true,
+          "name": "sortRoutes",
+          "precision5": 0.2,
+          "total_ms": 310.685705
+        }
+      ],
+      "refresh": {
+        "chunks": 5274,
+        "embedded_chunks": 57,
+        "files": 383,
+        "ms": 1383.642265,
+        "reused_chunks": 5217
+      },
+      "repo": "caddy",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 5274,
+        "embedded_chunks": 1,
+        "files": 383,
+        "ms": 1096.4137110000001,
+        "reused_chunks": 5273
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/data/cases/remove_parens_from_lhs.py",
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/black/mode.py",
+            "tests/data/cases/cantfit.py",
+            "tests/data/cases/pep_646.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 289.072433
+        },
+        "grep": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/black/mode.py",
+            "tests/data/cases/remove_parens_from_lhs.py",
+            "src/black/nodes.py",
+            "tests/data/miscellaneous/string_quotes.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 219.003116
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-00cd1e4a6b30",
+      "lookup": [
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/cache.py",
+            "src/black/lines.py",
+            "src/black/output.py",
+            "src/blib2to3/pgen2/grammar.py",
+            "src/blib2to3/pgen2/token.py",
+            "tests/data/cases/expression.py",
+            "src/blib2to3/pytree.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "_maybe_split_omitting_optional_parens",
+          "precision5": 0.2,
+          "total_ms": 263.583965
+        },
+        {
+          "files": [
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "src/black/nodes.py",
+            "tests/data/cases/pep_572_py310.py",
+            "src/black/numerics.py",
+            "tests/data/cases/attribute_access_on_number_literals.py",
+            "tests/data/cases/python38.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": false,
+          "name": "_is_annotated_assignment",
+          "precision5": 0.0,
+          "total_ms": 299.28572399999996
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/black/nodes.py",
+            "tests/data/cases/power_op_spacing.py",
+            "src/blib2to3/pytree.py",
+            "src/black/__init__.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": true,
+          "name": "can_omit_invisible_parens",
+          "precision5": 0.2,
+          "total_ms": 242.91009
+        },
+        {
+          "files": [
+            "src/black/mode.py",
+            "src/blackd/__init__.py",
+            "src/black/lines.py",
+            "src/black/__init__.py",
+            "src/black/nodes.py",
+            "src/black/linegen.py",
+            "tests/data/cases/fmtskip2.py",
+            "tests/test_docs.py",
+            "tests/data/cases/pyi_docstring_blank_lines.py"
+          ],
+          "gold_files": [
+            "src/black/mode.py"
+          ],
+          "hit5": true,
+          "name": "Preview",
+          "precision5": 0.2,
+          "total_ms": 260.992997
+        }
+      ],
+      "refresh": {
+        "chunks": 6998,
+        "embedded_chunks": 5236,
+        "files": 320,
+        "ms": 14261.329478,
+        "reused_chunks": 0
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7023,
+        "embedded_chunks": 23,
+        "files": 321,
+        "ms": 1241.2922179999998,
+        "reused_chunks": 6995
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/black/nodes.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "tests/data/cases/fmtskip_after_bracket_with_comment.py",
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 403.53018
+        },
+        "grep": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/black/nodes.py",
+            "tests/data/cases/fmtskip_after_bracket_with_comment.py",
+            "tests/data/cases/cantfit.py",
+            "tests/data/cases/preview_long_strings__edge_case.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 345.65000000000003
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-46c2abc37cd7",
+      "lookup": [
+        {
+          "files": [
+            "src/black/linegen.py",
+            "tests/data/cases/type_params.py",
+            "src/black/lines.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets_no_ll1.py",
+            "tests/data/cases/fmtskip_after_bracket_with_comment.py",
+            "tests/data/cases/pep_750.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": true,
+          "name": "is_line_short_enough",
+          "precision5": 0.2,
+          "total_ms": 283.374566
+        }
+      ],
+      "refresh": {
+        "chunks": 7037,
+        "embedded_chunks": 25,
+        "files": 324,
+        "ms": 1360.531491,
+        "reused_chunks": 7009
+      },
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 7037,
+        "embedded_chunks": 2,
+        "files": 324,
+        "ms": 1291.781232,
+        "reused_chunks": 7035
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/test_black.py",
+            "tests/data/cases/collections.py",
+            "profiling/dict_big.py",
+            "src/black/files.py",
+            "profiling/dict_huge.py",
+            "profiling/list_big.py",
+            "profiling/list_huge.py",
+            "profiling/mix_big.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 335.731972
+        },
+        "grep": {
+          "files": [
+            "src/black/files.py",
+            "src/black/__init__.py",
+            "src/blib2to3/pgen2/driver.py",
+            "tests/test_black.py",
+            "src/black/const.py",
+            "src/black/comments.py",
+            "src/black/lines.py",
+            "src/black/linegen.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 238.909806
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-2d174df7cb16",
+      "lookup": [
+        {
+          "files": [
+            "src/black/__init__.py",
+            "src/black/files.py",
+            "tests/test_black.py",
+            "tests/data/cases/preview_hug_comparator.py",
+            "action/main.py"
+          ],
+          "gold_files": [
+            "src/black/__init__.py"
+          ],
+          "hit5": true,
+          "name": "read_pyproject_toml",
+          "precision5": 0.2,
+          "total_ms": 271.539355
+        }
+      ],
+      "refresh": {
+        "chunks": 7037,
+        "embedded_chunks": 4,
+        "files": 324,
+        "ms": 1273.6861740000002,
+        "reused_chunks": 7033
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7039,
+        "embedded_chunks": 3,
+        "files": 324,
+        "ms": 1300.492999,
+        "reused_chunks": 7036
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/nodes.py",
+            "src/black/lines.py",
+            "src/black/linegen.py",
+            "src/black/ranges.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/black/__init__.py",
+            "tests/data/cases/line_ranges_unwrapping.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 351.444902
+        },
+        "grep": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/black/__init__.py",
+            "src/black/lines.py",
+            "tests/data/cases/python37.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 264.591858
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-0a6396ba56d2",
+      "lookup": [
+        {
+          "files": [
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/brackets.py",
+            "src/black/__init__.py",
+            "src/black/trans.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": false,
+          "name": "_NodeReplacements",
+          "precision5": 0.0,
+          "total_ms": 278.523759
+        },
+        {
+          "files": [
+            "tests/data/cases/class_methods_new_line.py",
+            "src/black/linegen.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/rusty.py",
+            "tests/test_black.py",
+            "tests/data/cases/form_feeds.py",
+            "tests/data/cases/preview_long_strings__regression.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": false,
+          "name": "__init__",
+          "precision5": 0.0,
+          "total_ms": 241.327694
+        },
+        {
+          "files": [
+            "src/black/ranges.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/nodes.py",
+            "src/black/linegen.py",
+            "src/blib2to3/pytree.py",
+            "src/black/comments.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "_convert_node_to_standalone_comment",
+          "precision5": 0.2,
+          "total_ms": 310.737662
+        },
+        {
+          "files": [
+            "src/black/ranges.py",
+            "src/black/nodes.py",
+            "src/black/comments.py",
+            "tests/data/cases/expression.py",
+            "tests/data/cases/comments9.py",
+            "tests/data/cases/tupleassign.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "_convert_nodes_to_standalone_comment",
+          "precision5": 0.2,
+          "total_ms": 326.52170800000005
+        },
+        {
+          "files": [
+            "src/black/ranges.py",
+            "src/black/__init__.py",
+            "src/black/comments.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/lines.py",
+            "src/blackd/__init__.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets_no_ll1.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "_convert_unchanged_line_by_line",
+          "precision5": 0.2,
+          "total_ms": 327.405294
+        },
+        {
+          "files": [
+            "src/black/__init__.py",
+            "src/black/ranges.py",
+            "src/black/comments.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/blib2to3/pgen2/tokenize.py",
+            "tests/data/cases/multiline_consecutive_open_parentheses_ignore.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "convert_unchanged_lines",
+          "precision5": 0.2,
+          "total_ms": 260.55971300000004
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "src/black/ranges.py",
+            "src/black/comments.py",
+            "src/black/parsing.py",
+            "src/blib2to3/pygram.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "visit_simple_stmt",
+          "precision5": 0.2,
+          "total_ms": 273.215084
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "tests/data/cases/preview_long_strings.py",
+            "src/black/nodes.py",
+            "tests/data/miscellaneous/debug_visitor.py",
+            "src/black/ranges.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": false,
+          "name": "visit_suite",
+          "precision5": 0.0,
+          "total_ms": 245.536814
+        }
+      ],
+      "refresh": {
+        "chunks": 7039,
+        "embedded_chunks": 4,
+        "files": 324,
+        "ms": 1403.067651,
+        "reused_chunks": 7035
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7040,
+        "embedded_chunks": 6,
+        "files": 324,
+        "ms": 1287.940609,
+        "reused_chunks": 7034
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/numerics.py",
+            "src/black/nodes.py",
+            "src/black/linegen.py",
+            "src/black/comments.py",
+            "src/black/lines.py",
+            "src/black/trans.py",
+            "src/black/ranges.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 306.280579
+        },
+        "grep": {
+          "files": [
+            "src/black/comments.py",
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "src/black/numerics.py",
+            "src/black/lines.py",
+            "src/black/trans.py",
+            "src/black/ranges.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 217.903783
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-308e2ee7dce7",
+      "lookup": [
+        {
+          "files": [
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets_no_ll1.py",
+            "tests/data/cases/docstring.py",
+            "tests/data/cases/docstring2.py",
+            "src/black/linegen.py",
+            "src/black/output.py",
+            "src/black/lines.py",
+            "src/black/strings.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": false,
+          "name": "Line",
+          "precision5": 0.0,
+          "total_ms": 284.412426
+        },
+        {
+          "files": [
+            "tests/data/cases/fmtonoff.py",
+            "src/black/linegen.py",
+            "tests/data/cases/expression.py",
+            "src/black/nodes.py",
+            "src/black/numerics.py",
+            "tests/data/cases/attribute_access_on_number_literals.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": false,
+          "name": "is_complex_subscript",
+          "precision5": 0.0,
+          "total_ms": 263.419805
+        }
+      ],
+      "refresh": {
+        "chunks": 7042,
+        "embedded_chunks": 7,
+        "files": 324,
+        "ms": 1486.4724919999999,
+        "reused_chunks": 7035
+      },
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 7042,
+        "embedded_chunks": 1,
+        "files": 324,
+        "ms": 1329.325602,
+        "reused_chunks": 7041
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/linegen.py",
+            "tests/data/cases/remove_except_parens.py",
+            "tests/data/cases/pep_572_py39.py",
+            "tests/data/cases/remove_parens_from_lhs.py",
+            "tests/data/cases/python315.py",
+            "src/black/strings.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 1.0,
+          "total_ms": 284.102743
+        },
+        "grep": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/__init__.py",
+            "src/black/nodes.py",
+            "src/blib2to3/pgen2/pgen.py",
+            "tests/data/cases/preview_wrap_comprehension_in.py",
+            "tests/data/cases/comment_in_subscript_annotation.py",
+            "tests/data/cases/remove_except_parens.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 1.0,
+          "total_ms": 201.527751
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-bd622eda1aab",
+      "lookup": [
+        {
+          "files": [
+            "tests/data/cases/remove_parens_from_lhs.py",
+            "tests/data/cases/python315.py",
+            "tests/data/cases/class_blank_parentheses.py",
+            "src/black/linegen.py",
+            "src/black/strings.py",
+            "src/black/__init__.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "_has_redundant_generator_parentheses",
+          "precision5": 0.2,
+          "total_ms": 238.794613
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "src/black/__init__.py",
+            "src/black/lines.py",
+            "src/blib2to3/pgen2/token.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets.py",
+            "src/black/brackets.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "maybe_make_parens_invisible_in_atom",
+          "precision5": 0.2,
+          "total_ms": 282.431677
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "tests/data/cases/preview_long_strings.py",
+            "src/black/brackets.py",
+            "tests/data/miscellaneous/debug_visitor.py",
+            "src/blib2to3/pgen2/token.py",
+            "tests/data/cases/starred_for_target.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "visit_atom",
+          "precision5": 0.2,
+          "total_ms": 278.39750699999996
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "tests/data/cases/preview_simplify_power_operator_hugging_long.py",
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/remove_await_parens.py",
+            "tests/data/miscellaneous/debug_visitor.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "visit_power",
+          "precision5": 0.2,
+          "total_ms": 240.151706
+        },
+        {
+          "files": [
+            "src/black/mode.py",
+            "src/blackd/__init__.py",
+            "src/black/lines.py",
+            "src/black/__init__.py",
+            "src/black/nodes.py",
+            "src/black/linegen.py",
+            "tests/data/cases/fmtskip2.py",
+            "tests/test_docs.py",
+            "tests/data/cases/preview_fmt_off_class_blank_lines.py"
+          ],
+          "gold_files": [
+            "src/black/mode.py"
+          ],
+          "hit5": true,
+          "name": "Preview",
+          "precision5": 0.2,
+          "total_ms": 302.459479
+        }
+      ],
+      "refresh": {
+        "chunks": 7126,
+        "embedded_chunks": 110,
+        "files": 330,
+        "ms": 1723.6604829999999,
+        "reused_chunks": 7002
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7183,
+        "embedded_chunks": 50,
+        "files": 331,
+        "ms": 1320.053214,
+        "reused_chunks": 7122
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/data/cases/pyi_overload_groups.py",
+            "src/blackd/__init__.py",
+            "src/black/mode.py",
+            "tests/data/cases/docstring2.py",
+            "src/black/__init__.py",
+            "tests/data/cases/docstring_no_extra_empty_line_before_eof.py",
+            "tests/data/cases/module_docstring_followed_by_class.py",
+            "tests/data/cases/module_docstring_followed_by_function.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 308.173286
+        },
+        "grep": {
+          "files": [
+            "src/black/mode.py",
+            "tests/data/cases/pyi_overload_groups.py",
+            "src/black/__init__.py",
+            "tests/data/cases/docstring_no_extra_empty_line_before_eof.py",
+            "tests/data/cases/module_docstring_followed_by_class.py",
+            "tests/data/cases/module_docstring_followed_by_function.py",
+            "src/black/ranges.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 251.49968499999997
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-3224f36a0fca",
+      "lookup": [
+        {
+          "files": [
+            "src/black/lines.py",
+            "tests/data/cases/module_docstring_1.py",
+            "tests/data/cases/module_docstring_3.py",
+            "tests/data/cases/module_docstring_4.py",
+            "tests/data/cases/docstring.py",
+            "tests/data/cases/docstring2.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": true,
+          "name": "_line_is_module_docstring",
+          "precision5": 0.2,
+          "total_ms": 287.61982
+        }
+      ],
+      "refresh": {
+        "chunks": 7176,
+        "embedded_chunks": 0,
+        "files": 330,
+        "ms": 1127.404048,
+        "reused_chunks": 7176
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7177,
+        "embedded_chunks": 2,
+        "files": 331,
+        "ms": 1233.435899,
+        "reused_chunks": 7175
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "action/main.py",
+            "src/black/__init__.py",
+            "src/black/cache.py",
+            "src/black/files.py",
+            "src/blackd/__init__.py",
+            "scripts/diff_shades_gha_helper.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 329.049151
+        },
+        "grep": {
+          "files": [
+            "action/main.py",
+            "src/black/files.py",
+            "scripts/diff_shades_gha_helper.py",
+            "src/black/__init__.py",
+            "src/black/const.py",
+            "src/black/schema.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 274.971516
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-b5b1eb6f60ce",
+      "lookup": [
+        {
+          "files": [
+            "action/main.py",
+            "src/black/files.py",
+            "src/black/__init__.py",
+            "src/black/cache.py",
+            "src/blackd/__init__.py",
+            "src/black/parsing.py",
+            "tests/data/cases/import_spacing.py"
+          ],
+          "gold_files": [
+            "action/main.py"
+          ],
+          "hit5": true,
+          "name": "read_version_specifier_from_pyproject",
+          "precision5": 0.2,
+          "total_ms": 236.989461
+        }
+      ],
+      "refresh": {
+        "chunks": 7303,
+        "embedded_chunks": 104,
+        "files": 340,
+        "ms": 1784.248653,
+        "reused_chunks": 7145
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7303,
+        "embedded_chunks": 1,
+        "files": 340,
+        "ms": 1327.649106,
+        "reused_chunks": 7302
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/blib2to3/pgen2/conv.py",
+            "profiling/list_big.py",
+            "profiling/list_huge.py",
+            "src/black/files.py",
+            "src/black/trans.py",
+            "src/black/__init__.py",
+            "src/black/parsing.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 315.826597
+        },
+        "grep": {
+          "files": [
+            "src/blib2to3/pgen2/conv.py",
+            "src/black/parsing.py",
+            "src/black/__init__.py",
+            "tests/test_ipynb.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/black/files.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "src/black/lines.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 225.211624
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-601c629e1107",
+      "lookup": [
+        {
+          "files": [
+            "src/black/parsing.py",
+            "src/black/__init__.py",
+            "src/black/debug.py",
+            "src/blib2to3/pgen2/conv.py",
+            "src/black/trans.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/files.py"
+          ],
+          "gold_files": [
+            "src/blib2to3/pgen2/conv.py"
+          ],
+          "hit5": true,
+          "name": "parse_graminit_c",
+          "precision5": 0.2,
+          "total_ms": 230.823853
+        },
+        {
+          "files": [
+            "src/black/parsing.py",
+            "src/black/__init__.py",
+            "src/black/debug.py",
+            "src/blib2to3/pgen2/conv.py",
+            "src/black/trans.py",
+            "src/blib2to3/pgen2/parse.py",
+            "src/black/files.py"
+          ],
+          "gold_files": [
+            "src/blib2to3/pgen2/conv.py"
+          ],
+          "hit5": true,
+          "name": "parse_graminit_h",
+          "precision5": 0.2,
+          "total_ms": 253.366025
+        }
+      ],
+      "refresh": {
+        "chunks": 7407,
+        "embedded_chunks": 86,
+        "files": 342,
+        "ms": 1487.7160680000002,
+        "reused_chunks": 7299
+      },
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 7407,
+        "embedded_chunks": 1,
+        "files": 342,
+        "ms": 1342.346243,
+        "reused_chunks": 7406
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/data/cases/return_annotation_brackets.py",
+            "src/black/__init__.py",
+            "src/black/concurrency.py",
+            "tests/data/cases/generics_wrapping.py",
+            "tests/data/cases/preview_return_annotation_brackets_string.py",
+            "tests/data/cases/pep_750.py",
+            "tests/data/cases/torture.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 351.286021
+        },
+        "grep": {
+          "files": [
+            "src/black/__init__.py",
+            "src/black/concurrency.py",
+            "tests/data/cases/preview_return_annotation_brackets_string.py",
+            "tests/data/cases/torture.py",
+            "tests/data/cases/preview_long_strings.py",
+            "src/black/mode.py",
+            "src/black/linegen.py",
+            "tests/data/cases/funcdef_return_type_trailing_comma.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": false,
+          "recall10": 0.5,
+          "rr": 0.14285714285714285,
+          "total_ms": 234.255998
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-42047e102f6d",
+      "lookup": [
+        {
+          "files": [
+            "src/black/linegen.py",
+            "tests/data/cases/prefer_rhs_split.py",
+            "tests/data/cases/preview_prefer_rhs_split_indexed_assignment.py",
+            "src/black/lines.py",
+            "src/black/nodes.py",
+            "tests/data/cases/expression.py",
+            "tests/data/cases/pep_750.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "should_split_funcdef_with_rhs",
+          "precision5": 0.2,
+          "total_ms": 281.743263
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/trans.py",
+            "src/blib2to3/pgen2/token.py",
+            "src/black/__init__.py",
+            "src/black/files.py",
+            "src/black/parsing.py",
+            "src/black/nodes.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": true,
+          "name": "StringParenWrapper",
+          "precision5": 0.2,
+          "total_ms": 331.873227
+        },
+        {
+          "files": [
+            "tests/data/cases/pattern_matching_generic.py",
+            "tests/data/cases/pattern_matching_extras.py",
+            "tests/data/cases/pattern_matching_style.py",
+            "src/blib2to3/pytree.py",
+            "src/black/brackets.py",
+            "src/black/output.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": false,
+          "name": "_return_match",
+          "precision5": 0.0,
+          "total_ms": 299.57788600000003
+        },
+        {
+          "files": [
+            "tests/data/cases/pattern_matching_generic.py",
+            "tests/data/cases/pattern_matching_extras.py",
+            "tests/data/cases/pattern_matching_style.py",
+            "src/black/trans.py",
+            "src/black/linegen.py",
+            "src/blib2to3/pytree.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": true,
+          "name": "do_splitter_match",
+          "precision5": 0.2,
+          "total_ms": 261.72719500000005
+        },
+        {
+          "files": [
+            "src/black/trans.py",
+            "src/black/__init__.py",
+            "src/black/linegen.py",
+            "tests/data/cases/preview_redundant_generator_parentheses.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/nodes.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": true,
+          "name": "do_transform",
+          "precision5": 0.2,
+          "total_ms": 259.423966
+        }
+      ],
+      "refresh": {
+        "chunks": 7421,
+        "embedded_chunks": 9,
+        "files": 343,
+        "ms": 1438.047906,
+        "reused_chunks": 7406
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7427,
+        "embedded_chunks": 8,
+        "files": 343,
+        "ms": 1389.5945430000002,
+        "reused_chunks": 7417
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/mode.py",
+            "tests/data/cases/pyi_overload_groups.py",
+            "tests/data/cases/docstring_no_extra_empty_line_before_eof.py",
+            "tests/data/cases/module_docstring_followed_by_class.py",
+            "tests/data/cases/class_blank_parentheses.py",
+            "src/blackd/__init__.py",
+            "src/black/lines.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 290.05708899999996
+        },
+        "grep": {
+          "files": [
+            "src/black/lines.py",
+            "src/black/mode.py",
+            "src/black/parsing.py",
+            "src/black/nodes.py",
+            "src/black/__init__.py",
+            "src/black/linegen.py",
+            "tests/data/cases/pyi_overload_groups.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 232.934343
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-5fe7881e6e40",
+      "lookup": [
+        {
+          "files": [
+            "src/black/lines.py",
+            "tests/data/cases/comments9.py",
+            "tests/data/cases/dummy_implementations.py",
+            "src/blib2to3/__init__.py",
+            "src/black/__init__.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/linegen.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": true,
+          "name": "_maybe_empty_lines_for_class_or_def",
+          "precision5": 0.2,
+          "total_ms": 328.376012
+        },
+        {
+          "files": [
+            "src/blackd/__init__.py",
+            "src/black/mode.py",
+            "src/black/lines.py",
+            "src/black/nodes.py",
+            "src/black/__init__.py",
+            "src/black/strings.py",
+            "src/black/linegen.py",
+            "tests/data/cases/preview_magic_trailing_comma_trailer_split.py",
+            "tests/data/cases/fmtskip2.py"
+          ],
+          "gold_files": [
+            "src/black/mode.py"
+          ],
+          "hit5": true,
+          "name": "Preview",
+          "precision5": 0.2,
+          "total_ms": 260.672139
+        }
+      ],
+      "refresh": {
+        "chunks": 7495,
+        "embedded_chunks": 87,
+        "files": 350,
+        "ms": 1906.446901,
+        "reused_chunks": 7403
+      },
+      "repo": "black",
+      "tags": [
+        "keyword",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 7507,
+        "embedded_chunks": 10,
+        "files": 351,
+        "ms": 1457.4918910000001,
+        "reused_chunks": 7493
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "src/black/mode.py",
+            "src/black/trans.py",
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/black/concurrency.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.25,
+          "total_ms": 371.071983
+        },
+        "grep": {
+          "files": [
+            "src/black/mode.py",
+            "src/black/linegen.py",
+            "src/black/concurrency.py",
+            "src/blackd/__init__.py",
+            "src/black/__init__.py",
+            "src/black/lines.py",
+            "src/black/nodes.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 299.18499399999996
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-34bfc69e57d0",
+      "lookup": [
+        {
+          "files": [
+            "src/black/handle_ipynb_magics.py",
+            "src/black/strings.py",
+            "src/black/trans.py",
+            "src/black/linegen.py",
+            "action/main.py",
+            "src/black/cache.py",
+            "src/blackd/client.py",
+            "src/black/concurrency.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": true,
+          "name": "_remove_backslash_line_continuation_chars",
+          "precision5": 0.2,
+          "total_ms": 330.241318
+        },
+        {
+          "files": [
+            "src/black/__init__.py",
+            "src/black/linegen.py",
+            "tests/data/cases/context_managers_38.py",
+            "tests/data/cases/context_managers_39.py",
+            "tests/data/cases/context_managers_autodetect_39.py",
+            "src/black/trans.py"
+          ],
+          "gold_files": [
+            "src/black/trans.py"
+          ],
+          "hit5": false,
+          "name": "_transform_to_new_line",
+          "precision5": 0.0,
+          "total_ms": 314.18202499999995
+        }
+      ],
+      "refresh": {
+        "chunks": 7507,
+        "embedded_chunks": 0,
+        "files": 351,
+        "ms": 1239.8144300000001,
+        "reused_chunks": 7507
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7511,
+        "embedded_chunks": 6,
+        "files": 352,
+        "ms": 1377.608028,
+        "reused_chunks": 7505
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/files.py",
+            "tests/test_black.py",
+            "src/black/__init__.py",
+            "src/black/const.py",
+            "src/black/linegen.py",
+            "tests/data/cases/expression.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 282.78331000000003
+        },
+        "grep": {
+          "files": [
+            "src/black/files.py",
+            "src/black/__init__.py",
+            "src/black/const.py",
+            "src/black/linegen.py",
+            "tests/test_black.py",
+            "src/black/comments.py",
+            "src/black/lines.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 236.875265
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-e1c478359c08",
+      "lookup": [
+        {
+          "files": [
+            "action/main.py",
+            "src/black/comments.py",
+            "src/black/linegen.py",
+            "src/black/parsing.py",
+            "src/black/nodes.py",
+            "src/black/ranges.py",
+            "src/black/files.py",
+            "tests/data/cases/fmtskip10.py"
+          ],
+          "gold_files": [
+            "src/black/files.py"
+          ],
+          "hit5": false,
+          "name": "_collapse_parent_dirs",
+          "precision5": 0.0,
+          "total_ms": 273.047455
+        },
+        {
+          "files": [
+            "src/black/files.py",
+            "src/black/__init__.py",
+            "tests/data/cases/preview_wrap_comprehension_in.py",
+            "src/blib2to3/pgen2/token.py",
+            "src/black/const.py",
+            "action/main.py",
+            "src/black/linegen.py"
+          ],
+          "gold_files": [
+            "src/black/files.py"
+          ],
+          "hit5": true,
+          "name": "best_effort_relative_path",
+          "precision5": 0.2,
+          "total_ms": 248.809561
+        }
+      ],
+      "refresh": {
+        "chunks": 7511,
+        "embedded_chunks": 0,
+        "files": 352,
+        "ms": 1129.26692,
+        "reused_chunks": 7511
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7512,
+        "embedded_chunks": 3,
+        "files": 352,
+        "ms": 1534.192405,
+        "reused_chunks": 7509
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/cache.py",
+            "tests/data/cases/tuple_with_stmt.py",
+            "docs/conf.py",
+            "tests/data/cases/annotated_assignment_target_parens.py",
+            "src/black/lines.py",
+            "src/blib2to3/pgen2/conv.py",
+            "src/black/__init__.py",
+            "src/black/ranges.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 283.959319
+        },
+        "grep": {
+          "files": [
+            "src/blib2to3/pgen2/conv.py",
+            "src/black/__init__.py",
+            "src/black/concurrency.py",
+            "src/black/cache.py",
+            "tests/test_black.py",
+            "docs/conf.py",
+            "src/black/numerics.py",
+            "src/black/nodes.py",
+            "tests/data/cases/preview_redundant_generator_parentheses.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.3333333333333333,
+          "total_ms": 190.334422
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-2f3f992a9827",
+      "lookup": [
+        {
+          "files": [
+            "src/black/numerics.py",
+            "src/black/ranges.py",
+            "src/black/strings.py",
+            "tests/data/miscellaneous/blackd_diff.py",
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/torture.py",
+            "tests/test_concurrency_manager_shutdown.py",
+            "tests/data/cases/long_strings_flag_disabled.py"
+          ],
+          "gold_files": [
+            "src/black/concurrency.py"
+          ],
+          "hit5": false,
+          "name": "schedule_formatting",
+          "precision5": 0.0,
+          "total_ms": 234.334523
+        }
+      ],
+      "refresh": {
+        "chunks": 7505,
+        "embedded_chunks": 18,
+        "files": 350,
+        "ms": 1702.6918640000001,
+        "reused_chunks": 7486
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7516,
+        "embedded_chunks": 4,
+        "files": 351,
+        "ms": 1281.7711080000001,
+        "reused_chunks": 7512
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "action/main.py",
+            "tests/data/cases/pattern_matching_simple.py",
+            "src/blib2to3/pgen2/token.py",
+            "src/black/mode.py",
+            "tests/data/miscellaneous/string_quotes.py",
+            "src/black/comments.py",
+            "scripts/diff_shades_gha_helper.py",
+            "src/black/files.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 388.710708
+        },
+        "grep": {
+          "files": [
+            "action/main.py",
+            "src/black/mode.py",
+            "scripts/diff_shades_gha_helper.py",
+            "src/black/files.py",
+            "src/black/const.py",
+            "docs/conf.py",
+            "tests/test_black.py",
+            "tests/optional.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 227.51985
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-315a796590d1",
+      "lookup": [
+        {
+          "files": [
+            "action/main.py",
+            "src/blackd/__init__.py",
+            "src/black/__init__.py",
+            "src/black/cache.py",
+            "tests/data/cases/power_op_spacing.py",
+            "tests/data/cases/preview_hug_parens_with_braces_and_square_brackets_no_ll1.py"
+          ],
+          "gold_files": [
+            "action/main.py"
+          ],
+          "hit5": true,
+          "name": "find_black_version_in_array",
+          "precision5": 0.2,
+          "total_ms": 315.255005
+        }
+      ],
+      "refresh": {
+        "chunks": 7527,
+        "embedded_chunks": 16,
+        "files": 351,
+        "ms": 1595.712216,
+        "reused_chunks": 7511
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7538,
+        "embedded_chunks": 8,
+        "files": 352,
+        "ms": 1258.701052,
+        "reused_chunks": 7530
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/mode.py",
+            "profiling/dict_big.py",
+            "profiling/dict_huge.py",
+            "profiling/list_big.py",
+            "src/black/__init__.py",
+            "profiling/list_huge.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 779.287046
+        },
+        "grep": {
+          "files": [
+            "src/black/mode.py",
+            "src/black/__init__.py",
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "src/black/linegen.py",
+            "src/black/nodes.py",
+            "tests/data/cases/remove_parens_from_lhs.py"
+          ],
+          "hit1": false,
+          "hit10": false,
+          "hit5": false,
+          "recall10": 0.0,
+          "rr": 0.0,
+          "total_ms": 659.571306
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-f4f6cd9becda",
+      "lookup": [
+        {
+          "files": [
+            "src/black/__init__.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/output.py",
+            "tests/test_ipynb.py",
+            "tests/data/cases/jupytext_markdown_fmt.py",
+            "tests/data/cases/comments.py",
+            "tests/data/cases/expression.py"
+          ],
+          "gold_files": [
+            "src/black/handle_ipynb_magics.py"
+          ],
+          "hit5": true,
+          "name": "unmask_cell",
+          "precision5": 0.2,
+          "total_ms": 343.855192
+        }
+      ],
+      "refresh": {
+        "chunks": 7548,
+        "embedded_chunks": 13,
+        "files": 353,
+        "ms": 1270.9743119999998,
+        "reused_chunks": 7534
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7550,
+        "embedded_chunks": 3,
+        "files": 353,
+        "ms": 1389.944431,
+        "reused_chunks": 7547
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/mode.py",
+            "tests/data/cases/comment_type_hint.py",
+            "tests/data/cases/preview_unpacking_parens.py",
+            "tests/data/cases/remove_parens_from_lhs.py",
+            "tests/data/cases/preview_hug_comparator.py",
+            "tests/data/cases/remove_with_brackets.py",
+            "src/blackd/__init__.py",
+            "src/black/strings.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.3333333333333333,
+          "rr": 1.0,
+          "total_ms": 384.876532
+        },
+        "grep": {
+          "files": [
+            "src/black/strings.py",
+            "src/black/lines.py",
+            "src/black/mode.py",
+            "tests/data/cases/preview_unpacking_parens.py",
+            "tests/data/cases/preview_prefer_rhs_split_indexed_assignment.py",
+            "tests/data/cases/comment_type_hint.py",
+            "tests/data/cases/expression.py",
+            "src/black/linegen.py",
+            "src/blib2to3/pgen2/tokenize.py",
+            "tests/data/miscellaneous/string_quotes.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 271.180794
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-d9d091de04dd",
+      "lookup": [
+        {
+          "files": [
+            "tests/data/cases/expression.py",
+            "src/black/linegen.py",
+            "src/black/trans.py",
+            "tests/data/cases/preview_long_strings.py",
+            "tests/data/cases/long_strings_flag_disabled.py",
+            "src/black/brackets.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "delimiter_split",
+          "precision5": 0.2,
+          "total_ms": 265.779431
+        },
+        {
+          "files": [
+            "src/black/trans.py",
+            "src/black/linegen.py",
+            "src/black/files.py",
+            "src/black/output.py",
+            "src/black/strings.py",
+            "src/black/parsing.py",
+            "src/black/handle_ipynb_magics.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": false,
+          "name": "append",
+          "precision5": 0.0,
+          "total_ms": 268.631913
+        },
+        {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/lines.py",
+            "src/black/nodes.py",
+            "tests/data/cases/power_op_spacing.py",
+            "src/blib2to3/pytree.py",
+            "src/black/__init__.py"
+          ],
+          "gold_files": [
+            "src/black/lines.py"
+          ],
+          "hit5": true,
+          "name": "can_omit_invisible_parens",
+          "precision5": 0.2,
+          "total_ms": 252.47575100000003
+        },
+        {
+          "files": [
+            "src/blackd/__init__.py",
+            "src/black/mode.py",
+            "src/black/lines.py",
+            "src/black/nodes.py",
+            "src/black/__init__.py",
+            "src/black/strings.py",
+            "src/black/linegen.py",
+            "tests/data/cases/preview_magic_trailing_comma_trailer_split.py",
+            "tests/data/cases/fmtskip2.py"
+          ],
+          "gold_files": [
+            "src/black/mode.py"
+          ],
+          "hit5": true,
+          "name": "Preview",
+          "precision5": 0.2,
+          "total_ms": 294.859346
+        }
+      ],
+      "refresh": {
+        "chunks": 7558,
+        "embedded_chunks": 8,
+        "files": 354,
+        "ms": 1273.6434100000001,
+        "reused_chunks": 7549
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic",
+        "names-symbol"
+      ],
+      "update": {
+        "chunks": 7580,
+        "embedded_chunks": 18,
+        "files": 355,
+        "ms": 1513.0998,
+        "reused_chunks": 7554
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/test_ranges.py",
+            "tests/data/cases/line_ranges_unwrapping.py",
+            "tests/util.py",
+            "action/main.py",
+            "src/black/__init__.py",
+            "tests/data/cases/bracketmatch.py",
+            "scripts/make_width_table.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 369.199292
+        },
+        "grep": {
+          "files": [
+            "action/main.py",
+            "src/black/__init__.py",
+            "scripts/make_width_table.py",
+            "tests/test_github_action.py",
+            "src/black/ranges.py",
+            "tests/data/cases/fmtonoff5.py",
+            "tests/util.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.5,
+          "total_ms": 276.80754
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-97fb59f06a07",
+      "lookup": [
+        {
+          "files": [
+            "tests/test_black.py",
+            "src/blib2to3/pgen2/token.py",
+            "src/black/__init__.py",
+            "tests/data/cases/comments_non_breaking_space.py",
+            "src/black/lines.py",
+            "tests/data/cases/type_aliases.py"
+          ],
+          "gold_files": [
+            "src/black/__init__.py"
+          ],
+          "hit5": true,
+          "name": "reformat_one",
+          "precision5": 0.2,
+          "total_ms": 315.267654
+        }
+      ],
+      "refresh": {
+        "chunks": 7582,
+        "embedded_chunks": 17,
+        "files": 355,
+        "ms": 1651.50562,
+        "reused_chunks": 7565
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7582,
+        "embedded_chunks": 2,
+        "files": 355,
+        "ms": 1537.648771,
+        "reused_chunks": 7580
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "src/black/ranges.py",
+            "tests/data/cases/python315.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/blib2to3/pgen2/grammar.py",
+            "profiling/list_big.py",
+            "profiling/list_huge.py",
+            "tests/data/cases/pep_572_py310.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 1.0,
+          "total_ms": 391.029689
+        },
+        "grep": {
+          "files": [
+            "src/black/ranges.py",
+            "src/blib2to3/pgen2/driver.py",
+            "src/blib2to3/pgen2/grammar.py",
+            "scripts/make_width_table.py",
+            "profiling/dict_big.py",
+            "profiling/dict_huge.py",
+            "tests/util.py",
+            "tests/test_black.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 0.5,
+          "rr": 1.0,
+          "total_ms": 271.005591
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-77c0cae18bcc",
+      "lookup": [
+        {
+          "files": [
+            "src/black/ranges.py",
+            "src/black/__init__.py",
+            "tests/test_ranges.py",
+            "src/black/output.py",
+            "src/black/lines.py",
+            "src/black/strings.py",
+            "tests/data/cases/remove_lone_list_item_parens.py"
+          ],
+          "gold_files": [
+            "src/black/ranges.py"
+          ],
+          "hit5": true,
+          "name": "_calculate_lines_mappings",
+          "precision5": 0.2,
+          "total_ms": 280.4162
+        }
+      ],
+      "refresh": {
+        "chunks": 7582,
+        "embedded_chunks": 0,
+        "files": 355,
+        "ms": 1337.2934329999998,
+        "reused_chunks": 7582
+      },
+      "repo": "black",
+      "tags": [
+        "keyword-agnostic"
+      ],
+      "update": {
+        "chunks": 7585,
+        "embedded_chunks": 6,
+        "files": 355,
+        "ms": 1816.369781,
+        "reused_chunks": 7579
+      }
+    },
+    {
+      "arms": {
+        "fusion": {
+          "files": [
+            "tests/data/cases/docstring_no_extra_empty_line_before_eof.py",
+            "tests/data/cases/module_docstring_1.py",
+            "tests/data/cases/module_docstring_3.py",
+            "tests/data/cases/module_docstring_4.py",
+            "src/black/linegen.py",
+            "src/black/ranges.py"
+          ],
+          "hit1": false,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 0.2,
+          "total_ms": 385.097051
+        },
+        "grep": {
+          "files": [
+            "src/black/linegen.py",
+            "src/black/ranges.py",
+            "src/black/lines.py",
+            "tests/data/cases/module_docstring_1.py",
+            "tests/data/cases/module_docstring_3.py",
+            "tests/data/cases/module_docstring_4.py",
+            "src/black/strings.py"
+          ],
+          "hit1": true,
+          "hit10": true,
+          "hit5": true,
+          "recall10": 1.0,
+          "rr": 1.0,
+          "total_ms": 281.510222
+        }
+      },
+      "defs": null,
+      "defs_build": null,
+      "id": "black-c9b1148b5b87",
+      "lookup": [
+        {
+          "files": [
+            "tests/data/cases/preview_long_strings.py",
+            "src/black/linegen.py",
+            "src/black/handle_ipynb_magics.py",
+            "src/black/nodes.py",
+            "src/blib2to3/pgen2/token.py",
+            "src/black/brackets.py",
+            "src/black/trans.py",
+            "src/black/debug.py"
+          ],
+          "gold_files": [
+            "src/black/linegen.py"
+          ],
+          "hit5": true,
+          "name": "visit_STRING",
+          "precision5": 0.2,
+          "total_ms": 280.947608
+        }
+      ],
+      "refresh": {
+        "chunks": 7624,
+        "embedded_chunks": 41,
+        "files": 358,
+        "ms": 1782.892363,
+        "reused_chunks": 7573
+      },
+      "repo": "black",
+      "tags": [
+        "keyword"
+      ],
+      "update": {
+        "chunks": 7626,
+        "embedded_chunks": 4,
+        "files": 358,
+        "ms": 1492.891886,
+        "reused_chunks": 7622
+      }
+    }
+  ],
+  "unavailable": {
+    "defs": "no sym.defs probe was given (bench.md 2.1, D2)",
+    "navigation": "the runner has no language servers (bench.md 2.1, D2)"
+  },
+  "wall_ms": 405522.404242
+}
