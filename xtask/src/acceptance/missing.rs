@@ -247,9 +247,7 @@ async fn checks(
         Err(error) => {
             let message = format!("{error:#}");
             let lower = message.to_lowercase();
-            let is_tooling_error = names_provider(&lower, spec)
-                || lower.contains("language server")
-                || lower.contains("program not found");
+            let is_tooling_error = definition_error_is_tooling_error(&lower, spec);
             (is_tooling_error, message)
         }
     };
@@ -263,12 +261,7 @@ async fn checks(
 
     evidence.stage("service-status")?;
     let status_body = session.call_tool("service_status", json!({})).await?;
-    let lower_status = status_body.to_lowercase();
-    let service_status_ok = names_provider(&lower_status, spec)
-        && (lower_status.contains("optional")
-            || lower_status.contains("degraded")
-            || lower_status.contains("unavailable")
-            || lower_status.contains("missing"));
+    let service_status_ok = service_status_reports_missing_provider(&status_body, spec);
     evidence.set(
         "service_status_provider_optional_degraded",
         service_status_ok,
@@ -358,6 +351,48 @@ fn names_provider(lower: &str, spec: &MissingServerSpec) -> bool {
     lower.contains(spec.near_word) || spec.extra_terms.iter().any(|term| lower.contains(term))
 }
 
+fn definition_error_is_tooling_error(lower: &str, spec: &MissingServerSpec) -> bool {
+    spec.exact_provider_terms
+        .iter()
+        .any(|term| lower.contains(term))
+        || lower.contains("program not found")
+}
+
+fn service_status_reports_missing_provider(body: &str, spec: &MissingServerSpec) -> bool {
+    std::iter::once(body)
+        .chain(body.lines().filter_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .any(|response| {
+            let status = response
+                .pointer("/result/structuredContent")
+                .unwrap_or(&response);
+            let Some(components) = status
+                .get("components")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+            let Some(degraded) = status.get("degraded").and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+
+            components.iter().any(|component| {
+                let Some(name) = component.get("name").and_then(serde_json::Value::as_str) else {
+                    return false;
+                };
+                if component.get("ready") != Some(&serde_json::Value::Bool(false))
+                    || !names_provider(&name.to_lowercase(), spec)
+                {
+                    return false;
+                }
+                degraded.iter().any(|entry| {
+                    entry.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                })
+            })
+        })
+}
+
 fn contains_near(haystack: &str, needle: &str, max_gap: usize, options: &[&str]) -> bool {
     let mut start = 0;
     while let Some(idx) = haystack[start..].find(needle) {
@@ -404,8 +439,52 @@ fn search_returns_calculator(body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::search_returns_calculator;
-    use serde_json::json;
+    use super::{
+        MissingServerSpec, ProcessCheck, definition_error_is_tooling_error,
+        search_returns_calculator, service_status_reports_missing_provider,
+    };
+    use serde_json::{Value, json};
+
+    fn go_spec() -> MissingServerSpec {
+        MissingServerSpec {
+            language_key: "go",
+            display_name: "Go",
+            config_section: "go",
+            missing_path: "missing-gopls",
+            extra_config_lines: vec![],
+            source_files: vec![],
+            search_query: "query",
+            search_languages: &["go"],
+            definition_file: "source.go",
+            definition_line: 1,
+            definition_character: 1,
+            exact_provider_terms: &["gopls", "go language server"],
+            near_word: "go",
+            extra_terms: &["gopls"],
+            process_check: ProcessCheck::Children("gopls"),
+        }
+    }
+
+    fn status_body(component_ready: bool, degraded: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "structuredContent": {
+                    "ready": true,
+                    "can_create_semantic_index": true,
+                    "components": [{
+                        "name": "go_language_server_available",
+                        "ready": component_ready,
+                        "required": false,
+                        "detail": null
+                    }],
+                    "degraded": degraded
+                }
+            }
+        })
+        .to_string()
+    }
 
     #[test]
     fn query_echo_with_empty_results_is_not_retrieval() {
@@ -467,5 +546,50 @@ mod tests {
         ] {
             assert!(!search_returns_calculator(body), "{body}");
         }
+    }
+
+    #[test]
+    fn healthy_status_body_does_not_report_the_go_server_missing() {
+        let body = status_body(true, json!([]));
+        assert!(!service_status_reports_missing_provider(&body, &go_spec()));
+    }
+
+    #[test]
+    fn missing_server_status_body_reports_the_go_server_degraded() {
+        let body = status_body(
+            false,
+            json!([{
+                "name": "go_language_server_available",
+                "reason": "configured gopls command is unavailable"
+            }]),
+        );
+        assert!(service_status_reports_missing_provider(&body, &go_spec()));
+        let sse_body = format!("event: message\ndata: {body}\n\n");
+        assert!(service_status_reports_missing_provider(
+            &sse_body,
+            &go_spec()
+        ));
+    }
+
+    #[test]
+    fn missing_server_status_requires_a_matching_degraded_entry() {
+        let body = status_body(false, json!([]));
+        assert!(!service_status_reports_missing_provider(&body, &go_spec()));
+    }
+
+    #[test]
+    fn definition_error_with_only_an_incidental_go_word_is_not_a_tooling_error() {
+        assert!(!definition_error_is_tooling_error(
+            "unable to go to the requested source location",
+            &go_spec()
+        ));
+        assert!(definition_error_is_tooling_error(
+            "gopls is unavailable",
+            &go_spec()
+        ));
+        assert!(definition_error_is_tooling_error(
+            "program not found",
+            &go_spec()
+        ));
     }
 }
