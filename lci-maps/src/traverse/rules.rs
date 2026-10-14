@@ -30,6 +30,12 @@
 //! `prune`, `expand`, `boost`). The other actions are checkpoint rules: each
 //! fires once when its predicate holds for some frontier node (or, with an
 //! empty frontier, for the checkpoint alone), in list order.
+//!
+//! As rung 1 of the ladder the list is confident (1.0) when some rule matched
+//! and uncertain (0.0) when none did, when it ran out of time, or when two
+//! rules matching one node contradict each other (one prunes it, the other
+//! expands it or boosts it above 1); the first match is still the one it
+//! proposes. There is no rule for `budget`: a rule list cannot raise a cap.
 
 use crate::edge::WitnessClass;
 use crate::traverse::handler::{
@@ -332,6 +338,14 @@ fn parse_action(value: &Value) -> Result<Action, Fail> {
     })
 }
 
+/// Parses one rule-list action (`"prune"`, `{"boost": 2.0}`, ..).
+pub fn parse_action_json(value: &Value) -> Result<Action, String> {
+    parse_action(value).map_err(|fail| match fail {
+        Fail::Predicate(name) | Fail::Action(name) => format!("unknown action {name:?}"),
+        Fail::Invalid(reason) => reason,
+    })
+}
+
 /// Whether `text` matches `pattern`: `?` is one character other than `/`,
 /// `*` any run of characters other than `/`, `**` any run, `**/` any run
 /// ending in `/` or nothing. Everything else matches itself. Linear in the
@@ -450,6 +464,18 @@ fn eval(predicate: &Predicate, cx: &Cx) -> bool {
     }
 }
 
+/// Whether two node actions on one node pull opposite ways: one drops it,
+/// the other expands it or raises its priority.
+fn contradicts(a: &Action, b: &Action) -> bool {
+    let drops = |x: &Action| matches!(x, Action::Prune);
+    let wants = |x: &Action| match x {
+        Action::Expand => true,
+        Action::Boost(factor) => *factor > 1.0,
+        _ => false,
+    };
+    (drops(a) && wants(b)) || (wants(a) && drops(b))
+}
+
 /// Rung 1 of the ladder: a bounded list of rules.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleList {
@@ -518,6 +544,7 @@ impl Handler for RuleList {
         let expired = || started.elapsed() >= cap;
         let mut decision = Decision::default();
         let mut matched = false;
+        let mut conflicts = 0u32;
 
         'nodes: for item in &checkpoint.frontier {
             if expired() {
@@ -528,14 +555,27 @@ impl Handler for RuleList {
                 checkpoint,
                 item: Some(item),
             };
+            // The first match decides; a later match that contradicts it
+            // makes the whole list uncertain (it still applies the first).
+            let mut first: Option<&Action> = None;
             for rule in self.rules.iter().filter(|r| r.then.is_node_action()) {
-                if eval(&rule.when, &cx) {
-                    matched = true;
-                    decision.actions.push(Directive {
-                        node: Some(item.node.clone()),
-                        action: rule.then.clone(),
-                    });
-                    continue 'nodes;
+                if !eval(&rule.when, &cx) {
+                    continue;
+                }
+                match first {
+                    None => {
+                        matched = true;
+                        first = Some(&rule.then);
+                        decision.actions.push(Directive {
+                            node: Some(item.node.clone()),
+                            action: rule.then.clone(),
+                        });
+                    }
+                    Some(decided) if contradicts(decided, &rule.then) => {
+                        conflicts += 1;
+                        continue 'nodes;
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -579,7 +619,7 @@ impl Handler for RuleList {
             }
         }
 
-        decision.confidence = if matched && !decision.truncated {
+        decision.confidence = if matched && !decision.truncated && conflicts == 0 {
             1.0
         } else {
             0.0
@@ -604,9 +644,11 @@ mod tests {
             via: Some("scip"),
             witness: Some(WitnessClass::Compiler),
             score: 0.5,
+            potential: 0.5,
             depth,
             fanout: 3,
             seen_before: false,
+            est_cost: 0,
         }
     }
 
@@ -619,6 +661,7 @@ mod tests {
             frontier: items,
             visited: 4,
             cleared: 0,
+            ..Checkpoint::default()
         }
     }
 

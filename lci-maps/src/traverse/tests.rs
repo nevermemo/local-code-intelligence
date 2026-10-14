@@ -522,10 +522,7 @@ async fn statuses() {
     let stopped = walk(&reg, vec![seed("a")], budget(10), |t| {
         t.handler(
             scripted(|_| vec![act(None, Action::Stop)]),
-            StopPolicy {
-                every_pops: 1,
-                max_stops: 4,
-            },
+            StopPolicy::every(1),
         )
     })
     .await;
@@ -563,10 +560,7 @@ fn act(node: Option<&NodeId>, action: Action) -> Directive {
 }
 
 fn every(pops: u32) -> StopPolicy {
-    StopPolicy {
-        every_pops: pops,
-        max_stops: 4,
-    }
+    StopPolicy::every(pops)
 }
 
 /// a -> b, c, d (potential 1 each: below the gate).
@@ -874,13 +868,7 @@ async fn emit_and_directives_for_unknown_nodes() {
 async fn stops_fire_every_n_pops_and_at_most_max_stops() {
     let reg = registry(vec![lattice_map("g", 60)]);
     let result = walk(&reg, vec![seed("n0")], budget(50), |t| {
-        t.handler(
-            scripted(|_| Vec::new()),
-            StopPolicy {
-                every_pops: 5,
-                max_stops: 3,
-            },
-        )
+        t.handler(scripted(|_| Vec::new()), StopPolicy::every(5).max_stops(3))
     })
     .await;
     let stops: Vec<u64> = result
@@ -1125,7 +1113,9 @@ mod persist {
     fn without_marks(events: &[Value]) -> Vec<Value> {
         events
             .iter()
-            .filter(|e| !["start", "end", "resume", "stop"].contains(&e["ev"].as_str().unwrap()))
+            .filter(|e| {
+                !["start", "end", "resume", "stop", "return"].contains(&e["ev"].as_str().unwrap())
+            })
             .cloned()
             .map(|mut e| {
                 if let Some(obj) = e.as_object_mut() {
@@ -1414,5 +1404,1023 @@ mod persist {
         let cut = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
         assert_eq!(cut.status, TraversalStatus::BudgetExhausted);
         assert!(cut.snapshot.is_some());
+    }
+}
+
+// ---- slice S4: stops, the ladder, rung 3, the steer continuation ---------------
+
+mod steering {
+    use super::*;
+    use crate::traverse::{
+        handle::{HandleStore, Snapshot},
+        handler::{RAISE_MAX_POPS, RAISE_MAX_TOKENS},
+        ladder::{Ladder, LadderError},
+        steer::{MAX_STEER_ACTIONS, Steer, SteerError},
+        stop::{self, CARD_CHARS, Card},
+        trace,
+    };
+    use serde_json::json;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    /// A handler on a chosen rung with a canned answer; counts its calls.
+    struct Rung {
+        id: &'static str,
+        rung: u8,
+        confidence: f32,
+        actions: Vec<Directive>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Handler for Rung {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn rung(&self) -> u8 {
+            self.rung
+        }
+
+        fn decide(&self, _checkpoint: &Checkpoint, _budget: &StopBudget) -> Decision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Decision {
+                actions: self.actions.clone(),
+                confidence: self.confidence,
+                ..Decision::default()
+            }
+        }
+    }
+
+    fn rung(
+        id: &'static str,
+        rung: u8,
+        confidence: f32,
+        actions: Vec<Directive>,
+    ) -> (Rung, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Rung {
+            id,
+            rung,
+            confidence,
+            actions,
+            calls: calls.clone(),
+        };
+        (handler, calls)
+    }
+
+    /// A System One stand-in: rung 2, as S8 will fill it.
+    fn system_one_double(confidence: f32, actions: Vec<Directive>) -> (Rung, Arc<AtomicUsize>) {
+        rung("system_one_double", 2, confidence, actions)
+    }
+
+    fn no_rules() -> RuleList {
+        RuleList::new(Vec::new()).unwrap()
+    }
+
+    /// Matches every frontier node and changes nothing: rung 1 is sure.
+    fn sure_rules() -> RuleList {
+        RuleList::from_json(&json!([{"when": {"depth": {"ge": 0}}, "then": "continue"}])).unwrap()
+    }
+
+    fn ladder(tau: f32, rungs: Vec<Box<dyn Handler>>) -> Ladder {
+        Ladder::new(tau, rungs).unwrap()
+    }
+
+    fn of<'a>(result: &'a TraversalResult, ev: &str) -> Vec<&'a Value> {
+        result.events.iter().filter(|e| e["ev"] == ev).collect()
+    }
+
+    fn texts(events: &[&Value], key: &str) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match &e[key] {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    /// `(pops, reason)` of every stop.
+    fn stops_of(result: &TraversalResult) -> Vec<(u64, String)> {
+        of(result, "stop")
+            .iter()
+            .map(|e| {
+                (
+                    e["pops"].as_u64().unwrap(),
+                    e["reason"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    async fn continue_from(
+        reg: &Registry<'static>,
+        snapshot: Snapshot,
+        budget: TraversalBudget,
+        configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
+    ) -> TraversalResult {
+        let view = view();
+        configure(Traversal::resumed(
+            OnTheFly::new(reg, &view),
+            snapshot,
+            budget,
+        ))
+        .run()
+        .await
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lci-s4-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn noop() -> impl Handler {
+        scripted(|_| Vec::new())
+    }
+
+    /// Runs a handler and keeps every checkpoint it saw.
+    struct Observe<H>(H, Arc<Mutex<Vec<Checkpoint>>>);
+
+    impl<H: Handler> Handler for Observe<H> {
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+
+        fn decide(&self, checkpoint: &Checkpoint, budget: &StopBudget) -> Decision {
+            self.1.lock().unwrap().push(checkpoint.clone());
+            self.0.decide(checkpoint, budget)
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<Checkpoint>>>;
+
+    fn recorder() -> (Seen, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (seen.clone(), seen)
+    }
+
+    // ---- triggers ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn every_pops_fires_with_its_reason() {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
+            t.handler(noop(), every(4).max_stops(2))
+        })
+        .await;
+        assert_eq!(
+            stops_of(&result),
+            [(4, "every_pops".to_string()), (8, "every_pops".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_share_fires_at_each_share_of_the_pop_budget() {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let policy = StopPolicy::default().budget_share(25).max_stops(10);
+        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
+            t.handler(noop(), policy)
+        })
+        .await;
+        let share = "budget_share".to_string();
+        let stops = stops_of(&result);
+        assert_eq!(stops.len(), 4, "{stops:?}");
+        assert_eq!(stops[0], (5, share.clone()));
+        assert_eq!(stops[1], (10, share.clone()));
+        assert_eq!(stops[2], (15, share));
+    }
+
+    #[tokio::test]
+    async fn disagreement_fires_when_a_fuzzy_map_offers_what_the_structural_map_does_not() {
+        let (seen, sink) = recorder();
+        let reg = registry(vec![
+            GraphMap::new("s", &[("a", "b")]),
+            GraphMap::new("f", &[("a", "b"), ("a", "x")]).witness(WitnessClass::Vector),
+        ]);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(
+                Observe(noop(), sink),
+                StopPolicy::default().on_disagreement(1),
+            )
+        })
+        .await;
+        assert_eq!(stops_of(&result), [(1, "disagreement".to_string())]);
+        let cp = seen.lock().unwrap()[0].clone();
+        assert_eq!(cp.disagreements_total, 1);
+        let d = &cp.disagreements[0];
+        assert_eq!((d.node.clone(), d.src.clone()), (node("x"), node("a")));
+        assert_eq!(d.offered_by, ["f"]);
+        assert_eq!(d.silent, ["s"]);
+        assert_eq!(d.pop, 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_structural_answer_nothing_disagrees() {
+        let reg = registry(vec![
+            GraphMap::new("f", &[("a", "b"), ("a", "x")]).witness(WitnessClass::Vector),
+        ]);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(noop(), StopPolicy::default().on_disagreement(1))
+        })
+        .await;
+        assert!(stops_of(&result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stagnation_fires_after_pops_that_found_nothing_new() {
+        let reg = registry(vec![GraphMap::new(
+            "g",
+            &[
+                ("a", "b"),
+                ("a", "c"),
+                ("a", "d"),
+                ("b", "a"),
+                ("c", "a"),
+                ("d", "a"),
+            ],
+        )]);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(noop(), StopPolicy::default().on_stagnation(2))
+        })
+        .await;
+        assert_eq!(stops_of(&result), [(3, "stagnation".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn likely_complete_fires_once_when_two_maps_agree_on_what_they_found() {
+        let edges = [("a", "b"), ("a", "c"), ("a", "d"), ("a", "e")];
+        let reg = registry(vec![
+            GraphMap::new("m1", &edges),
+            GraphMap::new("m2", &edges),
+        ]);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(noop(), StopPolicy::default().likely_complete(90))
+        })
+        .await;
+        assert_eq!(stops_of(&result), [(1, "likely_complete".to_string())]);
+
+        let apart = registry(vec![
+            GraphMap::new("m1", &[("a", "b"), ("a", "c")]),
+            GraphMap::new("m2", &[("a", "d"), ("a", "e")]),
+        ]);
+        let none = walk(&apart, vec![seed("a")], budget(10), |t| {
+            t.handler(noop(), StopPolicy::default().likely_complete(1))
+        })
+        .await;
+        assert!(stops_of(&none).is_empty());
+    }
+
+    #[tokio::test]
+    async fn several_triggers_at_once_make_one_stop_and_max_stops_bounds_them_all() {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let policy = StopPolicy::every(5).budget_share(25).max_stops(10);
+        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
+            t.handler(noop(), policy)
+        })
+        .await;
+        let stops = of(&result, "stop");
+        assert_eq!(stops[0]["pops"], 5);
+        assert_eq!(stops[0]["reason"], "every_pops");
+        assert_eq!(stops[0]["triggers"], json!(["every_pops", "budget_share"]));
+
+        let capped = walk(&reg, vec![seed("n0")], budget(20), |t| {
+            t.handler(noop(), StopPolicy::every(5).budget_share(25).max_stops(2))
+        })
+        .await;
+        assert_eq!(capped.totals.stops, 2);
+    }
+
+    #[tokio::test]
+    async fn a_policy_with_no_trigger_never_stops() {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let result = walk(&reg, vec![seed("n0")], budget(10), |t| {
+            t.handler(noop(), StopPolicy::default())
+        })
+        .await;
+        assert_eq!(result.totals.stops, 0);
+        assert!(!StopPolicy::default().is_active());
+    }
+
+    // ---- the checkpoint payload ------------------------------------------------
+
+    #[tokio::test]
+    async fn the_checkpoint_carries_cards_regions_costs_and_the_rest() {
+        let (seen, sink) = recorder();
+        let reg = registry(vec![
+            GraphMap::new("g", &[("a", "b"), ("a", "c"), ("a", "tests/t"), ("b", "e")]).cost(5, 0),
+        ]);
+        walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.question("how does a reach e")
+                .handler(Observe(noop(), sink), every(2))
+        })
+        .await;
+        let cp = seen.lock().unwrap()[0].clone();
+        assert_eq!(cp.reason, stop::StopReason::EveryPops);
+        assert_eq!(cp.question, "how does a reach e");
+        assert_eq!(cp.seeds, [node("a")]);
+        assert_eq!((cp.pops, cp.stop, cp.pops_left), (2, 1, 8));
+        assert!(
+            cp.handle.is_none(),
+            "the handle belongs to a returned checkpoint"
+        );
+
+        let visited: Vec<_> = cp.visited_cards.iter().map(|c| c.node.clone()).collect();
+        assert_eq!(visited, [node("a"), node("b")]);
+        assert_eq!(cp.visited_cards[1].via, Some("g"));
+        assert_eq!(cp.visited_cards[1].witness, Some(WitnessClass::Compiler));
+        let answer: Vec<_> = cp.answer.iter().map(|c| c.node.clone()).collect();
+        assert!(!answer.contains(&node("a")), "the seed is not an answer");
+        assert!(answer.contains(&node("b")));
+
+        assert_eq!(cp.frontier.len(), 3);
+        assert!(
+            cp.frontier
+                .iter()
+                .all(|i| i.est_cost > 0 && i.potential > 0.0)
+        );
+        let (id, stat) = &cp.maps[0];
+        assert_eq!(*id, "g");
+        assert_eq!((stat.calls, stat.failures, stat.edges), (2, 0, 4));
+        assert_eq!(stat.tokens, 10);
+        assert_eq!(
+            (cp.regions.explored, cp.regions.seen, cp.regions.cleared),
+            (2, 3, 0)
+        );
+        assert_eq!(cp.regions.unknown, None);
+        assert!(
+            cp.regions
+                .rows
+                .iter()
+                .any(|r| r.path == "tests" && r.seen == 1)
+        );
+        assert_eq!(cp.disagreements_total, 0);
+        assert!(cp.likely_complete.is_none());
+        assert_eq!((cp.visited, cp.cleared), (2, 0));
+    }
+
+    #[tokio::test]
+    async fn cleared_nodes_show_in_the_regions() {
+        let (seen, sink) = recorder();
+        let reg = registry(vec![GraphMap::new(
+            "g",
+            &[("a", "b"), ("b", "c"), ("a", "tests/t"), ("a", "tests/u")],
+        )]);
+        let rules = RuleList::from_json(&json!([
+            {"when": {"path_glob": "tests/**"}, "then": "prune"}
+        ]))
+        .unwrap();
+        walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(Observe(rules, sink), every(1))
+        })
+        .await;
+        let later = seen.lock().unwrap();
+        let cp = later.last().unwrap();
+        assert_eq!(cp.cleared, 2);
+        assert_eq!(cp.regions.cleared, 2);
+    }
+
+    #[tokio::test]
+    async fn two_maps_re_finds_make_the_likely_complete_estimate() {
+        let (seen, sink) = recorder();
+        let reg = registry(vec![
+            GraphMap::new("m1", &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e")]),
+            GraphMap::new("m2", &[("a", "d"), ("a", "e"), ("a", "f"), ("a", "h")]),
+        ]);
+        walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(Observe(noop(), sink), every(1).max_stops(1))
+        })
+        .await;
+        let cp = seen.lock().unwrap()[0].clone();
+        let lc = cp.likely_complete.expect("the maps share nodes");
+        assert_eq!(lc.maps, ["m1", "m2"]);
+        assert_eq!((lc.refound, lc.found), (2, 6));
+        assert!(lc.fraction > 0.0 && lc.fraction <= 1.0);
+    }
+
+    #[test]
+    fn the_estimate_is_lincoln_petersen_over_the_two_largest_finders() {
+        let set = |names: &[&str]| -> BTreeSet<NodeId> { names.iter().map(|n| node(n)).collect() };
+        let mut found: BTreeMap<MapId, BTreeSet<NodeId>> = BTreeMap::new();
+        assert!(stop::likely_complete(&found).is_none());
+        found.insert(
+            "a",
+            set(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
+        );
+        assert!(
+            stop::likely_complete(&found).is_none(),
+            "one map is not a recapture"
+        );
+        found.insert(
+            "b",
+            set(&["6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]),
+        );
+        let lc = stop::likely_complete(&found).unwrap();
+        assert_eq!((lc.n1, lc.n2, lc.refound, lc.found), (10, 10, 5, 15));
+        assert_eq!((lc.estimate, lc.fraction), (20.0, 0.75));
+        found.insert("c", set(&["1", "20"]));
+        assert_eq!(stop::likely_complete(&found).unwrap().maps, ["a", "b"]);
+        let same: BTreeMap<MapId, BTreeSet<NodeId>> =
+            [("x", set(&["1", "2"])), ("y", set(&["1", "2"]))]
+                .into_iter()
+                .collect();
+        assert_eq!(stop::likely_complete(&same).unwrap().fraction, 1.0);
+        let apart: BTreeMap<MapId, BTreeSet<NodeId>> = [("x", set(&["1"])), ("y", set(&["2"]))]
+            .into_iter()
+            .collect();
+        assert!(stop::likely_complete(&apart).is_none());
+    }
+
+    #[test]
+    fn a_card_is_one_short_line() {
+        let card = Card {
+            node: node("a"),
+            via: Some("scip"),
+            witness: Some(WitnessClass::Compiler),
+            potential: 0.5,
+            depth: 2,
+        };
+        assert_eq!(card.text(), "file:src/a.rs | scip/compiler | p0.50 d2");
+        let long = Card {
+            node: NodeId::file(format!("src/{}/deep.rs", "very_long_directory/".repeat(30)))
+                .unwrap(),
+            ..card
+        };
+        let text = long.text();
+        assert!(text.chars().count() <= CARD_CHARS, "{text}");
+        assert!(text.starts_with('~') && text.ends_with("deep.rs | scip/compiler | p0.50 d2"));
+    }
+
+    #[tokio::test]
+    async fn equal_runs_give_equal_checkpoint_hashes() {
+        let run = || async {
+            let reg = registry(vec![
+                GraphMap::new("s", &[("a", "b"), ("b", "c")]),
+                GraphMap::new("f", &[("a", "b"), ("a", "x")]).witness(WitnessClass::Vector),
+            ]);
+            walk(&reg, vec![seed("a")], budget(10), |t| {
+                t.question("q").handler(noop(), every(1))
+            })
+            .await
+        };
+        let (a, b) = (run().await, run().await);
+        let hashes = |r: &TraversalResult| texts(&of(r, "stop"), "checkpoint_hash");
+        assert!(!hashes(&a).is_empty());
+        assert_eq!(hashes(&a), hashes(&b));
+        assert_eq!(a.events_jsonl(), b.events_jsonl());
+        let distinct: BTreeSet<_> = hashes(&a).into_iter().collect();
+        assert_eq!(distinct.len(), hashes(&a).len());
+    }
+
+    // ---- the ladder ----------------------------------------------------------------
+
+    #[test]
+    fn a_ladder_checks_tau_and_the_order_of_its_rungs() {
+        let rules = || -> Box<dyn Handler> { Box::new(no_rules()) };
+        let one = || -> Box<dyn Handler> { Box::new(system_one_double(1.0, Vec::new()).0) };
+        let agent = || -> Box<dyn Handler> { Box::new(rung("liar", 3, 1.0, Vec::new()).0) };
+        assert!(Ladder::new(0.8, vec![rules(), one()]).is_ok());
+        assert!(Ladder::new(0.8, Vec::new()).is_ok());
+        assert_eq!(
+            Ladder::new(1.5, vec![rules()]).err(),
+            Some(LadderError::BadTau)
+        );
+        assert_eq!(
+            Ladder::new(f32::NAN, vec![rules()]).err(),
+            Some(LadderError::BadTau)
+        );
+        assert_eq!(
+            Ladder::new(0.8, vec![one(), rules()]).err(),
+            Some(LadderError::BadRungs(vec![2, 1]))
+        );
+        assert_eq!(
+            Ladder::new(0.8, vec![rules(), rules()]).err(),
+            Some(LadderError::BadRungs(vec![1, 1]))
+        );
+        assert_eq!(
+            Ladder::new(0.8, vec![agent()]).err(),
+            Some(LadderError::BadRungs(vec![3]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_list_that_matches_nothing_escalates_in_order_to_the_agent() {
+        let (double, double_calls) = system_one_double(0.3, Vec::new());
+        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
+        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, rungs), every(1))
+        })
+        .await;
+        assert_eq!(result.status, TraversalStatus::Stopped);
+        assert_eq!(result.totals.pops, 1);
+        assert_eq!(double_calls.load(Ordering::SeqCst), 1);
+
+        let steers = of(&result, "steer");
+        let order: Vec<(u64, &str, &str)> = steers
+            .iter()
+            .map(|e| {
+                (
+                    e["rung"].as_u64().unwrap(),
+                    e["handler"].as_str().unwrap(),
+                    e["outcome"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (1, "rules", "uncertain"),
+                (2, "system_one_double", "uncertain"),
+                (3, "agent", "returned"),
+            ]
+        );
+        let checkpoint = result
+            .checkpoint
+            .as_ref()
+            .expect("rung 3 returns a checkpoint");
+        let hash = trace::checkpoint_hash(checkpoint);
+        assert_eq!(texts(&steers, "inputs_hash"), [hash.as_str(); 3]);
+        assert_eq!(
+            texts(&of(&result, "stop"), "checkpoint_hash"),
+            [hash.as_str()]
+        );
+        let ret = of(&result, "return");
+        assert_eq!(ret.len(), 1);
+        assert_eq!(ret[0]["reason"], "escalated");
+        assert_eq!(ret[0]["checkpoint_hash"], hash.as_str());
+        assert_eq!(result.totals.steers, 0, "nothing was applied");
+        let snapshot = result.snapshot.as_ref().unwrap();
+        assert_eq!(
+            checkpoint.handle.as_deref(),
+            Some(snapshot.handle().as_str())
+        );
+        assert_eq!(snapshot.returned.as_deref(), Some(hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_confident_rule_stops_the_escalation() {
+        let (double, double_calls) = system_one_double(1.0, Vec::new());
+        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(sure_rules()), Box::new(double)];
+        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, rungs), every(1))
+        })
+        .await;
+        assert_eq!(result.status, TraversalStatus::Complete);
+        assert_eq!(
+            double_calls.load(Ordering::SeqCst),
+            0,
+            "rung 2 was never asked"
+        );
+        let steers = of(&result, "steer");
+        assert!(!steers.is_empty());
+        assert!(
+            steers
+                .iter()
+                .all(|e| e["rung"] == 1 && e["outcome"] == "applied")
+        );
+        assert!(result.checkpoint.is_none() && result.snapshot.is_none());
+        assert!(of(&result, "return").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_confident_system_one_decides_when_the_rules_are_unsure() {
+        let (double, _) = system_one_double(0.9, vec![act(Some(&node("d")), Action::Prune)]);
+        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
+        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, rungs), every(1).max_stops(1))
+        })
+        .await;
+        assert_eq!(result.status, TraversalStatus::Complete);
+        assert!(result.cleared.contains(&node("d")));
+        assert!(result.reached(&node("e")) && !result.reached(&node("h")));
+        let steers = of(&result, "steer");
+        assert_eq!(texts(&steers, "outcome"), ["uncertain", "applied"]);
+        assert_eq!(steers[0]["rung"], 1);
+        assert_eq!(steers[1]["rung"], 2);
+        assert_eq!(steers[1]["applied"], 1);
+        assert_eq!(result.totals.steers, 1);
+    }
+
+    #[tokio::test]
+    async fn the_proposals_of_an_unsure_rung_are_not_applied() {
+        let (double, _) = system_one_double(0.1, vec![act(Some(&node("d")), Action::Prune)]);
+        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
+        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, rungs), every(1))
+        })
+        .await;
+        assert_eq!(result.status, TraversalStatus::Stopped);
+        assert!(result.cleared.is_empty());
+        let steers = of(&result, "steer");
+        assert_eq!(steers[1]["actions"][0]["action"], "prune");
+        assert_eq!(steers[1]["applied"], 0);
+    }
+
+    #[tokio::test]
+    async fn rules_that_contradict_each_other_are_unsure() {
+        let rules = RuleList::from_json(&json!([
+            {"when": {"path_glob": "src/d.rs"}, "then": "prune"},
+            {"when": {"kind": "file"}, "then": {"boost": 2.0}}
+        ]))
+        .unwrap();
+        let (double, double_calls) = system_one_double(0.95, Vec::new());
+        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(rules), Box::new(double)];
+        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, rungs), every(1).max_stops(1))
+        })
+        .await;
+        assert_eq!(double_calls.load(Ordering::SeqCst), 1);
+        assert!(result.cleared.is_empty(), "rung 1's prune was not applied");
+        let steers = of(&result, "steer");
+        assert_eq!(texts(&steers, "outcome"), ["uncertain", "applied"]);
+        assert_eq!(steers[0]["rung"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_agent_is_asked_only_when_the_rungs_are_unsure_or_a_budget_is_hit() {
+        let sure = ladder(0.8, vec![Box::new(sure_rules())]);
+        let done = walk(&fan(), vec![seed("a")], budget(20), |t| {
+            t.handler(sure, every(2))
+        })
+        .await;
+        assert_eq!(done.status, TraversalStatus::Complete);
+        assert!(done.checkpoint.is_none());
+        assert!(of(&done, "steer").iter().all(|e| e["rung"] != 3));
+
+        let sure = ladder(0.8, vec![Box::new(sure_rules())]);
+        let cut = walk(&fan(), vec![seed("a")], budget(3), |t| {
+            t.handler(sure, every(100))
+        })
+        .await;
+        assert_eq!(cut.status, TraversalStatus::BudgetExhausted);
+        let checkpoint = cut.checkpoint.as_ref().expect("a budget hit is returned");
+        assert_eq!(checkpoint.reason, stop::StopReason::Budget);
+        assert_eq!(checkpoint.pops, 3);
+        assert_eq!(of(&cut, "return")[0]["reason"], "budget");
+        assert!(of(&cut, "steer").is_empty(), "no rung was consulted");
+        assert!(of(&cut, "stop").is_empty());
+        assert_eq!(
+            checkpoint.handle.as_deref(),
+            Some(cut.snapshot.as_ref().unwrap().handle().as_str())
+        );
+    }
+
+    // ---- rung 3: the steer continuation ----------------------------------------
+
+    #[tokio::test]
+    async fn rung_three_round_trips_through_the_handle_with_a_steer() {
+        let reg = fan();
+        let dir = scratch("roundtrip");
+        let first = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.question("how does a reach h")
+                .handler(ladder(0.8, vec![Box::new(no_rules())]), every(1))
+        })
+        .await;
+        assert_eq!(first.status, TraversalStatus::Stopped);
+        let checkpoint = first.checkpoint.clone().unwrap();
+        let queued: Vec<_> = checkpoint.frontier.iter().map(|i| i.node.clone()).collect();
+        assert_eq!(queued, [node("b"), node("c"), node("d")]);
+        let handle = checkpoint.handle.clone().unwrap();
+        assert_eq!(
+            HandleStore::in_dir(&dir)
+                .put(first.snapshot.as_ref().unwrap())
+                .unwrap(),
+            handle
+        );
+
+        let steer = Steer::new(vec![
+            act(Some(&node("b")), Action::Prune),
+            act(Some(&node("d")), Action::Expand),
+        ]);
+        let snapshot = HandleStore::in_dir(&dir).get(&handle).unwrap();
+        let second = continue_from(&reg, snapshot, budget(10), |t| {
+            t.handler(ladder(0.8, vec![Box::new(sure_rules())]), every(1))
+                .steer(steer)
+        })
+        .await;
+        assert_eq!(second.events[..first.events.len()], first.events[..]);
+        assert_eq!(second.status, TraversalStatus::Complete);
+
+        let order = popped_names(&second);
+        assert_eq!(&order[..2], ["src/a.rs", "src/d.rs"]);
+        assert!(!order.contains(&"src/b.rs".to_string()));
+        assert!(second.cleared.contains(&node("b")) && !second.reached(&node("e")));
+        assert!(second.reached(&node("h")));
+
+        let hash = trace::checkpoint_hash(&checkpoint);
+        let mine: Vec<&Value> = of(&second, "steer")
+            .into_iter()
+            .filter(|e| e["rung"] == 3 && e["outcome"] == "applied")
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["handler"], "agent");
+        assert_eq!(mine[0]["inputs_hash"], hash.as_str());
+        assert_eq!(mine[0]["applied"], 2);
+        let resume_at = second
+            .events
+            .iter()
+            .position(|e| e["ev"] == "resume")
+            .unwrap();
+        let steer_at = second.events.iter().position(|e| e == mine[0]).unwrap();
+        assert!(resume_at < steer_at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_steer_can_stop_the_walk_and_leaves_a_new_handle() {
+        let reg = fan();
+        let first = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, vec![Box::new(no_rules())]), every(1))
+        })
+        .await;
+        let second = continue_from(&reg, first.snapshot.clone().unwrap(), budget(10), |t| {
+            t.steer(Steer::new(vec![act(None, Action::Stop)]))
+        })
+        .await;
+        assert_eq!(second.status, TraversalStatus::Stopped);
+        assert_eq!(second.totals.pops, 1);
+        assert_eq!(
+            second.checkpoint.as_ref().unwrap().reason,
+            stop::StopReason::Steer
+        );
+        assert_eq!(of(&second, "return").last().unwrap()["reason"], "steer");
+        assert_ne!(
+            second.snapshot.unwrap().handle(),
+            first.snapshot.unwrap().handle()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steer_redirects_and_switches_maps_like_any_rung() {
+        let reg = registry(vec![
+            GraphMap::new("m1", &[("a", "b"), ("b", "c")]),
+            GraphMap::new("m2", &[("a", "x"), ("x", "y")]),
+        ]);
+        let first = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(ladder(0.8, Vec::new()), every(1))
+        })
+        .await;
+        assert_eq!(first.status, TraversalStatus::Stopped);
+        let steer = Steer::new(vec![
+            act(None, Action::MapOff("m2".into())),
+            act(None, Action::Redirect(vec![node("b")])),
+        ]);
+        let second = continue_from(&reg, first.snapshot.unwrap(), budget(10), |t| {
+            t.steer(steer)
+        })
+        .await;
+        assert!(second.reached(&node("c")), "redirected to b");
+        assert!(
+            !second.reached(&node("y")),
+            "x was dropped from the frontier"
+        );
+        assert_eq!(second.status, TraversalStatus::Complete);
+    }
+
+    #[test]
+    fn a_steer_parses_from_json_under_the_rule_list_bounds() {
+        let ok = Steer::from_json(&json!({"actions": [
+            {"node": "file:src/a.rs", "action": "prune"},
+            {"node": "file:src/b.rs", "action": {"boost": 2.0}},
+            {"action": {"map_off": "vector"}},
+            {"action": {"rerank": "depth"}},
+            {"action": {"redirect": ["file:src/c.rs"]}},
+            {"action": {"budget": {"pops": 20, "tokens": 2000}}},
+            {"action": {"budget": {"pops": 5}}},
+            {"action": "stop"}
+        ]}))
+        .unwrap();
+        let names: Vec<_> = ok.actions.iter().map(|d| d.action.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "prune", "boost", "map_off", "rerank", "redirect", "budget", "budget", "stop"
+            ]
+        );
+        assert_eq!(ok.actions[0].node, Some(node("a")));
+        assert_eq!(
+            ok.actions[5].action,
+            Action::Budget {
+                pops: 20,
+                tokens: 2000
+            }
+        );
+        assert_eq!(ok.actions[6].action, Action::Budget { pops: 5, tokens: 0 });
+
+        let bad = |value: Value| Steer::from_json(&value).unwrap_err();
+        assert_eq!(bad(json!([])), SteerError::NotAnObject);
+        let many = vec![json!({"action": "stop"}); MAX_STEER_ACTIONS + 1];
+        assert!(matches!(
+            bad(json!({"actions": many})),
+            SteerError::TooManyActions(_)
+        ));
+        for value in [
+            json!({"action": "prune"}),
+            json!({"node": "file:src/a.rs", "action": {"map_off": "m"}}),
+            json!({"node": "file:src/a.rs", "action": "dance"}),
+            json!({"node": "nonsense", "action": "prune"}),
+            json!({"action": {"budget": {}}}),
+            json!({"action": {"budget": {"pops": -1}}}),
+        ] {
+            assert!(
+                matches!(
+                    bad(json!({"actions": [value.clone()]})),
+                    SteerError::Invalid { .. }
+                ),
+                "{value}"
+            );
+        }
+        assert!(
+            RuleList::from_json(&json!([
+                {"when": {"depth": {"ge": 0}}, "then": {"budget": {"pops": 5}}}
+            ]))
+            .is_err()
+        );
+    }
+
+    // ---- budgets across calls (carry-over 2) -------------------------------------
+
+    #[tokio::test]
+    async fn caps_are_absolute_across_calls_and_only_the_agent_raises_them() {
+        let reg = registry(vec![lattice_map("g", 400)]);
+        let first = walk(&reg, vec![seed("n0")], budget(4), |t| t).await;
+        assert_eq!(
+            (first.status, first.totals.pops),
+            (TraversalStatus::BudgetExhausted, 4)
+        );
+        let snapshot = first.snapshot.unwrap();
+
+        for cap in [4, 2, 0] {
+            let same = continue_from(&reg, snapshot.clone(), budget(cap), |t| t).await;
+            assert_eq!(
+                (same.status, same.totals.pops),
+                (TraversalStatus::BudgetExhausted, 4)
+            );
+            assert!(same.snapshot.is_some());
+        }
+        let more = continue_from(&reg, snapshot.clone(), budget(9), |t| t).await;
+        assert_eq!(more.totals.pops, 9);
+
+        let raise = |pops| Steer::new(vec![act(None, Action::Budget { pops, tokens: 0 })]);
+        let plus3 = continue_from(&reg, snapshot.clone(), budget(4), |t| t.steer(raise(3))).await;
+        assert_eq!(plus3.totals.pops, 7);
+        assert_eq!(plus3.snapshot.as_ref().unwrap().tally.raised_pops, 3);
+        let again = continue_from(&reg, plus3.snapshot.clone().unwrap(), budget(4), |t| t).await;
+        assert_eq!(again.totals.pops, 7, "the raise stays with the traversal");
+        let plus6 = continue_from(&reg, plus3.snapshot.unwrap(), budget(4), |t| {
+            t.steer(raise(3))
+        })
+        .await;
+        assert_eq!(plus6.totals.pops, 10);
+    }
+
+    #[tokio::test]
+    async fn the_raise_is_capped_and_the_other_rungs_cannot_raise_at_all() {
+        let reg = registry(vec![lattice_map("g", 400)]);
+        let deep = |pops| TraversalBudget {
+            max_depth: 1000,
+            ..budget(pops)
+        };
+        let first = walk(&reg, vec![seed("n0")], deep(4), |t| t).await;
+        let huge = Steer::new(vec![act(
+            None,
+            Action::Budget {
+                pops: u32::MAX,
+                tokens: u64::MAX,
+            },
+        )]);
+        let capped = continue_from(&reg, first.snapshot.unwrap(), deep(4), |t| t.steer(huge)).await;
+        assert_eq!(capped.totals.pops, 4 + RAISE_MAX_POPS);
+        let raised = capped.snapshot.unwrap();
+        assert_eq!(
+            (raised.tally.raised_pops, raised.tally.raised_tokens),
+            (RAISE_MAX_POPS, RAISE_MAX_TOKENS)
+        );
+
+        struct Greedy(u8);
+        impl Handler for Greedy {
+            fn id(&self) -> &str {
+                "greedy"
+            }
+            fn decide(&self, _: &Checkpoint, _: &StopBudget) -> Decision {
+                Decision {
+                    actions: vec![act(
+                        None,
+                        Action::Budget {
+                            pops: 50,
+                            tokens: 5000,
+                        },
+                    )],
+                    confidence: 1.0,
+                    rung: self.0,
+                    ..Decision::default()
+                }
+            }
+        }
+        for claimed in [0, 1, 2, 3] {
+            let result = walk(&reg, vec![seed("n0")], budget(6), |t| {
+                t.handler(Greedy(claimed), every(1))
+            })
+            .await;
+            assert_eq!(result.totals.pops, 6, "claimed rung {claimed}");
+            assert_eq!(result.totals.steers, 0);
+            assert_eq!(result.snapshot.unwrap().tally.raised_pops, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_can_raise_the_token_cap_within_its_limit() {
+        let reg = registry(vec![lattice_map("g", 3000)]);
+        let tight = TraversalBudget {
+            est_tokens: 60,
+            ..budget(5000)
+        };
+        let first = walk(&reg, vec![seed("n0")], tight, |t| t).await;
+        assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+        assert!(first.totals.tokens <= 60);
+        let snapshot = first.snapshot.unwrap();
+        let none = continue_from(&reg, snapshot.clone(), tight, |t| t).await;
+        assert_eq!(
+            none.totals.tokens, first.totals.tokens,
+            "no budget, no work"
+        );
+
+        let plenty = Steer::new(vec![act(
+            None,
+            Action::Budget {
+                pops: 0,
+                tokens: 1_000_000_000,
+            },
+        )]);
+        let more = continue_from(&reg, snapshot, tight, |t| t.steer(plenty)).await;
+        assert!(more.totals.pops > first.totals.pops);
+        assert!(more.totals.tokens > 60 && more.totals.tokens <= 60 + RAISE_MAX_TOKENS);
+    }
+
+    // ---- a pop cut by a budget is requeued (carry-over 1) ------------------------
+
+    #[tokio::test]
+    async fn a_pop_cut_by_the_token_cap_is_requeued_and_a_resume_finishes_it() {
+        let reg = registry(vec![
+            GraphMap::new(
+                "g",
+                &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"), ("a", "h")],
+            )
+            .cost(10, 0),
+        ]);
+        // The cost of the call is 10 and each edge adds its own; cap at 30.
+        let tight = TraversalBudget {
+            est_tokens: 30,
+            ..budget(10)
+        };
+        let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
+        assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+        let reached = first.states.len();
+        assert!(reached < 6, "the pop was cut, only some edges adopted");
+        let snapshot = first.snapshot.unwrap();
+        let queued: Vec<_> = snapshot
+            .frontier
+            .iter()
+            .map(|(s, _, _)| snapshot.states[*s].node.clone())
+            .collect();
+        assert!(queued.contains(&node("a")), "{queued:?}");
+        assert!(snapshot.expanded.is_empty());
+
+        let second = continue_from(&reg, snapshot, budget(10), |t| t).await;
+        assert_eq!(second.status, TraversalStatus::Complete);
+        for name in ["b", "c", "d", "e", "h"] {
+            assert!(second.reached(&node(name)), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pop_that_adopted_nothing_is_not_counted_and_is_requeued() {
+        let reg = registry(vec![GraphMap::new("g", &[("a", "b")]).cost(100, 0)]);
+        let tight = TraversalBudget {
+            est_tokens: 50,
+            ..budget(10)
+        };
+        let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
+        assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+        assert_eq!(first.totals.pops, 0);
+        assert!(first.popped.is_empty());
+        let snapshot = first.snapshot.clone().unwrap();
+        assert_eq!(snapshot.frontier.len(), 1);
+        assert!(snapshot.expanded.is_empty());
+
+        let roomy = TraversalBudget {
+            est_tokens: 1000,
+            ..budget(10)
+        };
+        let second = continue_from(&reg, snapshot, roomy, |t| t).await;
+        assert_eq!(second.totals.pops, 2);
+        assert!(second.reached(&node("b")));
+        assert_eq!(second.status, TraversalStatus::Complete);
     }
 }

@@ -54,6 +54,12 @@ impl Frontier {
         self.next_seq += 1;
     }
 
+    /// Puts a popped item back at its old place (same priority and
+    /// discovery number).
+    pub fn requeue(&mut self, item: Item) {
+        self.items.push(item);
+    }
+
     pub fn pop(&mut self) -> Option<Item> {
         let best = (0..self.items.len()).min_by(|&a, &b| self.items[a].order(&self.items[b]))?;
         Some(self.items.swap_remove(best))

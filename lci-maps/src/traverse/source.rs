@@ -31,6 +31,9 @@ pub struct FusedEdge {
     pub maps: Vec<MapId>,
     /// Every witness class among them, strongest first.
     pub witnesses: Vec<WitnessClass>,
+    /// Each offering map with the witness class of its best edge, in `maps`
+    /// order (the pairing `maps` and `witnesses` lose).
+    pub offers: Vec<(MapId, WitnessClass)>,
 }
 
 /// Groups `edges` by destination and fuses each group. Sorted by fused
@@ -56,7 +59,15 @@ pub fn fuse(edges: Vec<Edge>) -> Vec<FusedEdge> {
             let mut witnesses: Vec<WitnessClass> = group.iter().map(|e| e.witness).collect();
             witnesses.sort_unstable();
             witnesses.dedup();
+            let mut offers: Vec<(MapId, WitnessClass)> = Vec::new();
+            for edge in &group {
+                if !offers.iter().any(|(map, _)| *map == edge.map) {
+                    offers.push((edge.map, edge.witness));
+                }
+            }
+            offers.sort_unstable_by_key(|(map, _)| *map);
             FusedEdge {
+                offers,
                 conf: (f64::from(CONF_MAX) * (1.0 - miss)).round() as u8,
                 best: group.swap_remove(0),
                 maps,

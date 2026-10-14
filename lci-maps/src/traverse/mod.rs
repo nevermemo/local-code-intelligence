@@ -16,9 +16,25 @@
 //! Totals count adopted work only. A token is charged per adopted edge
 //! ([`TOKENS_PER_EDGE`]) plus the `est_tokens` the maps report.
 //!
-//! After every `every_pops` pops ([`StopPolicy`]) a [`Handler`] sees a
-//! [`Checkpoint`] and its directives are applied. Nothing a handler returns
-//! can raise a budget; cleared (pruned) nodes are never revisited.
+//! A pop that was cut by a budget (nothing adopted, only some edges adopted,
+//! or a map that timed out) is put back in the queue at its old place, so a
+//! resume expands the node again and finds the rest. A pop that adopted
+//! nothing is also taken off the pop count.
+//!
+//! Budgets across calls: `pops`, `est_tokens` and `external_calls` are
+//! absolute caps for the whole traversal (the totals persist in a handle);
+//! `deadline` and `max_depth` belong to one call. Only the outer agent can
+//! add to the caps, through a [`steer::Steer`], within fixed limits
+//! ([`handler::RAISE_MAX_POPS`], [`handler::RAISE_MAX_TOKENS`]); the addition
+//! stays with the traversal. See [`steer`].
+//!
+//! Stops ([`StopPolicy`]: every N pops, a share of the budget, disagreements,
+//! stagnation, a likely-complete estimate) hand a [`Checkpoint`] to a
+//! [`Handler`], in practice a [`ladder::Ladder`]: rules first, then System
+//! One, then the outer agent. Nothing a handler returns can raise a budget;
+//! cleared (pruned) nodes are never revisited. When no rung is confident, or
+//! a budget ends the call, the call ends with a [`TraversalResult::checkpoint`]
+//! and a handle, and the next call carries the agent's steer.
 //!
 //! The run is recorded as JSON events ([`TraversalResult::events`]), written as
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
@@ -26,8 +42,11 @@
 pub mod frontier;
 pub mod handle;
 pub mod handler;
+pub mod ladder;
 pub mod rules;
 pub mod source;
+pub mod steer;
+pub mod stop;
 pub mod trace;
 
 #[cfg(test)]
@@ -36,8 +55,9 @@ mod tests;
 use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
 use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop};
 use handler::{
-    Action, BOOST_MAX, Checkpoint, Decision, FrontierItem, Handler, REDIRECT_MAX, RerankBy,
-    StopBudget, StopPolicy,
+    Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
+    RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, RerankBy, StopBudget,
+    StopPolicy,
 };
 use lci_core::node::NodeId;
 use serde_json::{Value, json};
@@ -45,6 +65,11 @@ use source::{EdgeSource, Expansion, FusedEdge};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::Instant,
+};
+use steer::Steer;
+use stop::{
+    ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, Pause,
+    Regions, StopReason, Tally, is_structural, likely_complete,
 };
 
 /// Tokens charged per adopted edge: roughly one ~12-token card line (a guess).
@@ -143,6 +168,9 @@ pub struct TraversalResult {
     /// The state to resume from: set when the walk ended `Stopped` or
     /// `BudgetExhausted` with work left in the frontier.
     pub snapshot: Option<handle::Snapshot>,
+    /// What the caller (the outer agent) is shown when the call ends with
+    /// work left: set exactly when `snapshot` is, with the handle in it.
+    pub checkpoint: Option<Checkpoint>,
 }
 
 impl TraversalResult {
@@ -171,6 +199,7 @@ pub struct Traversal<'s> {
     seeds: Vec<Seed>,
     targets: Vec<NodeId>,
     resume: Option<handle::Snapshot>,
+    steer: Option<Steer>,
 }
 
 impl<'s> Traversal<'s> {
@@ -187,7 +216,15 @@ impl<'s> Traversal<'s> {
             seeds,
             targets: Vec::new(),
             resume: None,
+            steer: None,
         }
+    }
+
+    /// The outer agent's answer to a returned checkpoint (rung 3), applied
+    /// before the first pop. Meant for a resumed traversal.
+    pub fn steer(mut self, steer: Steer) -> Self {
+        self.steer = Some(steer);
+        self
     }
 
     pub fn scorer(mut self, scorer: impl HopScorer + 's) -> Self {
@@ -243,6 +280,11 @@ struct Run<'s> {
     last_stop_at: Option<u32>,
     /// Map switches applied by handlers, in order (a handle replays them).
     switches: Vec<(String, bool)>,
+    tally: Tally,
+    /// Set when a stop ends the call: why, and the reason of the stop.
+    pause: Option<(Pause, StopReason)>,
+    /// The hash of the checkpoint the previous call returned.
+    returned: Option<String>,
 }
 
 impl<'s> Run<'s> {
@@ -264,17 +306,36 @@ impl<'s> Run<'s> {
             events: Vec::new(),
             last_stop_at: None,
             switches: Vec::new(),
+            tally: Tally::default(),
+            pause: None,
+            returned: None,
         }
     }
 
+    /// The pop cap: the caller's plus what the agent raised.
+    fn pops_cap(&self) -> u32 {
+        self.t.budget.pops.saturating_add(self.tally.raised_pops)
+    }
+
+    fn tokens_cap(&self) -> u64 {
+        self.t
+            .budget
+            .est_tokens
+            .saturating_add(self.tally.raised_tokens)
+    }
+
+    fn pops_left(&self) -> u32 {
+        self.pops_cap().saturating_sub(self.totals.pops)
+    }
+
     fn remaining_pops_pct(&self) -> u32 {
-        let total = u64::from(self.t.budget.pops.max(1));
-        let left = total.saturating_sub(u64::from(self.totals.pops));
+        let total = u64::from(self.pops_cap().max(1));
+        let left = u64::from(self.pops_left());
         (left * 100 / total) as u32
     }
 
     fn tokens_left(&self) -> u64 {
-        self.t.budget.est_tokens.saturating_sub(self.totals.tokens)
+        self.tokens_cap().saturating_sub(self.totals.tokens)
     }
 
     fn calls_left(&self) -> u32 {
@@ -287,6 +348,13 @@ impl<'s> Run<'s> {
     fn add_seed(&mut self, seed: &Seed, fanout: u32) {
         if self.cleared.contains(&seed.node) || self.state_of.contains_key(&seed.node) {
             return;
+        }
+        if let Some(map) = seed.map {
+            self.tally
+                .found
+                .entry(map)
+                .or_default()
+                .insert(seed.node.clone());
         }
         let index = self.states.len();
         self.states.push(State {
@@ -320,10 +388,7 @@ impl<'s> Run<'s> {
                     "external_calls": self.t.budget.external_calls,
                 },
                 "scorer": self.t.scorer.label(),
-                "stops": {
-                    "every_pops": self.t.stops.every_pops,
-                    "max_stops": self.t.stops.max_stops,
-                },
+                "stops": stops_json(&self.t.stops),
             }));
             let seeds = std::mem::take(&mut self.t.seeds);
             let fanout = seeds.len() as u32;
@@ -332,7 +397,16 @@ impl<'s> Run<'s> {
             }
         }
 
+        // The agent's answer to the checkpoint the last call returned.
+        let steer_stop = match self.t.steer.take() {
+            Some(steer) => self.steer(steer),
+            None => false,
+        };
+
         let status = loop {
+            if steer_stop {
+                break TraversalStatus::Stopped;
+            }
             if !self.t.targets.is_empty()
                 && self.t.targets.iter().all(|t| self.state_of.contains_key(t))
             {
@@ -341,13 +415,14 @@ impl<'s> Run<'s> {
             if self.frontier.is_empty() {
                 break self.end_status(false);
             }
-            if self.stop_due() && self.stop() {
+            let due = self.due();
+            if !due.is_empty() && self.stop(&due) {
                 break TraversalStatus::Stopped;
             }
             if self.frontier.is_empty() {
                 continue;
             }
-            if self.totals.pops >= self.t.budget.pops
+            if self.totals.pops >= self.pops_cap()
                 || Instant::now() >= self.t.budget.deadline
                 || self.tokens_left() == 0
             {
@@ -357,12 +432,40 @@ impl<'s> Run<'s> {
             self.totals.pops += 1;
             self.popped.push(item.state);
             self.expanded.insert(item.state);
-            if self.expand(item.state).await {
+            if let Some(adopted) = self.expand(item.state).await {
+                // The node is not done: back in the queue at its old place,
+                // for a resume to expand again.
+                self.expanded.remove(&item.state);
+                self.frontier.requeue(item);
+                if !adopted {
+                    self.totals.pops -= 1;
+                    self.popped.pop();
+                }
                 break self.end_status(true);
             }
         };
 
         self.totals.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let resumable = matches!(
+            status,
+            TraversalStatus::Stopped | TraversalStatus::BudgetExhausted
+        ) && !self.frontier.is_empty();
+        // The call ends with work left: build what goes back to the caller.
+        let mut checkpoint = None;
+        if resumable {
+            let (pause, reason) = self
+                .pause
+                .take()
+                .unwrap_or((Pause::Budget, StopReason::Budget));
+            let cp = self.checkpoint(reason);
+            let hash = trace::checkpoint_hash(&cp);
+            self.events.push(json!({
+                "ev": "return", "reason": pause.as_str(), "stop": cp.stop,
+                "checkpoint_hash": hash,
+            }));
+            self.returned = Some(hash);
+            checkpoint = Some(cp);
+        }
         self.events.push(json!({
             "ev": "end",
             "status": status.as_str(),
@@ -378,14 +481,14 @@ impl<'s> Run<'s> {
                 "per_map": self.totals.per_map,
             },
         }));
-        let resumable = matches!(
-            status,
-            TraversalStatus::Stopped | TraversalStatus::BudgetExhausted
-        ) && !self.frontier.is_empty();
         let snapshot = resumable.then(|| self.snapshot());
+        if let (Some(cp), Some(snapshot)) = (checkpoint.as_mut(), &snapshot) {
+            cp.handle = Some(snapshot.handle());
+        }
         TraversalResult {
             status,
             snapshot,
+            checkpoint,
             states: self.states,
             popped: self.popped,
             cleared: self.cleared,
@@ -414,8 +517,9 @@ impl<'s> Run<'s> {
             .clone()
     }
 
-    /// Expands one state. True when the budget stopped the expansion.
-    async fn expand(&mut self, index: usize) -> bool {
+    /// Expands one state. `Some` when a budget (or a timeout) cut the
+    /// expansion short: true if some of its work was adopted, false if none.
+    async fn expand(&mut self, index: usize) -> Option<bool> {
         let node = self.states[index].node.clone();
         let depth = self.states[index].depth;
         let budget = Budget {
@@ -439,7 +543,7 @@ impl<'s> Run<'s> {
                 "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
                 "n_edges": 0, "calls": call_report, "dropped": "budget",
             }));
-            return true;
+            return Some(false);
         }
 
         // Candidates: never a cleared node or one that already has a state.
@@ -450,7 +554,15 @@ impl<'s> Run<'s> {
         let fanout = offered.len() as u32;
         for edge in &offered {
             *self.in_seen.entry(edge.best.dst.clone()).or_default() += 1;
+            for map in &edge.maps {
+                self.tally
+                    .found
+                    .entry(*map)
+                    .or_default()
+                    .insert(edge.best.dst.clone());
+            }
         }
+        self.note_disagreements(&node, &offered);
         let fresh: Vec<FusedEdge> = offered
             .into_iter()
             .filter(|e| !self.state_of.contains_key(&e.best.dst))
@@ -463,6 +575,24 @@ impl<'s> Run<'s> {
         self.totals.external_calls = self.totals.external_calls.saturating_add(call_external);
         for call in &calls {
             *self.totals.per_map.entry(call.map).or_default() += 1;
+            let stat = self.tally.maps.entry(call.map).or_default();
+            stat.calls += 1;
+            stat.failures += u32::from(call.failure.is_some());
+            stat.tokens += call.cost.est_tokens;
+        }
+        for edge in &kept {
+            self.tally.maps.entry(edge.best.map).or_default().edges += 1;
+        }
+        let spent = call_tokens + kept.len() as u64 * TOKENS_PER_EDGE;
+        let cost = self
+            .tally
+            .kind_cost
+            .entry(node.kind().prefix().to_string())
+            .or_default();
+        cost.0 += 1;
+        cost.1 += spent;
+        if !kept.is_empty() {
+            self.tally.last_fresh_pop = self.totals.pops;
         }
         self.events.push(json!({
             "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
@@ -520,20 +650,76 @@ impl<'s> Run<'s> {
         // A call that failed after the deadline left the node half-explored.
         let timed_out =
             calls.iter().any(|c| c.failure.is_some()) && Instant::now() >= self.t.budget.deadline;
-        truncated || timed_out
+        (truncated || timed_out).then_some(true)
     }
 
-    fn stop_due(&self) -> bool {
+    /// Records the nodes a fuzzy map offered that the structural maps, which
+    /// answered this expansion, did not (see [`stop`]).
+    fn note_disagreements(&mut self, src: &NodeId, offered: &[FusedEdge]) {
+        let mut structural: Vec<MapId> = offered
+            .iter()
+            .flat_map(|e| e.offers.iter())
+            .filter(|(_, w)| is_structural(*w))
+            .map(|(map, _)| *map)
+            .collect();
+        structural.sort_unstable();
+        structural.dedup();
+        if structural.is_empty() {
+            return;
+        }
+        for edge in offered {
+            if edge.offers.iter().any(|(_, w)| is_structural(*w)) {
+                continue;
+            }
+            let known = self
+                .tally
+                .disagreements
+                .iter()
+                .any(|d| d.src == *src && d.node == edge.best.dst);
+            if known || self.tally.disagreements.len() >= MAX_DISAGREEMENTS {
+                continue;
+            }
+            self.tally.disagreements.push(Disagreement {
+                pop: self.totals.pops,
+                src: src.clone(),
+                node: edge.best.dst.clone(),
+                offered_by: edge.maps.clone(),
+                silent: structural.clone(),
+            });
+        }
+    }
+
+    /// The stop triggers that hold now; none when no stop may fire.
+    fn due(&self) -> Vec<StopReason> {
         let policy = self.t.stops;
-        self.t.handler.is_some()
-            && policy.every_pops > 0
-            && self.totals.stops < policy.max_stops
-            && self.totals.pops > 0
-            && self.totals.pops.is_multiple_of(policy.every_pops)
-            && self.last_stop_at != Some(self.totals.pops)
+        if self.t.handler.is_none()
+            || !policy.is_active()
+            || self.totals.stops >= policy.max_stops
+            || self.totals.pops == 0
+            || self.last_stop_at == Some(self.totals.pops)
+        {
+            return Vec::new();
+        }
+        self.tally.triggers(
+            &policy,
+            self.totals.pops,
+            self.pops_cap(),
+            self.last_stop_at,
+        )
     }
 
-    fn checkpoint(&self) -> Checkpoint {
+    fn card_of(&self, state: usize) -> Card {
+        let s = &self.states[state];
+        Card {
+            node: s.node.clone(),
+            via: s.via,
+            witness: s.witness,
+            potential: s.potential,
+            depth: s.depth,
+        }
+    }
+
+    fn checkpoint(&self, reason: StopReason) -> Checkpoint {
         let frontier = self
             .frontier
             .sorted()
@@ -546,52 +732,217 @@ impl<'s> Run<'s> {
                     via: state.via,
                     witness: state.witness,
                     score: item.priority,
+                    potential: state.potential,
                     depth: state.depth,
                     fanout: state.fanout,
                     seen_before: self.in_seen.get(&state.node).copied().unwrap_or(0) > 1,
+                    est_cost: self.tally.est_cost(&state.node),
                 }
             })
             .collect();
+
+        // Best potential first; discovery order breaks ties.
+        let best_first = |a: &usize, b: &usize| {
+            self.states[*b]
+                .potential
+                .total_cmp(&self.states[*a].potential)
+                .then(a.cmp(b))
+        };
+        let mut visited: Vec<usize> = self.expanded.iter().copied().collect();
+        visited.sort_by(best_first);
+        let visited_cards = visited
+            .iter()
+            .take(CARD_K)
+            .map(|&s| self.card_of(s))
+            .collect();
+        let mut answer: Vec<Card> = self
+            .t
+            .targets
+            .iter()
+            .filter_map(|t| self.state_of.get(t))
+            .map(|&s| self.card_of(s))
+            .collect();
+        answer.extend(
+            visited
+                .iter()
+                .filter(|&&s| self.states[s].parent.is_some())
+                .map(|&s| self.card_of(s))
+                .filter(|card| !answer.iter().any(|a| a.node == card.node))
+                .take(ANSWER_K.saturating_sub(answer.len()))
+                .collect::<Vec<_>>(),
+        );
+        answer.truncate(ANSWER_K);
+
+        let estimate = likely_complete(&self.tally.found);
+        let unknown = estimate
+            .as_ref()
+            .map(|lc| (lc.estimate - lc.found as f64).max(0.0).round() as usize);
+        let regions = Regions::build(
+            self.states.iter().enumerate().map(|(i, s)| {
+                (
+                    &s.node,
+                    self.expanded.contains(&i),
+                    self.cleared.contains(&s.node),
+                )
+            }),
+            unknown,
+        );
+        let latest = self
+            .tally
+            .disagreements
+            .len()
+            .saturating_sub(CHECKPOINT_DISAGREEMENTS);
         Checkpoint {
+            reason,
+            handle: None,
+            question: self.t.question.clone(),
+            seeds: self
+                .states
+                .iter()
+                .filter(|s| s.parent.is_none())
+                .map(|s| s.node.clone())
+                .collect(),
             pops: self.totals.pops,
             stop: self.totals.stops,
             budget_left_pct: self.remaining_pops_pct(),
+            pops_left: self.pops_left(),
             tokens_left: self.tokens_left(),
+            calls_left: self.calls_left(),
+            answer,
+            visited_cards,
             frontier,
+            maps: self.tally.maps.iter().map(|(id, s)| (*id, *s)).collect(),
+            regions,
             visited: self.expanded.len(),
             cleared: self.cleared.len(),
+            disagreements: self.tally.disagreements[latest..].to_vec(),
+            disagreements_total: self.tally.disagreements.len(),
+            likely_complete: estimate,
         }
     }
 
     /// Runs the handler at a stop and applies its decision. True when the
-    /// decision stops the walk.
-    fn stop(&mut self) -> bool {
+    /// decision ends the call: a `stop` action, or no confident rung (the
+    /// checkpoint then goes back to the outer agent).
+    fn stop(&mut self, triggers: &[StopReason]) -> bool {
+        let reason = triggers[0];
         self.last_stop_at = Some(self.totals.pops);
         self.totals.stops += 1;
-        let checkpoint = self.checkpoint();
+        if triggers.contains(&StopReason::LikelyComplete) {
+            self.tally.complete_fired = true;
+        }
+        let checkpoint = self.checkpoint(reason);
         let Some(handler) = self.t.handler.as_ref() else {
             return false;
         };
         let checkpoint_hash = trace::checkpoint_hash(&checkpoint);
         self.events.push(json!({
             "ev": "stop", "stop": checkpoint.stop, "pops": checkpoint.pops,
-            "reason": "every_pops", "checkpoint_hash": checkpoint_hash,
+            "reason": reason.as_str(),
+            "triggers": triggers.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            "checkpoint_hash": checkpoint_hash,
         }));
         let decision = handler.decide(&checkpoint, &StopBudget::default());
-        let handler_id = handler.id().to_string();
-        let (applied, stop) = self.apply(&decision);
+        // A handler at a stop is never the agent: rung 3 is only the steer.
+        let rung = if decision.rung == 0 {
+            handler.rung()
+        } else {
+            decision.rung
+        }
+        .clamp(RUNG_RULES, RUNG_SYSTEM_ONE);
+        let handler_id = if decision.handler.is_empty() {
+            handler.id().to_string()
+        } else {
+            decision.handler.clone()
+        };
+        for attempt in &decision.trail {
+            self.events.push(steer_event(
+                checkpoint.stop,
+                attempt.rung,
+                &attempt.handler,
+                Some(&checkpoint_hash),
+                attempt.confidence,
+                attempt.truncated,
+                &attempt.actions,
+                0,
+                "uncertain",
+            ));
+        }
+        if decision.escalate {
+            self.events.push(steer_event(
+                checkpoint.stop,
+                RUNG_AGENT,
+                &handler_id,
+                Some(&checkpoint_hash),
+                0.0,
+                false,
+                &[],
+                0,
+                "returned",
+            ));
+            self.pause = Some((Pause::Escalated, reason));
+            return true;
+        }
+        let (applied, stop) = self.apply(&decision, rung);
         self.totals.steers += applied;
-        self.events.push(json!({
-            "ev": "steer", "stop": checkpoint.stop, "handler": handler_id,
-            "inputs_hash": checkpoint_hash,
-            "confidence": decision.confidence, "truncated": decision.truncated,
-            "actions": decision.actions.iter().map(|d| json!({
-                "node": d.node.as_ref().map(ToString::to_string),
-                "action": d.action.name(),
-            })).collect::<Vec<_>>(),
-            "applied": applied,
-        }));
+        self.events.push(steer_event(
+            checkpoint.stop,
+            rung,
+            &handler_id,
+            Some(&checkpoint_hash),
+            decision.confidence,
+            decision.truncated,
+            &decision.actions,
+            applied,
+            "applied",
+        ));
+        if stop {
+            self.pause = Some((Pause::HandlerStop, reason));
+        }
         stop
+    }
+
+    /// Applies the outer agent's steer (rung 3) before the first pop. True
+    /// when it stops the walk.
+    fn steer(&mut self, steer: Steer) -> bool {
+        let decision = Decision {
+            actions: steer.actions,
+            confidence: 1.0,
+            ..Decision::default()
+        };
+        let (applied, stop) = self.apply(&decision, RUNG_AGENT);
+        self.totals.steers += applied;
+        self.events.push(steer_event(
+            self.totals.stops,
+            RUNG_AGENT,
+            "agent",
+            self.returned.as_deref(),
+            1.0,
+            false,
+            &decision.actions,
+            applied,
+            "applied",
+        ));
+        if stop {
+            self.pause = Some((Pause::Steer, StopReason::Steer));
+        }
+        stop
+    }
+
+    /// Adds to the caps, within the fixed limits. True when anything grew.
+    fn raise(&mut self, pops: u32, tokens: u64) -> bool {
+        let before = (self.tally.raised_pops, self.tally.raised_tokens);
+        self.tally.raised_pops = self
+            .tally
+            .raised_pops
+            .saturating_add(pops)
+            .min(RAISE_MAX_POPS);
+        self.tally.raised_tokens = self
+            .tally
+            .raised_tokens
+            .saturating_add(tokens)
+            .min(RAISE_MAX_TOKENS);
+        before != (self.tally.raised_pops, self.tally.raised_tokens)
     }
 
     /// Switches a map for this run; a switch that took effect is kept for a
@@ -604,9 +955,10 @@ impl<'s> Run<'s> {
         ok
     }
 
-    /// Applies the directives under the engine's own limits. Returns how
-    /// many took effect and whether a `Stop` was among them.
-    fn apply(&mut self, decision: &Decision) -> (u32, bool) {
+    /// Applies the directives of a decision made at `rung` under the
+    /// engine's own limits. Returns how many took effect and whether a
+    /// `Stop` was among them.
+    fn apply(&mut self, decision: &Decision, rung: u8) -> (u32, bool) {
         let mut applied = 0;
         let mut stop = false;
         for directive in &decision.actions {
@@ -636,6 +988,10 @@ impl<'s> Run<'s> {
                 (None, Action::Stop) => {
                     stop = true;
                     true
+                }
+                // Only the outer agent's steer can add to a cap.
+                (None, Action::Budget { pops, tokens }) if rung == RUNG_AGENT => {
+                    self.raise(*pops, *tokens)
                 }
                 (None, Action::Emit(note)) => {
                     let note: String = note.chars().take(handler::EMIT_MAX).collect();
@@ -691,4 +1047,42 @@ impl<'s> Run<'s> {
             }
         }
     }
+}
+
+/// The stop policy as the trace records it.
+pub(crate) fn stops_json(policy: &StopPolicy) -> Value {
+    json!({
+        "every_pops": policy.every_pops,
+        "max_stops": policy.max_stops,
+        "budget_share": policy.budget_share,
+        "on_disagreement": policy.on_disagreement,
+        "on_stagnation": policy.on_stagnation,
+        "likely_complete": policy.likely_complete,
+    })
+}
+
+/// One `steer` event: what a rung proposed at a stop and what became of it.
+#[allow(clippy::too_many_arguments)]
+fn steer_event(
+    stop: u32,
+    rung: u8,
+    handler: &str,
+    inputs_hash: Option<&str>,
+    confidence: f32,
+    truncated: bool,
+    actions: &[Directive],
+    applied: u32,
+    outcome: &str,
+) -> Value {
+    json!({
+        "ev": "steer", "stop": stop, "rung": rung, "handler": handler,
+        "inputs_hash": inputs_hash,
+        "confidence": confidence, "truncated": truncated,
+        "actions": actions.iter().map(|d| json!({
+            "node": d.node.as_ref().map(ToString::to_string),
+            "action": d.action.name(),
+        })).collect::<Vec<_>>(),
+        "applied": applied,
+        "outcome": outcome,
+    })
 }

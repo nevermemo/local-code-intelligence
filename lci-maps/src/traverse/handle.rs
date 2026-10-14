@@ -14,10 +14,16 @@
 //! the handler. The caller passes them again, and may change them (a changed
 //! scorer is noted in the `resume` event). The budget is absolute for the
 //! whole traversal (`pops`, `est_tokens` and `external_calls` count from the
-//! first call), with a fresh deadline.
+//! first call), with a fresh deadline; what the outer agent raised stays with
+//! the traversal and is added to the caps a call passes (see [`super::steer`]).
+//! A resumed call may carry the agent's [`Steer`](super::steer::Steer).
 
 use super::{
-    Run, State, Totals, Traversal, TraversalBudget, frontier::Frontier, trace::value_hash,
+    Run, State, Totals, Traversal, TraversalBudget,
+    frontier::Frontier,
+    stop::{Disagreement, MapStat, Tally},
+    stops_json,
+    trace::{disagreement_json, value_hash},
 };
 use crate::{MapId, edge::WitnessClass, traverse::source::EdgeSource};
 use lci_core::node::NodeId;
@@ -29,7 +35,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const WITNESSES: [WitnessClass; 7] = [
     WitnessClass::Compiler,
     WitnessClass::Lsp,
@@ -94,6 +100,11 @@ pub struct Snapshot {
     /// Counters; `elapsed_ms` is always 0 here.
     pub totals: Totals,
     pub last_stop_at: Option<u32>,
+    /// What stops and checkpoints are built from, and what the agent raised.
+    pub tally: Tally,
+    /// The hash of the checkpoint the paused call returned, which a steer
+    /// answers.
+    pub returned: Option<String>,
     /// The trace so far, ending with the paused call's `end` event.
     pub events: Vec<Value>,
 }
@@ -147,6 +158,8 @@ impl Snapshot {
                 "per_map": self.totals.per_map,
             },
             "last_stop_at": self.last_stop_at,
+            "tally": tally_json(&self.tally),
+            "returned": self.returned,
             "events": self.events,
         })
     }
@@ -277,9 +290,93 @@ impl Snapshot {
                 elapsed_ms: 0.0,
             },
             last_stop_at: opt_u64(get(obj, "last_stop_at")?)?.map(|p| p as u32),
+            tally: tally_from_json(get(obj, "tally")?)?,
+            returned: match get(obj, "returned")? {
+                Value::Null => None,
+                v => Some(string_of(v)?),
+            },
             events: array(obj, "events")?.clone(),
         })
     }
+}
+
+fn tally_json(tally: &Tally) -> Value {
+    json!({
+        "found": tally.found.iter().map(|(map, nodes)| json!([
+            map, nodes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ])).collect::<Vec<_>>(),
+        "maps": tally.maps.iter().map(|(map, s)| json!([
+            map, s.calls, s.failures, s.edges, s.tokens,
+        ])).collect::<Vec<_>>(),
+        "kind_cost": tally.kind_cost.iter()
+            .map(|(kind, (n, tokens))| json!([kind, n, tokens])).collect::<Vec<_>>(),
+        "disagreements": tally.disagreements.iter().map(disagreement_json).collect::<Vec<_>>(),
+        "last_fresh_pop": tally.last_fresh_pop,
+        "complete_fired": tally.complete_fired,
+        "raised_pops": tally.raised_pops,
+        "raised_tokens": tally.raised_tokens,
+    })
+}
+
+fn tally_from_json(value: &Value) -> Result<Tally, String> {
+    let obj = value.as_object().ok_or("tally is not an object")?;
+    let rows = |key: &str, width: usize| -> Result<Vec<Vec<Value>>, String> {
+        array(obj, key)?
+            .iter()
+            .map(|row| match row.as_array() {
+                Some(cells) if cells.len() == width => Ok(cells.clone()),
+                _ => Err(format!("{key} row is not {width} cells")),
+            })
+            .collect()
+    };
+    let map_ids = |v: &Value| -> Result<Vec<MapId>, String> {
+        v.as_array()
+            .ok_or("map list is not an array")?
+            .iter()
+            .map(|id| intern(id.as_str().ok_or("map id is not a string")?))
+            .collect()
+    };
+    let mut tally = Tally::default();
+    for row in rows("found", 2)? {
+        let nodes = row[1].as_array().ok_or("found nodes is not an array")?;
+        tally.found.insert(
+            intern(row[0].as_str().ok_or("map id is not a string")?)?,
+            nodes.iter().map(node_id).collect::<Result<_, _>>()?,
+        );
+    }
+    for row in rows("maps", 5)? {
+        tally.maps.insert(
+            intern(row[0].as_str().ok_or("map id is not a string")?)?,
+            MapStat {
+                calls: u32_of(&row[1])?,
+                failures: u32_of(&row[2])?,
+                edges: u32_of(&row[3])?,
+                tokens: u64_of(&row[4])?,
+            },
+        );
+    }
+    for row in rows("kind_cost", 3)? {
+        tally
+            .kind_cost
+            .insert(string_of(&row[0])?, (u32_of(&row[1])?, u64_of(&row[2])?));
+    }
+    for d in array(obj, "disagreements")? {
+        let d = d.as_object().ok_or("disagreement is not an object")?;
+        tally.disagreements.push(Disagreement {
+            pop: u32_of(get(d, "pop")?)?,
+            src: node_id(get(d, "src")?)?,
+            node: node_id(get(d, "node")?)?,
+            offered_by: map_ids(get(d, "offered_by")?)?,
+            silent: map_ids(get(d, "silent")?)?,
+        });
+    }
+    tally.last_fresh_pop = u32_of(get(obj, "last_fresh_pop")?)?;
+    tally.complete_fired = get(obj, "complete_fired")?
+        .as_bool()
+        .ok_or("complete_fired is not a boolean")?;
+    tally.raised_pops = u32_of(get(obj, "raised_pops")?)?;
+    tally.raised_tokens = u64_of(get(obj, "raised_tokens")?)?;
+    Ok(tally)
 }
 
 type Obj = JsonMap<String, Value>;
@@ -389,6 +486,8 @@ impl Run<'_> {
                 ..self.totals.clone()
             },
             last_stop_at: self.last_stop_at,
+            tally: self.tally.clone(),
+            returned: self.returned.clone(),
             events: self.events.clone(),
         }
     }
@@ -410,6 +509,8 @@ impl Run<'_> {
             switches,
             totals,
             last_stop_at,
+            tally,
+            returned,
             events,
             ..
         } = snapshot;
@@ -431,6 +532,8 @@ impl Run<'_> {
         self.switches = switches;
         self.totals = totals;
         self.last_stop_at = last_stop_at;
+        self.tally = tally;
+        self.returned = returned;
         self.events = events;
         debug_assert_eq!(question, self.t.question);
         self.events.push(json!({
@@ -442,13 +545,12 @@ impl Run<'_> {
                 "max_depth": self.t.budget.max_depth,
                 "est_tokens": self.t.budget.est_tokens,
                 "external_calls": self.t.budget.external_calls,
+                "raised_pops": self.tally.raised_pops,
+                "raised_tokens": self.tally.raised_tokens,
             },
             "scorer": self.t.scorer.label(),
             "scorer_changed": scorer_changed,
-            "stops": {
-                "every_pops": self.t.stops.every_pops,
-                "max_stops": self.t.stops.max_stops,
-            },
+            "stops": stops_json(&self.t.stops),
         }));
     }
 }

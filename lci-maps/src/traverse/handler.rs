@@ -1,15 +1,25 @@
-//! Stops and handlers (spine brief 1.5, rung 1 only in this slice).
+//! Stops and handlers (spine brief 1.5).
 //!
-//! At a fixed stop (every N pops) the engine builds a [`Checkpoint`] and asks
-//! a [`Handler`] for a [`Decision`]: a list of [`Directive`]s over the
-//! frontier. The engine applies them under its own limits, whatever the
-//! handler asks: a directive can shrink the frontier (`Prune`), reorder it
-//! (`Expand`, `Boost`, `Rerank`), switch a map off or scale its hops down, or
-//! `Redirect` to other seeds. There is no action that raises a budget.
+//! At a stop ([`StopPolicy`]) the engine builds a [`Checkpoint`] and asks a
+//! [`Handler`] for a [`Decision`]: a list of [`Directive`]s over the
+//! frontier. The handler is usually a [`Ladder`](super::ladder::Ladder), whose
+//! decision also says which rung decided and which rungs it tried first, or
+//! that it found none confident enough and the checkpoint goes back to the
+//! outer agent (rung 3).
+//!
+//! The engine applies directives under its own limits, whatever the handler
+//! asks: a directive can shrink the frontier (`Prune`), reorder it (`Expand`,
+//! `Boost`, `Rerank`), switch a map off or scale its hops down, or `Redirect`
+//! to other seeds. The one action that raises a budget, `Budget`, is applied
+//! only when the outer agent sends it in a [`Steer`](super::steer::Steer), and
+//! only up to a fixed cap.
 
+use super::stop::{Card, Disagreement, LikelyComplete, MapStat, Regions, StopReason};
 use crate::{MapId, edge::WitnessClass};
 use lci_core::node::NodeId;
 use std::time::Duration;
+
+pub use super::stop::StopPolicy;
 
 /// The largest factor a `Boost` may apply to a priority.
 pub const BOOST_MAX: f64 = 8.0;
@@ -17,6 +27,17 @@ pub const BOOST_MAX: f64 = 8.0;
 pub const REDIRECT_MAX: usize = 16;
 /// The longest `Emit` note, in characters.
 pub const EMIT_MAX: usize = 200;
+/// The pops all `Budget` actions of a traversal may add together.
+pub const RAISE_MAX_POPS: u32 = 200;
+/// The tokens all `Budget` actions of a traversal may add together.
+pub const RAISE_MAX_TOKENS: u64 = 20_000;
+
+/// The rung of the deterministic rule list.
+pub const RUNG_RULES: u8 = 1;
+/// The rung of the fuzzy local models (slice S8).
+pub const RUNG_SYSTEM_ONE: u8 = 2;
+/// The rung of the outer agent.
+pub const RUNG_AGENT: u8 = 3;
 
 /// One frontier node as a handler sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,28 +49,58 @@ pub struct FrontierItem {
     pub witness: Option<WitnessClass>,
     /// The queue priority: the path potential until a handler changes it.
     pub score: f64,
+    /// The product of the hop values along the path.
+    pub potential: f64,
     pub depth: u32,
     /// How many edges the discovering expansion offered (seeds: the seed
     /// count).
     pub fanout: u32,
     /// Whether more than one edge into the node has been seen.
     pub seen_before: bool,
+    /// The tokens an expansion of a node of its kind has cost so far, on
+    /// average; 0 before the first.
+    pub est_cost: u64,
 }
 
-/// What the engine shows a handler at a stop. The full payload of the brief
-/// (cards, regions, disagreements) comes with the ladder slice.
+/// What the engine shows a handler at a stop, and returns to the agent
+/// when the ladder escalates or a budget ends the call.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Checkpoint {
+    pub reason: StopReason,
+    /// The handle that resumes the traversal; set only on a checkpoint that
+    /// is returned to the caller, and not part of its hash.
+    pub handle: Option<String>,
+    pub question: String,
+    /// The roots of the search: the seeds, and the nodes a redirect added.
+    pub seeds: Vec<NodeId>,
     pub pops: u32,
     /// One-based number of this stop.
     pub stop: u32,
     /// Share of the pop budget still left, whole percent.
     pub budget_left_pct: u32,
+    pub pops_left: u32,
     pub tokens_left: u64,
+    pub calls_left: u32,
+    /// The best answer so far (a guess at what the agent wants): the targets
+    /// reached, then the best visited nodes, at most [`super::stop::ANSWER_K`].
+    pub answer: Vec<Card>,
+    /// The best visited (expanded) nodes by potential, at most
+    /// [`super::stop::CARD_K`].
+    pub visited_cards: Vec<Card>,
     /// Best first, at most [`crate::traverse::CHECKPOINT_FRONTIER`] items.
     pub frontier: Vec<FrontierItem>,
+    /// Per-map counts and costs, by map id.
+    pub maps: Vec<(MapId, MapStat)>,
+    pub regions: Regions,
+    /// Expanded nodes.
     pub visited: usize,
+    /// Pruned nodes.
     pub cleared: usize,
+    /// The latest few, at most [`super::stop::CHECKPOINT_DISAGREEMENTS`].
+    pub disagreements: Vec<Disagreement>,
+    /// All recorded.
+    pub disagreements_total: usize,
+    pub likely_complete: Option<LikelyComplete>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +145,14 @@ pub enum Action {
     Stop,
     /// A note for the trace.
     Emit(String),
+    /// Add to the pop and token budget, up to [`RAISE_MAX_POPS`] and
+    /// [`RAISE_MAX_TOKENS`] over the traversal. Only the outer agent's steer
+    /// applies it; the engine refuses it from any other rung. The rule list
+    /// cannot express it.
+    Budget {
+        pops: u32,
+        tokens: u64,
+    },
 }
 
 impl Action {
@@ -110,6 +169,7 @@ impl Action {
             Self::Redirect(_) => "redirect",
             Self::Stop => "stop",
             Self::Emit(_) => "emit",
+            Self::Budget { .. } => "budget",
         }
     }
 
@@ -129,6 +189,17 @@ pub struct Directive {
     pub action: Action,
 }
 
+/// One rung that was consulted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attempt {
+    pub rung: u8,
+    pub handler: String,
+    pub confidence: f32,
+    pub truncated: bool,
+    /// What it proposed.
+    pub actions: Vec<Directive>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Decision {
     pub actions: Vec<Directive>,
@@ -138,6 +209,15 @@ pub struct Decision {
     pub cost: Duration,
     /// The handler ran out of its evaluation time and stopped early.
     pub truncated: bool,
+    /// The rung that decided; 0 means the handler's own [`Handler::rung`].
+    pub rung: u8,
+    /// The id of the handler that decided; empty means the handler itself.
+    pub handler: String,
+    /// No rung was confident: return the checkpoint to the outer agent.
+    pub escalate: bool,
+    /// The rungs consulted and found uncertain before this decision, in
+    /// order. Empty for a handler that is not a ladder.
+    pub trail: Vec<Attempt>,
 }
 
 /// What a stop may spend.
@@ -156,22 +236,11 @@ impl Default for StopBudget {
 
 pub trait Handler: Send + Sync {
     fn id(&self) -> &str;
-    fn decide(&self, checkpoint: &Checkpoint, budget: &StopBudget) -> Decision;
-}
 
-/// When a stop fires. A fixed every-N-pops stop in this slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StopPolicy {
-    /// A stop after every this many pops; 0 means never.
-    pub every_pops: u32,
-    pub max_stops: u32,
-}
-
-impl Default for StopPolicy {
-    fn default() -> Self {
-        Self {
-            every_pops: 0,
-            max_stops: 4,
-        }
+    /// The rung this handler sits on (1: rules, 2: System One).
+    fn rung(&self) -> u8 {
+        RUNG_RULES
     }
+
+    fn decide(&self, checkpoint: &Checkpoint, budget: &StopBudget) -> Decision;
 }

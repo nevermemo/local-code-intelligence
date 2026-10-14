@@ -1,20 +1,22 @@
-//! Demo of the traversal engine (spine slice S2): a lexical map finds the
-//! seeds, a SCIP map expands them, one rule prunes `tests/**` at a stop, and
-//! the run is printed as JSON lines on stdout (a summary goes to stderr).
+//! Demo of the traversal engine (spine slices S2 to S4): a lexical map finds
+//! the seeds, a SCIP map expands them, and the walk runs under the steering
+//! ladder. Rung 1 is one rule (prune `tests/**`), rung 2 is a stand-in for
+//! System One (slice S8) that is never sure, and rung 3 is the outer agent:
+//! a stop the rules cannot decide ends the call with a checkpoint and a
+//! handle. The demo then plays the agent: it reads the checkpoint, stores the
+//! handle (under `DIR/handles` with `--out`, else in memory), and calls again
+//! with a `Steer` (boost the best queued node, prune the worst, add pops).
+//! The second call's trace holds the whole walk and is printed on stdout as
+//! JSON lines; a summary goes to stderr.
 //!
 //! ```text
 //! cargo run -p lci-maps --example traverse_demo -- [--question TEXT] [--scip INDEX --root TREE] [--out DIR]
 //! ```
 //!
-//! With `--out DIR` (slice S3) the walk is two calls: call 1 stops at the first
-//! stop with a depth-2 node queued and leaves a handle; call 2 reads the
-//! handle back from `DIR/handles` (as a new process would) and resumes with
-//! steering of its own. Both traces are written under `DIR/traces`, and the
-//! second (which holds the whole walk) is printed.
-//!
-//! Without `--scip` it walks a small built-in call graph. With `--scip` it
-//! loads that SCIP index (and `--root`, the tree it indexes, for the
-//! enclosing-range repair) and walks it with best-effort symbol ids.
+//! Both traces are written under `DIR/traces` with `--out`. Without `--scip`
+//! it walks a small built-in call graph. With `--scip` it loads that SCIP
+//! index (and `--root`, the tree it indexes, for the enclosing-range repair)
+//! and walks it with best-effort symbol ids.
 
 use lci_core::node::NodeId;
 use lci_maps::{
@@ -22,8 +24,14 @@ use lci_maps::{
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     scip_graph::{DirSource, RawDocument, RawOccurrence, ScipGraph, ScipMap},
     traverse::{
-        Seed, Traversal, TraversalBudget, handle::HandleStore, handler::StopPolicy,
-        rules::RuleList, source::OnTheFly, trace,
+        Seed, Traversal, TraversalBudget,
+        handle::HandleStore,
+        handler::{Action, Checkpoint, Decision, Directive, Handler, StopBudget, StopPolicy},
+        ladder::Ladder,
+        rules::RuleList,
+        source::OnTheFly,
+        steer::Steer,
+        trace,
     },
     walk::tokenize,
 };
@@ -218,72 +226,137 @@ async fn main() {
     registry.register(Box::new(lexical), 1.0, 20).unwrap();
     registry.register(Box::new(scip), 1.0, 20).unwrap();
 
-    let prune_tests = serde_json::json!({"when": {"path_glob": "tests/**"}, "then": "prune"});
-    let rules = |extra: Option<serde_json::Value>| {
-        let list: Vec<_> = std::iter::once(prune_tests.clone()).chain(extra).collect();
-        RuleList::from_json(&serde_json::Value::Array(list)).expect("the demo rules parse")
+    let rules = RuleList::from_json(&serde_json::json!([
+        {"when": {"path_glob": "tests/**"}, "then": "prune"}
+    ]))
+    .expect("the demo rules parse");
+    let ladder = |rules: RuleList| {
+        Ladder::with_system_one(0.8, rules, NeverSure).expect("the demo ladder is valid")
     };
     let budget = TraversalBudget {
-        pops: 40,
+        pops: 12,
         max_depth: 6,
         deadline: now + Duration::from_secs(5),
         est_tokens: 4000,
         external_calls: 100,
     };
-    let stops = StopPolicy {
-        every_pops: 2,
-        max_stops: 4,
-    };
-    let mut result = Traversal::new(OnTheFly::new(&registry, &view), seeds, budget)
+    let stops = StopPolicy::every(2).max_stops(6);
+
+    // Call 1: rung 1 prunes test code while it can; the first stop it has no
+    // rule for goes through rung 2 (unsure) to rung 3: the call returns.
+    let first = Traversal::new(OnTheFly::new(&registry, &view), seeds, budget)
         .question(question.clone())
-        .handler(
-            // Without --out the walk is one call. With it, the first stop with
-            // a depth-2 node queued ends call 1.
-            rules(
-                out.as_ref()
-                    .map(|_| serde_json::json!({"when": {"depth": {"ge": 2}}, "then": "stop"})),
-            ),
-            stops,
-        )
+        .handler(ladder(rules), stops)
         .run()
         .await;
-
-    if let Some(out) = out {
-        let traces = out.join("traces");
-        let first = trace::write_trace(&traces, &result).expect("write the first trace");
-        let store = HandleStore::in_dir(out.join("handles"));
-        let snapshot = result
-            .snapshot
-            .as_ref()
-            .expect("call 1 should stop with work left");
-        let handle = store.put(snapshot).expect("store the handle");
+    for event in first.events.iter().filter(|e| e["ev"] == "steer") {
         eprintln!(
-            "call 1: {} at pop {}, handle {handle}, trace {}",
-            result.status.as_str(),
-            result.totals.pops,
-            first.display(),
+            "stop {}: rung {} {} -> {}",
+            event["stop"], event["rung"], event["handler"], event["outcome"]
         );
-        // Call 2: a store that has never seen the snapshot reads it from disk.
-        let snapshot = HandleStore::in_dir(out.join("handles"))
-            .get(&handle)
-            .expect("read the handle back");
-        result = Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget)
-            .handler(rules(None), stops)
-            .run()
-            .await;
-        let second = trace::write_trace(&traces, &result).expect("write the second trace");
-        eprintln!("call 2: trace {}", second.display());
+    }
+    let (Some(checkpoint), Some(snapshot)) = (first.checkpoint.as_ref(), first.snapshot.as_ref())
+    else {
+        eprintln!(
+            "the ladder never needed the agent ({})",
+            first.status.as_str()
+        );
+        print!("{}", first.events_jsonl());
+        return;
+    };
+
+    let (traces, store) = match &out {
+        Some(out) => (
+            Some(out.join("traces")),
+            HandleStore::in_dir(out.join("handles")),
+        ),
+        None => (None, HandleStore::memory()),
+    };
+    if let Some(traces) = &traces {
+        let path = trace::write_trace(traces, &first).expect("write the first trace");
+        eprintln!("call 1 trace {}", path.display());
+    }
+    let handle = store.put(snapshot).expect("store the handle");
+    eprintln!(
+        "call 1: {} at pop {} ({}), handle {handle}",
+        first.status.as_str(),
+        first.totals.pops,
+        checkpoint.reason.as_str(),
+    );
+    for card in checkpoint.answer.iter().take(3) {
+        eprintln!("  answer so far: {}", card.text());
+    }
+    for item in checkpoint.frontier.iter().take(3) {
+        eprintln!("  queued: {} (score {:.2})", item.node, item.score);
+    }
+
+    // The agent: boost the best queued node, prune the worst, add pops.
+    let mut actions = Vec::new();
+    if let Some(best) = checkpoint.frontier.first() {
+        actions.push(Directive {
+            node: Some(best.node.clone()),
+            action: Action::Boost(2.0),
+        });
+    }
+    if checkpoint.frontier.len() > 1 {
+        actions.push(Directive {
+            node: checkpoint.frontier.last().map(|item| item.node.clone()),
+            action: Action::Prune,
+        });
+    }
+    actions.push(Directive {
+        node: None,
+        action: Action::Budget {
+            pops: 10,
+            tokens: 0,
+        },
+    });
+    // Call 2: a store that has never seen the snapshot reads it back by handle.
+    let snapshot = store.get(&handle).expect("read the handle back");
+    let result = Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget)
+        .handler(
+            ladder(RuleList::new(Vec::new()).unwrap()),
+            stops.max_stops(0),
+        )
+        .steer(Steer::new(actions))
+        .run()
+        .await;
+    if let Some(traces) = &traces {
+        let path = trace::write_trace(traces, &result).expect("write the second trace");
+        eprintln!("call 2 trace {}", path.display());
     }
 
     print!("{}", result.events_jsonl());
     eprintln!(
-        "{}: {} pops, {} hops ({} cross-map), {} tokens, {} cleared, {:.1} ms",
+        "{}: {} pops, {} hops ({} cross-map), {} tokens, {} cleared, {} steers, {:.1} ms",
         result.status.as_str(),
         result.totals.pops,
         result.totals.hops,
         result.totals.cross_map_hops,
         result.totals.tokens,
         result.cleared.len(),
+        result.totals.steers,
         result.totals.elapsed_ms,
     );
+}
+
+/// The System One slot (slice S8) filled with a test double that is never
+/// sure, so the ladder goes on to the agent.
+struct NeverSure;
+
+impl Handler for NeverSure {
+    fn id(&self) -> &str {
+        "system_one_double"
+    }
+
+    fn rung(&self) -> u8 {
+        2
+    }
+
+    fn decide(&self, _checkpoint: &Checkpoint, _budget: &StopBudget) -> Decision {
+        Decision {
+            confidence: 0.3,
+            ..Decision::default()
+        }
+    }
 }
