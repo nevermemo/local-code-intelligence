@@ -4,6 +4,11 @@
 //! named `[search_profiles.<name>]` can override those switches and the
 //! rerank window per search (see [`App::search_in_profile`]).
 
+// The wrapped legacy maps of the multimap spike: unit tests (T0) and the
+// `spike-maps` feature only, so the default build adds no public path.
+#[cfg(any(test, feature = "spike-maps"))]
+mod legacy_maps;
+
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
     config::{ChannelsConfig, FusionConfig, IndexFreshness, SearchSettings},
@@ -503,6 +508,27 @@ fn cap_by_file<T>(items: Vec<T>, max: u32, path_of: impl Fn(&T) -> &str) -> Vec<
     head
 }
 
+/// The `workspace/symbol` queries for `query`: one `<term>#` per term, and
+/// for a term over four bytes that ends in `s`, its singular first; at most
+/// eight.
+fn lsp_symbol_queries(query: &str) -> Vec<String> {
+    let mut symbol_queries = Vec::new();
+    for term in lexical::terms(query) {
+        if term.ends_with('s') && term.len() > 4 {
+            symbol_queries.push(format!("{}#", &term[..term.len() - 1]));
+        }
+        symbol_queries.push(format!("{term}#"));
+    }
+    symbol_queries.dedup();
+    symbol_queries.truncate(8);
+    symbol_queries
+}
+
+/// The warning for providers that failed (`provider: cause` each).
+fn lsp_failure_warning(failures: &[String]) -> String {
+    format!("Optional LSP provider unavailable: {}", failures.join("; "))
+}
+
 /// What the language-server channel of one search produced.
 #[derive(Default)]
 struct LspChannel {
@@ -709,23 +735,11 @@ impl App {
         // deliberately disabled channel is skipped outright: no work, a zero
         // timing, and no "unavailable" warning.
         let channels = settings.channels;
-        let mut applicable_adapters: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
-        if channels.lsp {
-            let indexed_languages: HashSet<&str> = all_chunks
-                .iter()
-                .map(|hit| hit.chunk.language.as_str())
-                .collect();
-            for language in indexed_languages {
-                for adapter in self.analyzer.adapters_for_language(language) {
-                    if adapter.enabled() {
-                        applicable_adapters
-                            .entry(adapter.provider())
-                            .or_insert_with(|| Arc::clone(adapter));
-                    }
-                }
-            }
-        }
-        let lsp_budget = Duration::from_millis(self.config.lsp_search_budget_ms);
+        let applicable_adapters = if channels.lsp {
+            self.applicable_lsp_adapters(&all_chunks)
+        } else {
+            Vec::new()
+        };
         let (query_result, lexical_result, lsp_result) = tokio::join!(
             async {
                 if !channels.semantic {
@@ -755,63 +769,10 @@ impl App {
                         ..LspChannel::default()
                     };
                 }
-                let mut symbol_queries = Vec::new();
-                for term in lexical::terms(query) {
-                    if term.ends_with('s') && term.len() > 4 {
-                        symbol_queries.push(format!("{}#", &term[..term.len() - 1]));
-                    }
-                    symbol_queries.push(format!("{term}#"));
-                }
-                symbol_queries.dedup();
-                symbol_queries.truncate(8);
-                // The providers run side by side, each under the same wall
-                // clock budget, so one that is still starting cannot starve
-                // the others. Past the budget the provider's future is
-                // dropped, which only stops this search waiting: its session
-                // lives in the manager and keeps starting and warming for the
-                // next search. Answers gathered before the budget ran out are
-                // kept.
-                let mut providers: Vec<&Arc<dyn LspAdapter>> =
-                    applicable_adapters.values().collect();
-                providers.sort_by_key(|adapter| adapter.provider());
-                let (workspace, queries) = (&report.workspace, &symbol_queries);
-                let answers =
-                    futures::future::join_all(providers.into_iter().map(|adapter| async move {
-                        let gathered = std::sync::Mutex::new(Vec::new());
-                        let answer = tokio::time::timeout(
-                            lsp_budget,
-                            self.provider_symbols(adapter, workspace, queries, &gathered),
-                        )
-                        .await;
-                        let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
-                        (adapter.provider(), gathered, answer)
-                    }))
+                let symbol_queries = lsp_symbol_queries(query);
+                let mut channel = self
+                    .lsp_channel(&applicable_adapters, &report.workspace, &symbol_queries)
                     .await;
-                let mut channel = LspChannel::default();
-                let mut per_provider = Vec::new();
-                for (provider, gathered, answer) in answers {
-                    per_provider.push(gathered);
-                    match answer {
-                        Ok(failure) => channel.failures.extend(failure),
-                        Err(_) => {
-                            tracing::debug!(
-                                provider,
-                                budget_ms = self.config.lsp_search_budget_ms,
-                                "language server did not answer within the search budget"
-                            );
-                            channel.over_budget.push(provider);
-                        }
-                    }
-                }
-                // Merge query by query across providers, as one sequential
-                // pass would: first-seen order decides the LSP rank.
-                for index in 0..symbol_queries.len() {
-                    for locations in &mut per_provider {
-                        if let Some(found) = locations.get_mut(index) {
-                            channel.locations.append(found);
-                        }
-                    }
-                }
                 channel.elapsed_ms = ms(timer);
                 channel
             },
@@ -830,19 +791,12 @@ impl App {
         if !lsp_result.over_budget.is_empty() {
             // Not a warning: nothing failed, the server is just not ready
             // yet. A warning would also count the search as a fallback.
-            report.notes.push(format!(
-                "LSP still starting or slow; symbol results from {} are missing or incomplete \
-                 for this search (lsp_search_budget_ms = {}). The server keeps starting in the \
-                 background.",
-                lsp_result.over_budget.join(", "),
-                self.config.lsp_search_budget_ms
-            ));
+            report
+                .notes
+                .push(self.lsp_over_budget_note(&lsp_result.over_budget));
         }
         if !lsp_failures.is_empty() {
-            let message = format!(
-                "Optional LSP provider unavailable: {}",
-                lsp_failures.join("; ")
-            );
+            let message = lsp_failure_warning(&lsp_failures);
             report.warning = Some(
                 report
                     .warning
@@ -1250,6 +1204,95 @@ impl App {
         lexical_hits
     }
 
+    /// The enabled language-server adapters that apply to the languages of
+    /// `chunks`, one per provider name, sorted by provider. The LSP channel
+    /// of `search_once` and the `lsp.symbols` map both pick providers here.
+    fn applicable_lsp_adapters(&self, chunks: &[Hit]) -> Vec<Arc<dyn LspAdapter>> {
+        let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
+        let languages: HashSet<&str> = chunks
+            .iter()
+            .map(|hit| hit.chunk.language.as_str())
+            .collect();
+        for language in languages {
+            for adapter in self.analyzer.adapters_for_language(language) {
+                if adapter.enabled() {
+                    applicable
+                        .entry(adapter.provider())
+                        .or_insert_with(|| Arc::clone(adapter));
+                }
+            }
+        }
+        let mut providers: Vec<_> = applicable.into_values().collect();
+        providers.sort_by_key(|adapter| adapter.provider());
+        providers
+    }
+
+    /// Runs `symbol_queries` against every provider of `providers` side by
+    /// side, each under the same `lsp_search_budget_ms` wall clock budget,
+    /// so one that is still starting cannot starve the others. Past the
+    /// budget the provider's future is dropped, which only stops this
+    /// search waiting: its session lives in the manager and keeps starting
+    /// and warming for the next search. Answers gathered before the budget
+    /// ran out are kept, and merged query by query across providers, as one
+    /// sequential pass would: first-seen order decides the LSP rank. The
+    /// returned channel's `elapsed_ms` is left for the caller to set.
+    async fn lsp_channel(
+        &self,
+        providers: &[Arc<dyn LspAdapter>],
+        workspace: &Workspace,
+        symbol_queries: &[String],
+    ) -> LspChannel {
+        let budget = Duration::from_millis(self.config.lsp_search_budget_ms);
+        let answers = futures::future::join_all(providers.iter().map(|adapter| async move {
+            let gathered = std::sync::Mutex::new(Vec::new());
+            let answer = tokio::time::timeout(
+                budget,
+                self.provider_symbols(adapter, workspace, symbol_queries, &gathered),
+            )
+            .await;
+            let gathered = gathered.into_inner().unwrap_or_else(|p| p.into_inner());
+            (adapter.provider(), gathered, answer)
+        }))
+        .await;
+        let mut channel = LspChannel::default();
+        let mut per_provider = Vec::new();
+        for (provider, gathered, answer) in answers {
+            per_provider.push(gathered);
+            match answer {
+                Ok(failure) => channel.failures.extend(failure),
+                Err(_) => {
+                    tracing::debug!(
+                        provider,
+                        budget_ms = self.config.lsp_search_budget_ms,
+                        "language server did not answer within the search budget"
+                    );
+                    channel.over_budget.push(provider);
+                }
+            }
+        }
+        for index in 0..symbol_queries.len() {
+            for locations in &mut per_provider {
+                if let Some(found) = locations.get_mut(index) {
+                    channel.locations.append(found);
+                }
+            }
+        }
+        channel
+    }
+
+    /// The note for providers past the LSP budget: not a warning, because
+    /// nothing failed (the server is only not ready yet), and a warning
+    /// would also count the search as a fallback.
+    fn lsp_over_budget_note(&self, over_budget: &[&str]) -> String {
+        format!(
+            "LSP still starting or slow; symbol results from {} are missing or incomplete \
+             for this search (lsp_search_budget_ms = {}). The server keeps starting in the \
+             background.",
+            over_budget.join(", "),
+            self.config.lsp_search_budget_ms
+        )
+    }
+
     /// One provider's `workspace/symbol` answers, one list per symbol query
     /// in query order, pushed onto `gathered` as they arrive so that the
     /// caller keeps them even when it drops this future at the search budget.
@@ -1459,6 +1502,8 @@ mod tests {
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
 
     const RRF_K: f32 = 60.0;
+
+    mod t0;
 
     thread_local! {
         pub(super) static LEXICAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

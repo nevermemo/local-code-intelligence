@@ -3623,6 +3623,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-maps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "lci-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lexical-core"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3788,6 +3799,7 @@ dependencies = [
  "futures",
  "lancedb",
  "lci-core",
+ "lci-maps",
  "reqwest 0.13.5",
  "rmcp",
  "schemars 1.2.2",

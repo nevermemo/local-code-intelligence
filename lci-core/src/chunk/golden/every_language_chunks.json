@@ -1,0 +1,354 @@
+[
+  {
+    "relative_file_path": "native/math.c",
+    "language": "c",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "#include <stdio.h>",
+    "content_hash": "1e839e32685d525d4c1965f9ba99267582bb562cbb1d9eba94b1c8058cde2f2e"
+  },
+  {
+    "relative_file_path": "native/math.c",
+    "language": "c",
+    "start_line": 3,
+    "end_line": 4,
+    "code": "/* adds */\nint add(int a, int b) { return a + b; }",
+    "content_hash": "4e2effea2026823bfe97ebab24a3b96e6d13a6394424ca35015d522cf5a77b9a"
+  },
+  {
+    "relative_file_path": "native/math.c",
+    "language": "c",
+    "start_line": 6,
+    "end_line": 6,
+    "code": "struct pair { int a; int b; };",
+    "content_hash": "c072bed2909d23bbf7b9cc5b80a5f11919f23c93e9023dae4daffdda1dbdc63d"
+  },
+  {
+    "relative_file_path": "native/shape.cpp",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "#include <string>",
+    "content_hash": "75b3b4aaa4e59fcc89279bde3d1909228ef18abd5fe73f9c213f186cbfbcf942"
+  },
+  {
+    "relative_file_path": "native/shape.cpp",
+    "language": "cpp",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "namespace geo {",
+    "content_hash": "ceaadce0c2c8bf15a1e572b650620495664582bed1e9ebb5776c52f26c474011"
+  },
+  {
+    "relative_file_path": "native/shape.cpp",
+    "language": "cpp",
+    "start_line": 3,
+    "end_line": 4,
+    "code": "class Shape {\npublic:",
+    "content_hash": "0454cb5b9cc1e45d9775c11245248472b6bcf2ad46bed535298421263f76c60a"
+  },
+  {
+    "relative_file_path": "native/shape.cpp",
+    "language": "cpp",
+    "start_line": 5,
+    "end_line": 6,
+    "code": "virtual double area() const = 0;\n};",
+    "content_hash": "34d23c9500763d43019e111b8fd6f7fcc6eb216ec5d670a3bd78a8bdf383953f"
+  },
+  {
+    "relative_file_path": "native/shape.cpp",
+    "language": "cpp",
+    "start_line": 7,
+    "end_line": 8,
+    "code": "double twice(double x) { return 2 * x; }\n}",
+    "content_hash": "c76f8a73d2ea0b20dc33b0c39bec76ebcfac7147ab8dd0650b1c6f4c9a571e74"
+  },
+  {
+    "relative_file_path": "native/shape.hpp",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "#pragma once",
+    "content_hash": "6a221112d7fd41cf3950158643c579b4548c047d28be1bb8086a245b2607f49c"
+  },
+  {
+    "relative_file_path": "native/shape.hpp",
+    "language": "cpp",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "int area();",
+    "content_hash": "b88bd55c8e82475135390c6138e0c59f929277713e4de7a94af3fc4da3cabca0"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 1,
+    "end_line": 3,
+    "code": "//! Crate docs.\n\nuse std::fmt;",
+    "content_hash": "4d15caa4808c199f6710725b8103780692e064ed745a111fa5206498a06fceab"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 5,
+    "end_line": 7,
+    "code": "/// A point.\n#[derive(Debug)]\npub struct Point { x: i32 }",
+    "content_hash": "b33525973004c91b5e6d8deeed4145596ae98b0be30d51ad14abe8990b64f926"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 9,
+    "end_line": 9,
+    "code": "impl fmt::Display for",
+    "content_hash": "9750d2966250b0211682b561639f183f019075d8b880b280ac2c1bf28c0f268d"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 9,
+    "end_line": 9,
+    "code": "Point",
+    "content_hash": "2fc0c524431a923617b003031d19d1e02e729210afacbe3ee02337a43422634a"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 9,
+    "end_line": 13,
+    "code": "{\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"{}\", self.x)\n    }\n}",
+    "content_hash": "96c00bbf281d7bdd8927b6072fef5df01e9824e4bb9b698ffd03ffd9763332e6"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 15,
+    "end_line": 15,
+    "code": "mod inner",
+    "content_hash": "e0ebd173eed9529103465583f81af0ccb64e070fc686b88386cfd23a0d589114"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 15,
+    "end_line": 17,
+    "code": "{\n    pub fn helper() -> u8 { 1 }\n}",
+    "content_hash": "f72e328a9e1131e16fe44bb6a261dc68fc93099661ef70ef583ed85c898f76dd"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 19,
+    "end_line": 19,
+    "code": "pub trait",
+    "content_hash": "657a8ad5d3ad2ef8513489d7f6748b359c6ebc4ac0a8deb31065d193c7b62b2c"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 19,
+    "end_line": 19,
+    "code": "Shape",
+    "content_hash": "e0e492707f85ff1f9c23155494a54382b52bf34888091adc7a6bb338ef78f88d"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 19,
+    "end_line": 19,
+    "code": "{ fn area(&self) -> f64; }",
+    "content_hash": "f55d4e05d5f09d0a26944d3c3de63b4746577fd961b0ffbc16361754c512a67c"
+  },
+  {
+    "relative_file_path": "src/lib.rs",
+    "language": "rust",
+    "start_line": 21,
+    "end_line": 21,
+    "code": "macro_rules! twice { ($e:expr) => { $e * 2 }; }",
+    "content_hash": "45a9c81cca7f5c0219b0b27d22179633ed3d18740c38265983d785960e3bbbd6"
+  },
+  {
+    "relative_file_path": "svc/App.java",
+    "language": "java",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "package demo;",
+    "content_hash": "579a300c3f77ea01c6102253838192e31dc1d231b2c853b211f9f1c232b07c4a"
+  },
+  {
+    "relative_file_path": "svc/App.java",
+    "language": "java",
+    "start_line": 3,
+    "end_line": 6,
+    "code": "/** App. */\npublic class App {\n    @Override\n    public String toString() { return \"app\"; }",
+    "content_hash": "ffb32f19a137cb6c3dbe438ec4b0a67e6894ba2d5def319b8f128c75d7e7c7d4"
+  },
+  {
+    "relative_file_path": "svc/App.java",
+    "language": "java",
+    "start_line": 7,
+    "end_line": 8,
+    "code": "static int twice(int x) { return 2 * x; }\n}",
+    "content_hash": "b4e5b30e2843e6e7f408141ffdac06d2b4dd1f3ccb4b6e751e9a2582a56dc9b7"
+  },
+  {
+    "relative_file_path": "svc/Calc.cs",
+    "language": "csharp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "namespace Acceptance;",
+    "content_hash": "9c501a2bd8905bfd1ffe2db463521b46bd6d978c5e7322a5ed8cd9f82518bf8b"
+  },
+  {
+    "relative_file_path": "svc/Calc.cs",
+    "language": "csharp",
+    "start_line": 2,
+    "end_line": 4,
+    "code": "// A calculator.\npublic sealed class Calculator {\n    public int Add(int a, int b) => a + b;",
+    "content_hash": "d5b8c8606078b6a0ef60368e39d6af174f41aa9ce6559773be71afa3602feac4"
+  },
+  {
+    "relative_file_path": "svc/Calc.cs",
+    "language": "csharp",
+    "start_line": 5,
+    "end_line": 6,
+    "code": "public int Sub(int a, int b) => a - b;\n}",
+    "content_hash": "9d0ee33891eb9c8d655e29e7b256ade1c769506cc72f1f9037a0aa8bd779c87a"
+  },
+  {
+    "relative_file_path": "svc/main.go",
+    "language": "go",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "package main",
+    "content_hash": "512843855fcc92a51c810b1b58e0731c01eac9a6a23c157bfa02aad71edffbe7"
+  },
+  {
+    "relative_file_path": "svc/main.go",
+    "language": "go",
+    "start_line": 3,
+    "end_line": 3,
+    "code": "import \"fmt\"",
+    "content_hash": "fd68edbadc1535917a1bca6848f45e93c6588249f923c24958981b6c28f2a045"
+  },
+  {
+    "relative_file_path": "svc/main.go",
+    "language": "go",
+    "start_line": 5,
+    "end_line": 6,
+    "code": "// Greeter greets.\ntype Greeter struct{ Name string }",
+    "content_hash": "bdf4801f2adba7d644ddb099e905b5b1f41feec4b674910a8749081f57db7947"
+  },
+  {
+    "relative_file_path": "svc/main.go",
+    "language": "go",
+    "start_line": 8,
+    "end_line": 8,
+    "code": "func (g Greeter) Greet() string { return fmt.Sprintf(\"hi %s\", g.Name) }",
+    "content_hash": "7698d62973b0633fb1e6495eb7431e22ef71ba02e092e73a23970f22f8887610"
+  },
+  {
+    "relative_file_path": "svc/main.go",
+    "language": "go",
+    "start_line": 10,
+    "end_line": 10,
+    "code": "func main() { fmt.Println(Greeter{\"a\"}.Greet()) }",
+    "content_hash": "613f03352c4d268256285b5f0f98096e56a0a52dd1eb854ede40c436359f5274"
+  },
+  {
+    "relative_file_path": "tools/run.py",
+    "language": "python",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "\"\"\"Module docs.\"\"\"",
+    "content_hash": "6b1754d2b5eb055512ea4512f91a8bd34bfe57fc5fa6226e9ff40f199f05f7c4"
+  },
+  {
+    "relative_file_path": "tools/run.py",
+    "language": "python",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "import os",
+    "content_hash": "de2abade832c8e350a1bdc98cfcdb1e202ac4749c5fc51a4a970d41736b6df5c"
+  },
+  {
+    "relative_file_path": "tools/run.py",
+    "language": "python",
+    "start_line": 5,
+    "end_line": 9,
+    "code": "class Runner:\n    \"\"\"Runs things.\"\"\"\n\n    def run(self, name):\n        return os.path.join(name, 'x')",
+    "content_hash": "f3dbf904e9cbc39d3cc322486fef41c71fecba9d2462331624a1505259d3e6de"
+  },
+  {
+    "relative_file_path": "tools/run.py",
+    "language": "python",
+    "start_line": 12,
+    "end_line": 14,
+    "code": "@staticmethod\ndef main():\n    Runner().run('a')",
+    "content_hash": "208f39a331925604fa1b73ccf27ab05a45e9174563bba258a0479766f7c0f3af"
+  },
+  {
+    "relative_file_path": "web/app.ts",
+    "language": "typescript",
+    "start_line": 1,
+    "end_line": 2,
+    "code": "// Header comment\nexport interface User { name: string }",
+    "content_hash": "d5e5c261013602e0f7416c00b5a431b0ee0fbd56bb44b6808246f722ec57e1e1"
+  },
+  {
+    "relative_file_path": "web/app.ts",
+    "language": "typescript",
+    "start_line": 4,
+    "end_line": 5,
+    "code": "export class Store {\n  private users: User[] = [];",
+    "content_hash": "2d38915892a23f6cf32f108d0ee9a056277edcf4dc3f277d66f3de06870e1e6f"
+  },
+  {
+    "relative_file_path": "web/app.ts",
+    "language": "typescript",
+    "start_line": 6,
+    "end_line": 7,
+    "code": "add(user: User): void { this.users.push(user); }\n}",
+    "content_hash": "920e52a1b3fbd393f6529bec3efe7ed3082400096cfc3695af222867b34d7886"
+  },
+  {
+    "relative_file_path": "web/app.ts",
+    "language": "typescript",
+    "start_line": 9,
+    "end_line": 11,
+    "code": "export function greet(user: User): string {\n  return `hi ${user.name}`;\n}",
+    "content_hash": "ff548e260a309699edda735b3b4db244e07dcb85e9c7dd95862281b110613838"
+  },
+  {
+    "relative_file_path": "web/button.jsx",
+    "language": "jsx",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "export const Button = () => <button>ok</button>;",
+    "content_hash": "6470415307e05543fa6fafdaaa962808baacca78a5a2fc06b1bf3f67c5e51aaf"
+  },
+  {
+    "relative_file_path": "web/util.js",
+    "language": "javascript",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "function add(a, b) { return a + b; }",
+    "content_hash": "054b016b2a89850c8ca3c7e9429e3042f16fc06dbd307046b5b15dc7282eccb5"
+  },
+  {
+    "relative_file_path": "web/util.js",
+    "language": "javascript",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "module.exports = { add };",
+    "content_hash": "7f49e2e65459414247315d5be65a712ff356749e0edcf5ba06018480089efa28"
+  },
+  {
+    "relative_file_path": "web/view.tsx",
+    "language": "tsx",
+    "start_line": 1,
+    "end_line": 3,
+    "code": "export function View(props: { name: string }) {\n  return <div>{props.name}</div>;\n}",
+    "content_hash": "26dafbff32acaba08502aea93b6f11d7dc6f39c5f967fb6eeedea9dfbac2116b"
+  }
+]

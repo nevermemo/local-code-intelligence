@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "lci-core"]
+members = ["xtask", "lci-core", "lci-maps"]
 
 [package]
 name = "local-code-intelligence"
@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 dunce = "1"
 futures = "0.3"
 lci-core = { path = "lci-core" }
+lci-maps = { path = "lci-maps" }
 # 0.38.0's job module references Error::Http without a feature guard.
 # Enable remote to compile upstream; the application opens only local paths.
 lancedb = { version = "=0.38.0", default-features = false, features = ["remote"] }
@@ -29,6 +30,13 @@ tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# The multimap spike's test-only entry points (`App::fuse_through_maps`,
+# `App::record_through_maps`) and the wrapped legacy maps they use.
+# `cargo xtask test --suite Full` and `--suite Indexing` enable it; the
+# default build has neither (merge condition M3).
+spike-maps = []
 
 [dev-dependencies]
 tempfile = "3"

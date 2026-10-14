@@ -85,6 +85,11 @@ fn invoke_focused(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The root crate's feature that compiles the multimap spike's test-only
+/// entry points; the suites that run their tests enable it, so they do not
+/// vanish from the gate (merge condition M3).
+const SPIKE_MAPS: &str = "local-code-intelligence/spike-maps";
+
 /// The cargo calls of [`Suite::Full`] after the path lint, in order. The ones
 /// that resolve dependencies run `--locked`, so a pull request that edits a
 /// `Cargo.toml` and forgets `Cargo.lock` fails here (as `cargo xtask build`
@@ -93,12 +98,14 @@ fn invoke_focused(args: &[&str]) -> Result<()> {
 /// in the middle of an edit.
 const FULL_STEPS: [&[&str]; 3] = [
     &["fmt", "--all", "--", "--check"],
-    &["test", "--workspace", "--locked"],
+    &["test", "--workspace", "--locked", "--features", SPIKE_MAPS],
     &[
         "clippy",
         "--workspace",
         "--all-targets",
         "--locked",
+        "--features",
+        SPIKE_MAPS,
         "--",
         "-D",
         "warnings",
@@ -119,7 +126,14 @@ pub fn run(suite: Suite) -> Result<()> {
             invoke_focused(&["test", "--workspace", "--lib", "evaluate::"])?;
             invoke_focused(&["test", "--test", "integration", "evaluation::"])
         }
-        Suite::Indexing => invoke_focused(&["test", "--test", "integration", "indexing::"]),
+        Suite::Indexing => invoke_focused(&[
+            "test",
+            "--test",
+            "integration",
+            "--features",
+            SPIKE_MAPS,
+            "indexing::",
+        ]),
         Suite::Readiness => invoke_focused(&["test", "--test", "integration", "readiness::"]),
         Suite::Mcp => invoke_focused(&["test", "--test", "integration", "mcp::"]),
         Suite::Watching => invoke_focused(&["test", "--test", "integration", "watching::"]),
@@ -140,7 +154,7 @@ pub fn run(suite: Suite) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FULL_STEPS, executed_in_summary};
+    use super::{FULL_STEPS, SPIKE_MAPS, executed_in_summary};
 
     #[test]
     fn the_full_suite_locks_every_step_that_resolves_dependencies() {
@@ -154,6 +168,24 @@ mod tests {
                     .clone()
                     .any(|argument| *argument == "--locked"),
                 "{step:?} is not --locked"
+            );
+        }
+    }
+
+    #[test]
+    fn the_full_suite_tests_and_lints_with_the_spike_maps_feature() {
+        // Without it the tests of the spike's test-only entry points would
+        // compile out of the gate.
+        for step in FULL_STEPS.iter().filter(|step| step[0] != "fmt") {
+            let cargo_arguments: Vec<_> = step
+                .iter()
+                .take_while(|argument| **argument != "--")
+                .collect();
+            assert!(
+                cargo_arguments
+                    .windows(2)
+                    .any(|pair| *pair[0] == "--features" && *pair[1] == SPIKE_MAPS),
+                "{step:?} does not enable {SPIKE_MAPS}"
             );
         }
     }

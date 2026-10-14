@@ -163,6 +163,14 @@ async fn embed(
             vec![1.0, 0.0, 0.0]
         } else if text.contains("buildProductionTelemetryPipeline") {
             vec![0.0, 1.0, 0.0]
+        } else if let Some(step) = text
+            .split("golden_rank_")
+            .nth(1)
+            .and_then(|rest| rest.chars().next()?.to_digit(10))
+        {
+            // A text marked `golden_rank_<d>` gets its own vector, so a test
+            // can give every chunk a distinct cosine distance (no ties).
+            vec![0.1 * step as f32, 0.0, 1.0]
         } else {
             vec![0.1, 0.1, 1.0]
         };

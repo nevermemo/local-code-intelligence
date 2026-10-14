@@ -176,6 +176,47 @@ fn chunks_with_adapter(
     source: &str,
     adapter: &language::LanguageAdapter,
 ) -> Result<Vec<Chunk>> {
+    Ok(extract(path, source, adapter, false)?.chunks)
+}
+
+/// What one parse of a file yields (the extraction hook of the multimap
+/// spike, slice S3): the file's chunks, exactly as [`chunks_for_path`] gives
+/// them, and its declarations where the language has an extractor (Rust
+/// only so far; `None` for every other language).
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub chunks: Vec<Chunk>,
+    pub declarations: Option<Vec<crate::node::Declaration>>,
+}
+
+/// [`chunks_for_path`] plus the declarations, from one parse.
+pub fn extract_for_path(path: &str, source: &str) -> Result<Extraction> {
+    let Some(adapter) = language::for_path(Path::new(path)) else {
+        bail!("unsupported source extension: {path}");
+    };
+    extract_with_adapter(path, source, adapter)
+}
+
+/// [`chunks_with_adapter`] plus the declarations, from one parse (the
+/// extraction hook).
+pub fn extract_with_adapter(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+) -> Result<Extraction> {
+    extract(path, source, adapter, true)
+}
+
+/// The one chunker: parses `source`, cuts the tree into chunks, and walks
+/// the declarations only when `with_declarations` asks for them (and the
+/// language has an extractor), so a caller that wants chunks alone pays
+/// for no declaration walk.
+fn extract(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+    with_declarations: bool,
+) -> Result<Extraction> {
     let mut parser = Parser::new();
     parser.set_language(&adapter.grammar())?;
     let tree = parser
@@ -203,7 +244,12 @@ fn chunks_with_adapter(
     }
     #[cfg(test)]
     tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
-    Ok(chunks)
+    let declarations = (with_declarations && adapter.identifier() == "rust")
+        .then(|| crate::node::rust_declarations_in(tree.root_node(), source));
+    Ok(Extraction {
+        chunks,
+        declarations,
+    })
 }
 
 struct SourceFile {
@@ -221,7 +267,7 @@ struct SourceFile {
 /// Line structure is preserved, so line ranges stay valid. One leading byte
 /// order mark (U+FEFF) is dropped: it is not text, `trim()` keeps it, and it
 /// would otherwise sit in the first chunk's code and in the file's hash.
-fn decode_source(bytes: Vec<u8>) -> (String, bool) {
+pub fn decode_source(bytes: Vec<u8>) -> (String, bool) {
     let (mut source, lossy) = match String::from_utf8(bytes) {
         Ok(source) => (source, false),
         Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
@@ -397,6 +443,9 @@ pub fn scan_incremental(
 pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
     Ok(scan_incremental(root, &HashMap::new())?.chunks)
 }
+
+#[cfg(test)]
+mod extraction_tests;
 
 #[cfg(test)]
 mod tests {

@@ -11,6 +11,7 @@ mod compare;
 mod definition;
 mod metrics;
 mod replay;
+mod run_record;
 mod runner;
 mod types;
 
@@ -26,6 +27,7 @@ pub use replay::{
     MIN_R_SQUARED, OriginalTimings, RefusedQuery, ReplayArm, ReplayBlock, ReplayCounts,
     ReplayLatency, ReplayOptions, ReplayOriginal, ReplayReport, fit_line, replay, replay_file,
 };
+pub use run_record::{FuseReplay, RunRecordFile};
 pub use runner::{
     RunOptions, WorkspaceMapping, has_failures, parse_workspace_mapping, parse_workspace_mappings,
     run_evaluation, run_evaluation_with_options,
