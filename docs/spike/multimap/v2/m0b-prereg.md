@@ -117,8 +117,8 @@ FR-versus-anything reading is made until a new pre-registered run.
 * Indexing the tree with the real embedder: 2 to 15 minutes [G], depending on chunk count and on
   other load on the embedding service.
 * Total, serial: about 0.5 to 3.5 hours of wall clock [G]. The services are loopback only; no
-  other listener is opened. The run starts only when no other lane uses the services (the
-  coordinator checks this and records it).
+  other listener is opened. The run may share the services with the A/B batch 2 (amended before
+  the first run, to save wall time): timings are then not latency evidence, the A/B load is recorded beside them, and the degraded-query rule above guards FR validity.
 
 ## 4. Metrics
 
