@@ -129,7 +129,8 @@ const fn class_conf(class: Class) -> u8 {
 /// const (this covers fields, which have no node kind of their own); no
 /// container is known. The witness is [`WitnessClass::Exact`] when the SCIP
 /// closure (W1) holds and [`WitnessClass::Text`] otherwise; the site is the
-/// declaration's name line, with the path as `blob`.
+/// declaration's name line, with the path (the blob is left to an edge
+/// source).
 impl From<&Edge> for crate::edge::Edge {
     fn from(edge: &Edge) -> Self {
         use crate::edge::{Site, WitnessClass};
@@ -169,7 +170,8 @@ impl From<&Edge> for crate::edge::Edge {
             },
             conf: class_conf(class),
             site: Some(Site {
-                blob: edge.decl.path.clone(),
+                path: edge.decl.path.clone(),
+                blob: String::new(),
                 line: edge.decl.line,
                 col: 0,
             }),
@@ -1503,7 +1505,7 @@ mod edge_conversion_tests {
         assert_eq!(confirmed.src.to_string(), "cfg:toml:index.freshness");
         let site = confirmed.site.unwrap();
         assert_eq!(
-            (site.blob.as_str(), site.line),
+            (site.path.as_str(), site.line),
             ("lci-core/src/config.rs", 7)
         );
     }

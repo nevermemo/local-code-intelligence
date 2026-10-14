@@ -63,11 +63,14 @@ impl WitnessClass {
     }
 }
 
-/// Where an edge was observed. `blob` names the file's content when the map
-/// knows it; a map that only knows the path puts the path there until blob
-/// ids are threaded through.
+/// Where an edge was observed. A map knows the `path` and leaves `blob`
+/// empty; an edge source fills `blob` from the snapshot view
+/// ([`crate::traverse::merged::FileBlobs`]): a hash of the file's content, as
+/// the snapshot holds it, never a path. `blob` stays empty for a file the
+/// view does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Site {
+    pub path: String,
     pub blob: String,
     pub line: u32,
     pub col: u32,

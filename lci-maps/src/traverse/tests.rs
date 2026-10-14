@@ -32,6 +32,8 @@ struct GraphMap {
     delay: Duration,
     panics: bool,
     cost: Cost,
+    /// The file every edge was seen in, when set.
+    site_path: Option<String>,
 }
 
 impl GraphMap {
@@ -57,7 +59,13 @@ impl GraphMap {
             delay: Duration::ZERO,
             panics: false,
             cost: Cost::default(),
+            site_path: None,
         }
+    }
+
+    fn site(mut self, path: &str) -> Self {
+        self.site_path = Some(path.to_string());
+        self
     }
 
     fn conf(mut self, conf: u8) -> Self {
@@ -117,7 +125,12 @@ impl Map for GraphMap {
                 map: self.descriptor.id,
                 witness: self.witness,
                 conf: self.conf,
-                site: None,
+                site: self.site_path.as_ref().map(|path| crate::edge::Site {
+                    path: path.clone(),
+                    blob: String::new(),
+                    line: 1,
+                    col: 0,
+                }),
                 cost: self.cost,
             })
             .collect()
@@ -2423,4 +2436,38 @@ mod steering {
         assert!(second.reached(&node("b")));
         assert_eq!(second.status, TraversalStatus::Complete);
     }
+
+    // ---- carry-over: a retried pop counts its edges once -------------------------
+
+    #[tokio::test]
+    async fn a_retried_pop_counts_its_edges_into_in_seen_once() {
+        let reg = registry(vec![
+            GraphMap::new(
+                "g",
+                &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"), ("a", "h")],
+            )
+            .cost(10, 0),
+        ]);
+        let tight = TraversalBudget {
+            est_tokens: 30,
+            ..budget(10)
+        };
+        let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
+        let snapshot = first.snapshot.unwrap();
+        // The cut pop is put back, so its edges are not counted yet.
+        assert!(snapshot.in_seen.is_empty(), "{:?}", snapshot.in_seen);
+
+        // The retry finishes the expansion; the pop cap then ends the call
+        // with work left, which leaves the counts to read.
+        let second = continue_from(&reg, snapshot, budget(2), |t| t).await;
+        let retried = second.snapshot.expect("work is left").in_seen;
+        assert_eq!(retried.len(), 5);
+        assert!(retried.iter().all(|(_, count)| *count == 1), "{retried:?}");
+
+        // The same counts as a walk that was never cut.
+        let straight = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
+        assert_eq!(retried, straight.snapshot.unwrap().in_seen);
+    }
 }
+
+mod pre_merged;

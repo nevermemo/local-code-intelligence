@@ -43,6 +43,7 @@ pub mod frontier;
 pub mod handle;
 pub mod handler;
 pub mod ladder;
+pub mod merged;
 pub mod rules;
 pub mod source;
 pub mod steer;
@@ -268,8 +269,12 @@ struct Run<'s> {
     frontier: Frontier,
     /// The state of each node that has one.
     state_of: HashMap<NodeId, usize>,
-    /// Edges into each node seen so far.
+    /// Edges into each node seen so far, from expansions that finished or
+    /// whose retry is not pending.
     in_seen: HashMap<NodeId, u32>,
+    /// The destinations the latest expansion added to `in_seen`, so a pop
+    /// that is put back can take them off again.
+    counted: Vec<NodeId>,
     expanded: HashSet<usize>,
     popped: Vec<usize>,
     cleared: BTreeSet<NodeId>,
@@ -297,6 +302,7 @@ impl<'s> Run<'s> {
             frontier: Frontier::default(),
             state_of: HashMap::new(),
             in_seen: HashMap::new(),
+            counted: Vec::new(),
             expanded: HashSet::new(),
             popped: Vec::new(),
             cleared: BTreeSet::new(),
@@ -436,6 +442,7 @@ impl<'s> Run<'s> {
                 // The node is not done: back in the queue at its old place,
                 // for a resume to expand again.
                 self.expanded.remove(&item.state);
+                self.uncount();
                 self.frontier.requeue(item);
                 if !adopted {
                     self.totals.pops -= 1;
@@ -527,6 +534,7 @@ impl<'s> Run<'s> {
             max_external_calls: self.calls_left(),
             max_nodes_touched: u64::MAX,
         };
+        self.counted.clear();
         let Expansion { edges, calls } = self.t.source.edges(&node, budget).await;
 
         let call_tokens: u64 = calls.iter().map(|c| c.cost.est_tokens).sum();
@@ -554,6 +562,7 @@ impl<'s> Run<'s> {
         let fanout = offered.len() as u32;
         for edge in &offered {
             *self.in_seen.entry(edge.best.dst.clone()).or_default() += 1;
+            self.counted.push(edge.best.dst.clone());
             for map in &edge.maps {
                 self.tally
                     .found
@@ -651,6 +660,20 @@ impl<'s> Run<'s> {
         let timed_out =
             calls.iter().any(|c| c.failure.is_some()) && Instant::now() >= self.t.budget.deadline;
         (truncated || timed_out).then_some(true)
+    }
+
+    /// Takes the latest expansion's edges off `in_seen`: its pop is put back
+    /// and the retry counts them again (an edge counts once per expansion
+    /// that finished).
+    fn uncount(&mut self) {
+        for dst in std::mem::take(&mut self.counted) {
+            if let Some(count) = self.in_seen.get_mut(&dst) {
+                *count -= 1;
+                if *count == 0 {
+                    self.in_seen.remove(&dst);
+                }
+            }
+        }
     }
 
     /// Records the nodes a fuzzy map offered that the structural maps, which

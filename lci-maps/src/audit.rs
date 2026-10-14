@@ -12,11 +12,19 @@
 //! unit suite, a replay of this repository's commits in the slow suite
 //! (`tests.rs`, `c4_commit_replay`).
 
-use crate::{SnapshotRef, fresh::Target, kit::ContractFailure, scratch::Scratch, symdefs::SymDefs};
+use crate::{
+    Budget, SnapshotRef,
+    fresh::Target,
+    kit::ContractFailure,
+    scratch::Scratch,
+    symdefs::SymDefs,
+    traverse::source::{EdgeSource, Expansion, FusedEdge},
+};
 use lci_core::{
     bundle::{BundleStore, Declarations, Producer, StoredDeclaration},
     chunk::scan_incremental,
     manifest::CachedFile,
+    node::NodeId,
 };
 use std::{
     collections::HashMap,
@@ -105,7 +113,7 @@ pub fn audit(
 }
 
 /// The first entry in one sorted list and not the other, described.
-fn first_difference(incremental: &[String], full: &[String]) -> Option<String> {
+pub fn first_difference(incremental: &[String], full: &[String]) -> Option<String> {
     let (mut i, mut f) = (0, 0);
     loop {
         match (incremental.get(i), full.get(f)) {
@@ -119,6 +127,99 @@ fn first_difference(incremental: &[String], full: &[String]) -> Option<String> {
             (Some(a), None) => return Some(format!("{a:?} (incremental only)")),
         }
     }
+}
+
+/// One fused edge in canonical text form: every field a traversal reads
+/// (ends, kind, fused confidence, provenance, the best edge with its site),
+/// no cost (a measurement, not part of the answer).
+pub fn canonical_fused(fused: &FusedEdge) -> String {
+    let best = &fused.best;
+    format!(
+        "{} -{}-> {} conf={} maps={:?} witnesses={:?} offers={:?} best={}/{:?}/{} site={:?}",
+        best.src,
+        best.kind.as_str(),
+        best.dst,
+        fused.conf,
+        fused.maps,
+        fused.witnesses,
+        fused.offers,
+        best.map,
+        best.witness,
+        best.conf,
+        best.site,
+    )
+}
+
+/// What an expansion says, in canonical form and in the source's order: its
+/// edges, then the calls it reports (map, edge count, whether it failed).
+fn canonical_expansion(expansion: &Expansion) -> Vec<String> {
+    expansion
+        .edges
+        .iter()
+        .map(|fused| format!("edge {}", canonical_fused(fused)))
+        .chain(expansion.calls.iter().map(|call| {
+            format!(
+                "call {} n={} failed={}",
+                call.map,
+                call.n_edges,
+                call.failure.is_some()
+            )
+        }))
+        .collect()
+}
+
+/// What an equivalence audit of two edge sources compared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceReport {
+    pub nodes: usize,
+    /// Fused edges compared, per source.
+    pub edges: usize,
+}
+
+/// Contract S5, the equivalence auditor: for every node of `nodes`, the two
+/// sources must give the same edges (as a set), in the same order, and report
+/// the same calls (cost aside). Used for the pre-merged source against the
+/// on-the-fly one on fixtures (spine brief 1.3); the first difference fails.
+/// Whatever switches the caller wants audited are applied to both sources
+/// before the call.
+pub async fn audit_edge_sources(
+    left: &dyn EdgeSource,
+    right: &dyn EdgeSource,
+    nodes: &[NodeId],
+    per_node: Duration,
+) -> Result<SourceReport, ContractFailure> {
+    let broke = |detail: String| ContractFailure {
+        contract: "S5",
+        detail,
+    };
+    let budget = || Budget {
+        deadline: Instant::now() + per_node,
+        max_external_calls: u32::MAX,
+        max_nodes_touched: u64::MAX,
+    };
+    let mut report = SourceReport::default();
+    for node in nodes {
+        let left = left.edges(node, budget()).await;
+        let right = right.edges(node, budget()).await;
+        let (a, b) = (canonical_expansion(&left), canonical_expansion(&right));
+        let (mut sorted_a, mut sorted_b) = (a.clone(), b.clone());
+        sorted_a.sort();
+        sorted_b.sort();
+        if let Some(difference) = first_difference(&sorted_a, &sorted_b) {
+            return Err(broke(format!(
+                "node {node}: the sources differ at {difference} (left, right)"
+            )));
+        }
+        if let Some(at) = a.iter().zip(&b).position(|(x, y)| x != y) {
+            return Err(broke(format!(
+                "node {node}: same entries, different order from position {at}: {:?} vs {:?}",
+                a[at], b[at]
+            )));
+        }
+        report.nodes += 1;
+        report.edges += left.edges.len();
+    }
+    Ok(report)
 }
 
 /// The suffix the C4 adapter bump gives the stored state's adapter version.

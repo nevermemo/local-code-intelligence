@@ -5,8 +5,10 @@
 //! (a panic or a missed deadline becomes a note on the call, never an error),
 //! and fuses the edges that reach the same destination: noisy-OR of the best
 //! confidence per map, provenance (maps and witness classes) as a union.
-//! The pre-merged source comes in a later slice.
+//! The pre-merged source ([`super::merged::PreMerged`]) answers from a
+//! materialised union built with this same fusion.
 
+use super::merged::FileBlobs;
 use crate::{
     Budget, Cost, EXPAND_LIMIT, MapId, Registry, SnapshotView,
     edge::{CONF_MAX, Edge, MapCard, WitnessClass, sort_edges},
@@ -17,6 +19,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashSet},
     panic::AssertUnwindSafe,
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -116,6 +119,8 @@ pub struct OnTheFly<'r, 'a, 'v> {
     registry: &'r Registry<'a>,
     view: &'r SnapshotView<'v>,
     off: HashSet<String>,
+    /// Content hashes of the view's files, for the sites of the edges.
+    blobs: OnceLock<FileBlobs>,
 }
 
 impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
@@ -124,13 +129,20 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
             registry,
             view,
             off: HashSet::new(),
+            blobs: OnceLock::new(),
         }
     }
-}
 
-#[crate::async_trait]
-impl EdgeSource for OnTheFly<'_, '_, '_> {
-    async fn edges(&self, node: &NodeId, budget: Budget) -> Expansion {
+    /// The blob of each file of the view.
+    pub fn blobs(&self) -> &FileBlobs {
+        self.blobs.get_or_init(|| FileBlobs::of(self.view))
+    }
+
+    /// What the enabled maps say about `node`, before fusion: every edge
+    /// (sanitised, sites with their blobs) in registry order, and the calls
+    /// made. [`EdgeSource::edges`] fuses exactly these.
+    pub async fn ask(&self, node: &NodeId, budget: Budget) -> (Vec<Edge>, Vec<ExpandCall>) {
+        let blobs = self.blobs();
         let kind = node.kind();
         let calls = self
             .registry
@@ -166,6 +178,7 @@ impl EdgeSource for OnTheFly<'_, '_, '_> {
                             edge.conf = edge.conf.min(CONF_MAX);
                         }
                         edges.truncate(EXPAND_LIMIT);
+                        blobs.fill(&mut edges);
                         (id, edges, None)
                     }
                 }
@@ -181,9 +194,17 @@ impl EdgeSource for OnTheFly<'_, '_, '_> {
             });
             all.extend(edges);
         }
+        (all, report)
+    }
+}
+
+#[crate::async_trait]
+impl EdgeSource for OnTheFly<'_, '_, '_> {
+    async fn edges(&self, node: &NodeId, budget: Budget) -> Expansion {
+        let (all, calls) = self.ask(node, budget).await;
         Expansion {
             edges: fuse(all),
-            calls: report,
+            calls,
         }
     }
 

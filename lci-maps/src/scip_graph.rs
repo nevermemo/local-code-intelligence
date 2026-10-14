@@ -724,8 +724,8 @@ impl From<GraphEdgeKind> for EdgeKind {
 }
 
 /// A SCIP edge is compiler-grade evidence ([`WitnessClass::Compiler`]), with
-/// the first site as its site. The site's `blob` is the file path (the graph
-/// holds no blob ids); `conf` is the graph's 1.0 or 0.5 in whole percent.
+/// the first site as its site. The site has the file path and no blob (the
+/// graph holds no blob ids; an edge source fills it); `conf` is the graph's 1.0 or 0.5 in whole percent.
 impl From<ScipEdgeRef<'_>> for TypedEdge {
     fn from(r: ScipEdgeRef<'_>) -> Self {
         Self {
@@ -736,7 +736,8 @@ impl From<ScipEdgeRef<'_>> for TypedEdge {
             witness: WitnessClass::Compiler,
             conf: conf_from_unit(r.edge.conf),
             site: Some(Site {
-                blob: r.edge.witness.file.clone(),
+                path: r.edge.witness.file.clone(),
+                blob: String::new(),
                 line: r.edge.witness.line,
                 col: r.edge.witness.col,
             }),
@@ -1120,7 +1121,8 @@ mod tests {
         assert_eq!(
             call.site,
             Some(Site {
-                blob: "a.rs".into(),
+                path: "a.rs".into(),
+                blob: String::new(),
                 line: 1,
                 col: 12
             })

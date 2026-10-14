@@ -18,26 +18,30 @@
 //! index (and `--root`, the tree it indexes, for the enclosing-range repair)
 //! and walks it with best-effort symbol ids.
 
-use lci_core::node::NodeId;
+use lci_core::{chunk::Chunk, node::NodeId};
 use lci_maps::{
     Budget, Contribution, EdgeKind, Evidence, FreshnessModel, Map, MapDescriptor, MapHit,
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    audit::audit_edge_sources,
     scip_graph::{DirSource, RawDocument, RawOccurrence, ScipGraph, ScipMap},
     traverse::{
-        Seed, Traversal, TraversalBudget,
+        Seed, Traversal, TraversalBudget, TraversalResult,
         handle::HandleStore,
         handler::{Action, Checkpoint, Decision, Directive, Handler, StopBudget, StopPolicy},
         ladder::Ladder,
+        merged::{BuildOptions, MergedAdjacency, PreMerged},
         rules::RuleList,
-        source::OnTheFly,
+        source::{EdgeSource, Expansion, OnTheFly},
         steer::Steer,
         trace,
     },
     walk::tokenize,
 };
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
-    path::PathBuf,
+    collections::{BTreeSet, HashSet},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -183,7 +187,7 @@ async fn main() {
     }
     let graph = match scip_path {
         Some(path) => {
-            let source = root.map(DirSource);
+            let source = root.clone().map(DirSource);
             let source = source
                 .as_ref()
                 .map(|s| s as &dyn lci_maps::scip_graph::SourceText);
@@ -193,8 +197,30 @@ async fn main() {
     };
     let scip = ScipMap::with_default_ids(graph);
     let lexical = NameLexical::new(&scip);
+    let roots: Vec<NodeId> = (0..scip.graph().nodes.len())
+        .map(|i| scip.node_id(i).clone())
+        .collect();
 
-    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    // One chunk per indexed file, its content hash the SHA-256 of the file
+    // under `--root` (of its path without one): enough for the file blobs
+    // the pre-merged source keys on.
+    let files: BTreeSet<&str> = scip
+        .graph()
+        .nodes
+        .iter()
+        .map(|node| node.file.as_str())
+        .collect();
+    let chunks: Vec<Chunk> = files
+        .iter()
+        .map(|path| file_chunk(path, root.as_deref()))
+        .collect();
+    let view = SnapshotView::new(
+        SnapshotRef {
+            indexed_at: "demo".into(),
+            fingerprint: "demo-1".into(),
+        },
+        chunks.iter().collect(),
+    );
     let now = Instant::now();
     let seed_hits = lexical
         .query(
@@ -225,6 +251,8 @@ async fn main() {
     let mut registry = Registry::new(60.0);
     registry.register(Box::new(lexical), 1.0, 20).unwrap();
     registry.register(Box::new(scip), 1.0, 20).unwrap();
+
+    compare_policies(&registry, &view, &chunks, &seeds, &question, &roots, &out).await;
 
     let rules = RuleList::from_json(&serde_json::json!([
         {"when": {"path_glob": "tests/**"}, "then": "prune"}
@@ -340,6 +368,192 @@ async fn main() {
     );
 }
 
+/// The chunk of one file: the whole file as one chunk.
+fn file_chunk(path: &str, root: Option<&Path>) -> Chunk {
+    let bytes = root
+        .and_then(|root| std::fs::read(root.join(path)).ok())
+        .unwrap_or_else(|| path.as_bytes().to_vec());
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |out, byte| format!("{out}{byte:02x}"));
+    Chunk {
+        relative_file_path: path.to_string(),
+        language: "rust".into(),
+        start_line: 1,
+        end_line: 1,
+        code: String::new(),
+        content_hash: hash,
+    }
+}
+
+/// Slice S5: the same question under both edge policies, and what differs.
+///
+/// Builds the pre-merged adjacency (timed), audits it against the maps on
+/// every node it holds, walks the question once per policy and diffs the two
+/// traces, then edits one file's blob and updates the adjacency to show how
+/// little it asks again. Everything goes to stderr; with `--out` the traces
+/// and the diff are written under it.
+async fn compare_policies(
+    registry: &Registry<'static>,
+    view: &SnapshotView<'_>,
+    chunks: &[Chunk],
+    seeds: &[Seed],
+    question: &str,
+    roots: &[NodeId],
+    out: &Option<PathBuf>,
+) {
+    let options = BuildOptions {
+        roots: roots.to_vec(),
+        ..BuildOptions::default()
+    };
+    let mut adjacency = MergedAdjacency::build_with(registry, view, &options).await;
+    let built = adjacency.stats().clone();
+    eprintln!(
+        "pre-merged build: {} rows ({} asked, {} incomplete) in {:.0} ms over {} file blobs",
+        built.nodes,
+        built.expanded,
+        built.incomplete,
+        built.elapsed_ms,
+        adjacency.blobs().len()
+    );
+
+    let nodes: Vec<NodeId> = adjacency.nodes().cloned().collect();
+    match audit_edge_sources(
+        &OnTheFly::new(registry, view),
+        &PreMerged::new(&adjacency),
+        &nodes,
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(report) => eprintln!(
+            "equivalence audit: {} nodes, {} fused edges, identical",
+            report.nodes, report.edges
+        ),
+        Err(failure) => eprintln!("equivalence audit FAILED: {}", failure.detail),
+    }
+
+    let budget = TraversalBudget {
+        pops: 200,
+        max_depth: 4,
+        deadline: Instant::now() + Duration::from_secs(60),
+        est_tokens: 100_000,
+        external_calls: 1000,
+    };
+    let fly = walk(
+        Box::new(OnTheFly::new(registry, view)),
+        seeds,
+        question,
+        budget,
+    )
+    .await;
+    let merged = walk(
+        Box::new(PreMerged::new(&adjacency)),
+        seeds,
+        question,
+        budget,
+    )
+    .await;
+    eprintln!(
+        "on-the-fly: {} pops, {} hops, {:.2} ms | pre-merged: {} pops, {} hops, {:.2} ms",
+        fly.totals.pops,
+        fly.totals.hops,
+        fly.totals.elapsed_ms,
+        merged.totals.pops,
+        merged.totals.hops,
+        merged.totals.elapsed_ms,
+    );
+    let diff = trace_diff(&fly.events, &merged.events);
+    eprintln!(
+        "trace diff: {} events vs {} events, {} differ",
+        fly.events.len(),
+        merged.events.len(),
+        diff.len()
+    );
+    for line in diff.iter().take(8) {
+        eprintln!("  {line}");
+    }
+    if let Some(out) = out {
+        let traces = out.join("traces");
+        for (policy, result) in [("on-the-fly", &fly), ("pre-merged", &merged)] {
+            let path = trace::write_trace(&traces, result).expect("write a policy trace");
+            eprintln!("{policy} trace {}", path.display());
+        }
+        std::fs::create_dir_all(out).expect("create the output directory");
+        std::fs::write(out.join("trace-diff.txt"), diff.join("\n")).expect("write the diff");
+    }
+
+    // One file is edited (its blob moves): the update asks only about the
+    // rows that depend on it.
+    if let Some(first) = chunks.first() {
+        let mut edited: Vec<Chunk> = chunks.to_vec();
+        edited[0].content_hash.push_str("-edited");
+        let after = SnapshotView::new(
+            SnapshotRef {
+                indexed_at: "demo".into(),
+                fingerprint: "demo-2".into(),
+            },
+            edited.iter().collect(),
+        );
+        let stats = adjacency.update(registry, &after, &options).await;
+        eprintln!(
+            "edit of {}: update asked {} of {} rows ({} reused, {} undated and so always asked), {} blob added, {} removed, {:.0} ms",
+            first.relative_file_path,
+            stats.expanded,
+            stats.nodes,
+            stats.reused,
+            stats.undated,
+            stats.blobs_added,
+            stats.blobs_removed,
+            stats.elapsed_ms,
+        );
+        let fresh = MergedAdjacency::build_with(registry, &after, &options).await;
+        eprintln!(
+            "update equals a build from nothing: {} (full build {:.0} ms)",
+            adjacency.canonical() == fresh.canonical(),
+            fresh.stats().elapsed_ms
+        );
+    }
+}
+
+/// Events that differ, by position, shortened.
+fn trace_diff(a: &[Value], b: &[Value]) -> Vec<String> {
+    let short = |event: Option<&Value>| {
+        event.map_or("(none)".to_string(), |e| {
+            let text = e.to_string();
+            text.chars().take(140).collect()
+        })
+    };
+    (0..a.len().max(b.len()))
+        .filter(|&i| a.get(i) != b.get(i))
+        .map(|i| {
+            format!(
+                "event {i}: on-the-fly {} | pre-merged {}",
+                short(a.get(i)),
+                short(b.get(i))
+            )
+        })
+        .collect()
+}
+
+/// A boxed source as a source, so one closure can walk either policy.
+struct BoxedSource<'a>(Box<dyn EdgeSource + 'a>);
+
+#[lci_maps::async_trait]
+impl EdgeSource for BoxedSource<'_> {
+    async fn edges(&self, node: &NodeId, budget: Budget) -> Expansion {
+        self.0.edges(node, budget).await
+    }
+
+    fn card(&self, map: lci_maps::MapId) -> lci_maps::edge::MapCard {
+        self.0.card(map)
+    }
+
+    fn set_enabled(&mut self, id: &str, on: bool) -> bool {
+        self.0.set_enabled(id, on)
+    }
+}
+
 /// The System One slot (slice S8) filled with a test double that is never
 /// sure, so the ladder goes on to the agent.
 struct NeverSure;
@@ -359,4 +573,17 @@ impl Handler for NeverSure {
             ..Decision::default()
         }
     }
+}
+
+/// One traversal of `question` over `source`, no handler.
+async fn walk(
+    source: Box<dyn EdgeSource + '_>,
+    seeds: &[Seed],
+    question: &str,
+    budget: TraversalBudget,
+) -> TraversalResult {
+    Traversal::new(BoxedSource(source), seeds.to_vec(), budget)
+        .question(question)
+        .run()
+        .await
 }
