@@ -16,8 +16,10 @@ pub mod kit;
 pub mod kit_c3;
 pub mod labels;
 pub mod run_record;
+pub mod scip_graph;
 pub mod scratch;
 pub mod symdefs;
+pub mod walk;
 
 /// Re-exported so a crate that implements [`Map`] needs no direct
 /// dependency on `async-trait`.
