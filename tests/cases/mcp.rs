@@ -2246,12 +2246,31 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
             .any(|n| n.contains("translator_leaf")),
         "{answer}"
     );
+    // `structure.contains` is on by default: the walk also climbs to the file.
+    assert!(reached.contains(&"file:src/lib.rs"), "{answer}");
+    assert!(
+        answer["totals"]["per_map"]["structure.contains"]
+            .as_u64()
+            .is_some_and(|calls| calls > 0),
+        "{answer}"
+    );
 
     // Every result item says where its node is: the repository-relative file
     // and the one-based line and column of the name (`scip_bytes` puts the
     // name of function `i` at line `i`, column 3).
+    // A file node (`structure.contains` climbs from a symbol to its file) is at
+    // the first line.
     for card in answer["results"].as_array().unwrap() {
         let node = card["node"].as_str().unwrap();
+        if node == "file:src/lib.rs" {
+            assert_eq!(card["via"], "structure.contains", "{card}");
+            assert_eq!(
+                card["site"],
+                json!({"path": "src/lib.rs", "line": 1, "col": 1}),
+                "{card}"
+            );
+            continue;
+        }
         let line = [
             ("translator_entry", 1),
             ("translator_helper", 2),
@@ -2274,7 +2293,15 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
     assert_eq!(start.seed_source.as_deref(), Some("hybrid"));
     assert_eq!(start.seed_hits.len(), hits.len());
     let ids: Vec<&str> = start.maps.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["seeds.hybrid", "seeds.scip_names", "graph.scip"]);
+    assert_eq!(
+        ids,
+        [
+            "seeds.hybrid",
+            "seeds.scip_names",
+            "graph.scip",
+            "structure.contains"
+        ]
+    );
     assert!(start.maps.iter().all(|m| m.enabled && m.weight == 1.0));
     let policy = start.policy.unwrap();
     assert!(policy.ladder.is_empty() && policy.tau.is_none() && policy.rules == 0);

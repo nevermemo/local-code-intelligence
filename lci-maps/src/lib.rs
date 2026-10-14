@@ -10,6 +10,7 @@
 //! and checked against `fuse_hits` bit for bit (test T0).
 
 pub mod audit;
+pub mod contains;
 pub mod crates;
 pub mod edge;
 pub mod fresh;
@@ -236,6 +237,9 @@ pub enum EdgeKind {
     CompileErrorAt,
     /// Near in embedding space.
     Near,
+    /// A declaration lies in a file or in an enclosing declaration (the
+    /// reverse of `Contains`, for climbing).
+    DefinedIn,
 }
 
 impl EdgeKind {
@@ -255,6 +259,7 @@ impl EdgeKind {
             Self::Cochange => "cochange",
             Self::CompileErrorAt => "compile_error_at",
             Self::Near => "near",
+            Self::DefinedIn => "defined_in",
         }
     }
 }

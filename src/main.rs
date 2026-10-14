@@ -388,9 +388,10 @@ struct TraverseArgs {
     /// them from the question.
     #[arg(long, value_delimiter = ',', conflicts_with = "handle")]
     seeds: Vec<String>,
-    /// Maps to use, comma separated: graph.scip, seeds.hybrid,
-    /// seeds.scip_names (default: all). Without seeds.hybrid the stand-in
-    /// seeds.scip_names finds the start nodes.
+    /// Maps to use, comma separated: graph.scip, structure.contains,
+    /// seeds.hybrid, seeds.scip_names (default: all). Without seeds.hybrid the
+    /// stand-in seeds.scip_names finds the start nodes; structure.contains
+    /// lets a chunk or file start node reach the symbols it holds.
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// The `[search_profiles.<name>]` the hybrid search for the start nodes

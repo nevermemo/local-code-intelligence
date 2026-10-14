@@ -36,6 +36,7 @@ use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
     Budget, Contribution, EdgeKind, Evidence, FreshnessModel, Map, MapDescriptor, MapHit, MapId,
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    contains::{CONTAINS_MAP_ID, ContainsMap},
     scip_graph::{DirSource, SCIP_MAP_ID, ScipMap, SourceText},
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
@@ -67,8 +68,11 @@ pub const SEEDS_MAP: MapId = "seeds.scip_names";
 /// The map of the start nodes the hybrid search found (`seed_source`
 /// `hybrid`).
 pub const SEEDS_HYBRID: MapId = "seeds.hybrid";
-/// The maps a traversal can use, in registration order.
-pub const MAPS: [MapId; 3] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID];
+/// The maps a traversal can use, in registration order. All of them are on
+/// unless the caller names the ones it wants; `structure.contains` is what
+/// lets a chunk or file start node (what the hybrid search often finds) reach
+/// the symbols the SCIP graph walks.
+pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP_ID];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
 /// Most symbols one hit of the hybrid search may start from (a chunk that
@@ -185,6 +189,9 @@ struct Loaded {
     stamp: (Option<SystemTime>, u64),
     scip: Arc<ScipMap>,
     names: Arc<NameSeeds>,
+    /// The containment of the graph's files and symbols (map
+    /// `structure.contains`); a call adds the lines of its chunk seeds.
+    contains: ContainsMap,
     /// The graph nodes of each file (path as the index writes it, `/`
     /// separated), in graph order.
     by_file: HashMap<String, Vec<usize>>,
@@ -193,6 +200,7 @@ struct Loaded {
 impl Loaded {
     fn new(stamp: (Option<SystemTime>, u64), scip: ScipMap) -> Self {
         let names = NameSeeds::new(&scip);
+        let contains = ContainsMap::new(&scip);
         let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, node) in scip.graph().nodes.iter().enumerate() {
             by_file
@@ -204,6 +212,7 @@ impl Loaded {
             stamp,
             scip: Arc::new(scip),
             names: Arc::new(names),
+            contains,
             by_file,
         }
     }
@@ -919,6 +928,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         Box::new(Shared(loaded.scip.clone())),
         wants(SCIP_MAP_ID),
     )?;
+    register(
+        &mut registry,
+        &mut plan_maps,
+        Box::new(loaded.contains.with_chunk_lines(chunk_lines(&found))),
+        wants(CONTAINS_MAP_ID),
+    )?;
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
@@ -980,6 +995,21 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         response,
         trace: trace_path,
     })
+}
+
+/// The lines of the chunk start nodes (1-based, inclusive), which a chunk's
+/// node id does not carry, for `structure.contains`.
+fn chunk_lines(found: &Seeds) -> Vec<(NodeId, (u32, u32))> {
+    found
+        .nodes
+        .iter()
+        .zip(&found.details)
+        .filter(|(seed, _)| seed.node.kind() == NodeKind::Chunk)
+        .filter_map(|(seed, info)| {
+            let line = |i: usize| u32::try_from(info["lines"][i].as_u64()?).ok();
+            Some((seed.node.clone(), (line(0)?, line(1)?)))
+        })
+        .collect()
 }
 
 /// The start nodes of a call and where they came from.
@@ -1045,10 +1075,17 @@ async fn find_seeds(
                     };
                     let chunks = kinds("chunk") + kinds("file");
                     if chunks > 0 {
-                        found.notes.push(format!(
-                            "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; nothing expands them",
-                            mapped.len()
-                        ));
+                        found.notes.push(if wanted.contains(&CONTAINS_MAP_ID) {
+                            format!(
+                                "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; {CONTAINS_MAP_ID} expands them to the symbols they contain",
+                                mapped.len()
+                            )
+                        } else {
+                            format!(
+                                "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; nothing expands them (add {CONTAINS_MAP_ID} to the maps)",
+                                mapped.len()
+                            )
+                        });
                     }
                     found.source = "hybrid";
                     for seed in mapped {
@@ -1261,6 +1298,12 @@ fn add_sites(response: &mut Value, loaded: &Loaded, seeds: &[Value]) {
         return;
     }
     let mut sites: HashMap<String, Value> = HashMap::new();
+    // A file node is at its first line (`structure.contains` climbs to files).
+    for node in &wanted {
+        if let Ok(NodeId::File { path }) = NodeId::from_str(node) {
+            sites.insert(node.clone(), site_json(&path, 1, 1));
+        }
+    }
     // Chunk and file seeds first, so a symbol's definition wins.
     for seed in seeds {
         let (Some(node), Some(path), Some(line)) = (
@@ -1575,6 +1618,48 @@ mod tests {
         assert_eq!(got, [pair("helper", "defined")]);
     }
 
+    #[tokio::test]
+    async fn a_chunk_seed_between_functions_is_expanded_by_the_containment_map() {
+        let loaded = loaded();
+        // Line 12 (1-based) is the gap before `parse_query`: a chunk seed.
+        let hits = [
+            hit("src/search.rs", (11, 12), 1),
+            hit("src/other.rs", (4, 6), 2),
+        ];
+        let seeds = map_hits(&loaded, "x", &hits);
+        let found = Seeds {
+            nodes: seeds
+                .iter()
+                .map(|seed| Seed {
+                    node: seed.node.clone(),
+                    map: Some(SEEDS_HYBRID),
+                })
+                .collect(),
+            details: seeds.iter().map(|seed| seed.info.clone()).collect(),
+            ..Seeds::default()
+        };
+        // Only the chunk node has lines to give.
+        let lines = chunk_lines(&found);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!((lines[0].0.kind(), lines[0].1), (NodeKind::Chunk, (11, 12)));
+
+        let map = loaded.contains.with_chunk_lines(lines.clone());
+        let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+        let budget = Budget {
+            deadline: Instant::now() + Duration::from_secs(5),
+            max_external_calls: u32::MAX,
+            max_nodes_touched: u64::MAX,
+        };
+        let edges = map.expand(&lines[0].0, budget, &view).await;
+        // No function lies on those lines: all the file's functions follow.
+        assert_eq!(edges.len(), 9, "{edges:?}");
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.kind == EdgeKind::Contains && e.map == CONTAINS_MAP_ID)
+        );
+    }
+
     #[test]
     fn lines_are_counted_from_1_in_chunks_and_from_0_in_the_graph() {
         let loaded = loaded();
@@ -1651,13 +1736,18 @@ mod tests {
         );
         let symbol = seeds.iter().find(|s| s.info["kind"] == "symbol").unwrap();
         let chunk = seeds.iter().find(|s| s.info["kind"] == "chunk").unwrap();
-        let unknown = NodeId::file("src/elsewhere.rs").unwrap().to_string();
+        let unknown = NodeId::Commit {
+            sha: "a".repeat(40),
+        }
+        .to_string();
+        let file = NodeId::file("src/elsewhere.rs").unwrap().to_string();
         let card = |node: &str| json!({"node": node, "via": null});
         let mut response = json!({
             "results": [
                 card(&symbol.node.to_string()),
                 card(&chunk.node.to_string()),
                 card(&unknown),
+                card(&file),
             ],
             "checkpoint": {
                 "answer": [card(&symbol.node.to_string())],
@@ -1677,6 +1767,11 @@ mod tests {
         );
         // Nothing locates this one, so the field is left out.
         assert!(response["results"][2].get("site").is_none());
+        // A file node is at its first line, wherever it is.
+        assert_eq!(
+            response["results"][3]["site"],
+            json!({"path": "src/elsewhere.rs", "line": 1, "col": 1})
+        );
         // The checkpoint's cards carry the same site as the results'.
         assert_eq!(response["checkpoint"]["answer"][0]["site"], *site);
         assert_eq!(response["checkpoint"]["frontier"][0]["site"], *site);

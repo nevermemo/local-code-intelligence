@@ -229,7 +229,11 @@ pub fn kind_prior(kind: EdgeKind) -> f64 {
         EdgeKind::Implements => 0.9,
         EdgeKind::Imports | EdgeKind::ReadsKey => 0.8,
         EdgeKind::Tests => 0.7,
-        EdgeKind::Contains | EdgeKind::QueryMatch | EdgeKind::Touched | EdgeKind::Cochange => 0.5,
+        EdgeKind::Contains
+        | EdgeKind::DefinedIn
+        | EdgeKind::QueryMatch
+        | EdgeKind::Touched
+        | EdgeKind::Cochange => 0.5,
         EdgeKind::Mentions => 0.4,
         EdgeKind::Near | EdgeKind::Prior => 0.3,
     }
