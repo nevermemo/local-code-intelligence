@@ -13,7 +13,9 @@
 
 use lci_maps::{
     impact::{ImpactIndex, SourceCache, dir_source},
-    reads_key::{CONFIG_RS, Class, build_key_table, extract, in_cfg_test_module},
+    reads_key::{
+        CONFIG_RS, Class, build_key_table, extract, in_cfg_test_module, rs_files, test_module_files,
+    },
     walk::wilson,
 };
 use serde_json::{Map, Value, json};
@@ -68,6 +70,7 @@ fn reads_key(m: &BTreeMap<String, String>) {
     let table = build_key_table(&ix, &src);
     let edges = extract(&ix, &root, &src, &table).expect("extract");
     let mut cache = SourceCache::new(&src);
+    let test_files = test_module_files(&src, &rs_files(&root).expect("files"));
 
     let keys: Vec<Value> = table
         .iter()
@@ -87,6 +90,7 @@ fn reads_key(m: &BTreeMap<String, String>) {
         }
         *per_key.entry(e.key.clone()).or_default() += 1;
         let test = is_test_path(&e.decl.path)
+            || test_files.contains(&e.decl.path)
             || in_cfg_test_module(&mut cache, &e.decl.path, e.decl.line as usize - 1);
         out_edges.push(json!({
             "key": e.key,
@@ -189,8 +193,8 @@ fn check_flow(m: &BTreeMap<String, String>) {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|r| s(&r["path"]) != CONFIG_RS)
-            .map(|r| (s(&r["path"]), r["line"].as_u64().unwrap_or(0)))
+            .filter(|r| s(&r["file"]) != CONFIG_RS)
+            .map(|r| (s(&r["file"]), r["line"].as_u64().unwrap_or(0)))
             .collect();
         let ex_set: BTreeSet<(String, u64)> = all_edges
             .iter()

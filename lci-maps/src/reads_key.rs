@@ -1311,3 +1311,78 @@ dup = 2
         assert_eq!(word_at_init("    xrerank: 4", "rerank"), None);
     }
 }
+
+/// Files that are out-of-line test modules: `#[cfg(test)]` followed (within 3
+/// lines) by `mod name;` in a file, resolved to `name.rs` or `name/mod.rs`
+/// beside it (a file other than `mod.rs`, `lib.rs`, `main.rs` looks in the
+/// directory named after its stem).
+pub fn test_module_files(src: &dyn SourceText, files: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in files {
+        let lines = text_lines(src, f);
+        let (dir, stem) = match f.rsplit_once('/') {
+            Some((d, n)) => (d.to_string(), n.trim_end_matches(".rs").to_string()),
+            None => (String::new(), f.trim_end_matches(".rs").to_string()),
+        };
+        let base = if matches!(stem.as_str(), "mod" | "lib" | "main") {
+            dir.clone()
+        } else if dir.is_empty() {
+            stem.clone()
+        } else {
+            format!("{dir}/{stem}")
+        };
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim().starts_with("#[cfg(test)]") {
+                continue;
+            }
+            for next in lines.iter().skip(i + 1).take(3) {
+                let t = next.trim();
+                let t = t.strip_prefix("pub ").unwrap_or(t);
+                if let Some(name) = t.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')) {
+                    let name = name.trim();
+                    let join = |n: &str| {
+                        if base.is_empty() {
+                            n.to_string()
+                        } else {
+                            format!("{base}/{n}")
+                        }
+                    };
+                    out.insert(join(&format!("{name}.rs")));
+                    out.insert(join(&format!("{name}/mod.rs")));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod test_module_tests {
+    use super::*;
+
+    struct Mem(HashMap<String, String>);
+    impl SourceText for Mem {
+        fn read(&self, p: &str) -> Option<Vec<u8>> {
+            self.0.get(p).map(|s| s.clone().into_bytes())
+        }
+    }
+
+    #[test]
+    fn out_of_line_test_modules_resolve_beside_the_declaring_file() {
+        let mut m = HashMap::new();
+        m.insert(
+            "src/evaluate.rs".to_string(),
+            "mod a;\n#[cfg(test)]\nmod tests;\n".to_string(),
+        );
+        m.insert(
+            "src/lib.rs".to_string(),
+            "#[cfg(test)]\npub mod t;\n".to_string(),
+        );
+        let files = vec!["src/evaluate.rs".to_string(), "src/lib.rs".to_string()];
+        let got = test_module_files(&Mem(m), &files);
+        assert!(got.contains("src/evaluate/tests.rs"));
+        assert!(got.contains("src/t.rs"));
+        assert!(!got.contains("src/evaluate/a.rs"));
+    }
+}

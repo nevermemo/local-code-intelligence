@@ -11,7 +11,13 @@
 //!                        [--gold impact.json (O, OD only)] [--anchors anchors.json] \
 //!                        [--size-from C-run.json (B, R)] [--seed 1] --out run.json
 //! impact_eval kinds      --scip INDEX.scip --root TREE
+//! impact_eval anchors-key --scip INDEX.scip --root TREE --input anchor-input.json //!                        --edges edges.json --rule C|N [--k 5] --out anchors-key.json
 //! ```
+//!
+//! Slice M1.2 (`docs/spike/multimap/v2/m1.2-prereg.md`) adds the arms
+//! `OT|NTa|NT|CTa|CT` to `run` (with `--edges edges.json`; `NTa|NT` take the N key
+//! anchors, `CTa|CT` the C key anchors; `--edge-classes` keeps only the listed
+//! witness classes, default all) and the `anchors-key` step.
 //!
 //! `make-input` is the only step that reads the gold before the anchors are
 //! frozen, and only for the item ids and the questions (an alignment check).
@@ -22,6 +28,9 @@ use lci_maps::{
     impact::{
         Chunk, Decl, ImpactIndex, SourceCache, arm_b, arm_r, arm_v, code_names, dir_source,
         reverse_reach,
+    },
+    reads_key::{
+        Class, KeyAnchor, KeyEntry, KeyResolution, Via, anchor_c_t, anchor_n_t, key_of_symbol,
     },
     scip_graph::ScipGraph,
     walk::wilson,
@@ -78,6 +87,7 @@ fn main() {
     match mode.as_str() {
         "make-input" => make_input(&m),
         "anchors" => anchors(&m),
+        "anchors-key" => anchors_key(&m),
         "label" => label(&m),
         "run" => run(&m),
         "kinds" => kinds(&m),
@@ -189,6 +199,115 @@ fn anchors(m: &BTreeMap<String, String>) {
     );
 }
 
+fn load_table(path: &str) -> Vec<KeyEntry> {
+    let v = read_json(path);
+    v["keys"]
+        .as_array()
+        .expect("edges.keys")
+        .iter()
+        .map(|k| KeyEntry {
+            section: k["section"].as_str().map(str::to_string),
+            key: s(&k["key"]),
+            toml_line: k["toml_line"].as_u64().unwrap_or(0) as u32,
+            field_symbol: k["field_symbol"].as_str().map(str::to_string),
+            owner: k["owner"].as_str().map(str::to_string),
+            renamed: k["renamed"].as_bool().unwrap_or(false),
+        })
+        .collect()
+}
+
+/// Edge declarations per key id, restricted to the listed witness classes.
+fn load_edges(path: &str, classes: Option<&str>) -> BTreeMap<String, Vec<Decl>> {
+    let v = read_json(path);
+    let keep: Option<Vec<&str>> = classes.map(|c| c.split(',').collect());
+    let mut out: BTreeMap<String, Vec<Decl>> = BTreeMap::new();
+    for e in v["edges"].as_array().expect("edges.edges") {
+        let class = s(&e["class"]);
+        if keep.as_ref().is_some_and(|k| !k.contains(&class.as_str())) {
+            continue;
+        }
+        out.entry(s(&e["key"])).or_default().push(Decl {
+            path: s(&e["path"]),
+            line: e["line"].as_u64().unwrap_or(0) as u32,
+            name: s(&e["name"]),
+            symbol: s(&e["symbol"]),
+        });
+    }
+    let _ = Class::Confirmed;
+    out
+}
+
+fn anchors_key(m: &BTreeMap<String, String>) {
+    assert!(
+        !m.contains_key("--gold"),
+        "the anchor step has no gold option"
+    );
+    let ix = load_index(m);
+    let table = load_table(need(m, "--edges"));
+    let input = read_json(need(m, "--input"));
+    let rule = need(m, "--rule");
+    let k: u32 = m
+        .get("--k")
+        .map_or(5, |v| v.parse().expect("--k is a number"));
+    let mut items = Map::new();
+    let (mut found, mut none, mut via_table, mut abstained) = (0, 0, 0, 0);
+    for it in input.as_array().expect("input array") {
+        let id = s(&it["id"]);
+        let query = s(&it["query"]);
+        let evidence: Vec<Chunk> = it["evidence"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| Chunk {
+                rank: e["rank"].as_u64().unwrap_or(0) as u32,
+                path: s(&e["path"]),
+                start_line: e["start_line"].as_u64().unwrap_or(0) as u32,
+                end_line: e["end_line"].as_u64().unwrap_or(0) as u32,
+            })
+            .collect();
+        let (anchor, resolution): (Option<KeyAnchor>, Option<KeyResolution>) = match rule {
+            "N" => {
+                let (a, r) = anchor_n_t(&ix, &table, &query);
+                (a, Some(r))
+            }
+            "C" => (anchor_c_t(&ix, &table, &query, &evidence, k), None),
+            other => panic!("unknown rule {other}"),
+        };
+        let res = match resolution {
+            Some(KeyResolution::Key(_)) => "key",
+            Some(KeyResolution::Abstain) => "abstain",
+            Some(KeyResolution::None) => "none",
+            None => "-",
+        };
+        if res == "abstain" {
+            abstained += 1;
+        }
+        let entry = match anchor {
+            Some(a) => {
+                found += 1;
+                if a.via == Via::Table {
+                    via_table += 1;
+                }
+                let key = key_of_symbol(&table, &a.symbol).map(KeyEntry::id);
+                json!({"symbol": a.symbol, "key": key, "chunk_rank": a.chunk_rank,
+                       "via": if a.via == Via::Table { "table" } else { "base" }, "resolution": res})
+            }
+            None => {
+                none += 1;
+                json!({"symbol": null, "key": null, "via": "none", "resolution": res})
+            }
+        };
+        items.insert(id, entry);
+    }
+    write_json(
+        need(m, "--out"),
+        &json!({"rule": rule, "k": if rule == "C" { json!(k) } else { Value::Null }, "items": items}),
+    );
+    eprintln!(
+        "anchors-key {rule} k={k}: {found} anchored ({via_table} through the key table), {none} none, {abstained} abstained"
+    );
+}
+
 fn label(m: &BTreeMap<String, String>) {
     let anchors = read_json(need(m, "--anchors"));
     let gold = read_json(need(m, "--gold"));
@@ -276,7 +395,7 @@ fn kinds(m: &BTreeMap<String, String>) {
 
 fn run(m: &BTreeMap<String, String>) {
     let arm = need(m, "--arm");
-    let seeded = matches!(arm, "O" | "OD");
+    let seeded = matches!(arm, "O" | "OD" | "OT");
     assert!(
         seeded || !m.contains_key("--gold"),
         "arm {arm} must not be given the gold"
@@ -317,6 +436,28 @@ fn run(m: &BTreeMap<String, String>) {
         BTreeMap::new()
     };
     let units = ix.unit_defs();
+    let t_arm = matches!(arm, "OT" | "NTa" | "NT" | "CTa" | "CT");
+    let table: Vec<KeyEntry> = if t_arm {
+        load_table(need(m, "--edges"))
+    } else {
+        Vec::new()
+    };
+    let edges: BTreeMap<String, Vec<Decl>> = if t_arm {
+        load_edges(
+            need(m, "--edges"),
+            m.get("--edge-classes").map(String::as_str),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    // Key translation: the closure of the key's field joined with the key's edges.
+    let clt = |sym: &str| -> Vec<Decl> {
+        let mut out: Vec<Decl> = ix.closure(sym).into_iter().map(|d| ix.decl(d)).collect();
+        if let Some(e) = key_of_symbol(&table, sym) {
+            out.extend(edges.get(&e.id()).cloned().unwrap_or_default());
+        }
+        out
+    };
 
     let mut out = Map::new();
     let (mut empty, mut total, mut max, mut defects, mut no_start) = (0, 0, 0, 0, 0);
@@ -330,9 +471,10 @@ fn run(m: &BTreeMap<String, String>) {
                     .collect()
             }
             (_, None) => Vec::new(),
-            ("O" | "C" | "N", Some(sym)) => {
+            ("O" | "C" | "N" | "NTa" | "CTa", Some(sym)) => {
                 ix.closure(sym).into_iter().map(|d| ix.decl(d)).collect()
             }
+            ("OT" | "NT" | "CT", Some(sym)) => clt(sym),
             ("V", Some(sym)) => match ix.def_index(sym) {
                 Some(a) => arm_v(&ix, &root, &mut cache, a)
                     .expect("rg")
