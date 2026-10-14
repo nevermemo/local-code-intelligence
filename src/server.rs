@@ -293,13 +293,14 @@ impl McpServer {
         if mode.is_some() {
             return self.answer(
                 traverse::search(
-                    &self.app.config,
+                    &self.app,
                     &args.workspace_path,
                     &args.query,
                     args.top_k,
                     budget.as_ref(),
                     steer.as_ref(),
                     handle.as_deref(),
+                    self.search_profile.as_deref(),
                 )
                 .await,
             );

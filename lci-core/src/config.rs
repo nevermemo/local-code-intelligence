@@ -507,10 +507,15 @@ pub struct TraverseConfig {
     /// Confidence a rung of the steering ladder needs to decide a stop,
     /// from `0` to `1`.
     pub tau: f32,
+    /// Hits of the hybrid search (the pipeline `search_code` runs, with the
+    /// profile of the request) that become start nodes when a request gives
+    /// a question and no seeds, `1..=40`.
+    pub seed_k: u32,
 }
 
 impl TraverseConfig {
     pub const MAX_POPS_LIMIT: u32 = 2000;
+    pub const MAX_SEED_K_LIMIT: u32 = 40;
     pub const MAX_DEPTH_LIMIT: u32 = 32;
     pub const MAX_EST_TOKENS_LIMIT: u64 = 1_000_000;
     pub const MAX_DEADLINE_MS_LIMIT: u64 = 60_000;
@@ -560,6 +565,12 @@ impl TraverseConfig {
             "traverse.tau must be a number from 0 to 1 (got {})",
             self.tau
         );
+        ensure!(
+            (1..=Self::MAX_SEED_K_LIMIT).contains(&self.seed_k),
+            "traverse.seed_k must be 1..={} (got {})",
+            Self::MAX_SEED_K_LIMIT,
+            self.seed_k
+        );
         Ok(())
     }
 }
@@ -575,6 +586,7 @@ impl Default for TraverseConfig {
             deadline_ms: 5_000,
             max_stops: 4,
             tau: 0.8,
+            seed_k: 8,
         }
     }
 }
@@ -2726,6 +2738,7 @@ mod tests {
         assert_eq!(value["traverse"]["enabled"], true);
         assert_eq!(value["traverse"]["scip_index"], "index.scip");
         assert_eq!(value["traverse"]["max_pops"], 200);
+        assert_eq!(value["traverse"]["seed_k"], 8);
     }
 
     #[test]
@@ -2733,7 +2746,7 @@ mod tests {
         let text = format!("{}[traverse]\nnope = 1\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 9] = [
+        let bad: [(&str, Set); 11] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2747,6 +2760,10 @@ mod tests {
             }),
             ("tau", |t| t.tau = 1.5),
             ("tau", |t| t.tau = f32::NAN),
+            ("seed_k", |t| t.seed_k = 0),
+            ("seed_k", |t| {
+                t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1
+            }),
         ];
         for (key, set) in bad {
             let mut config = Config {

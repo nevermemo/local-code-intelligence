@@ -280,13 +280,17 @@ wait_for_existing_job_seconds = 120
 # are exactly those of a server without the mode, and a request that asks for
 # the mode is an error. Enabled, a request with mode = "traverse" walks the
 # workspace's SCIP index (map graph.scip, written by `rust-analyzer scip`;
-# symbol names in the query pick the start nodes) under the budget, the rule
+# the start nodes are the top seed_k hits of the hybrid search search_code runs
+# in its normal mode, mapped to symbols of the index) under the budget, the rule
 # list and the stop settings of its steer object, and returns the reached
 # nodes with the trace totals; a handle and a checkpoint come back only when
 # the steering ladder could not decide a stop or the budget ran out. The
 # limits below are caps: a request may lower them, never raise them. The same
-# walk runs offline as `lci traverse`, which needs no services and ignores
-# enabled. Traces and handles are written under data_dir.
+# walk runs as `lci traverse`, which ignores enabled and, given --root, seeds
+# from the hybrid search of that tree (the model services it configures). A stand-in that matches the question's words against symbol names
+# replaces the hybrid search only when it is unavailable or finds nothing, and
+# the response and the trace say so (seed_source). Traces and handles are
+# written under data_dir.
 [traverse]
 enabled = false
 # A relative path is taken from the workspace directory.
@@ -297,3 +301,5 @@ max_est_tokens = 20000
 deadline_ms = 5000
 max_stops = 4
 tau = 0.8
+# Hits of the hybrid search that become start nodes, 1 to 40.
+seed_k = 8

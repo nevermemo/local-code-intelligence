@@ -147,6 +147,176 @@ pub fn trace_hash(events: &[Value]) -> String {
     hash16(jsonl(events).as_bytes())
 }
 
+/// One map of the plan: what the `start` event records of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanMap {
+    pub id: String,
+    pub version: u32,
+    pub weight: f64,
+    pub enabled: bool,
+}
+
+impl PlanMap {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "version": self.version,
+            "weight": self.weight,
+            "enabled": self.enabled,
+        })
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            id: value.get("id")?.as_str()?.to_owned(),
+            version: value.get("version").and_then(Value::as_u64).unwrap_or(0) as u32,
+            weight: value.get("weight").and_then(Value::as_f64).unwrap_or(1.0),
+            enabled: value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        })
+    }
+}
+
+/// The steering policy of the plan, besides the stop policy the engine
+/// already knows: the rungs, the confidence a rung needs and the rule count.
+/// All empty (no rungs, no `tau`, no rules) for a walk without a handler.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanPolicy {
+    /// The rungs in order, ending with `agent`; empty without a handler.
+    pub ladder: Vec<String>,
+    pub tau: Option<f32>,
+    pub rules: u32,
+}
+
+/// What the caller says about a run that the engine cannot know: the maps
+/// registered (ids, versions, weights), the steering policy and where the
+/// start nodes came from. Set with `Traversal::plan`; the `start` event then
+/// carries `maps`, `policy` (the stop policy as `stops` plus the fields of
+/// [`PlanPolicy`]), and, when given, `seed_source` and `seed_hits`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StartPlan {
+    pub maps: Vec<PlanMap>,
+    pub policy: PlanPolicy,
+    /// `hybrid`, `name_tokens` or `given`.
+    pub seed_source: Option<String>,
+    /// Per start node: the retrievers that found it and their scores (the
+    /// caller's JSON objects).
+    pub seed_hits: Vec<Value>,
+}
+
+impl StartPlan {
+    /// The fields the engine adds to the `start` event, given the stop
+    /// policy as the engine writes it.
+    pub fn fields(&self, stops: Value) -> Vec<(&'static str, Value)> {
+        let mut fields = vec![
+            (
+                "maps",
+                Value::Array(self.maps.iter().map(PlanMap::to_json).collect()),
+            ),
+            (
+                "policy",
+                json!({
+                    "stops": stops,
+                    "ladder": self.policy.ladder,
+                    // f32 to six places, so 0.8 is written 0.8.
+                    "tau": self.policy.tau.map(|t| (f64::from(t) * 1e6).round() / 1e6),
+                    "rules": self.policy.rules,
+                }),
+            ),
+        ];
+        if let Some(source) = &self.seed_source {
+            fields.push(("seed_source", json!(source)));
+        }
+        if !self.seed_hits.is_empty() {
+            fields.push(("seed_hits", Value::Array(self.seed_hits.clone())));
+        }
+        fields
+    }
+}
+
+/// A `start` event as a reader sees it. Traces written before `maps` and
+/// `policy` existed have neither: they read as an empty list and `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartEvent {
+    pub question: String,
+    pub seeds: Vec<String>,
+    pub budget: Value,
+    pub scorer: Option<String>,
+    pub stops: Value,
+    pub maps: Vec<PlanMap>,
+    pub policy: Option<StartPolicy>,
+    pub seed_source: Option<String>,
+    pub seed_hits: Vec<Value>,
+}
+
+/// The `policy` of a `start` event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartPolicy {
+    pub stops: Value,
+    pub ladder: Vec<String>,
+    pub tau: Option<f32>,
+    pub rules: u32,
+}
+
+impl StartEvent {
+    /// Reads a `start` event; `None` when `event` is not one.
+    pub fn from_json(event: &Value) -> Option<Self> {
+        if event.get("ev")?.as_str()? != "start" {
+            return None;
+        }
+        let strings = |value: Option<&Value>| -> Vec<String> {
+            value
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(Self {
+            question: event
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            seeds: strings(event.get("seeds")),
+            budget: event.get("budget").cloned().unwrap_or(Value::Null),
+            scorer: event
+                .get("scorer")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            stops: event.get("stops").cloned().unwrap_or(Value::Null),
+            maps: event
+                .get("maps")
+                .and_then(Value::as_array)
+                .map(|maps| maps.iter().filter_map(PlanMap::from_json).collect())
+                .unwrap_or_default(),
+            policy: event
+                .get("policy")
+                .filter(|p| p.is_object())
+                .map(|policy| StartPolicy {
+                    stops: policy.get("stops").cloned().unwrap_or(Value::Null),
+                    ladder: strings(policy.get("ladder")),
+                    tau: policy.get("tau").and_then(Value::as_f64).map(|t| t as f32),
+                    rules: policy.get("rules").and_then(Value::as_u64).unwrap_or(0) as u32,
+                }),
+            seed_source: event
+                .get("seed_source")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            seed_hits: event
+                .get("seed_hits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+}
+
 /// Appends events to a JSONL file.
 pub struct TraceWriter {
     out: BufWriter<File>,

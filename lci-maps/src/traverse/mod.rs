@@ -201,6 +201,7 @@ pub struct Traversal<'s> {
     targets: Vec<NodeId>,
     resume: Option<handle::Snapshot>,
     steer: Option<Steer>,
+    plan: Option<trace::StartPlan>,
 }
 
 impl<'s> Traversal<'s> {
@@ -218,7 +219,16 @@ impl<'s> Traversal<'s> {
             targets: Vec::new(),
             resume: None,
             steer: None,
+            plan: None,
         }
+    }
+
+    /// What the caller knows of the run that the engine does not (maps with
+    /// weights, steering policy, where the seeds came from): written into
+    /// the `start` event. Without it the event has none of those fields.
+    pub fn plan(mut self, plan: trace::StartPlan) -> Self {
+        self.plan = Some(plan);
+        self
     }
 
     /// The outer agent's answer to a returned checkpoint (rung 3), applied
@@ -383,7 +393,7 @@ impl<'s> Run<'s> {
         if let Some(snapshot) = self.t.resume.take() {
             self.restore(snapshot);
         } else {
-            self.events.push(json!({
+            let mut start = json!({
                 "ev": "start",
                 "question": self.t.question,
                 "seeds": self.t.seeds.iter().map(|s| s.node.to_string()).collect::<Vec<_>>(),
@@ -395,7 +405,13 @@ impl<'s> Run<'s> {
                 },
                 "scorer": self.t.scorer.label(),
                 "stops": stops_json(&self.t.stops),
-            }));
+            });
+            if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
+                for (key, value) in plan.fields(stops_json(&self.t.stops)) {
+                    object.insert(key.to_owned(), value);
+                }
+            }
+            self.events.push(start);
             let seeds = std::mem::take(&mut self.t.seeds);
             let fanout = seeds.len() as u32;
             for seed in &seeds {

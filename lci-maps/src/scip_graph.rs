@@ -173,7 +173,14 @@ pub struct Node {
     pub name: String,
     pub kind: FnKind,
     pub file: String,
+    /// The line of the name (0-based, as SCIP counts).
     pub line: u32,
+    /// The column of the name (0-based).
+    pub col: u32,
+    /// The first and last line (0-based, inclusive) of the definition's
+    /// enclosing range, after the repair; the name line alone when the index
+    /// gave none.
+    pub span: (u32, u32),
 }
 
 /// Counts from loading, for the evaluation's report.
@@ -301,6 +308,10 @@ impl ScipGraph {
                     kind,
                     file: def.path.clone(),
                     line: def.name_range.0,
+                    col: def.name_range.1,
+                    span: def
+                        .enclosing
+                        .map_or((def.name_range.0, def.name_range.0), |enc| (enc.0, enc.2)),
                 });
             }
         }

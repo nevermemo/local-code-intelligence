@@ -336,10 +336,14 @@ enum Command {
         #[arg(long, value_parser = parse_non_negative)]
         vote_weight: Option<f32>,
     },
-    /// Walk the code graph of a SCIP index from the symbols a question names
-    /// (or from given nodes), under a budget and optional steering rules, and
-    /// write the trace. Works offline: no model service, index store or
-    /// language server is used, and `[traverse] enabled` does not apply (it
+    /// Walk the code graph of a SCIP index from the start nodes a question
+    /// finds (or from given nodes), under a budget and optional steering
+    /// rules, and write the trace. With `--root` the start nodes are the top
+    /// hits of the hybrid search over that tree (its index and the configured
+    /// model services, as `search` uses them), mapped to the index's symbols;
+    /// without it, or when that search fails or finds nothing, a stand-in that
+    /// matches the question's words against symbol names is used and the
+    /// output says so (`seed_source`). `[traverse] enabled` does not apply (it
     /// only gates the MCP mode). The limits are the `[traverse]` caps. Prints
     /// one JSON object: the reached nodes, the totals, the handlers'
     /// decisions and, when the ladder could not decide a stop or the budget
@@ -371,20 +375,28 @@ struct TraverseArgs {
     /// The SCIP index to walk (from `rust-analyzer scip`).
     #[arg(long)]
     scip: PathBuf,
-    /// The tree the index describes, read for the enclosing-range repair.
+    /// The tree the index describes, read for the enclosing-range repair and
+    /// searched for the start nodes (it must be the workspace `search` indexes).
     #[arg(long)]
     root: Option<PathBuf>,
-    /// The question; the symbol names in it pick the start nodes.
+    /// The question; the start nodes come from the hybrid search for it (the
+    /// stand-in that matches its words against symbol names when that is not
+    /// available).
     #[arg(long, conflicts_with = "handle")]
     question: Option<String>,
     /// Start nodes (canonical node ids, comma separated) instead of finding
     /// them from the question.
     #[arg(long, value_delimiter = ',', conflicts_with = "handle")]
     seeds: Vec<String>,
-    /// Maps to use, comma separated: graph.scip, seeds.scip_names (default:
-    /// both).
+    /// Maps to use, comma separated: graph.scip, seeds.hybrid,
+    /// seeds.scip_names (default: all). Without seeds.hybrid the stand-in
+    /// seeds.scip_names finds the start nodes.
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
+    /// The `[search_profiles.<name>]` the hybrid search for the start nodes
+    /// runs with (default: the base configuration).
+    #[arg(long)]
+    search_profile: Option<String>,
     /// The steering policy: a JSON file or inline JSON, either an array of
     /// rules or the object of `search_code`'s `steer` (rules, ladder,
     /// max_stops, tau, stop_every).
@@ -480,6 +492,27 @@ async fn run_traverse(
         None => Dirs::under(&config.data_dir),
     };
     let maps = (!args.maps.is_empty()).then_some(args.maps.as_slice());
+    // The hybrid search needs the application (index store, model services);
+    // open it only when the start nodes come from a question over a tree.
+    let wants_search = args.seeds.is_empty()
+        && args.handle.is_none()
+        && args.question.is_some()
+        && (maps.is_none_or(|ids| ids.iter().any(|id| id == traverse::SEEDS_HYBRID)));
+    let app = match (&args.root, wants_search) {
+        (Some(_), true) => Some(App::open(config.clone()).await),
+        _ => None,
+    };
+    let seed_search: Option<Box<dyn traverse::SeedSearch + '_>> = match (&app, &args.root) {
+        (Some(Ok(app)), Some(root)) => Some(Box::new(traverse::AppSeeds {
+            app,
+            workspace: root,
+            profile: args.search_profile.as_deref(),
+        })),
+        (Some(Err(error)), _) => Some(Box::new(traverse::NoSearch(format!(
+            "the application did not open: {error:#}"
+        )))),
+        _ => None,
+    };
     let report = traverse::run(
         &config.traverse,
         &dirs,
@@ -488,6 +521,7 @@ async fn run_traverse(
             scip_root: args.root.as_deref(),
             question: args.question.as_deref().unwrap_or_default(),
             seeds: &args.seeds,
+            seed_search: seed_search.as_deref(),
             top_k: args.top_k,
             maps,
             budget: &budget,

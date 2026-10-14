@@ -2470,4 +2470,150 @@ mod steering {
     }
 }
 
+// ---- the start event's plan (slice S6b) -------------------------------------
+
+mod start_plan {
+    use super::*;
+    use crate::traverse::trace::{self, PlanMap, PlanPolicy, StartEvent, StartPlan};
+    use serde_json::json;
+
+    /// A handler that never decides anything.
+    fn noop() -> impl Handler {
+        struct Quiet;
+        impl Handler for Quiet {
+            fn id(&self) -> &str {
+                "quiet"
+            }
+
+            fn decide(&self, _: &Checkpoint, _: &StopBudget) -> Decision {
+                Decision::default()
+            }
+        }
+        Quiet
+    }
+
+    fn plan() -> StartPlan {
+        StartPlan {
+            maps: vec![
+                PlanMap {
+                    id: "seeds.hybrid".into(),
+                    version: 1,
+                    weight: 1.0,
+                    enabled: true,
+                },
+                PlanMap {
+                    id: "g".into(),
+                    version: 3,
+                    weight: 0.5,
+                    enabled: false,
+                },
+            ],
+            policy: PlanPolicy {
+                ladder: vec!["rules".into(), "agent".into()],
+                tau: Some(0.8),
+                rules: 2,
+            },
+            seed_source: Some("hybrid".into()),
+            seed_hits: vec![json!({"node": "sym:rust:a/fn", "score": 0.5})],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_start_event_lists_the_maps_and_the_policy() {
+        let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
+        let policy = StopPolicy::every(1).max_stops(3);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(noop(), policy).plan(plan())
+        })
+        .await;
+        let start = &result.events[0];
+        assert_eq!(start["ev"], "start");
+        assert_eq!(
+            start["maps"],
+            json!([
+                {"id": "seeds.hybrid", "version": 1, "weight": 1.0, "enabled": true},
+                {"id": "g", "version": 3, "weight": 0.5, "enabled": false},
+            ])
+        );
+        assert_eq!(start["policy"]["ladder"], json!(["rules", "agent"]));
+        assert_eq!(start["policy"]["tau"], 0.8);
+        assert_eq!(start["policy"]["rules"], 2);
+        assert_eq!(start["policy"]["stops"], start["stops"]);
+        assert_eq!(start["policy"]["stops"]["max_stops"], 3);
+        assert_eq!(start["seed_source"], "hybrid");
+        assert_eq!(start["seed_hits"][0]["score"], 0.5);
+
+        // The reader gives back what was written.
+        let read = StartEvent::from_json(start).unwrap();
+        assert_eq!(read.maps, plan().maps);
+        let policy = read.policy.unwrap();
+        assert_eq!(policy.ladder, ["rules", "agent"]);
+        assert_eq!(policy.tau, Some(0.8));
+        assert_eq!(policy.rules, 2);
+        assert_eq!(policy.stops, start["stops"]);
+        assert_eq!(read.seed_source.as_deref(), Some("hybrid"));
+        assert_eq!(read.seeds, ["a".to_string()].map(|n| node(&n).to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_walk_without_a_plan_writes_the_event_it_always_did() {
+        let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
+        let result = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
+        let start = result.events[0].as_object().unwrap();
+        for key in ["maps", "policy", "seed_source", "seed_hits"] {
+            assert!(!start.contains_key(key), "{key}");
+        }
+        // And a plan without a handler records an empty ladder and no tau.
+        let planned = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.plan(StartPlan {
+                maps: vec![],
+                ..StartPlan::default()
+            })
+        })
+        .await;
+        let policy = &planned.events[0]["policy"];
+        assert_eq!(policy["ladder"], json!([]));
+        assert_eq!(policy["tau"], json!(null));
+        assert_eq!(policy["rules"], 0);
+        assert!(planned.events[0].get("seed_source").is_none());
+    }
+
+    #[test]
+    fn an_old_start_event_without_maps_or_policy_still_reads() {
+        let old = json!({
+            "ev": "start", "question": "q", "seeds": ["sym:rust:a/fn"],
+            "budget": {"pops": 10, "max_depth": 6, "est_tokens": 100, "external_calls": 5},
+            "scorer": "rules", "stops": {"every_pops": 0},
+        });
+        let read = StartEvent::from_json(&old).unwrap();
+        assert_eq!(read.question, "q");
+        assert_eq!(read.seeds, ["sym:rust:a/fn"]);
+        assert!(read.maps.is_empty());
+        assert!(read.policy.is_none());
+        assert!(read.seed_source.is_none() && read.seed_hits.is_empty());
+        assert_eq!(read.scorer.as_deref(), Some("rules"));
+        // Not a start event.
+        assert!(StartEvent::from_json(&json!({"ev": "end"})).is_none());
+        assert!(StartEvent::from_json(&json!(3)).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_planned_trace_round_trips_through_a_file_and_replays_to_the_same_hash() {
+        let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
+        let run = || async { walk(&reg, vec![seed("a")], budget(10), |t| t.plan(plan())).await };
+        let (a, b) = (run().await, run().await);
+        assert_eq!(trace::trace_hash(&a.events), trace::trace_hash(&b.events));
+        let dir = std::env::temp_dir().join(format!("lci-s6b-{}", std::process::id()));
+        let path = trace::write_trace(&dir, &a).unwrap();
+        let events = trace::read_trace(&path).unwrap();
+        assert_eq!(events, a.events);
+        assert_eq!(
+            StartEvent::from_json(&events[0]).unwrap().maps.len(),
+            2,
+            "the maps survive the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 mod pre_merged;

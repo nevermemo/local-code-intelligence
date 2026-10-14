@@ -1923,6 +1923,10 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
     let plain = first["structuredContent"].clone();
     assert_eq!(plain["mode"], "traverse");
     assert_eq!(plain["status"], "complete", "{plain}");
+    // The index-only workspace has nothing to search, so the stand-in seeds
+    // it, and the answer says so.
+    assert_eq!(plain["seed_source"], "name_tokens", "{plain}");
+    assert!(plain["seed_fallback"].is_string(), "{plain}");
     // The seeds (name matches) and what the walk reached from them.
     let reached: Vec<&str> = plain["seeds"]
         .as_array()
@@ -2003,6 +2007,24 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
         stopped["checkpoint"]["frontier"].as_array().is_some(),
         "{stopped}"
     );
+    // The checkpoint's cards say where their nodes are, as the results do.
+    let cards: Vec<&Value> = ["answer", "visited_cards", "frontier"]
+        .iter()
+        .flat_map(|key| stopped["checkpoint"][key].as_array().unwrap())
+        .chain(stopped["results"].as_array().unwrap())
+        .collect();
+    assert!(!cards.is_empty(), "{stopped}");
+    for card in cards {
+        let path = card["site"]["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{card}"));
+        assert!(
+            path == "src/search.rs" || path == "tests/support.rs",
+            "{card}"
+        );
+        assert!(card["site"]["line"].as_u64().unwrap() >= 1, "{card}");
+        assert!(card["site"]["col"].as_u64().unwrap() >= 1, "{card}");
+    }
     assert_eq!(
         stopped["steering"].as_array().unwrap().last().unwrap()["rung"],
         3
@@ -2083,6 +2105,260 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
     .await;
     assert_ne!(nothing["isError"], true, "{nothing}");
     assert_eq!(nothing["structuredContent"]["status"], "no_seeds");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+/// A workspace whose sources and `index.scip` agree: function `i` of
+/// `src/lib.rs` is on line `i` (0-based), as `scip_bytes` writes them. Three
+/// functions mention "translator" (the fake models rank those first); the
+/// fourth does not.
+fn write_hybrid_workspace(root: &Path) {
+    write(
+        root,
+        "src/lib.rs",
+        "fn translator_entry() { translator_helper(); }\n\
+         fn translator_helper() { translator_leaf(); }\n\
+         fn translator_leaf() {}\n\
+         fn other_thing() {}\n",
+    );
+    std::fs::write(
+        root.join("index.scip"),
+        scip_bytes(&[(
+            "src/lib.rs",
+            &[
+                ("translator_entry", &["translator_helper"]),
+                ("translator_helper", &["translator_leaf"]),
+                ("translator_leaf", &[]),
+                ("other_thing", &[]),
+            ],
+        )]),
+    )
+    .unwrap();
+}
+
+/// The `start` event of a trace file.
+fn start_event(data_dir: &Path, response: &Value) -> lci_maps::traverse::trace::StartEvent {
+    let file = response["trace"]["file"].as_str().unwrap();
+    let events = lci_maps::traverse::trace::read_trace(data_dir.join("traces").join(file)).unwrap();
+    lci_maps::traverse::trace::StartEvent::from_json(&events[0]).unwrap()
+}
+
+#[tokio::test]
+async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    let workspace = temp.path().join("scip-hybrid");
+    write_hybrid_workspace(&workspace);
+    let data_dir = config.data_dir.clone();
+    let app = Arc::new(App::open(config).await.unwrap());
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    // No function of the question's words is named "the question": only the
+    // search can find these functions.
+    let answer = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"translator","top_k":20,"mode":"traverse"}),
+    )
+    .await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    let answer = answer["structuredContent"].clone();
+    assert_eq!(answer["status"], "complete", "{answer}");
+    assert_eq!(answer["seed_source"], "hybrid", "{answer}");
+    assert!(answer.get("seed_fallback").is_none(), "{answer}");
+
+    // Every seed is the symbol node of the function its hit's chunk holds,
+    // with the lines of that chunk (1-based) and who found it.
+    let hits = answer["seed_hits"].as_array().unwrap();
+    let seeds: Vec<&str> = answer["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seed| seed.as_str().unwrap())
+        .collect();
+    assert_eq!(seeds.len(), hits.len(), "{answer}");
+    for (seed, hit) in seeds.iter().zip(hits) {
+        assert_eq!(hit["node"], *seed);
+        assert_eq!(hit["kind"], "symbol", "{hit}");
+        assert_eq!(hit["how"], "defined", "{hit}");
+        assert_eq!(hit["path"], "src/lib.rs", "{hit}");
+        assert!(
+            !hit["retrievers"].as_array().unwrap().is_empty(),
+            "which retriever found it: {hit}"
+        );
+        assert!(
+            hit["score"].is_number() && hit["score_kind"].is_string(),
+            "{hit}"
+        );
+    }
+    for (name, line) in [
+        ("translator_entry", 1),
+        ("translator_helper", 2),
+        ("translator_leaf", 3),
+    ] {
+        let hit = hits
+            .iter()
+            .find(|hit| hit["node"].as_str().unwrap().contains(name))
+            .unwrap_or_else(|| panic!("{name} is a seed: {hits:?}"));
+        assert_eq!(hit["lines"], json!([line, line]), "{name}");
+        assert_eq!(
+            hit["symbol"].as_str().unwrap().rsplit("::").next(),
+            Some(name)
+        );
+        // The fake reranker scores a chunk that mentions the word high.
+        assert_eq!(hit["score_kind"], "reranker", "{hit}");
+        assert!(hit["score"].as_f64().unwrap() > 0.9, "{hit}");
+        assert!(
+            hit["retrievers"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("semantic")),
+            "{hit}"
+        );
+    }
+    let ranks: Vec<u64> = hits
+        .iter()
+        .map(|hit| hit["hit_rank"].as_u64().unwrap())
+        .collect();
+    assert!(
+        ranks.windows(2).all(|w| w[0] < w[1]),
+        "best hit first: {ranks:?}"
+    );
+
+    // The walk goes on from the seeds along the call edges.
+    let reached: Vec<&str> = answer["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["node"].as_str().unwrap())
+        .collect();
+    assert!(
+        reached
+            .iter()
+            .chain(&seeds)
+            .any(|n| n.contains("translator_leaf")),
+        "{answer}"
+    );
+
+    // Every result item says where its node is: the repository-relative file
+    // and the one-based line and column of the name (`scip_bytes` puts the
+    // name of function `i` at line `i`, column 3).
+    for card in answer["results"].as_array().unwrap() {
+        let node = card["node"].as_str().unwrap();
+        let line = [
+            ("translator_entry", 1),
+            ("translator_helper", 2),
+            ("translator_leaf", 3),
+            ("other_thing", 4),
+        ]
+        .iter()
+        .find(|(name, _)| node.contains(name))
+        .unwrap()
+        .1;
+        assert_eq!(
+            card["site"],
+            json!({"path": "src/lib.rs", "line": line, "col": 4}),
+            "{card}"
+        );
+    }
+
+    // The trace names the source, the maps and the policy.
+    let start = start_event(&data_dir, &answer);
+    assert_eq!(start.seed_source.as_deref(), Some("hybrid"));
+    assert_eq!(start.seed_hits.len(), hits.len());
+    let ids: Vec<&str> = start.maps.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["seeds.hybrid", "seeds.scip_names", "graph.scip"]);
+    assert!(start.maps.iter().all(|m| m.enabled && m.weight == 1.0));
+    let policy = start.policy.unwrap();
+    assert!(policy.ladder.is_empty() && policy.tau.is_none() && policy.rules == 0);
+
+    // With rules, the policy in the trace is theirs.
+    let ruled = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({
+            "workspace_path":workspace,"query":"translator","mode":"traverse",
+            "steer":{"rules":[{"when":{"path_glob":"tests/**"},"then":"prune"}],"tau":0.5,"stop_every":1},
+        }),
+    )
+    .await;
+    assert_ne!(ruled["isError"], true, "{ruled}");
+    let start = start_event(&data_dir, &ruled["structuredContent"]);
+    let policy = start.policy.unwrap();
+    assert_eq!(policy.ladder, ["rules", "agent"]);
+    assert_eq!(policy.tau, Some(0.5));
+    assert_eq!(policy.rules, 1);
+    assert_eq!(policy.stops["every_pops"], 1);
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    // A port nothing listens on: the embedder is unreachable.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    config.embedding_url = format!("http://127.0.0.1:{dead}/v1");
+    config.embedding_timeout_seconds = 2;
+    let workspace = temp.path().join("scip-down");
+    write_hybrid_workspace(&workspace);
+    let data_dir = config.data_dir.clone();
+    let app = Arc::new(App::open(config).await.unwrap());
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    let answer = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"how does translator helper work","mode":"traverse"}),
+    )
+    .await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    let answer = answer["structuredContent"].clone();
+    assert_eq!(answer["seed_source"], "name_tokens", "{answer}");
+    let reason = answer["seed_fallback"].as_str().unwrap();
+    assert!(reason.contains("hybrid search failed"), "{reason}");
+    assert!(
+        answer["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("name_tokens")),
+        "{answer}"
+    );
+    let hits = answer["seed_hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "the stand-in still found names: {answer}");
+    assert!(
+        hits.iter()
+            .all(|h| h["retrievers"] == json!(["name_tokens"]))
+    );
+    assert!(
+        answer["seeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|seed| seed.as_str().unwrap().contains("translator_helper")),
+        "{answer}"
+    );
+    let start = start_event(&data_dir, &answer);
+    assert_eq!(start.seed_source.as_deref(), Some("name_tokens"));
 
     token.cancel();
     server.abort();
