@@ -3,8 +3,14 @@
 //! the run is printed as JSON lines on stdout (a summary goes to stderr).
 //!
 //! ```text
-//! cargo run -p lci-maps --example traverse_demo -- [--question TEXT] [--scip INDEX --root TREE]
+//! cargo run -p lci-maps --example traverse_demo -- [--question TEXT] [--scip INDEX --root TREE] [--out DIR]
 //! ```
+//!
+//! With `--out DIR` (slice S3) the walk is two calls: call 1 stops at the first
+//! stop with a depth-2 node queued and leaves a handle; call 2 reads the
+//! handle back from `DIR/handles` (as a new process would) and resumes with
+//! steering of its own. Both traces are written under `DIR/traces`, and the
+//! second (which holds the whole walk) is printed.
 //!
 //! Without `--scip` it walks a small built-in call graph. With `--scip` it
 //! loads that SCIP index (and `--root`, the tree it indexes, for the
@@ -16,7 +22,8 @@ use lci_maps::{
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     scip_graph::{DirSource, RawDocument, RawOccurrence, ScipGraph, ScipMap},
     traverse::{
-        Seed, Traversal, TraversalBudget, handler::StopPolicy, rules::RuleList, source::OnTheFly,
+        Seed, Traversal, TraversalBudget, handle::HandleStore, handler::StopPolicy,
+        rules::RuleList, source::OnTheFly, trace,
     },
     walk::tokenize,
 };
@@ -152,7 +159,7 @@ fn builtin_graph() -> ScipGraph {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut question = "how does search rank hits".to_string();
-    let (mut scip_path, mut root) = (None, None);
+    let (mut scip_path, mut root, mut out) = (None, None, None);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args
@@ -162,6 +169,7 @@ async fn main() {
             "--question" => question = value,
             "--scip" => scip_path = Some(PathBuf::from(value)),
             "--root" => root = Some(PathBuf::from(value)),
+            "--out" => out = Some(PathBuf::from(value)),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -210,31 +218,62 @@ async fn main() {
     registry.register(Box::new(lexical), 1.0, 20).unwrap();
     registry.register(Box::new(scip), 1.0, 20).unwrap();
 
-    let rules = RuleList::from_json(&serde_json::json!([
-        {"when": {"path_glob": "tests/**"}, "then": "prune"}
-    ]))
-    .expect("the demo rules parse");
-    let result = Traversal::new(
-        OnTheFly::new(&registry, &view),
-        seeds,
-        TraversalBudget {
-            pops: 40,
-            max_depth: 6,
-            deadline: now + Duration::from_secs(5),
-            est_tokens: 4000,
-            external_calls: 100,
-        },
-    )
-    .question(question.clone())
-    .handler(
-        rules,
-        StopPolicy {
-            every_pops: 2,
-            max_stops: 4,
-        },
-    )
-    .run()
-    .await;
+    let prune_tests = serde_json::json!({"when": {"path_glob": "tests/**"}, "then": "prune"});
+    let rules = |extra: Option<serde_json::Value>| {
+        let list: Vec<_> = std::iter::once(prune_tests.clone()).chain(extra).collect();
+        RuleList::from_json(&serde_json::Value::Array(list)).expect("the demo rules parse")
+    };
+    let budget = TraversalBudget {
+        pops: 40,
+        max_depth: 6,
+        deadline: now + Duration::from_secs(5),
+        est_tokens: 4000,
+        external_calls: 100,
+    };
+    let stops = StopPolicy {
+        every_pops: 2,
+        max_stops: 4,
+    };
+    let mut result = Traversal::new(OnTheFly::new(&registry, &view), seeds, budget)
+        .question(question.clone())
+        .handler(
+            // Without --out the walk is one call. With it, the first stop with
+            // a depth-2 node queued ends call 1.
+            rules(
+                out.as_ref()
+                    .map(|_| serde_json::json!({"when": {"depth": {"ge": 2}}, "then": "stop"})),
+            ),
+            stops,
+        )
+        .run()
+        .await;
+
+    if let Some(out) = out {
+        let traces = out.join("traces");
+        let first = trace::write_trace(&traces, &result).expect("write the first trace");
+        let store = HandleStore::in_dir(out.join("handles"));
+        let snapshot = result
+            .snapshot
+            .as_ref()
+            .expect("call 1 should stop with work left");
+        let handle = store.put(snapshot).expect("store the handle");
+        eprintln!(
+            "call 1: {} at pop {}, handle {handle}, trace {}",
+            result.status.as_str(),
+            result.totals.pops,
+            first.display(),
+        );
+        // Call 2: a store that has never seen the snapshot reads it from disk.
+        let snapshot = HandleStore::in_dir(out.join("handles"))
+            .get(&handle)
+            .expect("read the handle back");
+        result = Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget)
+            .handler(rules(None), stops)
+            .run()
+            .await;
+        let second = trace::write_trace(&traces, &result).expect("write the second trace");
+        eprintln!("call 2: trace {}", second.display());
+    }
 
     print!("{}", result.events_jsonl());
     eprintln!(

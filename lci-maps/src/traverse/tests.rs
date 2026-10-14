@@ -1071,3 +1071,348 @@ fn a_slower_or_weaker_map_prices_its_hops_lower() {
     assert!(score(&strong[0], &slow) < base);
     assert!(score(&weak_witness[0], &fast) < base);
 }
+
+// ---- trace files and handles (slice S3) ------------------------------------
+
+mod persist {
+    use super::*;
+    use crate::traverse::handle::{HandleError, HandleStore, Snapshot};
+    use crate::traverse::trace::{self, TraceWriter};
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lci-s3-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Prunes the worst queued node at every stop.
+    fn prune_last(cp: &Checkpoint) -> Vec<Directive> {
+        cp.frontier
+            .last()
+            .map(|item| act(Some(&item.node), Action::Prune))
+            .into_iter()
+            .collect()
+    }
+
+    async fn resume(
+        reg: &Registry<'static>,
+        snapshot: Snapshot,
+        budget: TraversalBudget,
+        configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
+    ) -> TraversalResult {
+        let view = view();
+        configure(Traversal::resumed(
+            OnTheFly::new(reg, &view),
+            snapshot,
+            budget,
+        ))
+        .run()
+        .await
+    }
+
+    async fn pruning_walk(pops: u32) -> TraversalResult {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        walk(&reg, vec![seed("n0")], budget(pops), |t| {
+            t.question("how does n0 reach n9")
+                .handler(scripted(prune_last), every(3))
+        })
+        .await
+    }
+
+    /// The events without the call markers and without what depends on the
+    /// call's own budget (a checkpoint shows the budget left).
+    fn without_marks(events: &[Value]) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|e| !["start", "end", "resume", "stop"].contains(&e["ev"].as_str().unwrap()))
+            .cloned()
+            .map(|mut e| {
+                if let Some(obj) = e.as_object_mut() {
+                    obj.remove("inputs_hash");
+                }
+                e
+            })
+            .collect()
+    }
+
+    fn stop_hashes(result: &TraversalResult) -> Vec<String> {
+        result
+            .events
+            .iter()
+            .filter(|e| e["ev"] == "stop")
+            .map(|e| e["checkpoint_hash"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_trace_writes_and_reads_back() {
+        let result = pruning_walk(9).await;
+        let dir = scratch("roundtrip");
+        let path = trace::write_trace(&dir, &result).unwrap();
+        assert_eq!(path.extension().unwrap(), "jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            result.events_jsonl()
+        );
+        assert_eq!(trace::read_trace(&path).unwrap(), result.events);
+        // A resumable run is named by its handle.
+        let handle = result.snapshot.as_ref().unwrap().handle();
+        assert_eq!(path.file_stem().unwrap().to_str().unwrap(), handle);
+
+        // The writer appends line by line; a bad line is an error naming it.
+        let mut writer = TraceWriter::create(dir.join("w.jsonl")).unwrap();
+        writer.append(&result.events[0]).unwrap();
+        writer.append_all(&result.events[1..3]).unwrap();
+        let written = writer.finish().unwrap();
+        assert_eq!(trace::read_trace(&written).unwrap(), result.events[..3]);
+        std::fs::write(&written, "{}\nnot json\n").unwrap();
+        let err = trace::read_trace(&written).unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stops_and_steers_cite_the_checkpoint_hash() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let result = walk(&reg, vec![seed("n0")], budget(12), |t| {
+            t.question("how does n0 reach n9").handler(
+                scripted(move |cp| {
+                    sink.lock().unwrap().push(trace::checkpoint_hash(cp));
+                    prune_last(cp)
+                }),
+                every(3),
+            )
+        })
+        .await;
+        let stops = stop_hashes(&result);
+        let steers: Vec<String> = result
+            .events
+            .iter()
+            .filter(|e| e["ev"] == "steer")
+            .map(|e| e["inputs_hash"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(stops.len(), 4);
+        assert_eq!(stops, steers);
+        assert_eq!(stops, *seen.lock().unwrap());
+        // Different checkpoints, different hashes; the same run, the same.
+        let distinct: BTreeSet<&String> = stops.iter().collect();
+        assert_eq!(distinct.len(), stops.len());
+        assert_eq!(stops, stop_hashes(&pruning_walk(12).await));
+    }
+
+    #[tokio::test]
+    async fn equal_runs_write_byte_identical_traces_and_handles() {
+        let (a, b) = (pruning_walk(8).await, pruning_walk(8).await);
+        let (dir_a, dir_b) = (scratch("bytes-a"), scratch("bytes-b"));
+        let path_a = trace::write_trace(&dir_a, &a).unwrap();
+        let path_b = trace::write_trace(&dir_b, &b).unwrap();
+        assert_eq!(path_a.file_name(), path_b.file_name());
+        assert_eq!(
+            std::fs::read(&path_a).unwrap(),
+            std::fs::read(&path_b).unwrap()
+        );
+        assert_eq!(trace::trace_hash(&a.events), trace::trace_hash(&b.events));
+        let (sa, sb) = (a.snapshot.clone().unwrap(), b.snapshot.unwrap());
+        assert_eq!(sa.handle(), sb.handle());
+        assert_eq!(sa.to_json().to_string(), sb.to_json().to_string());
+
+        // And so do two resumed runs.
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let ra = resume(&reg, sa, budget(20), |t| {
+            t.handler(scripted(prune_last), every(3))
+        })
+        .await;
+        let rb = resume(&reg, sb, budget(20), |t| {
+            t.handler(scripted(prune_last), every(3))
+        })
+        .await;
+        assert_eq!(ra.events_jsonl(), rb.events_jsonl());
+        // A different run has a different trace.
+        let other = pruning_walk(9).await;
+        assert_ne!(
+            trace::trace_hash(&other.events),
+            trace::trace_hash(&a.events)
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[tokio::test]
+    async fn a_resume_continues_at_the_same_pop_count_and_matches_a_straight_run() {
+        let straight = pruning_walk(12).await;
+
+        let first = pruning_walk(6).await;
+        assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+        let snapshot = first.snapshot.clone().expect("a paused run has a snapshot");
+        assert_eq!(snapshot.pops(), 6);
+
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let second = resume(&reg, snapshot, budget(12), |t| {
+            t.handler(scripted(prune_last), every(3))
+        })
+        .await;
+        let resumed = second
+            .events
+            .iter()
+            .find(|e| e["ev"] == "resume")
+            .expect("the resume is in the trace");
+        assert_eq!(resumed["pops"], 6);
+        assert_eq!(second.events[..first.events.len()], first.events[..]);
+        assert_eq!(second.totals.pops, 12);
+
+        assert_eq!(second.status, straight.status);
+        assert_eq!(second.popped, straight.popped);
+        assert_eq!(second.states, straight.states);
+        assert_eq!(second.cleared, straight.cleared);
+        let (a, b) = (&second.totals, &straight.totals);
+        assert_eq!(
+            (
+                a.pops,
+                a.hops,
+                a.cross_map_hops,
+                a.tokens,
+                a.stops,
+                a.steers
+            ),
+            (
+                b.pops,
+                b.hops,
+                b.cross_map_hops,
+                b.tokens,
+                b.stops,
+                b.steers
+            )
+        );
+        assert_eq!(a.per_map, b.per_map);
+        assert_eq!(
+            without_marks(&second.events),
+            without_marks(&straight.events)
+        );
+        // The stop at pop 6 fired once, in the first call. The first call's
+        // stops saw a budget of 6 pops, so their checkpoints (and hashes)
+        // differ from the straight run's; the stops of the second call saw
+        // the same budget and the same state.
+        let (hs, hr) = (stop_hashes(&second), stop_hashes(&straight));
+        assert_eq!((hs.len(), hr.len()), (4, 4));
+        assert_ne!(hs[..2], hr[..2]);
+        assert_eq!(hs[2..], hr[2..]);
+    }
+
+    #[tokio::test]
+    async fn a_handler_stop_returns_a_handle_that_resumes_with_the_switches_kept() {
+        let reg = registry(vec![
+            GraphMap::new("m1", &[("a", "b"), ("b", "c"), ("c", "d")]),
+            GraphMap::new("m2", &[("a", "x"), ("x", "y")]),
+        ]);
+        fn steer(cp: &Checkpoint) -> Vec<Directive> {
+            if cp.stop == 1 {
+                vec![
+                    act(None, Action::MapOff("m2".into())),
+                    act(None, Action::MapWeight("m1".into(), 0.5)),
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+        let straight = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(scripted(steer), every(1))
+        })
+        .await;
+        assert!(!straight.reached(&node("y")));
+
+        let first = walk(&reg, vec![seed("a")], budget(10), |t| {
+            t.handler(
+                scripted(|cp| {
+                    let mut out = steer(cp);
+                    out.push(act(None, Action::Stop));
+                    out
+                }),
+                every(1),
+            )
+        })
+        .await;
+        assert_eq!(first.status, TraversalStatus::Stopped);
+        let dir = scratch("store");
+        let handle = HandleStore::in_dir(&dir)
+            .put(first.snapshot.as_ref().unwrap())
+            .unwrap();
+
+        // A fresh store reads the file, as a new process would.
+        let snapshot = HandleStore::in_dir(&dir).get(&handle).unwrap();
+        assert_eq!(&snapshot, first.snapshot.as_ref().unwrap());
+        let second = resume(&reg, snapshot, budget(10), |t| t).await;
+        assert_eq!(second.states, straight.states);
+        assert_eq!(second.popped, straight.popped);
+        assert!(!second.reached(&node("y")), "the m2 switch survives");
+        let c = second.states.iter().find(|s| s.node == node("c")).unwrap();
+        assert!(c.potential < 1.0, "the m1 weight survives");
+        assert_eq!(second.status, TraversalStatus::Complete);
+        assert!(second.snapshot.is_none(), "a finished walk has no handle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_handle_store_checks_what_it_reads() {
+        let first = pruning_walk(6).await;
+        let snapshot = first.snapshot.unwrap();
+        let dir = scratch("checks");
+
+        let memory = HandleStore::memory();
+        let handle = memory.put(&snapshot).unwrap();
+        assert_eq!(handle, snapshot.handle());
+        assert_eq!(memory.put(&snapshot).unwrap(), handle);
+        assert_eq!(memory.get(&handle).unwrap(), snapshot);
+        assert!(matches!(
+            memory.get("h0000000000000000"),
+            Err(HandleError::Unknown(_))
+        ));
+        for bad in ["../x", "", "hABCDEF0123456789", "h123", "x0000000000000000"] {
+            assert!(
+                matches!(memory.get(bad), Err(HandleError::BadHandle(_))),
+                "{bad}"
+            );
+        }
+
+        HandleStore::in_dir(&dir).put(&snapshot).unwrap();
+        let file = dir.join(format!("{handle}.json"));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(HandleStore::in_dir(&dir).get(&handle).unwrap(), snapshot);
+
+        // Edited content no longer hashes to its name.
+        let edited = text.replacen("\"depth\":1", "\"depth\":2", 1);
+        assert_ne!(edited, text);
+        std::fs::write(&file, edited).unwrap();
+        assert!(matches!(
+            HandleStore::in_dir(&dir).get(&handle),
+            Err(HandleError::Corrupt(_))
+        ));
+        // A state naming a parent that does not precede it is refused.
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["states"][1]["parent"] = 7.into();
+        std::fs::write(&file, value.to_string()).unwrap();
+        assert!(matches!(
+            HandleStore::in_dir(&dir).get(&handle),
+            Err(HandleError::Corrupt(_))
+        ));
+        std::fs::write(&file, "{ torn").unwrap();
+        assert!(matches!(
+            HandleStore::in_dir(&dir).get(&handle),
+            Err(HandleError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_a_walk_with_work_left_leaves_a_handle() {
+        let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
+        let done = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
+        assert_eq!(done.status, TraversalStatus::Complete);
+        assert!(done.snapshot.is_none());
+        let cut = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
+        assert_eq!(cut.status, TraversalStatus::BudgetExhausted);
+        assert!(cut.snapshot.is_some());
+    }
+}

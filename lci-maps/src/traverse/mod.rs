@@ -20,13 +20,15 @@
 //! [`Checkpoint`] and its directives are applied. Nothing a handler returns
 //! can raise a budget; cleared (pruned) nodes are never revisited.
 //!
-//! The run is recorded as JSON events ([`TraversalResult::events`]); the
-//! trace writer and handles are the next slice.
+//! The run is recorded as JSON events ([`TraversalResult::events`]), written as
+//! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
 
 pub mod frontier;
+pub mod handle;
 pub mod handler;
 pub mod rules;
 pub mod source;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;
@@ -138,6 +140,9 @@ pub struct TraversalResult {
     /// One JSON object per event, without any wall-clock value: equal runs
     /// give equal events.
     pub events: Vec<Value>,
+    /// The state to resume from: set when the walk ended `Stopped` or
+    /// `BudgetExhausted` with work left in the frontier.
+    pub snapshot: Option<handle::Snapshot>,
 }
 
 impl TraversalResult {
@@ -165,6 +170,7 @@ pub struct Traversal<'s> {
     question: String,
     seeds: Vec<Seed>,
     targets: Vec<NodeId>,
+    resume: Option<handle::Snapshot>,
 }
 
 impl<'s> Traversal<'s> {
@@ -180,6 +186,7 @@ impl<'s> Traversal<'s> {
             question: String::new(),
             seeds,
             targets: Vec::new(),
+            resume: None,
         }
     }
 
@@ -234,6 +241,8 @@ struct Run<'s> {
     totals: Totals,
     events: Vec<Value>,
     last_stop_at: Option<u32>,
+    /// Map switches applied by handlers, in order (a handle replays them).
+    switches: Vec<(String, bool)>,
 }
 
 impl<'s> Run<'s> {
@@ -254,6 +263,7 @@ impl<'s> Run<'s> {
             totals: Totals::default(),
             events: Vec::new(),
             last_stop_at: None,
+            switches: Vec::new(),
         }
     }
 
@@ -296,26 +306,30 @@ impl<'s> Run<'s> {
 
     async fn run(mut self) -> TraversalResult {
         let started = Instant::now();
-        self.events.push(json!({
-            "ev": "start",
-            "question": self.t.question,
-            "seeds": self.t.seeds.iter().map(|s| s.node.to_string()).collect::<Vec<_>>(),
-            "budget": {
-                "pops": self.t.budget.pops,
-                "max_depth": self.t.budget.max_depth,
-                "est_tokens": self.t.budget.est_tokens,
-                "external_calls": self.t.budget.external_calls,
-            },
-            "scorer": self.t.scorer.label(),
-            "stops": {
-                "every_pops": self.t.stops.every_pops,
-                "max_stops": self.t.stops.max_stops,
-            },
-        }));
-        let seeds = std::mem::take(&mut self.t.seeds);
-        let fanout = seeds.len() as u32;
-        for seed in &seeds {
-            self.add_seed(seed, fanout);
+        if let Some(snapshot) = self.t.resume.take() {
+            self.restore(snapshot);
+        } else {
+            self.events.push(json!({
+                "ev": "start",
+                "question": self.t.question,
+                "seeds": self.t.seeds.iter().map(|s| s.node.to_string()).collect::<Vec<_>>(),
+                "budget": {
+                    "pops": self.t.budget.pops,
+                    "max_depth": self.t.budget.max_depth,
+                    "est_tokens": self.t.budget.est_tokens,
+                    "external_calls": self.t.budget.external_calls,
+                },
+                "scorer": self.t.scorer.label(),
+                "stops": {
+                    "every_pops": self.t.stops.every_pops,
+                    "max_stops": self.t.stops.max_stops,
+                },
+            }));
+            let seeds = std::mem::take(&mut self.t.seeds);
+            let fanout = seeds.len() as u32;
+            for seed in &seeds {
+                self.add_seed(seed, fanout);
+            }
         }
 
         let status = loop {
@@ -364,8 +378,14 @@ impl<'s> Run<'s> {
                 "per_map": self.totals.per_map,
             },
         }));
+        let resumable = matches!(
+            status,
+            TraversalStatus::Stopped | TraversalStatus::BudgetExhausted
+        ) && !self.frontier.is_empty();
+        let snapshot = resumable.then(|| self.snapshot());
         TraversalResult {
             status,
+            snapshot,
             states: self.states,
             popped: self.popped,
             cleared: self.cleared,
@@ -552,12 +572,18 @@ impl<'s> Run<'s> {
         let Some(handler) = self.t.handler.as_ref() else {
             return false;
         };
+        let checkpoint_hash = trace::checkpoint_hash(&checkpoint);
+        self.events.push(json!({
+            "ev": "stop", "stop": checkpoint.stop, "pops": checkpoint.pops,
+            "reason": "every_pops", "checkpoint_hash": checkpoint_hash,
+        }));
         let decision = handler.decide(&checkpoint, &StopBudget::default());
         let handler_id = handler.id().to_string();
         let (applied, stop) = self.apply(&decision);
         self.totals.steers += applied;
         self.events.push(json!({
             "ev": "steer", "stop": checkpoint.stop, "handler": handler_id,
+            "inputs_hash": checkpoint_hash,
             "confidence": decision.confidence, "truncated": decision.truncated,
             "actions": decision.actions.iter().map(|d| json!({
                 "node": d.node.as_ref().map(ToString::to_string),
@@ -568,6 +594,16 @@ impl<'s> Run<'s> {
         stop
     }
 
+    /// Switches a map for this run; a switch that took effect is kept for a
+    /// handle to replay.
+    fn switch(&mut self, id: &str, on: bool) -> bool {
+        let ok = self.t.source.set_enabled(id, on);
+        if ok {
+            self.switches.push((id.to_string(), on));
+        }
+        ok
+    }
+
     /// Applies the directives under the engine's own limits. Returns how
     /// many took effect and whether a `Stop` was among them.
     fn apply(&mut self, decision: &Decision) -> (u32, bool) {
@@ -576,8 +612,8 @@ impl<'s> Run<'s> {
         for directive in &decision.actions {
             let ok = match (&directive.node, &directive.action) {
                 (Some(node), action) => self.apply_to_node(node, action),
-                (None, Action::MapOn(id)) => self.t.source.set_enabled(id, true),
-                (None, Action::MapOff(id)) => self.t.source.set_enabled(id, false),
+                (None, Action::MapOn(id)) => self.switch(id, true),
+                (None, Action::MapOff(id)) => self.switch(id, false),
                 (None, Action::MapWeight(id, weight)) if weight.is_finite() => {
                     self.weights.insert(id.clone(), weight.clamp(0.0, 1.0));
                     true

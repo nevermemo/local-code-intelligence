@@ -67,6 +67,33 @@ impl Frontier {
         self.items.is_empty()
     }
 
+    /// The queue as `(state, priority, discovery number)` in discovery
+    /// order, and the next discovery number: all a handle needs to rebuild it.
+    pub fn parts(&self) -> (Vec<(usize, f64, u64)>, u64) {
+        let mut items: Vec<_> = self
+            .items
+            .iter()
+            .map(|item| (item.state, item.priority, item.seq))
+            .collect();
+        items.sort_by_key(|&(_, _, seq)| seq);
+        (items, self.next_seq)
+    }
+
+    /// The inverse of [`Frontier::parts`].
+    pub fn from_parts(items: &[(usize, f64, u64)], next_seq: u64) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(|&(state, priority, seq)| Item {
+                    state,
+                    priority,
+                    seq,
+                })
+                .collect(),
+            next_seq,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.items.clear();
     }
