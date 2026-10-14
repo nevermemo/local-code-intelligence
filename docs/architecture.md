@@ -15,7 +15,7 @@ Tree-sitter grammars, plus portable evaluation definitions and validation --
 and depends on none of LanceDB, Arrow, axum or rmcp. The
 root crate holds what needs the embedded database or a protocol server: `app`,
 `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server`,
-`rest` and `main`, and re-exports the `lci-core` modules from `src/lib.rs` so
+`rest`, `init` (`lci init`) and `main`, and re-exports the `lci-core` modules from `src/lib.rs` so
 existing `crate::chunk`-style paths keep resolving. The split exists for build
 time (commit `0729d9a`): the LanceDB/Arrow tree takes minutes to compile, so a
 change that stays inside `lci-core` can be checked in seconds with

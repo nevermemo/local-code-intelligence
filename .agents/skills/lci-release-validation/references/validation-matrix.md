@@ -4,7 +4,7 @@ Choose rows affected by the change; a release candidate should cover the full ma
 
 | Surface | Deterministic evidence | Live evidence |
 | --- | --- | --- |
-| Build quality | `cargo xtask test --suite Full` (format check, workspace tests, Clippy with warnings denied) | release binary starts on Windows |
+| Build quality | `cargo xtask test --suite Full` (machine-path lint, format check, workspace tests, Clippy with warnings denied) | release binary starts on Windows |
 | MCP/HTTP | initialization, tool discovery, structured errors, REST mirror, `/health`, `/ready` tests (`--suite Mcp`, `--suite Readiness`) | real client connects to `127.0.0.1:8768/mcp`; `/openapi.json` served |
 | Persistence | temporary LanceDB, manifest compatibility, restart reuse, failed-update preservation (`--suite Indexing`, `--suite Watching`) | external data directory survives process restart |
 | Retrieval | mock semantic/lexical/LSP/fusion/reranker and filter coverage (`--suite Filter`, `--suite Evaluation`) | `evaluate ./evaluations/core.toml` against 8766/8767 with auditable source results |

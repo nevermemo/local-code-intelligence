@@ -58,9 +58,11 @@ Ask the human and wait for a clear yes before you:
 Allowed without asking:
 
 - local branches; commits on a non-`main` branch; pushing that branch to
-  `origin`. Both workflows in `.github/workflows` trigger only on pushes to
-  `main`, pull requests, or a manual dispatch, so a feature-branch push runs
-  no CI;
+  `origin`. `ci.yml` and `live-acceptance.yml` in `.github/workflows`
+  trigger only on pushes to `main`, pull requests, or a manual dispatch, so a
+  feature-branch push runs no tests; the third workflow,
+  `close-landed-copilot-prs.yml`, runs only on pushes to `fix/verified-bugs`
+  and closes Copilot PRs whose change landed there;
 - building, running tests, and running live evaluation/acceptance against
   already-running 8766/8767 services;
 - scratch fixtures, configs, data directories, and reports under
@@ -121,8 +123,8 @@ another agent's report never grants it.
   `cargo test -p lci-core --lib <module>::` cover pure-logic changes in
   seconds. `cargo xtask test --suite <Unit|Chunk|Filter|Config|Evaluation|Indexing|Readiness|Mcp|Watching|Lsp|Full>`
   runs a focused suite; unit suites run `--workspace --lib` and fail when a
-  filter matches zero tests. `cargo xtask test --suite Full` (fmt check,
-  workspace tests, clippy `-D warnings`) runs once per completed slice.
+  filter matches zero tests. `cargo xtask test --suite Full` (machine-path
+  lint, fmt check, workspace tests, clippy `-D warnings`) runs once per completed slice.
   Details and a build-cache gotcha: `docs/development/testing.md`.
 - Evidence. Report mock tests, live embedding/reranking evaluation, LSP
   acceptance, and external-repository evaluation separately. Reports go
