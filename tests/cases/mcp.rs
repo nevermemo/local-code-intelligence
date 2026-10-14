@@ -1638,3 +1638,453 @@ async fn a_search_only_profile_lists_four_tools_and_refuses_the_others() {
     server.abort();
     models_task.abort();
 }
+
+// ---- search_code mode = "traverse" (multimap spine S6) ----
+
+/// A function and the functions it calls.
+type Function<'a> = (&'a str, &'a [&'a str]);
+
+/// The wire form of a SCIP index (`scip.proto`: Index.documents = 2,
+/// Document.relative_path = 1 and .occurrences = 2, Occurrence.range = 1,
+/// .symbol = 2, .symbol_roles = 3, .enclosing_range = 7), one function per
+/// line that calls the functions after its name. The tests need a real file
+/// and the root crate has no protobuf writer.
+fn scip_bytes(documents: &[(&str, &[Function<'_>])]) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    fn bytes(tag: u64, payload: &[u8], out: &mut Vec<u8>) {
+        varint(tag << 3 | 2, out);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+    fn ints(tag: u64, values: &[u64], out: &mut Vec<u8>) {
+        let mut packed = Vec::new();
+        values.iter().for_each(|v| varint(*v, &mut packed));
+        bytes(tag, &packed, out);
+    }
+    let symbol = |name: &str| format!("rust-analyzer cargo demo 0.1.0 m/{name}().");
+    let occurrence = |range: [u64; 4], name: &str, roles: u64, enclosing: Option<[u64; 4]>| {
+        let mut out = Vec::new();
+        ints(1, &range, &mut out);
+        bytes(2, symbol(name).as_bytes(), &mut out);
+        if roles != 0 {
+            varint(3 << 3, &mut out);
+            varint(roles, &mut out);
+        }
+        if let Some(enclosing) = enclosing {
+            ints(7, &enclosing, &mut out);
+        }
+        out
+    };
+    let mut index = Vec::new();
+    for (path, functions) in documents {
+        let mut document = Vec::new();
+        bytes(1, path.as_bytes(), &mut document);
+        for (line, (name, callees)) in functions.iter().enumerate() {
+            let line = line as u64;
+            let definition = occurrence([line, 3, line, 6], name, 1, Some([line, 0, line, 200]));
+            bytes(2, &definition, &mut document);
+            for (i, callee) in callees.iter().enumerate() {
+                let col = 10 + 5 * i as u64;
+                let call = occurrence([line, col, line, col + 4], callee, 0, None);
+                bytes(2, &call, &mut document);
+            }
+        }
+        bytes(2, &document, &mut index);
+    }
+    index
+}
+
+/// A workspace with an `index.scip` for a small call graph: `search` calls
+/// `parse_query`, `rank_hits` and `mock_ranker` (test code); `rank_hits`
+/// calls `score_hit`.
+fn write_scip_workspace(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join("index.scip"),
+        scip_bytes(&[
+            (
+                "src/search.rs",
+                &[
+                    ("search", &["parse_query", "rank_hits", "mock_ranker"]),
+                    ("parse_query", &["tokenize_query"]),
+                    ("rank_hits", &["score_hit"]),
+                    ("tokenize_query", &[]),
+                    ("score_hit", &["boost_exact"]),
+                    ("boost_exact", &[]),
+                ],
+            ),
+            (
+                "tests/support.rs",
+                &[("mock_ranker", &["fixture_hits"]), ("fixture_hits", &[])],
+            ),
+        ]),
+    )
+    .unwrap();
+}
+
+/// The `inputSchema` of `search_code` in a `tools/list` result.
+fn search_code_schema(tools: &Value) -> Value {
+    tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "search_code")
+        .unwrap()["inputSchema"]
+        .clone()
+}
+
+/// Compares `actual` with the checked-in golden file `name` (rewritten when
+/// `BLESS_GOLDEN` is set).
+fn assert_golden(name: &str, actual: &Value) {
+    let text = serde_json::to_string_pretty(actual).unwrap() + "\n";
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    if std::env::var_os("BLESS_GOLDEN").is_some() {
+        std::fs::write(&golden, &text).unwrap();
+    }
+    let expected = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|error| panic!("{}: {error}; run with BLESS_GOLDEN=1", golden.display()))
+        .replace("\r\n", "\n");
+    assert_eq!(text, expected, "{name} changed");
+}
+
+/// One `search_code` call over MCP: the whole `result` (so an error shows).
+async fn mcp_search_call(
+    client: &reqwest::Client,
+    base: &str,
+    session: &str,
+    arguments: Value,
+) -> Value {
+    mcp_result(
+        client,
+        base,
+        "/mcp",
+        session,
+        "tools/call",
+        json!({"name":"search_code","arguments":arguments}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn with_traverse_off_search_code_is_the_tool_it_was() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("scip-off");
+    write_scip_workspace(&workspace);
+    assert!(!config.traverse.enabled, "off is the default");
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, info) = mcp_initialize(&client, &base, "/mcp").await;
+
+    // The instructions are those of a server without the mode.
+    let instructions = info["instructions"].as_str().unwrap();
+    assert!(!instructions.contains("traverse"), "{instructions}");
+    assert!(
+        instructions.ends_with("Line ranges are one-based and inclusive."),
+        "{instructions}"
+    );
+
+    // The tool's schema is the one `SearchArgs` alone derives, which is the
+    // one it had before the mode: pinned in a golden.
+    let tools = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    let schema = search_code_schema(&tools);
+    let plain = rmcp::handler::server::common::schema_for_input::<
+        local_code_intelligence::server::SearchArgs,
+    >()
+    .unwrap();
+    assert_eq!(schema, Value::Object((*plain).clone()));
+    assert_golden("search_code_input_schema.json", &schema);
+    for field in ["mode", "budget", "steer", "handle"] {
+        assert!(schema["properties"].get(field).is_none(), "{field}");
+    }
+
+    // The mode is refused by name, and so are its fields without it.
+    let refused = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"search","mode":"traverse"}),
+    )
+    .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("switched off") && text.contains("[traverse]"),
+        "{text}"
+    );
+    let stray = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"search","steer":{"rules":[]}}),
+    )
+    .await;
+    assert_eq!(stray["isError"], true, "{stray}");
+    assert!(
+        stray["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode"),
+        "{stray}"
+    );
+    // Nothing was written for either.
+    assert!(!temp.path().join("data/traces").exists());
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn with_traverse_on_the_schema_and_instructions_describe_the_mode() {
+    let (_temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, info) = mcp_initialize(&client, &base, "/mcp").await;
+    let instructions = info["instructions"].as_str().unwrap();
+    assert!(instructions.contains("mode=\"traverse\""), "{instructions}");
+    assert!(
+        instructions.starts_with("Local Rust, TypeScript"),
+        "{instructions}"
+    );
+
+    let tools = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    let schema = search_code_schema(&tools);
+    // Every field of the plain search is still there, then the four of the
+    // mode (the key order of the parsed object is not the declared order).
+    let mut names: Vec<&str> = schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "budget",
+            "exclude_paths",
+            "handle",
+            "include_paths",
+            "languages",
+            "mode",
+            "query",
+            "source_roles",
+            "steer",
+            "top_k",
+            "workspace_path",
+        ]
+    );
+    assert_eq!(schema["required"], json!(["workspace_path", "query"]));
+    assert_golden("search_code_input_schema_traverse.json", &schema);
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_its_handle() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    let workspace = temp.path().join("scip-on");
+    write_scip_workspace(&workspace);
+    let data_dir = config.data_dir.clone();
+    let app = Arc::new(App::open(config).await.unwrap());
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let question = "how does search rank hits";
+
+    // One call, one answer: no rules, so no handler and no checkpoint.
+    let first = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":question,"top_k":20,"mode":"traverse"}),
+    )
+    .await;
+    assert_ne!(first["isError"], true, "{first}");
+    let plain = first["structuredContent"].clone();
+    assert_eq!(plain["mode"], "traverse");
+    assert_eq!(plain["status"], "complete", "{plain}");
+    // The seeds (name matches) and what the walk reached from them.
+    let reached: Vec<&str> = plain["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seed| seed.as_str().unwrap())
+        .chain(
+            plain["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|card| card["node"].as_str().unwrap()),
+        )
+        .collect();
+    for name in [
+        "parse_query",
+        "rank_hits",
+        "score_hit",
+        "mock_ranker",
+        "boost_exact",
+    ] {
+        assert!(
+            reached.iter().any(|node| node.contains(name)),
+            "{name} in {reached:?}"
+        );
+    }
+    assert!(
+        plain.get("handle").is_none() && plain.get("checkpoint").is_none(),
+        "{plain}"
+    );
+    assert!(plain["totals"]["pops"].as_u64().unwrap() > 0, "{plain}");
+    assert_eq!(
+        plain["trace"]["hash"].as_str().unwrap().len(),
+        16,
+        "{plain}"
+    );
+    let trace = data_dir
+        .join("traces")
+        .join(plain["trace"]["file"].as_str().unwrap());
+    assert!(trace.is_file(), "{}", trace.display());
+    assert!(
+        !plain.to_string().contains(data_dir.to_str().unwrap()),
+        "no path in the answer"
+    );
+
+    // The same question again gives the same trace.
+    let again = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":question,"top_k":20,"mode":"traverse"}),
+    )
+    .await;
+    assert_eq!(
+        again["structuredContent"]["trace"]["hash"],
+        plain["trace"]["hash"]
+    );
+
+    // Rules that prune test code decide the stops they match; a stop no
+    // rule matches goes to the agent: handle and checkpoint come back.
+    let rules = json!([{"when":{"path_glob":"tests/**"},"then":"prune"}]);
+    let stopped = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({
+            "workspace_path":workspace,"query":question,"mode":"traverse",
+            "steer":{"rules":rules,"stop_every":2,"max_stops":4},
+        }),
+    )
+    .await;
+    assert_ne!(stopped["isError"], true, "{stopped}");
+    let stopped = stopped["structuredContent"].clone();
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    let handle = stopped["handle"].as_str().unwrap().to_owned();
+    assert_eq!(stopped["checkpoint"]["handle"], stopped["handle"]);
+    assert!(
+        stopped["checkpoint"]["frontier"].as_array().is_some(),
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["steering"].as_array().unwrap().last().unwrap()["rung"],
+        3
+    );
+
+    // The agent's answer: continue, with more pops, and no more stops.
+    let finished = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({
+            "workspace_path":workspace,"query":question,"mode":"traverse",
+            "handle":handle,
+            "steer":{"actions":[{"action":{"budget":{"pops":20}}}],"max_stops":0,"rules":[]},
+        }),
+    )
+    .await;
+    assert_ne!(finished["isError"], true, "{finished}");
+    let finished = finished["structuredContent"].clone();
+    assert_eq!(finished["status"], "complete", "{finished}");
+    assert_eq!(finished["question"], question);
+    assert!(finished.get("handle").is_none(), "{finished}");
+    assert!(
+        data_dir
+            .join("traverse/handles")
+            .join(format!("{handle}.json"))
+            .is_file()
+    );
+
+    // Mistakes are errors that say what to fix, not empty answers.
+    for (arguments, needle) in [
+        (json!({"handle":"hdeadbeefdeadbeef"}), "handle"),
+        (
+            json!({"steer":{"rules":[{"when":{"nope":1},"then":"prune"}]}}),
+            "steer.rules",
+        ),
+        (
+            json!({"steer":{"ladder":["rules","system_one","agent"]}}),
+            "system_one",
+        ),
+        (json!({"steer":{"script":"1 + 1"}}), "script"),
+        (json!({"steer":{"actions":[]}}), "handle"),
+        (json!({"top_k":0}), "top_k"),
+    ] {
+        let mut full = json!({"workspace_path":workspace,"query":"search rank","mode":"traverse"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = mcp_search_call(&client, &base, &session, full).await;
+        assert_eq!(result["isError"], true, "{needle}: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    // A workspace without an index says how to make one.
+    let empty = temp.path().join("no-scip");
+    std::fs::create_dir_all(&empty).unwrap();
+    let missing = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":empty,"query":"search rank","mode":"traverse"}),
+    )
+    .await;
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert!(
+        missing["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("rust-analyzer scip")
+    );
+    // A question that names nothing in the graph is an answer with no seeds.
+    let nothing = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"zebra xylophone","mode":"traverse"}),
+    )
+    .await;
+    assert_ne!(nothing["isError"], true, "{nothing}");
+    assert_eq!(nothing["structuredContent"]["status"], "no_seeds");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

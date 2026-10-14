@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "exclude_paths": {
+      "description": "Repository-relative exclude globs.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "include_paths": {
+      "description": "Repository-relative include globs.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "languages": {
+      "description": "Registered language identifiers to include.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "query": {
+      "type": "string"
+    },
+    "source_roles": {
+      "description": "Source roles to include.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "top_k": {
+      "description": "Number of results, 1 through 40; defaults to configured top-k (8). A\nsearch returns at most `rerank_candidate_count` results (24 unless\nconfigured), whatever top_k says; a larger top_k you pass adds a note\nto the response.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "workspace_path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_path",
+    "query"
+  ],
+  "type": "object"
+}

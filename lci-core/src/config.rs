@@ -469,6 +469,114 @@ pub struct Config {
     /// no profile ignores them all.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub search_profiles: BTreeMap<String, SearchProfile>,
+    /// The graph-traversal mode of `search_code` (`mode = "traverse"`) and its
+    /// limits. Off by default; while it is off `search_code` is exactly the
+    /// search it was before the mode existed. Left out of the serialized
+    /// configuration while it equals the default, so `config` and the layer
+    /// reports stay as they were.
+    #[serde(skip_serializing_if = "TraverseConfig::is_default")]
+    pub traverse: TraverseConfig,
+}
+
+/// `[traverse]`: the multimap traversal behind `search_code`'s
+/// `mode = "traverse"` (spine brief 1.7). The limits are also the caps of a
+/// request: a `budget` in the request may lower them, never raise them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TraverseConfig {
+    /// Accept `mode = "traverse"` in `search_code` and say so in the server
+    /// instructions. `false`: the mode is refused with an error, the tool's
+    /// schema and instructions are those of a server without it, and every
+    /// other `search_code` call is unchanged.
+    pub enabled: bool,
+    /// The SCIP index a traversal walks (map `graph.scip`), as written by
+    /// `rust-analyzer scip`. A relative path is taken from the workspace
+    /// directory. The tree it indexes is the workspace.
+    pub scip_index: String,
+    /// Most pops (node expansions) of one traversal, `1..=2000`.
+    pub max_pops: u32,
+    /// Deepest state that is expanded, `1..=32`.
+    pub max_depth: u32,
+    /// Most estimated tokens the expansions of one traversal may cost,
+    /// `1..=1000000`.
+    pub max_est_tokens: u64,
+    /// Longest one call may run, in milliseconds, `1..=60000`.
+    pub deadline_ms: u64,
+    /// Most stops (handler consultations) of one traversal, `0..=32`.
+    pub max_stops: u32,
+    /// Confidence a rung of the steering ladder needs to decide a stop,
+    /// from `0` to `1`.
+    pub tau: f32,
+}
+
+impl TraverseConfig {
+    pub const MAX_POPS_LIMIT: u32 = 2000;
+    pub const MAX_DEPTH_LIMIT: u32 = 32;
+    pub const MAX_EST_TOKENS_LIMIT: u64 = 1_000_000;
+    pub const MAX_DEADLINE_MS_LIMIT: u64 = 60_000;
+    pub const MAX_STOPS_LIMIT: u32 = 32;
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.scip_index.trim().is_empty(),
+            "traverse.scip_index must be nonempty"
+        );
+        ensure!(
+            (1..=Self::MAX_POPS_LIMIT).contains(&self.max_pops),
+            "traverse.max_pops must be 1..={} (got {})",
+            Self::MAX_POPS_LIMIT,
+            self.max_pops
+        );
+        ensure!(
+            (1..=Self::MAX_DEPTH_LIMIT).contains(&self.max_depth),
+            "traverse.max_depth must be 1..={} (got {})",
+            Self::MAX_DEPTH_LIMIT,
+            self.max_depth
+        );
+        ensure!(
+            (1..=Self::MAX_EST_TOKENS_LIMIT).contains(&self.max_est_tokens),
+            "traverse.max_est_tokens must be 1..={} (got {})",
+            Self::MAX_EST_TOKENS_LIMIT,
+            self.max_est_tokens
+        );
+        ensure!(
+            (1..=Self::MAX_DEADLINE_MS_LIMIT).contains(&self.deadline_ms),
+            "traverse.deadline_ms must be 1..={} (got {})",
+            Self::MAX_DEADLINE_MS_LIMIT,
+            self.deadline_ms
+        );
+        ensure!(
+            self.max_stops <= Self::MAX_STOPS_LIMIT,
+            "traverse.max_stops must be 0..={} (got {})",
+            Self::MAX_STOPS_LIMIT,
+            self.max_stops
+        );
+        ensure!(
+            self.tau.is_finite() && (0.0..=1.0).contains(&self.tau),
+            "traverse.tau must be a number from 0 to 1 (got {})",
+            self.tau
+        );
+        Ok(())
+    }
+}
+
+impl Default for TraverseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scip_index: "index.scip".into(),
+            max_pops: 200,
+            max_depth: 6,
+            max_est_tokens: 20_000,
+            deadline_ms: 5_000,
+            max_stops: 4,
+            tau: 0.8,
+        }
+    }
 }
 
 /// Optional C# language-server (csharp-ls) configuration.
@@ -767,6 +875,7 @@ impl Default for Config {
             channels: ChannelsConfig::default(),
             fusion: FusionConfig::default(),
             search_profiles: BTreeMap::new(),
+            traverse: TraverseConfig::default(),
         }
     }
 }
@@ -830,6 +939,7 @@ impl Config {
             FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT,
             self.fusion.max_chunks_per_file
         );
+        self.traverse.validate()?;
         ensure!(
             self.watch_poll_milliseconds > 0 && self.watch_debounce_milliseconds > 0,
             "watch intervals must be positive"
@@ -2596,5 +2706,63 @@ mod tests {
         // With doubled braces the inner placeholder still fills and the
         // outer braces stay.
         assert_eq!(fill_template("{{code}}", &values), "{X}");
+    }
+
+    #[test]
+    fn traverse_is_off_by_default_and_invisible_while_it_is_the_default() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(!config.traverse.enabled);
+        assert_eq!(config.traverse, TraverseConfig::default());
+        // Not in the serialized configuration, so `config` and the layer
+        // reports are what they were before the section existed.
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(value.get("traverse").is_none(), "{value}");
+        // A changed section is reported, with every key.
+        let on: Config =
+            toml::from_str(&format!("{}[traverse]\nenabled = true\n", base_toml())).unwrap();
+        on.validate().unwrap();
+        let value = serde_json::to_value(&on).unwrap();
+        assert_eq!(value["traverse"]["enabled"], true);
+        assert_eq!(value["traverse"]["scip_index"], "index.scip");
+        assert_eq!(value["traverse"]["max_pops"], 200);
+    }
+
+    #[test]
+    fn traverse_rejects_unknown_keys_and_out_of_range_limits() {
+        let text = format!("{}[traverse]\nnope = 1\n", base_toml());
+        assert!(toml::from_str::<Config>(&text).is_err());
+        type Set = fn(&mut TraverseConfig);
+        let bad: [(&str, Set); 9] = [
+            ("scip_index", |t| t.scip_index = " ".into()),
+            ("max_pops", |t| t.max_pops = 0),
+            ("max_pops", |t| {
+                t.max_pops = TraverseConfig::MAX_POPS_LIMIT + 1
+            }),
+            ("max_depth", |t| t.max_depth = 0),
+            ("max_est_tokens", |t| t.max_est_tokens = 0),
+            ("deadline_ms", |t| t.deadline_ms = 0),
+            ("max_stops", |t| {
+                t.max_stops = TraverseConfig::MAX_STOPS_LIMIT + 1
+            }),
+            ("tau", |t| t.tau = 1.5),
+            ("tau", |t| t.tau = f32::NAN),
+        ];
+        for (key, set) in bad {
+            let mut config = Config {
+                data_dir: std::env::temp_dir(),
+                ..Config::default()
+            };
+            set(&mut config.traverse);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(&format!("traverse.{key}")), "{key}: {error}");
+        }
+        let mut config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.traverse.max_stops = 0;
+        config.traverse.tau = 0.0;
+        config.validate().unwrap();
     }
 }

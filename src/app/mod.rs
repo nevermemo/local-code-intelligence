@@ -8,6 +8,7 @@ mod indexing;
 mod navigation;
 pub(crate) mod readiness;
 mod search;
+pub mod traverse;
 
 pub use compact::{COMPACT_MAX_LINE_CHARS, compact_view};
 pub use indexing::{

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use local_code_intelligence::{
     app::{App, CANDIDATE_DUMP_ENV},
@@ -336,6 +336,16 @@ enum Command {
         #[arg(long, value_parser = parse_non_negative)]
         vote_weight: Option<f32>,
     },
+    /// Walk the code graph of a SCIP index from the symbols a question names
+    /// (or from given nodes), under a budget and optional steering rules, and
+    /// write the trace. Works offline: no model service, index store or
+    /// language server is used, and `[traverse] enabled` does not apply (it
+    /// only gates the MCP mode). The limits are the `[traverse]` caps. Prints
+    /// one JSON object: the reached nodes, the totals, the handlers'
+    /// decisions and, when the ladder could not decide a stop or the budget
+    /// ran out, the `handle` and `checkpoint`; continue with `--handle` (and
+    /// `--steer`).
+    Traverse(TraverseArgs),
     Symbols {
         workspace: PathBuf,
         query: String,
@@ -354,6 +364,143 @@ enum Command {
         #[arg(long)]
         include_declaration: bool,
     },
+}
+
+#[derive(clap::Args)]
+struct TraverseArgs {
+    /// The SCIP index to walk (from `rust-analyzer scip`).
+    #[arg(long)]
+    scip: PathBuf,
+    /// The tree the index describes, read for the enclosing-range repair.
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// The question; the symbol names in it pick the start nodes.
+    #[arg(long, conflicts_with = "handle")]
+    question: Option<String>,
+    /// Start nodes (canonical node ids, comma separated) instead of finding
+    /// them from the question.
+    #[arg(long, value_delimiter = ',', conflicts_with = "handle")]
+    seeds: Vec<String>,
+    /// Maps to use, comma separated: graph.scip, seeds.scip_names (default:
+    /// both).
+    #[arg(long, value_delimiter = ',')]
+    maps: Vec<String>,
+    /// The steering policy: a JSON file or inline JSON, either an array of
+    /// rules or the object of `search_code`'s `steer` (rules, ladder,
+    /// max_stops, tau, stop_every).
+    #[arg(long)]
+    policy: Option<String>,
+    /// A stop (a consultation of the rules) every this many pops.
+    #[arg(long)]
+    stops: Option<u32>,
+    /// Most pops, up to the `[traverse]` cap.
+    #[arg(long)]
+    pops: Option<u32>,
+    /// Deepest state expanded, up to the `[traverse]` cap.
+    #[arg(long)]
+    max_depth: Option<u32>,
+    /// Results to print.
+    #[arg(long, default_value_t = 8)]
+    top_k: usize,
+    /// Continue the traversal this handle names (it must be under --out, or
+    /// under the data directory without it).
+    #[arg(long)]
+    handle: Option<String>,
+    /// With --handle: the answer to the checkpoint, a JSON file or inline
+    /// JSON, an array of actions or `{"actions": [..]}`.
+    #[arg(long, requires = "handle")]
+    steer: Option<String>,
+    /// Write `traces/` and `handles/` under this directory instead of the
+    /// data directory.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+/// JSON given inline or as the path of a file.
+fn json_argument(text: &str) -> Result<Value> {
+    let trimmed = text.trim_start();
+    let raw = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        text.to_owned()
+    } else {
+        std::fs::read_to_string(text).with_context(|| format!("read {text}"))?
+    };
+    serde_json::from_str(&raw).with_context(|| format!("parse the JSON in {text}"))
+}
+
+/// `traverse`: one traversal call over a SCIP index, printed as JSON. Runs
+/// without opening the application.
+async fn run_traverse(
+    config_path: Option<PathBuf>,
+    no_local_config: bool,
+    args: TraverseArgs,
+) -> Result<()> {
+    use local_code_intelligence::app::traverse::{self, BudgetArgs, Call, Dirs, SteerArgs};
+    if args.question.is_none() && args.seeds.is_empty() && args.handle.is_none() {
+        anyhow::bail!("give --question or --seeds, or --handle to continue a traversal");
+    }
+    let spec = ResolveSpec::from_process(
+        config_path,
+        Flags {
+            port: None,
+            no_local_config,
+        },
+    )?;
+    let config = layers::resolve(&spec)?.config;
+    let mut steer = match &args.policy {
+        None => SteerArgs::default(),
+        Some(text) => match json_argument(text)? {
+            rules @ Value::Array(_) => SteerArgs {
+                rules: Some(rules),
+                ..SteerArgs::default()
+            },
+            object => serde_json::from_value(object).context("--policy")?,
+        },
+    };
+    if args.stops.is_some() {
+        steer.stop_every = args.stops;
+    }
+    if let Some(text) = &args.steer {
+        steer.actions = Some(match json_argument(text)? {
+            Value::Object(mut object) => object
+                .remove("actions")
+                .context("--steer: the object has no `actions`")?,
+            actions => actions,
+        });
+    }
+    let budget = BudgetArgs {
+        pops: args.pops,
+        max_depth: args.max_depth,
+        ..BudgetArgs::default()
+    };
+    let dirs = match &args.out {
+        Some(out) => Dirs {
+            traces: out.join("traces"),
+            handles: out.join("handles"),
+        },
+        None => Dirs::under(&config.data_dir),
+    };
+    let maps = (!args.maps.is_empty()).then_some(args.maps.as_slice());
+    let report = traverse::run(
+        &config.traverse,
+        &dirs,
+        &Call {
+            scip_index: &args.scip,
+            scip_root: args.root.as_deref(),
+            question: args.question.as_deref().unwrap_or_default(),
+            seeds: &args.seeds,
+            top_k: args.top_k,
+            maps,
+            budget: &budget,
+            steer: &steer,
+            handle: args.handle.as_deref(),
+        },
+    )
+    .await?;
+    if let Some(trace) = &report.trace {
+        eprintln!("trace {}", trace.display());
+    }
+    println!("{}", serde_json::to_string_pretty(&report.response)?);
+    Ok(())
 }
 
 fn parse_resamples(value: &str) -> Result<usize, String> {
@@ -801,6 +948,9 @@ async fn run() -> Result<()> {
             },
         );
     }
+    if let Command::Traverse(args) = command {
+        return run_traverse(cli.config, cli.no_local_config, args).await;
+    }
     if let Command::Config { json } = command {
         return run_config(cli.config, cli.no_local_config, json);
     }
@@ -924,6 +1074,7 @@ async fn run() -> Result<()> {
         Command::Init { .. } => unreachable!("init returns before the application opens"),
         Command::Compare { .. } => unreachable!("compare returns before the application opens"),
         Command::Replay { .. } => unreachable!("replay returns before the application opens"),
+        Command::Traverse(_) => unreachable!("traverse returns before the application opens"),
         Command::Symbols { workspace, query } => serde_json::to_value(
             until_shutdown_signal(&app, app.symbols(&workspace, &query)).await?,
         )?,

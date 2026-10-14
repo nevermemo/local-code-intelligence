@@ -1,0 +1,216 @@
+{
+  "$defs": {
+    "BudgetArgs": {
+      "additionalProperties": false,
+      "description": "`budget` of a traversal request. Each value may lower the `[traverse]`\ncap of the same name, never raise it.",
+      "properties": {
+        "deadline_ms": {
+          "description": "Longest the call may run, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "est_tokens": {
+          "description": "Most estimated tokens the expansions may cost.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_depth": {
+          "description": "Deepest state that is expanded.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pops": {
+          "description": "Most node expansions (pops).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SearchMode": {
+      "description": "What `search_code` can do besides the ranked search.",
+      "oneOf": [
+        {
+          "const": "traverse",
+          "description": "Walk the code graph from the symbols the query names instead of\nreturning a ranked list (needs `[traverse] enabled` on the server).",
+          "type": "string"
+        }
+      ]
+    },
+    "SteerArgs": {
+      "additionalProperties": false,
+      "description": "`steer` of a traversal request: the rules the ladder applies at each\nstop, how many stops there may be, and, on a continuation, the outer\nagent's answer to a returned checkpoint.",
+      "properties": {
+        "actions": {
+          "description": "Only with `handle`: the outer agent's answer to the checkpoint,\n`[{\"node\"?: id, \"action\": ..}]` with the actions of the rule list plus\n`{\"budget\": {\"pops\": n, \"tokens\": n}}` (bounded)."
+        },
+        "ladder": {
+          "description": "The rungs, in order, ending with `agent`. Only `rules` and `agent` are\navailable. A stop no rung can decide returns the checkpoint to the\ncaller.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "max_stops": {
+          "description": "Most stops in the traversal (never above the `[traverse]` cap).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rules": {
+          "description": "Rung 1 of the ladder: an array of `{\"when\": predicate, \"then\": action}`\nrules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,\n`score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,\n`not`. Actions: `prune`, `expand`, `continue`, `stop`, `{\"boost\": f}`,\n`{\"map_on\": id}`, `{\"map_off\": id}`, `{\"map_weight\": {\"id\", \"weight\"}}`,\n`{\"rerank\": \"witness\"|\"depth\"|\"fanout\"}`, `{\"redirect\": [node ids]}`,\n`{\"emit\": note}`. They can only shrink, reorder or redirect the walk."
+        },
+        "script": {
+          "description": "Reserved for an embedded script handler; not available yet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stop_every": {
+          "description": "A stop every this many pops. Without it, stops happen every\n`pops / (max_stops + 1)` pops while rules are given.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tau": {
+          "description": "Confidence a rung needs to decide a stop, 0 to 1.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "budget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BudgetArgs"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "With `mode = traverse`: lowers the server's pop, depth, token and time\ncaps for this call."
+    },
+    "exclude_paths": {
+      "description": "Repository-relative exclude globs.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "handle": {
+      "description": "With `mode = traverse`: continue the traversal whose `handle` and\n`checkpoint` an earlier call returned (the query is then ignored).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "include_paths": {
+      "description": "Repository-relative include globs.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "languages": {
+      "description": "Registered language identifiers to include.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SearchMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`traverse`: walk the code graph (callers, callees, references) from the\nsymbols `query` names, under `budget` and `steer`, instead of ranking\nchunks. `top_k` then limits the reached nodes returned."
+    },
+    "query": {
+      "type": "string"
+    },
+    "source_roles": {
+      "description": "Source roles to include.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "steer": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SteerArgs"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "With `mode = traverse`: the rules applied at each stop and the stop\nsettings; with `handle`, also the answer to a returned checkpoint."
+    },
+    "top_k": {
+      "description": "Number of results, 1 through 40; defaults to configured top-k (8). A\nsearch returns at most `rerank_candidate_count` results (24 unless\nconfigured), whatever top_k says; a larger top_k you pass adds a note\nto the response.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "workspace_path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_path",
+    "query"
+  ],
+  "type": "object"
+}
