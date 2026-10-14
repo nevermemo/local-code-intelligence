@@ -10,6 +10,11 @@
 //! workspace, else skipped and counted; key `(code, file, line, column)`,
 //! first occurrence kept; a site's node is the innermost SCIP unit holding the
 //! 0-based start position, else it is unattributed.
+//!
+//! Expansion rule (one level): the expansion site is read from
+//! `span.expansion.span` only, the call site rustc reports for the span; a
+//! further expansion recorded inside that call site is not followed. If the
+//! call site is outside the workspace the span is skipped and counted.
 
 use crate::impact::ImpactIndex;
 use serde_json::{Value, json};
@@ -38,25 +43,32 @@ pub struct Parsed {
 }
 
 /// Paths are compared with forward slashes and relative to the workspace root.
+/// The root prefix is matched character by character, ignoring case (Windows
+/// paths), so no byte offset of a lowercased copy is ever used.
 pub fn relative(path: &str, root: &str) -> String {
     let p = path.replace('\\', "/");
     let mut w = root.replace('\\', "/");
     if !w.ends_with('/') {
         w.push('/');
     }
-    if p.to_lowercase().starts_with(&w.to_lowercase()) {
-        p[w.len()..].to_string()
-    } else {
-        p
+    let mut chars = p.char_indices();
+    for wc in w.chars() {
+        match chars.next() {
+            Some((_, pc)) if pc.to_lowercase().eq(wc.to_lowercase()) => {}
+            _ => return p,
+        }
     }
+    let rest = chars.next().map_or(p.len(), |(i, _)| i);
+    p[rest..].to_string()
 }
 
-/// A workspace source file as opposed to a registry or toolchain one.
+/// A workspace source file as opposed to a registry or toolchain one: after
+/// [`relative`] the path is still relative (no leading `/`, no drive colon, no
+/// `..`). Registry, git and toolchain sources are reported by cargo with
+/// absolute paths, so any member file (a root `build.rs`, `benches/`, a new
+/// crate) counts without a list of directories.
 pub fn in_workspace(rel: &str) -> bool {
-    !(rel.starts_with('/') || rel.contains(':'))
-        && ["src/", "tests/", "lci-core/", "xtask/", "lci-maps/"]
-            .iter()
-            .any(|p| rel.starts_with(p))
+    !(rel.is_empty() || rel.starts_with('/') || rel.starts_with("../") || rel.contains(':'))
 }
 
 fn unit_key(target: &Value) -> String {
@@ -216,6 +228,55 @@ mod tests {
         let p = parse_cargo_json(&ext, "C:/tree");
         assert_eq!(p.sites.len(), 1);
         assert_eq!((p.sites[0].line, p.sites[0].col), (7, 9));
+        assert_eq!(p.external_spans_skipped, 1);
+    }
+
+    #[test]
+    fn any_relative_path_is_in_the_workspace() {
+        for rel in [
+            "build.rs",
+            "benches/b.rs",
+            "newcrate/src/lib.rs",
+            "src/a.rs",
+        ] {
+            assert!(in_workspace(rel), "{rel}");
+        }
+        for rel in [
+            "/rustc/abc/library/core/src/lib.rs",
+            "C:/reg/x.rs",
+            "../x.rs",
+            "",
+        ] {
+            assert!(!in_workspace(rel), "{rel}");
+        }
+    }
+
+    #[test]
+    fn relative_matches_the_root_without_byte_offsets() {
+        assert_eq!(relative("c:\\Tree\\build.rs", "C:/tree"), "build.rs");
+        assert_eq!(
+            relative("C:/other/build.rs", "C:/tree"),
+            "C:/other/build.rs"
+        );
+        // Lowercasing U+0130 changes the byte length; the strip must not rely on it.
+        assert_eq!(relative("\u{130}/src/a.rs", "\u{130}"), "src/a.rs");
+        assert_eq!(relative("x", "a-much-longer-root"), "x");
+    }
+
+    #[test]
+    fn nested_expansion_is_not_followed() {
+        // The call site is itself in an external file whose own expansion would
+        // point into the workspace; the current rule reads one level and skips.
+        let nested = json!({"reason": "compiler-message", "target": {"name": "t", "kind": ["lib"]},
+            "message": {"level": "error", "message": "m", "code": {"code": "E1"},
+            "spans": [{"file_name": "C:/registry/x.rs", "line_start": 1, "column_start": 1,
+                       "is_primary": true, "expansion": {"span": {"file_name": "C:/registry/y.rs",
+                       "line_start": 2, "column_start": 2,
+                       "expansion": {"span": {"file_name": "src/m.rs",
+                                              "line_start": 7, "column_start": 9}}}}}]}})
+        .to_string();
+        let p = parse_cargo_json(&nested, "C:/tree");
+        assert!(p.sites.is_empty());
         assert_eq!(p.external_spans_skipped, 1);
     }
 

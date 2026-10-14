@@ -54,7 +54,7 @@ fn git(tree: &Path, args: &[&str]) -> (bool, String) {
 }
 
 fn clean(tree: &Path) -> bool {
-    let (ok, text) = git(tree, &["status", "--porcelain", "--untracked-files=no"]);
+    let (ok, text) = git(tree, &["status", "--porcelain"]);
     ok && text.trim().is_empty()
 }
 
@@ -86,12 +86,10 @@ fn main() {
     let scip_load_ms = ms(t);
 
     let t = Instant::now();
-    let mut apply_ok = true;
     if let Some(p) = &patch {
         let p = p.to_string_lossy().into_owned();
         let (ok, text) = git(&tree, &["apply", "--unidiff-zero", &p]);
         assert!(ok, "git apply failed: {text}");
-        apply_ok = ok;
     }
     let apply_ms = ms(t);
 
@@ -116,11 +114,14 @@ fn main() {
     if patch.is_some() {
         // `git apply -R` leaves a pure deletion as a line-ending change in a
         // CRLF checkout, so the revert restores the files from the index.
+        // Files a patch adds are removed too (`clean -fd`; the target dir is
+        // outside the tree and ignored files such as `.tools/` are kept).
         let (ok, text) = git(&tree, &["checkout", "--", "."]);
-        if !ok {
-            eprintln!("revert failed: {text}");
+        let (clean_ok, clean_text) = git(&tree, &["clean", "-fd"]);
+        if !ok || !clean_ok {
+            eprintln!("revert failed: {text}{clean_text}");
         }
-        revert_ok = ok;
+        revert_ok = ok && clean_ok;
     }
     let revert_ms = ms(t);
     let clean_after = clean(&tree);
@@ -145,7 +146,7 @@ fn main() {
         "tree_commit": git(&tree, &["rev-parse", "HEAD"]).1.trim(),
         "clean_before": clean_before,
         "clean_after": clean_after,
-        "apply_ok": apply_ok,
+        "apply_ok": true,
         "revert_ok": revert_ok,
         "cargo_rc": output.status.code(),
         "build_success": parsed.build_success,
