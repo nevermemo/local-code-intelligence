@@ -11,7 +11,7 @@
 //!                        [--gold impact.json (O, OD only)] [--anchors anchors.json] \
 //!                        [--size-from C-run.json (B, R)] [--seed 1] --out run.json
 //! impact_eval kinds      --scip INDEX.scip --root TREE
-//! impact_eval anchors-key --scip INDEX.scip --root TREE --input anchor-input.json //!                        --edges edges.json --rule C|N [--k 5] --out anchors-key.json
+//! impact_eval anchors-key --scip INDEX.scip --root TREE --input anchor-input.json \n//!                        --edges edges.json --rule C|N [--k 5] --out anchors-key.json
 //! ```
 //!
 //! Slice M1.2 (`docs/spike/multimap/v2/m1.2-prereg.md`) adds the arms

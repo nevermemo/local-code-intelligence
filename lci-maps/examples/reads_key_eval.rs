@@ -14,7 +14,7 @@
 use lci_maps::{
     impact::{ImpactIndex, SourceCache, dir_source},
     reads_key::{
-        CONFIG_RS, Class, build_key_table, extract, in_cfg_test_module, rs_files, test_module_files,
+        CONFIG_RS, build_key_table, extract, in_cfg_test_module, rs_files, test_module_files,
     },
     walk::wilson,
 };
@@ -138,7 +138,6 @@ fn reads_key(m: &BTreeMap<String, String>) {
         counts.first().copied().unwrap_or(0),
         counts.last().copied().unwrap_or(0)
     );
-    let _ = Class::Confirmed;
 }
 
 fn s(v: &Value) -> String {

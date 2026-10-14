@@ -759,6 +759,12 @@ pub fn extract(
         let owner = e.owner.clone().unwrap_or_default();
         let field_def = ix.def_index(sym).map(|d| ix.defs[d].name_range);
         let def_path = ix.def_index(sym).map(|d| ix.defs[d].path.clone());
+        // Width of the field name as written at its definition (a renamed key
+        // differs from the key text).
+        let field_len = field_def
+            .map(|r| r.3.saturating_sub(r.1) as usize)
+            .filter(|n| *n > 0)
+            .unwrap_or(e.key.len());
 
         // W1: SCIP occurrences of the field symbol.
         for (path, line, col) in ix.occurrences(sym) {
@@ -766,7 +772,7 @@ pub fn extract(
                 continue;
             };
             let role = match cache.lines(&path).and_then(|ls| ls.get(line as usize)) {
-                Some(l) => role_in_line(l, col as usize, e.key.len()),
+                Some(l) => role_in_line(l, col as usize, field_len),
                 None => Role::Read,
             };
             touch(&mut acc, &id, ix.decl(u), false, (true, false, false), role);
