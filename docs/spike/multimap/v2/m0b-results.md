@@ -194,7 +194,7 @@ Reading (rules 2 to 6):
   every band and F is a small gain (beats on `some`).
 * **The reranker** (rule 6): FR minus F on the primary metric `decl_f1` is a small gain in every band (+0.015
   `unique`, +0.036 `common`, interval above 0, below the floor; items improved/tied/worsened 11/70/0 and 15/20/0),
-  so by rule 6 there is **no evidence of an effect** large enough to call. On the ranking metrics it meets rule 2 in
+  so by rule 6 there is **no evidence of an effect** large enough to call (small gain = an effect below the floor, not called). On the ranking metrics it meets rule 2 in
   `common` (`decl_recall@5` +0.060, `decl_recall@10` +0.061, `decl_ndcg@10` +0.092) and in `unique` for
   `decl_recall@10` (+0.058); window-level `decl_recall` also meets rule 2 in `common` (+0.057) with 0 items worse.
   Since the same shortlist feeds both and window recall moved too, part of the gain comes from a changed selection
@@ -202,6 +202,9 @@ Reading (rules 2 to 6):
 * **Fusion** (rule 7, descriptive): F is not at least as good as the better channel on `unique` (L 0.183, S 0.124,
   F 0.164, a small loss against L); on `common` (L 0.109, S 0.118, F 0.117) and `some` (L 0.115, S 0.098, F 0.124) F is within
   noise of the better one. File recall is the clearest fusion effect: F 0.876 against L 0.790 and S 0.829.
+* **Product baseline for M1.4** (descriptive): `tests_deep_recall` is 0.000 for L, F and FR (n_defined 103), and
+  `r2_decl_recall` is 0.18 / 0.19 / 0.21 (L / F / FR, overall, n_defined 141); M1.4 reads the `tests_deep` stratum
+  against this baseline.
 * **C1 caveat** (rule 6 of M0.3): file-level metrics move more than declaration-level ones. FR's `file_recall`
   (0.900 [0.866, 0.931]) is 0.110 above L's, while `decl_recall` is 0.018 above (no evidence of a difference).
 
@@ -355,7 +358,7 @@ Reading (rules 1, 2, 4, 6):
   evidence at rule 2.
 * **The reranker:** FR minus F on the headline items is a small gain (+0.035 [+0.002, +0.085], 6 items improved, 1
   worse), and on the not-flagged headline items no evidence (+0.021 [+0.000, +0.038]). Rule 6: **no evidence of an effect**
-  in the primary cell. On `named` items it meets rule 2 (+0.052 [+0.009, +0.125]), a non-primary cell.
+  in the primary cell (small gain = an effect below the floor, not called). On `named` items it meets rule 2 (+0.052 [+0.009, +0.125]), a non-primary cell.
 * No arm names a whole path on a headline item (0 of 55 each). `tau` and `exact_order` are not read.
 * S is worse than L overall (-0.050 [-0.106, -0.006], exactly at the floor) and on flagged headline items (-0.064
   [-0.140, -0.015]); no evidence elsewhere.
@@ -367,14 +370,14 @@ Reading (rules 1, 2, 4, 6):
 | F beats L, `impact` | no | rule 4, `decl_f1`: F minus L small loss on `unique`, no evidence on `some` and `common` |
 | FR beats L, `impact` | no | rule 4: small gain on `common` (+0.044), no evidence on `unique` |
 | F or FR beats `grep_baseline`, `impact` | no, worse in every band | rule 5, `decl_f1` |
-| F or FR beats BM25, `impact` file level | yes | rule 5, `file_f1` and `file_recall`, every band |
+| F or FR beats BM25, `impact` file level | yes, descriptive file-level comparison; not a rule-5 verdict | rule 3 names only `decl_f1` for `impact` and BM25 has no declaration metrics; `file_f1` and `file_recall` are higher in every band |
 | F beats L, `where-to` | yes | rule 4, `reg_hit@3` +0.160 and convention `set_recall` +0.267 |
 | FR beats L, `where-to` | yes | rule 4, `reg_hit@3` +0.200, `reg_mrr` +0.171, convention `set_recall` +0.378 |
 | F beats BM25, `where-to` | no | rule 5, `reg_hit@3` no evidence, convention `set_recall` no evidence |
 | FR beats BM25, `where-to` | yes on registration, no on convention | rule 5, `reg_hit@3` +0.200, `reg_mrr` +0.259; convention `set_recall` no evidence |
 | F or FR beats L, `flow` | no | rule 4, headline `path_recall`, overall and not-flagged |
 | Reranker helps, `impact` | no (small gains) | rule 6, `decl_f1`; ranking metrics and window recall meet rule 2 in `common` |
-| Reranker helps, `where-to` | on set metrics only (changed selection); no evidence on registration ranking | rule 6 |
+| Reranker helps, `where-to` | yes (convention `set_recall`, n 14: FR minus F +0.111 [+0.020, +0.222], 4/10/0); no evidence on registration ranking; a changed selection [I] | rule 6 |
 | Reranker helps, `flow` | no evidence of an effect | rule 6, headline |
 | S beats F in a primary cell | no | prereg section 9 |
 
@@ -416,6 +419,13 @@ against 0.03 to 0.18 s on the 5090.
   A/B baseline moved to the 5090 and a 4B embedder (the pre-registration's own rule: the A/B's value wins). The
   amendment (section 12) was committed before any query of the run reported here; the earlier attempt is section 7.
   An earlier proposal (section 11: a second-GPU reranker on another port) was superseded by the port move and never run.
+* **No exploratory score read before amendment 12.** No exploratory 0.6B score was read before amendment 12
+  (13:10:38Z): the S run file and its score existed from about 11:41Z, but neither the run agent nor the coordinator
+  read any score; the trigger was the owner's decision to move every model to the RTX 5090 (A/B addendum 10.6), not a
+  result.
+* **Overwritten iGPU score files.** The stats scripts overwrote the iGPU S and F score/stats files when the 5090 arms
+  were scored; the unchanged run files (byte-identical in `out/` and `out_igpu/`, sha256 checked) were re-scored
+  deterministically into `out_igpu/` with 0 mismatches.
 * **300 s wall-clock rule.** `lci evaluate` has no per-query wall-clock limit of its own; the rule was checked from the
   per-query total time in the report (maximum 1,788 ms) together with the product's own 240 s reranker timeout.
   No process-level watchdog was used. No query came near the limit.
