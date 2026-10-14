@@ -1,0 +1,154 @@
+# Gold scorers (`cargo xtask gold`)
+
+Scorers for five local gold sets: `impact`, `flow`, `where-to`, `history` and
+`instructions`. The gold files are not part of this repository; every command
+takes them with `--gold <path>`. Nothing here embeds gold content, and the unit
+tests use small synthetic items.
+
+```
+cargo xtask gold score       --set <impact|flow|where-to|history|instructions> --gold <path> --run <path> [--out <path>] [--partial] [--strict]
+cargo xtask gold baseline    --set <set> --gold <path> [--kind shipped|oracle|constant] [--out <path>]
+cargo xtask gold to-evaluate --set <set> --gold <path> --out <path> [--workspace self] [--top-k 10]
+```
+
+Gold file: a JSON array of items, each with a string `id`. A scorer reads only
+the fields named below; extra fields are ignored.
+
+## Run file
+
+A run is one JSON object mapping an item id to a ranked array of answers (best
+first):
+
+```json
+{ "impact-0001": [ {"path": "src/a.rs", "line": 120}, "src/b.rs" ] }
+```
+
+Each answer is a string or an object. Object fields, all optional:
+
+| field | meaning |
+| --- | --- |
+| `path` (alias `doc`, `file`) | repository-relative path, `/` separators |
+| `line`, `end_line` | one line, or a span (`start_line` is an alias of `line`) |
+| `name` | symbol or function name, `Owner::name` or `module::name` |
+| `symbol` | the SCIP symbol string, when the system has one |
+| `commit` | commit hash, full or a prefix of 7 or more hex digits (history) |
+| `files` | history only: files the answer says the commit touched |
+
+String shorthand: `path`, `path:line`, `path:start-end`, a name, or (history) a
+hex commit. A string that has a `/`, or a `.` and no `::`, whitespace or `(`,
+is a path; other strings are names.
+
+An item missing from the run is scored as an empty answer (0) unless
+`--partial` is given, which scores only the items present. The report lists
+`run_ids_not_in_gold`.
+
+## Report
+
+`score` writes (stdout or `--out`):
+
+```
+{ set, gold_items, excluded_from_population, scored_items, items_missing_from_run,
+  missing_scored_as_empty, run_ids_not_in_gold, strict,
+  overall: { n, metrics: {name: mean}, n_defined?: {name: k} },
+  strata:  { <dimension>: { <value>: { n, metrics, n_defined? } } } }
+```
+
+`n` is the number of items in the cell. A metric that is undefined for some
+items of the cell (for example tau on one-node answers, or `file_recall` when
+no answer lists files) is averaged over the items where it is defined, and
+`n_defined` gives that count. Means are rounded to 4 places.
+
+## Metrics
+
+Shared primitives (in `xtask/src/gold/metrics.rs`): precision (0 when nothing
+was returned), recall (1 when the gold is empty), F1, hit@k, reciprocal rank
+with a cut-off, binary nDCG@k, and Kendall tau (concordant minus discordant over
+pairs).
+
+**impact** (the `primary: true` items only; strata `kind`, `band` = name
+ambiguity, `coverage` = test coverage label). A returned declaration matches a
+gold R1 declaration by `symbol`, by `path` plus a line inside the declaration
+span, or by `path` plus the bare or full name (a name alone matches too). An
+answer with a line, name or symbol is a declaration; a path-only answer is a
+file. Declarations in `accept.neutral_decls`, the seed's own declaration, and
+files in `accept.neutral_files` are skipped; everything else not in the gold is
+wrong. Metrics: `decl_precision`, `decl_recall`, `decl_f1`,
+`decl_recall@5/10/20`, `decl_ndcg@10` (a repeat of an already-credited
+declaration earns no gain), `file_precision/recall/f1` over distinct answered
+paths against `gold.r1.files`; secondary recalls `r2_decl_recall`,
+`tests_recall`, `tests_deep_recall`, `tests_lexical_recall`, `docs_recall`
+(config items), reported only where the item has that gold.
+
+**flow** (strata `stratum` = first part of the stratum, `headline`). An answer
+names functions; it matches a gold node by `Owner::name`, by bare name when
+that is unambiguous inside the item, or by `file:line`, case-insensitive
+(backticks and a trailing `()` dropped). `path_recall` is the fraction of gold
+intermediates named (multi-path: best alternate; config-flow: field plus
+readers). `tau` and `exact_order` are for path items; `spurious` counts
+answers that match no known node and are not in `accept.ignorable_nodes`;
+`fanout_recall` is for dispatch items.
+
+**where-to** (strata `form`, `leak`). Registration items: `reg_hit@3` and
+`reg_mrr` (rank cut at 10) of the first expected file, and `reg_decl_hit@3`
+for answers with a line. Preferred, documentation, definition, related and
+neutral sites are skipped when ranking unless `--strict`. Exemplar and
+convention items: `set_recall`, `set_precision`, `set_f1`; an entry that
+matches no member lowers precision, a line inside an implementation (or its
+equivalent) matches it, and a path-only answer matches when exactly one
+implementation lives in that file.
+
+**history** (stratum `family` = H1, H2, H3a, H3b). `mrr` of the first accepted
+commit (H1/H2: `gold.commit`; H3: `accept.mrr_commits`), `hit@1/2/3/5/10`, and
+`file_recall` against `gold.files` (with `accept.alt_files` as the same file
+under its other name) when answers carry `files`. Commits match by prefix.
+
+**instructions** (strata `subtype`, `stratum`). I1: `i1_section_precision`,
+`i1_section_recall`, `i1_section_f1` (a returned span counts when it lies in a
+gold section of the same document), and `i1_path_specific_recall` over the
+sections whose scope is `path`. I2: `i2_hit@3_primary`, `i2_hit@3_core`
+(overlap in the same document), `i2_required_recall@5`, `i2_required_recall`,
+`i2_required_precision@5`, `i2_decoy_in_top3`. A path-only answer is the whole
+document.
+
+## Baselines
+
+`baseline --kind shipped` (the default) rebuilds what the gold file itself can
+reproduce:
+
+- `impact`: the `grep_baseline` field stores only metrics, not the returned
+  declarations, so no run can be built. The output is a metrics report in the
+  `score` layout (metric names prefixed `grep_`), averaged per stratum.
+- `history`: a run. H1 and H3 get the best constant commit; H2 gets the
+  "gold sits at rank N of the file log" shortcut rebuilt from
+  `accept.file_log_rank`, with placeholder entries that match no commit. The H1
+  "file created by the gold commit" shortcut needs git history and is not
+  rebuilt. `--kind constant` uses a constant commit for H2 as well.
+- `instructions`: a run for the I1 items only: the root documents' sections that
+  occur in some I1 gold. Recall equals the real root-only system's; precision is
+  an upper bound. The I2 lexical baseline needs the rule corpus and is not
+  rebuilt (score with `--partial`).
+- `flow` and `where-to` ship no baseline; use a run from your own system.
+
+`baseline --kind oracle` answers every item with its own gold. Scoring it must
+give 1.0 on every primary metric; it is a self-check of the scorer and of the
+run schema.
+
+## Conversion to `lci evaluate`
+
+`to-evaluate` writes the TOML definition `lci evaluate` reads (see
+`lci-core/src/evaluation.rs`): one workspace and one query per item, with
+`expected_paths`, `disfavored_paths`, `top_k` and tags. The definition is
+validated with the same function the evaluator uses before it is written, and a
+summary of dropped items goes to stderr. The format is file-level, so:
+
+| set | `expected_paths` | lost or dropped |
+| --- | --- | --- |
+| impact | `gold.r1.files`; decoy files are `disfavored_paths` | the non-primary items; declaration gold, R2, tests, docs |
+| flow | files of the gold intermediates (config-flow: field and readers; dispatch: plus fan-out) | hop order, tau, spurious nodes, entry and target files |
+| where-to | expected files, exemplar member files or convention implementation files; decoys as `disfavored_paths` | spans, neutral sites, precision |
+| history | `gold.files` plus `accept.alt_files` | the commit (the real target) and the as-of cut-off; evaluate searches the checked-out tree, so a file that no longer exists cannot be found |
+| instructions | rule documents (I1) or the primary units' documents (I2, other required documents as `preferred_paths`) | sections and units; these documents are outside the default index, so a score of 0 is expected for today's index |
+
+Queries run against the workspace key given with `--workspace` (default
+`self`); the evaluated tree must be the one the gold was built on for the
+structural sets to mean anything.

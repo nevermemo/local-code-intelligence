@@ -1,6 +1,7 @@
 mod acceptance;
 mod build;
 mod env;
+mod gold;
 mod lint;
 mod live_acceptance;
 mod mine;
@@ -67,6 +68,14 @@ enum Command {
     /// file:line for each hit. Also part of `test --suite Full`. See
     /// docs/development/machine-values.md, "Lint".
     LintMachinePaths,
+    /// Score, baseline and convert the local gold sets (impact, flow,
+    /// where-to, history, instructions). The gold files live outside the
+    /// repository and are passed with --gold. See
+    /// docs/spike/multimap/v2/gold-scorers.md.
+    Gold {
+        #[command(subcommand)]
+        which: gold::GoldCommand,
+    },
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
@@ -256,6 +265,7 @@ async fn main() -> Result<()> {
         } => live_acceptance::run(only, skip_build, require_all),
         Command::Env(args) => env::run(args),
         Command::LintMachinePaths => lint::run(),
+        Command::Gold { which } => gold::run(which),
         Command::MineQueries {
             repo,
             key,
