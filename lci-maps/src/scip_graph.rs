@@ -354,11 +354,11 @@ struct PairSites {
     first: Witness,
 }
 
-struct Def {
-    symbol: String,
-    path: String,
-    name_range: Range,
-    enclosing: Option<Range>,
+pub struct Def {
+    pub symbol: String,
+    pub path: String,
+    pub name_range: Range,
+    pub enclosing: Option<Range>,
 }
 
 impl Def {
@@ -373,7 +373,7 @@ impl Def {
 }
 
 /// First definition of every non-local symbol, in index order.
-fn collect_definitions(documents: &[RawDocument]) -> Vec<Def> {
+pub(crate) fn collect_definitions(documents: &[RawDocument]) -> Vec<Def> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut defs = Vec::new();
     for document in documents {
@@ -408,7 +408,7 @@ fn contains_pos(r: Range, line: u32, col: u32) -> bool {
 
 /// The smallest range holding the position (by lines, then columns); the
 /// first of equals wins.
-fn innermost(scope: &[(Range, usize)], line: u32, col: u32) -> Option<usize> {
+pub(crate) fn innermost(scope: &[(Range, usize)], line: u32, col: u32) -> Option<usize> {
     let mut best: Option<((u32, i64), usize)> = None;
     for &(enc, def) in scope {
         if contains_pos(enc, line, col) {
@@ -424,7 +424,11 @@ fn innermost(scope: &[(Range, usize)], line: u32, col: u32) -> Option<usize> {
 /// A function whose range equals another function's range in the same file,
 /// or strictly holds one, is a macro-expanded impl member; its range is
 /// replaced by the span from its name line to the end of its body.
-fn repair_enclosing(defs: &mut [Def], source: Option<&dyn SourceText>, report: &mut BuildReport) {
+pub(crate) fn repair_enclosing(
+    defs: &mut [Def],
+    source: Option<&dyn SourceText>,
+    report: &mut BuildReport,
+) {
     let mut per_file: HashMap<String, Vec<(Range, usize)>> = HashMap::new();
     for (i, def) in defs.iter().enumerate() {
         if let (true, Some(enc)) = (def.is_function(), def.enclosing) {
@@ -474,11 +478,11 @@ fn repair_enclosing(defs: &mut [Def], source: Option<&dyn SourceText>, report: &
 /// The code bytes (outside comments, strings and char literals) after a
 /// position, with their coordinates. Strings spanning lines are not tracked,
 /// like the gold set's scanner.
-struct Structural<'a> {
-    lines: &'a [Vec<u8>],
-    line: usize,
-    col: usize,
-    block_depth: u32,
+pub(crate) struct Structural<'a> {
+    pub(crate) lines: &'a [Vec<u8>],
+    pub(crate) line: usize,
+    pub(crate) col: usize,
+    pub(crate) block_depth: u32,
 }
 
 fn char_literal_len(text: &[u8], i: usize) -> Option<usize> {

@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod crates;
 pub mod fresh;
+pub mod impact;
 pub mod kit;
 pub mod kit_c3;
 pub mod labels;
