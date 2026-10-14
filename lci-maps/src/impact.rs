@@ -275,6 +275,26 @@ impl ImpactIndex {
         self.def_of.get(symbol).copied()
     }
 
+    /// Definitions of a file (indices into `defs`).
+    pub fn defs_in_file(&self, path: &str) -> &[usize] {
+        self.by_file.get(path).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Paths of the indexed documents.
+    pub fn doc_paths(&self) -> BTreeSet<&str> {
+        self.docs.iter().map(|d| d.path.as_str()).collect()
+    }
+
+    /// Non-definition occurrences of a symbol: (path, line, col), zero-based.
+    pub fn occurrences(&self, symbol: &str) -> Vec<(String, u32, u32)> {
+        self.refs
+            .get(symbol)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|&(di, line, col)| (self.docs[di].path.clone(), line, col))
+            .collect()
+    }
+
     pub fn ref_count(&self, def: usize) -> usize {
         self.refs.get(&self.defs[def].symbol).map_or(0, Vec::len)
     }
@@ -324,7 +344,7 @@ impl ImpactIndex {
         set.into_iter().map(|t| t.3).collect()
     }
 
-    fn matches(&self, def: usize, name: &[String]) -> bool {
+    pub fn matches(&self, def: usize, name: &[String]) -> bool {
         self.chains[def].as_ref().is_some_and(|c| {
             c.names.len() >= name.len() && c.names[c.names.len() - name.len()..] == *name
         })
@@ -442,6 +462,11 @@ impl<'a> SourceCache<'a> {
             self.files.insert(path.to_string(), entry);
         }
         self.files.get(path).and_then(Option::as_ref)
+    }
+
+    /// The lines of a file, split at line feeds (a carriage return may remain).
+    pub fn lines(&mut self, path: &str) -> Option<&Vec<Vec<u8>>> {
+        self.file(path).map(|(lines, _)| lines)
     }
 
     /// Whether the position (zero-based) is a code byte.

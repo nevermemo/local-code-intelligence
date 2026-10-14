@@ -17,6 +17,7 @@ pub mod kit;
 pub mod kit_c3;
 pub mod labels;
 pub mod probe;
+pub mod reads_key;
 pub mod run_record;
 pub mod scip_graph;
 pub mod scratch;
