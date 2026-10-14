@@ -23,6 +23,7 @@ pub mod run_record;
 pub mod scip_graph;
 pub mod scratch;
 pub mod symdefs;
+pub mod traverse;
 pub mod walk;
 
 /// Re-exported so a crate that implements [`Map`] needs no direct
