@@ -3,11 +3,13 @@
 //! Public items are re-exported from private child modules so the existing
 //! `crate::app::*` API remains stable.
 
+mod compact;
 mod indexing;
 mod navigation;
 pub(crate) mod readiness;
 mod search;
 
+pub use compact::{COMPACT_MAX_LINE_CHARS, compact_view};
 pub use indexing::{
     IndexAction, IndexReport, IndexedFile, IndexedFilesReport, Status, WatchReport,
 };

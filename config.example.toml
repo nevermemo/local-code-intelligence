@@ -204,6 +204,30 @@ reranker = true
 # [search_profiles.deep]
 # lsp = false
 # rerank_candidate_count = 48
+#
+# Four more profile keys change only how the MCP endpoint /mcp/<name> shows
+# itself to an agent and never what a search retrieves; REST and the command
+# line always return the full result:
+#   tools = "full" (default) or "search": "search" lists and serves only
+#     search_code, search_symbols, find_definition and find_references, not the
+#     six maintenance tools (about a third of the tool list).
+#   response = "full" (default) or "compact": "compact" makes search_code return
+#     per hit only relative_file_path, start_line, end_line, language,
+#     source_role and code, and a short envelope. The same hits in the same
+#     order.
+#   compact_max_hit_lines = 40 (1..=1000): a longer hit's code is cut after this
+#     many lines and marked (code_truncated, excerpt_end_line, and a last line
+#     naming the lines to read from the file).
+#   compact_max_response_chars = 16000 (1000..=1000000): a ceiling on the whole
+#     serialized result; code is shortened across hits (response_truncated), and
+#     if even the locators do not fit the call fails and asks for a lower top_k.
+# The two compact_* keys are an error without response = "compact". A search-only
+# agent endpoint with the compact result (served at /mcp/agent):
+# [search_profiles.agent]
+# tools = "search"
+# response = "compact"
+# compact_max_hit_lines = 40
+# compact_max_response_chars = 16000
 
 # Per-channel weights for Reciprocal Rank Fusion. A channel adds
 # weight / (rrf_k + rank) for each chunk it returns, and a chunk several

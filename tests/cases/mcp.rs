@@ -1037,3 +1037,546 @@ async fn rest_search_code_takes_an_optional_search_profile() {
     server.abort();
     models_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Search-only tool list and compact `search_code` result (roadmap N28 to N31),
+// chosen by `[search_profiles.<name>]` keys and so by endpoint. Retrieval is
+// the profile's own and these keys never change it; `/mcp` and every profile
+// that sets none of the keys stay exactly what they were.
+// ---------------------------------------------------------------------------
+
+/// Profiles over the default retrieval (no language server, a rerank window
+/// of ten, wider than the eight chunks) that differ only in their presentation:
+/// `compact`, `capped` (10 lines per hit), `tight` (3000 characters in all),
+/// `starved` (1000 characters, which cannot hold eight locators), `search`
+/// (search-only tool list, full result) and `lean` (search-only and compact).
+fn presentation_config(mut config: Config) -> Config {
+    use local_code_intelligence::config::{McpResponse, McpToolList, SearchProfile};
+    config.channels.lsp = false;
+    config.rerank_candidate_count = 10;
+    let compact = SearchProfile {
+        response: Some(McpResponse::Compact),
+        ..SearchProfile::default()
+    };
+    config.search_profiles = std::collections::BTreeMap::from([
+        ("compact".to_owned(), compact),
+        (
+            "capped".to_owned(),
+            SearchProfile {
+                compact_max_hit_lines: Some(10),
+                ..compact
+            },
+        ),
+        (
+            "tight".to_owned(),
+            SearchProfile {
+                compact_max_hit_lines: Some(1000),
+                compact_max_response_chars: Some(3000),
+                ..compact
+            },
+        ),
+        (
+            "starved".to_owned(),
+            SearchProfile {
+                compact_max_response_chars: Some(1000),
+                ..compact
+            },
+        ),
+        (
+            "search".to_owned(),
+            SearchProfile {
+                tools: Some(McpToolList::Search),
+                ..SearchProfile::default()
+            },
+        ),
+        (
+            "lean".to_owned(),
+            SearchProfile {
+                tools: Some(McpToolList::Search),
+                ..compact
+            },
+        ),
+    ]);
+    config
+}
+
+/// The profile workspace plus `src/long.rs`: one hundred-line function, which
+/// is one chunk, so a line cap has something to cut.
+fn write_presentation_workspace(root: &Path) {
+    write_profile_workspace(root);
+    let mut long = String::from("fn translator_long() {\n");
+    for step in 1..=98 {
+        long.push_str(&format!(
+            "    let step_{step} = {step}; // translator_long\n"
+        ));
+    }
+    long.push_str("}\n");
+    write(root, "src/long.rs", &long);
+}
+
+/// The whole JSON-RPC response of `tools/call`, errors included.
+async fn mcp_call(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let response = mcp_post(
+        client,
+        &format!("{base}{path}"),
+        Some(session),
+        &json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+    )
+    .await;
+    assert!(response.status().is_success(), "{path} {name}");
+    rpc_response(&response.text().await.unwrap())
+}
+
+/// A `search_code` call for `translator` with every chunk of the workspace
+/// asked for (`top_k` 8); the JSON-RPC response.
+async fn mcp_search_everything(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    session: &str,
+    workspace: &Path,
+) -> Value {
+    mcp_call(
+        client,
+        base,
+        path,
+        session,
+        "search_code",
+        json!({"workspace_path":workspace,"query":"translator","top_k":8}),
+    )
+    .await
+}
+
+fn structured(response: &Value) -> &Value {
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    &response["result"]["structuredContent"]
+}
+
+fn tool_names(tools: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+fn object_keys(value: &Value) -> Vec<&str> {
+    value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the_full_result() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("mcp-compact");
+    write_presentation_workspace(&workspace);
+    let app = Arc::new(
+        App::open(presentation_config(config))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (default_session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let (compact_session, _) = mcp_initialize(&client, &base, "/mcp/compact").await;
+    let (capped_session, _) = mcp_initialize(&client, &base, "/mcp/capped").await;
+
+    // `/mcp` is unchanged: the full report with every retrieval key.
+    let full = mcp_search_everything(&client, &base, "/mcp", &default_session, &workspace).await;
+    let full = structured(&full);
+    assert!(has_the_unprofiled_report_keys(full), "{full}");
+    let full_hits = full["results"].as_array().unwrap();
+    assert_eq!(full_hits.len(), 8, "{full}");
+    assert!(full_hits[0]["semantic_score"].is_number() || full_hits[0]["lexical_rank"].is_number());
+    let locator = |hit: &Value| {
+        (
+            hit["relative_file_path"].clone(),
+            hit["start_line"].clone(),
+            hit["end_line"].clone(),
+        )
+    };
+    let full_locators: Vec<_> = full_hits.iter().map(locator).collect();
+
+    // `/mcp/compact` returns the same hits in the same order, each as a
+    // locator, language, role and byte-identical code; nothing of the
+    // retrieval metadata, and a short envelope.
+    let compact =
+        mcp_search_everything(&client, &base, "/mcp/compact", &compact_session, &workspace).await;
+    let compact = structured(&compact);
+    assert_eq!(
+        object_keys(compact),
+        ["workspace", "search_profile", "filters", "index", "results"],
+        "{compact}"
+    );
+    assert_eq!(compact["search_profile"], "compact");
+    assert_eq!(compact["workspace"]["path"], full["workspace"]["path"]);
+    assert_eq!(object_keys(&compact["workspace"]), ["path"]);
+    assert_eq!(compact["filters"], full["filters"]);
+    let compact_hits = compact["results"].as_array().unwrap();
+    assert_eq!(
+        compact_hits.iter().map(locator).collect::<Vec<_>>(),
+        full_locators
+    );
+    let mut long_hits = 0;
+    for (compact_hit, full_hit) in compact_hits.iter().zip(full_hits) {
+        let mut expected = vec![
+            "relative_file_path",
+            "start_line",
+            "end_line",
+            "language",
+            "source_role",
+            "code",
+        ];
+        if compact_hit.get("code_truncated").is_some() {
+            expected.extend(["code_truncated", "excerpt_end_line"]);
+        }
+        assert_eq!(object_keys(compact_hit), expected, "{compact_hit}");
+        assert_eq!(compact_hit["language"], full_hit["language"]);
+        assert_eq!(compact_hit["source_role"], full_hit["source_role"]);
+        let code = full_hit["code"].as_str().unwrap();
+        if code.lines().count() <= 40 {
+            assert_eq!(compact_hit["code"], full_hit["code"]);
+            assert!(compact_hit.get("code_truncated").is_none());
+        } else {
+            long_hits += 1;
+        }
+    }
+    // The hundred-line function is over the default 40-line cap.
+    assert_eq!(long_hits, 1);
+    let long = compact_hits
+        .iter()
+        .find(|hit| hit["relative_file_path"] == "src/long.rs")
+        .unwrap();
+    assert_eq!(long["code_truncated"], true);
+    assert_eq!(long["excerpt_end_line"], 40);
+    assert_eq!(long["end_line"], 100);
+    let shown = long["code"].as_str().unwrap();
+    assert!(shown.contains("lines 41-100"), "{shown}");
+    assert!(shown.contains("read them from the file"), "{shown}");
+    assert_eq!(shown.lines().count(), 41);
+
+    // A smaller cap on another profile cuts at its own line count; short
+    // chunks (one line) are untouched.
+    let capped =
+        mcp_search_everything(&client, &base, "/mcp/capped", &capped_session, &workspace).await;
+    let capped = structured(&capped);
+    let capped_long = capped["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["relative_file_path"] == "src/long.rs")
+        .unwrap();
+    assert_eq!(capped_long["excerpt_end_line"], 10);
+    assert!(
+        capped_long["code"]
+            .as_str()
+            .unwrap()
+            .contains("lines 11-100")
+    );
+    assert_eq!(
+        capped["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(locator)
+            .collect::<Vec<_>>(),
+        full_locators
+    );
+
+    // The compact result is much smaller than the full one.
+    assert!(compact.to_string().len() * 2 < full.to_string().len() + 3000);
+
+    // Presentation is not retrieval: the REST endpoint of the same profile
+    // is still the full report, and so is the plain `/mcp` afterwards.
+    let rest = client
+        .post(format!("{base}/v1/search_code?search_profile=compact"))
+        .json(&json!({"workspace_path": workspace, "query": "translator", "top_k": 8}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(rest["search_profile"], "compact");
+    assert!(rest["timings"].is_object(), "{rest}");
+    assert!(rest["results"][0]["fusion_score"].is_number(), "{rest}");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn the_compact_response_ceiling_shortens_code_but_keeps_every_locator_or_fails_with_advice() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("mcp-ceiling");
+    write_presentation_workspace(&workspace);
+    let app = Arc::new(
+        App::open(presentation_config(config))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (default_session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let (tight_session, _) = mcp_initialize(&client, &base, "/mcp/tight").await;
+    let (starved_session, _) = mcp_initialize(&client, &base, "/mcp/starved").await;
+
+    let full = mcp_search_everything(&client, &base, "/mcp", &default_session, &workspace).await;
+    let full_locators: Vec<(Value, Value, Value)> = structured(&full)["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            (
+                hit["relative_file_path"].clone(),
+                hit["start_line"].clone(),
+                hit["end_line"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(full_locators.len(), 8);
+
+    // 3000 characters cannot hold the hundred-line function in full (no
+    // line cap on this profile), so it is shortened and the response says so.
+    let tight =
+        mcp_search_everything(&client, &base, "/mcp/tight", &tight_session, &workspace).await;
+    let tight = structured(&tight);
+    assert!(tight.to_string().chars().count() <= 3000, "{tight}");
+    assert_eq!(tight["response_truncated"], true, "{tight}");
+    let tight_hits = tight["results"].as_array().unwrap();
+    assert_eq!(
+        tight_hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit["relative_file_path"].clone(),
+                    hit["start_line"].clone(),
+                    hit["end_line"].clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        full_locators
+    );
+    let long = tight_hits
+        .iter()
+        .find(|hit| hit["relative_file_path"] == "src/long.rs")
+        .unwrap();
+    assert_eq!(long["code_truncated"], true, "{long}");
+    assert!(
+        long["code"]
+            .as_str()
+            .unwrap()
+            .contains("read them from the file")
+    );
+
+    // 1000 characters cannot hold the locators of eight results: an error
+    // that says what to change.
+    let starved =
+        mcp_search_everything(&client, &base, "/mcp/starved", &starved_session, &workspace).await;
+    assert_eq!(starved["result"]["isError"], true, "{starved}");
+    let text = starved["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("compact_max_response_chars"), "{text}");
+    assert!(text.contains("top_k"), "{text}");
+    assert!(text.len() < 600, "{text}");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn a_search_only_profile_lists_four_tools_and_refuses_the_others() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("mcp-search-only");
+    write_presentation_workspace(&workspace);
+    let unindexed = temp.path().join("never-indexed");
+    write(&unindexed, "lib.rs", "fn untouched() {}\n");
+    let app = Arc::new(
+        App::open(presentation_config(config))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+
+    let (default_session, default_info) = mcp_initialize(&client, &base, "/mcp").await;
+    let (search_session, search_info) = mcp_initialize(&client, &base, "/mcp/search").await;
+    let (lean_session, _) = mcp_initialize(&client, &base, "/mcp/lean").await;
+    let (compact_session, _) = mcp_initialize(&client, &base, "/mcp/compact").await;
+    // The instructions are the same everywhere.
+    assert_eq!(search_info, default_info);
+
+    // The default endpoint and a profile that does not ask for it keep all
+    // ten tools; the search-only ones list exactly four.
+    let list = |path: &'static str, session: String| {
+        let (client, base) = (client.clone(), base.clone());
+        async move { mcp_result(&client, &base, path, &session, "tools/list", json!({})).await }
+    };
+    let all_ten = [
+        "find_definition",
+        "find_references",
+        "index_status",
+        "index_workspace",
+        "list_indexed_files",
+        "search_code",
+        "search_symbols",
+        "service_status",
+        "unwatch_workspace",
+        "watch_workspace",
+    ];
+    let default_tools = list("/mcp", default_session.clone()).await;
+    assert_eq!(tool_names(&default_tools), all_ten);
+    let compact_tools = list("/mcp/compact", compact_session).await;
+    assert_eq!(compact_tools, default_tools);
+    let four = [
+        "find_definition",
+        "find_references",
+        "search_code",
+        "search_symbols",
+    ];
+    for (path, session) in [
+        ("/mcp/search", &search_session),
+        ("/mcp/lean", &lean_session),
+    ] {
+        let tools = list(path, session.clone()).await;
+        assert_eq!(tool_names(&tools), four, "{path}");
+    }
+    // The tools it keeps are the default endpoint's, schemas included.
+    let search_tools = list("/mcp/search", search_session.clone()).await;
+    for tool in search_tools["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let same = default_tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == name)
+            .unwrap();
+        assert_eq!(tool, same, "{name}");
+    }
+
+    // The others are not callable on it, and still are on `/mcp`.
+    for name in [
+        "index_workspace",
+        "index_status",
+        "list_indexed_files",
+        "watch_workspace",
+        "unwatch_workspace",
+    ] {
+        let response = mcp_call(
+            &client,
+            &base,
+            "/mcp/search",
+            &search_session,
+            name,
+            json!({"workspace_path": workspace}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_some() || response["result"]["isError"] == true,
+            "{name}: {response}"
+        );
+        assert!(
+            response["result"]["structuredContent"].is_null(),
+            "{name}: {response}"
+        );
+    }
+    let service = mcp_call(
+        &client,
+        &base,
+        "/mcp/lean",
+        &lean_session,
+        "service_status",
+        json!({}),
+    )
+    .await;
+    assert!(
+        service.get("error").is_some() || service["result"]["isError"] == true,
+        "{service}"
+    );
+    let status = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &default_session,
+        "index_status",
+        json!({"workspace_path": workspace}),
+    )
+    .await;
+    assert_ne!(status["result"]["isError"], true, "{status}");
+
+    // The search tool works on it, and (with no `response` key) returns the
+    // full report with the profile's name.
+    let search =
+        mcp_search_everything(&client, &base, "/mcp/search", &search_session, &workspace).await;
+    let search = structured(&search);
+    assert_eq!(search["search_profile"], "search");
+    assert!(search["timings"].is_object() && search["results"][0]["fusion_score"].is_number());
+    // Both keys together: a compact result behind the short tool list.
+    let lean = mcp_search_everything(&client, &base, "/mcp/lean", &lean_session, &workspace).await;
+    assert!(
+        structured(&lean)["results"][0]
+            .get("fusion_score")
+            .is_none()
+    );
+
+    // A navigation tool on a workspace that was never indexed fails by
+    // naming a tool the endpoint has; on `/mcp` the text is unchanged.
+    let arguments = json!({"workspace_path": unindexed, "query": "untouched"});
+    let on_search_only = mcp_call(
+        &client,
+        &base,
+        "/mcp/search",
+        &search_session,
+        "search_symbols",
+        arguments.clone(),
+    )
+    .await;
+    assert_eq!(
+        on_search_only["result"]["isError"], true,
+        "{on_search_only}"
+    );
+    let text = on_search_only["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("not indexed") && text.contains("search_code"),
+        "{text}"
+    );
+    assert!(!text.contains("index_workspace"), "{text}");
+    let on_default = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &default_session,
+        "search_symbols",
+        arguments,
+    )
+    .await;
+    let text = on_default["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("call index_workspace first"), "{text}");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

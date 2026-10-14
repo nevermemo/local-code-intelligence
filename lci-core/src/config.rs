@@ -102,6 +102,13 @@ impl Default for ChannelsConfig {
 /// Like the top-level values, each profile must leave at least one of
 /// `semantic`, `lexical`, and `lsp` enabled and keep `rerank_candidate_count`
 /// in `1..=200`; validation checks the resolved settings.
+///
+/// Four more keys change only how the profile's MCP endpoint (`/mcp/<name>`)
+/// presents itself to an agent, never what a search retrieves: `tools` (which
+/// MCP tools the endpoint lists), `response` (the shape of the `search_code`
+/// result), and, for `response = "compact"`, `compact_max_hit_lines` and
+/// `compact_max_response_chars`. REST and the command line always return the
+/// full result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchProfile {
@@ -115,6 +122,103 @@ pub struct SearchProfile {
     pub reranker: Option<bool>,
     /// Override of the top-level `rerank_candidate_count`.
     pub rerank_candidate_count: Option<usize>,
+    /// Which MCP tools the profile's endpoint lists and dispatches; absent
+    /// means [`McpToolList::Full`].
+    pub tools: Option<McpToolList>,
+    /// The shape of the `search_code` result on the profile's MCP endpoint;
+    /// absent means [`McpResponse::Full`].
+    pub response: Option<McpResponse>,
+    /// With `response = "compact"`: most lines of code one hit keeps
+    /// (`1..=`[`COMPACT_MAX_HIT_LINES_LIMIT`]); absent means
+    /// [`DEFAULT_COMPACT_MAX_HIT_LINES`].
+    pub compact_max_hit_lines: Option<usize>,
+    /// With `response = "compact"`: most serialized characters the whole
+    /// `search_code` result may have
+    /// ([`COMPACT_MAX_RESPONSE_CHARS_RANGE`]); absent means
+    /// [`DEFAULT_COMPACT_MAX_RESPONSE_CHARS`].
+    pub compact_max_response_chars: Option<usize>,
+}
+
+impl SearchProfile {
+    /// How the profile's MCP endpoint presents itself (see
+    /// [`Config::mcp_presentation`]); the keys it leaves out give every tool
+    /// and the full result.
+    pub fn mcp_presentation(&self) -> McpPresentation {
+        let defaults = CompactLimits::default();
+        McpPresentation {
+            tools: self.tools.unwrap_or_default(),
+            compact: (self.response == Some(McpResponse::Compact)).then(|| CompactLimits {
+                max_hit_lines: self.compact_max_hit_lines.unwrap_or(defaults.max_hit_lines),
+                max_response_chars: self
+                    .compact_max_response_chars
+                    .unwrap_or(defaults.max_response_chars),
+            }),
+        }
+    }
+}
+
+/// The MCP tool list an endpoint offers (`[search_profiles.<name>].tools`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolList {
+    /// Every tool: indexing, watching, status, search, and navigation.
+    #[default]
+    Full,
+    /// Only `search_code`, `search_symbols`, `find_definition`, and
+    /// `find_references`; the other tools are neither listed nor callable.
+    Search,
+}
+
+/// The shape of an MCP `search_code` result (`[search_profiles.<name>].response`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpResponse {
+    /// The whole search report, as REST and the command line return it.
+    #[default]
+    Full,
+    /// Locators and code only, with a per-hit line cap and a whole-response
+    /// ceiling (see [`CompactLimits`]).
+    Compact,
+}
+
+/// Default for `compact_max_hit_lines`.
+pub const DEFAULT_COMPACT_MAX_HIT_LINES: usize = 40;
+/// Largest accepted `compact_max_hit_lines`.
+pub const COMPACT_MAX_HIT_LINES_LIMIT: usize = 1000;
+/// Default for `compact_max_response_chars`: a starting value, not a measured
+/// client limit.
+pub const DEFAULT_COMPACT_MAX_RESPONSE_CHARS: usize = 16_000;
+/// Accepted `compact_max_response_chars`.
+pub const COMPACT_MAX_RESPONSE_CHARS_RANGE: std::ops::RangeInclusive<usize> = 1_000..=1_000_000;
+
+/// The limits of a compact `search_code` result, resolved from a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactLimits {
+    /// Most lines of code one hit keeps.
+    pub max_hit_lines: usize,
+    /// Most serialized characters the whole result may have.
+    pub max_response_chars: usize,
+}
+
+impl Default for CompactLimits {
+    fn default() -> Self {
+        Self {
+            max_hit_lines: DEFAULT_COMPACT_MAX_HIT_LINES,
+            max_response_chars: DEFAULT_COMPACT_MAX_RESPONSE_CHARS,
+        }
+    }
+}
+
+/// How one MCP endpoint presents itself: the tool list and the shape of the
+/// `search_code` result. Resolved by [`Config::mcp_presentation`]; the default
+/// (`/mcp`, or a profile that sets none of the keys) is every tool and the
+/// full result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpPresentation {
+    /// Which tools the endpoint lists and dispatches.
+    pub tools: McpToolList,
+    /// `Some` when `search_code` returns the compact result.
+    pub compact: Option<CompactLimits>,
 }
 
 /// The query-time settings one search runs with: the top-level values, or
@@ -830,6 +934,26 @@ impl Config {
                 "search_profiles.{name}: rerank_candidate_count must be 1..=200 (got {})",
                 resolved.rerank_candidate_count
             );
+            ensure!(
+                profile.response == Some(McpResponse::Compact)
+                    || (profile.compact_max_hit_lines.is_none()
+                        && profile.compact_max_response_chars.is_none()),
+                "search_profiles.{name}: compact_max_hit_lines and compact_max_response_chars apply only with response = \"compact\""
+            );
+            if let Some(lines) = profile.compact_max_hit_lines {
+                ensure!(
+                    (1..=COMPACT_MAX_HIT_LINES_LIMIT).contains(&lines),
+                    "search_profiles.{name}: compact_max_hit_lines must be 1..={COMPACT_MAX_HIT_LINES_LIMIT} (got {lines})"
+                );
+            }
+            if let Some(chars) = profile.compact_max_response_chars {
+                ensure!(
+                    COMPACT_MAX_RESPONSE_CHARS_RANGE.contains(&chars),
+                    "search_profiles.{name}: compact_max_response_chars must be {}..={} (got {chars})",
+                    COMPACT_MAX_RESPONSE_CHARS_RANGE.start(),
+                    COMPACT_MAX_RESPONSE_CHARS_RANGE.end()
+                );
+            }
         }
         ensure!(
             (1..=40).contains(&self.default_top_k),
@@ -917,6 +1041,20 @@ impl Config {
             );
         };
         Ok(self.resolve_search_profile(name, overrides))
+    }
+
+    /// How the MCP endpoint of `profile` presents itself: `None` (`/mcp`) and
+    /// a profile that sets none of `tools`, `response` and the compact limits
+    /// give every tool and the full result. Presentation only: it is not part
+    /// of [`SearchSettings`] and never changes what a search retrieves. A name
+    /// that is not configured is an error, as in [`Self::search_settings`].
+    pub fn mcp_presentation(&self, profile: Option<&str>) -> Result<McpPresentation> {
+        let Some(name) = profile else {
+            return Ok(McpPresentation::default());
+        };
+        // Reuses the unknown-name error of `search_settings`.
+        self.search_settings(Some(name))?;
+        Ok(self.search_profiles[name].mcp_presentation())
     }
 
     /// `overrides` applied over the top-level settings, under `name`.
@@ -1758,6 +1896,125 @@ mod tests {
                 toml::from_str::<Config>(&toml_text).is_err(),
                 "{key} was accepted"
             );
+        }
+    }
+
+    #[test]
+    fn mcp_presentation_is_full_unless_a_profile_asks_for_search_tools_or_a_compact_result() {
+        let toml_text = format!(
+            "{}[search_profiles.plain]\nreranker = false\n\
+             [search_profiles.tools_only]\ntools = \"search\"\n\
+             [search_profiles.compact]\nresponse = \"compact\"\n\
+             [search_profiles.tuned]\ntools = \"search\"\nresponse = \"compact\"\n\
+             compact_max_hit_lines = 12\ncompact_max_response_chars = 5000\n\
+             [search_profiles.fullagain]\ntools = \"full\"\nresponse = \"full\"\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&toml_text).unwrap();
+        config.validate().unwrap();
+        let full = McpPresentation::default();
+        assert_eq!(full.tools, McpToolList::Full);
+        assert_eq!(full.compact, None);
+        assert_eq!(config.mcp_presentation(None).unwrap(), full);
+        assert_eq!(config.mcp_presentation(Some("plain")).unwrap(), full);
+        assert_eq!(config.mcp_presentation(Some("fullagain")).unwrap(), full);
+        assert_eq!(
+            config.mcp_presentation(Some("tools_only")).unwrap(),
+            McpPresentation {
+                tools: McpToolList::Search,
+                compact: None,
+            }
+        );
+        // The documented defaults: 40 lines per hit, 16,000 characters.
+        assert_eq!(DEFAULT_COMPACT_MAX_HIT_LINES, 40);
+        assert_eq!(DEFAULT_COMPACT_MAX_RESPONSE_CHARS, 16_000);
+        assert_eq!(
+            config.mcp_presentation(Some("compact")).unwrap(),
+            McpPresentation {
+                tools: McpToolList::Full,
+                compact: Some(CompactLimits {
+                    max_hit_lines: 40,
+                    max_response_chars: 16_000,
+                }),
+            }
+        );
+        assert_eq!(
+            config.mcp_presentation(Some("tuned")).unwrap(),
+            McpPresentation {
+                tools: McpToolList::Search,
+                compact: Some(CompactLimits {
+                    max_hit_lines: 12,
+                    max_response_chars: 5000,
+                }),
+            }
+        );
+        let error = config.mcp_presentation(Some("nope")).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown search profile"),
+            "{error}"
+        );
+        // The presentation keys never reach the retrieval settings.
+        assert_eq!(
+            config.search_settings(Some("tuned")).unwrap().channels,
+            config.base_search_settings().channels
+        );
+        assert_eq!(
+            config
+                .search_settings(Some("tuned"))
+                .unwrap()
+                .rerank_candidate_count,
+            config.rerank_candidate_count
+        );
+    }
+
+    #[test]
+    fn invalid_presentation_keys_of_a_search_profile_are_rejected_with_the_profile_name() {
+        for (keys, expected) in [
+            ("tools = \"everything\"", None),
+            ("response = \"tiny\"", None),
+            (
+                "response = \"compact\"\ncompact_max_hit_lines = 0",
+                Some("compact_max_hit_lines"),
+            ),
+            (
+                "response = \"compact\"\ncompact_max_hit_lines = 1001",
+                Some("compact_max_hit_lines"),
+            ),
+            (
+                "response = \"compact\"\ncompact_max_response_chars = 999",
+                Some("compact_max_response_chars"),
+            ),
+            (
+                "response = \"compact\"\ncompact_max_response_chars = 1000001",
+                Some("compact_max_response_chars"),
+            ),
+            ("compact_max_hit_lines = 20", Some("only with response")),
+            (
+                "response = \"full\"\ncompact_max_response_chars = 5000",
+                Some("only with response"),
+            ),
+        ] {
+            let toml_text = format!("{}[search_profiles.p]\n{keys}\n", base_toml());
+            match (toml::from_str::<Config>(&toml_text), expected) {
+                (Err(_), None) => {}
+                (Ok(config), Some(expected)) => {
+                    let error = config.validate().unwrap_err().to_string();
+                    assert!(error.contains("search_profiles.p"), "{keys}: {error}");
+                    assert!(error.contains(expected), "{keys}: {error}");
+                }
+                (parsed, expected) => {
+                    panic!("{keys}: unexpected {parsed:?} for {expected:?}")
+                }
+            }
+        }
+        // Bounds are inclusive.
+        for keys in [
+            "response = \"compact\"\ncompact_max_hit_lines = 1\ncompact_max_response_chars = 1000",
+            "response = \"compact\"\ncompact_max_hit_lines = 1000\ncompact_max_response_chars = 1000000",
+        ] {
+            let toml_text = format!("{}[search_profiles.p]\n{keys}\n", base_toml());
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            config.validate().unwrap();
         }
     }
 

@@ -976,7 +976,7 @@ async fn run() -> Result<()> {
             );
             if !profile_endpoints.is_empty() {
                 tracing::info!(
-                    "MCP search profiles (same tools, search_code bound to the profile): {}",
+                    "MCP search profiles (search_code bound to the profile; tool list and result shape per its tools and response keys): {}",
                     profile_endpoints.join(", ")
                 );
             }

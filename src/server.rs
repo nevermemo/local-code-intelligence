@@ -1,4 +1,7 @@
-use crate::app::App;
+use crate::{
+    app::{App, compact_view},
+    config::{McpPresentation, McpToolList},
+};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -13,10 +16,29 @@ pub struct McpServer {
     tool_router: ToolRouter<Self>,
     /// The `[search_profiles.<name>]` this endpoint's `search_code` runs
     /// with: `None` on `/mcp`, the profile's name on `/mcp/<name>`. It is
-    /// the only thing that differs between the endpoints; the tool list and
+    /// the only thing that differs between the searches of the endpoints;
     /// the instructions are the same on every one.
     search_profile: Option<String>,
+    /// How this endpoint presents itself: the tool list and the shape of the
+    /// `search_code` result. Every tool and the full result unless the
+    /// profile has `tools` or `response` keys that say otherwise.
+    presentation: McpPresentation,
 }
+
+/// The tools a `tools = "search"` endpoint offers; the rest are removed from
+/// its router, so they are neither listed nor callable.
+const SEARCH_ONLY_TOOLS: [&str; 4] = [
+    "search_code",
+    "search_symbols",
+    "find_definition",
+    "find_references",
+];
+
+/// What the navigation and search errors tell an agent to call when the
+/// workspace has no index, and what a search-only endpoint says instead,
+/// because `index_workspace` is not one of its tools.
+const INDEX_FIRST: &str = "call index_workspace first";
+const SEARCH_FIRST: &str = "run search_code on this workspace first, which builds the index";
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceArgs {
@@ -77,12 +99,46 @@ fn result<T: serde::Serialize>(value: anyhow::Result<T>) -> CallToolResult {
 }
 
 impl McpServer {
-    pub fn new(app: Arc<App>, search_profile: Option<String>) -> Self {
+    pub fn new(
+        app: Arc<App>,
+        search_profile: Option<String>,
+        presentation: McpPresentation,
+    ) -> Self {
+        let mut tool_router = Self::tool_router();
+        if presentation.tools == McpToolList::Search {
+            let hidden: Vec<String> = tool_router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .filter(|name| !SEARCH_ONLY_TOOLS.contains(&name.as_str()))
+                .collect();
+            for name in hidden {
+                tool_router.remove_route(&name);
+            }
+        }
         Self {
             app,
-            tool_router: Self::tool_router(),
+            tool_router,
             search_profile,
+            presentation,
         }
+    }
+
+    /// [`result`] for this endpoint: on a search-only endpoint an error that
+    /// tells the agent to call `index_workspace` names `search_code` instead,
+    /// a tool the endpoint has.
+    fn answer<T: serde::Serialize>(&self, value: anyhow::Result<T>) -> CallToolResult {
+        if self.presentation.tools == McpToolList::Search {
+            return result(value.map_err(|error| {
+                let text = format!("{error:#}");
+                if text.contains(INDEX_FIRST) {
+                    anyhow::anyhow!(text.replace(INDEX_FIRST, SEARCH_FIRST))
+                } else {
+                    error
+                }
+            }));
+        }
+        result(value)
     }
 }
 
@@ -130,7 +186,7 @@ impl McpServer {
         description = "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd."
     )]
     async fn search_symbols(&self, Parameters(args): Parameters<SymbolArgs>) -> CallToolResult {
-        result(
+        self.answer(
             self.app
                 .symbols(Path::new(&args.workspace_path), &args.query)
                 .await,
@@ -140,7 +196,7 @@ impl McpServer {
         description = "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd."
     )]
     async fn find_definition(&self, Parameters(args): Parameters<PositionArgs>) -> CallToolResult {
-        result(
+        self.answer(
             self.app
                 .definition(
                     Path::new(&args.workspace_path),
@@ -158,7 +214,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ReferencesArgs>,
     ) -> CallToolResult {
-        result(
+        self.answer(
             self.app
                 .references(
                     Path::new(&args.workspace_path),
@@ -174,22 +230,26 @@ impl McpServer {
         description = "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. A missing index is auto-created on first search."
     )]
     async fn search_code(&self, Parameters(args): Parameters<SearchArgs>) -> CallToolResult {
-        result(
-            self.app
-                .search_in_profile(
-                    Path::new(&args.workspace_path),
-                    &args.query,
-                    args.top_k,
-                    crate::filter::FilterRequest {
-                        languages: args.languages,
-                        include_paths: args.include_paths,
-                        exclude_paths: args.exclude_paths,
-                        source_roles: args.source_roles,
-                    },
-                    self.search_profile.as_deref(),
-                )
-                .await,
-        )
+        let report = self
+            .app
+            .search_in_profile(
+                Path::new(&args.workspace_path),
+                &args.query,
+                args.top_k,
+                crate::filter::FilterRequest {
+                    languages: args.languages,
+                    include_paths: args.include_paths,
+                    exclude_paths: args.exclude_paths,
+                    source_roles: args.source_roles,
+                },
+                self.search_profile.as_deref(),
+            )
+            .await;
+        match self.presentation.compact {
+            // A presentation step after the search: retrieval is finished.
+            Some(limits) => self.answer(report.and_then(|report| compact_view(&report, limits))),
+            None => self.answer(report),
+        }
     }
     #[tool(
         description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, and clangd. Missing language servers do not make readiness fail."
@@ -217,13 +277,15 @@ pub fn mcp_path(search_profile: Option<&str>) -> String {
     }
 }
 
-/// One MCP endpoint: the same tools, instructions, and rmcp configuration as
-/// every other, `search_code` bound to `search_profile`, and a session
+/// One MCP endpoint: the same instructions and rmcp configuration as every
+/// other, `search_code` bound to `search_profile`, the tool list and result
+/// shape its profile asks for (`presentation`), and a session
 /// manager of its own, so a session id minted by one endpoint is unknown to
 /// every other.
 fn mcp_service(
     app: &Arc<App>,
     search_profile: Option<String>,
+    presentation: McpPresentation,
     config: &rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
 ) -> rmcp::transport::streamable_http_server::StreamableHttpService<
     McpServer,
@@ -244,7 +306,13 @@ fn mcp_service(
     session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(3600));
     let app = app.clone();
     StreamableHttpService::new(
-        move || Ok(McpServer::new(app.clone(), search_profile.clone())),
+        move || {
+            Ok(McpServer::new(
+                app.clone(),
+                search_profile.clone(),
+                presentation,
+            ))
+        },
         Arc::new(session_manager),
         config.clone(),
     )
@@ -290,17 +358,22 @@ pub fn router(
     // same service, so the same sessions). Added after `route_layer` so the
     // loopback guard stays off these routes; each rmcp service validates Host
     // and Origin itself.
-    let default_service = mcp_service(&app, None, &config);
+    let default_service = mcp_service(&app, None, McpPresentation::default(), &config);
     let router = router
         .route_service(&mcp_path(None), default_service.clone())
         .route_service("/mcp/", default_service);
     app.config
         .search_profiles
-        .keys()
-        .fold(router, |router, name| {
+        .iter()
+        .fold(router, |router, (name, profile)| {
             router.route_service(
                 &mcp_path(Some(name)),
-                mcp_service(&app, Some(name.clone()), &config),
+                mcp_service(
+                    &app,
+                    Some(name.clone()),
+                    profile.mcp_presentation(),
+                    &config,
+                ),
             )
         })
         .with_state(ready_app)
