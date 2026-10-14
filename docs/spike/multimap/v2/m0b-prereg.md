@@ -274,3 +274,33 @@ the same server flags, from a newer llama.cpp build for that GPU. Reason [M]: un
 24-document call to the first reranker service took about 300 s, above the timeout, which would make FR degraded by
 infrastructure rather than by the method. The embedder service is unchanged for every arm. The results record both reranker
 identities (build, backend). This amendment is made before any FR query.
+
+## 12. Amendment (2026-10-14T13:10Z, before the 5090 run)
+
+Written before any query of the run that counts. Labels as above.
+
+* **Embedder.** The A/B's embedder changed to `qwen3-embedding-4b-q8` (Qwen3-Embedding-4B, Q8_0 GGUF,
+  llama.cpp CUDA build, dimension 2560, loopback port 8766) on an RTX 5090 (owner decision; A/B
+  addendum 10.6) [G]. Section 3 says the A/B's value wins when the A/B's frozen embedder differs
+  from the one named there, and this paragraph applies that rule: M0b runs with `embedding_model =
+  "qwen3-embedding-4b-q8"` at `http://127.0.0.1:8766/v1`. The prompt templates stay at their
+  defaults (the A/B sets none). Every other key of section 3 is unchanged.
+* **Reranker.** FR's reranker is `http://127.0.0.1:8767/rerank`, model `qwen3-reranker-4b`, now served
+  from the RTX 5090 (same GGUF, Q8_0, same server flags; llama.cpp CUDA build). The earlier proposal
+  to use port 8773 is superseded by the port move and was never run. An equivalence check of the two
+  reranker servers (12 queries) passed [G, from the coordinator]: mean Spearman 0.985, top-1 the same in
+  11 of 12, top-8 overlap 7.5 of 8.
+* **New data directory.** The new embedding identity cannot read the earlier index, so M0b indexes
+  `<tree>` again, once, into a fresh directory `<scratch>/data-m0b-4b` (one configuration file per
+  arm as in section 10, `data_dir` and `embedding_model` changed, reranker URL as above).
+* **Earlier exploratory outputs.** Before this amendment, a run on the iGPU-era services (0.6B
+  embedder, ROCm reranker) completed the index, the L identity check (0 of 311 lists differ from
+  M0.3), S and F, and was stopped before FR. Those outputs are not M0b's result. They are reported in
+  the results document as an exploratory side record, labelled as such; the F arm of that record is
+  scored the same way, and no verdict in the results document is read from it.
+* **Load.** A live A/B batch and an index pre-build share the services during the run. Timings are
+  not latency evidence (section 3); the load is recorded beside them.
+* **Binary.** Unchanged: the release build already made from this branch (no rebuild). Its sha256 is
+  recorded in the results document.
+* Everything else (inputs, arms, order, reading rules, the FR degraded-query rule and the retry
+  pass, timeouts) is exactly as written in sections 1 to 10.
