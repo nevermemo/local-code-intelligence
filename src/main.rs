@@ -389,9 +389,12 @@ struct TraverseArgs {
     #[arg(long, value_delimiter = ',', conflicts_with = "handle")]
     seeds: Vec<String>,
     /// Maps to use, comma separated: graph.scip, structure.contains,
-    /// seeds.hybrid, seeds.scip_names (default: all). Without seeds.hybrid the
-    /// stand-in seeds.scip_names finds the start nodes; structure.contains
-    /// lets a chunk or file start node reach the symbols it holds.
+    /// seeds.hybrid, seeds.scip_names (default: all four). Without
+    /// seeds.hybrid the stand-in seeds.scip_names finds the start nodes;
+    /// structure.contains lets a chunk or file start node reach the symbols it
+    /// holds. Also available, only when named, and both need --root: grep.live
+    /// (a search of the tree's current bytes) and config.key (config keys and
+    /// the declarations that read them; needs rg on PATH).
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// The `[search_profiles.<name>]` the hybrid search for the start nodes

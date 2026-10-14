@@ -10,6 +10,7 @@
 //! and checked against `fuse_hits` bit for bit (test T0).
 
 pub mod audit;
+pub mod config_key;
 pub mod contains;
 pub mod crates;
 pub mod edge;
@@ -18,6 +19,7 @@ pub mod impact;
 pub mod kit;
 pub mod kit_c3;
 pub mod labels;
+pub mod live_grep;
 pub mod probe;
 pub mod reads_key;
 pub mod run_record;

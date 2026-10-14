@@ -42,6 +42,10 @@
 //!   [`FreshnessModel::PerFile`]: everything is asked again (such a map may
 //!   answer differently for a file nobody touched).
 //!
+//! A map declared [`FreshnessModel::Live`] reads the working tree, which the
+//! snapshot's blobs do not describe: a row that asked one is asked again at
+//! every update.
+//!
 //! The per-file trust is the maps' declared freshness model: a `PerFile` map's
 //! edges from a node change only when a file the edges come from changes.
 //! A map that breaks that declaration makes an incremental update differ from
@@ -135,10 +139,15 @@ impl FileBlobs {
         self.by_path.keys().map(String::as_str)
     }
 
-    /// Sets the blob of every site whose path the view holds; a site in a
-    /// file the view does not hold keeps what it had.
+    /// Sets the blob of every site that has none and whose path the view
+    /// holds. A site keeps a blob its map set (a live map hashes the current
+    /// bytes, which the snapshot may not have seen yet) and a site in a file
+    /// the view does not hold keeps what it had.
     pub fn fill(&self, edges: &mut [Edge]) {
         for site in edges.iter_mut().filter_map(|edge| edge.site.as_mut()) {
+            if !site.blob.is_empty() {
+                continue;
+            }
             if let Some(blob) = self.by_path.get(&site.path) {
                 site.blob.clone_from(blob);
             }
@@ -345,8 +354,16 @@ impl MergedAdjacency {
             .iter()
             .filter(|(blob, count)| blobs.counts().get(*blob) != Some(count))
             .count();
+        // A row that asked a map reading the live tree is never reused: its
+        // answer can change with no change in the snapshot.
+        let live: HashSet<MapId> = enabled
+            .iter()
+            .filter(|e| e.map.describe().freshness == FreshnessModel::Live)
+            .map(|e| e.map.describe().id)
+            .collect();
         let valid = |row: &Row| {
             row.complete
+                && !row.calls.iter().any(|call| live.contains(call.map))
                 && (same_world
                     || (!row.deps.is_empty()
                         && row.deps.iter().all(|blob| {

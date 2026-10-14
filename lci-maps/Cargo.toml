@@ -10,9 +10,11 @@ publish = false
 # only; maps that touch LanceDB live in the root crate. Every dependency is
 # already in Cargo.lock except `scip` (Apache-2.0) and `protobuf` (MIT) for the
 # scored-walk harness of the v2 spike (slice M0.4); `scip` needs no `protoc`.
+# `ignore` (already a dependency of `lci-core`) walks the tree for `grep.live`.
 [dependencies]
 async-trait = "0.1.92"
 futures = "0.3"
+ignore = "0.4"
 lci-core = { path = "../lci-core" }
 protobuf = "=3.7.2"
 scip = "0.10.0"

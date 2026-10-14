@@ -36,7 +36,10 @@ use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
     Budget, Contribution, EdgeKind, Evidence, FreshnessModel, Map, MapDescriptor, MapHit, MapId,
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
+    impact::{Decl, ImpactIndex},
+    live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
     scip_graph::{DirSource, SCIP_MAP_ID, ScipMap, SourceText},
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
@@ -73,6 +76,10 @@ pub const SEEDS_HYBRID: MapId = "seeds.hybrid";
 /// lets a chunk or file start node (what the hybrid search often finds) reach
 /// the symbols the SCIP graph walks.
 pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP_ID];
+/// The maps a traversal uses only when the call names them (`--maps`): they
+/// need the tree (`grep.live` searches its current bytes, `config.key` runs
+/// the M1.2 extractor, which needs `rg`) and are not part of the default.
+pub const OPT_IN_MAPS: [MapId; 2] = [GREP_LIVE_MAP_ID, CONFIG_KEY_MAP_ID];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
 /// Most symbols one hit of the hybrid search may start from (a chunk that
@@ -149,7 +156,7 @@ pub struct Call<'a> {
     pub seed_search: Option<&'a dyn SeedSearch>,
     /// Results to return, 1 through 40.
     pub top_k: usize,
-    /// The maps to use; `None` is all of [`MAPS`].
+    /// The maps to use; `None` is all of [`MAPS`] (not [`OPT_IN_MAPS`]).
     pub maps: Option<&'a [String]>,
     pub budget: &'a BudgetArgs,
     pub steer: &'a SteerArgs,
@@ -260,6 +267,46 @@ async fn load(index: &Path, root: Option<&Path>) -> Result<Arc<Loaded>> {
         .unwrap_or_else(PoisonError::into_inner)
         .insert(key, loaded.clone());
     Ok(loaded)
+}
+
+type ConfigKeyCache =
+    Mutex<HashMap<(PathBuf, PathBuf), ((Option<SystemTime>, u64), Arc<ConfigKeyMap>)>>;
+
+/// The `config.key` map of a SCIP index and a tree, built once per index
+/// stamp (a tree edit after that is not seen; the map's freshness is
+/// `global`). Declarations take the ids of the SCIP graph.
+async fn config_key_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<ConfigKeyMap>> {
+    static CACHE: OnceLock<ConfigKeyCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (index.to_path_buf(), root.to_path_buf());
+    if let Some((stamp, map)) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        && *stamp == loaded.stamp
+    {
+        return Ok(map.clone());
+    }
+    let (index, root, scip) = (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
+    let map = tokio::task::spawn_blocking(move || -> Result<ConfigKeyMap> {
+        let source = DirSource(root.clone());
+        let ix = ImpactIndex::load(&index, Some(&source)).map_err(|error| anyhow!(error))?;
+        let resolve = |decl: &Decl| {
+            scip.graph()
+                .node_index(&decl.symbol)
+                .map(|node| scip.node_id(node).clone())
+        };
+        ConfigKeyMap::extract(&ix, &root, &source, &resolve, ConfigKeyOptions::default())
+            .map_err(|error| anyhow!(error))
+    })
+    .await
+    .context("build config.key")??;
+    let map = Arc::new(map);
+    cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (loaded.stamp, map.clone()));
+    Ok(map)
 }
 
 /// Matches the question's words against symbol names. Text only: it never
@@ -860,13 +907,23 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .iter()
             .map(|id| {
                 MAPS.iter()
+                    .chain(&OPT_IN_MAPS)
                     .copied()
                     .find(|known| known == id)
-                    .ok_or_else(|| anyhow!("unknown map {id:?}; the maps are {}", MAPS.join(", ")))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown map {id:?}; the maps are {}, and on request {}",
+                            MAPS.join(", "),
+                            OPT_IN_MAPS.join(", ")
+                        )
+                    })
             })
             .collect::<Result<_>>()?,
     };
-    let (budget, mut notes) = clamp_budget(limits, call.budget);
+    if wanted.iter().any(|id| OPT_IN_MAPS.contains(id)) && call.scip_root.is_none() {
+        bail!("the maps grep.live and config.key read the tree: give its root");
+    }
+    let (mut budget, mut notes) = clamp_budget(limits, call.budget);
     let handler = build_ladder(limits, call.steer, budget.pops, &mut notes)?;
     let actions = match (&call.steer.actions, call.handle) {
         (Some(_), None) => {
@@ -934,6 +991,33 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         Box::new(loaded.contains.with_chunk_lines(chunk_lines(&found))),
         wants(CONTAINS_MAP_ID),
     )?;
+    // Building the tree maps is setup, not walking: the deadline does not run
+    // while it happens.
+    let setup = Instant::now();
+    if let (true, Some(root)) = (wants(GREP_LIVE_MAP_ID), call.scip_root) {
+        let grep = LiveGrep::new(root, Some(Arc::new(ScipSpans::from_scip(&loaded.scip))));
+        // Measure the map's cost before the walk prices a hop by it.
+        grep.calibrate(3).await;
+        register(&mut registry, &mut plan_maps, Box::new(grep), true)?;
+    }
+    if let (true, Some(root)) = (wants(CONFIG_KEY_MAP_ID), call.scip_root) {
+        let map = match config_key_map(call.scip_index, root, &loaded).await {
+            Ok(map) => {
+                let stats = map.stats();
+                notes.push(format!(
+                    "config.key: {} keys, {} exact and {} text edges (text edges off), built in {:.0} ms",
+                    stats.keys, stats.exact, stats.text, stats.build_ms
+                ));
+                map
+            }
+            Err(error) => {
+                notes.push(format!("config.key has no edges: {error:#}"));
+                Arc::new(ConfigKeyMap::empty(ConfigKeyOptions::default()))
+            }
+        };
+        register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+    }
+    budget.deadline += setup.elapsed();
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
@@ -1298,7 +1382,8 @@ fn add_sites(response: &mut Value, loaded: &Loaded, seeds: &[Value]) {
         return;
     }
     let mut sites: HashMap<String, Value> = HashMap::new();
-    // A file node is at its first line (`structure.contains` climbs to files).
+    // A file node is at its first line (`structure.contains` climbs to files,
+    // grep.live names them).
     for node in &wanted {
         if let Ok(NodeId::File { path }) = NodeId::from_str(node) {
             sites.insert(node.clone(), site_json(&path, 1, 1));
@@ -1736,8 +1821,9 @@ mod tests {
         );
         let symbol = seeds.iter().find(|s| s.info["kind"] == "symbol").unwrap();
         let chunk = seeds.iter().find(|s| s.info["kind"] == "chunk").unwrap();
-        let unknown = NodeId::Commit {
-            sha: "a".repeat(40),
+        let unknown = NodeId::ConfigKey {
+            namespace: lci_core::node::ConfigNamespace::Toml,
+            key: "nope.key".into(),
         }
         .to_string();
         let file = NodeId::file("src/elsewhere.rs").unwrap().to_string();
@@ -1961,5 +2047,43 @@ mod tests {
         assert!(none.fallback.is_some());
         let nothing = seeds_for(None, "zebra", &[], &[SCIP_MAP_ID]).await;
         assert_eq!(nothing.source, "none");
+    }
+
+    #[tokio::test]
+    async fn the_tree_maps_are_named_not_default_and_need_the_root() {
+        assert!(OPT_IN_MAPS.iter().all(|id| !MAPS.contains(id)));
+        let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+        let run_with = |maps: &[&str]| {
+            let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+            let (budget, steer) = (budget.clone(), steer.clone());
+            async move {
+                let dirs = Dirs::under(Path::new("unused"));
+                let call = Call {
+                    scip_index: Path::new("unused"),
+                    scip_root: None,
+                    question: "q",
+                    seeds: &[],
+                    seed_search: None,
+                    top_k: 8,
+                    maps: Some(&maps),
+                    budget: &budget,
+                    steer: &steer,
+                    handle: None,
+                };
+                run(&limits(), &dirs, &call)
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+            }
+        };
+        let no_root = run_with(&["graph.scip", "grep.live"]).await.unwrap();
+        assert!(no_root.contains("give its root"), "{no_root}");
+        let no_root = run_with(&["config.key"]).await.unwrap();
+        assert!(no_root.contains("give its root"), "{no_root}");
+        let unknown = run_with(&["nope"]).await.unwrap();
+        assert!(
+            unknown.contains("grep.live") && unknown.contains("config.key"),
+            "{unknown}"
+        );
     }
 }
