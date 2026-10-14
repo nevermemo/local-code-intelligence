@@ -14,11 +14,21 @@
 //! size of the whole result. A shortened hit says so with `code_truncated`,
 //! `excerpt_end_line` (the last line shown, absent when none is), and a closing
 //! line inside `code` that names the range to read from the file.
+//!
+//! The result is built from typed structs and returned as JSON text, because
+//! the order of their fields (locators first) is the order of the keys in the
+//! text, whether or not `serde_json` keeps the insertion order of a `Map`.
+//! (Parsing the text into a `serde_json::Value` is free to reorder the keys.)
 
-use super::SearchReport;
-use crate::{config::CompactLimits, store::Hit};
+use super::{SearchIndexLifecycle, SearchReport};
+use crate::{
+    config::CompactLimits,
+    filter::{EffectiveFilterReport, SourceRole},
+    store::Hit,
+};
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use serde::Serialize;
+use std::path::Path;
 
 /// A line longer than this many characters is cut and marked, so one
 /// minified line cannot defeat the line cap.
@@ -28,23 +38,78 @@ pub const COMPACT_MAX_LINE_CHARS: usize = 500;
 /// ceiling shortens (the line itself is about 100 to 140 characters).
 const CLOSING_LINE_RESERVE: usize = 150;
 
-/// `report` as the compact result: see the module documentation. Fails only
-/// when the ceiling cannot hold the mandatory metadata of the results (every
-/// locator, the envelope, and a closing line per hit).
-pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Value> {
+/// The compact result: the envelope of the report, then the hits. The field
+/// order is the key order of the JSON text.
+#[derive(Serialize)]
+struct CompactReport<'a> {
+    workspace: CompactWorkspace<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'a str>,
+    #[serde(skip_serializing_if = "no_notes")]
+    notes: &'a [String],
+    filters: &'a EffectiveFilterReport,
+    index: &'a SearchIndexLifecycle,
+    /// Set when the response ceiling shortened the code of the hits.
+    #[serde(skip_serializing_if = "is_false")]
+    response_truncated: bool,
+    results: Vec<CompactHit<'a>>,
+}
+
+#[derive(Serialize)]
+struct CompactWorkspace<'a> {
+    path: &'a Path,
+}
+
+/// One compact hit: the locator first, then what the reader needs to judge it.
+#[derive(Serialize)]
+struct CompactHit<'a> {
+    relative_file_path: &'a str,
+    start_line: u32,
+    end_line: u32,
+    language: &'a str,
+    source_role: SourceRole,
+    code: String,
+    #[serde(skip_serializing_if = "is_false")]
+    code_truncated: bool,
+    /// The last line shown; absent when the code was shortened to nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excerpt_end_line: Option<u32>,
+}
+
+fn no_notes(notes: &&[String]) -> bool {
+    notes.is_empty()
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+/// `report` as the compact result, as JSON text whose keys are in the order of
+/// the module documentation. Fails only when the ceiling cannot hold the
+/// mandatory metadata of the results (every locator, the envelope, and a
+/// closing line per hit).
+pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<String> {
     let ceiling = limits.max_response_chars;
-    let build = |per_hit_budget: Option<usize>| -> Result<Value> {
-        let mut view = envelope(report)?;
-        if per_hit_budget.is_some() {
-            view.insert("response_truncated".into(), Value::Bool(true));
-        }
-        let hits = report
-            .results
-            .iter()
-            .map(|hit| compact_hit(hit, limits.max_hit_lines, per_hit_budget))
-            .collect();
-        view.insert("results".into(), Value::Array(hits));
-        Ok(Value::Object(view))
+    let build = |per_hit_budget: Option<usize>| -> Result<String> {
+        let view = CompactReport {
+            workspace: CompactWorkspace {
+                path: &report.workspace.path,
+            },
+            search_profile: report.search_profile.as_deref(),
+            warning: report.warning.as_deref(),
+            notes: &report.notes,
+            filters: &report.filters,
+            index: &report.index,
+            response_truncated: per_hit_budget.is_some(),
+            results: report
+                .results
+                .iter()
+                .map(|hit| compact_hit(hit, limits.max_hit_lines, per_hit_budget))
+                .collect(),
+        };
+        Ok(serde_json::to_string(&view)?)
     };
 
     let whole = build(None)?;
@@ -86,51 +151,21 @@ pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Valu
     build(Some(low))
 }
 
-/// Everything of the report except `results`, in the compact shape.
-fn envelope(report: &SearchReport) -> Result<Map<String, Value>> {
-    let mut view = Map::new();
-    let mut workspace = Map::new();
-    workspace.insert("path".into(), serde_json::to_value(&report.workspace.path)?);
-    view.insert("workspace".into(), Value::Object(workspace));
-    if let Some(profile) = &report.search_profile {
-        view.insert("search_profile".into(), Value::String(profile.clone()));
-    }
-    if let Some(warning) = &report.warning {
-        view.insert("warning".into(), Value::String(warning.clone()));
-    }
-    if !report.notes.is_empty() {
-        view.insert("notes".into(), serde_json::to_value(&report.notes)?);
-    }
-    view.insert("filters".into(), serde_json::to_value(&report.filters)?);
-    view.insert("index".into(), serde_json::to_value(&report.index)?);
-    Ok(view)
-}
-
 /// One compact hit. `per_hit_budget` is the ceiling pass's cap on the
 /// serialized characters of this hit's `code`, closing line included.
-fn compact_hit(hit: &Hit, max_lines: usize, per_hit_budget: Option<usize>) -> Value {
+fn compact_hit(hit: &Hit, max_lines: usize, per_hit_budget: Option<usize>) -> CompactHit<'_> {
     let chunk = &hit.chunk;
-    let (code, truncated, last_shown) = excerpt(hit, max_lines, per_hit_budget);
-    let mut object = Map::new();
-    object.insert(
-        "relative_file_path".into(),
-        Value::String(chunk.relative_file_path.clone()),
-    );
-    object.insert("start_line".into(), chunk.start_line.into());
-    object.insert("end_line".into(), chunk.end_line.into());
-    object.insert("language".into(), Value::String(chunk.language.clone()));
-    object.insert(
-        "source_role".into(),
-        serde_json::to_value(hit.source_role).unwrap_or(Value::Null),
-    );
-    object.insert("code".into(), Value::String(code));
-    if truncated {
-        object.insert("code_truncated".into(), Value::Bool(true));
-        if let Some(last_shown) = last_shown {
-            object.insert("excerpt_end_line".into(), last_shown.into());
-        }
+    let (code, code_truncated, last_shown) = excerpt(hit, max_lines, per_hit_budget);
+    CompactHit {
+        relative_file_path: &chunk.relative_file_path,
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        language: &chunk.language,
+        source_role: hit.source_role,
+        code,
+        code_truncated,
+        excerpt_end_line: if code_truncated { last_shown } else { None },
     }
-    Value::Object(object)
 }
 
 /// The code of `hit` as shown: at most `max_lines` lines, each at most
@@ -248,20 +283,21 @@ fn json_chars(text: &str) -> usize {
     serde_json::to_string(text).map_or(text.chars().count() + 2, |json| json.chars().count())
 }
 
-/// Characters of the compact JSON text of `value`.
-fn serialized_chars(value: &Value) -> usize {
-    value.to_string().chars().count()
+/// Characters of the compact JSON text of the result.
+fn serialized_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        app::{IndexAction, SearchIndexLifecycle, Timings},
+        app::{IndexAction, Timings},
         chunk::Chunk,
         filter::{EffectiveFilter, FilterRequest, SourceRole},
         workspace::Workspace,
     };
+    use serde_json::Value;
 
     fn hit(path: &str, start_line: u32, code: &str) -> Hit {
         let lines = code.split_inclusive('\n').count().max(1) as u32;
@@ -345,37 +381,106 @@ mod tests {
             .collect()
     }
 
+    /// The compact result parsed into a `Value`, whose keys `serde_json` may
+    /// reorder: use it for values and for the SET of keys, never for their
+    /// order (that is what [`assert_key_order`] is for).
+    fn view_of(report: &SearchReport, limits: CompactLimits) -> Result<Value> {
+        Ok(serde_json::from_str(&compact_view(report, limits)?)?)
+    }
+
+    fn chars_of(view: &Value) -> usize {
+        view.to_string().chars().count()
+    }
+
+    /// The keys of `object`, sorted.
     fn keys(object: &Value) -> Vec<&str> {
-        object
+        let mut keys: Vec<&str> = object
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
-            .collect()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn sorted(mut keys: Vec<&str>) -> Vec<&str> {
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Asserts that each of `keys` occurs as a JSON key of `text`, in this
+    /// order. The text is what the server sends, so this is the order a reader
+    /// of the response sees.
+    fn assert_key_order(text: &str, keys: &[&str]) {
+        let mut from = 0;
+        for key in keys {
+            let needle = format!("\"{key}\":");
+            match text[from..].find(&needle) {
+                Some(at) => from += at + needle.len(),
+                None => panic!("key {key} not found in order after byte {from} of {text}"),
+            }
+        }
     }
 
     #[test]
     fn a_compact_result_keeps_the_locators_and_code_and_drops_the_retrieval_metadata() {
         let code = "fn short() {\n    1\n}\n";
-        let view =
-            compact_view(&report(vec![hit("src/a.rs", 10, code)]), limits(40, 16_000)).unwrap();
+        let one = report(vec![hit("src/a.rs", 10, code)]);
+        let text = compact_view(&one, limits(40, 16_000)).unwrap();
+        let view = view_of(&one, limits(40, 16_000)).unwrap();
         assert_eq!(
             keys(&view),
-            ["workspace", "search_profile", "filters", "index", "results"]
+            sorted(vec![
+                "workspace",
+                "search_profile",
+                "filters",
+                "index",
+                "results"
+            ])
+        );
+        // The order of the keys in the text does not depend on how
+        // `serde_json` orders a parsed map: the struct fields set it.
+        assert_key_order(
+            &text,
+            &[
+                "workspace",
+                "path",
+                "search_profile",
+                "filters",
+                "index",
+                "results",
+                "relative_file_path",
+                "start_line",
+                "end_line",
+                "language",
+                "source_role",
+                "code",
+            ],
+        );
+        assert!(
+            text.starts_with(
+                "{\"workspace\":{\"path\":\"/workspace\"},\"search_profile\":\"lean\","
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"results\":[{\"relative_file_path\":\"src/a.rs\",\"start_line\":10,\"end_line\":12,\"language\":\"rust\",\"source_role\":\"source\",\"code\":"),
+            "{text}"
         );
         assert_eq!(view["workspace"], serde_json::json!({"path": "/workspace"}));
         assert_eq!(view["search_profile"], "lean");
         // The locator comes first, so a reader sees where before what.
         assert_eq!(
             keys(&results(&view)[0]),
-            [
+            sorted(vec![
                 "relative_file_path",
                 "start_line",
                 "end_line",
                 "language",
                 "source_role",
                 "code"
-            ]
+            ])
         );
         let first = &results(&view)[0];
         assert_eq!(first["relative_file_path"], "src/a.rs");
@@ -391,20 +496,23 @@ mod tests {
         let mut with = report(vec![hit("src/a.rs", 1, "x\n")]);
         with.warning = Some("the reranker failed".to_owned());
         with.notes = vec!["a language server is still starting".to_owned()];
-        let view = compact_view(&with, limits(40, 16_000)).unwrap();
+        let view = view_of(&with, limits(40, 16_000)).unwrap();
         assert_eq!(view["warning"], "the reranker failed");
         assert_eq!(view["notes"][0], "a language server is still starting");
         let mut none = report(vec![]);
         none.search_profile = None;
-        let view = compact_view(&none, limits(40, 16_000)).unwrap();
-        assert_eq!(keys(&view), ["workspace", "filters", "index", "results"]);
+        let view = view_of(&none, limits(40, 16_000)).unwrap();
+        assert_eq!(
+            keys(&view),
+            sorted(vec!["workspace", "filters", "index", "results"])
+        );
         assert!(results(&view).is_empty());
     }
 
     #[test]
     fn a_hit_over_the_line_cap_is_cut_with_a_marker_naming_the_rest() {
         let code = numbered_lines(100);
-        let view = compact_view(
+        let view = view_of(
             &report(vec![hit("src/big.rs", 10, &code)]),
             limits(40, 100_000),
         )
@@ -432,13 +540,12 @@ mod tests {
     #[test]
     fn the_cap_leaves_a_chunk_of_exactly_the_limit_alone_and_cuts_one_line_more() {
         let exact = numbered_lines(40);
-        let view =
-            compact_view(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
+        let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
         assert_eq!(results(&view)[0]["code"], exact.as_str());
         assert!(results(&view)[0].get("code_truncated").is_none());
         assert!(results(&view)[0].get("excerpt_end_line").is_none());
         let one_more = numbered_lines(41);
-        let view = compact_view(
+        let view = view_of(
             &report(vec![hit("a.rs", 1, &one_more)]),
             limits(40, 100_000),
         )
@@ -453,7 +560,7 @@ mod tests {
         );
         // A chunk without a final newline keeps that too.
         let unterminated = "fn f() {\n}";
-        let view = compact_view(
+        let view = view_of(
             &report(vec![hit("a.rs", 1, unterminated)]),
             limits(40, 100_000),
         )
@@ -465,7 +572,7 @@ mod tests {
     fn the_cap_counts_lines_not_bytes_and_keeps_crlf_endings_and_multibyte_text() {
         let line = |n: usize| format!("// zeile {n} \u{e4}\u{f6}\u{fc}\r\n");
         let crlf: String = (1..=50).map(line).collect();
-        let view = compact_view(&report(vec![hit("a.rs", 1, &crlf)]), limits(5, 100_000)).unwrap();
+        let view = view_of(&report(vec![hit("a.rs", 1, &crlf)]), limits(5, 100_000)).unwrap();
         let shown = results(&view)[0]["code"].as_str().unwrap();
         let prefix: String = (1..=5).map(line).collect();
         assert!(shown.starts_with(&prefix), "{shown:?}");
@@ -478,8 +585,7 @@ mod tests {
         // 3000 two-byte characters on one line: a minified file's chunk.
         let line = "\u{e9}".repeat(3000);
         let code = format!("{line}\n");
-        let view =
-            compact_view(&report(vec![hit("min.js", 7, &code)]), limits(40, 100_000)).unwrap();
+        let view = view_of(&report(vec![hit("min.js", 7, &code)]), limits(40, 100_000)).unwrap();
         let first = &results(&view)[0];
         let shown = first["code"].as_str().unwrap();
         assert!(
@@ -494,8 +600,7 @@ mod tests {
         assert_eq!(first["excerpt_end_line"], 7);
         // A line of exactly the limit is left alone.
         let exact = format!("{}\n", "x".repeat(COMPACT_MAX_LINE_CHARS));
-        let view =
-            compact_view(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
+        let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
         assert_eq!(results(&view)[0]["code"], exact.as_str());
     }
 
@@ -511,18 +616,14 @@ mod tests {
     #[test]
     fn the_response_ceiling_holds_and_every_locator_survives_in_order() {
         let full = forty_hits();
-        let uncapped = compact_view(&full, limits(40, 1_000_000)).unwrap();
-        let uncapped_chars = serialized_chars(&uncapped);
+        let uncapped = view_of(&full, limits(40, 1_000_000)).unwrap();
+        let uncapped_chars = chars_of(&uncapped);
         assert!(uncapped_chars > 30_000, "{uncapped_chars}");
         assert!(uncapped.get("response_truncated").is_none());
         let expected = locators(&uncapped);
         for ceiling in [1_000_000, 30_000, 16_000, 13_000] {
-            let view = compact_view(&full, limits(40, ceiling)).unwrap();
-            assert!(
-                serialized_chars(&view) <= ceiling,
-                "{ceiling}: {}",
-                serialized_chars(&view)
-            );
+            let view = view_of(&full, limits(40, ceiling)).unwrap();
+            assert!(chars_of(&view) <= ceiling, "{ceiling}: {}", chars_of(&view));
             assert_eq!(locators(&view), expected, "{ceiling}");
             let shortened = view.get("response_truncated").is_some();
             assert_eq!(shortened, ceiling < uncapped_chars, "{ceiling}");
@@ -550,26 +651,24 @@ mod tests {
     #[test]
     fn a_ceiling_squeezes_the_code_down_to_the_markers_and_then_reports_an_error() {
         let full = forty_hits();
-        let view = compact_view(&full, limits(40, 1_000_000)).unwrap();
+        let view = view_of(&full, limits(40, 1_000_000)).unwrap();
         // Locators, envelope and one closing line per hit fit, code does not.
         let locators_only = {
             let mut bare = view.clone();
             for hit in bare["results"].as_array_mut().unwrap() {
                 hit.as_object_mut().unwrap().remove("code");
             }
-            serialized_chars(&bare)
+            chars_of(&bare)
         };
         let ceiling = locators_only + 40 * 160;
-        let squeezed = compact_view(&full, limits(40, ceiling)).unwrap();
-        assert!(serialized_chars(&squeezed) <= ceiling);
+        let squeezed = view_of(&full, limits(40, ceiling)).unwrap();
+        assert!(chars_of(&squeezed) <= ceiling);
         assert_eq!(locators(&squeezed), locators(&view));
         assert_eq!(squeezed["response_truncated"], true);
 
         // Below what the locators and metadata need there is no response to
         // give, only an actionable and bounded error.
-        let error = compact_view(&full, limits(40, 1_000))
-            .unwrap_err()
-            .to_string();
+        let error = view_of(&full, limits(40, 1_000)).unwrap_err().to_string();
         assert!(error.contains("compact_max_response_chars"), "{error}");
         assert!(error.contains("top_k"), "{error}");
         assert!(error.contains("40 results"), "{error}");
@@ -583,13 +682,13 @@ mod tests {
         let code = format!("{}\nsecond\n", "word ".repeat(100));
         let one = report(vec![hit("a.rs", 1, &code)]);
         let bare = {
-            let mut view = compact_view(&one, limits(40, 100_000)).unwrap();
+            let mut view = view_of(&one, limits(40, 100_000)).unwrap();
             view["results"][0].as_object_mut().unwrap().remove("code");
-            serialized_chars(&view)
+            chars_of(&view)
         };
         let ceiling = bare + CLOSING_LINE_RESERVE + 180;
-        let view = compact_view(&one, limits(40, ceiling)).unwrap();
-        assert!(serialized_chars(&view) <= ceiling);
+        let view = view_of(&one, limits(40, ceiling)).unwrap();
+        assert!(chars_of(&view) <= ceiling);
         let first = &results(&view)[0];
         let shown = first["code"].as_str().unwrap();
         assert!(shown.starts_with("word word"), "{shown}");
@@ -599,7 +698,7 @@ mod tests {
 
     #[test]
     fn empty_code_is_fine() {
-        let view = compact_view(&report(vec![hit("a.rs", 3, "")]), limits(40, 16_000)).unwrap();
+        let view = view_of(&report(vec![hit("a.rs", 3, "")]), limits(40, 16_000)).unwrap();
         assert_eq!(results(&view)[0]["code"], "");
         assert!(results(&view)[0].get("code_truncated").is_none());
     }

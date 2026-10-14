@@ -98,6 +98,21 @@ fn result<T: serde::Serialize>(value: anyhow::Result<T>) -> CallToolResult {
     }
 }
 
+/// A successful result whose text content is `text`, JSON with its keys in
+/// the order the writer chose (see `compact_view`), and whose structured
+/// content is the same JSON as a `Value`. The text is kept as written: a
+/// `Value` does not promise to keep the order of the keys.
+fn ordered_result(text: String) -> CallToolResult {
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => {
+            let mut called = CallToolResult::structured(value);
+            called.content = vec![ContentBlock::text(text)];
+            called
+        }
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))]),
+    }
+}
+
 impl McpServer {
     pub fn new(
         app: Arc<App>,
@@ -247,7 +262,10 @@ impl McpServer {
             .await;
         match self.presentation.compact {
             // A presentation step after the search: retrieval is finished.
-            Some(limits) => self.answer(report.and_then(|report| compact_view(&report, limits))),
+            Some(limits) => match report.and_then(|report| compact_view(&report, limits)) {
+                Ok(text) => ordered_result(text),
+                Err(error) => self.answer::<()>(Err(error)),
+            },
             None => self.answer(report),
         }
     }

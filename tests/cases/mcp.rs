@@ -1170,13 +1170,35 @@ fn tool_names(tools: &Value) -> Vec<&str> {
     names
 }
 
+/// The keys of a JSON object, sorted: a parsed `Value` does not promise to
+/// keep the order of the keys, so the SET is compared here and the order of
+/// a response is checked on its text with [`assert_key_order`].
 fn object_keys(value: &Value) -> Vec<&str> {
-    value
+    let mut keys: Vec<&str> = value
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
-        .collect()
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The text content of a tool call response, exactly as the server wrote it.
+fn text_content(response: &Value) -> &str {
+    response["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+/// Asserts that each of `keys` occurs as a JSON key of `text`, in this order.
+fn assert_key_order(text: &str, keys: &[&str]) {
+    let mut from = 0;
+    for key in keys {
+        let needle = format!("\"{key}\":");
+        match text[from..].find(&needle) {
+            Some(at) => from += at + needle.len(),
+            None => panic!("key {key} not found in order after byte {from} of {text}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -1216,13 +1238,48 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
     // `/mcp/compact` returns the same hits in the same order, each as a
     // locator, language, role and byte-identical code; nothing of the
     // retrieval metadata, and a short envelope.
-    let compact =
+    let compact_response =
         mcp_search_everything(&client, &base, "/mcp/compact", &compact_session, &workspace).await;
-    let compact = structured(&compact);
+    let compact = structured(&compact_response);
     assert_eq!(
         object_keys(compact),
-        ["workspace", "search_profile", "filters", "index", "results"],
+        ["filters", "index", "results", "search_profile", "workspace"],
         "{compact}"
+    );
+    // The text of the response keeps the key order the code writes: the
+    // envelope, then per hit the locator first.
+    let compact_text = text_content(&compact_response);
+    assert_key_order(
+        compact_text,
+        &[
+            "workspace",
+            "search_profile",
+            "filters",
+            "index",
+            "results",
+            "relative_file_path",
+            "start_line",
+            "end_line",
+            "language",
+            "source_role",
+            "code",
+        ],
+    );
+    let truncated_hit = &compact_text[compact_text
+        .find("\"relative_file_path\":\"src/long.rs\"")
+        .expect(compact_text)..];
+    assert_key_order(
+        truncated_hit,
+        &[
+            "relative_file_path",
+            "start_line",
+            "end_line",
+            "language",
+            "source_role",
+            "code",
+            "code_truncated",
+            "excerpt_end_line",
+        ],
     );
     assert_eq!(compact["search_profile"], "compact");
     assert_eq!(compact["workspace"]["path"], full["workspace"]["path"]);
@@ -1236,15 +1293,16 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
     let mut long_hits = 0;
     for (compact_hit, full_hit) in compact_hits.iter().zip(full_hits) {
         let mut expected = vec![
-            "relative_file_path",
-            "start_line",
+            "code",
             "end_line",
             "language",
+            "relative_file_path",
             "source_role",
-            "code",
+            "start_line",
         ];
         if compact_hit.get("code_truncated").is_some() {
             expected.extend(["code_truncated", "excerpt_end_line"]);
+            expected.sort_unstable();
         }
         assert_eq!(object_keys(compact_hit), expected, "{compact_hit}");
         assert_eq!(compact_hit["language"], full_hit["language"]);
