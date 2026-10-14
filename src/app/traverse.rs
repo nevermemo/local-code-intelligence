@@ -38,8 +38,10 @@ use lci_maps::{
     MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
+    git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     impact::{Decl, ImpactIndex},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
+    probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::{DirSource, SCIP_MAP_ID, ScipMap, SourceText},
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
@@ -76,10 +78,17 @@ pub const SEEDS_HYBRID: MapId = "seeds.hybrid";
 /// lets a chunk or file start node (what the hybrid search often finds) reach
 /// the symbols the SCIP graph walks.
 pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP_ID];
-/// The maps a traversal uses only when the call names them (`--maps`): they
-/// need the tree (`grep.live` searches its current bytes, `config.key` runs
-/// the M1.2 extractor, which needs `rg`) and are not part of the default.
-pub const OPT_IN_MAPS: [MapId; 2] = [GREP_LIVE_MAP_ID, CONFIG_KEY_MAP_ID];
+/// The maps a traversal uses only when the call names them (`--maps`); all
+/// need the tree and none is part of the default: `grep.live` searches its
+/// current bytes, `config.key` runs the M1.2 extractor (needs `rg`),
+/// `git.history` reads the git history up to its HEAD, and `probe.compile`
+/// runs `cargo check` on a scratch copy (seconds per node).
+pub const OPT_IN_MAPS: [MapId; 4] = [
+    GREP_LIVE_MAP_ID,
+    CONFIG_KEY_MAP_ID,
+    GIT_HISTORY_ID,
+    PROBE_COMPILE_ID,
+];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
 /// Most symbols one hit of the hybrid search may start from (a chunk that
@@ -912,7 +921,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                     .find(|known| known == id)
                     .ok_or_else(|| {
                         anyhow!(
-                            "unknown map {id:?}; the maps are {}, and on request {}",
+                            "unknown map {id:?}; the maps are {}, and, only when named, {}",
                             MAPS.join(", "),
                             OPT_IN_MAPS.join(", ")
                         )
@@ -1017,6 +1026,42 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         };
         register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
     }
+    let mut git_history = None;
+    if wants(GIT_HISTORY_ID) {
+        match call.scip_root {
+            None => notes.push("git.history needs the tree: give --root".to_owned()),
+            Some(root) => {
+                let table = symbol_files(&loaded.scip);
+                match GitHistoryMap::open_with(root, GitHistoryConfig::default(), table) {
+                    Ok(map) => {
+                        let map = Arc::new(map);
+                        register(
+                            &mut registry,
+                            &mut plan_maps,
+                            Box::new(Shared(map.clone())),
+                            true,
+                        )?;
+                        git_history = Some(map);
+                    }
+                    Err(error) => notes.push(format!("git.history is unavailable: {error}")),
+                }
+            }
+        }
+    }
+    if wants(PROBE_COMPILE_ID) {
+        match call.scip_root {
+            None => notes.push("probe.compile needs the tree: give --root".to_owned()),
+            Some(root) => {
+                let map = ProbeMap::new(loaded.scip.clone(), ProbeConfig::for_tree(root));
+                register(
+                    &mut registry,
+                    &mut plan_maps,
+                    Box::new(Shared(Arc::new(map))),
+                    true,
+                )?;
+            }
+        }
+    }
     budget.deadline += setup.elapsed();
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
@@ -1066,7 +1111,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             None
         }
     };
-    let response = response_json(
+    let mut response = response_json(
         call,
         &result,
         &found,
@@ -1075,6 +1120,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         trace_path.as_deref(),
         notes,
     );
+    if let Some(history) = &git_history {
+        add_commits(&mut response, history);
+    }
     Ok(Report {
         response,
         trace: trace_path,
@@ -1094,6 +1142,30 @@ fn chunk_lines(found: &Seeds) -> Vec<(NodeId, (u32, u32))> {
             Some((seed.node.clone(), (line(0)?, line(1)?)))
         })
         .collect()
+}
+
+/// Gives every commit card the subject (first line) and date of its commit.
+fn add_commits(response: &mut Value, history: &GitHistoryMap) {
+    for list in ["/results", "/checkpoint/answer"] {
+        let Some(Value::Array(items)) = response.pointer_mut(list) else {
+            continue;
+        };
+        for card in items {
+            let commit = card["node"]
+                .as_str()
+                .and_then(|node| NodeId::from_str(node).ok())
+                .and_then(|node| match node {
+                    NodeId::Commit { sha } => history.commit_node(&sha),
+                    _ => None,
+                });
+            if let (Some(commit), Some(object)) = (commit, card.as_object_mut()) {
+                object.insert(
+                    "commit".into(),
+                    json!({"subject": commit.subject, "date": commit.date}),
+                );
+            }
+        }
+    }
 }
 
 /// The start nodes of a call and where they came from.
