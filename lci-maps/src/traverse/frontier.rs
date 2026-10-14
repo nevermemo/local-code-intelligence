@@ -7,9 +7,10 @@
 //! set).
 //!
 //! [`hop`] is `walk::hop` over fused edges: a node with at most `gate`
-//! offered edges is followed whole at value 1; above the gate a [`HopScorer`]
-//! orders them, the best `beam` are kept, and the edge at rank `r` gets
-//! `1 / (1 + r)`. The rules scorer sees the edge's witness class, kind, the
+//! offered edges is followed whole, each at its kind's [`kind_prior`] (1 for a
+//! call, 0.5 for a containment hop, so structure does not tie with the call
+//! graph); above the gate a [`HopScorer`] orders them, the best `beam` are
+//! kept, and the edge at rank `r` gets `1 / (1 + r)`. The rules scorer sees the edge's witness class, kind, the
 //! fused confidence, the in-degree seen so far, the query overlap and the map
 //! card's cost, so a hop into another map is priced like any other.
 
@@ -327,8 +328,15 @@ pub fn hop(
     cands: &[Candidate],
     price: HopPrice,
 ) -> Vec<(usize, f64)> {
-    if scorer.unscored() || cands.len() <= price.gate {
+    if scorer.unscored() {
         return (0..cands.len()).map(|i| (i, 1.0)).collect();
+    }
+    if cands.len() <= price.gate {
+        return cands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, kind_prior(c.edge.best.kind)))
+            .collect();
     }
     let scores = scorer.score(ctx, cands);
     let mut order: Vec<usize> = (0..cands.len()).collect();

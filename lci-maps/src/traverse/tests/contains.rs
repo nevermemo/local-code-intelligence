@@ -477,3 +477,79 @@ async fn the_pre_merged_source_gives_the_edges_the_map_gives_on_the_fly() {
             .all(|e| e.best.site.as_ref().is_some_and(|s| !s.blob.is_empty()))
     );
 }
+
+// ---- hop pricing of structural edges (S6d) ----------------------------------
+
+fn kinded(kind: EdgeKind, dst: &str) -> Edge {
+    Edge {
+        kind,
+        ..edge("a", dst, "m", WitnessClass::Exact, 100)
+    }
+}
+
+#[test]
+fn a_hop_under_the_gate_is_valued_at_its_kind_prior() {
+    let fused = fuse(vec![
+        kinded(EdgeKind::CallsOrRefs, "calls"),
+        kinded(EdgeKind::Contains, "contains"),
+        kinded(EdgeKind::DefinedIn, "defined"),
+    ]);
+    let cands: Vec<Candidate> = fused
+        .iter()
+        .map(|edge| Candidate {
+            edge,
+            in_seen: 0,
+            card: MapCard::default(),
+        })
+        .collect();
+    let ctx = ScoreCtx {
+        query: &[],
+        nodes_seen: 10,
+    };
+    let value_of = |dst: &str| {
+        let at = fused.iter().position(|f| f.best.dst == node(dst)).unwrap();
+        let steps = hop(&mut RulesScorer, &ctx, &cands, HopPrice::default());
+        assert_eq!(steps.len(), 3);
+        steps.iter().find(|(i, _)| *i == at).unwrap().1
+    };
+    assert_eq!(value_of("calls"), 1.0);
+    assert_eq!(value_of("contains"), 0.5);
+    assert_eq!(value_of("defined"), 0.5);
+    // The unscored control keeps value 1 for every kind.
+    let steps = hop(&mut BfsScorer, &ctx, &cands, HopPrice::default());
+    assert!(steps.iter().all(|(_, v)| *v == 1.0));
+}
+
+#[tokio::test]
+async fn a_call_neighbour_outranks_the_file_and_its_siblings() {
+    let scip = demo_scip();
+    let (alpha, beta) = (symbol(&scip, "a/alpha()."), symbol(&scip, "b/beta()."));
+    let method = symbol(&scip, "a/impl#[T]method().");
+    let file = NodeId::file("src/a.rs").unwrap();
+    let reg = registry_of(demo_scip(), Some(ContainsMap::new(&scip)));
+    let result = walk(&reg, vec![Seed::from(alpha.clone())], budget(20), |t| t).await;
+    let potential = |node: &NodeId| {
+        result
+            .states
+            .iter()
+            .find(|s| s.node == *node)
+            .unwrap_or_else(|| panic!("{node} not reached"))
+            .potential
+    };
+    // alpha calls beta (value 1); alpha -> its file is DefinedIn (0.5), and
+    // the sibling is one Contains hop further (0.25).
+    assert_eq!(potential(&beta), 1.0);
+    assert_eq!(potential(&file), 0.5);
+    assert_eq!(potential(&method), 0.25);
+    // Ranked by potential, as the tool does: the call neighbour comes first.
+    let mut ranked: Vec<&State> = result.states.iter().filter(|s| s.node != alpha).collect();
+    ranked.sort_by(|a, b| b.potential.total_cmp(&a.potential));
+    assert_eq!(ranked[0].node, beta);
+    // Every state reached through the containment map ranks below it.
+    let structural: Vec<&&State> = ranked
+        .iter()
+        .filter(|s| s.via == Some(CONTAINS_MAP_ID))
+        .collect();
+    assert!(!structural.is_empty());
+    assert!(structural.iter().all(|s| s.potential <= 0.5));
+}
