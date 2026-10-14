@@ -207,7 +207,7 @@ Current state only, at most about 7 KB (the post-compaction hook prints it whole
 ```text
 # Run checkpoint -- <date time>. Last pushed: <hash> (<branch>, <PR>). Tree: <clean | uncommitted: files>
 Active run: <yes (since <date>; what) | no>
-FIRST AFTER ANY COMPACTION: run the post-compaction check script; call get_usage; read this file; read the roadmap "In progress" section and `git status`.
+FIRST AFTER ANY COMPACTION: run the post-compaction hook (owner-local); call get_usage; read this file; read the roadmap "In progress" section and `git status`.
 
 ## Standing mandate
 <what the owner asked for; pause at 90% of the 5-hour window, stop at 90% of the weekly window; pointer to the memory file holding the preferences>
