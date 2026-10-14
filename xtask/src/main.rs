@@ -4,6 +4,7 @@ mod env;
 mod gold;
 mod lint;
 mod live_acceptance;
+mod maps;
 mod mine;
 mod setup;
 mod test;
@@ -75,6 +76,12 @@ enum Command {
     Gold {
         #[command(subcommand)]
         which: gold::GoldCommand,
+    },
+    /// Multimap spine tooling: `bench` runs `lci traverse` over a gold set,
+    /// scores it and appends a trend row. See docs/spike/multimap/v2/trend.md.
+    Maps {
+        #[command(subcommand)]
+        which: maps::MapsCommand,
     },
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
@@ -266,6 +273,7 @@ async fn main() -> Result<()> {
         Command::Env(args) => env::run(args),
         Command::LintMachinePaths => lint::run(),
         Command::Gold { which } => gold::run(which),
+        Command::Maps { which } => maps::run(which),
         Command::MineQueries {
             repo,
             key,

@@ -1,0 +1,1842 @@
+//! `cargo xtask maps bench`: run `lci traverse` once per gold question, score
+//! the answers with the gold scorers (in-process) and append one trend row per
+//! (wave, set).
+//!
+//! The runner only calls the CLI, so whatever seeds the traversal today (the
+//! name-token stand-in, later the hybrid search of S6b) is what is measured.
+//! The gold items are read for their `question` only; the seed, the answer and
+//! every other gold field are never given to the traversal.
+//!
+//! A traversal answers with graph nodes (`sym:...` ids). Each set scores a
+//! different answer type, so a small adapter per set turns the nodes into the
+//! run-file answers the scorer reads (declarations with a path and a name,
+//! files, commits, document paths). A symbol id carries its module path but not
+//! its file, so paths are recovered from the frozen tree by the same
+//! module-path rule the node ids were made with. When no selected map can emit
+//! the node kind a set needs (commits for history, document sections for
+//! instructions), the row says so instead of reporting zeros.
+
+use super::trend::{self, NCOLS, TrendRow};
+use crate::gold::{self, Answer, Set};
+use anyhow::{Context, Result, bail};
+use clap::{Args, ValueEnum};
+use lci_core::node::{NodeId, NodeKind, SymbolKind, rust_module_path};
+use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// The maps `lci traverse` uses when `--maps` is not given.
+const DEFAULT_MAPS: [&str; 2] = ["seeds.scip_names", "graph.scip"];
+/// Where the trend file lives, relative to the repository root.
+const DEFAULT_TREND: &str = "docs/spike/multimap/v2/trend.md";
+const NO_MAP: &str = "no map yields this answer type";
+/// A progress line goes to stderr after this many items.
+const PROGRESS_EVERY: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SetArg {
+    Impact,
+    Flow,
+    WhereTo,
+    History,
+    Instructions,
+    All,
+}
+
+impl SetArg {
+    fn sets(self) -> Vec<Set> {
+        match self {
+            SetArg::Impact => vec![Set::Impact],
+            SetArg::Flow => vec![Set::Flow],
+            SetArg::WhereTo => vec![Set::WhereTo],
+            SetArg::History => vec![Set::History],
+            SetArg::Instructions => vec![Set::Instructions],
+            SetArg::All => vec![
+                Set::Impact,
+                Set::Flow,
+                Set::WhereTo,
+                Set::History,
+                Set::Instructions,
+            ],
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct BenchArgs {
+    /// Which gold set to run (all = the five, in order).
+    #[arg(long, value_enum)]
+    set: SetArg,
+    /// Directory holding impact.json, flow.json, where-to.json, history.json
+    /// and instructions.json (private; no default).
+    #[arg(long)]
+    gold_dir: PathBuf,
+    /// The SCIP index of the frozen tree.
+    #[arg(long)]
+    scip: PathBuf,
+    /// The frozen tree the index describes (also read to find the file of a
+    /// symbol).
+    #[arg(long)]
+    tree: PathBuf,
+    /// Maps to use, comma separated (default: the CLI's own default).
+    #[arg(long, value_delimiter = ',')]
+    maps: Vec<String>,
+    /// A steering policy file for `lci traverse --policy`, or `default` for
+    /// none.
+    #[arg(long, default_value = "default")]
+    policy: String,
+    /// Run only the first N items of each set (impact: of the primary items).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Answers requested per item (`lci traverse --top-k`, at most 40).
+    #[arg(long, default_value_t = 10)]
+    top_k: usize,
+    /// Label of this measurement; the trend keeps one row per (wave, set).
+    #[arg(long, default_value = "unlabelled")]
+    wave: String,
+    /// Longest one `lci traverse` call may run, in seconds; a slower item is
+    /// killed and skipped with the cause `timeout`.
+    #[arg(long, default_value_t = 60)]
+    timeout_s: u64,
+    /// Mark the latencies as measured while other work ran on the machine.
+    #[arg(long)]
+    under_load: bool,
+    /// Also answer with the traversal's seed nodes, ahead of what it reached.
+    #[arg(long)]
+    include_seeds: bool,
+    /// Free text for the row's note column (build profile, tree, seeding).
+    #[arg(long)]
+    note: Option<String>,
+    /// The `lci` binary (default: target/release or target/debug of this
+    /// repository, whichever exists and is newer).
+    #[arg(long)]
+    lci: Option<PathBuf>,
+    /// Where run files, scores and raw traversal outputs are written.
+    #[arg(long)]
+    out_dir: PathBuf,
+    /// Trend file to append to (default: the repository's trend.md).
+    #[arg(long)]
+    trend: Option<PathBuf>,
+}
+
+pub fn run(args: BenchArgs) -> Result<()> {
+    let maps = effective_maps(&args.maps);
+    let policy = match args.policy.as_str() {
+        "default" => None,
+        other => Some(other.to_string()),
+    };
+    let lci = match &args.lci {
+        Some(path) => path.clone(),
+        None => default_lci()?,
+    };
+    let tree = TreeIndex::scan(&args.tree)?;
+    let trend_path = args
+        .trend
+        .clone()
+        .unwrap_or_else(|| repo_root().join(DEFAULT_TREND));
+    let mut traverser = CliTraverser {
+        lci,
+        scip: args.scip.clone(),
+        tree: args.tree.clone(),
+        maps: maps.clone(),
+        policy,
+        top_k: args.top_k,
+        out: args.out_dir.join("cli"),
+        timeout: Duration::from_secs(args.timeout_s),
+    };
+    // One cheap call per map, once for the whole run: a map that fails is
+    // marked unavailable and is not tried again per item.
+    let maps_unavailable = preflight_maps(&traverser, &maps);
+    for (map, reason) in &maps_unavailable {
+        eprintln!(
+            "map unavailable: {map}: {}",
+            reason.lines().next().unwrap_or_default()
+        );
+    }
+    let config = RunConfig {
+        wave: args.wave.clone(),
+        maps: maps.clone(),
+        maps_unavailable,
+        policy_label: policy_label(&args.policy),
+        under_load: args.under_load,
+        include_seeds: args.include_seeds,
+        note: args.note.clone().unwrap_or_default(),
+        progress: true,
+    };
+    traverser.maps = config.available_maps();
+    for set in args.set.sets() {
+        let items = select_items(
+            set,
+            gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(set))))?,
+            args.limit,
+        );
+        eprintln!("{}: {} items", set_name(set), items.len());
+        let outcome = bench_set(set, &items, &traverser, &tree, &config)?;
+        write_outputs(
+            &args.out_dir.join(slug(&args.wave)).join(set_name(set)),
+            &outcome,
+        )?;
+        trend::append(&trend_path, &outcome.row)?;
+        eprintln!("{}", outcome.row.to_markdown());
+    }
+    Ok(())
+}
+
+/// `crates/xtask/..` is the repository root; the manifest dir is `xtask/`.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+fn default_lci() -> Result<PathBuf> {
+    let exe = if cfg!(windows) {
+        "local-code-intelligence.exe"
+    } else {
+        "local-code-intelligence"
+    };
+    let found = ["release", "debug"]
+        .iter()
+        .map(|profile| repo_root().join("target").join(profile).join(exe))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max_by_key(|(time, _)| *time)
+        .map(|(_, p)| p);
+    found.context("no built lci binary under target/release or target/debug; pass --lci <path>")
+}
+
+fn effective_maps(requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        DEFAULT_MAPS.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        requested.to_vec()
+    }
+}
+
+fn policy_label(policy: &str) -> String {
+    if policy == "default" {
+        return "default".into();
+    }
+    Path::new(policy)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("custom")
+        .to_string()
+}
+
+fn slug(text: &str) -> String {
+    let s: String = text
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    if s.is_empty() { "wave".into() } else { s }
+}
+
+pub fn set_name(set: Set) -> &'static str {
+    match set {
+        Set::Impact => "impact",
+        Set::Flow => "flow",
+        Set::WhereTo => "where-to",
+        Set::History => "history",
+        Set::Instructions => "instructions",
+    }
+}
+
+/// The scored population of a set (impact keeps its `primary` items), cut to
+/// the first `limit`.
+fn select_items(set: Set, items: Vec<Value>, limit: Option<usize>) -> Vec<Value> {
+    let kept = items.into_iter().filter(|item| match set {
+        Set::Impact => item.get("primary").and_then(Value::as_bool) == Some(true),
+        _ => true,
+    });
+    match limit {
+        Some(n) => kept.take(n).collect(),
+        None => kept.collect(),
+    }
+}
+
+// ------------------------------------------------------------ capabilities
+
+/// The node kinds a known map emits; `None` for a map this runner does not
+/// know (it is run and judged by its results).
+fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
+    match map {
+        "seeds.scip_names" | "graph.scip" => Some(&[NodeKind::Symbol]),
+        _ => None,
+    }
+}
+
+/// The node kinds from which a set's answers can be made.
+fn needed_kinds(set: Set) -> &'static [NodeKind] {
+    match set {
+        Set::Impact | Set::Flow | Set::WhereTo => &[NodeKind::Symbol, NodeKind::File],
+        Set::History => &[NodeKind::Commit],
+        Set::Instructions => &[NodeKind::DocSection],
+    }
+}
+
+/// Whether any selected map can emit a node kind the set needs.
+pub fn can_answer(set: Set, maps: &[String]) -> bool {
+    maps.iter().any(|m| match map_emits(m) {
+        Some(kinds) => kinds.iter().any(|k| needed_kinds(set).contains(k)),
+        None => true,
+    })
+}
+
+// -------------------------------------------------------------- traversal
+
+/// One returned node: its canonical id and the one-line text an agent reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultNode {
+    pub id: String,
+    pub text: String,
+}
+
+/// The totals of one traversal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Totals {
+    pub pops: u64,
+    pub hops: u64,
+    pub cross_map_hops: u64,
+    pub stops: u64,
+    pub elapsed_ms: f64,
+}
+
+/// What one `lci traverse` call returned, reduced to what the bench uses.
+#[derive(Debug, Clone, Default)]
+pub struct Traversed {
+    pub status: String,
+    pub seeds: Vec<String>,
+    pub results: Vec<ResultNode>,
+    pub totals: Option<Totals>,
+    pub wall_ms: f64,
+}
+
+impl Traversed {
+    pub fn from_json(value: &Value, wall_ms: f64) -> Traversed {
+        let strings = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let results = value["results"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        Some(ResultNode {
+                            id: r["node"].as_str()?.to_string(),
+                            text: r["text"].as_str().unwrap_or_default().to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let totals = value
+            .get("totals")
+            .filter(|t| t.is_object())
+            .map(|t| Totals {
+                pops: t["pops"].as_u64().unwrap_or(0),
+                hops: t["hops"].as_u64().unwrap_or(0),
+                cross_map_hops: t["cross_map_hops"].as_u64().unwrap_or(0),
+                stops: t["stops"].as_u64().unwrap_or(0),
+                elapsed_ms: t["elapsed_ms"].as_f64().unwrap_or(0.0),
+            });
+        Traversed {
+            status: value["status"].as_str().unwrap_or("unknown").to_string(),
+            seeds: strings(&value["seeds"]),
+            results,
+            totals,
+            wall_ms,
+        }
+    }
+}
+
+/// Why a traversal call produced no answer. Both causes skip the item; they
+/// are counted apart in the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraverseError {
+    /// The call ran past the per-item timeout and was killed.
+    Timeout(u64),
+    /// The CLI could not run, exited non-zero or printed no JSON.
+    Cli(String),
+}
+
+impl std::fmt::Display for TraverseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraverseError::Timeout(secs) => write!(f, "timeout after {secs}s"),
+            TraverseError::Cli(message) => write!(f, "cli error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TraverseError {}
+
+/// Something that answers a question with a traversal. The real one runs the
+/// CLI; the tests use a fixture.
+pub trait Traverser {
+    /// The parsed answer and the raw JSON it came from.
+    fn traverse(&self, question: &str) -> Result<(Traversed, Value), TraverseError>;
+
+    /// One cheap call that uses only `map`; an error means the map is
+    /// unavailable on this tree.
+    fn preflight(&self, map: &str) -> Result<(), TraverseError>;
+}
+
+/// Runs the preflight once per map. Returns the reason for each map that
+/// failed; those maps are not used for the run and are not retried per item.
+pub fn preflight_maps(traverser: &dyn Traverser, maps: &[String]) -> Vec<(String, String)> {
+    maps.iter()
+        .filter_map(|map| {
+            traverser
+                .preflight(map)
+                .err()
+                .map(|error| (map.clone(), error.to_string()))
+        })
+        .collect()
+}
+
+/// Words that make a harmless question for the preflight call.
+const PREFLIGHT_QUESTION: &str = "preflight probe";
+
+#[derive(Clone)]
+pub struct CliTraverser {
+    pub lci: PathBuf,
+    pub scip: PathBuf,
+    pub tree: PathBuf,
+    pub maps: Vec<String>,
+    pub policy: Option<String>,
+    pub top_k: usize,
+    pub out: PathBuf,
+    pub timeout: Duration,
+}
+
+impl Traverser for CliTraverser {
+    fn traverse(&self, question: &str) -> Result<(Traversed, Value), TraverseError> {
+        let mut command = Command::new(&self.lci);
+        command
+            .arg("traverse")
+            .arg("--scip")
+            .arg(&self.scip)
+            .arg("--root")
+            .arg(&self.tree)
+            .arg(format!("--question={question}"))
+            .arg(format!("--top-k={}", self.top_k))
+            .arg("--out")
+            .arg(&self.out);
+        if !self.maps.is_empty() {
+            command.arg(format!("--maps={}", self.maps.join(",")));
+        }
+        if let Some(policy) = &self.policy {
+            command.arg("--policy").arg(policy);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut child = command
+            .spawn()
+            .map_err(|e| TraverseError::Cli(format!("run the lci binary: {e}")))?;
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let stdout = drain(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let stderr = drain(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() >= self.timeout => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = (stdout.join(), stderr.join());
+                    return Err(TraverseError::Timeout(self.timeout.as_secs()));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => return Err(TraverseError::Cli(format!("wait for lci: {e}"))),
+            }
+        };
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let out = stdout.join().unwrap_or_default();
+        let err = stderr.join().unwrap_or_default();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&err);
+            let tail: String = stderr
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(TraverseError::Cli(format!(
+                "lci traverse exited with {status}: {}",
+                tail.trim()
+            )));
+        }
+        let value: Value = serde_json::from_slice(&out)
+            .map_err(|e| TraverseError::Cli(format!("lci traverse printed no JSON: {e}")))?;
+        Ok((Traversed::from_json(&value, wall_ms), value))
+    }
+
+    fn preflight(&self, map: &str) -> Result<(), TraverseError> {
+        let probe = CliTraverser {
+            maps: vec![map.to_string()],
+            ..self.clone()
+        };
+        probe.traverse(PREFLIGHT_QUESTION).map(|_| ())
+    }
+}
+
+// ------------------------------------------------------------- tree index
+
+/// The `.rs` files of the frozen tree by module path, to find the file of a
+/// symbol id (which names its module path, not its file).
+#[derive(Debug, Default)]
+pub struct TreeIndex {
+    by_module: BTreeMap<Vec<String>, String>,
+}
+
+impl TreeIndex {
+    pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> TreeIndex {
+        let mut paths: Vec<&str> = paths.into_iter().filter(|p| p.ends_with(".rs")).collect();
+        paths.sort_unstable();
+        let mut by_module = BTreeMap::new();
+        for path in paths {
+            by_module
+                .entry(rust_module_path(path))
+                .or_insert_with(|| path.to_string());
+        }
+        TreeIndex { by_module }
+    }
+
+    pub fn scan(root: &Path) -> Result<TreeIndex> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
+            for entry in
+                std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if entry.file_type()?.is_dir() {
+                    if !matches!(name.as_ref(), ".git" | "target" | "node_modules") {
+                        walk(&path, root, out)?;
+                    }
+                } else if name.ends_with(".rs")
+                    && let Ok(relative) = path.strip_prefix(root)
+                {
+                    out.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        walk(root, root, &mut files)?;
+        if files.is_empty() {
+            bail!("no .rs files under the tree {}", root.display());
+        }
+        Ok(TreeIndex::from_paths(files.iter().map(String::as_str)))
+    }
+
+    /// The file for a module path: the longest prefix that is a file (a symbol
+    /// in an inline module belongs to the file around it).
+    pub fn file_of(&self, module_path: &[String]) -> Option<&str> {
+        (0..=module_path.len())
+            .rev()
+            .find_map(|n| self.by_module.get(&module_path[..n]))
+            .map(String::as_str)
+    }
+}
+
+// ------------------------------------------------------------- adapters
+
+/// A symbol node as the scorers see a declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decl {
+    pub path: Option<String>,
+    /// `Owner::name` for a method, `module::name` otherwise.
+    pub name: String,
+    pub kind: SymbolKind,
+}
+
+/// The type an impl or trait header names: `impl Map for Lexical<T>` ->
+/// `Lexical`, `trait Map` -> `Map`.
+pub fn owner_of_container(header: &str) -> Option<String> {
+    let header = header.trim();
+    let keyword_end = header
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(header.len());
+    let mut rest = header[keyword_end..].trim_start();
+    if rest.starts_with('<') {
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = rest[end..].trim_start();
+    }
+    if let Some(i) = rest.find(" where ") {
+        rest = &rest[..i];
+    }
+    if let Some(i) = rest.rfind(" for ") {
+        rest = &rest[i + 5..];
+    }
+    let rest = rest
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("dyn ");
+    let rest = rest.split('<').next().unwrap_or(rest);
+    let owner = rest.rsplit("::").next().unwrap_or(rest).trim();
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
+pub fn decl_of(id: &str, tree: &TreeIndex) -> Option<Decl> {
+    let NodeId::Symbol(key) = id.parse::<NodeId>().ok()? else {
+        return None;
+    };
+    let owner = key
+        .container
+        .last()
+        .and_then(|h| owner_of_container(h))
+        .or_else(|| key.module_path.last().cloned());
+    let name = match owner {
+        Some(owner) => format!("{owner}::{}", key.name),
+        None => key.name.clone(),
+    };
+    Some(Decl {
+        path: tree.file_of(&key.module_path).map(str::to_string),
+        name,
+        kind: key.kind,
+    })
+}
+
+fn parsed(id: &str) -> Option<NodeId> {
+    id.parse::<NodeId>().ok()
+}
+
+/// The file a node stands for: a file, chunk or doc node names it, a symbol
+/// is resolved through the tree.
+fn path_of(id: &str, tree: &TreeIndex) -> Option<String> {
+    match parsed(id)? {
+        NodeId::Symbol(_) => decl_of(id, tree)?.path,
+        other => other.path().map(str::to_string),
+    }
+}
+
+fn answer(path: Option<&str>, name: Option<&str>) -> Value {
+    let mut map = Map::new();
+    if let Some(path) = path {
+        map.insert("path".into(), json!(path));
+    }
+    if let Some(name) = name {
+        map.insert("name".into(), json!(name));
+    }
+    Value::Object(map)
+}
+
+fn dedup(answers: Vec<Value>) -> Vec<Value> {
+    let mut seen = BTreeSet::new();
+    answers
+        .into_iter()
+        .filter(|a| seen.insert(a.to_string()))
+        .collect()
+}
+
+fn paths_only(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| path_of(&n.id, tree))
+            .map(|p| answer(Some(&p), None))
+            .collect(),
+    )
+}
+
+/// Turns the nodes a traversal returned, best first, into the run-file answers
+/// the set's scorer reads.
+pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+    match set {
+        Set::Impact => adapt_impact(nodes, tree),
+        Set::Flow => adapt_flow(nodes, tree),
+        Set::WhereTo => adapt_where_to(item, nodes, tree),
+        Set::History => adapt_history(nodes),
+        Set::Instructions => adapt_instructions(nodes),
+    }
+}
+
+/// Impact: every symbol is a declaration (path and name; the node id has no
+/// line), a file node is a file.
+pub fn adapt_impact(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| match parsed(&n.id)? {
+                NodeId::Symbol(_) => {
+                    let d = decl_of(&n.id, tree)?;
+                    Some(answer(d.path.as_deref(), Some(&d.name)))
+                }
+                other => other.path().map(|p| answer(Some(p), None)),
+            })
+            .collect(),
+    )
+}
+
+/// Flow: the path is made of functions and methods; other nodes are not
+/// offered (an offered node that is no known node would count as spurious).
+pub fn adapt_flow(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| decl_of(&n.id, tree))
+            .filter(|d| matches!(d.kind, SymbolKind::Function | SymbolKind::Method))
+            .map(|d| answer(d.path.as_deref(), Some(&d.name)))
+            .collect(),
+    )
+}
+
+/// Where-to: registration items want files, ranked; convention items want an
+/// implementation per file (a path-only answer matches when one implementation
+/// lives in the file); exemplar items want members by name, or files when the
+/// item is file-granular.
+pub fn adapt_where_to(item: &Value, nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+    let gold = &item["gold"];
+    let by_name =
+        gold["form"].as_str() == Some("exemplar") && gold["granularity"].as_str() != Some("file");
+    if !by_name {
+        return paths_only(nodes, tree);
+    }
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| decl_of(&n.id, tree))
+            .filter(|d| matches!(d.kind, SymbolKind::Function | SymbolKind::Method))
+            .map(|d| answer(d.path.as_deref(), Some(&d.name)))
+            .collect(),
+    )
+}
+
+/// History: commit nodes, by hash.
+pub fn adapt_history(nodes: &[ResultNode]) -> Vec<Value> {
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| match parsed(&n.id)? {
+                NodeId::Commit { sha } => Some(json!({ "commit": sha })),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Instructions: document-section nodes, as the whole document (the id holds
+/// the heading path, not a line range).
+pub fn adapt_instructions(nodes: &[ResultNode]) -> Vec<Value> {
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| match parsed(&n.id)? {
+                NodeId::DocSection { path, .. } => Some(json!({ "path": path })),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+// ----------------------------------------------------------------- scoring
+
+/// F-beta: `(1 + b^2) p r / (b^2 p + r)`, 0 when both are 0.
+pub fn f_beta(precision: f64, recall: f64, beta: f64) -> f64 {
+    let b2 = beta * beta;
+    let denominator = b2 * precision + recall;
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        (1.0 + b2) * precision * recall / denominator
+    }
+}
+
+fn answers_of(values: &[Value]) -> Result<Vec<Answer>> {
+    values.iter().map(Answer::from_value).collect()
+}
+
+/// The scorer's metrics for one item scored alone.
+fn item_metrics(
+    set: Set,
+    item: &Value,
+    answers: &[Value],
+) -> Result<BTreeMap<String, Option<f64>>> {
+    let id = item["id"].as_str().context("gold item without an id")?;
+    let mut run = gold::Run::new();
+    run.insert(id.to_string(), answers_of(answers)?);
+    let report = gold::score_set(set, std::slice::from_ref(item), &run, false, false)?;
+    Ok(report["overall"]["metrics"]
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_f64())).collect())
+        .unwrap_or_default())
+}
+
+/// The answer-set precision and recall of one item, from the scorer's own
+/// definitions (see the trend preface).
+pub fn item_precision_recall(
+    set: Set,
+    item: &Value,
+    answers: &[Value],
+    metrics: &BTreeMap<String, Option<f64>>,
+) -> (f64, f64) {
+    let m = |name: &str| metrics.get(name).copied().flatten().unwrap_or(0.0);
+    match set {
+        Set::Impact => (m("decl_precision"), m("decl_recall")),
+        Set::Flow => {
+            let returned = answers.len() as f64;
+            let precision = if returned == 0.0 {
+                0.0
+            } else {
+                ((returned - m("spurious")) / returned).clamp(0.0, 1.0)
+            };
+            (precision, m("path_recall"))
+        }
+        Set::WhereTo => {
+            if item["gold"]["form"].as_str() == Some("registration") {
+                registration_precision_recall(item, answers)
+            } else {
+                (m("set_precision"), m("set_recall"))
+            }
+        }
+        Set::History => history_precision_recall(item, answers),
+        Set::Instructions => {
+            if item["subtype"].as_str() == Some("I1") {
+                (m("i1_section_precision"), m("i1_section_recall"))
+            } else {
+                (m("i2_required_precision@5"), m("i2_required_recall"))
+            }
+        }
+    }
+}
+
+fn string_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Registration: distinct returned files, minus the files the gold treats as
+/// neutral, against the expected files.
+fn registration_precision_recall(item: &Value, answers: &[Value]) -> (f64, f64) {
+    let expected: BTreeSet<String> = string_list(&item["gold"]["expected_files"])
+        .into_iter()
+        .collect();
+    let accept = &item["accept"];
+    let mut neutral: BTreeSet<String> = BTreeSet::new();
+    for key in [
+        "preferred",
+        "documentation",
+        "neutral_sites",
+        "definition_sites",
+    ] {
+        neutral.extend(
+            accept[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s["path"].as_str().map(str::to_string)),
+        );
+    }
+    for related in accept["related_sites"].as_array().into_iter().flatten() {
+        neutral.extend(string_list(&related["files"]));
+    }
+    neutral.retain(|f| !expected.contains(f));
+    let returned: BTreeSet<&str> = answers
+        .iter()
+        .filter_map(|a| a["path"].as_str())
+        .filter(|p| !neutral.contains(*p))
+        .collect();
+    let hits = returned.iter().filter(|p| expected.contains(**p)).count();
+    let precision = if returned.is_empty() {
+        0.0
+    } else {
+        hits as f64 / returned.len() as f64
+    };
+    let recall = if expected.is_empty() {
+        1.0
+    } else {
+        hits as f64 / expected.len() as f64
+    };
+    (precision, recall)
+}
+
+/// History: accepted commits among the distinct commits returned; recall is 1
+/// when an accepted commit was returned (every item has one answer to find).
+fn history_precision_recall(item: &Value, answers: &[Value]) -> (f64, f64) {
+    let mut accepted = string_list(&item["accept"]["mrr_commits"]);
+    if accepted.is_empty() {
+        accepted.extend(item["gold"]["commit"].as_str().map(str::to_string));
+    }
+    let same = |a: &str, b: &str| {
+        let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+        a.len() >= 7 && b.len() >= 7 && (a.starts_with(&b) || b.starts_with(&a))
+    };
+    let returned: BTreeSet<&str> = answers
+        .iter()
+        .filter_map(|a| a["commit"].as_str())
+        .collect();
+    let hits = returned
+        .iter()
+        .filter(|c| accepted.iter().any(|g| same(c, g)))
+        .count();
+    if returned.is_empty() {
+        return (0.0, 0.0);
+    }
+    (hits as f64 / returned.len() as f64, f64::from(hits > 0))
+}
+
+// -------------------------------------------------------------- the bench
+
+pub struct RunConfig {
+    pub wave: String,
+    /// The maps asked for (the CLI's default pair when none were given).
+    pub maps: Vec<String>,
+    /// Maps that failed the preflight, with the reason; they are not used.
+    pub maps_unavailable: Vec<(String, String)>,
+    pub policy_label: String,
+    pub under_load: bool,
+    pub include_seeds: bool,
+    pub note: String,
+    /// Print a progress line to stderr every [`PROGRESS_EVERY`] items.
+    pub progress: bool,
+}
+
+impl RunConfig {
+    /// The requested maps that passed the preflight.
+    fn available_maps(&self) -> Vec<String> {
+        self.maps
+            .iter()
+            .filter(|m| !self.maps_unavailable.iter().any(|(u, _)| u == *m))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Everything one (wave, set) produced.
+pub struct SetOutcome {
+    /// `{"<item id>": [answers]}`, the gold scorer's run file (scored items
+    /// only).
+    pub run: Value,
+    /// The gold scorer's report (`Null` when nothing was scored).
+    pub report: Value,
+    pub row: TrendRow,
+    /// Per attempted item: the raw traversal JSON, or the error text.
+    pub raw: Vec<(String, Value)>,
+}
+
+/// Items that were not scored, by cause. Nothing is dropped without a count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Skips {
+    pub timeout: usize,
+    pub cli_error: usize,
+    pub no_answer_type: usize,
+    pub map_unavailable: usize,
+}
+
+impl Skips {
+    pub fn total(&self) -> usize {
+        self.timeout + self.cli_error + self.no_answer_type + self.map_unavailable
+    }
+
+    /// `timeout=2; cli_error=1` (only the causes that occurred), or `none`.
+    pub fn describe(&self) -> String {
+        let parts: Vec<String> = [
+            ("timeout", self.timeout),
+            ("cli_error", self.cli_error),
+            ("no_answer_type", self.no_answer_type),
+            ("map_unavailable", self.map_unavailable),
+        ]
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(cause, n)| format!("{cause}={n}"))
+        .collect();
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+#[derive(Default)]
+struct Sums {
+    pops: u64,
+    hops: u64,
+    cross: u64,
+    stops: u64,
+    answer_chars_tokens: u64,
+    engine_ms: Vec<f64>,
+    wall_ms: Vec<f64>,
+    answered: usize,
+    no_seeds: usize,
+    precision: f64,
+    f05: f64,
+}
+
+/// Nearest-rank percentile of an unsorted sample.
+pub fn percentile(sample: &[f64], p: f64) -> Option<f64> {
+    if sample.is_empty() {
+        return None;
+    }
+    let mut sorted = sample.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    Some(sorted[rank - 1])
+}
+
+fn ms_pair(sample: &[f64], under_load: bool) -> String {
+    match (percentile(sample, 0.5), percentile(sample, 0.95)) {
+        (Some(a), Some(b)) => format!(
+            "{a:.0}/{b:.0}{}",
+            if under_load { " (under load)" } else { "" }
+        ),
+        _ => "-".into(),
+    }
+}
+
+/// The metrics a row shows for each set.
+fn headline(set: Set) -> &'static [&'static str] {
+    match set {
+        Set::Impact => &["decl_recall", "decl_f1", "decl_ndcg@10", "file_f1"],
+        Set::Flow => &["path_recall", "tau", "spurious"],
+        Set::WhereTo => &["reg_hit@3", "reg_mrr", "set_f1"],
+        Set::History => &["mrr", "hit@3", "hit@10"],
+        Set::Instructions => &["i1_section_f1", "i2_hit@3_primary", "i2_required_recall@5"],
+    }
+}
+
+fn metrics_cell(set: Set, report: &Value) -> String {
+    let overall = &report["overall"];
+    headline(set)
+        .iter()
+        .filter(|name| overall["metrics"].get(**name).is_some())
+        .map(|name| {
+            let value = match overall["metrics"][*name].as_f64() {
+                Some(v) => format!("{v:.3}"),
+                None => "n/a".into(),
+            };
+            match overall["n_defined"][*name].as_u64() {
+                Some(k) => format!("{name}={value} ({k})"),
+                None => format!("{name}={value}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The row with the cells every outcome has; the rest stay `-`.
+fn base_cells(config: &RunConfig, set: Set, n_gold: usize) -> [String; NCOLS] {
+    let mut cells: [String; NCOLS] = std::array::from_fn(|_| "-".to_string());
+    cells[0] = config.wave.clone();
+    cells[1] = set_name(set).to_string();
+    cells[2] = n_gold.to_string();
+    cells[17] = config.maps.join(",");
+    cells[18] = if config.maps_unavailable.is_empty() {
+        "none".into()
+    } else {
+        config
+            .maps_unavailable
+            .iter()
+            .map(|(map, reason)| {
+                let reason: String = reason
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(60)
+                    .collect();
+                format!("{map} ({reason})")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    cells[19] = config.policy_label.clone();
+    cells[20] = config.note.clone();
+    cells
+}
+
+/// A row for a set none of the items of which could be attempted.
+fn skipped_outcome(
+    config: &RunConfig,
+    set: Set,
+    n_gold: usize,
+    skips: Skips,
+    why: &str,
+) -> SetOutcome {
+    let mut cells = base_cells(config, set, n_gold);
+    cells[3] = "0".into();
+    cells[4] = "0".into();
+    cells[5] = skips.describe();
+    cells[7] = why.to_string();
+    SetOutcome {
+        run: Value::Object(Map::new()),
+        report: Value::Null,
+        row: TrendRow { cells },
+        raw: Vec::new(),
+    }
+}
+
+pub fn bench_set(
+    set: Set,
+    items: &[Value],
+    traverser: &dyn Traverser,
+    tree: &TreeIndex,
+    config: &RunConfig,
+) -> Result<SetOutcome> {
+    let n_gold = items.len();
+    if !can_answer(set, &config.maps) {
+        let skips = Skips {
+            no_answer_type: n_gold,
+            ..Skips::default()
+        };
+        return Ok(skipped_outcome(config, set, n_gold, skips, NO_MAP));
+    }
+    if !can_answer(set, &config.available_maps()) {
+        let skips = Skips {
+            map_unavailable: n_gold,
+            ..Skips::default()
+        };
+        return Ok(skipped_outcome(
+            config,
+            set,
+            n_gold,
+            skips,
+            "map unavailable: no usable map can answer this set",
+        ));
+    }
+
+    let mut run = Map::new();
+    let mut raw = Vec::new();
+    let mut sums = Sums::default();
+    let mut skips = Skips::default();
+    let mut scored: Vec<(Vec<Value>, &Value)> = Vec::new();
+    let started = Instant::now();
+    for (index, item) in items.iter().enumerate() {
+        let id = item["id"].as_str().context("gold item without an id")?;
+        let question = item["question"].as_str().unwrap_or_default();
+        match traverser.traverse(question) {
+            Ok((traversed, raw_json)) => {
+                raw.push((id.to_string(), raw_json));
+                let mut nodes: Vec<ResultNode> = Vec::new();
+                if config.include_seeds {
+                    nodes.extend(traversed.seeds.iter().map(|s| ResultNode {
+                        id: s.clone(),
+                        text: s.clone(),
+                    }));
+                }
+                nodes.extend(traversed.results.iter().cloned());
+                let answers = adapt(set, item, &nodes, tree);
+                if traversed.status == "no_seeds" {
+                    sums.no_seeds += 1;
+                }
+                if !answers.is_empty() {
+                    sums.answered += 1;
+                }
+                let chars: usize = nodes.iter().map(|n| n.text.chars().count()).sum();
+                sums.answer_chars_tokens += chars.div_ceil(4) as u64;
+                sums.wall_ms.push(traversed.wall_ms);
+                if let Some(t) = &traversed.totals {
+                    sums.pops += t.pops;
+                    sums.hops += t.hops;
+                    sums.cross += t.cross_map_hops;
+                    sums.stops += t.stops;
+                    sums.engine_ms.push(t.elapsed_ms);
+                }
+                run.insert(id.to_string(), Value::Array(answers.clone()));
+                scored.push((answers, item));
+            }
+            Err(error) => {
+                match error {
+                    TraverseError::Timeout(_) => skips.timeout += 1,
+                    TraverseError::Cli(_) => skips.cli_error += 1,
+                }
+                raw.push((id.to_string(), json!({ "skipped": error.to_string() })));
+            }
+        }
+        let done = index + 1;
+        if config.progress && (done % PROGRESS_EVERY == 0 || done == n_gold) {
+            eprintln!(
+                "{}: {done}/{n_gold} done, skipped {}, elapsed {:.0}s, ETA {:.0}s",
+                set_name(set),
+                skips.describe(),
+                started.elapsed().as_secs_f64(),
+                started.elapsed().as_secs_f64() / done as f64 * (n_gold - done) as f64,
+            );
+        }
+    }
+
+    for (answers, item) in &scored {
+        let metrics = item_metrics(set, item, answers)?;
+        let (p, r) = item_precision_recall(set, item, answers, &metrics);
+        sums.precision += p;
+        sums.f05 += f_beta(p, r, 0.5);
+    }
+    let n_scored = scored.len();
+    let scored_items: Vec<Value> = scored.iter().map(|(_, item)| (*item).clone()).collect();
+    let run_value = Value::Object(run);
+    let report = if n_scored == 0 {
+        Value::Null
+    } else {
+        let parsed_run = gold::parse_run(&run_value.to_string())?;
+        gold::score_set(set, &scored_items, &parsed_run, false, false)?
+    };
+
+    let mut cells = base_cells(config, set, n_gold);
+    cells[3] = n_gold.to_string();
+    cells[4] = n_scored.to_string();
+    cells[5] = skips.describe();
+    if n_scored == 0 {
+        cells[7] = "none scored".into();
+    } else {
+        let n = n_scored as f64;
+        cells[6] = format!("{}/{n_scored}", sums.answered);
+        cells[7] = format!("{} (over {n_scored})", metrics_cell(set, &report));
+        cells[8] = format!("{:.3}", sums.precision / n);
+        cells[9] = format!("{:.3}", sums.f05 / n);
+        cells[10] = sums.pops.to_string();
+        cells[11] = sums.hops.to_string();
+        cells[12] = sums.cross.to_string();
+        cells[13] = sums.stops.to_string();
+        cells[14] = sums.answer_chars_tokens.to_string();
+        cells[15] = ms_pair(&sums.engine_ms, config.under_load);
+        cells[16] = ms_pair(&sums.wall_ms, config.under_load);
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if !config.note.is_empty() {
+        notes.push(config.note.clone());
+    }
+    if sums.no_seeds > 0 {
+        notes.push(format!("{} scored items found no seeds", sums.no_seeds));
+    }
+    if skips.total() > 0 {
+        notes.push("skipped items are not in any metric; reasons in raw/".into());
+    }
+    if config.include_seeds {
+        notes.push("seeds included in answers".into());
+    }
+    if config.under_load {
+        notes.push("latency measured under load: not comparable with a clean run".into());
+    }
+    notes.push("ans tok = chars/4".into());
+    cells[20] = notes.join("; ");
+    Ok(SetOutcome {
+        run: run_value,
+        report,
+        row: TrendRow { cells },
+        raw,
+    })
+}
+
+/// Writes `run.json`, `score.json`, `row.md` and `raw/<id>.json` under `dir`.
+pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
+    let raw_dir = dir.join("raw");
+    std::fs::create_dir_all(&raw_dir).with_context(|| format!("create {}", raw_dir.display()))?;
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).map(|s| s + "\n");
+    std::fs::write(dir.join("run.json"), pretty(&outcome.run)?)?;
+    if !outcome.report.is_null() {
+        std::fs::write(dir.join("score.json"), pretty(&outcome.report)?)?;
+    }
+    std::fs::write(dir.join("row.md"), outcome.row.to_markdown() + "\n")?;
+    for (id, value) in &outcome.raw {
+        std::fs::write(raw_dir.join(format!("{}.json", slug(id))), pretty(value)?)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> TreeIndex {
+        TreeIndex::from_paths([
+            "src/app/search.rs",
+            "src/app/mod.rs",
+            "src/lib.rs",
+            "lci-core/src/chunk.rs",
+            "README.md",
+        ])
+    }
+
+    fn node(id: &str) -> ResultNode {
+        ResultNode {
+            id: id.to_string(),
+            text: format!("{id} | graph.scip/compiler | p1.00 d1"),
+        }
+    }
+
+    const SEARCH_FN: &str = "sym:rust:app::search::rerank_document/fn";
+    const METHOD: &str = "sym:rust:lci-core::chunk::impl Chunker for Splitter::split/method";
+    const INLINE_FN: &str = "sym:rust:app::search::inner::helper/fn";
+    const TYPE: &str = "sym:rust:app::search::Hit/struct";
+    const COMMIT: &str = "commit:0123456789abcdef0123456789abcdef01234567";
+    const DOC: &str = "doc:AGENTS.md#hard-rules";
+
+    #[test]
+    fn tree_resolves_module_paths_by_longest_prefix() {
+        let t = tree();
+        let module = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            t.file_of(&module(&["app", "search"])),
+            Some("src/app/search.rs")
+        );
+        assert_eq!(
+            t.file_of(&module(&["app", "search", "inner"])),
+            Some("src/app/search.rs")
+        );
+        assert_eq!(t.file_of(&module(&["app"])), Some("src/app/mod.rs"));
+        assert_eq!(
+            t.file_of(&module(&["lci-core", "chunk"])),
+            Some("lci-core/src/chunk.rs")
+        );
+        // The crate root has the empty module path, so an unknown module falls back to it.
+        assert_eq!(t.file_of(&module(&["nope"])), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn owners_come_from_impl_and_trait_headers() {
+        assert_eq!(
+            owner_of_container("impl Map for LexicalMap").as_deref(),
+            Some("LexicalMap")
+        );
+        assert_eq!(
+            owner_of_container("impl LexicalMap").as_deref(),
+            Some("LexicalMap")
+        );
+        assert_eq!(owner_of_container("trait Map").as_deref(), Some("Map"));
+        assert_eq!(
+            owner_of_container("impl<T: Clone> Source for Wrapper<T> where T: Send").as_deref(),
+            Some("Wrapper")
+        );
+        assert_eq!(
+            owner_of_container("impl crate::a::Thing").as_deref(),
+            Some("Thing")
+        );
+    }
+
+    #[test]
+    fn symbols_become_declarations_with_path_and_owner_name() {
+        let t = tree();
+        let d = decl_of(SEARCH_FN, &t).unwrap();
+        assert_eq!(d.path.as_deref(), Some("src/app/search.rs"));
+        assert_eq!(d.name, "search::rerank_document");
+        let m = decl_of(METHOD, &t).unwrap();
+        assert_eq!(m.path.as_deref(), Some("lci-core/src/chunk.rs"));
+        assert_eq!(m.name, "Splitter::split");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert!(decl_of(COMMIT, &t).is_none());
+    }
+
+    #[test]
+    fn impact_adapter_offers_declarations_and_dedups() {
+        let t = tree();
+        let nodes = [
+            node(SEARCH_FN),
+            node(METHOD),
+            node(TYPE),
+            node(SEARCH_FN),
+            node(COMMIT),
+        ];
+        let answers = adapt_impact(&nodes, &t);
+        assert_eq!(
+            answers,
+            vec![
+                json!({"path": "src/app/search.rs", "name": "search::rerank_document"}),
+                json!({"path": "lci-core/src/chunk.rs", "name": "Splitter::split"}),
+                json!({"path": "src/app/search.rs", "name": "search::Hit"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_adapter_keeps_functions_and_methods_only() {
+        let t = tree();
+        let answers = adapt_flow(
+            &[node(SEARCH_FN), node(TYPE), node(METHOD), node(INLINE_FN)],
+            &t,
+        );
+        let names: Vec<&str> = answers
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "search::rerank_document",
+                "Splitter::split",
+                "inner::helper"
+            ]
+        );
+    }
+
+    #[test]
+    fn where_to_adapter_follows_the_item_form() {
+        let t = tree();
+        let nodes = [node(SEARCH_FN), node(INLINE_FN), node(METHOD), node(TYPE)];
+        let registration = json!({"gold": {"form": "registration"}});
+        assert_eq!(
+            adapt_where_to(&registration, &nodes, &t),
+            vec![
+                json!({"path": "src/app/search.rs"}),
+                json!({"path": "lci-core/src/chunk.rs"})
+            ]
+        );
+        let convention = json!({"gold": {"form": "convention"}});
+        assert_eq!(adapt_where_to(&convention, &nodes, &t).len(), 2);
+        let exemplar = json!({"gold": {"form": "exemplar", "granularity": "member"}});
+        let by_name = adapt_where_to(&exemplar, &nodes, &t);
+        assert_eq!(by_name.len(), 3);
+        assert_eq!(by_name[0]["name"], "search::rerank_document");
+        let file_level = json!({"gold": {"form": "exemplar", "granularity": "file"}});
+        assert_eq!(adapt_where_to(&file_level, &nodes, &t).len(), 2);
+    }
+
+    #[test]
+    fn history_and_instruction_adapters_read_their_node_kinds() {
+        assert_eq!(
+            adapt_history(&[node(SEARCH_FN), node(COMMIT), node(COMMIT)]),
+            vec![json!({"commit": "0123456789abcdef0123456789abcdef01234567"})]
+        );
+        assert!(adapt_history(&[node(SEARCH_FN)]).is_empty());
+        assert_eq!(
+            adapt_instructions(&[node(DOC), node(SEARCH_FN)]),
+            vec![json!({"path": "AGENTS.md"})]
+        );
+        assert!(adapt_instructions(&[node(SEARCH_FN)]).is_empty());
+    }
+
+    #[test]
+    fn precision_and_f_half() {
+        // p = 0.5, r = 1.0: F0.5 = 1.25 * 0.5 / (0.125 + 1.0)
+        assert!((f_beta(0.5, 1.0, 0.5) - 0.625 / 1.125).abs() < 1e-12);
+        assert!((f_beta(1.0, 0.5, 0.5) - 0.625 / 0.75).abs() < 1e-12);
+        assert_eq!(f_beta(0.0, 0.0, 0.5), 0.0);
+        assert_eq!(f_beta(0.0, 1.0, 0.5), 0.0);
+        assert!((f_beta(1.0, 1.0, 0.5) - 1.0).abs() < 1e-12);
+        // Precision weighs more than recall.
+        assert!(f_beta(0.9, 0.3, 0.5) > f_beta(0.3, 0.9, 0.5));
+    }
+
+    #[test]
+    fn registration_precision_skips_neutral_files() {
+        let item = json!({
+            "gold": {"form": "registration", "expected_files": ["a.rs", "b.rs"]},
+            "accept": {"preferred": [{"path": "t.rs"}], "related_sites": [{"files": ["r.rs"]}]}
+        });
+        let answers = [
+            json!({"path": "a.rs"}),
+            json!({"path": "t.rs"}),
+            json!({"path": "x.rs"}),
+            json!({"path": "r.rs"}),
+        ];
+        let (p, r) = registration_precision_recall(&item, &answers);
+        assert!((p - 0.5).abs() < 1e-12 && (r - 0.5).abs() < 1e-12);
+        assert_eq!(registration_precision_recall(&item, &[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn history_precision_counts_accepted_commits() {
+        let item = json!({"gold": {"commit": "0123456789abcdef"}, "accept": {}});
+        let hit = json!({"commit": "0123456789abcdef0123456789abcdef01234567"});
+        let miss = json!({"commit": "ffffffffffffffffffffffffffffffffffffffff"});
+        assert_eq!(
+            history_precision_recall(&item, &[hit.clone(), miss]),
+            (0.5, 1.0)
+        );
+        assert_eq!(history_precision_recall(&item, &[hit]), (1.0, 1.0));
+        assert_eq!(history_precision_recall(&item, &[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let sample = [10.0, 40.0, 20.0, 30.0];
+        assert_eq!(percentile(&sample, 0.5), Some(20.0));
+        assert_eq!(percentile(&sample, 0.95), Some(40.0));
+        assert_eq!(percentile(&[], 0.5), None);
+        assert_eq!(percentile(&[7.0], 0.95), Some(7.0));
+    }
+
+    #[test]
+    fn capabilities_follow_the_maps() {
+        let scip: Vec<String> = DEFAULT_MAPS.iter().map(|s| s.to_string()).collect();
+        assert!(can_answer(Set::Impact, &scip));
+        assert!(can_answer(Set::WhereTo, &scip));
+        assert!(!can_answer(Set::History, &scip));
+        assert!(!can_answer(Set::Instructions, &scip));
+        // A map this runner does not know is run and judged by its results.
+        assert!(can_answer(Set::History, &["git.log".to_string()]));
+    }
+
+    // ---- synthetic end-to-end run: tiny gold, fixture traversals, temp trend.
+
+    /// Answers by question; a missing question is a CLI error, `"timeout"`
+    /// as the value is a timeout. Maps in `down` fail the preflight. `calls`
+    /// counts traversal calls (not preflights).
+    struct Fixture {
+        answers: BTreeMap<String, Value>,
+        down: Vec<String>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Fixture {
+        fn new(answers: BTreeMap<String, Value>) -> Fixture {
+            Fixture {
+                answers,
+                down: Vec::new(),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Traverser for Fixture {
+        fn traverse(&self, question: &str) -> Result<(Traversed, Value), TraverseError> {
+            self.calls.set(self.calls.get() + 1);
+            match self.answers.get(question) {
+                Some(v) if v == "timeout" => Err(TraverseError::Timeout(60)),
+                Some(raw) => Ok((Traversed::from_json(raw, 12.0), raw.clone())),
+                None => Err(TraverseError::Cli("no fixture".into())),
+            }
+        }
+
+        fn preflight(&self, map: &str) -> Result<(), TraverseError> {
+            if self.down.iter().any(|d| d == map) {
+                Err(TraverseError::Cli(format!("{map} is down")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn traversal(seeds: &[&str], results: &[&str], pops: u64) -> Value {
+        json!({
+            "mode": "traverse", "status": "complete", "seeds": seeds,
+            "results": results.iter().map(|id| json!({
+                "node": id, "text": format!("{id} | graph.scip/compiler | p1.00 d1"),
+                "via": "graph.scip", "witness": "compiler", "potential": 1.0, "depth": 1,
+            })).collect::<Vec<_>>(),
+            "totals": {"pops": pops, "hops": 2, "cross_map_hops": 1, "stops": 1,
+                       "tokens": 9, "steers": 0, "elapsed_ms": 3.5},
+        })
+    }
+
+    fn impact_item(id: &str, question: &str, path: &str, name: &str) -> Value {
+        json!({
+            "id": id, "question": question, "primary": true,
+            "stratum": "sym-fn/x/covered", "accept": {},
+            "seed": {"path": "seed.rs", "name": "seed", "line": 1, "span": [1, 2], "symbol": "s"},
+            "gold": {"r1": {"decls": [{"path": path, "name": name, "line": 10,
+                                       "span": [10, 20], "symbol": "g"}],
+                            "files": [path]}},
+        })
+    }
+
+    fn config(maps: &[&str]) -> RunConfig {
+        RunConfig {
+            wave: "test-wave".into(),
+            maps: maps.iter().map(|s| s.to_string()).collect(),
+            maps_unavailable: Vec::new(),
+            policy_label: "default".into(),
+            under_load: false,
+            include_seeds: false,
+            note: String::new(),
+            progress: false,
+        }
+    }
+
+    fn counts(cells: &[String]) -> (&str, &str, &str) {
+        (cells[2].as_str(), cells[3].as_str(), cells[4].as_str())
+    }
+
+    #[test]
+    fn three_item_run_scores_and_appends_a_trend_row() {
+        let t = tree();
+        let items = vec![
+            impact_item(
+                "i1",
+                "q one",
+                "src/app/search.rs",
+                "search::rerank_document",
+            ),
+            impact_item("i2", "q two", "lci-core/src/chunk.rs", "Splitter::split"),
+            impact_item("i3", "q three", "src/lib.rs", "nothing"),
+        ];
+        let mut answers = BTreeMap::new();
+        // i1: the one gold declaration plus one wrong one; i2: exactly right;
+        // i3: no seeds (a scored empty answer, not a skip).
+        answers.insert("q one".into(), traversal(&["x"], &[SEARCH_FN, TYPE], 6));
+        answers.insert("q two".into(), traversal(&["x"], &[METHOD], 4));
+        answers.insert(
+            "q three".into(),
+            json!({"mode": "traverse", "status": "no_seeds", "results": [], "seeds": []}),
+        );
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(answers),
+            &t,
+            &config(&["graph.scip", "seeds.scip_names"]),
+        )
+        .unwrap();
+
+        // Run file: the gold scorer's format.
+        assert_eq!(outcome.run["i1"].as_array().unwrap().len(), 2);
+        assert_eq!(outcome.run["i3"], json!([]));
+        // The in-process scorer saw all three items.
+        assert_eq!(outcome.report["scored_items"], 3);
+        assert_eq!(outcome.report["items_missing_from_run"], 0);
+        // decl_recall: 1, 1, 0 -> 2/3.
+        let recall = outcome.report["overall"]["metrics"]["decl_recall"]
+            .as_f64()
+            .unwrap();
+        assert!((recall - 0.6667).abs() < 1e-4, "{recall}");
+
+        let cells = &outcome.row.cells;
+        assert_eq!(counts(cells), ("3", "3", "3"));
+        assert_eq!(cells[5], "none");
+        assert_eq!(cells[6], "2/3");
+        // Precision: 0.5, 1.0, 0 -> 0.5. F0.5: 1.25*.5*1/(.125+1)=0.5556, 1.0, 0.
+        assert_eq!(cells[8], "0.500");
+        assert_eq!(cells[9], format!("{:.3}", (0.625 / 1.125 + 1.0) / 3.0));
+        // Totals are sums over the items that had a traversal.
+        assert_eq!((cells[10].as_str(), cells[11].as_str()), ("10", "4"));
+        assert_eq!((cells[12].as_str(), cells[13].as_str()), ("2", "2"));
+        assert_eq!(cells[15], "4/4");
+        assert!(cells[20].contains("1 scored items found no seeds"));
+        assert!(cells[7].contains("decl_recall=0.667") && cells[7].contains("(over 3)"));
+        assert_eq!(cells[18], "none");
+
+        let dir = std::env::temp_dir().join(format!("xtask-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let trend_path = dir.join("trend.md");
+        trend::append(&trend_path, &outcome.row).unwrap();
+        write_outputs(&dir.join("out"), &outcome).unwrap();
+        let text = std::fs::read_to_string(&trend_path).unwrap();
+        assert!(text.contains("| test-wave | impact | 3 | 3 | 3 | none | 2/3 |"));
+        assert!(dir.join("out/run.json").exists() && dir.join("out/score.json").exists());
+        assert!(dir.join("out/raw/i1.json").exists());
+        // Re-running the same wave and set is refused.
+        assert!(trend::append(&trend_path, &outcome.row).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skipped_items_are_counted_by_cause_and_stay_out_of_the_metrics() {
+        let items = vec![
+            impact_item("i1", "q ok", "src/app/search.rs", "search::rerank_document"),
+            impact_item("i2", "q slow", "a.rs", "a"),
+            impact_item("i3", "q broken", "b.rs", "b"),
+            impact_item("i4", "q ok2", "lci-core/src/chunk.rs", "Splitter::split"),
+        ];
+        let mut answers = BTreeMap::new();
+        answers.insert("q ok".into(), traversal(&["x"], &[SEARCH_FN], 5));
+        answers.insert("q slow".into(), json!("timeout"));
+        answers.insert("q ok2".into(), traversal(&["x"], &[METHOD], 5));
+        let mut progress_config = config(&["graph.scip"]);
+        progress_config.progress = true; // only prints to stderr
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(answers),
+            &tree(),
+            &progress_config,
+        )
+        .unwrap();
+        let cells = &outcome.row.cells;
+        assert_eq!(counts(cells), ("4", "4", "2"));
+        assert_eq!(cells[5], "timeout=1; cli_error=1");
+        // Both scored items are perfect; the skipped ones do not pull the means down.
+        assert!(cells[7].contains("decl_recall=1.000") && cells[7].contains("(over 2)"));
+        assert_eq!(cells[8], "1.000");
+        assert_eq!(cells[10], "10");
+        assert_eq!(outcome.run.as_object().unwrap().len(), 2);
+        assert_eq!(outcome.report["scored_items"], 2);
+        // The reasons are kept in the raw output.
+        let raw: BTreeMap<_, _> = outcome.raw.iter().cloned().collect();
+        assert!(raw["i2"]["skipped"].as_str().unwrap().contains("timeout"));
+        assert!(raw["i3"]["skipped"].as_str().unwrap().contains("cli error"));
+        assert!(cells[20].contains("skipped items are not in any metric"));
+    }
+
+    #[test]
+    fn when_every_call_fails_the_row_says_nothing_was_scored() {
+        let items = vec![impact_item("i1", "missing", "a.rs", "a")];
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(BTreeMap::new()),
+            &tree(),
+            &config(&["graph.scip"]),
+        )
+        .unwrap();
+        let cells = &outcome.row.cells;
+        assert_eq!(counts(cells), ("1", "1", "0"));
+        assert_eq!(cells[5], "cli_error=1");
+        assert_eq!(cells[7], "none scored");
+        assert_eq!(cells[8], "-");
+        assert!(outcome.report.is_null());
+    }
+
+    #[test]
+    fn a_set_no_map_can_answer_gets_the_no_map_row() {
+        let items = vec![json!({"id": "h1", "question": "q", "gold": {"commit": "abc"}}); 2];
+        let fixture = Fixture::new(BTreeMap::new());
+        let outcome = bench_set(
+            Set::History,
+            &items,
+            &fixture,
+            &tree(),
+            &config(&["graph.scip"]),
+        )
+        .unwrap();
+        let cells = &outcome.row.cells;
+        assert_eq!(counts(cells), ("2", "0", "0"));
+        assert_eq!(cells[5], "no_answer_type=2");
+        assert_eq!(cells[7], NO_MAP);
+        assert_eq!(cells[8], "-");
+        assert_eq!(fixture.calls.get(), 0);
+        assert!(outcome.report.is_null());
+    }
+
+    #[test]
+    fn preflight_marks_a_failing_map_once_and_it_is_not_used() {
+        let mut fixture = Fixture::new(BTreeMap::new());
+        fixture.down = vec!["graph.scip".into()];
+        let maps: Vec<String> = DEFAULT_MAPS.iter().map(|s| s.to_string()).collect();
+        let unavailable = preflight_maps(&fixture, &maps);
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].0, "graph.scip");
+        assert!(unavailable[0].1.contains("is down"));
+
+        // The seeds map still emits symbols, so the run goes ahead with it
+        // and the row names the map that was not used.
+        let mut cfg = config(&["seeds.scip_names", "graph.scip"]);
+        cfg.maps_unavailable = unavailable;
+        assert_eq!(cfg.available_maps(), ["seeds.scip_names"]);
+        let mut answers = BTreeMap::new();
+        answers.insert("q".into(), traversal(&["x"], &[SEARCH_FN], 1));
+        let fixture = Fixture::new(answers);
+        let items = vec![impact_item(
+            "i1",
+            "q",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let outcome = bench_set(Set::Impact, &items, &fixture, &tree(), &cfg).unwrap();
+        assert!(
+            outcome.row.cells[18].starts_with("graph.scip (cli error: graph.scip is down"),
+            "{}",
+            outcome.row.cells[18]
+        );
+        assert_eq!(outcome.row.cells[4], "1");
+
+        // With every map down no traversal is attempted: all items are skipped
+        // with the cause map_unavailable.
+        cfg.maps_unavailable = cfg
+            .maps
+            .iter()
+            .map(|m| (m.clone(), "down".into()))
+            .collect();
+        let outcome = bench_set(Set::Impact, &items, &fixture, &tree(), &cfg).unwrap();
+        assert_eq!(fixture.calls.get(), 1);
+        assert_eq!(outcome.row.cells[3], "0");
+        assert_eq!(outcome.row.cells[5], "map_unavailable=1");
+        assert!(outcome.row.cells[7].contains("map unavailable"));
+    }
+
+    #[test]
+    fn skips_describe_only_the_causes_that_occurred() {
+        assert_eq!(Skips::default().describe(), "none");
+        let skips = Skips {
+            timeout: 2,
+            map_unavailable: 1,
+            ..Skips::default()
+        };
+        assert_eq!(skips.describe(), "timeout=2; map_unavailable=1");
+        assert_eq!(skips.total(), 3);
+    }
+
+    #[test]
+    fn under_load_puts_a_reminder_in_the_row() {
+        let mut answers = BTreeMap::new();
+        answers.insert("q".into(), traversal(&["x"], &[SEARCH_FN], 1));
+        let mut cfg = config(&["graph.scip"]);
+        cfg.under_load = true;
+        let items = vec![impact_item(
+            "i1",
+            "q",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let outcome =
+            bench_set(Set::Impact, &items, &Fixture::new(answers), &tree(), &cfg).unwrap();
+        assert!(outcome.row.cells[15].ends_with("(under load)"));
+        assert!(outcome.row.cells[20].contains("under load"));
+    }
+
+    #[test]
+    fn limit_and_population_select_items() {
+        let items = vec![
+            json!({"id": "a", "primary": false}),
+            json!({"id": "b", "primary": true}),
+            json!({"id": "c", "primary": true}),
+        ];
+        let ids = |v: Vec<Value>| {
+            v.iter()
+                .map(|i| i["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(select_items(Set::Impact, items.clone(), None)),
+            ["b", "c"]
+        );
+        assert_eq!(
+            ids(select_items(Set::Impact, items.clone(), Some(1))),
+            ["b"]
+        );
+        assert_eq!(ids(select_items(Set::Flow, items, Some(2))), ["a", "b"]);
+    }
+}
