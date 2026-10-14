@@ -1353,7 +1353,8 @@ fn response_json(
         .enumerate()
         .filter(|(_, state)| state.parent.is_some() && !result.cleared.contains(&state.node))
         .collect();
-    results.sort_by(|a, b| b.1.potential.total_cmp(&a.1.potential).then(a.0.cmp(&b.0)));
+    let rank = |state: &lci_maps::traverse::State| result.ranked_potential(state);
+    results.sort_by(|a, b| rank(b.1).total_cmp(&rank(a.1)).then(a.0.cmp(&b.0)));
     let results: Vec<Value> = results
         .into_iter()
         .take(call.top_k)
@@ -1364,6 +1365,7 @@ fn response_json(
                 witness: state.witness,
                 potential: state.potential,
                 depth: state.depth,
+                maps: state.maps.iter().copied().collect(),
             })
         })
         .collect();

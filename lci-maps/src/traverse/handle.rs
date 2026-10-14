@@ -135,6 +135,8 @@ impl Snapshot {
                 "witness": s.witness.map(WitnessClass::as_str),
                 "potential": s.potential,
                 "fanout": s.fanout,
+                "maps": s.maps,
+                "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "frontier": self.frontier.iter()
                 .map(|&(state, priority, seq)| json!([state, priority, seq]))
@@ -188,6 +190,15 @@ impl Snapshot {
                     },
                     potential: f64_of(get(s, "potential")?)?,
                     fanout: u32_of(get(s, "fanout")?)?,
+                    // Handles kept before corroboration existed have neither.
+                    maps: strings(s.get("maps"))?
+                        .iter()
+                        .map(|m| intern(m))
+                        .collect::<Result<_, _>>()?,
+                    witnesses: strings(s.get("witnesses"))?
+                        .iter()
+                        .map(|w| witness_of(w))
+                        .collect::<Result<_, _>>()?,
                 })
             })
             .collect::<Result<Vec<State>, String>>()?;
@@ -428,6 +439,19 @@ fn node_id(v: &Value) -> Result<NodeId, String> {
         .map_err(|e| format!("bad node id {v}: {e}"))
 }
 
+/// An optional array of strings; absent is empty.
+fn strings(value: Option<&Value>) -> Result<Vec<&str>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(v) => v
+            .as_array()
+            .ok_or("expected an array of strings")?
+            .iter()
+            .map(|item| item.as_str().ok_or("expected a string".to_string()))
+            .collect(),
+    }
+}
+
 fn witness_of(name: &str) -> Result<WitnessClass, String> {
     WITNESSES
         .into_iter()
@@ -550,6 +574,7 @@ impl Run<'_> {
             },
             "scorer": self.t.scorer.label(),
             "scorer_changed": scorer_changed,
+            "rank": {"corroboration_boost": self.t.boost},
             "stops": stops_json(&self.t.stops),
         }));
     }

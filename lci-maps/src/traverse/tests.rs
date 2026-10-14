@@ -1858,6 +1858,7 @@ mod steering {
             witness: Some(WitnessClass::Compiler),
             potential: 0.5,
             depth: 2,
+            maps: vec!["scip"],
         };
         assert_eq!(card.text(), "file:src/a.rs | scip/compiler | p0.50 d2");
         let long = Card {
@@ -2619,3 +2620,5 @@ mod start_plan {
 mod pre_merged;
 
 mod contains;
+
+mod corroboration;

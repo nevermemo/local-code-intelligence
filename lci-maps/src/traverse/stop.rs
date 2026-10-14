@@ -190,6 +190,9 @@ pub struct Card {
     /// The path potential.
     pub potential: f64,
     pub depth: u32,
+    /// The maps whose edges reached the node, sorted (seed maps are not
+    /// counted; see `State::maps`). `n_maps` is its length.
+    pub maps: Vec<MapId>,
 }
 
 impl Card {

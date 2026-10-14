@@ -3,10 +3,28 @@
 //! through an [`EdgeSource`].
 //!
 //! A state's priority is the product of the hop values along its path (the
-//! `walk.rs` rule); ties pop in discovery order. A node becomes a state once:
-//! the first edge that reaches it decides its path. Hop values come from
+//! `walk.rs` rule); ties pop in discovery order. A node becomes a state once
+//! and is expanded at most once, so a cycle cannot loop. Hop values come from
 //! [`frontier::hop`]; the rules scorer prices cross-map hops through the map
 //! card.
+//!
+//! Later arrivals at a node that has a state are not dropped:
+//!
+//! - A node that is queued (not yet popped) and reached by a route with a
+//!   higher potential is relaxed: its potential, parent, `via`, witness,
+//!   depth and fan-out become those of the stronger route, its queue priority
+//!   is scaled by the same ratio (a handler's boost stays), and a `relax`
+//!   event is traced. A queued node is only relaxed to a depth below
+//!   `max_depth`; a node that was never queued for its depth is queued when
+//!   a route brings it below `max_depth`.
+//! - A node already popped keeps its state; the route is traced as an
+//!   `alt_path` event. An ancestor of the expanding node (a cycle) is neither.
+//! - Corroboration: a [`State`] keeps the set of maps (and witness classes)
+//!   whose edges reached it. An arrival from a map not in the set adds it. The
+//!   maps that found the seeds ([`Seed::map`]) are start points, not evidence,
+//!   and are never in the set: only maps that offered an edge count. Results
+//!   rank by [`State::ranked_potential`]: the potential times
+//!   `1 + boost * (n_maps - 1)` ([`DEFAULT_CORROBORATION_BOOST`]).
 //!
 //! Budget (all checked, none exceeded): `pops` before every pop, `deadline`
 //! before every pop and inside every map call, `est_tokens` and
@@ -77,6 +95,9 @@ use stop::{
 pub const TOKENS_PER_EDGE: u64 = 12;
 /// The most frontier items a checkpoint carries.
 pub const CHECKPOINT_FRONTIER: usize = 256;
+/// The default share added to a node's rank for each map beyond the first
+/// that reached it (see [`State::ranked_potential`]).
+pub const DEFAULT_CORROBORATION_BOOST: f64 = 0.1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TraversalBudget {
@@ -137,6 +158,25 @@ pub struct State {
     pub potential: f64,
     /// Edges the discovering expansion offered.
     pub fanout: u32,
+    /// The maps whose edges reached the node, by any route. A seed's own map
+    /// (`Seed::map`) is not here.
+    pub maps: BTreeSet<MapId>,
+    /// The witness classes of those edges.
+    pub witnesses: BTreeSet<WitnessClass>,
+}
+
+impl State {
+    /// How many independent maps reached the node.
+    pub fn n_maps(&self) -> usize {
+        self.maps.len()
+    }
+
+    /// `potential * (1 + boost * (n_maps - 1))`: the value results are ranked
+    /// by. A node no map reached counts as one map.
+    pub fn ranked_potential(&self, boost: f64) -> f64 {
+        let extra = self.maps.len().saturating_sub(1) as f64;
+        self.potential * (1.0 + boost * extra)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -172,9 +212,16 @@ pub struct TraversalResult {
     /// What the caller (the outer agent) is shown when the call ends with
     /// work left: set exactly when `snapshot` is, with the handle in it.
     pub checkpoint: Option<Checkpoint>,
+    /// The corroboration boost the run ranked with.
+    pub corroboration_boost: f64,
 }
 
 impl TraversalResult {
+    /// The rank of a state of this result (see [`State::ranked_potential`]).
+    pub fn ranked_potential(&self, state: &State) -> f64 {
+        state.ranked_potential(self.corroboration_boost)
+    }
+
     pub fn reached(&self, node: &NodeId) -> bool {
         self.states.iter().any(|s| s.node == *node)
     }
@@ -202,6 +249,7 @@ pub struct Traversal<'s> {
     resume: Option<handle::Snapshot>,
     steer: Option<Steer>,
     plan: Option<trace::StartPlan>,
+    boost: f64,
 }
 
 impl<'s> Traversal<'s> {
@@ -220,7 +268,21 @@ impl<'s> Traversal<'s> {
             resume: None,
             steer: None,
             plan: None,
+            boost: DEFAULT_CORROBORATION_BOOST,
         }
+    }
+
+    /// The rank share added per corroborating map (default
+    /// [`DEFAULT_CORROBORATION_BOOST`]); 0 ranks by potential alone. Not kept
+    /// in a handle: a resumed traversal passes it again. A negative or
+    /// non-finite value is 0.
+    pub fn corroboration_boost(mut self, boost: f64) -> Self {
+        self.boost = if boost.is_finite() {
+            boost.max(0.0)
+        } else {
+            0.0
+        };
+        self
     }
 
     /// What the caller knows of the run that the engine does not (maps with
@@ -300,6 +362,9 @@ struct Run<'s> {
     pause: Option<(Pause, StopReason)>,
     /// The hash of the checkpoint the previous call returned.
     returned: Option<String>,
+    /// `(state reached, state that offered the edge)` pairs already traced as
+    /// `alt_path`, so a retried expansion does not repeat them.
+    alts: HashSet<(usize, usize)>,
 }
 
 impl<'s> Run<'s> {
@@ -325,6 +390,7 @@ impl<'s> Run<'s> {
             tally: Tally::default(),
             pause: None,
             returned: None,
+            alts: HashSet::new(),
         }
     }
 
@@ -381,6 +447,8 @@ impl<'s> Run<'s> {
             witness: None,
             potential: 1.0,
             fanout,
+            maps: BTreeSet::new(),
+            witnesses: BTreeSet::new(),
         });
         self.state_of.insert(seed.node.clone(), index);
         if self.t.budget.max_depth > 0 {
@@ -405,6 +473,7 @@ impl<'s> Run<'s> {
                 },
                 "scorer": self.t.scorer.label(),
                 "stops": stops_json(&self.t.stops),
+                "rank": {"corroboration_boost": self.t.boost},
             });
             if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
                 for (key, value) in plan.fields(stops_json(&self.t.stops)) {
@@ -517,6 +586,7 @@ impl<'s> Run<'s> {
             cleared: self.cleared,
             totals: self.totals,
             events: self.events,
+            corroboration_boost: self.t.boost,
         }
     }
 
@@ -588,15 +658,43 @@ impl<'s> Run<'s> {
             }
         }
         self.note_disagreements(&node, &offered);
-        let fresh: Vec<FusedEdge> = offered
-            .into_iter()
-            .filter(|e| !self.state_of.contains_key(&e.best.dst))
-            .collect();
+        // Edges to a node that has a state are arrivals, not discoveries; an
+        // edge back to the expanding node or its own path is a cycle and is
+        // neither.
+        let mut path = HashSet::new();
+        let mut at = Some(index);
+        while let Some(i) = at {
+            path.insert(i);
+            at = self.states[i].parent;
+        }
         let affordable = ((self.tokens_left() - call_tokens) / TOKENS_PER_EDGE) as usize;
-        let truncated = fresh.len() > affordable;
-        let kept: Vec<FusedEdge> = fresh.into_iter().take(affordable).collect();
+        let n_fresh = offered
+            .iter()
+            .filter(|e| !self.state_of.contains_key(&e.best.dst))
+            .count();
+        let truncated = n_fresh > affordable;
+        // The edges to price, in offer order: the fresh ones the tokens
+        // afford (`None`) and the arrivals (the state reached).
+        let mut kept: Vec<FusedEdge> = Vec::new();
+        let mut target: Vec<Option<usize>> = Vec::new();
+        let mut fresh_taken = 0;
+        for edge in offered {
+            match self.state_of.get(&edge.best.dst).copied() {
+                Some(state) if path.contains(&state) => {}
+                Some(state) => {
+                    kept.push(edge);
+                    target.push(Some(state));
+                }
+                None if fresh_taken < affordable => {
+                    fresh_taken += 1;
+                    kept.push(edge);
+                    target.push(None);
+                }
+                None => {}
+            }
+        }
 
-        self.totals.tokens += call_tokens + kept.len() as u64 * TOKENS_PER_EDGE;
+        self.totals.tokens += call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE;
         self.totals.external_calls = self.totals.external_calls.saturating_add(call_external);
         for call in &calls {
             *self.totals.per_map.entry(call.map).or_default() += 1;
@@ -605,10 +703,10 @@ impl<'s> Run<'s> {
             stat.failures += u32::from(call.failure.is_some());
             stat.tokens += call.cost.est_tokens;
         }
-        for edge in &kept {
+        for (edge, _) in kept.iter().zip(&target).filter(|(_, t)| t.is_none()) {
             self.tally.maps.entry(edge.best.map).or_default().edges += 1;
         }
-        let spent = call_tokens + kept.len() as u64 * TOKENS_PER_EDGE;
+        let spent = call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE;
         let cost = self
             .tally
             .kind_cost
@@ -616,13 +714,13 @@ impl<'s> Run<'s> {
             .or_default();
         cost.0 += 1;
         cost.1 += spent;
-        if !kept.is_empty() {
+        if fresh_taken > 0 {
             self.tally.last_fresh_pop = self.totals.pops;
         }
         self.events.push(json!({
             "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
-            "n_edges": kept.len(), "calls": call_report,
-            "tokens": call_tokens + kept.len() as u64 * TOKENS_PER_EDGE,
+            "n_edges": fresh_taken, "calls": call_report,
+            "tokens": call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE,
         }));
 
         let cards: Vec<MapCard> = kept.iter().map(|e| self.card(e.best.map)).collect();
@@ -648,8 +746,12 @@ impl<'s> Run<'s> {
             let map = edge.best.map;
             let value = value * self.weights.get(map).copied().unwrap_or(1.0);
             let potential = parent.potential * value;
-            let child = self.states.len();
             let cross = parent.via.is_some_and(|via| via != map);
+            if let Some(reached) = target[i] {
+                self.arrive(index, &parent, reached, edge, potential, fanout, cross);
+                continue;
+            }
+            let child = self.states.len();
             self.states.push(State {
                 node: dst.clone(),
                 parent: Some(index),
@@ -658,6 +760,8 @@ impl<'s> Run<'s> {
                 witness: Some(edge.best.witness),
                 potential,
                 fanout,
+                maps: edge.maps.iter().copied().collect(),
+                witnesses: edge.witnesses.iter().copied().collect(),
             });
             self.state_of.insert(dst.clone(), child);
             self.totals.hops += 1;
@@ -676,6 +780,85 @@ impl<'s> Run<'s> {
         let timed_out =
             calls.iter().any(|c| c.failure.is_some()) && Instant::now() >= self.t.budget.deadline;
         (truncated || timed_out).then_some(true)
+    }
+
+    /// A route from the expanding state `from` (`parent`) to a node that
+    /// already has a state (`reached`), at `potential`. The maps and witness
+    /// classes of the edge join the node's corroboration. A node that is not
+    /// popped and is reached at a higher potential is relaxed onto the new
+    /// route; any other route is traced as an `alt_path`. The node is never
+    /// expanded again.
+    #[allow(clippy::too_many_arguments)]
+    fn arrive(
+        &mut self,
+        from: usize,
+        parent: &State,
+        reached: usize,
+        edge: &FusedEdge,
+        potential: f64,
+        fanout: u32,
+        cross: bool,
+    ) {
+        let depth = parent.depth + 1;
+        let max_depth = self.t.budget.max_depth;
+        let popped = self.expanded.contains(&reached);
+        let queued = self.frontier.contains(reached);
+        let old_src = self.states[reached]
+            .parent
+            .map(|p| self.states[p].node.to_string());
+        let state = &mut self.states[reached];
+        let new_maps: Vec<MapId> = edge
+            .maps
+            .iter()
+            .copied()
+            .filter(|map| state.maps.insert(*map))
+            .collect();
+        state.witnesses.extend(edge.witnesses.iter().copied());
+
+        let old = state.potential;
+        let old_depth = state.depth;
+        // A queued node must stay below the depth limit.
+        let stronger = !popped && potential > old && (!queued || depth < max_depth);
+        let dst = state.node.to_string();
+        if !stronger {
+            if self.alts.insert((reached, from)) {
+                self.events.push(json!({
+                    "ev": "alt_path", "src": parent.node.to_string(), "dst": dst,
+                    "kind": edge.best.kind.as_str(), "map": edge.best.map,
+                    "maps": edge.maps, "witness": edge.best.witness.as_str(),
+                    "potential": potential, "state_potential": old,
+                    "popped": popped, "new_maps": new_maps,
+                }));
+            }
+            return;
+        }
+        state.parent = Some(from);
+        state.depth = depth;
+        state.via = Some(edge.best.map);
+        state.witness = Some(edge.best.witness);
+        state.potential = potential;
+        state.fanout = fanout;
+        self.events.push(json!({
+            "ev": "relax", "src": parent.node.to_string(), "dst": dst,
+            "kind": edge.best.kind.as_str(), "map": edge.best.map,
+            "maps": edge.maps, "witness": edge.best.witness.as_str(),
+            "old_potential": old, "potential": potential, "old_src": old_src,
+            "depth": depth, "cross_map": cross, "new_maps": new_maps,
+        }));
+        if queued {
+            match self.frontier.priority_of(reached) {
+                // A handler's boost or reorder stays: scale by the ratio.
+                Some(priority) if priority != old && old > 0.0 => {
+                    self.frontier.scale(reached, potential / old);
+                }
+                _ => {
+                    self.frontier.set_priority(reached, potential);
+                }
+            }
+        } else if !popped && old_depth >= max_depth && depth < max_depth {
+            // It was too deep to queue; the new route is not.
+            self.frontier.push(reached, potential);
+        }
     }
 
     /// Takes the latest expansion's edges off `in_seen`: its pop is put back
@@ -755,6 +938,7 @@ impl<'s> Run<'s> {
             witness: s.witness,
             potential: s.potential,
             depth: s.depth,
+            maps: s.maps.iter().copied().collect(),
         }
     }
 
@@ -780,13 +964,10 @@ impl<'s> Run<'s> {
             })
             .collect();
 
-        // Best potential first; discovery order breaks ties.
-        let best_first = |a: &usize, b: &usize| {
-            self.states[*b]
-                .potential
-                .total_cmp(&self.states[*a].potential)
-                .then(a.cmp(b))
-        };
+        // Best rank first (potential, boosted by corroboration); discovery
+        // order breaks ties.
+        let rank = |s: &usize| self.states[*s].ranked_potential(self.t.boost);
+        let best_first = |a: &usize, b: &usize| rank(b).total_cmp(&rank(a)).then(a.cmp(b));
         let mut visited: Vec<usize> = self.expanded.iter().copied().collect();
         visited.sort_by(best_first);
         let visited_cards = visited

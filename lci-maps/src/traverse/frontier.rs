@@ -10,7 +10,9 @@
 //! offered edges is followed whole, each at its kind's [`kind_prior`] (1 for a
 //! call, 0.5 for a containment hop, so structure does not tie with the call
 //! graph); above the gate a [`HopScorer`] orders them, the best `beam` are
-//! kept, and the edge at rank `r` gets `1 / (1 + r)`. The rules scorer sees the edge's witness class, kind, the
+//! kept, and the edge at rank `r` gets `1 / (1 + r)` times its kind's
+//! [`kind_prior`], so a rank-0 containment edge is worth 0.5 above the gate as
+//! it is below it. An unscored arm follows every edge at 1. The rules scorer sees the edge's witness class, kind, the
 //! fused confidence, the in-degree seen so far, the query overlap and the map
 //! card's cost, so a hop into another map is priced like any other.
 
@@ -135,6 +137,14 @@ impl Frontier {
             }
             None => false,
         }
+    }
+
+    /// The priority of a queued state.
+    pub fn priority_of(&self, state: usize) -> Option<f64> {
+        self.items
+            .iter()
+            .find(|item| item.state == state)
+            .map(|item| item.priority)
     }
 
     pub fn scale(&mut self, state: usize, factor: f64) -> bool {
@@ -321,7 +331,9 @@ impl HopScorer for BfsScorer {
     }
 }
 
-/// One step: `(index into cands, hop value)` for the edges to follow.
+/// One step: `(index into cands, hop value)` for the edges to follow. The
+/// value is the kind prior at or below the gate and `kind_prior / (1 + rank)`
+/// above it; the unscored arm gives every edge 1.
 pub fn hop(
     scorer: &mut dyn HopScorer,
     ctx: &ScoreCtx,
@@ -345,6 +357,6 @@ pub fn hop(
         .into_iter()
         .take(price.beam)
         .enumerate()
-        .map(|(rank, i)| (i, 1.0 / (1.0 + rank as f64)))
+        .map(|(rank, i)| (i, kind_prior(cands[i].edge.best.kind) / (1.0 + rank as f64)))
         .collect()
 }
