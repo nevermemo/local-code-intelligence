@@ -22,6 +22,14 @@
 //! text of the indexed tree; without it those functions keep their wide
 //! range and the build report counts them.
 
+use crate::{
+    Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
+    MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
+    edge::{
+        CONF_MAX, Edge as TypedEdge, Site, WitnessClass, cap_edges, conf_from_unit, sort_edges,
+    },
+};
+use lci_core::node::{NodeId, NodeKind, SymbolKey, SymbolKind, rust_module_path};
 use protobuf::Message;
 use std::{
     collections::{HashMap, HashSet},
@@ -697,6 +705,208 @@ fn describe(symbol: &str) -> (String, FnKind) {
     (name, kind)
 }
 
+// ------------------------------------------------------------- as a map
+
+/// One graph edge with the node ids of its ends, for the typed [`TypedEdge`].
+pub struct ScipEdgeRef<'a> {
+    pub src: &'a NodeId,
+    pub dst: &'a NodeId,
+    pub edge: &'a Edge,
+}
+
+impl From<GraphEdgeKind> for EdgeKind {
+    fn from(kind: GraphEdgeKind) -> Self {
+        match kind {
+            GraphEdgeKind::CallsOrRefs => Self::CallsOrRefs,
+            GraphEdgeKind::Contains => Self::Contains,
+        }
+    }
+}
+
+/// A SCIP edge is compiler-grade evidence ([`WitnessClass::Compiler`]), with
+/// the first site as its site. The site's `blob` is the file path (the graph
+/// holds no blob ids); `conf` is the graph's 1.0 or 0.5 in whole percent.
+impl From<ScipEdgeRef<'_>> for TypedEdge {
+    fn from(r: ScipEdgeRef<'_>) -> Self {
+        Self {
+            src: r.src.clone(),
+            dst: r.dst.clone(),
+            kind: r.edge.kind.into(),
+            map: SCIP_MAP_ID,
+            witness: WitnessClass::Compiler,
+            conf: conf_from_unit(r.edge.conf),
+            site: Some(Site {
+                blob: r.edge.witness.file.clone(),
+                line: r.edge.witness.line,
+                col: r.edge.witness.col,
+            }),
+            cost: Cost::default(),
+        }
+    }
+}
+
+/// The id of [`ScipMap`].
+pub const SCIP_MAP_ID: MapId = "graph.scip";
+
+/// A best-effort [`NodeId`] per graph node: Rust, the module path of the
+/// file, no container (the graph does not keep the impl header), the last
+/// segment of the display name, kind from [`FnKind`]. Two nodes with the
+/// same key get distinct disambiguators in graph order. A caller with the
+/// real declarations should pass its own ids to [`ScipMap::new`].
+pub fn default_node_ids(graph: &ScipGraph) -> Vec<NodeId> {
+    let mut seen: HashMap<SymbolKey, u16> = HashMap::new();
+    graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut key = SymbolKey {
+                language: "rust".into(),
+                module_path: rust_module_path(&node.file),
+                container: Vec::new(),
+                name: node.name.rsplit("::").next().unwrap_or(&node.name).into(),
+                kind: match node.kind {
+                    FnKind::Function => SymbolKind::Function,
+                    FnKind::Method => SymbolKind::Method,
+                },
+                disambiguator: 0,
+            };
+            let count = seen.entry(key.clone()).or_insert(0);
+            key.disambiguator = *count;
+            *count += 1;
+            NodeId::Symbol(key)
+        })
+        .collect()
+}
+
+/// The graph as a [`Map`]: `expand` returns the node's out-edges with
+/// witness [`WitnessClass::Compiler`]; `query` answers a seeded request with
+/// the best edge to each neighbour. No text.
+pub struct ScipMap {
+    graph: ScipGraph,
+    ids: Vec<NodeId>,
+    index: HashMap<NodeId, usize>,
+    descriptor: MapDescriptor,
+}
+
+impl ScipMap {
+    /// `ids[i]` is the id of `graph.nodes[i]`; they must be one per node and
+    /// distinct.
+    pub fn new(graph: ScipGraph, ids: Vec<NodeId>) -> Result<Self, String> {
+        if ids.len() != graph.nodes.len() {
+            return Err(format!(
+                "{} ids for {} graph nodes",
+                ids.len(),
+                graph.nodes.len()
+            ));
+        }
+        let index: HashMap<NodeId, usize> = ids.iter().cloned().zip(0..).collect();
+        if index.len() != ids.len() {
+            return Err("node ids are not distinct".into());
+        }
+        Ok(Self {
+            graph,
+            ids,
+            index,
+            descriptor: MapDescriptor {
+                id: SCIP_MAP_ID,
+                version: 1,
+                contribution: Contribution::Expansion,
+                accepts_text: false,
+                accepts: vec![NodeKind::Symbol],
+                emits: vec![NodeKind::Symbol],
+                freshness: FreshnessModel::PerFile,
+                source_labels: vec![SourceLabel::Scip],
+                needs: Vec::new(),
+            },
+        })
+    }
+
+    pub fn with_default_ids(graph: ScipGraph) -> Self {
+        let ids = default_node_ids(&graph);
+        Self::new(graph, ids).expect("default ids are distinct")
+    }
+
+    pub fn graph(&self) -> &ScipGraph {
+        &self.graph
+    }
+
+    pub fn node_id(&self, node: usize) -> &NodeId {
+        &self.ids[node]
+    }
+
+    /// The out-edges of graph node `from`, unsorted.
+    fn typed_edges(&self, from: usize) -> Vec<TypedEdge> {
+        let cost = Cost {
+            nodes_touched: self.graph.out[from].len() as u64,
+            ..Cost::default()
+        };
+        self.graph.out[from]
+            .iter()
+            .map(|edge| {
+                let mut typed = TypedEdge::from(ScipEdgeRef {
+                    src: &self.ids[from],
+                    dst: &self.ids[edge.to],
+                    edge,
+                });
+                typed.cost = cost;
+                typed
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Map for ScipMap {
+    fn describe(&self) -> &MapDescriptor {
+        &self.descriptor
+    }
+
+    async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        let mut edges = Vec::new();
+        for (seed, _) in request.seeds {
+            if let Some(&from) = self.index.get(seed) {
+                edges.extend(self.typed_edges(from));
+            }
+        }
+        sort_edges(&mut edges);
+        let mut seen = HashSet::new();
+        edges.retain(|edge| seen.insert(edge.dst.clone()));
+        edges.truncate(request.limit);
+        let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
+        response.cost.nodes_touched = edges.len() as u64;
+        response.hits = edges
+            .into_iter()
+            .zip(1..)
+            .map(|(edge, rank)| MapHit {
+                node: edge.dst,
+                rank,
+                score: Some(f32::from(edge.conf) / f32::from(CONF_MAX)),
+                evidence: vec![Evidence {
+                    via: Some(edge.src),
+                    edge: edge.kind,
+                    label: SourceLabel::Scip,
+                    detail: None,
+                }],
+            })
+            .collect();
+        response
+    }
+
+    async fn expand(
+        &self,
+        node: &NodeId,
+        _budget: Budget,
+        _view: &SnapshotView<'_>,
+    ) -> Vec<TypedEdge> {
+        let Some(&from) = self.index.get(node) else {
+            return Vec::new();
+        };
+        let mut edges = self.typed_edges(from);
+        cap_edges(&mut edges, EXPAND_LIMIT);
+        edges
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,5 +1057,126 @@ mod tests {
             (decl.0.as_str(), decl.1),
             ("LspAdapter::enabled", FnKind::Method)
         );
+    }
+
+    fn demo_map() -> ScipMap {
+        ScipMap::with_default_ids(ScipGraph::build(&demo_documents(), None))
+    }
+
+    fn empty_view() -> SnapshotView<'static> {
+        SnapshotView::new(crate::SnapshotRef::default(), Vec::new())
+    }
+
+    fn test_budget() -> Budget {
+        Budget {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            max_external_calls: u32::MAX,
+            max_nodes_touched: u64::MAX,
+        }
+    }
+
+    /// The demo of slice S1: the typed edges of one symbol. Run with
+    /// `cargo test -p lci-maps demo_prints -- --nocapture`.
+    #[tokio::test]
+    async fn expand_returns_the_graph_edges_with_compiler_witness() {
+        use crate::Map as _;
+        let map = demo_map();
+        let beta = map.graph().node_index(&sym("a/beta().")).unwrap();
+        let node = map.node_id(beta).clone();
+        let view = empty_view();
+
+        let edges =
+            crate::kit_c3::check_expand(&map, &node, std::time::Duration::from_secs(5), &view)
+                .await
+                .expect("C7");
+        for edge in &edges {
+            println!(
+                "{} -[{} {} conf {}]-> {}  at {:?}",
+                edge.src,
+                edge.kind.as_str(),
+                edge.witness.as_str(),
+                edge.conf,
+                edge.dst,
+                edge.site
+            );
+        }
+
+        // One typed edge per graph edge, same ends and kinds, all Compiler.
+        let mut want: Vec<_> = map.graph().out[beta]
+            .iter()
+            .map(|e| (map.node_id(e.to).clone(), EdgeKind::from(e.kind)))
+            .collect();
+        let mut got: Vec<_> = edges.iter().map(|e| (e.dst.clone(), e.kind)).collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.witness == WitnessClass::Compiler));
+        assert!(edges.iter().all(|e| e.map == SCIP_MAP_ID && e.conf == 100));
+        let call = edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::CallsOrRefs)
+            .unwrap();
+        assert_eq!(
+            call.site,
+            Some(Site {
+                blob: "a.rs".into(),
+                line: 1,
+                col: 12
+            })
+        );
+        // An unknown node has no edges.
+        let unknown = NodeId::file("nowhere.rs").unwrap();
+        assert!(map.expand(&unknown, test_budget(), &view).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generated_only_edges_are_half_confidence_and_query_agrees_with_expand() {
+        use crate::Map as _;
+        let docs = vec![RawDocument {
+            path: "a.rs".into(),
+            occurrences: vec![
+                occ((0, 3, 0, 4), &sym("a/f()."), 1, Some((0, 0, 3, 1))),
+                occ((5, 3, 5, 4), &sym("a/g()."), 1, Some((5, 0, 6, 1))),
+                occ((1, 4, 1, 5), &sym("a/g()."), 16, None),
+            ],
+        }];
+        let map = ScipMap::with_default_ids(ScipGraph::build(&docs, None));
+        let f = map
+            .node_id(map.graph().node_index(&sym("a/f().")).unwrap())
+            .clone();
+        let view = empty_view();
+        let edges = map.expand(&f, test_budget(), &view).await;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].conf, 50);
+
+        // The seeded query names the same neighbours as `expand`.
+        let seeds = [(f.clone(), 1.0)];
+        let params = serde_json::Value::Null;
+        let response = map
+            .query(
+                &crate::MapRequest {
+                    text: None,
+                    seeds: &seeds,
+                    limit: 10,
+                    budget: test_budget(),
+                    params: &params,
+                    as_of: None,
+                },
+                &view,
+            )
+            .await;
+        let hit_nodes: Vec<_> = response.hits.iter().map(|h| h.node.clone()).collect();
+        let edge_nodes: Vec<_> = edges.iter().map(|e| e.dst.clone()).collect();
+        assert_eq!(hit_nodes, edge_nodes);
+        assert_eq!(response.hits[0].evidence[0].edge, EdgeKind::CallsOrRefs);
+    }
+
+    #[test]
+    fn map_construction_rejects_wrong_or_repeated_ids() {
+        let graph = ScipGraph::build(&demo_documents(), None);
+        assert!(ScipMap::new(graph.clone(), Vec::new()).is_err());
+        let one = NodeId::file("a.rs").unwrap();
+        assert!(ScipMap::new(graph, vec![one; 4]).is_err());
     }
 }

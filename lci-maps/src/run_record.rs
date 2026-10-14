@@ -212,10 +212,7 @@ fn freshness_name(model: FreshnessModel) -> &'static str {
 }
 
 fn edge_name(edge: EdgeKind) -> &'static str {
-    match edge {
-        EdgeKind::QueryMatch => "query_match",
-        EdgeKind::Prior => "prior",
-    }
+    edge.as_str()
 }
 
 pub fn cost_json(cost: &Cost) -> Value {

@@ -10,6 +10,8 @@
 
 use crate::impact::{Chunk, Decl, ImpactIndex, SourceCache, code_names, rg_hits};
 use crate::scip_graph::SourceText;
+use crate::{Cost, EdgeKind};
+use lci_core::node::{ConfigNamespace, NodeId, SymbolKey, SymbolKind, rust_module_path};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -106,6 +108,72 @@ impl Edge {
             (true, false, _) => Class::Scip,
             (false, true, _) => Class::Text,
             _ => Class::TextOnlyL,
+        }
+    }
+}
+
+/// Whole-percent confidence by class: placeholders that keep the class
+/// order (both witnesses > SCIP only > text > TOML text only); not measured.
+const fn class_conf(class: Class) -> u8 {
+    match class {
+        Class::Confirmed => 100,
+        Class::Scip => 80,
+        Class::Text => 35,
+        Class::TextOnlyL => 15,
+    }
+}
+
+/// `reads_key(key -> declaration)` as a typed edge. The source is the TOML
+/// key, the destination a symbol node built from the declaration's SCIP
+/// symbol and path: a function for `().`, a struct for `#`, otherwise a
+/// const (this covers fields, which have no node kind of their own); no
+/// container is known. The witness is [`WitnessClass::Exact`] when the SCIP
+/// closure (W1) holds and [`WitnessClass::Text`] otherwise; the site is the
+/// declaration's name line, with the path as `blob`.
+impl From<&Edge> for crate::edge::Edge {
+    fn from(edge: &Edge) -> Self {
+        use crate::edge::{Site, WitnessClass};
+        let class = edge.class();
+        let kind = if edge.decl.symbol.ends_with("().") {
+            SymbolKind::Function
+        } else if edge.decl.symbol.ends_with('#') {
+            SymbolKind::Struct
+        } else {
+            SymbolKind::Const
+        };
+        Self {
+            src: NodeId::ConfigKey {
+                namespace: ConfigNamespace::Toml,
+                key: edge.key.clone(),
+            },
+            dst: NodeId::Symbol(SymbolKey {
+                language: "rust".into(),
+                module_path: rust_module_path(&edge.decl.path),
+                container: Vec::new(),
+                name: edge
+                    .decl
+                    .name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&edge.decl.name)
+                    .into(),
+                kind,
+                disambiguator: 0,
+            }),
+            kind: EdgeKind::ReadsKey,
+            map: "config.key",
+            witness: if edge.w1 {
+                WitnessClass::Exact
+            } else {
+                WitnessClass::Text
+            },
+            conf: class_conf(class),
+            site: Some(Site {
+                blob: edge.decl.path.clone(),
+                line: edge.decl.line,
+                col: 0,
+            }),
+            cost: Cost::default(),
         }
     }
 }
@@ -1390,5 +1458,66 @@ mod test_module_tests {
         assert!(got.contains("src/evaluate/tests.rs"));
         assert!(got.contains("src/t.rs"));
         assert!(!got.contains("src/evaluate/a.rs"));
+    }
+}
+
+#[cfg(test)]
+mod edge_conversion_tests {
+    use super::*;
+    use crate::edge::{CONF_MAX, WitnessClass};
+
+    fn edge(symbol: &str, w1: bool, w2: bool, l: bool) -> Edge {
+        Edge {
+            key: "index.freshness".into(),
+            decl: Decl {
+                path: "lci-core/src/config.rs".into(),
+                line: 7,
+                name: "IndexConfig::freshness".into(),
+                symbol: symbol.into(),
+            },
+            w1,
+            w2,
+            l,
+            roles: BTreeSet::new(),
+            in_def_file: true,
+            outside_scip: false,
+        }
+    }
+
+    #[test]
+    fn classes_map_to_witness_and_ordered_confidence() {
+        let typed = |w1, w2, l| crate::edge::Edge::from(&edge("x/f().", w1, w2, l));
+        let (confirmed, scip, text, l_only) = (
+            typed(true, true, false),
+            typed(true, false, false),
+            typed(false, true, false),
+            typed(false, false, true),
+        );
+        assert_eq!(confirmed.witness, WitnessClass::Exact);
+        assert_eq!(scip.witness, WitnessClass::Exact);
+        assert_eq!(text.witness, WitnessClass::Text);
+        assert_eq!(l_only.witness, WitnessClass::Text);
+        assert!(confirmed.conf > scip.conf && scip.conf > text.conf && text.conf > l_only.conf);
+        assert!(confirmed.conf <= CONF_MAX);
+        assert_eq!(confirmed.kind, EdgeKind::ReadsKey);
+        assert_eq!(confirmed.src.to_string(), "cfg:toml:index.freshness");
+        let site = confirmed.site.unwrap();
+        assert_eq!(
+            (site.blob.as_str(), site.line),
+            ("lci-core/src/config.rs", 7)
+        );
+    }
+
+    #[test]
+    fn destination_kind_follows_the_scip_suffix() {
+        let kind_of =
+            |symbol: &str| match crate::edge::Edge::from(&edge(symbol, true, true, false)).dst {
+                NodeId::Symbol(key) => (key.kind, key.name),
+                other => panic!("not a symbol: {other}"),
+            };
+        assert_eq!(kind_of("a/f().").0, SymbolKind::Function);
+        assert_eq!(kind_of("a/Config#").0, SymbolKind::Struct);
+        assert_eq!(kind_of("a/Config#freshness.").0, SymbolKind::Const);
+        assert_eq!(kind_of("a/f().").1, "freshness");
     }
 }

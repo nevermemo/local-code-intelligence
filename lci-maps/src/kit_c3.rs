@@ -15,13 +15,14 @@
 //! or a stale map, never a hard error. Every answer names the snapshot it
 //! came from.
 
+use crate::edge::{CONF_MAX, Edge, sort_edges};
 use crate::{
-    Budget, FreshnessModel, Map, MapHit, MapRequest, MapResponse, MapStatus, Observed, SnapshotRef,
-    SnapshotView,
+    Budget, EXPAND_LIMIT, FreshnessModel, Map, MapDescriptor, MapHit, MapRequest, MapResponse,
+    MapStatus, Observed, SnapshotRef, SnapshotView,
     fresh::{IndexFreshness, Prepared, Refreshable, Target, prepare},
     kit::ContractFailure,
 };
-use lci_core::chunk::Chunk;
+use lci_core::{chunk::Chunk, node::NodeId};
 use std::time::{Duration, Instant};
 
 fn broke(detail: impl Into<String>) -> ContractFailure {
@@ -402,6 +403,75 @@ pub async fn check_live_freshness(
         )));
     }
     Ok(())
+}
+
+/// Contract C7, edge invariants, for the answer of [`Map::expand`] on `node`
+/// (also the invariants of any edge list a consumer relies on): every edge
+/// leaves `node`, names the map `descriptor` describes, has a confidence of
+/// at most [`CONF_MAX`], the list is in [`sort_edges`] order and holds at
+/// most `cap` edges.
+pub fn check_edge_invariants(
+    node: &NodeId,
+    descriptor: &MapDescriptor,
+    edges: &[Edge],
+    cap: usize,
+) -> Result<(), ContractFailure> {
+    let fail = |detail: String| {
+        Err(ContractFailure {
+            contract: "C7",
+            detail,
+        })
+    };
+    if edges.len() > cap {
+        return fail(format!(
+            "{} returned {} edges, cap {cap}",
+            descriptor.id,
+            edges.len()
+        ));
+    }
+    for (position, edge) in edges.iter().enumerate() {
+        if edge.src != *node {
+            return fail(format!(
+                "edge {position} leaves {}, expanded {node}",
+                edge.src
+            ));
+        }
+        if edge.map != descriptor.id {
+            return fail(format!(
+                "edge {position} names map {}, expected {}",
+                edge.map, descriptor.id
+            ));
+        }
+        if edge.conf > CONF_MAX {
+            return fail(format!("edge {position} has conf {}", edge.conf));
+        }
+    }
+    let mut sorted = edges.to_vec();
+    sort_edges(&mut sorted);
+    if let Some(position) = sorted.iter().zip(edges).position(|(want, got)| want != got) {
+        return fail(format!(
+            "{} edges are not in confidence-then-node order (first difference at {position})",
+            descriptor.id
+        ));
+    }
+    Ok(())
+}
+
+/// Runs [`Map::expand`] on `node` and checks C7 against [`EXPAND_LIMIT`].
+pub async fn check_expand(
+    map: &dyn Map,
+    node: &NodeId,
+    budget: Duration,
+    view: &SnapshotView<'_>,
+) -> Result<Vec<Edge>, ContractFailure> {
+    let budget = Budget {
+        deadline: Instant::now() + budget,
+        max_external_calls: u32::MAX,
+        max_nodes_touched: u64::MAX,
+    };
+    let edges = map.expand(node, budget, view).await;
+    check_edge_invariants(node, map.describe(), &edges, EXPAND_LIMIT)?;
+    Ok(edges)
 }
 
 #[cfg(test)]

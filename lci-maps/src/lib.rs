@@ -11,6 +11,7 @@
 
 pub mod audit;
 pub mod crates;
+pub mod edge;
 pub mod fresh;
 pub mod impact;
 pub mod kit;
@@ -210,13 +211,51 @@ impl<'a> SnapshotView<'a> {
     }
 }
 
-/// The kind of edge an evidence item follows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The kind of edge an evidence item or an [`edge::Edge`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EdgeKind {
     /// The node matched the query text.
     QueryMatch,
     /// A prior value attached to the node.
     Prior,
+    /// A function or method refers to another.
+    CallsOrRefs,
+    /// A declaration encloses another.
+    Contains,
+    Imports,
+    Implements,
+    Tests,
+    /// A config key is read or set by a declaration.
+    ReadsKey,
+    Mentions,
+    /// A commit touched a file or declaration.
+    Touched,
+    Cochange,
+    /// A compiler error lands at the node.
+    CompileErrorAt,
+    /// Near in embedding space.
+    Near,
+}
+
+impl EdgeKind {
+    /// The stable name used in run files and traces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueryMatch => "query_match",
+            Self::Prior => "prior",
+            Self::CallsOrRefs => "calls_or_refs",
+            Self::Contains => "contains",
+            Self::Imports => "imports",
+            Self::Implements => "implements",
+            Self::Tests => "tests",
+            Self::ReadsKey => "reads_key",
+            Self::Mentions => "mentions",
+            Self::Touched => "touched",
+            Self::Cochange => "cochange",
+            Self::CompileErrorAt => "compile_error_at",
+            Self::Near => "near",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -318,7 +357,39 @@ pub trait Map: Send + Sync {
     /// but the registry does not rely on it: it catches a panic, stops
     /// waiting at the deadline and checks the answer (contract C1).
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse;
+
+    /// The edges leaving `node`, sorted and capped at [`EXPAND_LIMIT`]. The
+    /// default is a seeded query: `node` the only seed, no text, hits turned
+    /// into edges ([`edge::edges_from_response`]). Graph maps override it.
+    async fn expand(
+        &self,
+        node: &NodeId,
+        budget: Budget,
+        view: &SnapshotView<'_>,
+    ) -> Vec<edge::Edge> {
+        let seeds = [(node.clone(), 1.0)];
+        let params = serde_json::Value::Null;
+        let request = MapRequest {
+            text: None,
+            seeds: &seeds,
+            limit: EXPAND_LIMIT,
+            budget,
+            params: &params,
+            as_of: None,
+        };
+        let response = self.query(&request, view).await;
+        edge::edges_from_response(node, self.describe(), &response, EXPAND_LIMIT)
+    }
+
+    /// What this map says about itself to a traversal that prices hops.
+    fn card(&self) -> edge::MapCard {
+        edge::MapCard::from_descriptor(self.describe())
+    }
 }
+
+/// The most edges one [`Map::expand`] returns; also the `limit` of its
+/// default seeded query.
+pub const EXPAND_LIMIT: usize = 256;
 
 /// A map call as the registry recorded it.
 #[derive(Debug, Clone)]
