@@ -266,3 +266,11 @@ One configuration file per arm (L check, S, F, FR); they share `data_dir = "<scr
 and differ only in `[channels]`. Channels never change the index, so no re-index happens between
 arms. Scripts, configurations and raw reports stay in the scratch directory; only the two
 documents of this slice are committed.
+
+## 11. Amendment before the FR pass (2026-10-14)
+
+The FR arm uses a reranker served on a second GPU (loopback), with the same model file (Qwen3-Reranker-4B, Q8_0 GGUF) and
+the same server flags, from a newer llama.cpp build for that GPU. Reason [M]: under the load of the parallel A/B lanes, one
+24-document call to the first reranker service took about 300 s, above the timeout, which would make FR degraded by
+infrastructure rather than by the method. The embedder service is unchanged for every arm. The results record both reranker
+identities (build, backend). This amendment is made before any FR query.
