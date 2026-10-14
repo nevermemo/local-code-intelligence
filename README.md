@@ -296,8 +296,8 @@ repo=$PWD                                    # this repository: the walkthrough 
 "$lci" list-files "$repo"
 "$lci" search "$repo" 'plain REST JSON-over-HTTP mirror of the MCP tools'
 "$lci" symbols "$repo" 'openapi_document#'
-"$lci" definition "$repo" 'src/rest.rs' 264 64
-"$lci" references "$repo" 'src/rest.rs' 160 3 --include-declaration
+"$lci" definition "$repo" 'src/rest.rs' 277 64
+"$lci" references "$repo" 'src/rest.rs' 171 3 --include-declaration
 "$lci" references "$repo" 'lci-core/src/workspace.rs' 17 11 --include-declaration
 "$lci" index "$repo"
 ```
