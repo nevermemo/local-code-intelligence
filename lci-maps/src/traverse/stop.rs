@@ -20,10 +20,10 @@
 //! The score bound is not a trigger either and consults no handler: when a
 //! result limit `k` is given ([`super::Traversal::top_k`]), the walk ends with
 //! the stop reason `bound` (status `complete`, no handle) once at least `k`
-//! results exist and no state still in the frontier can lift a result above
-//! the `k`-th one. The bound is
+//! results exist and neither a state still in the frontier nor a result below
+//! the top `k` can rise above the `k`-th one. The bound is
 //!
-//! `best frontier potential * (1 + boost * (n_maps - 1)) <= ranked potential of the k-th result`
+//! `max(best frontier potential, best potential below the top k) * (1 + boost * (n_maps - 1)) <= ranked potential of the k-th result`
 //!
 //! where `n_maps` is the number of registered maps that expand nodes (the
 //! caller passes it with `k`: [`super::Traversal::top_k`]; seed-only maps are
@@ -31,11 +31,11 @@
 //! kept the evidence of more maps than are registered now raises it to what the
 //! states hold. A hop value is at most 1, so no state found from the
 //! frontier has a potential above the frontier's best; ranks only rise by
-//! corroboration, at most by the factor above. What it does not cover: a
-//! result already found can still gain maps from later arrivals. The stop
-//! ends the discovery of new results (and of better routes to queued nodes),
-//! not the corroboration of old ones; this is the price of stopping early.
-//! The `bound` event of the trace gives the numbers.
+//! corroboration, at most by the factor above. A result below the top `k`
+//! can gain maps from a later arrival, so its potential counts too; the
+//! frontier need not hold it. The bound fixes the top-`k` set, not the order
+//! inside it: a later arrival can still corroborate a result in the top `k`
+//! and reorder them. The `bound` event of the trace gives the numbers.
 //!
 //! The rest of the module is the payload of a stop: [`Card`]s (one line of
 //! about 40 tokens per node), [`MapStat`]s, [`Regions`], [`Disagreement`]s and
