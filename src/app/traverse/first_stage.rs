@@ -28,12 +28,20 @@ use crate::config::TraverseFirstStage;
 use lci_core::node::NodeId;
 use lci_maps::{
     MapId,
-    exact_history::{GitLog, Tally, classify, history_commits},
+    exact_history::{GitLog, Tally, classify, history_commits, run_capture},
     scip_impact::ImpactMap,
     traverse::{Seed, stop::Card, trace},
 };
 use serde_json::{Value, json};
-use std::{cell::Cell, cell::RefCell, collections::HashSet, str::FromStr};
+use std::{
+    cell::Cell,
+    cell::RefCell,
+    collections::HashSet,
+    path::PathBuf,
+    process::Command,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 /// The exact operator over the SCIP impact index.
 pub const EXACT_CLOSURE_ID: MapId = "exact.closure";
@@ -133,10 +141,43 @@ pub fn closure_cards(map: &ImpactMap, in_graph: &dyn Fn(&str) -> bool, question:
     }
 }
 
-/// A [`GitLog`] that counts the calls made through it.
+/// The error [`BudgetedGit`] gives once the first stage's time is spent.
+pub const STAGE_TIME_SPENT: &str = "first-stage time spent";
+
+/// `git log` over a tree under one budget for all the calls: each call may run
+/// as long as the least of `per_call` and the time left until `end`; once `end
+/// has passed, a call is refused ([`STAGE_TIME_SPENT`]) without running git.
+pub struct BudgetedGit {
+    pub git: PathBuf,
+    pub tree: PathBuf,
+    pub per_call: Duration,
+    pub end: Instant,
+}
+
+impl GitLog for BudgetedGit {
+    fn log(&self, args: &[String]) -> Result<Vec<String>, String> {
+        let left = self.end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(STAGE_TIME_SPENT.to_owned());
+        }
+        let mut command = Command::new(&self.git);
+        command.arg("-C").arg(&self.tree).arg("log").args(args);
+        let text = run_capture(command, self.per_call.min(left))?;
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+/// A [`GitLog`] that counts the calls made through it (a call refused for
+/// [`STAGE_TIME_SPENT`] is not a call) and notes the refusals.
 pub struct CountingGit<'a> {
     inner: &'a dyn GitLog,
     calls: Cell<u32>,
+    refused: Cell<u32>,
 }
 
 impl<'a> CountingGit<'a> {
@@ -144,6 +185,7 @@ impl<'a> CountingGit<'a> {
         Self {
             inner,
             calls: Cell::new(0),
+            refused: Cell::new(0),
         }
     }
 
@@ -151,12 +193,22 @@ impl<'a> CountingGit<'a> {
     pub fn calls(&self) -> u32 {
         self.calls.get()
     }
+
+    /// Calls refused because the first stage's time was spent.
+    pub fn refused(&self) -> u32 {
+        self.refused.get()
+    }
 }
 
 impl GitLog for CountingGit<'_> {
     fn log(&self, args: &[String]) -> Result<Vec<String>, String> {
-        self.calls.set(self.calls.get() + 1);
-        self.inner.log(args)
+        let result = self.inner.log(args);
+        if matches!(&result, Err(why) if why == STAGE_TIME_SPENT) {
+            self.refused.set(self.refused.get() + 1);
+        } else {
+            self.calls.set(self.calls.get() + 1);
+        }
+        result
     }
 }
 
@@ -204,8 +256,14 @@ pub fn pickaxe_cards(git: &dyn GitLog, question: &str, k: usize) -> Pickaxe {
         )
     };
     note.push_str(&format!(" (git calls {}", counted.calls()));
-    if let Some(first) = &tally.first_failure {
-        note.push_str(&format!(", failed {}: {first}", tally.failures));
+    let failed = tally.failures.saturating_sub(counted.refused() as usize);
+    if let (true, Some(first)) = (failed > 0, &tally.first_failure) {
+        note.push_str(&format!(", failed {failed}: {first}"));
+    }
+    if counted.refused() > 0 {
+        note.push_str(
+            ", stopped: the first stage's time ran out, the commits found so far are kept",
+        );
     }
     note.push(')');
     Pickaxe {
@@ -649,12 +707,40 @@ mod tests {
             failed.note
         );
 
+        // Out of time: the refused calls are not git calls, and the note says so.
+        let late = Fake(
+            vec![Ok(Vec::new()), Err(STAGE_TIME_SPENT.into())],
+            Cell::new(0),
+        );
+        let stopped = pickaxe_cards(&late, "Which commit first created `Foo`?", 10);
+        assert_eq!(stopped.git_calls, 1);
+        assert!(stopped.cards.is_empty());
+        assert!(
+            stopped
+                .note
+                .contains("stopped: the first stage's time ran out")
+                && !stopped.note.contains("failed"),
+            "{}",
+            stopped.note
+        );
+
         let nothing = pickaxe_cards(&Fake(Vec::new(), Cell::new(0)), "?", 10);
         assert_eq!(nothing.git_calls, 0);
         assert_eq!(
             nothing.note,
             "exact.pickaxe: class H3, no commits (git calls 0)"
         );
+    }
+
+    #[test]
+    fn a_budgeted_git_refuses_a_call_once_its_time_has_passed() {
+        let git = BudgetedGit {
+            git: PathBuf::from("git"),
+            tree: PathBuf::from("."),
+            per_call: Duration::from_secs(20),
+            end: Instant::now(),
+        };
+        assert_eq!(git.log(&[]), Err(STAGE_TIME_SPENT.to_owned()));
     }
 
     #[test]

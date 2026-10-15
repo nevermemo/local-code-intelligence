@@ -42,8 +42,8 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use first_stage::{
-    EXACT_CLOSURE_ID, EXACT_PICKAXE_ID, ExactCard, FirstStage, closure_cards, merge, origin_counts,
-    pickaxe_cards, seed_cards,
+    BudgetedGit, EXACT_CLOSURE_ID, EXACT_PICKAXE_ID, ExactCard, FirstStage, closure_cards, merge,
+    origin_counts, pickaxe_cards, seed_cards,
 };
 use lci_core::{
     config::TraverseRerankScores,
@@ -55,7 +55,6 @@ use lci_maps::{
     MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
-    exact_history::RealGit,
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     impact::{Decl, ImpactIndex},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
@@ -1544,6 +1543,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let exact_wanted = wants(EXACT_CLOSURE_ID) || wants(EXACT_PICKAXE_ID);
     let mut stage = FirstStage::off();
     let mut exact_report: Vec<Value> = Vec::new();
+    let mut stage_time = Duration::ZERO;
     if snapshot.is_some() {
         if exact_wanted || limits.first_stage != TraverseFirstStage::Off || limits.exact_seeds {
             notes.push(
@@ -1579,16 +1579,19 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                     0 => PICKAXE_UNCAPPED,
                     k => k as usize,
                 };
-                let found = tokio::task::spawn_blocking(move || {
-                    let git = RealGit {
-                        git: PathBuf::from("git"),
-                        tree,
-                        timeout: EXACT_GIT_TIMEOUT,
-                    };
-                    pickaxe_cards(&git, &question, k)
-                })
-                .await
-                .context("run exact.pickaxe")?;
+                // The git calls share what is left of the call's deadline
+                // (the walk's deadline is not extended by them, see below).
+                let git = BudgetedGit {
+                    git: PathBuf::from("git"),
+                    tree,
+                    per_call: EXACT_GIT_TIMEOUT,
+                    end: budget.deadline,
+                };
+                let started = Instant::now();
+                let found = tokio::task::spawn_blocking(move || pickaxe_cards(&git, &question, k))
+                    .await
+                    .context("run exact.pickaxe")?;
+                stage_time += started.elapsed();
                 notes.push(found.note);
                 exact_report.push(json!({
                     "map": id,
@@ -1663,7 +1666,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             search_maps.1 = Some(map);
         }
     }
-    budget.deadline += setup.elapsed() + early;
+    // Setup does not run the walk's deadline, but the first stage's git calls
+    // do: they were bounded by the deadline and count against it.
+    budget.deadline += setup.elapsed().saturating_sub(stage_time) + early;
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
@@ -2119,7 +2124,14 @@ fn add_first_stage_only(
     };
     if stage.active() {
         let results = merge(stage.mode, &stage.cards, &[], stage.first_k, top_k);
-        object.insert("first_stage".into(), origin_counts(&results));
+        // The counts sit under `totals`, as on a response with a walk.
+        object.insert(
+            "totals".into(),
+            json!({
+                "first_stage": origin_counts(&results),
+                "physical_external_calls": stage.git_calls,
+            }),
+        );
         object.insert("results".into(), json!(results));
     }
     if !exact_report.is_empty() {
@@ -3981,6 +3993,312 @@ mod tests {
             "{next}"
         );
         assert!(next["totals"].get("first_stage").is_none(), "{next}");
+    }
+
+    // ---- the exact operators answering (slice BR4b) -----------------------
+
+    /// The source of the tree the exact operators are asked about.
+    const EXACT_SOURCE: &str = "struct Foo;\nfn alpha() { let _ = Foo; }\nfn beta() { Foo; Foo; }\nstruct Holder { f: Foo }\n";
+
+    /// A tree with `a.rs` (see [`EXACT_SOURCE`]) and a SCIP index over it:
+    /// `alpha` holds one reference to `Foo`, `beta` two, `Holder` (a type, so
+    /// not a node of the SCIP graph) one.
+    struct ScipTree {
+        dir: tempfile::TempDir,
+        index: PathBuf,
+    }
+
+    impl ScipTree {
+        #[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+        fn new() -> Self {
+            use scip::types::symbol_information::Kind;
+            use scip::types::{Document, Index, Occurrence, SymbolInformation};
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.rs"), EXACT_SOURCE).unwrap();
+            let sym = |path: &str| format!("rust-analyzer cargo demo 0.1.0 {path}");
+            let occurrence = |range: &[i32], symbol: &str, roles: i32, enclosing: &[i32]| {
+                let mut o = Occurrence::default();
+                o.range = range.to_vec();
+                o.symbol = sym(symbol);
+                o.symbol_roles = roles;
+                o.enclosing_range = enclosing.to_vec();
+                o
+            };
+            let info = |symbol: &str, kind: Kind| {
+                let mut i = SymbolInformation::default();
+                i.symbol = sym(symbol);
+                i.kind = kind.into();
+                i
+            };
+            let mut document = Document::default();
+            document.relative_path = "a.rs".to_owned();
+            document.occurrences = vec![
+                occurrence(&[0, 7, 10], "a/Foo#", 1, &[0, 0, 0, 11]),
+                occurrence(&[1, 3, 8], "a/alpha().", 1, &[1, 0, 1, 27]),
+                occurrence(&[1, 21, 24], "a/Foo#", 0, &[]),
+                occurrence(&[2, 3, 7], "a/beta().", 1, &[2, 0, 2, 23]),
+                occurrence(&[2, 12, 15], "a/Foo#", 0, &[]),
+                occurrence(&[2, 17, 20], "a/Foo#", 0, &[]),
+                occurrence(&[3, 7, 13], "a/Holder#", 1, &[3, 0, 3, 24]),
+                occurrence(&[3, 19, 22], "a/Foo#", 0, &[]),
+            ];
+            document.symbols = vec![
+                info("a/Foo#", Kind::Struct),
+                info("a/alpha().", Kind::Function),
+                info("a/beta().", Kind::Function),
+                info("a/Holder#", Kind::Struct),
+            ];
+            let mut message = Index::default();
+            message.documents = vec![document];
+            let index = dir.path().join("index.scip");
+            scip::write_message_to_file(&index, message).unwrap();
+            Self { dir, index }
+        }
+
+        /// `a.rs` in a git repository of one commit.
+        fn commit(&self) {
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(self.dir.path())
+                    .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                    .args(["-c", "commit.gpgsign=false"])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            git(&["init", "-q"]);
+            git(&["add", "a.rs"]);
+            git(&["commit", "-q", "-m", "add Foo"]);
+        }
+
+        async fn run(
+            &self,
+            limits: &TraverseConfig,
+            maps: &[&str],
+            seeds: &[String],
+            deadline_ms: Option<u64>,
+        ) -> Value {
+            let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+            let (budget, steer) = (
+                BudgetArgs {
+                    pops: Some(3),
+                    deadline_ms,
+                    ..BudgetArgs::default()
+                },
+                SteerArgs::default(),
+            );
+            let call = Call {
+                scip_index: &self.index,
+                scip_root: Some(self.dir.path()),
+                question: if maps.iter().any(|id| id == EXACT_PICKAXE_ID) {
+                    "Which commit first created `Foo`?"
+                } else {
+                    "What breaks if `Foo` changes?"
+                },
+                seeds,
+                seed_search: None,
+                top_k: 8,
+                maps: Some(&maps),
+                budget: &budget,
+                steer: &steer,
+                handle: None,
+                lsp: None,
+            };
+            run(limits, &Dirs::under(self.dir.path()), &call)
+                .await
+                .unwrap()
+                .response
+        }
+    }
+
+    fn stage_limits(exact_seeds: bool, answer_seeds: bool) -> TraverseConfig {
+        TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            exact_seeds,
+            answer_seeds,
+            ..limits()
+        }
+    }
+
+    fn listed(response: &Value) -> Vec<(String, String)> {
+        response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|card| {
+                (
+                    card["node"].as_str().unwrap().to_owned(),
+                    card["origin"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn exact_closure_answers_a_question_that_starts_no_walk() {
+        let tree = ScipTree::new();
+        let maps = ["graph.scip", EXACT_CLOSURE_ID];
+        let response = tree
+            .run(&stage_limits(false, false), &maps, &[], None)
+            .await;
+        // Nothing the walk can start from: the first stage is the answer, under
+        // `totals` as on every response.
+        assert_eq!(response["status"], "no_seeds", "{response}");
+        assert_eq!(response["totals"]["first_stage"]["exact"], 3, "{response}");
+        assert_eq!(response["totals"]["first_stage"]["walk"], 0, "{response}");
+        assert!(response.get("first_stage").is_none(), "{response}");
+        let results = response["results"].as_array().unwrap();
+        // beta holds two references, then alpha and Holder one each.
+        assert_eq!(results[0]["site"]["path"], "a.rs", "{response}");
+        assert_eq!(results[0]["site"]["line"], 3, "{response}");
+        assert_eq!(results[0]["held"], 2, "{response}");
+        assert!(results.iter().all(|card| card["origin"] == "exact"));
+        // Holder is not a node of the SCIP graph: its card keeps the site the
+        // operator gave it (nothing else could locate it).
+        let holder = results
+            .iter()
+            .find(|card| card["name"] == "Holder")
+            .unwrap_or_else(|| panic!("no Holder card in {response}"));
+        assert_eq!(holder["site"]["line"], 4, "{response}");
+        assert_eq!(response["exact"][0]["answered"], true, "{response}");
+        let notes = response["notes"].to_string();
+        assert!(
+            notes.contains("exact.closure: names 1, anchored yes"),
+            "{notes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_seeds_start_the_walk_from_the_exact_nodes_the_graph_holds() {
+        let tree = ScipTree::new();
+        let maps = ["graph.scip", EXACT_CLOSURE_ID];
+        let response = tree.run(&stage_limits(true, false), &maps, &[], None).await;
+        assert_ne!(response["status"], "no_seeds", "{response}");
+        assert_eq!(response["seed_source"], "exact", "{response}");
+        // alpha and beta, not Holder (the graph holds functions only).
+        assert_eq!(response["seeds"].as_array().unwrap().len(), 2, "{response}");
+        let hits = response["seed_hits"].as_array().unwrap();
+        assert!(hits.iter().all(|hit| hit["how"] == "exact"), "{response}");
+        // The exact cards lead, each node once, and the walk's cards come
+        // after them; a card's site is where it is defined.
+        let cards = listed(&response);
+        assert!(
+            cards[..3].iter().all(|(_, origin)| origin == "exact"),
+            "{cards:?}"
+        );
+        assert!(
+            cards[3..].iter().all(|(_, origin)| origin == "walk"),
+            "{cards:?}"
+        );
+        let mut nodes: Vec<&String> = cards.iter().map(|(node, _)| node).collect();
+        nodes.sort();
+        nodes.dedup();
+        assert_eq!(nodes.len(), cards.len(), "{cards:?}");
+        let first = &response["results"][0];
+        assert_eq!(first["site"]["line"], 3, "{response}");
+        assert_eq!(first["site"]["col"], 4, "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_seed_the_exact_stage_also_lists_is_listed_once_and_not_started_twice() {
+        let tree = ScipTree::new();
+        let maps = ["graph.scip", EXACT_CLOSURE_ID];
+        let first = tree
+            .run(&stage_limits(false, false), &maps, &[], None)
+            .await;
+        let beta = first["results"][0]["node"].as_str().unwrap().to_owned();
+        // The given seed is also the first exact card: with answer_seeds it is
+        // listed once, as the exact card (the first stage lists its own first).
+        let response = tree
+            .run(
+                &stage_limits(true, true),
+                &maps,
+                std::slice::from_ref(&beta),
+                None,
+            )
+            .await;
+        let cards = listed(&response);
+        assert_eq!(
+            cards.iter().filter(|(node, _)| *node == beta).count(),
+            1,
+            "{cards:?}"
+        );
+        assert_eq!(cards[0], (beta.clone(), "exact".to_owned()), "{cards:?}");
+        assert_eq!(response["totals"]["first_stage"]["seeds"], 0, "{response}");
+        // exact_seeds adds alpha and leaves beta the one start node it was.
+        let seeds = response["seeds"].as_array().unwrap();
+        assert_eq!(seeds.len(), 2, "{response}");
+        assert_eq!(seeds[0], beta.as_str(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn exact_pickaxe_answers_with_commits_and_counts_its_git_calls() {
+        let tree = ScipTree::new();
+        tree.commit();
+        let maps = ["graph.scip", EXACT_PICKAXE_ID];
+        let limits = stage_limits(false, false);
+        let response = tree.run(&limits, &maps, &[], None).await;
+        let results = response["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "{response}");
+        assert!(
+            results[0]["node"].as_str().unwrap().starts_with("commit:"),
+            "{response}"
+        );
+        assert_eq!(results[0]["origin"], "exact", "{response}");
+        let git_calls = response["exact"][0]["git_calls"].as_u64().unwrap();
+        assert!(git_calls >= 1, "{response}");
+        assert_eq!(
+            response["totals"]["physical_external_calls"], git_calls,
+            "{response}"
+        );
+        let notes = response["notes"].to_string();
+        assert!(
+            notes.contains("exact.pickaxe: class H1, 1 commits"),
+            "{notes}"
+        );
+
+        // With a walk, the commit leads the results and the git calls add to
+        // the totals the walk reports.
+        let closure = ["graph.scip", EXACT_CLOSURE_ID];
+        let first = tree
+            .run(&stage_limits(false, false), &closure, &[], None)
+            .await;
+        let beta = first["results"][0]["node"].as_str().unwrap().to_owned();
+        let walked = tree
+            .run(&limits, &maps, std::slice::from_ref(&beta), None)
+            .await;
+        let cards = listed(&walked);
+        assert!(cards[0].0.starts_with("commit:"), "{cards:?}");
+        assert_eq!(cards[0].1, "exact");
+        assert_eq!(walked["totals"]["first_stage"]["exact"], 1, "{walked}");
+        assert!(
+            walked["totals"]["physical_external_calls"]
+                .as_u64()
+                .unwrap()
+                >= git_calls,
+            "{walked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_pickaxe_stops_asking_git_when_the_deadline_has_passed() {
+        let tree = ScipTree::new();
+        tree.commit();
+        let maps = ["graph.scip", EXACT_PICKAXE_ID];
+        // The deadline is spent by the time the index is loaded: the first
+        // stage runs no git, keeps what it found (nothing) and says so.
+        let response = tree
+            .run(&stage_limits(false, false), &maps, &[], Some(1))
+            .await;
+        assert_eq!(response["exact"][0]["git_calls"], 0, "{response}");
+        assert_eq!(response["exact"][0]["answered"], false, "{response}");
+        let notes = response["notes"].to_string();
+        assert!(
+            notes.contains("stopped: the first stage's time ran out"),
+            "{notes}"
+        );
     }
 
     #[tokio::test]

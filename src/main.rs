@@ -478,13 +478,15 @@ struct TraverseArgs {
     /// first_k` setting).
     #[arg(long)]
     first_k: Option<u32>,
-    /// Also answer with the start nodes (the `[traverse] answer_seeds` setting).
-    #[arg(long)]
-    answer_seeds: bool,
+    /// Also answer with the start nodes (the `[traverse] answer_seeds`
+    /// setting); `--answer-seeds=false` turns a configured `true` off.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    answer_seeds: Option<bool>,
     /// Add the exact cards the SCIP graph holds to the start nodes (the
-    /// `[traverse] exact_seeds` setting).
-    #[arg(long)]
-    exact_seeds: bool,
+    /// `[traverse] exact_seeds` setting); `--exact-seeds=false` turns a
+    /// configured `true` off.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    exact_seeds: Option<bool>,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -544,8 +546,14 @@ async fn run_traverse(
     if let Some(first_k) = args.first_k {
         config.traverse.first_k = first_k;
     }
-    config.traverse.answer_seeds |= args.answer_seeds;
-    config.traverse.exact_seeds |= args.exact_seeds;
+    if let Some(answer_seeds) = args.answer_seeds {
+        config.traverse.answer_seeds = answer_seeds;
+    }
+    if let Some(exact_seeds) = args.exact_seeds {
+        config.traverse.exact_seeds = exact_seeds;
+    }
+    // The overrides come after the configuration was checked: check it again.
+    config.validate().context("traverse options")?;
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(name) if traverse::presets::is_preset(name) => SteerArgs {
