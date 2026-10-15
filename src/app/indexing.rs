@@ -53,7 +53,7 @@ const MIN_EMBED_PREFIX_BYTES: usize = 512;
 /// repository-relative file path. The default template `{code}` yields the
 /// source unchanged. The oversized-input fallback below shortens this
 /// formatted text from its end, so a prefix from the template survives.
-fn document_text(template: &str, chunk: &chunk::Chunk) -> String {
+pub(super) fn document_text(template: &str, chunk: &chunk::Chunk) -> String {
     fill_template(
         template,
         &[

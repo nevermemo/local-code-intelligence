@@ -30,6 +30,8 @@
 //! the only way to add pops or tokens is a `budget` action in `steer.actions`
 //! on a continuation, within the engine's own limits.
 
+mod chunks;
+
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use lci_core::node::{NodeId, NodeKind};
@@ -43,6 +45,10 @@ use lci_maps::{
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
     probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::{DirSource, SCIP_MAP_ID, ScipMap, SourceText},
+    scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
+    search_maps::{
+        ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
+    },
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
         handle::HandleStore,
@@ -82,12 +88,20 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// need the tree and none is part of the default: `grep.live` searches its
 /// current bytes, `config.key` runs the M1.2 extractor (needs `rg`),
 /// `git.history` reads the git history up to its HEAD, and `probe.compile`
-/// runs `cargo check` on a scratch copy (seconds per node).
-pub const OPT_IN_MAPS: [MapId; 4] = [
+/// runs `cargo check` on a scratch copy (seconds per node). The three maps of
+/// wave W0c: `search.lexical` (the lexical search from a node's own name),
+/// `search.vector` (the chunks nearest to a node's stored embedding; one
+/// counted embedding call when none is stored; needs the embedder) and
+/// `scip.impact` (the declarations that reference a symbol, the reverse
+/// closure of the SCIP impact index).
+pub const OPT_IN_MAPS: [MapId; 7] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
     PROBE_COMPILE_ID,
+    SEARCH_LEXICAL_ID,
+    SEARCH_VECTOR_ID,
+    SCIP_IMPACT_ID,
 ];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
@@ -318,6 +332,43 @@ async fn config_key_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Ar
     Ok(map)
 }
 
+type ImpactCache = Mutex<HashMap<(PathBuf, PathBuf), ((Option<SystemTime>, u64), Arc<ImpactMap>)>>;
+
+/// The `scip.impact` map of a SCIP index and a tree, built once per index
+/// stamp. Units the SCIP graph holds take its node ids.
+async fn impact_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<ImpactMap>> {
+    static CACHE: OnceLock<ImpactCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (index.to_path_buf(), root.to_path_buf());
+    if let Some((stamp, map)) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        && *stamp == loaded.stamp
+    {
+        return Ok(map.clone());
+    }
+    let (index, root, scip) = (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
+    let map = tokio::task::spawn_blocking(move || -> Result<ImpactMap> {
+        let source = DirSource(root);
+        let ix = ImpactIndex::load(&index, Some(&source)).map_err(|error| anyhow!(error))?;
+        let resolve = |symbol: &str| {
+            scip.graph()
+                .node_index(symbol)
+                .map(|node| scip.node_id(node).clone())
+        };
+        Ok(ImpactMap::new(ix, &resolve, ImpactOptions::default()))
+    })
+    .await
+    .context("build scip.impact")??;
+    let map = Arc::new(map);
+    cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (loaded.stamp, map.clone()));
+    Ok(map)
+}
+
 /// Matches the question's words against symbol names. Text only: it never
 /// expands a node. A stand-in for the lexical and vector channels until they
 /// are wrapped as maps.
@@ -439,6 +490,12 @@ impl SeedHit {
 pub trait SeedSearch: Send + Sync {
     /// The best `k` hits of the question, best first.
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>>;
+
+    /// The chunks of the workspace's index, for the maps `search.lexical` and
+    /// `search.vector`; `None` when this search has no index to offer.
+    fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
+        None
+    }
 }
 
 /// The search `search_code` runs in its normal mode, over one workspace and
@@ -451,6 +508,10 @@ pub struct AppSeeds<'a> {
 
 #[lci_maps::async_trait]
 impl SeedSearch for AppSeeds<'_> {
+    fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
+        Some(Arc::new(chunks::AppChunks::new(self.app, self.workspace)))
+    }
+
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
         let report = self
             .app
@@ -930,7 +991,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .collect::<Result<_>>()?,
     };
     if wanted.iter().any(|id| OPT_IN_MAPS.contains(id)) && call.scip_root.is_none() {
-        bail!("the maps grep.live and config.key read the tree: give its root");
+        bail!("the maps named beyond the defaults read the tree: give its root");
     }
     let (mut budget, mut notes) = clamp_budget(limits, call.budget);
     let handler = build_ladder(limits, call.steer, budget.pops, &mut notes)?;
@@ -994,10 +1055,37 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         Box::new(Shared(loaded.scip.clone())),
         wants(SCIP_MAP_ID),
     )?;
+    // The chunks the search maps reach have no lines in their ids: with a
+    // search map on, every chunk of the index is given to structure.contains
+    // so that it can expand them.
+    let early = Instant::now();
+    let mut lines = chunk_lines(&found);
+    let mut search_index: Option<Arc<dyn ChunkSearch + '_>> = None;
+    if wants(SEARCH_LEXICAL_ID) || wants(SEARCH_VECTOR_ID) {
+        match call.seed_search.and_then(|search| search.chunk_search()) {
+            None => notes.push(
+                "search.lexical and search.vector need the workspace index: give --root and a question or seeds, with the application available".to_owned(),
+            ),
+            Some(index) => {
+                match index.chunk_lines().await {
+                    Ok(all) => {
+                        let known: HashSet<NodeId> =
+                            lines.iter().map(|(node, _)| node.clone()).collect();
+                        lines.extend(all.into_iter().filter(|(node, _)| !known.contains(node)));
+                    }
+                    Err(error) => notes.push(format!(
+                        "the search maps found no chunk lines (structure.contains cannot expand the chunks they reach): {error}"
+                    )),
+                }
+                search_index = Some(index);
+            }
+        }
+    }
+    let early = early.elapsed();
     register(
         &mut registry,
         &mut plan_maps,
-        Box::new(loaded.contains.with_chunk_lines(chunk_lines(&found))),
+        Box::new(loaded.contains.with_chunk_lines(lines)),
         wants(CONTAINS_MAP_ID),
     )?;
     // Building the tree maps is setup, not walking: the deadline does not run
@@ -1062,7 +1150,62 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             }
         }
     }
-    budget.deadline += setup.elapsed();
+    let mut impact = None;
+    if wants(SCIP_IMPACT_ID) {
+        match call.scip_root {
+            None => notes.push("scip.impact needs the tree: give --root".to_owned()),
+            Some(root) => {
+                let map = match impact_map(call.scip_index, root, &loaded).await {
+                    Ok(map) => {
+                        let stats = map.stats();
+                        notes.push(format!(
+                            "scip.impact: {} definitions, {} with a node id ({} those of graph.scip), cap {} users per node",
+                            stats.defs,
+                            stats.nodes,
+                            stats.resolved,
+                            map.options().cap
+                        ));
+                        map
+                    }
+                    Err(error) => {
+                        notes.push(format!("scip.impact has no edges: {error:#}"));
+                        Arc::new(ImpactMap::empty(ImpactOptions::default()))
+                    }
+                };
+                impact = Some(map.clone());
+                register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+            }
+        }
+    }
+    let mut search_maps: (
+        Option<Arc<LexicalChunks<'_>>>,
+        Option<Arc<VectorChunks<'_>>>,
+    ) = (None, None);
+    if let Some(index) = &search_index {
+        let decls: Arc<dyn lci_maps::search_maps::DeclLocator> =
+            Arc::new(ScipDecls::from_scip(&loaded.scip));
+        if wants(SEARCH_LEXICAL_ID) {
+            let map = Arc::new(LexicalChunks::new(index.clone(), Some(decls.clone())));
+            register(
+                &mut registry,
+                &mut plan_maps,
+                Box::new(Shared(map.clone())),
+                true,
+            )?;
+            search_maps.0 = Some(map);
+        }
+        if wants(SEARCH_VECTOR_ID) {
+            let map = Arc::new(VectorChunks::new(index.clone(), Some(decls)));
+            register(
+                &mut registry,
+                &mut plan_maps,
+                Box::new(Shared(map.clone())),
+                true,
+            )?;
+            search_maps.1 = Some(map);
+        }
+    }
+    budget.deadline += setup.elapsed() + early;
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
@@ -1111,6 +1254,45 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             None
         }
     };
+    let failures = [
+        search_maps
+            .0
+            .as_ref()
+            .map(|map| (SEARCH_LEXICAL_ID, map.failures())),
+        search_maps
+            .1
+            .as_ref()
+            .map(|map| (SEARCH_VECTOR_ID, map.failures())),
+    ];
+    for (id, failures) in failures.into_iter().flatten() {
+        if let Some(first) = failures.first() {
+            notes.push(format!(
+                "{id}: {} calls failed and gave no edges (fail-open); the first: {first}",
+                failures.count()
+            ));
+        }
+    }
+    // What the new maps cost per call, measured in this run (the p50 ring the
+    // map cards report).
+    let costs = [
+        search_maps
+            .0
+            .as_ref()
+            .map(|map| (SEARCH_LEXICAL_ID, map.log())),
+        search_maps
+            .1
+            .as_ref()
+            .map(|map| (SEARCH_VECTOR_ID, map.log())),
+        impact.as_ref().map(|map| (SCIP_IMPACT_ID, map.log())),
+    ];
+    for (id, log) in costs.into_iter().flatten() {
+        if let Some(p50) = log.p50() {
+            notes.push(format!(
+                "{id}: expand p50 {p50:.1} ms over {} timed calls",
+                log.len()
+            ));
+        }
+    }
     let mut response = response_json(
         call,
         &result,
@@ -2154,9 +2336,18 @@ mod tests {
         assert!(no_root.contains("give its root"), "{no_root}");
         let no_root = run_with(&["config.key"]).await.unwrap();
         assert!(no_root.contains("give its root"), "{no_root}");
+        for id in [SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, SCIP_IMPACT_ID] {
+            assert!(!MAPS.contains(&id), "{id} is opt-in");
+            let no_root = run_with(&[id]).await.unwrap();
+            assert!(no_root.contains("give its root"), "{id}: {no_root}");
+        }
         let unknown = run_with(&["nope"]).await.unwrap();
         assert!(
-            unknown.contains("grep.live") && unknown.contains("config.key"),
+            unknown.contains("grep.live")
+                && unknown.contains("config.key")
+                && unknown.contains("search.lexical")
+                && unknown.contains("search.vector")
+                && unknown.contains("scip.impact"),
             "{unknown}"
         );
     }

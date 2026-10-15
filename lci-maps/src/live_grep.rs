@@ -349,7 +349,7 @@ impl CostLog {
 }
 
 /// The identifier to look for from `node`, if the node names one.
-fn needle_of(node: &NodeId) -> Option<String> {
+pub(crate) fn needle_of(node: &NodeId) -> Option<String> {
     let name = match node {
         NodeId::Symbol(key) => key.name.clone(),
         NodeId::File { path } | NodeId::Chunk { path, .. } => {

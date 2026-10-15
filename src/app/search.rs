@@ -1128,7 +1128,7 @@ impl App {
     /// file path equals it, or is a `/`-delimited suffix of it, compared
     /// case-insensitively); each line then takes the first candidate, in
     /// `all_chunks` order, whose line range holds it.
-    fn map_lexical_matches(
+    pub(super) fn map_lexical_matches(
         all_chunks: &[Hit],
         search: lexical::LexicalSearch,
         candidate_count: usize,

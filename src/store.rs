@@ -503,6 +503,44 @@ impl Store {
         Ok((hits, rows, rejected))
     }
 
+    /// The stored vector of the chunk of `path` with `content_hash` that
+    /// starts at `start_line`, if the index holds one.
+    pub async fn chunk_vector(
+        snapshot: &Snapshot,
+        path: &str,
+        content_hash: &str,
+        start_line: u32,
+    ) -> Result<Option<Vec<f32>>> {
+        let quoted = |text: &str| text.replace('\'', "''");
+        let batches = snapshot
+            .table
+            .query()
+            .only_if(format!(
+                "relative_file_path = '{}' AND content_hash = '{}' AND start_line = {start_line}",
+                quoted(path),
+                quoted(content_hash)
+            ))
+            .select(Select::columns(&["vector"]))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let vectors = column::<FixedSizeListArray>(&batch, "vector")?;
+            let value = vectors.value(0);
+            let vector = value
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .context("invalid vector values")?;
+            return Ok(Some(vector.values().to_vec()));
+        }
+        Ok(None)
+    }
+
     pub async fn languages(snapshot: &Snapshot) -> Result<HashSet<String>> {
         let mut batches = snapshot
             .table

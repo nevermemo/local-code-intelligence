@@ -397,7 +397,11 @@ struct TraverseArgs {
     /// the declarations that read them; needs rg on PATH), git.history
     /// (commits and co-change from the tree's git history) and probe.compile
     /// (compiler errors of a patch to a function, found by `cargo check` on a
-    /// scratch copy; seconds per node).
+    /// scratch copy; seconds per node), search.lexical (the lexical search
+    /// from a node's own name, to the chunks it finds), search.vector (the
+    /// chunks nearest to a node's stored embedding; needs the embedder only
+    /// for a node with no stored vector) and scip.impact (the declarations
+    /// that reference a symbol, from the SCIP impact index).
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// The `[search_profiles.<name>]` the hybrid search for the start nodes
@@ -505,7 +509,15 @@ async fn run_traverse(
         && args.handle.is_none()
         && args.question.is_some()
         && (maps.is_none_or(|ids| ids.iter().any(|id| id == traverse::SEEDS_HYBRID)));
-    let app = match (&args.root, wants_search) {
+    // The maps search.lexical and search.vector read the index too, from
+    // whatever start nodes the call has.
+    let wants_chunks = maps.is_some_and(|ids| {
+        ids.iter().any(|id| {
+            id == lci_maps::search_maps::SEARCH_LEXICAL_ID
+                || id == lci_maps::search_maps::SEARCH_VECTOR_ID
+        })
+    });
+    let app = match (&args.root, wants_search || wants_chunks) {
         (Some(_), true) => Some(App::open(config.clone()).await),
         _ => None,
     };
