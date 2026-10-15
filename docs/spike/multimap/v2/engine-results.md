@@ -217,3 +217,47 @@ On every set a first stage (search hits or an exact operator) gives the best
 early answers and the walk adds answers the first stage does not reach. BR4
 puts this in the engine: exact operators that abstain when the question names
 nothing, the seeds kept in the answers, and a merge of the two lists.
+
+## First stage in the engine (bench-1023)
+
+BR4b's first stage on the release build at `b5462ad`: arm F-off is the walk
+alone; F-append lists the first stage (exact answers on impact and history,
+the search seeds on every set, `first_k = 10`) and then the walk; F-interleave
+alternates them; F-exactseed is F-append with the walk also starting from the
+exact answers. Impact selects `exact.closure`, history `git.history` and
+`exact.pickaxe`. Deltas are against F-off, 95% paired bootstrap, no item
+stopped on the deadline.
+
+| set | metric | F-off | F-append | F-interleave | F-exactseed |
+| --- | --- | --- | --- | --- | --- |
+| where-to (59) | reg_mrr (25) | .687 | .837 [+.027, +.293] | .847 [+.040, +.300] | - |
+| | set_f1 (34) | .242 | .297 [+.023, +.091] | .260 (n.s.) | - |
+| | precision | .333 | .287 [-.088, -.009] | .358 (n.s.) | - |
+| flow (111) | path_recall | .328 | .547 [+.168, +.272] | .398 [+.008, +.134] | - |
+| | precision | .138 | .216 [+.060, +.098] | .300 [+.136, +.191] | - |
+| | tau (30 / 16) | .933 | .756 [-.356, -.044] | .792 (n.s.) | - |
+| impact (141) | decl_recall | .067 | .874 | .711 | .869 |
+| | r2_decl_recall | .046 | .461 | .364 | .464 |
+| | tests_recall (100) | .006 | .387 | .291 | .387 |
+| | precision | .052 | .342 | .428 | .331 |
+| history (110) | mrr | .128 | .501 [+.281, +.465] | .483 | .501 |
+| | hit@10 | .191 | .664 [+.373, +.573] | .582 | .664 |
+
+Every impact and history interval excludes zero by a wide margin. Findings:
+
+- A plain repeat of F-off (arm R-off) gives the same score on every item of
+  every set: the engine's run-to-run noise is zero at this deadline, so any
+  nonzero delta here is a real change in the answers. This is the engine's
+  noise floor only; the noise of agent runs is still to be measured.
+- Append is the default to beat: it is best or tied on recall everywhere
+  (flow path_recall +.219, impact second-ring +.415, history hit@10 +.473)
+  and loses only flow order (tau) and where-to precision. Interleave buys
+  precision (flow .300, impact .428) for recall.
+- `exact_seeds` adds nothing: on impact it costs 2.1 more expansions per item
+  for the same scores, and on history its answers are identical to append's
+  on all 110 items (pickaxe answers are commits, which the walk does not
+  start from).
+- Against the offline merges above, the in-engine first stage is below them on
+  impact second ring (.461 vs .572) and history hit@10 (.664 vs .727); those
+  merges used the reranked walk and wider maps, these arms the default maps
+  without the reranker frontier.
