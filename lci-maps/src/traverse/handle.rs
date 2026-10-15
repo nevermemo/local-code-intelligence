@@ -18,9 +18,10 @@
 //! ([`Snapshot::identity`]); a caller that knows them refuses a handle that
 //! names others ([`Snapshot::check_identity`]).
 //!
-//! What a resume does not carry: the edge source, the scorer, the price and
-//! the handler. The caller passes them again, and may change them (a changed
-//! scorer is noted in the `resume` event). The budget is absolute for the
+//! What a resume does not carry: the edge source, the scorer, the price, the
+//! handler and the reranker frontier's rescorer (its floor is kept, and
+//! [`Snapshot::check_rerank`] refuses another). The caller passes them again,
+//! and may change them (a changed scorer is noted in the `resume` event). The budget is absolute for the
 //! whole traversal (`pops`, `est_tokens` and `external_calls` count from the
 //! first call), with a fresh deadline; what the outer agent raised stays with
 //! the traversal and is added to the caps a call passes (see [`super::steer`]).
@@ -48,7 +49,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -73,6 +74,14 @@ pub enum HandleError {
     /// [`Snapshot::check_priors`]); each side is `question type @ table hash`,
     /// or `none` for the guessed table.
     WrongPriors {
+        handle: String,
+        found: String,
+        expected: String,
+    },
+    /// The handle was made with another reranker frontier setting than the
+    /// caller gives (see [`Snapshot::check_rerank`]); each side is the floor,
+    /// or `off`.
+    WrongRerank {
         handle: String,
         found: String,
         expected: String,
@@ -111,6 +120,15 @@ impl fmt::Display for HandleError {
                 f,
                 "handle {handle} was made with the hop priors {found}, this call has \
                  {expected}; give the same table and question type, or start a new traversal"
+            ),
+            Self::WrongRerank {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the reranker frontier {found}, this call has \
+                 {expected}; give the same rerank_frontier and rerank_floor, or start a new traversal"
             ),
         }
     }
@@ -170,6 +188,10 @@ pub struct Snapshot {
     /// Whether the first call passed through connective nodes (their pops
     /// were free); a resume keeps it.
     pub pass_through: bool,
+    /// The floor of the reranker frontier the first call ran with (none: it
+    /// was off). The caller passes the rescorer again and checks the floor
+    /// with [`Snapshot::check_rerank`].
+    pub rerank_floor: Option<f64>,
     /// Whether the score bound could end the walk; a resume keeps it.
     pub score_bound: bool,
     /// The question type and content hash of the fitted hop priors the first
@@ -232,6 +254,9 @@ impl Snapshot {
                 "tokens": self.totals.tokens,
                 "external_calls": self.totals.external_calls,
                 "pass_through_pops": self.totals.pass_through_pops,
+                "rerank_calls": self.totals.rerank_calls,
+                "rerank_docs": self.totals.rerank_docs,
+                "rerank_failures": self.totals.rerank_failures,
                 "stops": self.totals.stops,
                 "steers": self.totals.steers,
             },
@@ -246,6 +271,7 @@ impl Snapshot {
             "identity": self.identity,
             "boost": self.boost,
             "pass_through": self.pass_through,
+            "rerank_floor": self.rerank_floor,
             "score_bound": self.score_bound,
         })
     }
@@ -288,6 +314,22 @@ impl Snapshot {
             handle: self.handle(),
             found: show(&self.priors),
             expected: show(&current),
+        })
+    }
+
+    /// Refuses a snapshot made with another reranker frontier setting than
+    /// `floor`: the floor of the call (none: the frontier is off). The
+    /// rescorer is not in a handle, so the caller checks what it passes.
+    pub fn check_rerank(&self, floor: Option<f64>) -> Result<(), HandleError> {
+        if self.rerank_floor == floor {
+            return Ok(());
+        }
+        let show =
+            |floor: Option<f64>| floor.map_or("off".to_owned(), |f| format!("on at floor {f}"));
+        Err(HandleError::WrongRerank {
+            handle: self.handle(),
+            found: show(self.rerank_floor),
+            expected: show(floor),
         })
     }
 
@@ -499,6 +541,9 @@ impl Snapshot {
                 tokens: u64_of(get(totals, "tokens")?)?,
                 external_calls: u32_of(get(totals, "external_calls")?)?,
                 pass_through_pops: u32_of(get(totals, "pass_through_pops")?)?,
+                rerank_calls: u32_of(get(totals, "rerank_calls")?)?,
+                rerank_docs: u32_of(get(totals, "rerank_docs")?)?,
+                rerank_failures: u32_of(get(totals, "rerank_failures")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
                 steers: u32_of(get(totals, "steers")?)?,
                 elapsed_ms: 0.0,
@@ -521,6 +566,10 @@ impl Snapshot {
             pass_through: get(obj, "pass_through")?
                 .as_bool()
                 .ok_or("pass_through is not a boolean")?,
+            rerank_floor: match get(obj, "rerank_floor")? {
+                Value::Null => None,
+                v => Some(f64_of(v)?),
+            },
             score_bound: get(obj, "score_bound")?
                 .as_bool()
                 .ok_or("score_bound is not a boolean")?,
@@ -779,6 +828,7 @@ impl Run<'_> {
             boost: self.t.boost,
             fusion: self.t.fusion,
             pass_through: self.t.pass_through,
+            rerank_floor: self.rerank_floor(),
             score_bound: self.t.score_bound,
             priors: self
                 .t
@@ -891,6 +941,9 @@ impl Run<'_> {
         });
         if let (true, Some(object)) = (pass_through, resume.as_object_mut()) {
             object.insert("pass_through".into(), json!(true));
+        }
+        if let (Some(floor), Some(object)) = (self.rerank_floor(), resume.as_object_mut()) {
+            object.insert("rerank_floor".into(), json!(floor));
         }
         if let (false, Some(object)) = (score_bound, resume.as_object_mut()) {
             object.insert("score_bound".into(), json!(false));

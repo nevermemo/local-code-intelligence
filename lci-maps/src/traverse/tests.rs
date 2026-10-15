@@ -2460,3 +2460,5 @@ mod harness;
 mod fusion;
 
 mod priors;
+
+mod rescore;

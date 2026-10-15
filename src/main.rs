@@ -441,6 +441,12 @@ struct TraverseArgs {
     /// keeps the setting its handle started with.
     #[arg(long)]
     pass_through: bool,
+    /// Rate the kept hops of each expansion with the reranker and scale their
+    /// values by `rerank_floor + (1 - rerank_floor) * relevance` (default: the
+    /// `[traverse] rerank_frontier` setting; the floor is `rerank_floor`).
+    /// Needs --root. A continuation must be given the same setting.
+    #[arg(long)]
+    rerank_frontier: bool,
     /// Never end the walk on the score bound (the `[traverse] score_bound`
     /// setting, on by default). A continuation keeps the setting its handle
     /// started with.
@@ -502,6 +508,7 @@ async fn run_traverse(
         config.traverse.fusion = fusion;
     }
     config.traverse.pass_through |= args.pass_through;
+    config.traverse.rerank_frontier |= args.rerank_frontier;
     config.traverse.score_bound &= !args.no_score_bound;
     config.traverse.priors = args.priors.clone().or(config.traverse.priors);
     config.traverse.question_type = args.question_type.clone().or(config.traverse.question_type);
@@ -553,7 +560,9 @@ async fn run_traverse(
                 || id == lci_maps::search_maps::SEARCH_VECTOR_ID
         })
     });
-    let app = match (&args.root, wants_search || wants_chunks) {
+    // The reranker frontier calls the reranker through the application.
+    let wants_rerank = config.traverse.rerank_frontier;
+    let app = match (&args.root, wants_search || wants_chunks || wants_rerank) {
         (Some(_), true) => Some(App::open(config.clone()).await),
         _ => None,
     };

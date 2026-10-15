@@ -106,6 +106,11 @@ pub struct BenchArgs {
     /// note says when it is on.
     #[arg(long)]
     pass_through: bool,
+    /// Rate the kept hops with the reranker (`lci traverse --rerank-frontier`;
+    /// the floor is the config's `[traverse] rerank_floor`). The row's note
+    /// says `rerank-frontier` and counts the reranker calls.
+    #[arg(long)]
+    rerank_frontier: bool,
     /// Switch the score bound off (`lci traverse --no-score-bound`). The row's
     /// note says `no-bound`.
     #[arg(long)]
@@ -205,6 +210,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         policy,
         fusion: fusion_arg(&args.fusion),
         pass_through: args.pass_through,
+        rerank_frontier: args.rerank_frontier,
         no_score_bound: args.no_score_bound,
         priors: args
             .priors
@@ -243,7 +249,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         note: note_with_flags(
             args.note.as_deref(),
             &args.fusion,
-            args.pass_through,
+            [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
             priors_note(&args),
         ),
@@ -294,7 +300,7 @@ fn rescore(
         note: note_with_flags(
             args.note.as_deref(),
             &args.fusion,
-            args.pass_through,
+            [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
             priors_note(args),
         ),
@@ -372,17 +378,18 @@ fn fusion_arg(fusion: &str) -> Option<String> {
 }
 
 /// The note of the row, with the fusion when it is not the default and
-/// `pass-through` when it is on.
+/// `pass-through` and `rerank-frontier` when they are on.
 fn note_with_flags(
     note: Option<&str>,
     fusion: &str,
-    pass_through: bool,
+    [pass_through, rerank_frontier]: [bool; 2],
     no_score_bound: bool,
     priors: Option<String>,
 ) -> String {
     let flags = [
         fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
         pass_through.then(|| "pass-through".to_owned()),
+        rerank_frontier.then(|| "rerank-frontier".to_owned()),
         no_score_bound.then(|| "no-bound".to_owned()),
         priors,
     ];
@@ -531,6 +538,10 @@ pub struct Totals {
     pub cross_map_hops: u64,
     pub stops: u64,
     pub elapsed_ms: f64,
+    /// The reranker frontier's counts (0 when it was off).
+    pub rerank_calls: u64,
+    pub rerank_docs: u64,
+    pub rerank_failures: u64,
 }
 
 /// What one `lci traverse` call returned, reduced to what the bench uses.
@@ -611,6 +622,9 @@ impl Traversed {
                 cross_map_hops: t["cross_map_hops"].as_u64().unwrap_or(0),
                 stops: t["stops"].as_u64().unwrap_or(0),
                 elapsed_ms: t["elapsed_ms"].as_f64().unwrap_or(0.0),
+                rerank_calls: t["rerank_calls"].as_u64().unwrap_or(0),
+                rerank_docs: t["rerank_docs"].as_u64().unwrap_or(0),
+                rerank_failures: t["rerank_failures"].as_u64().unwrap_or(0),
             });
         Traversed {
             status: value["status"].as_str().unwrap_or("unknown").to_string(),
@@ -769,6 +783,8 @@ pub struct CliTraverser {
     pub fusion: Option<String>,
     /// `--pass-through` for the CLI.
     pub pass_through: bool,
+    /// `--rerank-frontier` for the CLI.
+    pub rerank_frontier: bool,
     /// `--no-score-bound` for the CLI.
     pub no_score_bound: bool,
     /// `--priors` and `--question-type` for the CLI: the table file and the
@@ -823,6 +839,9 @@ impl CliTraverser {
         }
         if self.pass_through {
             command.arg("--pass-through");
+        }
+        if self.rerank_frontier {
+            command.arg("--rerank-frontier");
         }
         if self.no_score_bound {
             command.arg("--no-score-bound");
@@ -1400,6 +1419,8 @@ struct Sums {
     hops: u64,
     cross: u64,
     stops: u64,
+    /// Reranker frontier calls, nodes rated and calls that failed.
+    rerank: [u64; 3],
     answer_chars_tokens: u64,
     engine_ms: Vec<f64>,
     wall_ms: Vec<f64>,
@@ -1592,6 +1613,13 @@ pub fn bench_set(
                     sums.hops += t.hops;
                     sums.cross += t.cross_map_hops;
                     sums.stops += t.stops;
+                    for (sum, n) in sums.rerank.iter_mut().zip([
+                        t.rerank_calls,
+                        t.rerank_docs,
+                        t.rerank_failures,
+                    ]) {
+                        *sum += n;
+                    }
                     sums.engine_ms.push(t.elapsed_ms);
                 }
                 run.insert(id.to_string(), Value::Array(answers.clone()));
@@ -1659,6 +1687,12 @@ pub fn bench_set(
     }
     if sums.no_seeds > 0 {
         notes.push(format!("{} scored items found no seeds", sums.no_seeds));
+    }
+    let [calls, docs, failures] = sums.rerank;
+    if calls >= 1 {
+        notes.push(format!(
+            "rerank calls={calls} docs={docs} failed={failures}"
+        ));
     }
     if !sums.stop_reasons.is_empty() {
         let counts: Vec<String> = sums
@@ -2088,6 +2122,9 @@ mod tests {
         answers.insert("q one".into(), traversal(&["x"], &[SEARCH_FN, TYPE], 6));
         let mut two = traversal(&["x"], &[METHOD], 4);
         two["stop_reason"] = json!("deadline");
+        two["totals"]["rerank_calls"] = json!(3);
+        two["totals"]["rerank_docs"] = json!(7);
+        two["totals"]["rerank_failures"] = json!(1);
         answers.insert("q two".into(), two);
         answers.insert(
             "q three".into(),
@@ -2125,6 +2162,7 @@ mod tests {
         assert_eq!((cells[12].as_str(), cells[13].as_str()), ("2", "2"));
         assert_eq!(cells[15], "4/4");
         assert!(cells[20].contains("1 scored items found no seeds"));
+        assert!(cells[20].contains("rerank calls=3 docs=7 failed=1"));
         assert!(cells[20].contains("stops: bound=1 deadline=1 no_seeds=1"));
         assert!(cells[7].contains("decl_recall=0.667") && cells[7].contains("(over 3)"));
         assert_eq!(cells[18], "none");

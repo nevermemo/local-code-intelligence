@@ -109,6 +109,15 @@
 //! pops at most twice the cap. The free pops are counted apart in
 //! [`Totals::pass_through_pops`]. A handle keeps the setting.
 //!
+//! Reranker frontier (`[traverse] rerank_frontier`, off by default): see
+//! [`rescore`]. One batched [`rescore::FrontierRescorer`] call per expansion
+//! rates the kept destinations, and each kept hop's value is multiplied by a
+//! factor in `[floor, 1]`, so the score bound stays sound. Counted in
+//! [`Totals::rerank_calls`], [`Totals::rerank_docs`] and
+//! [`Totals::rerank_failures`]; the time of the calls is
+//! [`TraversalResult::rerank_ms`]. A handle keeps the floor
+//! ([`handle::Snapshot::check_rerank`]); the caller passes the rescorer again.
+//!
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
 //! reason `bound`, once `k` results exist and neither a queued state nor a
 //! result below the top `k` can reach a rank above the `k`-th; it fixes the
@@ -127,6 +136,7 @@ pub mod handler;
 pub mod ladder;
 pub mod merged;
 pub mod priors;
+pub mod rescore;
 pub mod rules;
 pub mod source;
 pub mod steer;
@@ -145,6 +155,7 @@ use handler::{
 };
 use lci_core::node::{NodeId, NodeKind};
 use priors::HopPriors;
+use rescore::FrontierRescorer;
 use serde_json::{Value, json};
 use source::{EdgeSource, Expansion, FusedEdge};
 use std::{
@@ -273,6 +284,12 @@ pub struct Totals {
     /// Pops of connective nodes that did not count toward `pops` (pass-through
     /// only; see the module docs).
     pub pass_through_pops: u32,
+    /// Reranker frontier only (see [`rescore`]): batched rescorer calls made
+    /// (one per expansion that kept a hop), the nodes they rated, and the
+    /// calls that failed (their hops kept factor 1).
+    pub rerank_calls: u32,
+    pub rerank_docs: u32,
+    pub rerank_failures: u32,
     pub stops: u32,
     /// Directives applied at stops.
     pub steers: u32,
@@ -316,6 +333,11 @@ pub struct TraversalResult {
     /// Milliseconds each map spent answering expansions in this call. Wall
     /// clock: kept out of the events, the checkpoint and the handle.
     pub map_ms: BTreeMap<MapId, f64>,
+    /// The floor of the reranker frontier the run used (none: it was off).
+    pub rerank_floor: Option<f64>,
+    /// Milliseconds the rescorer calls took in this call. Wall clock: kept
+    /// out of the events, the checkpoint and the handle.
+    pub rerank_ms: f64,
 }
 
 impl TraversalResult {
@@ -377,6 +399,8 @@ pub struct Traversal<'s> {
     boost: f64,
     fusion: Fusion,
     pass_through: bool,
+    /// The reranker frontier: the rescorer and the floor of the hop factor.
+    rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
     score_bound: bool,
     priors: HopPriors,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
@@ -403,6 +427,7 @@ impl<'s> Traversal<'s> {
             boost: DEFAULT_CORROBORATION_BOOST,
             fusion: Fusion::Boost,
             pass_through: false,
+            rerank: None,
             score_bound: true,
             priors: HopPriors::default(),
             bound: None,
@@ -459,6 +484,17 @@ impl<'s> Traversal<'s> {
     /// made with.
     pub fn pass_through(mut self, on: bool) -> Self {
         self.pass_through = on;
+        self
+    }
+
+    /// The reranker frontier (default off; see [`rescore`]): one `rescorer`
+    /// call per expansion multiplies each kept hop by `floor + (1 - floor) *
+    /// s`. A floor outside `[0, 1]` is clamped, one that is not a number is 1
+    /// (no effect). Not kept in a handle but its floor is: a resumed traversal
+    /// passes the same rescorer and floor again and the caller checks them
+    /// with [`handle::Snapshot::check_rerank`].
+    pub fn rerank_frontier(mut self, rescorer: impl FrontierRescorer + 's, floor: f64) -> Self {
+        self.rerank = Some((Box::new(rescorer), rescore::sane_floor(floor)));
         self
     }
 
@@ -572,6 +608,8 @@ struct Run<'s> {
     paid: BTreeMap<usize, (u64, u32)>,
     /// Milliseconds each map spent answering expansions in this call.
     map_ms: BTreeMap<MapId, f64>,
+    /// Milliseconds the rescorer calls took in this call.
+    rerank_ms: f64,
 }
 
 impl<'s> Run<'s> {
@@ -602,7 +640,13 @@ impl<'s> Run<'s> {
             partial: HashSet::new(),
             paid: BTreeMap::new(),
             map_ms: BTreeMap::new(),
+            rerank_ms: 0.0,
         }
+    }
+
+    /// The floor of the reranker frontier, when it is on.
+    fn rerank_floor(&self) -> Option<f64> {
+        self.t.rerank.as_ref().map(|(_, floor)| *floor)
     }
 
     /// The pop cap: the caller's plus what the agent raised.
@@ -695,6 +739,9 @@ impl<'s> Run<'s> {
             });
             if let (true, Some(object)) = (self.t.pass_through, start.as_object_mut()) {
                 object.insert("pass_through".into(), json!(true));
+            }
+            if let (Some(floor), Some(object)) = (self.rerank_floor(), start.as_object_mut()) {
+                object.insert("rerank_floor".into(), json!(floor));
             }
             if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
                 object.insert("score_bound".into(), json!(false));
@@ -845,6 +892,11 @@ impl<'s> Run<'s> {
             if self.t.pass_through {
                 object["totals"]["pass_through_pops"] = json!(self.totals.pass_through_pops);
             }
+            if self.t.rerank.is_some() {
+                object["totals"]["rerank_calls"] = json!(self.totals.rerank_calls);
+                object["totals"]["rerank_docs"] = json!(self.totals.rerank_docs);
+                object["totals"]["rerank_failures"] = json!(self.totals.rerank_failures);
+            }
         }
         self.events.push(end);
         let snapshot = resumable.then(|| self.snapshot());
@@ -879,6 +931,8 @@ impl<'s> Run<'s> {
             stop_reason,
             maps: self.tally.maps,
             map_ms: self.map_ms,
+            rerank_floor: self.t.rerank.as_ref().map(|(_, floor)| *floor),
+            rerank_ms: self.rerank_ms,
         }
     }
 
@@ -1106,6 +1160,7 @@ impl<'s> Run<'s> {
             priors: &self.t.priors,
         };
         let steps = hop(self.t.scorer.as_mut(), &ctx, &cands, self.t.price);
+        let (steps, rerank) = self.rescore(steps, &kept).await;
 
         // Then adopt what the tokens afford, best first.
         let affordable = ((self.tokens_left() - owed_tokens) / TOKENS_PER_EDGE) as usize;
@@ -1225,6 +1280,9 @@ impl<'s> Run<'s> {
             if (paid_tokens, paid_calls) != (0, 0) {
                 object.insert("paid_before".into(), json!([paid_tokens, paid_calls]));
             }
+            if let Some(rerank) = rerank {
+                object.insert("rerank".into(), rerank);
+            }
             // The maps were given no external call for this expansion.
             if self.t.budget.external_calls > 0 && calls_before == 0 {
                 object.insert("external_spent".into(), json!(true));
@@ -1232,6 +1290,59 @@ impl<'s> Run<'s> {
         }
         self.events.insert(at, event);
         cut.then_some(adopted > 0 || timed_out)
+    }
+
+    /// The reranker frontier (see [`rescore`]): one rescorer call rates the
+    /// destinations of the hops the gate and the beam kept, and each hop's
+    /// value is multiplied by its factor. Returns the hops and the `rerank`
+    /// field of the `expand` event (none when the frontier is off or nothing
+    /// was kept). A failed call (an error, the deadline, a wrong count or a
+    /// score that is not a number) leaves the values as they were.
+    async fn rescore(
+        &mut self,
+        steps: Vec<(usize, f64)>,
+        kept: &[FusedEdge],
+    ) -> (Vec<(usize, f64)>, Option<Value>) {
+        let Some((rescorer, floor)) = &self.t.rerank else {
+            return (steps, None);
+        };
+        if steps.is_empty() {
+            return (steps, None);
+        }
+        let floor = *floor;
+        let nodes: Vec<NodeId> = steps
+            .iter()
+            .map(|&(i, _)| kept[i].best.dst.clone())
+            .collect();
+        let started = Instant::now();
+        let left = self.t.budget.deadline.saturating_duration_since(started);
+        let answer = tokio::time::timeout(left, rescorer.relevance(&self.t.question, &nodes)).await;
+        self.rerank_ms += started.elapsed().as_secs_f64() * 1000.0;
+        let scores = match answer {
+            Ok(Ok(scores))
+                if scores.len() == nodes.len() && scores.iter().all(|s| s.is_finite()) =>
+            {
+                Some(scores)
+            }
+            _ => None,
+        };
+        let docs = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+        self.totals.rerank_calls = self.totals.rerank_calls.saturating_add(1);
+        self.totals.rerank_docs = self.totals.rerank_docs.saturating_add(docs);
+        self.totals.rerank_failures = self
+            .totals
+            .rerank_failures
+            .saturating_add(u32::from(scores.is_none()));
+        let event = json!({"docs": docs, "failed": scores.is_none()});
+        let steps = match scores {
+            Some(scores) => steps
+                .into_iter()
+                .zip(scores)
+                .map(|((i, value), s)| (i, value * rescore::factor(floor, s)))
+                .collect(),
+            None => steps,
+        };
+        (steps, Some(event))
     }
 
     /// Whether `target` is `from` or one of its ancestors.

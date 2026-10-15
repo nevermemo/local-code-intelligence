@@ -32,7 +32,7 @@
 
 mod chunks;
 
-use crate::{app::App, config::TraverseConfig, filter::FilterRequest};
+use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow, bail};
 use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
@@ -56,6 +56,7 @@ use lci_maps::{
         handler::{Checkpoint, StopPolicy},
         ladder::Ladder,
         priors::HopPriors,
+        rescore::FrontierRescorer,
         rules::RuleList,
         source::OnTheFly,
         steer::Steer,
@@ -486,6 +487,12 @@ pub trait SeedSearch: Send + Sync {
     fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
         None
     }
+
+    /// The reranker client, for `[traverse] rerank_frontier`; `None` when this
+    /// search has none.
+    fn reranker(&self) -> Option<&Models> {
+        None
+    }
 }
 
 /// The search `search_code` runs in its normal mode, over one workspace and
@@ -500,6 +507,10 @@ pub struct AppSeeds<'a> {
 impl SeedSearch for AppSeeds<'_> {
     fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
         Some(Arc::new(chunks::AppChunks::new(self.app, self.workspace)))
+    }
+
+    fn reranker(&self) -> Option<&Models> {
+        Some(&self.app.models)
     }
 
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
@@ -569,6 +580,102 @@ pub struct NoSearch(pub String);
 impl SeedSearch for NoSearch {
     async fn search(&self, _question: &str, _k: usize) -> Result<Vec<SeedHit>> {
         Err(anyhow!("{}", self.0))
+    }
+}
+
+/// The longest text the reranker frontier sends for one node, in characters.
+const RERANK_TEXT_CHARS: usize = 1000;
+
+/// The reranker frontier's rescorer: rates the destinations of an expansion
+/// with the configured reranker (`Models::rerank`, one batched call). The text
+/// of a node is what the call already holds without a new index query: for a
+/// SCIP symbol its file, kind and `Owner::name` from the graph in memory, for
+/// a file its path, for any other node its id (a chunk's id names its file).
+/// Not the source text.
+struct GraphRescorer<'a> {
+    models: &'a Models,
+    scip: Arc<ScipMap>,
+    by_node: HashMap<NodeId, usize>,
+    /// The error of every call that failed, in order.
+    errors: Mutex<Vec<String>>,
+}
+
+impl<'a> GraphRescorer<'a> {
+    fn new(models: &'a Models, scip: Arc<ScipMap>) -> Self {
+        let by_node = (0..scip.graph().nodes.len())
+            .map(|i| (scip.node_id(i).clone(), i))
+            .collect();
+        Self {
+            models,
+            scip,
+            by_node,
+            errors: Mutex::default(),
+        }
+    }
+
+    fn text(&self, node: &NodeId) -> String {
+        let text = match (self.by_node.get(node), node) {
+            (Some(&i), _) => {
+                let n = &self.scip.graph().nodes[i];
+                let kind = match n.kind {
+                    lci_maps::scip_graph::FnKind::Function => "fn",
+                    lci_maps::scip_graph::FnKind::Method => "method",
+                };
+                format!("{}\n{kind} {}", n.file.replace('\\', "/"), n.name)
+            }
+            (None, NodeId::File { path }) => path.clone(),
+            (None, other) => other.to_string(),
+        };
+        text.chars().take(RERANK_TEXT_CHARS).collect()
+    }
+
+    fn errors(&self) -> Vec<String> {
+        self.errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The reranker's scores as relevance in `[0, 1]`. A server that returns
+/// probabilities (llama.cpp's `/rerank` does) is used as it is; if any score of
+/// the call lies outside `[0, 1]` (logits), the whole call goes through the
+/// logistic function `1 / (1 + e^-x)`, so one call is always on one scale.
+fn relevance(scores: &[f64]) -> Vec<f64> {
+    if scores.iter().all(|s| (0.0..=1.0).contains(s)) {
+        scores.to_vec()
+    } else {
+        scores.iter().map(|s| 1.0 / (1.0 + (-s).exp())).collect()
+    }
+}
+
+#[lci_maps::async_trait]
+impl FrontierRescorer for &GraphRescorer<'_> {
+    async fn relevance(&self, question: &str, nodes: &[NodeId]) -> Result<Vec<f64>, String> {
+        let answer = if question.trim().is_empty() {
+            Err("the question is empty".to_owned())
+        } else {
+            let documents: Vec<String> = nodes.iter().map(|node| self.text(node)).collect();
+            self.models
+                .rerank(question, &documents)
+                .await
+                .map_err(|error| format!("{error:#}"))
+        };
+        let ranks = match answer {
+            Ok(ranks) => ranks,
+            Err(error) => {
+                self.errors
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(error.clone());
+                return Err(error);
+            }
+        };
+        let mut scores = vec![f64::NAN; nodes.len()];
+        for (index, score) in ranks {
+            scores[index] = f64::from(score);
+        }
+        Ok(relevance(&scores))
     }
 }
 
@@ -1042,7 +1149,19 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .check_identity(&identity)
             .map_err(|e| anyhow!("{e}"))?;
         snapshot.check_priors(&priors).map_err(|e| anyhow!("{e}"))?;
+        snapshot
+            .check_rerank(limits.rerank_frontier.then_some(limits.rerank_floor))
+            .map_err(|e| anyhow!("{e}"))?;
     }
+    let rescorer = match (limits.rerank_frontier, call.seed_search) {
+        (false, _) => None,
+        (true, search) => match search.and_then(|search| search.reranker()) {
+            Some(models) => Some(GraphRescorer::new(models, loaded.scip.clone())),
+            None => bail!(
+                "[traverse] rerank_frontier needs the reranker: the call needs the application (give --root with a question or seeds)"
+            ),
+        },
+    };
     let wants = |id: MapId| wanted.contains(&id);
 
     // The start nodes (not on a continuation, which resumes the old ones).
@@ -1289,6 +1408,10 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .score_bound(limits.score_bound)
         .priors(priors)
         .top_k(call.top_k, expanding);
+    let traversal = match &rescorer {
+        Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
+        None => traversal,
+    };
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),
         None => traversal,
@@ -1329,6 +1452,15 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             notes.push(format!(
                 "{id}: {} calls failed and gave no edges (fail-open); the first: {first}",
                 failures.count()
+            ));
+        }
+    }
+    if let Some(rescorer) = &rescorer {
+        let errors = rescorer.errors();
+        if let Some(first) = errors.first() {
+            notes.push(format!(
+                "rerank_frontier: {} reranker calls failed and left their hops at factor 1; the first: {first}",
+                errors.len()
             ));
         }
     }
@@ -1677,6 +1809,20 @@ fn response_json(
                 "pass_through_pops".into(),
                 json!(result.totals.pass_through_pops),
             );
+        }
+        if let (Some(_), Some(totals)) = (
+            result.rerank_floor,
+            object.get_mut("totals").and_then(Value::as_object_mut),
+        ) {
+            // `rerank_ms` is this call's wall clock; the counts are the whole
+            // traversal's.
+            totals.insert("rerank_calls".into(), json!(result.totals.rerank_calls));
+            totals.insert("rerank_docs".into(), json!(result.totals.rerank_docs));
+            totals.insert(
+                "rerank_failures".into(),
+                json!(result.totals.rerank_failures),
+            );
+            totals.insert("rerank_ms".into(), json!(result.rerank_ms));
         }
         if let Some(checkpoint) = &result.checkpoint {
             object.insert("handle".into(), json!(handle));
@@ -2078,6 +2224,80 @@ mod tests {
             (None, 0),
             ScipMap::with_default_ids(ScipGraph::build(&docs, None)),
         )
+    }
+
+    #[test]
+    fn reranker_scores_become_relevance_on_one_scale_per_call() {
+        // Probabilities pass through; one logit among them moves the whole call
+        // to the logistic scale.
+        assert_eq!(relevance(&[0.0, 0.2, 1.0]), [0.0, 0.2, 1.0]);
+        let logistic = relevance(&[-2.0, 0.0, 3.0]);
+        assert_eq!(logistic[1], 0.5);
+        assert!(logistic[0] < 0.5 && logistic[2] > 0.5 && logistic[2] < 1.0);
+        assert_eq!(relevance(&[0.5, 1.5])[0], 1.0 / (1.0 + (-0.5f64).exp()));
+    }
+
+    #[tokio::test]
+    async fn the_frontier_rates_nodes_by_what_the_graph_holds_and_records_a_failed_call() {
+        let loaded = loaded();
+        let config = lci_core::config::Config {
+            reranker_url: "http://127.0.0.1:1/rerank".into(),
+            ..Default::default()
+        };
+        let models = Models::new(&config).unwrap();
+        let rescorer = GraphRescorer::new(&models, loaded.scip.clone());
+        let symbol = loaded.scip.node_id(0).clone();
+        let text = rescorer.text(&symbol);
+        assert!(text.starts_with("src/search.rs\nfn "), "{text:?}");
+        let file = NodeId::file("src/new.rs").unwrap();
+        assert_eq!(rescorer.text(&file), "src/new.rs");
+        let long = NodeId::file(format!("src/{}.rs", "x".repeat(3000))).unwrap();
+        assert_eq!(rescorer.text(&long).chars().count(), RERANK_TEXT_CHARS);
+
+        // The reranker is unreachable: the call fails, the error is kept, and
+        // an empty question is refused without asking.
+        let error = (&rescorer)
+            .relevance("rank hits", &[symbol.clone(), file.clone()])
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty());
+        let empty = (&rescorer).relevance("  ", &[symbol]).await.unwrap_err();
+        assert_eq!(empty, "the question is empty");
+        assert_eq!(rescorer.errors().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_reranker_frontier_needs_the_application() {
+        let tree = tempfile::tempdir().unwrap();
+        let index = tree.path().join("index.scip");
+        std::fs::write(&index, []).unwrap();
+        let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+        let call = Call {
+            scip_index: &index,
+            scip_root: Some(tree.path()),
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        let limits = TraverseConfig {
+            rerank_frontier: true,
+            ..limits()
+        };
+        let error = run(&limits, &Dirs::under(tree.path()), &call)
+            .await
+            .err()
+            .expect("no reranker")
+            .to_string();
+        assert!(
+            error.contains("rerank_frontier needs the reranker"),
+            "{error}"
+        );
     }
 
     #[test]

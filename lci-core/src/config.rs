@@ -574,6 +574,17 @@ pub struct TraverseConfig {
     /// and their tokens are charged as for any expansion. A resumed traversal keeps the
     /// setting its handle was made with.
     pub pass_through: bool,
+    /// Reranker frontier: after the gate and the beam have kept the edges of
+    /// an expansion, one batched reranker call scores the kept destinations
+    /// against the question, and each kept hop's value is multiplied by
+    /// `rerank_floor + (1 - rerank_floor) * s`, `s` the relevance in `[0, 1]`.
+    /// The factor is at most 1, so the score bound stays sound. A failed call
+    /// leaves the factor at 1. A resumed traversal must be given the same
+    /// setting (its handle keeps it).
+    pub rerank_frontier: bool,
+    /// The factor a hop gets when the reranker rates its destination 0; from
+    /// `0` to `1` (`1` switches the effect off). Only with `rerank_frontier`.
+    pub rerank_floor: f64,
     /// Whether the score bound may end a traversal early (stop reason
     /// `bound`). `false`: the walk runs to its budgets or a dry frontier. A
     /// resumed traversal keeps the setting its handle was made with.
@@ -656,6 +667,11 @@ impl TraverseConfig {
             self.corroboration_boost
         );
         ensure!(
+            (0.0..=1.0).contains(&self.rerank_floor),
+            "traverse.rerank_floor must be a number from 0 to 1 (got {})",
+            self.rerank_floor
+        );
+        ensure!(
             (1..=Self::MAX_SEED_K_LIMIT).contains(&self.seed_k),
             "traverse.seed_k must be 1..={} (got {})",
             Self::MAX_SEED_K_LIMIT,
@@ -692,6 +708,8 @@ impl Default for TraverseConfig {
             corroboration_boost: 0.1,
             fusion: TraverseFusion::Boost,
             pass_through: false,
+            rerank_frontier: false,
+            rerank_floor: 0.25,
             score_bound: true,
             priors: None,
             question_type: None,
@@ -2888,6 +2906,19 @@ fusion = \"rrf\"
         assert!(free.traverse.pass_through);
         let text = format!("{}[traverse]\npass_through = \"yes\"\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
+        // The reranker frontier is off unless set; the floor defaults to 0.25.
+        assert_eq!(value["traverse"]["rerank_frontier"], false);
+        assert_eq!(value["traverse"]["rerank_floor"], 0.25);
+        let text = format!(
+            "{}[traverse]\nrerank_frontier = true\nrerank_floor = 0.5\n",
+            base_toml()
+        );
+        let reranked: Config = toml::from_str(&text).unwrap();
+        reranked.validate().unwrap();
+        assert!(reranked.traverse.rerank_frontier);
+        assert_eq!(reranked.traverse.rerank_floor, 0.5);
+        let text = format!("{}[traverse]\nrerank_frontier = \"yes\"\n", base_toml());
+        assert!(toml::from_str::<Config>(&text).is_err());
         // The score bound is on unless switched off.
         assert_eq!(value["traverse"]["score_bound"], true);
         let text = format!("{}[traverse]\nscore_bound = false\n", base_toml());
@@ -2915,7 +2946,7 @@ fusion = \"{fusion}\"
             assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
         }
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 18] = [
+        let bad: [(&str, Set); 21] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2935,6 +2966,9 @@ fusion = \"{fusion}\"
             ("corroboration_boost", |t| {
                 t.corroboration_boost = TraverseConfig::MAX_CORROBORATION_BOOST + 0.5
             }),
+            ("rerank_floor", |t| t.rerank_floor = -0.1),
+            ("rerank_floor", |t| t.rerank_floor = 1.5),
+            ("rerank_floor", |t| t.rerank_floor = f64::NAN),
             ("priors", |t| t.priors = Some("table.json".into())),
             ("question_type", |t| t.question_type = Some("flow".into())),
             ("priors", |t| {

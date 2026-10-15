@@ -349,6 +349,15 @@ fusion = "boost"
 # make its children free, and the token budget is charged as usual. A resumed
 # traversal keeps the setting its handle was made with.
 pass_through = false
+# Reranker frontier: after the gate and the beam keep the edges of an expansion, one
+# batched reranker call scores the kept destinations against the question, and each
+# kept hop's value is multiplied by rerank_floor + (1 - rerank_floor) * s, s the
+# relevance in 0..1 (a score outside 0..1 is mapped with a logistic function). The
+# factor is at most 1, so the score bound stays sound. A failed call leaves the
+# factor at 1. Uses the configured reranker; a resumed traversal must be given the
+# same two settings. rerank_floor is the factor for relevance 0, 0 to 1 (1: no effect).
+rerank_frontier = false
+rerank_floor = 0.25
 # Whether the score bound may end a traversal early: once enough results exist and
 # nothing queued can lift a result above the k-th, the walk stops with the stop
 # reason `bound`. false: the walk runs to its budgets or a dry frontier. A resumed
