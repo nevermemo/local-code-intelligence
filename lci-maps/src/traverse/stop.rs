@@ -25,11 +25,14 @@
 //!
 //! `max(best frontier potential, best potential below the top k) * (1 + boost * (n_maps - 1)) <= ranked potential of the k-th result`
 //!
-//! where `n_maps` is the number of registered maps that expand nodes (the
-//! caller passes it with `k`: [`super::Traversal::top_k`]; seed-only maps are
-//! not counted), the most a state can be corroborated by; a resumed state that
-//! kept the evidence of more maps than are registered now raises it to what the
-//! states hold. A hop value is at most 1, so no state found from the
+//! with `<` instead of `<=` when a tie-break orders tied results (a state
+//! that can only tie the `k`-th could be the one the tie-break prefers).
+//! `n_maps` is the most a state can be corroborated by: the registered maps
+//! that expand nodes, enabled or not (the caller passes their count with `k`,
+//! [`super::Traversal::top_k`], and their ids, [`super::Traversal::expanders`];
+//! seed-only maps are not counted), and for each state the union of those with
+//! the maps whose evidence it kept, so a resumed state that kept evidence from
+//! maps that have left still has room to gain from the maps registered now. A hop value is at most 1, so no state found from the
 //! frontier has a potential above the frontier's best; ranks only rise by
 //! corroboration, at most by the factor above. A result below the top `k`
 //! can gain maps from a later arrival, so its potential counts too; the

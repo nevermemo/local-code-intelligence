@@ -379,13 +379,11 @@ fn the_most_a_node_can_be_corroborated_by_counts_dependent_maps_once() {
         GraphMap::new("seeds", &[]).accepts(Vec::new()),
     ]);
     assert_eq!(reg.independent_expanders(), 3);
-    reg.set_enabled("m4", false);
-    reg.set_enabled("m1", false);
-    assert_eq!(
-        reg.independent_expanders(),
-        2,
-        "m2 still stands for the graph"
-    );
-    reg.set_enabled("m2", false);
-    assert_eq!(reg.independent_expanders(), 1);
+    assert_eq!(reg.expanding_maps(), ["m1", "m2", "m3", "m4"]);
+    // A map switched off still counts: a steer can switch it on mid-walk.
+    for id in ["m4", "m1", "m2"] {
+        reg.set_enabled(id, false);
+    }
+    assert_eq!(reg.independent_expanders(), 3);
+    assert_eq!(reg.expanding_maps(), ["m1", "m2", "m3", "m4"]);
 }

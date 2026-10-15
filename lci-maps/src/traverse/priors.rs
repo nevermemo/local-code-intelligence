@@ -3,9 +3,11 @@
 //!
 //! A [`PriorTable`] holds, per question type (the gold set's name: `impact`,
 //! `flow`, `where-to`, `history`), a prior for each (map, edge kind) pair.
-//! [`PriorTable::lookup`] falls back to the guess for a type or pair the table
-//! does not hold. The table is plain JSON with sorted keys, so the same fit
-//! always writes the same bytes.
+//! [`PriorTable::lookup`] falls back to the guess for a type the table does
+//! not hold, and, on a [normalised](PriorTable::normalised) table, to the guess
+//! scaled onto the fitted scale for a pair missing from a type it holds. A
+//! prior in a file must be finite and not negative. The table is plain JSON
+//! with sorted keys, so the same fit always writes the same bytes.
 //!
 //! [`PriorFit`] fits a table from traces. A `hop` or `relax` event is one
 //! scored edge. It is a positive when it is the edge that finally parents its
@@ -60,6 +62,10 @@ pub struct PriorTable {
     /// Item ids kept out of the fit; an evaluation uses only these.
     pub holdout: BTreeSet<String>,
     pub types: Priors,
+    /// Per question type, the factor that puts a guessed prior on the scale of
+    /// the type's normalised priors; set by [`PriorTable::normalised`], empty
+    /// otherwise.
+    fallback_scale: BTreeMap<String, f64>,
 }
 
 impl Default for PriorTable {
@@ -68,6 +74,7 @@ impl Default for PriorTable {
             version: VERSION,
             holdout: BTreeSet::new(),
             types: Priors::new(),
+            fallback_scale: BTreeMap::new(),
         }
     }
 }
@@ -78,14 +85,22 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 impl PriorTable {
     /// The prior of a hop of `kind` offered by `map` for `question_type`; the
-    /// guessed [`kind_prior`] when the table has no such type or pair.
+    /// guessed [`kind_prior`] when the table has no such type. For a pair a
+    /// held type lacks, the guess on the type's scale on a normalised table:
+    /// `min(1, kind_prior(kind) * c)`, `c` being the type's normalised priors
+    /// summed over the sum of the guesses for the same entries (see
+    /// [`PriorTable::normalised`]); the plain guess on any other table.
     pub fn lookup(&self, question_type: &str, map: &str, kind: EdgeKind) -> f64 {
-        self.types
-            .get(question_type)
-            .and_then(|maps| maps.get(map))
+        let Some(maps) = self.types.get(question_type) else {
+            return kind_prior(kind);
+        };
+        maps.get(map)
             .and_then(|kinds| kinds.get(&kind))
             .copied()
-            .unwrap_or_else(|| kind_prior(kind))
+            .unwrap_or_else(|| match self.fallback_scale.get(question_type) {
+                Some(scale) => (kind_prior(kind) * scale).min(1.0),
+                None => kind_prior(kind),
+            })
     }
 
     /// The table the engine prices hops with: per question type, every prior
@@ -93,9 +108,16 @@ impl PriorTable {
     /// keep their ratios (fitted base rates are far below the guess, whose
     /// scale the gate and beam arithmetic assumes). A type whose largest
     /// prior is not positive is left as it is.
+    ///
+    /// A guess is on the guess scale, not the fitted one (a fitted call at
+    /// 0.088 against a guessed 1.0), so a pair missing from a held type would
+    /// outrank every fitted pair. Each scaled type records
+    /// `c = (sum of its normalised priors) / (sum of the guesses for the kinds
+    /// of the same entries)`, and [`PriorTable::lookup`] prices a missing pair
+    /// at `min(1, guess * c)`. A type the table lacks keeps the plain guess.
     pub fn normalised(&self) -> Self {
         let mut table = self.clone();
-        for maps in table.types.values_mut() {
+        for (question_type, maps) in &mut table.types {
             let top = maps
                 .values()
                 .flat_map(BTreeMap::values)
@@ -105,6 +127,17 @@ impl PriorTable {
                 maps.values_mut()
                     .flat_map(BTreeMap::values_mut)
                     .for_each(|prior| *prior /= top);
+                let fitted: f64 = maps.values().flat_map(BTreeMap::values).sum();
+                let guessed: f64 = maps
+                    .values()
+                    .flat_map(BTreeMap::keys)
+                    .map(|kind| kind_prior(*kind))
+                    .sum();
+                if guessed > 0.0 {
+                    table
+                        .fallback_scale
+                        .insert(question_type.clone(), fitted / guessed);
+                }
             }
         }
         table
@@ -169,6 +202,11 @@ impl PriorTable {
                     let prior = prior
                         .as_f64()
                         .ok_or_else(|| invalid("a prior must be a number"))?;
+                    if !prior.is_finite() || prior < 0.0 {
+                        return Err(invalid(format!(
+                            "the prior of {question_type}/{map}/{name} must be finite and not negative"
+                        )));
+                    }
                     table
                         .types
                         .entry(question_type.clone())
@@ -516,14 +554,79 @@ mod tests {
         assert!((at("impact", "scip.impact", EdgeKind::CallsOrRefs) - 0.5).abs() < 1e-12);
         assert_eq!(at("flow", "graph.scip", EdgeKind::CallsOrRefs), 1.0);
         assert_eq!(at("dead", "graph.scip", EdgeKind::CallsOrRefs), 0.0);
-        // The file keeps the raw values; an absent pair is still the guess.
+        // The file keeps the raw values and the plain guess for an absent pair.
         assert_eq!(
             table.lookup("impact", "graph.scip", EdgeKind::DefinedIn),
             0.13
         );
         assert_eq!(
-            at("impact", "graph.scip", EdgeKind::Tests),
+            table.lookup("impact", "graph.scip", EdgeKind::Tests),
             kind_prior(EdgeKind::Tests)
         );
+        // A type the table lacks keeps the plain guess when normalised too, and
+        // so does a type left unscaled (no positive prior).
+        assert_eq!(
+            at("history", "graph.scip", EdgeKind::Tests),
+            kind_prior(EdgeKind::Tests)
+        );
+        assert_eq!(
+            at("dead", "graph.scip", EdgeKind::Tests),
+            kind_prior(EdgeKind::Tests)
+        );
+    }
+
+    #[test]
+    fn a_pair_missing_from_a_held_type_falls_back_to_the_guess_on_the_fitted_scale() {
+        // Fitted calls at 0.088 and containment at 0.044: normalised 1 and 0.5.
+        let mut table = PriorTable::default();
+        for (map, kind, prior) in [
+            ("graph.scip", EdgeKind::CallsOrRefs, 0.088),
+            ("graph.scip", EdgeKind::Contains, 0.044),
+            ("scip.impact", EdgeKind::CallsOrRefs, 0.022),
+        ] {
+            table
+                .types
+                .entry("flow".into())
+                .or_default()
+                .entry(map.into())
+                .or_default()
+                .insert(kind, prior);
+        }
+        let got = table.normalised();
+        // c = (1 + 0.5 + 0.25) / (1.0 + 0.5 + 1.0), the guesses of the three
+        // entries' kinds.
+        let scale = 1.75 / 2.5;
+        let expected = kind_prior(EdgeKind::Tests) * scale;
+        let tests = got.lookup("flow", "graph.scip", EdgeKind::Tests);
+        assert!((tests - expected).abs() < 1e-12, "{tests}");
+        // Under the plain guess, which was far above these fitted base rates.
+        assert!(tests < kind_prior(EdgeKind::Tests));
+        // A map the type does not hold falls back the same way, and never past 1.
+        assert_eq!(got.lookup("flow", "other.map", EdgeKind::Tests), tests);
+        assert!(got.lookup("flow", "other.map", EdgeKind::CallsOrRefs) <= 1.0);
+        // A type absent from the table keeps the plain guess.
+        assert_eq!(
+            got.lookup("impact", "graph.scip", EdgeKind::Tests),
+            kind_prior(EdgeKind::Tests)
+        );
+        // Fitted pairs are not touched.
+        assert_eq!(got.lookup("flow", "graph.scip", EdgeKind::CallsOrRefs), 1.0);
+    }
+
+    #[test]
+    fn a_prior_that_is_negative_or_not_finite_is_rejected_on_load() {
+        let table = |prior: &str| {
+            format!(
+                r#"{{"version": 1, "priors": {{"flow": {{"graph.scip": {{"calls_or_refs": {prior}}}}}}}}}"#
+            )
+        };
+        assert!(PriorTable::from_json_str(&table("0.5")).is_ok());
+        assert!(PriorTable::from_json_str(&table("0")).is_ok());
+        for bad in ["-0.1", "-1e-9", "1e999", "\"NaN\"", "null"] {
+            assert!(PriorTable::from_json_str(&table(bad)).is_err(), "{bad}");
+        }
+        let error = PriorTable::from_json_str(&table("-0.1")).unwrap_err();
+        assert!(error.to_string().contains("flow/graph.scip/calls_or_refs"));
+        assert!(HopPriors::from_text(&table("-0.1"), "flow").is_err());
     }
 }

@@ -144,7 +144,8 @@ impl fmt::Display for HandleError {
                 expected,
             } => write!(
                 f,
-                "handle {handle} was made with the tie-break {found}, this call has \n                 {expected}; give the same file, or start a new traversal"
+                "handle {handle} was made with the tie-break {found}, this call has \
+                 {expected}; give the same file, or start a new traversal"
             ),
         }
     }

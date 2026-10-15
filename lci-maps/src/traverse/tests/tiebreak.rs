@@ -90,10 +90,13 @@ async fn a_tie_break_orders_ties_only_and_leaves_the_walk_alone() {
     assert_eq!(broken.events, plain.events);
 }
 
-/// The bound reasons about rank alone: with or without a tie-break it ends the
-/// walk at the same pop, with the same states.
+/// Without a tie-break the bound ends the walk once the `k`-th rank cannot be
+/// beaten, ties included. With one, `alpha`, `beta` and `gamma` tie at the 2nd
+/// rank (0.5) and a tied state could be the one it prefers: the walk goes on
+/// past the pop where the plain walk stopped.
 #[tokio::test]
-async fn the_score_bound_ends_the_walk_where_it_did() {
+async fn the_score_bound_waits_for_a_state_that_can_tie_the_kth_when_a_tie_break_is_in_use() {
+    use crate::traverse::stop::StopReason;
     let bounded = |tie_break| async move {
         walk(&graph(), vec![seed("s")], budget(20), |t| {
             t.question("beta").tie_break(tie_break).top_k(2, 1)
@@ -102,10 +105,26 @@ async fn the_score_bound_ends_the_walk_where_it_did() {
     };
     let plain = bounded(None).await;
     let broken = bounded(Some(tie_break(1.0))).await;
-    assert_eq!(plain.stop_reason, crate::traverse::stop::StopReason::Bound);
-    assert_eq!(broken.stop_reason, plain.stop_reason);
-    assert_eq!(broken.states, plain.states);
-    assert_eq!(broken.popped, plain.popped);
+    assert_eq!(plain.stop_reason, StopReason::Bound);
+    assert!(broken.totals.pops > plain.totals.pops);
+    // Every state of the plain walk is in the longer one, with the same rank.
+    assert!(broken.states.len() >= plain.states.len());
+    assert!(broken.popped.starts_with(&plain.popped));
+    // The tied states were expanded: the plain walk stopped before them.
+    assert!(!popped_names(&plain).contains(&"src/gamma.rs".to_string()));
+    assert!(popped_names(&broken).contains(&"src/gamma.rs".to_string()));
+}
+
+#[test]
+fn a_handle_that_refuses_a_tie_break_says_so_on_one_line() {
+    let error = HandleError::WrongTieBreak {
+        handle: "h".into(),
+        found: "aaa".into(),
+        expected: "none".into(),
+    };
+    let text = error.to_string();
+    assert!(!text.contains('\n') && !text.contains("  "), "{text:?}");
+    assert!(text.contains("this call has none; give the same file"));
 }
 
 #[tokio::test]

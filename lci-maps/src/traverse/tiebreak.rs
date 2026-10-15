@@ -9,12 +9,13 @@
 //! its own order.
 //!
 //! The expression only orders results that are tied at the same
-//! `ranked_potential`. It cannot lift a result over a higher-ranked one, and
-//! the score bound ([`super::stop`]) still reasons about `ranked_potential`
-//! alone, so it stays sound. The bound fixes the top-`k` set by rank; where
-//! the `k`-th rank is shared, which of the tied results fill the last slots is
-//! decided among those found when the walk ended (a walk that goes on, such as
-//! one with the bound off, may find a tied result the expression prefers).
+//! `ranked_potential`. It cannot lift a result over a higher-ranked one. The
+//! score bound ([`super::stop`]) reasons about `ranked_potential` alone, but
+//! with a tie-break it is strict: a state that can only tie the `k`-th rank
+//! could be the one the expression prefers for a last slot, so the walk ends
+//! on the bound only when nothing in the frontier, and no result below the top
+//! `k`, can reach the `k`-th rank. Where the `k`-th rank is shared, the tied
+//! results the walk found fill the last slots by the expression.
 //!
 //! The features of a result are [`Facts::features`]; a name absent from the
 //! file has weight 0:

@@ -153,6 +153,80 @@ async fn q1_a_result_below_k_that_a_queued_expansion_will_corroborate_keeps_the_
     assert!(top.contains(&node("z")), "{top:?}");
 }
 
+#[tokio::test]
+async fn q1_with_a_tie_break_a_state_that_can_tie_the_kth_keeps_the_bound_off() {
+    use crate::traverse::tiebreak::TieBreak;
+    // `a` and `b` both rank 1 (every hop is worth 1). After `s` is popped the
+    // queue holds `a` at 1 and one result exists: without a tie-break a state
+    // that can only tie the 1st changes nothing, so the walk stops there.
+    let reg = registry(vec![GraphMap::new("g", &[("s", "a"), ("a", "b")])]);
+    let plain = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(1, 1)).await;
+    assert_eq!(plain.stop_reason, StopReason::Bound);
+    assert!(!plain.reached(&node("b")));
+
+    // With a tie-break that prefers depth, `b` (tied with `a`) is the one it
+    // prefers: the walk must reach it before it can stop.
+    let depth = TieBreak::from_text(r#"{"version": 1, "features": {"depth": 10.0}}"#).unwrap();
+    let result = walk(&reg, vec![seed("s")], budget(100), |t| {
+        t.tie_break(Some(depth)).top_k(1, 1)
+    })
+    .await;
+    assert!(result.reached(&node("b")));
+    assert!(popped_names(&result).contains(&"src/a.rs".to_string()));
+    assert!(events_of(&result, "bound").is_empty());
+    let top = result.ranked()[0];
+    assert_eq!(result.states[top].node, node("b"));
+}
+
+#[tokio::test]
+async fn q1_with_a_tie_break_the_bound_still_holds_when_nothing_can_reach_the_kth() {
+    use crate::traverse::tiebreak::TieBreak;
+    // `s` offers `a` (a call, 1) and `b`, `c` (containment, 0.5). With k = 1
+    // the 1st result is `a` at 1; once `a` is popped the queue holds `b` and
+    // `c` at 0.5 and the best result below the 1st is 0.5, strictly less.
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("s", "a")]),
+        GraphMap::new("m2", &[("s", "b"), ("s", "c")]).kind(EdgeKind::Contains),
+    ]);
+    let depth = TieBreak::from_text(r#"{"version": 1, "features": {"depth": 10.0}}"#).unwrap();
+    let result = walk(&reg, vec![seed("s")], budget(100), |t| {
+        t.tie_break(Some(depth)).top_k(1, 1)
+    })
+    .await;
+    assert_eq!(result.stop_reason, StopReason::Bound);
+    assert_eq!(popped_names(&result), ["src/s.rs", "src/a.rs"]);
+    let top = result.ranked()[0];
+    assert_eq!(result.states[top].node, node("a"));
+}
+
+#[tokio::test]
+async fn q1_a_resumed_state_counts_corroboration_from_the_maps_now_registered() {
+    // Map `a` found `x` and `y` before the pause. The resume registers only
+    // `b`, which offers `y` from `x`. A state with evidence from `a` alone can
+    // gain `b`: two maps, not one, so `y` (potential 1) can rank 1.5 and the
+    // bound must not hold at potential 1 before `x` is expanded.
+    let first_map = registry(vec![GraphMap::new("a", &[("s", "x"), ("s", "y")])]);
+    let first = walk(&first_map, vec![seed("s")], budget(1), |t| t).await;
+    let snapshot = first.snapshot.expect("the walk paused");
+
+    let second_map = registry(vec![GraphMap::new("b", &[("x", "y")])]);
+    let result = resume(&second_map, snapshot, budget(100), |t| {
+        t.corroboration_boost(0.5)
+            .top_k(1, second_map.independent_expanders())
+            .expanders(second_map.expanding_maps())
+    })
+    .await;
+    assert_eq!(result.stop_reason, StopReason::Bound);
+    let bound = events_of(&result, "bound");
+    assert_eq!(bound.len(), 1);
+    assert_eq!(bound[0]["maps"], 2, "{}", bound[0]);
+    // Not at the start of the resume: `x` was expanded, where `b` reached `y`.
+    assert!(popped_names(&result).contains(&"src/x.rs".to_string()));
+    let top = result.ranked()[0];
+    assert_eq!(result.states[top].node, node("y"));
+    assert_eq!(result.states[top].n_maps(), 2);
+}
+
 // ---- every exit names its reason and the maps that ran --------------------------------
 
 fn reason_of(result: &TraversalResult) -> (StopReason, &str) {

@@ -428,6 +428,9 @@ pub struct Traversal<'s> {
     tie_break: Option<TieBreak>,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
+    /// The registered maps that expand nodes, each with whether its card says
+    /// `dependent`; see [`Traversal::expanders`].
+    expanders: Vec<(MapId, bool)>,
     identity: String,
 }
 
@@ -455,19 +458,37 @@ impl<'s> Traversal<'s> {
             priors: HopPriors::default(),
             tie_break: None,
             bound: None,
+            expanders: Vec::new(),
             identity: String::new(),
         }
     }
 
     /// Ends the walk with the stop reason `bound` once `k` results exist and
     /// neither the frontier nor a result below the top `k` can lift a result
-    /// above the `k`-th (see [`stop`]). `n_maps` is how many registered maps expand nodes (seed-only
-    /// maps do not count): the most a state can be corroborated by. Not kept
+    /// above the `k`-th (see [`stop`]). `n_maps` is how many registered maps expand nodes, enabled
+    /// or not (seed-only maps do not count): the most a state can be corroborated by. Not kept
     /// in a handle; a resumed traversal passes it again. Without targets only:
     /// a walk with targets ends when they are reached. `k` of 0 switches the
     /// bound off.
     pub fn top_k(mut self, k: usize, n_maps: usize) -> Self {
         self.bound = (k > 0).then_some((k, n_maps));
+        self
+    }
+
+    /// The ids of the registered maps that expand nodes (`Registry::expanding_maps`), enabled
+    /// or not: a steer can switch one on later. The score bound then counts, for each state,
+    /// the union of the maps whose evidence it kept and these (maps whose cards say `dependent`
+    /// once together), so a resumed state that kept evidence from maps that have left still
+    /// has room to gain from the maps registered now. Without them the bound counts the larger
+    /// of the `n_maps` of [`Traversal::top_k`] and what each state kept. Not kept in a handle.
+    pub fn expanders(mut self, ids: impl IntoIterator<Item = MapId>) -> Self {
+        let mut expanders: Vec<(MapId, bool)> = Vec::new();
+        for id in ids {
+            if !expanders.iter().any(|(known, _)| *known == id) {
+                expanders.push((id, self.source.card(id).dependent));
+            }
+        }
+        self.expanders = expanders;
         self
     }
 
@@ -540,8 +561,9 @@ impl<'s> Traversal<'s> {
     }
 
     /// Orders results that tie at the same rank (default: discovery order);
-    /// see [`tiebreak`]. It does not change the walk or the score bound. A
-    /// handle keeps the file's hash, not the file: the caller passes it again
+    /// see [`tiebreak`]. It does not change the walk. With one, the score
+    /// bound holds only when nothing can tie the `k`-th result, since the
+    /// tie-break could prefer the tying one. A handle keeps the file's hash, not the file: the caller passes it again
     /// on a resume and checks it with [`handle::Snapshot::check_tie_break`].
     pub fn tie_break(mut self, tie_break: Option<TieBreak>) -> Self {
         self.tie_break = tie_break;
@@ -999,6 +1021,12 @@ impl<'s> Run<'s> {
     /// need not hold that node for the arrival to come. The bound fixes the
     /// top-`k` set, not the order inside it: corroboration of a result in the
     /// top `k` can still reorder it.
+    ///
+    /// With a tie-break the comparison is strict: a state that can tie the
+    /// `k`-th result could be the one the tie-break prefers, so the walk goes
+    /// on until nothing can reach the `k`-th rank. Without one a tie changes
+    /// nothing (discovery order), and a state that can only tie does not hold
+    /// the walk.
     fn bound_holds(&self) -> Option<Value> {
         let (k, n_maps) = self.t.bound?;
         // A fused score depends on the ranks of all the other results, so no
@@ -1029,15 +1057,24 @@ impl<'s> Run<'s> {
             .states()
             .map(|s| self.states[s].potential)
             .fold(f64::NEG_INFINITY, f64::max);
-        // The most a state can be corroborated by: the maps now registered, or
-        // the evidence a resumed state kept from maps that have left.
+        // The most a state can be corroborated by: the maps registered, and
+        // for each state the union of those with the evidence it kept (a
+        // resumed state may hold maps that have left; the maps count once each
+        // as `State::n_maps` counts them).
         let n_maps = self
             .states
             .iter()
-            .map(State::n_maps)
+            .map(|s| self.corroboration_ceiling(s))
             .fold(n_maps, usize::max);
         let factor = 1.0 + self.t.boost * n_maps.saturating_sub(1) as f64;
-        (best.max(below_k_best.unwrap_or(f64::NEG_INFINITY)) * factor <= kth).then(|| {
+        let reach = best.max(below_k_best.unwrap_or(f64::NEG_INFINITY)) * factor;
+        // A tie-break may prefer a state that only ties the `k`-th.
+        let holds = if self.t.tie_break.is_some() {
+            reach < kth
+        } else {
+            reach <= kth
+        };
+        holds.then(|| {
             json!({
                 "ev": "bound", "pop": self.totals.pops, "k": k, "kth": kth,
                 "frontier_best": best, "below_k_best": below_k_best,
@@ -1045,6 +1082,25 @@ impl<'s> Run<'s> {
                 "frontier": self.frontier.len(),
             })
         })
+    }
+
+    /// The most independent maps `state` can have evidence from: the maps it
+    /// kept plus the registered expanders it does not hold yet, the dependent
+    /// maps among them counted once together. Without the registered ids
+    /// ([`Traversal::expanders`]) only what the state kept.
+    fn corroboration_ceiling(&self, state: &State) -> usize {
+        let mut independent = state.maps.len() - state.dependent;
+        let mut dependent = state.dependent;
+        for (id, is_dependent) in &self.t.expanders {
+            if !state.maps.contains(id) {
+                if *is_dependent {
+                    dependent += 1;
+                } else {
+                    independent += 1;
+                }
+            }
+        }
+        independent + usize::from(dependent > 0)
     }
 
     fn end_status(&self, exhausted: bool) -> TraversalStatus {

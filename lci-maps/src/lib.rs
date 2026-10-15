@@ -576,14 +576,15 @@ impl<'a> Registry<'a> {
         found
     }
 
-    /// How many independent maps can offer a traversal edge: the enabled
+    /// How many independent maps can offer a traversal edge: the registered
     /// maps that accept some node kind (a start-node source accepts none),
-    /// with the maps whose cards say `dependent` counted once together. The
-    /// most a node can be corroborated by.
+    /// enabled or not (a steer can switch one on during a walk), with the
+    /// maps whose cards say `dependent` counted once together. The most a
+    /// node can be corroborated by.
     pub fn independent_expanders(&self) -> usize {
         let (mut independent, mut dependent) = (0, false);
         for entry in &self.entries {
-            if entry.enabled && !entry.map.describe().accepts.is_empty() {
+            if !entry.map.describe().accepts.is_empty() {
                 if entry.map.card().dependent {
                     dependent = true;
                 } else {
@@ -592,6 +593,17 @@ impl<'a> Registry<'a> {
             }
         }
         independent + usize::from(dependent)
+    }
+
+    /// The ids of the registered maps that accept some node kind, enabled or
+    /// not, in fusion order: the maps [`Registry::independent_expanders`]
+    /// counts, for `Traversal::expanders`.
+    pub fn expanding_maps(&self) -> Vec<MapId> {
+        self.entries
+            .iter()
+            .filter(|e| !e.map.describe().accepts.is_empty())
+            .map(|e| e.map.describe().id)
+            .collect()
     }
 
     /// The registered ids in fusion order.

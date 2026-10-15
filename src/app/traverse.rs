@@ -1439,7 +1439,8 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .score_bound(limits.score_bound)
         .priors(priors)
         .tie_break(tie_break)
-        .top_k(call.top_k, expanding);
+        .top_k(call.top_k, expanding)
+        .expanders(registry.expanding_maps());
     let traversal = match &rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
         None => traversal,
