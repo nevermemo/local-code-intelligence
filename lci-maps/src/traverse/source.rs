@@ -110,6 +110,61 @@ pub struct Expansion {
     pub calls: Vec<ExpandCall>,
 }
 
+/// The expansion cost each map is priced with when a traversal ranks hops: a
+/// recorded estimate, so that the ranking does not follow a map's running p50
+/// as the machine gets loaded, and so that both edge sources can use the same
+/// numbers.
+///
+/// [`OnTheFly::new`] records the table once, from the maps' cards, and keeps
+/// it for its lifetime. [`MergedAdjacency`](super::merged::MergedAdjacency)
+/// records one at every build or update and
+/// [`PreMerged`](super::merged::PreMerged) prices with it. To compare the two
+/// sources, or to rank by a table fixed beforehand, give the on-the-fly source
+/// the adjacency's table with [`OnTheFly::with_costs`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostTable {
+    p50_ms: BTreeMap<MapId, Option<f64>>,
+}
+
+impl CostTable {
+    /// What the maps of `registry` report as their p50 now.
+    pub fn record(registry: &Registry<'_>) -> Self {
+        Self::of_cards(registry.entries.iter().map(|entry| {
+            let map = &entry.map;
+            (map.describe().id, map.card())
+        }))
+    }
+
+    /// The p50 of each card.
+    pub fn of_cards(cards: impl IntoIterator<Item = (MapId, MapCard)>) -> Self {
+        Self {
+            p50_ms: cards
+                .into_iter()
+                .map(|(id, card)| (id, card.expand_p50_ms))
+                .collect(),
+        }
+    }
+
+    /// The recorded p50 of `map`; `None` when it has none or is unknown.
+    pub fn p50_ms(&self, map: &str) -> Option<f64> {
+        self.p50_ms.get(map).copied().flatten()
+    }
+
+    /// Whether the table has an entry for `map` (even an empty one).
+    pub fn knows(&self, map: &str) -> bool {
+        self.p50_ms.contains_key(map)
+    }
+
+    /// `card` with its p50 replaced by the recorded one, when the table knows
+    /// the map.
+    pub fn priced(&self, map: &str, mut card: MapCard) -> MapCard {
+        if self.knows(map) {
+            card.expand_p50_ms = self.p50_ms(map);
+        }
+        card
+    }
+}
+
 #[crate::async_trait]
 pub trait EdgeSource: Send + Sync {
     /// The edges leaving `node`, fused, within `budget`.
@@ -131,16 +186,32 @@ pub struct OnTheFly<'r, 'a, 'v> {
     off: HashSet<String>,
     /// Content hashes of the view's files, for the sites of the edges.
     blobs: OnceLock<FileBlobs>,
+    /// What hops are priced with (see [`CostTable`]).
+    costs: CostTable,
 }
 
 impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
+    /// A source that prices hops with the maps' p50 as of now.
     pub fn new(registry: &'r Registry<'a>, view: &'r SnapshotView<'v>) -> Self {
         Self {
             registry,
             view,
             off: HashSet::new(),
             blobs: OnceLock::new(),
+            costs: CostTable::record(registry),
         }
+    }
+
+    /// Prices hops with `costs` instead of the maps' p50 as of now, so that
+    /// this source ranks as another one (a pre-merged adjacency) does.
+    pub fn with_costs(mut self, costs: CostTable) -> Self {
+        self.costs = costs;
+        self
+    }
+
+    /// The table hops are priced with.
+    pub fn costs(&self) -> &CostTable {
+        &self.costs
     }
 
     /// The blob of each file of the view.
@@ -257,7 +328,7 @@ impl EdgeSource for OnTheFly<'_, '_, '_> {
             .entries
             .iter()
             .find(|entry| entry.map.describe().id == map)
-            .map(|entry| entry.map.card())
+            .map(|entry| self.costs.priced(map, entry.map.card()))
             .unwrap_or_default()
     }
 

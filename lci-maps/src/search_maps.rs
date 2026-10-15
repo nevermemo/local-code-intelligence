@@ -50,7 +50,10 @@
 //!
 //! `search.lexical` reads the working tree and maps it onto the snapshot, as
 //! the lexical channel does: [`FreshnessModel::Live`]. `search.vector` reads
-//! the snapshot: [`FreshnessModel::PerFile`].
+//! the snapshot but answers with the chunks nearest to the node's vector among
+//! all of the index, so a new, changed or deleted file anywhere can change the
+//! answer for a node whose own file did not: [`FreshnessModel::Global`]. A
+//! pre-merged adjacency therefore asks it again whenever the snapshot moves.
 
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, Freshness, FreshnessModel, Map,
@@ -580,7 +583,7 @@ impl<'a> VectorChunks<'a> {
                 accepts_text: false,
                 accepts: vec![NodeKind::Symbol, NodeKind::File, NodeKind::Chunk],
                 emits: vec![NodeKind::Chunk],
-                freshness: FreshnessModel::PerFile,
+                freshness: FreshnessModel::Global,
                 source_labels: vec![SourceLabel::Vector],
                 needs: vec![Need::Embedding],
             },

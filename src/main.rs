@@ -410,7 +410,7 @@ struct TraverseArgs {
     search_profile: Option<String>,
     /// The steering policy: a JSON file or inline JSON, either an array of
     /// rules or the object of `search_code`'s `steer` (rules, ladder,
-    /// max_stops, tau, stop_every).
+    /// max_stops, tau, stop_every, on_disagreement, likely_complete).
     #[arg(long)]
     policy: Option<String>,
     /// A stop (a consultation of the rules) every this many pops.

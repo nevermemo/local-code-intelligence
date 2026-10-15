@@ -1,8 +1,9 @@
 # Steering policies for `maps bench --policy`
 
 A policy file is the `--policy` argument of `lci traverse` (the `steer` object
-of `search_code`: rules, ladder, max_stops, tau, stop_every). JSON has no
-comments and the object refuses unknown keys, so each file is described here.
+of `search_code`: rules, ladder, max_stops, tau, stop_every, on_disagreement,
+likely_complete). JSON has no comments and the object refuses unknown keys, so
+each file is described here.
 Pass the path to `cargo xtask maps bench --policy <file>`; the trend row's
 `policy` column then names the file instead of `default`.
 
@@ -23,10 +24,11 @@ Turns the stop ladder on with rules only (no model, no agent answer):
 - a final `continue` rule that matches every node. Without it a stop no rung
   can decide returns a checkpoint, which ends a CLI run (the CLI has no
   agent to answer). With it the rules are confident at every stop and the run
-  goes on.
-
-Not expressible here: the likely-complete and disagreement stop triggers.
-`StopPolicy` has both (`likely_complete`, `on_disagreement`), but the
-`steer` object has no field for them and the traverse call only builds
-`StopPolicy::every(..).max_stops(..)`. Adding them needs `SteerArgs` and the
-handler construction in `src/app/traverse.rs`, which this slice did not touch.
+  goes on;
+- two more stop triggers beside the periodic one (`on_disagreement` and
+  `likely_complete`; every stop counts toward `max_stops`): a stop once 5 new
+  disagreements (a node a fuzzy map offered that a structural map, asked at
+  the same expansion, did not) have been recorded since the last stop, and
+  one stop once the mark-recapture estimate says 90 percent of the findable
+  nodes are found. Both only decide when the rules are consulted; with the
+  catch-all `continue` rule the run goes on after each.

@@ -3,9 +3,10 @@
 //!
 //! An agent writes rules as JSON; [`RuleList::from_json`] parses them into a
 //! closed AST (no eval, no scripts). Bounds: at most [`MAX_RULES`] rules,
-//! predicates nested at most [`MAX_NESTING`] deep, and an evaluation time of
-//! at most [`EVAL_CAP`] per stop (the list stops looking at nodes when the
-//! time is up and says so). The only actions are those of [`Action`]; none
+//! predicates nested at most [`MAX_NESTING`] deep, and at most [`MAX_STEPS`]
+//! predicate evaluations per stop (the list stops looking at nodes when the
+//! count is used up and says so; a generous wall-time backstop, [`EVAL_CAP`],
+//! does the same and adds an `emit` note). The only actions are those of [`Action`]; none
 //! raises a budget, and the engine clamps what they ask for.
 //!
 //! ```json
@@ -45,6 +46,7 @@ use crate::traverse::handler::{
 use lci_core::node::{NodeId, NodeKind};
 use serde_json::Value;
 use std::{
+    cell::Cell,
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -54,8 +56,19 @@ pub const MAX_NESTING: usize = 8;
 /// The most children of one `all` or `any`.
 pub const MAX_CHILDREN: usize = 16;
 pub const MAX_GLOB: usize = 128;
-/// The evaluation time of one stop.
-pub const EVAL_CAP: Duration = Duration::from_millis(5);
+/// The most predicate evaluations one stop may spend. The bound that decides
+/// when a list is cut short: it counts work, not time, so the same input is
+/// cut at the same place on any machine. The grammar caps a list at
+/// [`MAX_RULES`] rules and a checkpoint at 256 frontier items, so a flat list
+/// never reaches it.
+pub const MAX_STEPS: u32 = 200_000;
+/// A generous wall-time backstop for one stop (a hung or starved process, not
+/// a tuning knob). Crossing it cuts the list short like [`MAX_STEPS`] and
+/// adds an `emit` note saying so; under normal load it never fires, so it
+/// does not change decisions.
+pub const EVAL_CAP: Duration = Duration::from_millis(250);
+/// The wall clock is read once per this many node-by-rule checks.
+const WALL_CHECK_EVERY: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmp {
@@ -440,9 +453,12 @@ pub fn node_path(node: &NodeId) -> Option<String> {
 struct Cx<'a> {
     checkpoint: &'a Checkpoint,
     item: Option<&'a FrontierItem>,
+    /// Predicate evaluations so far in this stop.
+    steps: &'a Cell<u32>,
 }
 
 fn eval(predicate: &Predicate, cx: &Cx) -> bool {
+    cx.steps.set(cx.steps.get().saturating_add(1));
     let on_item = |test: &dyn Fn(&FrontierItem) -> bool| cx.item.is_some_and(test);
     match predicate {
         Predicate::Kind(kind) => on_item(&|i| i.node.kind() == *kind),
@@ -480,7 +496,16 @@ fn contradicts(a: &Action, b: &Action) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleList {
     rules: Vec<Rule>,
+    /// The wall-time backstop.
     eval_cap: Duration,
+    max_steps: u32,
+}
+
+/// Why an evaluation was cut short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Steps,
+    Wall,
 }
 
 impl RuleList {
@@ -491,6 +516,7 @@ impl RuleList {
         Ok(Self {
             rules,
             eval_cap: EVAL_CAP,
+            max_steps: MAX_STEPS,
         })
     }
 
@@ -522,9 +548,16 @@ impl RuleList {
         Self::new(rules)
     }
 
-    /// A shorter evaluation time than [`EVAL_CAP`]; a longer one is ignored.
+    /// A shorter wall-time backstop than [`EVAL_CAP`]; a longer one is
+    /// ignored.
     pub fn with_eval_cap(mut self, cap: Duration) -> Self {
         self.eval_cap = cap.min(EVAL_CAP);
+        self
+    }
+
+    /// A smaller step cap than [`MAX_STEPS`]; a larger one is ignored.
+    pub fn with_max_steps(mut self, steps: u32) -> Self {
+        self.max_steps = steps.min(MAX_STEPS);
         self
     }
 
@@ -540,20 +573,50 @@ impl Handler for RuleList {
 
     fn decide(&self, checkpoint: &Checkpoint, budget: &StopBudget) -> Decision {
         let started = Instant::now();
+        self.decide_with(checkpoint, budget, &|| started.elapsed())
+    }
+}
+
+impl RuleList {
+    /// [`Handler::decide`] with the clock passed in, so a test can slow it.
+    fn decide_with(
+        &self,
+        checkpoint: &Checkpoint,
+        budget: &StopBudget,
+        elapsed: &dyn Fn() -> Duration,
+    ) -> Decision {
         let cap = self.eval_cap.min(budget.max_eval).min(EVAL_CAP);
-        let expired = || started.elapsed() >= cap;
+        let steps = Cell::new(0u32);
+        let ticks = Cell::new(0u32);
+        let cut: Cell<Option<Cut>> = Cell::new(None);
+        // Work is the deterministic bound and is checked first; the wall
+        // clock is only a backstop, read once per few checks.
+        let cut_now = || {
+            if cut.get().is_some() {
+                return true;
+            }
+            let why = if steps.get() >= self.max_steps {
+                Some(Cut::Steps)
+            } else {
+                let tick = ticks.get();
+                ticks.set(tick.wrapping_add(1));
+                (tick.is_multiple_of(WALL_CHECK_EVERY) && elapsed() >= cap).then_some(Cut::Wall)
+            };
+            cut.set(why);
+            why.is_some()
+        };
         let mut decision = Decision::default();
         let mut matched = false;
         let mut conflicts = 0u32;
 
         'nodes: for item in &checkpoint.frontier {
-            if expired() {
-                decision.truncated = true;
+            if cut_now() {
                 break;
             }
             let cx = Cx {
                 checkpoint,
                 item: Some(item),
+                steps: &steps,
             };
             // The first match decides; a later match that contradicts it
             // makes the whole list uncertain (it still applies the first).
@@ -587,17 +650,19 @@ impl Handler for RuleList {
                     &Cx {
                         checkpoint,
                         item: None,
+                        steps: &steps,
                     },
                 )
             } else {
                 let mut hit = false;
                 for item in &checkpoint.frontier {
-                    if expired() {
+                    if cut_now() {
                         break;
                     }
                     let cx = Cx {
                         checkpoint,
                         item: Some(item),
+                        steps: &steps,
                     };
                     if eval(&rule.when, &cx) {
                         hit = true;
@@ -606,8 +671,7 @@ impl Handler for RuleList {
                 }
                 hit
             };
-            if expired() && !hit {
-                decision.truncated = true;
+            if cut.get().is_some() && !hit {
                 break;
             }
             if hit {
@@ -619,12 +683,25 @@ impl Handler for RuleList {
             }
         }
 
+        decision.truncated = cut.get().is_some();
+        if cut.get() == Some(Cut::Wall) {
+            // The one load-dependent event, made visible in the trace.
+            decision.actions.push(Directive {
+                node: None,
+                action: Action::Emit(format!(
+                    "rules: wall-time backstop ({} ms) reached after {} evaluations; \
+                     the list was cut short",
+                    cap.as_millis(),
+                    steps.get()
+                )),
+            });
+        }
         decision.confidence = if matched && !decision.truncated && conflicts == 0 {
             1.0
         } else {
             0.0
         };
-        decision.cost = started.elapsed();
+        decision.cost = elapsed();
         decision
     }
 }
@@ -906,14 +983,20 @@ mod tests {
         };
         let decision = list.decide(&cp, &zero);
         assert!(decision.truncated);
-        assert!(decision.actions.is_empty());
+        // Only the backstop's warning note, no rule action.
+        assert!(
+            decision
+                .actions
+                .iter()
+                .all(|d| matches!(d.action, Action::Emit(_)))
+        );
         assert_eq!(decision.confidence, 0.0);
         let decision = list
             .clone()
             .with_eval_cap(Duration::ZERO)
             .decide(&cp, &StopBudget::default());
         assert!(decision.truncated);
-        // A cap above the 5 ms bound is ignored.
+        // A backstop above EVAL_CAP is ignored.
         let long = list.with_eval_cap(Duration::from_secs(60));
         assert_eq!(long.eval_cap, EVAL_CAP);
         let long_budget = StopBudget {
@@ -921,6 +1004,75 @@ mod tests {
         };
         let decision = long.decide(&cp, &long_budget);
         assert!(decision.cost <= EVAL_CAP + Duration::from_millis(50));
+    }
+
+    /// A clock that moves `step` on every read.
+    fn ticking(step: Duration) -> impl Fn() -> Duration {
+        let now = std::cell::Cell::new(Duration::ZERO);
+        move || {
+            now.set(now.get() + step);
+            now.get()
+        }
+    }
+
+    #[test]
+    fn decisions_do_not_depend_on_the_clock() {
+        // R15: a loaded machine (a slow clock) must not change what the
+        // list decides, or the trace that records it.
+        let items: Vec<FrontierItem> = (0..200).map(|i| item(&format!("src/{i}.rs"), 1)).collect();
+        let cp = checkpoint(items);
+        let list = parse(json!([
+            {"when": {"depth": {"ge": 0}}, "then": "expand"},
+            {"when": {"budget_left": {"lt": 90}}, "then": {"map_off": "lexical"}}
+        ]));
+        let budget = StopBudget::default();
+        let fast = list.decide_with(&cp, &budget, &ticking(Duration::ZERO));
+        let slow = list.decide_with(&cp, &budget, &ticking(Duration::from_millis(1)));
+        assert!(!fast.truncated);
+        assert!(!slow.truncated, "a slow clock truncated the evaluation");
+        assert_eq!(fast.actions, slow.actions);
+        assert_eq!(fast.confidence, slow.confidence);
+        assert_eq!(fast.actions.len(), 201);
+    }
+
+    #[test]
+    fn the_step_cap_is_deterministic() {
+        // The cap counts evaluations, so the same input truncates at the
+        // same place whatever the clock says.
+        let items: Vec<FrontierItem> = (0..200).map(|i| item(&format!("src/{i}.rs"), 1)).collect();
+        let cp = checkpoint(items);
+        let list =
+            parse(json!([{"when": {"depth": {"ge": 0}}, "then": "expand"}])).with_max_steps(50);
+        let budget = StopBudget::default();
+        let fast = list.decide_with(&cp, &budget, &ticking(Duration::ZERO));
+        let slow = list.decide_with(&cp, &budget, &ticking(Duration::from_millis(1)));
+        assert!(fast.truncated && slow.truncated);
+        assert_eq!(fast.actions, slow.actions);
+        assert_eq!(fast.actions.len(), 50);
+        assert_eq!(fast.confidence, 0.0);
+        // A cut by steps is not a wall-time event: no warning note.
+        assert!(!fast.actions.iter().any(|d| d.action.name() == "emit"));
+    }
+
+    #[test]
+    fn the_wall_time_backstop_is_reported() {
+        let items: Vec<FrontierItem> = (0..200).map(|i| item(&format!("src/{i}.rs"), 1)).collect();
+        let cp = checkpoint(items);
+        let list = parse(json!([{"when": {"depth": {"ge": 0}}, "then": "expand"}]));
+        let budget = StopBudget::default();
+        // A clock that has jumped far past the backstop.
+        let decision = list.decide_with(&cp, &budget, &|| Duration::from_secs(60));
+        assert!(decision.truncated);
+        assert_eq!(decision.confidence, 0.0);
+        let warning = decision
+            .actions
+            .iter()
+            .find_map(|d| match &d.action {
+                Action::Emit(note) => Some(note.clone()),
+                _ => None,
+            })
+            .expect("a warning note");
+        assert!(warning.contains("wall-time"), "{warning}");
     }
 
     #[test]

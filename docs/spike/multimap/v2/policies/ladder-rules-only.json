@@ -11,5 +11,7 @@
   "ladder": ["rules", "agent"],
   "max_stops": 8,
   "tau": 0.5,
-  "stop_every": 20
+  "stop_every": 20,
+  "on_disagreement": 5,
+  "likely_complete": 90
 }

@@ -641,7 +641,8 @@ async fn cards_report_the_measured_median_and_the_freshness_model() {
     assert!(lex.card().expand_p50_ms.is_some());
     assert!(vec.card().expand_p50_ms.is_some());
     assert_eq!(lex.describe().freshness, FreshnessModel::Live);
-    assert_eq!(vec.describe().freshness, FreshnessModel::PerFile);
+    // Its neighbours come from the whole index, not from the node's file.
+    assert_eq!(vec.describe().freshness, FreshnessModel::Global);
     assert_eq!(lex.card().coverage, vec![NodeKind::Chunk]);
     assert!(lex.card().good_for.contains(&QuestionType::WhereTo));
     assert!(vec.card().good_for.contains(&QuestionType::WhereTo));
@@ -740,4 +741,99 @@ fn shape(edges: &[Edge]) -> Vec<(NodeId, u8, Option<Site>)> {
         .iter()
         .map(|e| (e.dst.clone(), e.conf, e.site.clone()))
         .collect()
+}
+
+// ---- R18: the vector map's answer depends on the whole index ------------------------
+
+/// An index that changes under the map: once `grown` is set, a new file's
+/// chunk is the nearest neighbour of everything.
+struct Shifting {
+    inner: Arc<Mem>,
+    grown: AtomicBool,
+}
+
+const NEW_CHUNK: Row = ("src/zeta.rs", "z1", 1, 2, "fn z() {}", None);
+
+#[crate::async_trait]
+impl ChunkSearch for Shifting {
+    async fn lexical(&self, query: &str, limit: usize) -> Result<Vec<ChunkHit>, String> {
+        self.inner.lexical(query, limit).await
+    }
+
+    async fn chunk_at(&self, path: &str, line: Option<u32>) -> Result<Option<ChunkHit>, String> {
+        self.inner.chunk_at(path, line).await
+    }
+
+    async fn stored_vector(&self, chunk: &NodeId) -> Result<Option<Vec<f32>>, String> {
+        self.inner.stored_vector(chunk).await
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.inner.embed(text).await
+    }
+
+    async fn nearest(&self, vector: &[f32], limit: usize) -> Result<Vec<ChunkHit>, String> {
+        let mut hits = self.inner.nearest(vector, limit).await?;
+        if self.grown.load(Ordering::Relaxed) {
+            hits.insert(0, hit_of(&NEW_CHUNK, 0.999));
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn chunk_lines(&self) -> Result<Vec<(NodeId, (u32, u32))>, String> {
+        self.inner.chunk_lines().await
+    }
+}
+
+fn view_of<'a>(chunks: &'a [Chunk], fingerprint: &str) -> SnapshotView<'a> {
+    SnapshotView::new(
+        SnapshotRef {
+            indexed_at: "t".into(),
+            fingerprint: fingerprint.into(),
+        },
+        chunks.iter().collect(),
+    )
+}
+
+#[tokio::test]
+async fn the_vector_map_is_global_so_any_index_change_asks_it_again() {
+    let index = Arc::new(Shifting {
+        inner: Mem::new(),
+        grown: AtomicBool::new(false),
+    });
+    let mut registry = Registry::new(60.0);
+    registry
+        .register(
+            Box::new(VectorChunks::new(index.clone(), Some(decls()))),
+            1.0,
+            40,
+        )
+        .unwrap();
+    let options = BuildOptions {
+        roots: vec![compute_total(), chunk_node("src/beta.rs", "b1")],
+        ..BuildOptions::default()
+    };
+    let before = view_chunks();
+    let mut adjacency =
+        MergedAdjacency::build_with(&registry, &view_of(&before, "f1"), &options).await;
+
+    // A new file arrives and becomes the nearest chunk of everything. No
+    // file the existing rows were derived from changed, yet each of their
+    // answers did.
+    index.grown.store(true, Ordering::Relaxed);
+    let mut after = view_chunks();
+    after.push(Chunk {
+        relative_file_path: NEW_CHUNK.0.into(),
+        language: "rust".into(),
+        start_line: NEW_CHUNK.2,
+        end_line: NEW_CHUNK.3,
+        code: NEW_CHUNK.4.into(),
+        content_hash: NEW_CHUNK.1.into(),
+    });
+    let second = view_of(&after, "f2");
+    let stats = adjacency.update(&registry, &second, &options).await;
+    let fresh = MergedAdjacency::build_with(&registry, &second, &options).await;
+    assert_eq!(adjacency.canonical(), fresh.canonical(), "{stats:?}");
+    assert!(stats.full_rebuild.is_some(), "{stats:?}");
 }

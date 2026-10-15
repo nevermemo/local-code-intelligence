@@ -123,7 +123,7 @@ fn a_file_gets_its_commits_newest_first_across_a_rename() {
     let (repo, shas) = lineage();
     let map = GitHistoryMap::open(repo.path()).unwrap();
     assert_eq!(map.head(), shas[4]);
-    let found = map.inner.edges_for(&file("a2.rs")).unwrap();
+    let found = map.inner.edges_for(&file("a2.rs"), None).unwrap();
     let (edges, cost) = (found.edges, found.cost);
     let touched: Vec<_> = edges
         .iter()
@@ -463,4 +463,80 @@ async fn the_pre_merged_source_equals_the_on_the_fly_source_for_git_history() {
         .expect("the sources agree");
     assert_eq!(report.nodes, nodes.len());
     assert!(report.edges >= 15, "{report:?}");
+}
+
+// ---- R19: the traversal deadline reaches the blocking git work --------------------
+
+fn budget_until(deadline: Instant) -> Budget {
+    Budget {
+        deadline,
+        max_external_calls: u32::MAX,
+        max_nodes_touched: u64::MAX,
+    }
+}
+
+#[tokio::test]
+async fn an_expired_deadline_runs_no_git_and_says_so() {
+    let (repo, _) = lineage();
+    let map = GitHistoryMap::open(repo.path()).unwrap();
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let expired = Instant::now();
+    let expanded = map
+        .expand(&file("b.rs"), budget_until(expired), &view)
+        .await;
+    assert!(expanded.edges.is_empty(), "{expanded:?}");
+    let error = map
+        .last_error()
+        .expect("the deadline is a recorded failure");
+    assert!(error.contains("deadline"), "{error}");
+
+    let seeds = [(file("b.rs"), 1.0)];
+    let params = serde_json::Value::Null;
+    let response = map
+        .query(
+            &MapRequest {
+                text: None,
+                seeds: &seeds,
+                limit: 3,
+                budget: budget_until(expired),
+                params: &params,
+                as_of: None,
+            },
+            &view,
+        )
+        .await;
+    assert!(response.hits.is_empty());
+    assert!(matches!(response.status, MapStatus::Failed { .. }));
+}
+
+#[tokio::test]
+async fn a_deadline_that_passes_during_the_work_stops_it() {
+    // A file expansion makes several git calls (the commit log, the co-change
+    // log, the file list). A deadline of a millisecond cannot outlast the
+    // first: the work ends there instead of running them all.
+    let repo = cochange_repo();
+    let map = GitHistoryMap::open(repo.path()).unwrap();
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let before = map.git_runs();
+    let started = Instant::now();
+    let expanded = map
+        .expand(
+            &file("x.rs"),
+            budget_until(Instant::now() + Duration::from_millis(1)),
+            &view,
+        )
+        .await;
+    assert!(expanded.edges.is_empty(), "{expanded:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        map.git_runs() - before <= 1,
+        "the work went on after the deadline: {} git runs",
+        map.git_runs() - before
+    );
+    assert!(map.last_error().unwrap().contains("deadline"));
+
+    // The cut left nothing half-done behind: the next call, with time to
+    // spare, answers in full.
+    let full = map.expand(&file("x.rs"), budget(), &view).await;
+    assert!(!full.edges.is_empty());
 }

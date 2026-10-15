@@ -38,6 +38,14 @@
 //!
 //! The map is off unless a traversal asks for it by id; it costs a few `git`
 //! processes per expansion (measured, see [`MapCard`]) and nothing else.
+//!
+//! The work runs on a blocking thread, which outlives a caller that stopped
+//! waiting, so the call's deadline ([`Budget::deadline`]) goes into the worker:
+//! no `git` process is started after it, the one running when it passes is
+//! killed (at most the time left, never more than
+//! [`GitHistoryConfig::git_timeout`]), and the expansion ends with
+//! [`DEADLINE_NOTE`] as its recorded failure and no edges. A log read cut short
+//! this way is not remembered.
 
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
@@ -52,11 +60,18 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 pub const GIT_HISTORY_ID: MapId = "git.history";
+
+/// The note of a call that ran out of the traversal's time (the deadline of
+/// its [`Budget`]).
+pub const DEADLINE_NOTE: &str = "git.history: the traversal deadline passed";
 
 /// The p50 of one expansion on the lci repository (about 100 commits),
 /// measured in W0b; the card reports the map's own running p50 once it has
@@ -166,6 +181,8 @@ struct Inner {
     commits: Mutex<HashMap<String, CommitNode>>,
     timings: Mutex<Vec<f64>>,
     last_error: Mutex<Option<String>>,
+    /// Git processes started by expansions and log reads (not by `open`).
+    runs: AtomicU32,
 }
 
 pub struct GitHistoryMap {
@@ -213,6 +230,7 @@ impl GitHistoryMap {
             commits: Mutex::new(HashMap::new()),
             timings: Mutex::new(Vec::new()),
             last_error: Mutex::new(None),
+            runs: AtomicU32::new(0),
         };
         Ok(Self {
             descriptor: MapDescriptor {
@@ -251,7 +269,7 @@ impl GitHistoryMap {
     /// log cannot be read.
     pub fn churn(&self, path: &str) -> u32 {
         self.inner
-            .log()
+            .log(None)
             .ok()
             .and_then(|log| log.churn.get(path).copied())
             .unwrap_or(0)
@@ -259,13 +277,19 @@ impl GitHistoryMap {
 
     /// The `n` most touched files, most first, ties by path.
     pub fn churn_ranked(&self, n: usize) -> Vec<(String, u32)> {
-        let Ok(log) = self.inner.log() else {
+        let Ok(log) = self.inner.log(None) else {
             return Vec::new();
         };
         let mut all: Vec<(String, u32)> = log.churn.iter().map(|(p, c)| (p.clone(), *c)).collect();
         all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         all.truncate(n);
         all
+    }
+
+    /// How many git processes expansions and log reads have started.
+    #[cfg(test)]
+    pub(crate) fn git_runs(&self) -> u32 {
+        self.inner.runs.load(Ordering::Relaxed)
     }
 
     /// The error of the last expansion that failed, if any (an expansion that
@@ -277,24 +301,51 @@ impl GitHistoryMap {
     /// The edges leaving `node`, synchronously (what [`Map::expand`] runs on a
     /// blocking thread).
     pub fn edges_blocking(&self, node: &NodeId) -> Result<Vec<Edge>, String> {
-        self.inner.edges_for(node).map(|expanded| expanded.edges)
+        self.inner
+            .edges_for(node, None)
+            .map(|expanded| expanded.edges)
     }
 }
 
 impl Inner {
-    fn git(&self, tally: &mut Tally, args: &[&str]) -> Result<(bool, Vec<u8>), String> {
-        git_run(&self.root, self.config.git_timeout, tally, args)
+    /// One git process, kept to `deadline` when there is one: not started
+    /// after it, and killed when it passes.
+    fn git(
+        &self,
+        deadline: Option<Instant>,
+        tally: &mut Tally,
+        args: &[&str],
+    ) -> Result<(bool, Vec<u8>), String> {
+        let started = tally.calls;
+        let ran = git_run(&self.root, self.config.git_timeout, deadline, tally, args);
+        self.runs
+            .fetch_add(tally.calls - started, Ordering::Relaxed);
+        ran
     }
 
-    fn log(&self) -> Result<&RepoLog, &String> {
-        self.log.get_or_init(|| self.read_log()).as_ref()
+    /// The log of the history read. A read cut short by the deadline is not
+    /// remembered: the next call, with time, reads it again.
+    fn log(&self, deadline: Option<Instant>) -> Result<&RepoLog, String> {
+        if self.log.get().is_none() {
+            let read = self.read_log(deadline);
+            if read.as_ref().is_err_and(|e| e == DEADLINE_NOTE) {
+                return Err(DEADLINE_NOTE.to_string());
+            }
+            let _ = self.log.set(read);
+        }
+        self.log
+            .get()
+            .expect("set above")
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
-    fn read_log(&self) -> Result<RepoLog, String> {
+    fn read_log(&self, deadline: Option<Instant>) -> Result<RepoLog, String> {
         let mut tally = Tally::default();
         let limit = self.config.log_limit.max(self.config.cochange_window);
         let limit = limit.to_string();
         let (ok, out) = self.git(
+            deadline,
             &mut tally,
             &[
                 "log",
@@ -322,20 +373,37 @@ impl Inner {
         Ok(RepoLog { entries, churn })
     }
 
-    fn head_files(&self, tally: &mut Tally) -> Result<&HashSet<String>, String> {
+    /// The files at HEAD; cut short by the deadline, it is not remembered.
+    fn head_files(
+        &self,
+        deadline: Option<Instant>,
+        tally: &mut Tally,
+    ) -> Result<&HashSet<String>, String> {
+        if self.head_files.get().is_none() {
+            let read = self
+                .git(
+                    deadline,
+                    tally,
+                    &["ls-tree", "-r", "-z", "--name-only", &self.head],
+                )
+                .and_then(|(ok, out)| {
+                    if !ok {
+                        return Err("git ls-tree failed".to_string());
+                    }
+                    Ok(String::from_utf8_lossy(&out)
+                        .split('\0')
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect::<HashSet<String>>())
+                });
+            if read.as_ref().is_err_and(|e| e == DEADLINE_NOTE) {
+                return Err(DEADLINE_NOTE.to_string());
+            }
+            let _ = self.head_files.set(read);
+        }
         self.head_files
-            .get_or_init(|| {
-                let (ok, out) =
-                    self.git(tally, &["ls-tree", "-r", "-z", "--name-only", &self.head])?;
-                if !ok {
-                    return Err("git ls-tree failed".into());
-                }
-                Ok(String::from_utf8_lossy(&out)
-                    .split('\0')
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect())
-            })
+            .get()
+            .expect("set above")
             .as_ref()
             .map_err(Clone::clone)
     }
@@ -350,6 +418,7 @@ impl Inner {
         let mut tally = Tally::default();
         let (ok, out) = self
             .git(
+                None,
                 &mut tally,
                 &["log", "-n", "1", "--format=%x1e%H%x1f%cI%x1f%B", sha],
             )
@@ -381,17 +450,21 @@ impl Inner {
         }
     }
 
-    fn edges_for(&self, node: &NodeId) -> Result<Expanded, String> {
+    /// The edges leaving `node`; with a `deadline`, no git process starts
+    /// after it and the one running then is killed, and the answer is an
+    /// error ([`DEADLINE_NOTE`]) instead of a part of the edges.
+    fn edges_for(&self, node: &NodeId, deadline: Option<Instant>) -> Result<Expanded, String> {
         let started = Instant::now();
         let mut tally = Tally::default();
         let mut edges = match node {
-            NodeId::Commit { sha } => self.commit_edges(node, sha, &mut tally)?,
+            NodeId::Commit { sha } => self.commit_edges(node, sha, deadline, &mut tally)?,
             _ => match self.path_of(node) {
                 Some((path, pct)) => self.file_edges(
                     node,
                     &path,
                     pct,
                     matches!(node, NodeId::File { .. } | NodeId::Chunk { .. }),
+                    deadline,
                     &mut tally,
                 )?,
                 None => Vec::new(),
@@ -420,11 +493,13 @@ impl Inner {
         path: &str,
         pct: u32,
         cochange: bool,
+        deadline: Option<Instant>,
         tally: &mut Tally,
     ) -> Result<Vec<Edge>, String> {
         let mut edges = Vec::new();
         let cap = self.config.file_commits.clamp(1, EXPAND_LIMIT).to_string();
         let (ok, out) = self.git(
+            deadline,
             tally,
             &[
                 "log",
@@ -456,7 +531,7 @@ impl Inner {
             self.remember(&commits);
         }
         if cochange {
-            edges.extend(self.cochange_edges(node, path, tally)?);
+            edges.extend(self.cochange_edges(node, path, deadline, tally)?);
         }
         Ok(edges)
     }
@@ -465,10 +540,11 @@ impl Inner {
         &self,
         node: &NodeId,
         path: &str,
+        deadline: Option<Instant>,
         tally: &mut Tally,
     ) -> Result<Vec<Edge>, String> {
-        let log = self.log().map_err(Clone::clone)?;
-        let head_files = self.head_files(tally)?;
+        let log = self.log(deadline)?;
+        let head_files = self.head_files(deadline, tally)?;
         let window = log.entries.iter().take(self.config.cochange_window);
         let mut seed_commits = 0u32;
         let mut together: HashMap<&str, u32> = HashMap::new();
@@ -509,15 +585,21 @@ impl Inner {
         &self,
         node: &NodeId,
         sha: &str,
+        deadline: Option<Instant>,
         tally: &mut Tally,
     ) -> Result<Vec<Edge>, String> {
         // History only up to HEAD: a commit that is not an ancestor of it is
         // not part of this map's history.
-        let (ancestor, _) = self.git(tally, &["merge-base", "--is-ancestor", sha, &self.head])?;
+        let (ancestor, _) = self.git(
+            deadline,
+            tally,
+            &["merge-base", "--is-ancestor", sha, &self.head],
+        )?;
         if !ancestor {
             return Ok(Vec::new());
         }
         let (ok, out) = self.git(
+            deadline,
             tally,
             &[
                 "diff-tree",
@@ -534,7 +616,7 @@ impl Inner {
         if !ok {
             return Ok(Vec::new());
         }
-        let head_files = self.head_files(tally)?;
+        let head_files = self.head_files(deadline, tally)?;
         let files: Vec<String> = String::from_utf8_lossy(&out)
             .split('\0')
             .filter(|p| !p.is_empty() && head_files.contains(*p))
@@ -589,18 +671,34 @@ fn git_command(root: &Path) -> Command {
     command
 }
 
-/// Runs git; the flag is whether it exited with status 0.
+/// Runs git; the flag is whether it exited with status 0. With a `deadline`
+/// the process is not started once it has passed, and gets no more time than
+/// is left of it ([`DEADLINE_NOTE`] when that is what ended it).
 fn git_run(
     root: &Path,
     timeout: Duration,
+    deadline: Option<Instant>,
     tally: &mut Tally,
     args: &[&str],
 ) -> Result<(bool, Vec<u8>), String> {
+    let (limit, by_deadline) = match deadline {
+        None => (timeout, false),
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(DEADLINE_NOTE.to_string());
+            }
+            (left.min(timeout), left < timeout)
+        }
+    };
     let mut command = git_command(root);
     command.args(args);
-    let ran = run_limited(command, timeout).map_err(|e| format!("cannot run git: {e}"))?;
+    let ran = run_limited(command, limit).map_err(|e| format!("cannot run git: {e}"))?;
     tally.calls += 1;
     tally.bytes += ran.stdout.len() as u64;
+    if ran.timed_out && by_deadline {
+        return Err(DEADLINE_NOTE.to_string());
+    }
     if ran.timed_out {
         return Err(format!(
             "git {} timed out after {} s",
@@ -617,7 +715,7 @@ fn git_text(
     tally: &mut Tally,
     args: &[&str],
 ) -> Result<String, String> {
-    let (ok, out) = git_run(root, timeout, tally, args)?;
+    let (ok, out) = git_run(root, timeout, None, tally, args)?;
     if !ok {
         return Err("git failed".into());
     }
@@ -681,13 +779,19 @@ impl Map for GitHistoryMap {
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
         let started = Instant::now();
+        let deadline = request.budget.deadline;
+        if started >= deadline {
+            let warning = DEADLINE_NOTE.to_string();
+            *lock(&self.inner.last_error) = Some(warning.clone());
+            return MapResponse::empty(&self.descriptor, view, MapStatus::Failed { warning });
+        }
         let inner = self.inner.clone();
         let seeds: Vec<NodeId> = request.seeds.iter().map(|(n, _)| n.clone()).collect();
         let answer = tokio::task::spawn_blocking(move || {
             let mut edges = Vec::new();
             let mut tally_cost = Cost::default();
             for seed in &seeds {
-                let found = inner.edges_for(seed)?;
+                let found = inner.edges_for(seed, Some(deadline))?;
                 tally_cost.external_calls += found.cost.external_calls;
                 tally_cost.bytes_read += found.cost.bytes_read;
                 edges.extend(found.edges);
@@ -755,9 +859,16 @@ impl Map for GitHistoryMap {
         if budget.max_external_calls == 0 {
             return Expanded::default();
         }
+        // The caller stops waiting at the deadline, but the blocking worker
+        // would not: it gets the deadline and stops there.
+        let deadline = budget.deadline;
+        if Instant::now() >= deadline {
+            *lock(&self.inner.last_error) = Some(DEADLINE_NOTE.to_string());
+            return Expanded::default();
+        }
         let inner = self.inner.clone();
         let node = node.clone();
-        match tokio::task::spawn_blocking(move || inner.edges_for(&node)).await {
+        match tokio::task::spawn_blocking(move || inner.edges_for(&node, Some(deadline))).await {
             Ok(Ok(expanded)) => expanded,
             Ok(Err(error)) => {
                 *lock(&self.inner.last_error) = Some(error);

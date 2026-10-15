@@ -70,8 +70,26 @@
             "null"
           ]
         },
+        "likely_complete": {
+          "description": "Also stop when the walk is estimated to have found this percent of\nwhat it will find (1 to 100). Counts toward `max_stops`; given alone it\nstarts the ladder like `stop_every` does.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_stops": {
           "description": "Most stops in the traversal (never above the `[traverse]` cap).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "on_disagreement": {
+          "description": "Also stop when this many new disagreements have been recorded since\nthe last stop (a node a fuzzy map offered that a structural map, which\nanswered the same expansion, did not). At least 1.\nCounts toward `max_stops`; given alone it starts the ladder like\n`stop_every` does, with the periodic stops at their default spacing.",
           "format": "uint32",
           "minimum": 0,
           "type": [

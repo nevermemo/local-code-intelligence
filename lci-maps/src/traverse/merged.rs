@@ -14,28 +14,36 @@
 //!
 //! For every node the adjacency covers, [`PreMerged`] returns the edges
 //! [`OnTheFly`] returns, in the same order, and the same calls (map and edge
-//! count), with two differences by design: a lookup costs nothing (the calls
-//! carry no cost), and a node the build never reached gets one call named
-//! [`GAP_MAP`] with a failure note when some map accepts its kind (the
-//! `max_nodes` cap, or a node nothing reaches from the roots). A node no map
-//! accepts has no row and no edges, as on the fly. The auditor
-//! ([`crate::audit::audit_edge_sources`]) checks this on fixtures.
+//! count), with one difference by design: a node the build never reached gets
+//! one call named [`GAP_MAP`] with a failure note when some map accepts its
+//! kind (the `max_nodes` cap, or a node nothing reaches from the roots). A
+//! node no map accepts has no row and no edges, as on the fly. Each call
+//! reports the cost it had when the row was built, so a traversal is charged
+//! the same tokens and external calls under either source; a lookup itself
+//! does no work. The auditor ([`crate::audit::audit_edge_sources`]) checks
+//! this on fixtures.
 //!
-//! # Incremental update, keyed by blob
+//! Hops are ranked with a recorded cost table ([`CostTable`]): the adjacency
+//! records the maps' p50 when it is built, [`PreMerged`] prices with it, and
+//! [`OnTheFly::with_costs`] takes the same table, so the two sources rank
+//! alike however the maps' running p50 has moved since.
+//!
+//! # Incremental update, keyed by file bindings
 //!
 //! A file's blob ([`FileBlobs`]) is a hash of its content as the snapshot
-//! holds it, not a path. [`MergedAdjacency::update`] reuses a row when every
-//! blob the row depends on is unchanged: the blob of the file the node
-//! belongs to (when its id names a path) and the blobs of the files its
-//! edges' sites are in. A node id still contains the path (that is its
-//! identity); the staleness test never looks at a path, a modification time
-//! or a file list. What forces a row to be asked again:
+//! holds it. A row depends on bindings of path to blob: the file the node
+//! belongs to (when its id names a path) and the files its edges' sites are
+//! in, each with the blob it had when the row was asked.
+//! [`MergedAdjacency::update`] reuses a row when every such path still has
+//! that blob. The counts of blobs are not enough: two files that trade
+//! contents keep the same counts, and a row built from one file's content is
+//! stale once the content is in the other. What forces a row to be asked
+//! again:
 //!
-//! * a dependency blob appeared, vanished or changed (or its number of files
-//!   changed);
+//! * a dependency file has another blob, or is no longer in the view;
 //! * the row has no dependency at all (a node with no path and no edges with
 //!   a site) or one of its sites is in a file the view does not hold: such a
-//!   row is reused only when no blob of the view changed;
+//!   row is reused only when no file of the view changed its blob;
 //! * the row is incomplete (a map failed or missed the deadline);
 //! * the map set (ids and versions) changed: everything is asked again;
 //! * the snapshot fingerprint changed and some enabled map is not
@@ -51,7 +59,7 @@
 //! A map that breaks that declaration makes an incremental update differ from
 //! a full build; `update` then equals `build` only for maps that keep it.
 
-use super::source::{EdgeSource, ExpandCall, Expansion, FusedEdge, OnTheFly, fuse};
+use super::source::{CostTable, EdgeSource, ExpandCall, Expansion, FusedEdge, OnTheFly, fuse};
 use crate::{
     Budget, Cost, FreshnessModel, MapId, Registry, SnapshotView,
     audit::canonical_fused,
@@ -134,6 +142,13 @@ impl FileBlobs {
         &self.files
     }
 
+    /// Each file's path with its blob: what a row's dependencies are checked
+    /// against. Two views with the same [`counts`](Self::counts) can differ
+    /// here (two files that traded contents).
+    pub fn bindings(&self) -> &BTreeMap<String, String> {
+        &self.by_path
+    }
+
     /// The paths of the view's files, sorted.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.by_path.keys().map(String::as_str)
@@ -206,6 +221,8 @@ pub struct BuildStats {
 struct StoredCall {
     map: MapId,
     n_edges: usize,
+    /// What the call cost when it was made; a lookup reports it again.
+    cost: Cost,
     failure: Option<String>,
 }
 
@@ -217,8 +234,10 @@ struct Row {
     /// `fuse(raw)`.
     fused: Vec<FusedEdge>,
     calls: Vec<StoredCall>,
-    /// The blobs the row depends on; empty means no dependency is known.
-    deps: BTreeSet<String>,
+    /// The files the row depends on, each with the blob it had: the file the
+    /// node belongs to and the files its edges' sites are in. Valid while
+    /// every path still has that blob; empty means no dependency is known.
+    deps: BTreeMap<String, String>,
     complete: bool,
 }
 
@@ -235,16 +254,19 @@ impl Row {
             max_nodes_touched: u64::MAX,
         };
         let (raw, calls) = source.ask(node, budget).await;
-        let mut deps = BTreeSet::new();
-        if let Some(blob) = node.path().and_then(|path| blobs.blob(path)) {
-            deps.insert(blob.to_string());
+        let mut deps = BTreeMap::new();
+        if let Some((path, blob)) = node
+            .path()
+            .and_then(|path| blobs.blob(path).map(|blob| (path, blob)))
+        {
+            deps.insert(path.to_string(), blob.to_string());
         }
         let mut unresolved = false;
         for site in raw.iter().filter_map(|edge| edge.site.as_ref()) {
             if site.blob.is_empty() {
                 unresolved = true;
             } else {
-                deps.insert(site.blob.clone());
+                deps.insert(site.path.clone(), site.blob.clone());
             }
         }
         if unresolved {
@@ -258,6 +280,7 @@ impl Row {
                 .map(|call| StoredCall {
                     map: call.map,
                     n_edges: call.n_edges,
+                    cost: call.cost,
                     failure: call.failure,
                 })
                 .collect(),
@@ -276,6 +299,10 @@ pub struct MergedAdjacency {
     fingerprint: String,
     /// Files per blob of the view the rows were built from.
     blobs: BTreeMap<String, u32>,
+    /// The blob of each path of that view.
+    bound: BTreeMap<String, String>,
+    /// What the maps' cards said the expansions cost at the last build.
+    costs: CostTable,
     /// Kinds some built map accepts.
     kinds: BTreeSet<NodeKind>,
     /// Every registered map, built or not.
@@ -341,8 +368,10 @@ impl MergedAdjacency {
         if stats.full_rebuild.is_some() {
             old.clear();
         }
+        // The same files with the same contents, path by path (equal blob
+        // counts are not enough: two files may have traded contents).
         let same_world =
-            self.built.is_some() && self.blobs == *blobs.counts() && stats.full_rebuild.is_none();
+            self.built.is_some() && self.bound == *blobs.bindings() && stats.full_rebuild.is_none();
         for (blob, count) in blobs.counts() {
             match self.blobs.get(blob) {
                 Some(before) if before == count => stats.blobs_kept += 1,
@@ -366,9 +395,8 @@ impl MergedAdjacency {
                 && !row.calls.iter().any(|call| live.contains(call.map))
                 && (same_world
                     || (!row.deps.is_empty()
-                        && row.deps.iter().all(|blob| {
-                            self.blobs.contains_key(blob)
-                                && self.blobs.get(blob) == blobs.counts().get(blob)
+                        && row.deps.iter().all(|(path, blob)| {
+                            blobs.blob(path).is_some_and(|now| now == blob.as_str())
                         })))
         };
 
@@ -414,10 +442,12 @@ impl MergedAdjacency {
             .iter()
             .map(|e| (e.map.describe().id, e.map.card()))
             .collect();
+        self.costs = CostTable::of_cards(self.cards.iter().map(|(id, card)| (*id, card.clone())));
         self.rows = rows;
         self.built = Some(built);
         self.fingerprint = view.snapshot.fingerprint.clone();
         self.blobs = blobs.counts().clone();
+        self.bound = blobs.bindings().clone();
         self.kinds = kinds;
         stats.nodes = self.rows.len();
         stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -452,6 +482,12 @@ impl MergedAdjacency {
     /// Files per blob of the view the rows were built from.
     pub fn blobs(&self) -> &BTreeMap<String, u32> {
         &self.blobs
+    }
+
+    /// The expansion cost each map was priced with at the last build; give it
+    /// to [`OnTheFly::with_costs`] to rank as [`PreMerged`] does.
+    pub fn costs(&self) -> &CostTable {
+        &self.costs
     }
 
     /// The node, map and note of every call that failed at build time.
@@ -546,7 +582,7 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> EdgeSource for PreMerged<A> {
             .map(|call| ExpandCall {
                 map: call.map,
                 n_edges: call.n_edges,
-                cost: Cost::default(),
+                cost: call.cost,
                 failure: call.failure.clone(),
             })
             .collect();

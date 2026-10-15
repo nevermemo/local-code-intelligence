@@ -157,6 +157,16 @@ pub struct SteerArgs {
     /// A stop every this many pops. Without it, stops happen every
     /// `pops / (max_stops + 1)` pops while rules are given.
     pub stop_every: Option<u32>,
+    /// Also stop when this many new disagreements have been recorded since
+    /// the last stop (a node a fuzzy map offered that a structural map, which
+    /// answered the same expansion, did not). At least 1.
+    /// Counts toward `max_stops`; given alone it starts the ladder like
+    /// `stop_every` does, with the periodic stops at their default spacing.
+    pub on_disagreement: Option<u32>,
+    /// Also stop when the walk is estimated to have found this percent of
+    /// what it will find (1 to 100). Counts toward `max_stops`; given alone it
+    /// starts the ladder like `stop_every` does.
+    pub likely_complete: Option<u32>,
     /// Only with `handle`: the outer agent's answer to the checkpoint,
     /// `[{"node"?: id, "action": ..}]` with the actions of the rule list plus
     /// `{"budget": {"pops": n, "tokens": n}}` (bounded).
@@ -900,10 +910,19 @@ fn build_ladder(
             );
         }
     }
-    if steer.rules.is_none() && steer.stop_every.is_none() {
+    if matches!(steer.on_disagreement, Some(0)) {
+        bail!("steer.on_disagreement must be at least 1");
+    }
+    if matches!(steer.likely_complete, Some(0) | Some(101..)) {
+        bail!("steer.likely_complete is a percent from 1 to 100");
+    }
+    let triggered = steer.stop_every.is_some()
+        || steer.on_disagreement.is_some()
+        || steer.likely_complete.is_some();
+    if steer.rules.is_none() && !triggered {
         if steer.max_stops.is_some() || steer.tau.is_some() {
             notes.push(
-                "steer.max_stops and steer.tau do nothing without steer.rules or steer.stop_every"
+                "steer.max_stops and steer.tau do nothing without steer.rules or a stop trigger                  (steer.stop_every, steer.on_disagreement, steer.likely_complete)"
                     .to_owned(),
             );
         }
@@ -943,11 +962,14 @@ fn build_ladder(
             .and_then(Value::as_array)
             .map_or(0, |rules| rules.len() as u32),
     };
-    Ok(Some((
-        ladder,
-        StopPolicy::every(every).max_stops(max_stops),
-        plan,
-    )))
+    let mut policy = StopPolicy::every(every).max_stops(max_stops);
+    if let Some(n) = steer.on_disagreement {
+        policy = policy.on_disagreement(n);
+    }
+    if let Some(percent) = steer.likely_complete {
+        policy = policy.likely_complete(percent);
+    }
+    Ok(Some((ladder, policy, plan)))
 }
 
 fn parse_seeds(seeds: &[String]) -> Result<Vec<NodeId>> {
@@ -1841,6 +1863,66 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().starts_with("steer.rules: "), "{error}");
+    }
+
+    #[test]
+    fn the_disagreement_and_likely_complete_triggers_come_from_the_steer_json() {
+        // The shape of docs/spike/multimap/v2/policies/ladder-rules-only.json.
+        let steer: SteerArgs = serde_json::from_value(json!({
+            "rules": [{"when": {"kind": "test"}, "then": "prune"}],
+            "max_stops": 3,
+            "stop_every": 10,
+            "on_disagreement": 5,
+            "likely_complete": 90
+        }))
+        .unwrap();
+        let (_, stops, _) = build_ladder(&limits(), &steer, 100, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stops.every_pops, 10);
+        assert_eq!(stops.max_stops, 3);
+        assert_eq!(stops.on_disagreement, 5);
+        assert_eq!(stops.likely_complete, 90);
+        assert_eq!(stops.budget_share, 0);
+        assert_eq!(stops.on_stagnation, 0);
+
+        // Absent, they stay off.
+        let plain: SteerArgs = serde_json::from_value(json!({"stop_every": 10})).unwrap();
+        let (_, stops, _) = build_ladder(&limits(), &plain, 100, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!((stops.on_disagreement, stops.likely_complete), (0, 0));
+
+        // Either alone starts the ladder, as stop_every does; the periodic
+        // stops keep their default spacing.
+        for body in [
+            json!({"on_disagreement": 2}),
+            json!({"likely_complete": 80}),
+        ] {
+            let alone: SteerArgs = serde_json::from_value(body).unwrap();
+            let mut notes = Vec::new();
+            let (_, stops, _) = build_ladder(&limits(), &alone, 100, &mut notes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stops.every_pops, 20, "100 pops over 5 spans");
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        // Out-of-range values are errors, not silent switch-offs.
+        for body in [
+            json!({"on_disagreement": 0}),
+            json!({"likely_complete": 0}),
+            json!({"likely_complete": 101}),
+        ] {
+            let bad: SteerArgs = serde_json::from_value(body.clone()).unwrap();
+            let error = build_ladder(&limits(), &bad, 100, &mut Vec::new())
+                .err()
+                .unwrap_or_else(|| panic!("{body} was accepted"));
+            assert!(error.to_string().starts_with("steer."), "{error}");
+        }
+
+        // Unknown keys are still refused.
+        assert!(serde_json::from_value::<SteerArgs>(json!({"on_stagnation": 3})).is_err());
     }
 
     // ---- start nodes from the hybrid search (slice S6b) --------------------

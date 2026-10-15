@@ -2521,7 +2521,15 @@ mod tests {
         let text = include_str!("../../../docs/spike/multimap/v2/policies/ladder-rules-only.json");
         let policy: Value = serde_json::from_str(text).unwrap();
         // `SteerArgs` refuses unknown keys, so a stray one would fail every call.
-        let allowed = ["rules", "ladder", "max_stops", "tau", "stop_every"];
+        let allowed = [
+            "rules",
+            "ladder",
+            "max_stops",
+            "tau",
+            "stop_every",
+            "on_disagreement",
+            "likely_complete",
+        ];
         for key in policy.as_object().unwrap().keys() {
             assert!(allowed.contains(&key.as_str()), "unknown key {key}");
         }
@@ -2533,6 +2541,8 @@ mod tests {
             .collect();
         assert_eq!(ladder, ["rules", "agent"]);
         assert!(policy["stop_every"].as_u64().unwrap() >= 1);
+        assert!(policy["on_disagreement"].as_u64().unwrap() >= 1);
+        assert!((1..=100).contains(&policy["likely_complete"].as_u64().unwrap()));
         let rules = policy["rules"].as_array().unwrap();
         assert!(rules.len() <= 64);
         assert!(

@@ -562,3 +562,285 @@ async fn a_node_the_build_never_reached_says_so() {
     let with_root = MergedAdjacency::build_with(&one_map(&[("q", "r")]), &view, &options).await;
     assert!(with_root.covers(&node("q")) && with_root.covers(&node("r")));
 }
+
+// ---- one cost source, and the real call cost (R16) --------------------------
+
+/// A map whose card reports a running p50 the test can move, as a live map's
+/// log does under load.
+struct Running {
+    inner: GraphMap,
+    p50: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Running {
+    fn new(inner: GraphMap, p50_ms: f64) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+        let p50 = Arc::new(std::sync::atomic::AtomicU64::new(p50_ms.to_bits()));
+        (
+            Self {
+                inner,
+                p50: p50.clone(),
+            },
+            p50,
+        )
+    }
+}
+
+#[crate::async_trait]
+impl Map for Running {
+    fn describe(&self) -> &MapDescriptor {
+        self.inner.describe()
+    }
+
+    async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        self.inner.query(request, view).await
+    }
+
+    async fn expand(
+        &self,
+        from: &NodeId,
+        budget: Budget,
+        view: &SnapshotView<'_>,
+    ) -> crate::edge::Expanded {
+        self.inner.expand(from, budget, view).await
+    }
+
+    fn card(&self) -> crate::edge::MapCard {
+        crate::edge::MapCard {
+            expand_p50_ms: Some(f64::from_bits(self.p50.load(Ordering::Relaxed))),
+            ..crate::edge::MapCard::default()
+        }
+    }
+}
+
+fn hop_order(result: &TraversalResult) -> Vec<String> {
+    result
+        .events
+        .iter()
+        .filter(|event| event["ev"] == "hop")
+        .map(|event| name_of_text(event["dst"].as_str().unwrap()))
+        .collect()
+}
+
+fn name_of_text(id: &str) -> String {
+    id.strip_prefix("file:src/")
+        .and_then(|p| p.strip_suffix(".rs"))
+        .unwrap_or(id)
+        .to_string()
+}
+
+// Ten candidates are above the hop gate (8), where the cost term ranks them.
+const FIVE_X: [(&str, &str); 5] = [
+    ("a", "x1"),
+    ("a", "x2"),
+    ("a", "x3"),
+    ("a", "x4"),
+    ("a", "x5"),
+];
+const FIVE_Y: [(&str, &str); 5] = [
+    ("a", "y1"),
+    ("a", "y2"),
+    ("a", "y3"),
+    ("a", "y4"),
+    ("a", "y5"),
+];
+
+#[tokio::test]
+async fn both_sources_rank_hops_with_the_same_recorded_costs() {
+    let chunks = files(&WORLD);
+    let view = view_of(&chunks, "f1");
+    let (m1, load) = Running::new(GraphMap::new("m1", &FIVE_X), 10.0);
+    let (m2, _) = Running::new(GraphMap::new("m2", &FIVE_Y), 10.0);
+    let mut reg = Registry::new(60.0);
+    reg.register(Box::new(m1), 1.0, 40).unwrap();
+    reg.register(Box::new(m2), 1.0, 40).unwrap();
+    let adjacency = Arc::new(build(&reg, &view).await);
+
+    // A load spike slows m1 after the build.
+    load.store(5000f64.to_bits(), Ordering::Relaxed);
+
+    let fly = Traversal::new(
+        OnTheFly::new(&reg, &view).with_costs(adjacency.costs().clone()),
+        vec![seed("a")],
+        budget(20),
+    )
+    .question("a to c")
+    .run()
+    .await;
+    let merged = Traversal::new(
+        PreMerged::new(adjacency.clone()),
+        vec![seed("a")],
+        budget(20),
+    )
+    .question("a to c")
+    .run()
+    .await;
+    assert_eq!(hop_order(&fly).len(), 10);
+    assert_eq!(hop_order(&fly), hop_order(&merged));
+    assert_eq!(fly.events, merged.events);
+
+    // The table is what decides: priced by the spike alone, the on-the-fly
+    // walk would put the slow map's hop last.
+    let live = Traversal::new(OnTheFly::new(&reg, &view), vec![seed("a")], budget(20))
+        .question("a to c")
+        .run()
+        .await;
+    assert_ne!(hop_order(&live), hop_order(&merged));
+    // And what the sources report as the map's p50 is the recorded one.
+    let fly_card = OnTheFly::new(&reg, &view)
+        .with_costs(adjacency.costs().clone())
+        .card("m1");
+    assert_eq!(fly_card.expand_p50_ms, Some(10.0));
+    assert_eq!(
+        PreMerged::new(adjacency).card("m1").expand_p50_ms,
+        Some(10.0)
+    );
+}
+
+#[tokio::test]
+async fn a_lookup_reports_the_call_cost_the_maps_reported() {
+    let chunks = files(&WORLD);
+    let view = view_of(&chunks, "f1");
+    // d has no edges and the call still cost: the cost is per call.
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("a", "b"), ("b", "d")]).cost(7, 1),
+        GraphMap::new("m2", &[("a", "c")]).cost(3, 0),
+    ]);
+    let adjacency = Arc::new(build(&reg, &view).await);
+    let fly = OnTheFly::new(&reg, &view);
+    let merged = PreMerged::new(adjacency.clone());
+    for name in ["a", "b", "d"] {
+        let (f, m) = (
+            fly.edges(&node(name), call_budget()).await,
+            merged.edges(&node(name), call_budget()).await,
+        );
+        assert_eq!(f.calls, m.calls, "calls of {name}");
+        assert!(m.calls.iter().all(|c| c.cost.est_tokens > 0), "{name}");
+    }
+
+    // A walk is charged the same under both sources.
+    let on_the_fly = Traversal::new(OnTheFly::new(&reg, &view), vec![seed("a")], budget(20))
+        .question("a to d")
+        .run()
+        .await;
+    let pre_merged = Traversal::new(PreMerged::new(adjacency), vec![seed("a")], budget(20))
+        .question("a to d")
+        .run()
+        .await;
+    assert!(on_the_fly.totals.tokens > 0 && on_the_fly.totals.external_calls > 0);
+    assert_eq!(on_the_fly.totals.tokens, pre_merged.totals.tokens);
+    assert_eq!(
+        on_the_fly.totals.external_calls,
+        pre_merged.totals.external_calls
+    );
+}
+
+// ---- bindings, not blob counts (R17, Q8) ------------------------------------
+
+/// A per-file map whose answer is the content of the node's file: a chunk
+/// hash `to:x` makes an edge to `x`. Truthful about its freshness, so a
+/// correct incremental update equals a full build.
+struct ContentMap {
+    descriptor: MapDescriptor,
+}
+
+impl ContentMap {
+    fn new(id: MapId) -> Self {
+        Self {
+            descriptor: GraphMap::new(id, &[]).descriptor,
+        }
+    }
+}
+
+#[crate::async_trait]
+impl Map for ContentMap {
+    fn describe(&self) -> &MapDescriptor {
+        &self.descriptor
+    }
+
+    async fn query(&self, _request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        MapResponse::empty(&self.descriptor, view, MapStatus::Ok)
+    }
+
+    async fn expand(
+        &self,
+        from: &NodeId,
+        _budget: Budget,
+        view: &SnapshotView<'_>,
+    ) -> crate::edge::Expanded {
+        let Some(path) = from.path() else {
+            return crate::edge::Expanded::default();
+        };
+        let target = view.ids().iter().find_map(|id| match id {
+            NodeId::Chunk {
+                path: at,
+                content_hash,
+                ..
+            } if at == path => content_hash.strip_prefix("to:").map(str::to_string),
+            _ => None,
+        });
+        let edges = target
+            .map(|to| Edge {
+                src: from.clone(),
+                dst: node(&to),
+                kind: EdgeKind::CallsOrRefs,
+                map: self.descriptor.id,
+                witness: WitnessClass::Compiler,
+                conf: 80,
+                site: None,
+            })
+            .into_iter()
+            .collect();
+        crate::edge::Expanded::new(edges, Cost::default())
+    }
+}
+
+fn content_registry() -> Registry<'static> {
+    let mut reg = Registry::new(60.0);
+    reg.register(Box::new(ContentMap::new("content")), 1.0, 40)
+        .unwrap();
+    reg
+}
+
+#[tokio::test]
+async fn swapped_files_and_a_deleted_one_leave_no_stale_or_dropped_rows() {
+    let reg = content_registry();
+    let before = files(&[("a", "to:c"), ("b", "to:d"), ("c", "to:d"), ("d", "leaf")]);
+    let mut adjacency = build(&reg, &view_of(&before, "f1")).await;
+    let old = Arc::new(adjacency.clone());
+    let old_rows = old.canonical();
+
+    // a and b trade contents (the multiset of blobs is the same), and c is
+    // deleted.
+    let after = files(&[("a", "to:d"), ("b", "to:c"), ("d", "leaf")]);
+    let view = view_of(&after, "f2");
+    adjacency
+        .update(&reg, &view, &BuildOptions::default())
+        .await;
+
+    let fresh = build(&reg, &view).await;
+    assert_eq!(adjacency.canonical(), fresh.canonical());
+    let nodes: Vec<NodeId> = fresh.nodes().cloned().collect();
+    assert!(nodes.contains(&node("c")), "c is still named by b's edge");
+    audit_edge_sources(
+        &OnTheFly::new(&reg, &view),
+        &PreMerged::new(&adjacency),
+        &nodes,
+        PER_NODE,
+    )
+    .await
+    .unwrap();
+    // The swap moved the edges: a reaches d, b reaches c.
+    let a = PreMerged::new(&adjacency)
+        .edges(&node("a"), call_budget())
+        .await;
+    assert_eq!(
+        a.edges
+            .iter()
+            .map(|e| name_of(&e.best.dst))
+            .collect::<Vec<_>>(),
+        ["d"]
+    );
+
+    // Whoever still holds the old adjacency sees the old world, whole.
+    assert_eq!(old.canonical(), old_rows);
+}
