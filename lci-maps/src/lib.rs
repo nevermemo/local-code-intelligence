@@ -21,6 +21,7 @@ pub mod kit;
 pub mod kit_c3;
 pub mod labels;
 pub mod live_grep;
+pub mod lsp_live;
 pub mod probe;
 pub mod probe_map;
 pub mod reads_key;

@@ -43,6 +43,7 @@ use lci_maps::{
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     impact::{Decl, ImpactIndex},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
+    lsp_live::{LSP_LIVE_ID, LspLive, ManagerBackend, ScipPlaces},
     probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::{DirSource, SCIP_MAP_ID, ScipMap, SourceText},
     scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
@@ -93,8 +94,10 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// `search.vector` (the chunks nearest to a node's stored embedding; one
 /// counted embedding call when none is stored; needs the embedder) and
 /// `scip.impact` (the declarations that reference a symbol, the reverse
-/// closure of the SCIP impact index).
-pub const OPT_IN_MAPS: [MapId; 7] = [
+/// closure of the SCIP impact index). `lsp.live` asks a language server for
+/// definition, references and document symbols (starts the server at the first
+/// expansion; needs its binary).
+pub const OPT_IN_MAPS: [MapId; 8] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -102,6 +105,7 @@ pub const OPT_IN_MAPS: [MapId; 7] = [
     SEARCH_LEXICAL_ID,
     SEARCH_VECTOR_ID,
     SCIP_IMPACT_ID,
+    LSP_LIVE_ID,
 ];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
@@ -1152,6 +1156,37 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             }
         }
     }
+    let mut lsp_live = None;
+    if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
+        // The servers of the default `[lsp]` settings; the server starts at
+        // the first expansion and stops when the map drops.
+        let workspace = dunce::canonicalize(root)
+            .map(|path| lci_core::workspace::Workspace {
+                id: lci_core::workspace::hash(&path.to_string_lossy()),
+                path,
+            })
+            .map_err(|error| error.to_string());
+        let backend = match workspace {
+            Ok(workspace) => {
+                ManagerBackend::open(workspace, &lci_core::config::Config::default()).await
+            }
+            Err(error) => Err(error),
+        };
+        match backend {
+            Ok(backend) => {
+                let places = Arc::new(ScipPlaces::from_scip(&loaded.scip));
+                let map = Arc::new(LspLive::new(Box::new(backend), places));
+                register(
+                    &mut registry,
+                    &mut plan_maps,
+                    Box::new(Shared(map.clone())),
+                    true,
+                )?;
+                lsp_live = Some(map);
+            }
+            Err(error) => notes.push(format!("lsp.live is unavailable: {error}")),
+        }
+    }
     let mut impact = None;
     if wants(SCIP_IMPACT_ID) {
         match call.scip_root {
@@ -1283,6 +1318,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                 failures.count()
             ));
         }
+    }
+    if let Some(error) = lsp_live.as_ref().and_then(|map| map.last_error()) {
+        notes.push(format!("lsp.live gave no edges for a node: {error}"));
     }
     // What the new maps cost per call, measured in this run (the p50 ring the
     // map cards report).
@@ -2543,7 +2581,12 @@ mod tests {
         assert!(no_root.contains("give its root"), "{no_root}");
         let no_root = run_with(&["config.key"]).await.unwrap();
         assert!(no_root.contains("give its root"), "{no_root}");
-        for id in [SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, SCIP_IMPACT_ID] {
+        for id in [
+            SEARCH_LEXICAL_ID,
+            SEARCH_VECTOR_ID,
+            SCIP_IMPACT_ID,
+            LSP_LIVE_ID,
+        ] {
             assert!(!MAPS.contains(&id), "{id} is opt-in");
             let no_root = run_with(&[id]).await.unwrap();
             assert!(no_root.contains("give its root"), "{id}: {no_root}");
