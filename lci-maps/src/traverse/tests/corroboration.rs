@@ -3,19 +3,6 @@
 
 use super::*;
 
-fn events<'a>(result: &'a TraversalResult, ev: &str) -> Vec<&'a Value> {
-    result.events.iter().filter(|e| e["ev"] == ev).collect()
-}
-
-fn state<'a>(result: &'a TraversalResult, name: &str) -> &'a State {
-    let wanted = node(name);
-    result
-        .states
-        .iter()
-        .find(|s| s.node == wanted)
-        .unwrap_or_else(|| panic!("{name} not reached"))
-}
-
 /// Everything priced by rank: no edge is followed whole.
 const RANKED: HopPrice = HopPrice { gate: 0, beam: 16 };
 
@@ -54,7 +41,7 @@ async fn a_node_found_by_a_weak_route_takes_the_strong_one_before_it_pops() {
         popped_names(&result),
         ["src/s.rs", "src/a.rs", "src/x.rs", "src/b.rs"]
     );
-    let relax = events(&result, "relax");
+    let relax = events_of(&result, "relax");
     assert_eq!(relax.len(), 1);
     assert_eq!(relax[0]["src"], "file:src/a.rs");
     assert_eq!(relax[0]["dst"], "file:src/x.rs");
@@ -63,7 +50,7 @@ async fn a_node_found_by_a_weak_route_takes_the_strong_one_before_it_pops() {
     assert!((relax[0]["old_potential"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-12);
     // The relax is not a new hop.
     assert_eq!(result.totals.hops, 3);
-    assert!(events(&result, "alt_path").is_empty());
+    assert!(events_of(&result, "alt_path").is_empty());
 }
 
 #[tokio::test]
@@ -83,11 +70,11 @@ async fn a_queued_node_is_not_relaxed_past_the_depth_limit() {
     };
     let deep = run(3).await;
     assert_eq!(state(&deep, "x").depth, 1, "depth 3 is the limit: x stays");
-    assert!(events(&deep, "relax").is_empty());
-    assert_eq!(events(&deep, "alt_path").len(), 1);
+    assert!(events_of(&deep, "relax").is_empty());
+    assert_eq!(events_of(&deep, "alt_path").len(), 1);
     let roomy = run(4).await;
     assert_eq!(state(&roomy, "x").depth, 3);
-    assert_eq!(events(&roomy, "relax").len(), 1);
+    assert_eq!(events_of(&roomy, "relax").len(), 1);
     for result in [&deep, &roomy] {
         // Nothing is expanded at or past the limit.
         let limit = if std::ptr::eq(result, &deep) { 3 } else { 4 };
@@ -101,29 +88,6 @@ async fn a_queued_node_is_not_relaxed_past_the_depth_limit() {
 }
 
 #[tokio::test]
-async fn a_popped_node_is_never_expanded_again() {
-    // Every node has two ways in; the walk meets each of them again.
-    let reg = registry(vec![lattice_map("g", 40)]);
-    let result = walk(&reg, vec![seed("n0")], budget(100), |t| t).await;
-    assert_eq!(result.status, TraversalStatus::Complete);
-    let expands = events(&result, "expand");
-    let mut nodes: Vec<&str> = expands
-        .iter()
-        .map(|e| e["node"].as_str().unwrap())
-        .collect();
-    assert_eq!(nodes.len(), result.totals.pops as usize);
-    nodes.sort_unstable();
-    nodes.dedup();
-    assert_eq!(nodes.len(), expands.len(), "a node was expanded twice");
-    let mut popped = result.popped.clone();
-    popped.sort_unstable();
-    popped.dedup();
-    assert_eq!(popped.len(), result.popped.len());
-    // The second ways in were seen, as a path to a popped node or a relax.
-    assert!(!events(&result, "alt_path").is_empty());
-}
-
-#[tokio::test]
 async fn a_cycle_is_neither_a_relax_nor_an_alt_path() {
     let reg = registry(vec![GraphMap::new(
         "g",
@@ -132,8 +96,8 @@ async fn a_cycle_is_neither_a_relax_nor_an_alt_path() {
     let result = walk(&reg, vec![seed("a")], budget(20), |t| t).await;
     assert_eq!(result.status, TraversalStatus::Complete);
     assert_eq!(result.totals.pops, 3);
-    assert!(events(&result, "relax").is_empty());
-    assert!(events(&result, "alt_path").is_empty());
+    assert!(events_of(&result, "relax").is_empty());
+    assert!(events_of(&result, "alt_path").is_empty());
     assert!(result.states.iter().all(|s| s.n_maps() <= 1));
 }
 
@@ -160,7 +124,7 @@ async fn two_maps_reaching_a_node_are_both_recorded_and_outrank_one() {
     assert!((result.ranked_potential(z) - z.potential * 1.1).abs() < 1e-12);
     assert_eq!(result.corroboration_boost, DEFAULT_CORROBORATION_BOOST);
     // The other route is traced with the map it added.
-    let alt = events(&result, "alt_path");
+    let alt = events_of(&result, "alt_path");
     let to_z: Vec<_> = alt.iter().filter(|e| e["dst"] == "file:src/z.rs").collect();
     assert_eq!(to_z.len(), 1);
     assert_eq!(to_z[0]["src"], "file:src/b.rs");
@@ -172,6 +136,13 @@ async fn two_maps_reaching_a_node_are_both_recorded_and_outrank_one() {
     assert_eq!(cards[0]["n_maps"], 2);
     assert_eq!(cards[0]["maps"], json!(["m1", "m2"]));
     assert_eq!(cards[1]["n_maps"], 1);
+    // The card shows the rank next to the potential.
+    let (potential, ranked) = (
+        cards[0]["potential"].as_f64().unwrap(),
+        cards[0]["ranked_potential"].as_f64().unwrap(),
+    );
+    assert!((ranked - potential * 1.1).abs() < 1e-12, "{}", cards[0]);
+    assert_eq!(cards[1]["ranked_potential"], cards[1]["potential"]);
 }
 
 fn card_json_of(result: &TraversalResult, name: &str) -> Value {
@@ -262,27 +233,7 @@ async fn the_map_that_found_a_seed_is_not_evidence() {
 }
 
 #[tokio::test]
-async fn budgets_and_determinism_hold_with_relax_and_corroboration() {
-    let reg = registry(vec![lattice_map("g", 60), lattice_map("h", 60)]);
-    let price = HopPrice { gate: 1, beam: 3 };
-    for pops in [0, 1, 7, 25] {
-        let run = || async { walk(&reg, vec![seed("n0")], budget(pops), |t| t.price(price)).await };
-        let (a, b) = (run().await, run().await);
-        assert!(a.totals.pops <= pops && a.popped.len() <= pops as usize);
-        assert_eq!(a.events_jsonl(), b.events_jsonl());
-        let mut seen = a.popped.clone();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), a.popped.len());
-    }
-    // Every node has two ways in, so the walk traced the second one.
-    let run = walk(&reg, vec![seed("n0")], budget(25), |t| t.price(price)).await;
-    assert!(!events(&run, "relax").is_empty() || !events(&run, "alt_path").is_empty());
-    assert!(run.states.iter().skip(1).all(|s| s.n_maps() == 2));
-}
-
-#[tokio::test]
-async fn corroboration_survives_a_handle() {
+async fn corroboration_and_its_boost_survive_a_handle() {
     let reg = two_maps_one_node();
     let result = walk(&reg, vec![seed("s")], budget(3), |t| t).await;
     let snapshot = result.snapshot.expect("a budget stop leaves a snapshot");
@@ -302,6 +253,22 @@ async fn corroboration_survives_a_handle() {
             .iter()
             .all(|s| s.maps.is_empty() && s.witnesses.is_empty())
     );
+
+    // A resumed walk ranks with the boost the handle holds, not the default.
+    let first = walk(&reg, vec![seed("s")], budget(2), |t| {
+        t.corroboration_boost(0.5)
+    })
+    .await;
+    let snapshot = first.snapshot.expect("the walk paused");
+    assert_eq!(snapshot.boost, 0.5);
+    let second = resume(&reg, snapshot, budget(20), |t| t).await;
+    assert_eq!(second.corroboration_boost, 0.5);
+    assert_eq!(
+        events_of(&second, "resume")[0]["rank"]["corroboration_boost"],
+        0.5
+    );
+    let z = state(&second, "z");
+    assert!((second.ranked_potential(z) - z.potential * 1.5).abs() < 1e-12);
 }
 
 fn kinded_edge(kind: EdgeKind, dst: &str) -> Edge {
@@ -320,18 +287,8 @@ fn above_the_gate_a_hop_is_the_rank_value_times_its_kind_prior() {
         kinded_edge(EdgeKind::Mentions, "mentions"),
         kinded_edge(EdgeKind::DefinedIn, "defined"),
     ]);
-    let cands: Vec<Candidate> = fused
-        .iter()
-        .map(|edge| Candidate {
-            edge,
-            in_seen: 0,
-            card: MapCard::default(),
-        })
-        .collect();
-    let ctx = ScoreCtx {
-        query: &[],
-        nodes_seen: 10,
-    };
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
     let price = HopPrice { gate: 2, beam: 4 };
     let steps = hop(&mut RulesScorer, &ctx, &cands, price);
     assert_eq!(steps.len(), 4);
@@ -358,14 +315,7 @@ fn above_the_gate_a_hop_is_the_rank_value_times_its_kind_prior() {
         kinded_edge(EdgeKind::Contains, "c2"),
         kinded_edge(EdgeKind::Contains, "c3"),
     ]);
-    let cands: Vec<Candidate> = contains_only
-        .iter()
-        .map(|edge| Candidate {
-            edge,
-            in_seen: 0,
-            card: MapCard::default(),
-        })
-        .collect();
+    let cands = candidates(&contains_only);
     let steps = hop(
         &mut RulesScorer,
         &ctx,
@@ -420,41 +370,6 @@ async fn maps_derived_from_one_graph_corroborate_once() {
     let restored = crate::traverse::handle::Snapshot::from_json(&snapshot.to_json()).unwrap();
     assert_eq!(restored, snapshot);
     assert!(restored.states.iter().any(|s| !s.dependent.is_empty()));
-}
-
-#[tokio::test]
-async fn a_card_shows_the_rank_next_to_the_potential() {
-    let reg = two_maps_one_node();
-    let result = walk(&reg, vec![seed("s")], budget(20), |t| t).await;
-    let card = card_json_of(&result, "z");
-    let potential = card["potential"].as_f64().unwrap();
-    let ranked = card["ranked_potential"].as_f64().unwrap();
-    assert!((ranked - potential * 1.1).abs() < 1e-12, "{card}");
-    let single = card_json_of(&result, "y");
-    assert_eq!(single["ranked_potential"], single["potential"]);
-}
-
-#[tokio::test]
-async fn a_resumed_walk_ranks_with_the_boost_the_handle_holds() {
-    let reg = two_maps_one_node();
-    let first = walk(&reg, vec![seed("s")], budget(2), |t| {
-        t.corroboration_boost(0.5)
-    })
-    .await;
-    let snapshot = first.snapshot.expect("the walk paused");
-    assert_eq!(snapshot.boost, 0.5);
-    // The second call is configured with the default boost; the handle wins.
-    let view = view();
-    let second = Traversal::resumed(OnTheFly::new(&reg, &view), snapshot, budget(20))
-        .run()
-        .await;
-    assert_eq!(second.corroboration_boost, 0.5);
-    assert_eq!(
-        events(&second, "resume")[0]["rank"]["corroboration_boost"],
-        0.5
-    );
-    let z = state(&second, "z");
-    assert!((second.ranked_potential(z) - z.potential * 1.5).abs() < 1e-12);
 }
 
 #[test]

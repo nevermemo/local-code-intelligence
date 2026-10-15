@@ -257,18 +257,104 @@ fn hops(result: &TraversalResult) -> Vec<(String, String)> {
         .collect()
 }
 
-// ---- budgets -------------------------------------------------------------
+fn events_of<'r>(result: &'r TraversalResult, ev: &str) -> Vec<&'r Value> {
+    result.events.iter().filter(|e| e["ev"] == ev).collect()
+}
 
-#[tokio::test]
-async fn the_pop_budget_is_never_exceeded() {
-    let reg = registry(vec![lattice_map("g", 60)]);
-    for pops in [0, 1, 7, 30] {
-        let result = walk(&reg, vec![seed("n0")], budget(pops), |t| t).await;
-        assert_eq!(result.totals.pops, pops);
-        assert_eq!(result.popped.len(), pops as usize);
-        assert_eq!(result.status, TraversalStatus::BudgetExhausted);
+fn state_of<'r>(result: &'r TraversalResult, name: &str) -> (usize, &'r State) {
+    result
+        .states
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.node == node(name))
+        .unwrap_or_else(|| panic!("no state for {name}"))
+}
+
+fn state<'r>(result: &'r TraversalResult, name: &str) -> &'r State {
+    state_of(result, name).1
+}
+
+/// Continues the walk a snapshot paused.
+async fn resume(
+    reg: &Registry<'static>,
+    snapshot: crate::traverse::handle::Snapshot,
+    budget: TraversalBudget,
+    configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
+) -> TraversalResult {
+    let view = view();
+    configure(Traversal::resumed(
+        OnTheFly::new(reg, &view),
+        snapshot,
+        budget,
+    ))
+    .run()
+    .await
+}
+
+/// `parent` offers the nine names `dsts`: the ninth is past the beam gate
+/// (hop value 1/9), the others are worth 1.
+fn nine(map: &mut GraphMap, parent: &str, dsts: [&str; 9]) {
+    map.edges
+        .extend(dsts.iter().map(|d| (parent.to_string(), d.to_string())));
+}
+
+/// A handler that never decides anything.
+fn noop() -> impl Handler {
+    scripted(|_| Vec::new())
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lci-traverse-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Prunes the worst queued node at every stop.
+fn prune_last(cp: &Checkpoint) -> Vec<Directive> {
+    cp.frontier
+        .last()
+        .map(|item| act(Some(&item.node), Action::Prune))
+        .into_iter()
+        .collect()
+}
+
+/// The candidates a scorer sees for these fused edges, from a map with no
+/// recorded cost.
+fn candidates(fused: &[FusedEdge]) -> Vec<Candidate<'_>> {
+    fused
+        .iter()
+        .map(|edge| Candidate {
+            edge,
+            in_seen: 0,
+            card: MapCard::default(),
+        })
+        .collect()
+}
+
+fn score_ctx() -> ScoreCtx<'static> {
+    ScoreCtx {
+        query: &[],
+        nodes_seen: 10,
     }
 }
+
+/// `(pops, reason)` of every stop.
+fn stops_of(result: &TraversalResult) -> Vec<(u64, String)> {
+    events_of(result, "stop")
+        .iter()
+        .map(|e| {
+            (
+                e["pops"].as_u64().unwrap(),
+                e["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+// ---- budgets -------------------------------------------------------------
+// That no budget is exceeded, that a seed gives one walk, and that a state is
+// expanded once hold for random walks in `harness`; the tests here are the
+// exact cases.
 
 #[tokio::test]
 async fn the_deadline_is_never_exceeded() {
@@ -297,65 +383,30 @@ async fn the_deadline_is_never_exceeded() {
 }
 
 #[tokio::test]
-async fn an_expired_deadline_pops_nothing() {
-    let reg = registry(vec![lattice_map("g", 10)]);
-    let mut limits = budget(100);
-    limits.deadline = Instant::now();
-    let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!(result.totals.pops, 0);
-    assert_eq!(result.status, TraversalStatus::BudgetExhausted);
-}
-
-#[tokio::test]
-async fn the_token_budget_is_never_exceeded() {
-    // Four fresh nodes per expansion at 20 tokens per call and 12 per edge.
-    let wide: Vec<(String, String)> = (0..40)
-        .flat_map(|i| (0..4).map(move |k| (format!("n{i}"), format!("n{}", i * 4 + k + 1))))
-        .collect();
-    let mut map = GraphMap::new("g", &[]).cost(20, 0);
-    map.edges = wide;
+async fn a_call_or_hop_the_tokens_cannot_afford_is_not_adopted() {
+    // Four fresh nodes at 20 tokens per call and 12 per edge.
+    let mut map = GraphMap::new(
+        "g",
+        &[("n0", "n1"), ("n0", "n2"), ("n0", "n3"), ("n0", "n4")],
+    )
+    .cost(20, 0);
+    map.edges.push(("n1".into(), "n5".into()));
     let reg = registry(vec![map]);
-    for limit in [0u64, 19, 44, 68, 200, 500] {
+    // 44 tokens: the call (20) and two of the four edges (24) fit. The pop is
+    // cut; the call ran, so it is charged now and the retry owes nothing for
+    // it (see `f1_a_cut_pop_is_requeued_and_its_retry_does_not_pay_its_calls_again`). With 19
+    // the call alone does not fit, so nothing is adopted.
+    for (limit, expected) in [(44, (44, 2)), (19, (0, 0))] {
         let mut limits = budget(1000);
         limits.est_tokens = limit;
         let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-        assert!(
-            result.totals.tokens <= limit,
-            "{} > {limit}",
-            result.totals.tokens
+        assert_eq!(
+            (result.totals.tokens, result.totals.hops),
+            expected,
+            "{limit}"
         );
         assert_eq!(result.status, TraversalStatus::BudgetExhausted, "{limit}");
     }
-    // 44 tokens: the call (20) and two of the four edges (24) fit. The pop is
-    // cut; the call ran, so it is charged now and the retry owes nothing for
-    // it (see `f1_a_retried_pop_does_not_pay_its_calls_again`).
-    let mut limits = budget(1000);
-    limits.est_tokens = 44;
-    let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!((result.totals.tokens, result.totals.hops), (44, 2));
-    // 19 tokens: the call alone does not fit, so nothing is adopted.
-    let mut limits = budget(1000);
-    limits.est_tokens = 19;
-    let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!((result.totals.tokens, result.totals.hops), (0, 0));
-}
-
-#[tokio::test]
-async fn the_external_call_budget_is_never_exceeded() {
-    // A map that keeps to its allowance is given none once it is spent, so it
-    // is not asked again; with nothing else to expand the walk ends.
-    let runs = Arc::new(AtomicU32::new(0));
-    let reg = registry(vec![lattice_map("g", 30).cost(0, 1).counted(&runs)]);
-    let mut limits = budget(1000);
-    limits.external_calls = 3;
-    let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!(result.totals.external_calls, 3);
-    assert_eq!(runs.load(Ordering::Relaxed), 3);
-    assert_eq!(result.status, TraversalStatus::Complete);
-    assert!(
-        result.events.iter().any(|e| e["external_spent"] == true),
-        "the trace says the maps were given no call"
-    );
 }
 
 #[tokio::test]
@@ -373,25 +424,6 @@ async fn max_depth_records_but_does_not_expand() {
 }
 
 // ---- determinism ---------------------------------------------------------
-
-#[tokio::test]
-async fn equal_runs_give_equal_events() {
-    let reg = registry(vec![lattice_map("g", 40)]);
-    let price = HopPrice { gate: 1, beam: 2 };
-    for seed_value in [1u64, 2, 3] {
-        let run = || {
-            walk(&reg, vec![seed("n0")], budget(25), move |t| {
-                t.price(price).scorer(RandomScorer::new(seed_value))
-            })
-        };
-        let (a, b) = (run().await, run().await);
-        assert_eq!(a.events, b.events, "seed {seed_value}");
-        assert_eq!(a.popped, b.popped);
-    }
-    // The default scorer is deterministic too.
-    let run = || walk(&reg, vec![seed("n0")], budget(25), move |t| t.price(price));
-    assert_eq!(run().await.events, run().await.events);
-}
 
 #[tokio::test]
 async fn the_seed_of_the_random_arm_changes_the_walk() {
@@ -515,10 +547,8 @@ fn fusion_is_noisy_or_over_maps_with_a_provenance_union() {
     assert_eq!(b.maps, ["m1", "m2"]);
     assert_eq!(b.witnesses, [WitnessClass::Compiler, WitnessClass::Text]);
     assert_eq!(b.best.map, "m1");
-}
 
-#[test]
-fn fusion_order_is_total() {
+    // The order is total: the input order does not matter.
     let edges = vec![
         edge("a", "z", "m1", WitnessClass::Compiler, 70),
         edge("a", "y", "m1", WitnessClass::Compiler, 70),
@@ -696,7 +726,7 @@ async fn an_out_of_range_boost_is_clamped_by_the_engine() {
 }
 
 #[tokio::test]
-async fn prune_clears_a_node_for_good() {
+async fn prune_clears_a_node_for_good_and_the_demo_rule_prunes_a_test_directory() {
     // b is pruned at the first stop; c reaches it again, and it stays out.
     let reg = registry(vec![GraphMap::new(
         "g",
@@ -726,10 +756,9 @@ async fn prune_clears_a_node_for_good() {
             .iter()
             .all(|e| !(e["ev"] == "hop" && e["dst"] == "file:src/b.rs"))
     );
-}
 
-#[tokio::test]
-async fn the_demo_rule_prunes_a_test_directory() {
+    // The demo rule prunes a test directory: discovered, then cleared, and
+    // never expanded.
     let reg = registry(vec![GraphMap::new(
         "g",
         &[("a", "b"), ("a", "tests/t"), ("tests/t", "u")],
@@ -886,44 +915,6 @@ async fn emit_and_directives_for_unknown_nodes() {
 }
 
 #[tokio::test]
-async fn stops_fire_every_n_pops_and_at_most_max_stops() {
-    let reg = registry(vec![lattice_map("g", 60)]);
-    let result = walk(&reg, vec![seed("n0")], budget(50), |t| {
-        t.handler(scripted(|_| Vec::new()), StopPolicy::every(5).max_stops(3))
-    })
-    .await;
-    let stops: Vec<u64> = result
-        .events
-        .iter()
-        .filter(|e| e["ev"] == "steer")
-        .map(|e| e["stop"].as_u64().unwrap())
-        .collect();
-    assert_eq!(stops, [1, 2, 3]);
-    assert_eq!(result.totals.stops, 3);
-    // The stops come after pops 5, 10 and 15.
-    let pops_at_steer: Vec<u64> = {
-        let mut pops = 0;
-        let mut out = Vec::new();
-        for e in &result.events {
-            match e["ev"].as_str().unwrap() {
-                "expand" => pops = e["pop"].as_u64().unwrap(),
-                "steer" => out.push(pops),
-                _ => {}
-            }
-        }
-        out
-    };
-    assert_eq!(pops_at_steer, [5, 10, 15]);
-
-    // No handler or no interval: no stops.
-    let none = walk(&reg, vec![seed("n0")], budget(20), |t| {
-        t.handler(scripted(|_| Vec::new()), every(0))
-    })
-    .await;
-    assert_eq!(none.totals.stops, 0);
-}
-
-#[tokio::test]
 async fn the_checkpoint_shows_the_frontier_and_the_budget() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = seen.clone();
@@ -1023,18 +1014,8 @@ fn hop_pricing_gate_and_beam() {
             })
             .collect(),
     );
-    let cands: Vec<Candidate> = fused
-        .iter()
-        .map(|edge| Candidate {
-            edge,
-            in_seen: 0,
-            card: MapCard::default(),
-        })
-        .collect();
-    let ctx = ScoreCtx {
-        query: &[],
-        nodes_seen: 10,
-    };
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
     // Within the gate: everything at value 1.
     let steps = hop(
         &mut RulesScorer,
@@ -1063,10 +1044,7 @@ fn a_slower_or_weaker_map_prices_its_hops_lower() {
         expand_p50_ms: Some(400.0),
         ..MapCard::default()
     };
-    let ctx = ScoreCtx {
-        query: &[],
-        nodes_seen: 10,
-    };
+    let ctx = score_ctx();
     let score = |edge: &FusedEdge, card: &MapCard| {
         let cands = [Candidate {
             edge,
@@ -1084,40 +1062,9 @@ fn a_slower_or_weaker_map_prices_its_hops_lower() {
 
 mod persist {
     use super::*;
-    use crate::traverse::handle::{HandleError, HandleStore, Snapshot};
+    use crate::traverse::handle::{HandleError, HandleStore};
     use crate::traverse::trace::{self, TraceWriter};
-    use std::{collections::BTreeSet, path::PathBuf};
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lci-s3-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    /// Prunes the worst queued node at every stop.
-    fn prune_last(cp: &Checkpoint) -> Vec<Directive> {
-        cp.frontier
-            .last()
-            .map(|item| act(Some(&item.node), Action::Prune))
-            .into_iter()
-            .collect()
-    }
-
-    async fn resume(
-        reg: &Registry<'static>,
-        snapshot: Snapshot,
-        budget: TraversalBudget,
-        configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
-    ) -> TraversalResult {
-        let view = view();
-        configure(Traversal::resumed(
-            OnTheFly::new(reg, &view),
-            snapshot,
-            budget,
-        ))
-        .run()
-        .await
-    }
+    use std::collections::BTreeSet;
 
     async fn pruning_walk(pops: u32) -> TraversalResult {
         let reg = registry(vec![lattice_map("g", 60)]);
@@ -1126,24 +1073,6 @@ mod persist {
                 .handler(scripted(prune_last), every(3))
         })
         .await
-    }
-
-    /// The events without the call markers and without what depends on the
-    /// call's own budget (a checkpoint shows the budget left).
-    fn without_marks(events: &[Value]) -> Vec<Value> {
-        events
-            .iter()
-            .filter(|e| {
-                !["start", "end", "resume", "stop", "return"].contains(&e["ev"].as_str().unwrap())
-            })
-            .cloned()
-            .map(|mut e| {
-                if let Some(obj) = e.as_object_mut() {
-                    obj.remove("inputs_hash");
-                }
-                e
-            })
-            .collect()
     }
 
     fn stop_hashes(result: &TraversalResult) -> Vec<String> {
@@ -1254,9 +1183,10 @@ mod persist {
     }
 
     #[tokio::test]
-    async fn a_resume_continues_at_the_same_pop_count_and_matches_a_straight_run() {
+    async fn a_resume_continues_at_the_pop_count_and_shares_the_straight_runs_later_stop_hashes() {
         let straight = pruning_walk(12).await;
-
+        // That the walks agree is checked for random walks in `harness`; here
+        // are the pop count, the trace of the two calls and the stop hashes.
         let first = pruning_walk(6).await;
         assert_eq!(first.status, TraversalStatus::BudgetExhausted);
         let snapshot = first.snapshot.clone().expect("a paused run has a snapshot");
@@ -1279,31 +1209,6 @@ mod persist {
         let both: Vec<Value> = first.events.iter().chain(&second.events).cloned().collect();
         assert_eq!(second.totals.pops, 12);
 
-        assert_eq!(second.status, straight.status);
-        assert_eq!(second.popped, straight.popped);
-        assert_eq!(second.states, straight.states);
-        assert_eq!(second.cleared, straight.cleared);
-        let (a, b) = (&second.totals, &straight.totals);
-        assert_eq!(
-            (
-                a.pops,
-                a.hops,
-                a.cross_map_hops,
-                a.tokens,
-                a.stops,
-                a.steers
-            ),
-            (
-                b.pops,
-                b.hops,
-                b.cross_map_hops,
-                b.tokens,
-                b.stops,
-                b.steers
-            )
-        );
-        assert_eq!(second.maps, straight.maps);
-        assert_eq!(without_marks(&both), without_marks(&straight.events));
         // The stop at pop 6 fired once, in the first call. The first call's
         // stops saw a budget of 6 pops, so their checkpoints (and hashes)
         // differ from the straight run's; the stops of the second call saw
@@ -1417,17 +1322,6 @@ mod persist {
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[tokio::test]
-    async fn only_a_walk_with_work_left_leaves_a_handle() {
-        let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
-        let done = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
-        assert_eq!(done.status, TraversalStatus::Complete);
-        assert!(done.snapshot.is_none());
-        let cut = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
-        assert_eq!(cut.status, TraversalStatus::BudgetExhausted);
-        assert!(cut.snapshot.is_some());
-    }
 }
 
 // ---- slice S4: stops, the ladder, rung 3, the steer continuation ---------------
@@ -1435,7 +1329,7 @@ mod persist {
 mod steering {
     use super::*;
     use crate::traverse::{
-        handle::{HandleStore, Snapshot},
+        handle::HandleStore,
         handler::{RAISE_MAX_POPS, RAISE_MAX_TOKENS},
         ladder::{Ladder, LadderError},
         steer::{MAX_STEER_ACTIONS, Steer, SteerError},
@@ -1445,7 +1339,6 @@ mod steering {
     use serde_json::json;
     use std::{
         collections::{BTreeMap, BTreeSet},
-        path::PathBuf,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1515,10 +1408,6 @@ mod steering {
         Ladder::new(tau, rungs).unwrap()
     }
 
-    fn of<'a>(result: &'a TraversalResult, ev: &str) -> Vec<&'a Value> {
-        result.events.iter().filter(|e| e["ev"] == ev).collect()
-    }
-
     fn texts(events: &[&Value], key: &str) -> Vec<String> {
         events
             .iter()
@@ -1527,45 +1416,6 @@ mod steering {
                 other => other.to_string(),
             })
             .collect()
-    }
-
-    /// `(pops, reason)` of every stop.
-    fn stops_of(result: &TraversalResult) -> Vec<(u64, String)> {
-        of(result, "stop")
-            .iter()
-            .map(|e| {
-                (
-                    e["pops"].as_u64().unwrap(),
-                    e["reason"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect()
-    }
-
-    async fn continue_from(
-        reg: &Registry<'static>,
-        snapshot: Snapshot,
-        budget: TraversalBudget,
-        configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
-    ) -> TraversalResult {
-        let view = view();
-        configure(Traversal::resumed(
-            OnTheFly::new(reg, &view),
-            snapshot,
-            budget,
-        ))
-        .run()
-        .await
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lci-s4-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    fn noop() -> impl Handler {
-        scripted(|_| Vec::new())
     }
 
     /// Runs a handler and keeps every checkpoint it saw.
@@ -1592,36 +1442,74 @@ mod steering {
     // ---- triggers ------------------------------------------------------------
 
     #[tokio::test]
-    async fn every_pops_fires_with_its_reason() {
+    async fn a_policy_stops_at_its_triggers_with_their_reasons_and_max_stops_bounds_them_all() {
         let reg = registry(vec![lattice_map("g", 60)]);
-        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
-            t.handler(noop(), every(4).max_stops(2))
-        })
-        .await;
+        let run = |policy: StopPolicy| {
+            walk(&reg, vec![seed("n0")], budget(20), move |t| {
+                t.handler(noop(), policy)
+            })
+        };
+        let rows = |stops: &[(u64, String)]| {
+            stops
+                .iter()
+                .map(|(p, r)| (*p, r.as_str().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let want = |list: &[(u64, &str)]| {
+            list.iter()
+                .map(|(p, r)| (*p, (*r).to_owned()))
+                .collect::<Vec<_>>()
+        };
+
+        let every_pops = run(every(4).max_stops(2)).await;
         assert_eq!(
-            stops_of(&result),
-            [(4, "every_pops".to_string()), (8, "every_pops".to_string())]
+            rows(&stops_of(&every_pops)),
+            want(&[(4, "every_pops"), (8, "every_pops")])
         );
+        let three = run(every(5).max_stops(3)).await;
+        assert_eq!(
+            rows(&stops_of(&three)),
+            want(&[(5, "every_pops"), (10, "every_pops"), (15, "every_pops")])
+        );
+        assert_eq!(three.totals.stops, 3);
+        // No interval: no stops.
+        assert_eq!(run(every(0)).await.totals.stops, 0);
+
+        let share = stops_of(&run(StopPolicy::default().budget_share(25).max_stops(10)).await);
+        assert_eq!(share.len(), 4, "{share:?}");
+        assert_eq!(
+            rows(&share[..3]),
+            want(&[
+                (5, "budget_share"),
+                (10, "budget_share"),
+                (15, "budget_share")
+            ])
+        );
+
+        // Several triggers at once make one stop that names them all.
+        let both = run(StopPolicy::every(5).budget_share(25).max_stops(10)).await;
+        let stops = events_of(&both, "stop");
+        assert_eq!(
+            (stops[0]["pops"].as_u64(), stops[0]["reason"].as_str()),
+            (Some(5), Some("every_pops"))
+        );
+        assert_eq!(stops[0]["triggers"], json!(["every_pops", "budget_share"]));
+        assert_eq!(
+            run(StopPolicy::every(5).budget_share(25).max_stops(2))
+                .await
+                .totals
+                .stops,
+            2
+        );
+
+        // A policy with no trigger never stops.
+        assert_eq!(run(StopPolicy::default()).await.totals.stops, 0);
+        assert!(!StopPolicy::default().is_active());
     }
 
     #[tokio::test]
-    async fn budget_share_fires_at_each_share_of_the_pop_budget() {
-        let reg = registry(vec![lattice_map("g", 60)]);
-        let policy = StopPolicy::default().budget_share(25).max_stops(10);
-        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
-            t.handler(noop(), policy)
-        })
-        .await;
-        let share = "budget_share".to_string();
-        let stops = stops_of(&result);
-        assert_eq!(stops.len(), 4, "{stops:?}");
-        assert_eq!(stops[0], (5, share.clone()));
-        assert_eq!(stops[1], (10, share.clone()));
-        assert_eq!(stops[2], (15, share));
-    }
-
-    #[tokio::test]
-    async fn disagreement_fires_when_a_fuzzy_map_offers_what_the_structural_map_does_not() {
+    async fn disagreement_fires_when_a_fuzzy_map_offers_what_the_structural_map_does_not_and_only_then()
+     {
         let (seen, sink) = recorder();
         let reg = registry(vec![
             GraphMap::new("s", &[("a", "b")]),
@@ -1642,14 +1530,12 @@ mod steering {
         assert_eq!(d.offered_by, ["f"]);
         assert_eq!(d.silent, ["s"]);
         assert_eq!(d.pop, 1);
-    }
 
-    #[tokio::test]
-    async fn without_a_structural_answer_nothing_disagrees() {
-        let reg = registry(vec![
+        // Without a structural answer nothing disagrees.
+        let fuzzy_only = registry(vec![
             GraphMap::new("f", &[("a", "b"), ("a", "x")]).witness(WitnessClass::Vector),
         ]);
-        let result = walk(&reg, vec![seed("a")], budget(10), |t| {
+        let result = walk(&fuzzy_only, vec![seed("a")], budget(10), |t| {
             t.handler(noop(), StopPolicy::default().on_disagreement(1))
         })
         .await;
@@ -1698,37 +1584,6 @@ mod steering {
         })
         .await;
         assert!(stops_of(&none).is_empty());
-    }
-
-    #[tokio::test]
-    async fn several_triggers_at_once_make_one_stop_and_max_stops_bounds_them_all() {
-        let reg = registry(vec![lattice_map("g", 60)]);
-        let policy = StopPolicy::every(5).budget_share(25).max_stops(10);
-        let result = walk(&reg, vec![seed("n0")], budget(20), |t| {
-            t.handler(noop(), policy)
-        })
-        .await;
-        let stops = of(&result, "stop");
-        assert_eq!(stops[0]["pops"], 5);
-        assert_eq!(stops[0]["reason"], "every_pops");
-        assert_eq!(stops[0]["triggers"], json!(["every_pops", "budget_share"]));
-
-        let capped = walk(&reg, vec![seed("n0")], budget(20), |t| {
-            t.handler(noop(), StopPolicy::every(5).budget_share(25).max_stops(2))
-        })
-        .await;
-        assert_eq!(capped.totals.stops, 2);
-    }
-
-    #[tokio::test]
-    async fn a_policy_with_no_trigger_never_stops() {
-        let reg = registry(vec![lattice_map("g", 60)]);
-        let result = walk(&reg, vec![seed("n0")], budget(10), |t| {
-            t.handler(noop(), StopPolicy::default())
-        })
-        .await;
-        assert_eq!(result.totals.stops, 0);
-        assert!(!StopPolicy::default().is_active());
     }
 
     // ---- the checkpoint payload ------------------------------------------------
@@ -1883,27 +1738,6 @@ mod steering {
         assert!(text.starts_with('~') && text.ends_with("deep.rs | scip/compiler | p0.50 d2"));
     }
 
-    #[tokio::test]
-    async fn equal_runs_give_equal_checkpoint_hashes() {
-        let run = || async {
-            let reg = registry(vec![
-                GraphMap::new("s", &[("a", "b"), ("b", "c")]),
-                GraphMap::new("f", &[("a", "b"), ("a", "x")]).witness(WitnessClass::Vector),
-            ]);
-            walk(&reg, vec![seed("a")], budget(10), |t| {
-                t.question("q").handler(noop(), every(1))
-            })
-            .await
-        };
-        let (a, b) = (run().await, run().await);
-        let hashes = |r: &TraversalResult| texts(&of(r, "stop"), "checkpoint_hash");
-        assert!(!hashes(&a).is_empty());
-        assert_eq!(hashes(&a), hashes(&b));
-        assert_eq!(a.events_jsonl(), b.events_jsonl());
-        let distinct: BTreeSet<_> = hashes(&a).into_iter().collect();
-        assert_eq!(distinct.len(), hashes(&a).len());
-    }
-
     // ---- the ladder ----------------------------------------------------------------
 
     #[test]
@@ -1947,7 +1781,7 @@ mod steering {
         assert_eq!(result.totals.pops, 1);
         assert_eq!(double_calls.load(Ordering::SeqCst), 1);
 
-        let steers = of(&result, "steer");
+        let steers = events_of(&result, "steer");
         let order: Vec<(u64, &str, &str)> = steers
             .iter()
             .map(|e| {
@@ -1973,10 +1807,10 @@ mod steering {
         let hash = trace::checkpoint_hash(checkpoint);
         assert_eq!(texts(&steers, "inputs_hash"), [hash.as_str(); 3]);
         assert_eq!(
-            texts(&of(&result, "stop"), "checkpoint_hash"),
+            texts(&events_of(&result, "stop"), "checkpoint_hash"),
             [hash.as_str()]
         );
-        let ret = of(&result, "return");
+        let ret = events_of(&result, "return");
         assert_eq!(ret.len(), 1);
         assert_eq!(ret[0]["reason"], "escalated");
         assert_eq!(ret[0]["checkpoint_hash"], hash.as_str());
@@ -2003,7 +1837,7 @@ mod steering {
             0,
             "rung 2 was never asked"
         );
-        let steers = of(&result, "steer");
+        let steers = events_of(&result, "steer");
         assert!(!steers.is_empty());
         assert!(
             steers
@@ -2011,39 +1845,36 @@ mod steering {
                 .all(|e| e["rung"] == 1 && e["outcome"] == "applied")
         );
         assert!(result.checkpoint.is_none() && result.snapshot.is_none());
-        assert!(of(&result, "return").is_empty());
+        assert!(events_of(&result, "return").is_empty());
     }
 
     #[tokio::test]
-    async fn a_confident_system_one_decides_when_the_rules_are_unsure() {
-        let (double, _) = system_one_double(0.9, vec![act(Some(&node("d")), Action::Prune)]);
-        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
-        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
-            t.handler(ladder(0.8, rungs), every(1).max_stops(1))
-        })
-        .await;
+    async fn a_system_one_decides_only_when_it_is_confident_and_an_unsure_ones_proposals_are_not_applied()
+     {
+        let run = |confidence| async move {
+            let (double, _) =
+                system_one_double(confidence, vec![act(Some(&node("d")), Action::Prune)]);
+            let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
+            walk(&fan(), vec![seed("a")], budget(10), |t| {
+                t.handler(ladder(0.8, rungs), every(1).max_stops(1))
+            })
+            .await
+        };
+        let result = run(0.9).await;
         assert_eq!(result.status, TraversalStatus::Complete);
         assert!(result.cleared.contains(&node("d")));
         assert!(result.reached(&node("e")) && !result.reached(&node("h")));
-        let steers = of(&result, "steer");
+        let steers = events_of(&result, "steer");
         assert_eq!(texts(&steers, "outcome"), ["uncertain", "applied"]);
         assert_eq!(steers[0]["rung"], 1);
         assert_eq!(steers[1]["rung"], 2);
         assert_eq!(steers[1]["applied"], 1);
         assert_eq!(result.totals.steers, 1);
-    }
 
-    #[tokio::test]
-    async fn the_proposals_of_an_unsure_rung_are_not_applied() {
-        let (double, _) = system_one_double(0.1, vec![act(Some(&node("d")), Action::Prune)]);
-        let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules()), Box::new(double)];
-        let result = walk(&fan(), vec![seed("a")], budget(10), |t| {
-            t.handler(ladder(0.8, rungs), every(1))
-        })
-        .await;
-        assert_eq!(result.status, TraversalStatus::Stopped);
-        assert!(result.cleared.is_empty());
-        let steers = of(&result, "steer");
+        let unsure = run(0.1).await;
+        assert_eq!(unsure.status, TraversalStatus::Stopped);
+        assert!(unsure.cleared.is_empty());
+        let steers = events_of(&unsure, "steer");
         assert_eq!(steers[1]["actions"][0]["action"], "prune");
         assert_eq!(steers[1]["applied"], 0);
     }
@@ -2063,7 +1894,7 @@ mod steering {
         .await;
         assert_eq!(double_calls.load(Ordering::SeqCst), 1);
         assert!(result.cleared.is_empty(), "rung 1's prune was not applied");
-        let steers = of(&result, "steer");
+        let steers = events_of(&result, "steer");
         assert_eq!(texts(&steers, "outcome"), ["uncertain", "applied"]);
         assert_eq!(steers[0]["rung"], 1);
     }
@@ -2077,7 +1908,7 @@ mod steering {
         .await;
         assert_eq!(done.status, TraversalStatus::Complete);
         assert!(done.checkpoint.is_none());
-        assert!(of(&done, "steer").iter().all(|e| e["rung"] != 3));
+        assert!(events_of(&done, "steer").iter().all(|e| e["rung"] != 3));
 
         let sure = ladder(0.8, vec![Box::new(sure_rules())]);
         let cut = walk(&fan(), vec![seed("a")], budget(3), |t| {
@@ -2088,9 +1919,9 @@ mod steering {
         let checkpoint = cut.checkpoint.as_ref().expect("a budget hit is returned");
         assert_eq!(checkpoint.reason, stop::StopReason::Pops);
         assert_eq!(checkpoint.pops, 3);
-        assert_eq!(of(&cut, "return")[0]["reason"], "budget");
-        assert!(of(&cut, "steer").is_empty(), "no rung was consulted");
-        assert!(of(&cut, "stop").is_empty());
+        assert_eq!(events_of(&cut, "return")[0]["reason"], "budget");
+        assert!(events_of(&cut, "steer").is_empty(), "no rung was consulted");
+        assert!(events_of(&cut, "stop").is_empty());
         assert_eq!(
             checkpoint.handle.as_deref(),
             Some(cut.snapshot.as_ref().unwrap().handle().as_str())
@@ -2102,7 +1933,7 @@ mod steering {
     #[tokio::test]
     async fn rung_three_round_trips_through_the_handle_with_a_steer() {
         let reg = fan();
-        let dir = scratch("roundtrip");
+        let dir = scratch("steer-roundtrip");
         let first = walk(&reg, vec![seed("a")], budget(10), |t| {
             t.question("how does a reach h")
                 .handler(ladder(0.8, vec![Box::new(no_rules())]), every(1))
@@ -2125,7 +1956,7 @@ mod steering {
             act(Some(&node("d")), Action::Expand),
         ]);
         let snapshot = HandleStore::in_dir(&dir).get(&handle).unwrap();
-        let second = continue_from(&reg, snapshot, budget(10), |t| {
+        let second = resume(&reg, snapshot, budget(10), |t| {
             t.handler(ladder(0.8, vec![Box::new(sure_rules())]), every(1))
                 .steer(steer)
         })
@@ -2143,7 +1974,7 @@ mod steering {
         assert!(second.reached(&node("h")));
 
         let hash = trace::checkpoint_hash(&checkpoint);
-        let mine: Vec<&Value> = of(&second, "steer")
+        let mine: Vec<&Value> = events_of(&second, "steer")
             .into_iter()
             .filter(|e| e["rung"] == 3 && e["outcome"] == "applied")
             .collect();
@@ -2168,7 +1999,7 @@ mod steering {
             t.handler(ladder(0.8, vec![Box::new(no_rules())]), every(1))
         })
         .await;
-        let second = continue_from(&reg, first.snapshot.clone().unwrap(), budget(10), |t| {
+        let second = resume(&reg, first.snapshot.clone().unwrap(), budget(10), |t| {
             t.steer(Steer::new(vec![act(None, Action::Stop)]))
         })
         .await;
@@ -2178,7 +2009,10 @@ mod steering {
             second.checkpoint.as_ref().unwrap().reason,
             stop::StopReason::Steer
         );
-        assert_eq!(of(&second, "return").last().unwrap()["reason"], "steer");
+        assert_eq!(
+            events_of(&second, "return").last().unwrap()["reason"],
+            "steer"
+        );
         assert_ne!(
             second.snapshot.unwrap().handle(),
             first.snapshot.unwrap().handle()
@@ -2200,7 +2034,7 @@ mod steering {
             act(None, Action::MapOff("m2".into())),
             act(None, Action::Redirect(vec![node("b")])),
         ]);
-        let second = continue_from(&reg, first.snapshot.unwrap(), budget(10), |t| {
+        let second = resume(&reg, first.snapshot.unwrap(), budget(10), |t| {
             t.steer(steer)
         })
         .await;
@@ -2285,23 +2119,23 @@ mod steering {
         let snapshot = first.snapshot.unwrap();
 
         for cap in [4, 2, 0] {
-            let same = continue_from(&reg, snapshot.clone(), budget(cap), |t| t).await;
+            let same = resume(&reg, snapshot.clone(), budget(cap), |t| t).await;
             assert_eq!(
                 (same.status, same.totals.pops),
                 (TraversalStatus::BudgetExhausted, 4)
             );
             assert!(same.snapshot.is_some());
         }
-        let more = continue_from(&reg, snapshot.clone(), budget(9), |t| t).await;
+        let more = resume(&reg, snapshot.clone(), budget(9), |t| t).await;
         assert_eq!(more.totals.pops, 9);
 
         let raise = |pops| Steer::new(vec![act(None, Action::Budget { pops, tokens: 0 })]);
-        let plus3 = continue_from(&reg, snapshot.clone(), budget(4), |t| t.steer(raise(3))).await;
+        let plus3 = resume(&reg, snapshot.clone(), budget(4), |t| t.steer(raise(3))).await;
         assert_eq!(plus3.totals.pops, 7);
         assert_eq!(plus3.snapshot.as_ref().unwrap().tally.raised_pops, 3);
-        let again = continue_from(&reg, plus3.snapshot.clone().unwrap(), budget(4), |t| t).await;
+        let again = resume(&reg, plus3.snapshot.clone().unwrap(), budget(4), |t| t).await;
         assert_eq!(again.totals.pops, 7, "the raise stays with the traversal");
-        let plus6 = continue_from(&reg, plus3.snapshot.unwrap(), budget(4), |t| {
+        let plus6 = resume(&reg, plus3.snapshot.unwrap(), budget(4), |t| {
             t.steer(raise(3))
         })
         .await;
@@ -2323,7 +2157,7 @@ mod steering {
                 tokens: u64::MAX,
             },
         )]);
-        let capped = continue_from(&reg, first.snapshot.unwrap(), deep(4), |t| t.steer(huge)).await;
+        let capped = resume(&reg, first.snapshot.unwrap(), deep(4), |t| t.steer(huge)).await;
         assert_eq!(capped.totals.pops, 4 + RAISE_MAX_POPS);
         let raised = capped.snapshot.unwrap();
         assert_eq!(
@@ -2373,7 +2207,7 @@ mod steering {
         assert_eq!(first.status, TraversalStatus::BudgetExhausted);
         assert!(first.totals.tokens <= 60);
         let snapshot = first.snapshot.unwrap();
-        let none = continue_from(&reg, snapshot.clone(), tight, |t| t).await;
+        let none = resume(&reg, snapshot.clone(), tight, |t| t).await;
         assert_eq!(
             none.totals.tokens, first.totals.tokens,
             "no budget, no work"
@@ -2386,46 +2220,12 @@ mod steering {
                 tokens: 1_000_000_000,
             },
         )]);
-        let more = continue_from(&reg, snapshot, tight, |t| t.steer(plenty)).await;
+        let more = resume(&reg, snapshot, tight, |t| t.steer(plenty)).await;
         assert!(more.totals.pops > first.totals.pops);
         assert!(more.totals.tokens > 60 && more.totals.tokens <= 60 + RAISE_MAX_TOKENS);
     }
 
     // ---- a pop cut by a budget is requeued (carry-over 1) ------------------------
-
-    #[tokio::test]
-    async fn a_pop_cut_by_the_token_cap_is_requeued_and_a_resume_finishes_it() {
-        let reg = registry(vec![
-            GraphMap::new(
-                "g",
-                &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"), ("a", "h")],
-            )
-            .cost(10, 0),
-        ]);
-        // The cost of the call is 10 and each edge adds its own; cap at 30.
-        let tight = TraversalBudget {
-            est_tokens: 30,
-            ..budget(10)
-        };
-        let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
-        assert_eq!(first.status, TraversalStatus::BudgetExhausted);
-        let reached = first.states.len();
-        assert!(reached < 6, "the pop was cut, only some edges adopted");
-        let snapshot = first.snapshot.unwrap();
-        let queued: Vec<_> = snapshot
-            .frontier
-            .iter()
-            .map(|(s, _, _)| snapshot.states[*s].node.clone())
-            .collect();
-        assert!(queued.contains(&node("a")), "{queued:?}");
-        assert!(snapshot.expanded.is_empty());
-
-        let second = continue_from(&reg, snapshot, budget(10), |t| t).await;
-        assert_eq!(second.status, TraversalStatus::Complete);
-        for name in ["b", "c", "d", "e", "h"] {
-            assert!(second.reached(&node(name)), "{name}");
-        }
-    }
 
     #[tokio::test]
     async fn a_pop_that_adopted_nothing_is_not_counted_and_is_requeued() {
@@ -2446,7 +2246,7 @@ mod steering {
             est_tokens: 1000,
             ..budget(10)
         };
-        let second = continue_from(&reg, snapshot, roomy, |t| t).await;
+        let second = resume(&reg, snapshot, roomy, |t| t).await;
         assert_eq!(second.totals.pops, 2);
         assert!(second.reached(&node("b")));
         assert_eq!(second.status, TraversalStatus::Complete);
@@ -2474,7 +2274,7 @@ mod steering {
 
         // The retry finishes the expansion; the pop cap then ends the call
         // with work left, which leaves the counts to read.
-        let second = continue_from(&reg, snapshot, budget(2), |t| t).await;
+        let second = resume(&reg, snapshot, budget(2), |t| t).await;
         let retried = second.snapshot.expect("work is left").in_seen;
         assert_eq!(retried.len(), 5);
         assert!(retried.iter().all(|(_, count)| *count == 1), "{retried:?}");
@@ -2491,21 +2291,6 @@ mod start_plan {
     use super::*;
     use crate::traverse::trace::{self, PlanMap, PlanPolicy, StartEvent, StartPlan};
     use serde_json::json;
-
-    /// A handler that never decides anything.
-    fn noop() -> impl Handler {
-        struct Quiet;
-        impl Handler for Quiet {
-            fn id(&self) -> &str {
-                "quiet"
-            }
-
-            fn decide(&self, _: &Checkpoint, _: &StopBudget) -> Decision {
-                Decision::default()
-            }
-        }
-        Quiet
-    }
 
     fn plan() -> StartPlan {
         StartPlan {
@@ -2648,3 +2433,5 @@ mod accounting;
 
 mod bound;
 mod continuation;
+
+mod harness;

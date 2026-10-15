@@ -1607,16 +1607,13 @@ mod tests {
     }
 
     #[test]
-    fn symbols_become_declarations_at_their_site() {
+    fn symbols_become_declarations_at_their_site_and_without_one_are_not_offered() {
         let d = decl_of(&located(SEARCH_FN, "src/app/other.rs", 12)).unwrap();
         assert_eq!((d.path.as_str(), d.line), ("src/app/other.rs", 12));
         let m = decl_of(&located(METHOD, "lci-core/src/chunk.rs", 30)).unwrap();
         assert_eq!(m.kind, SymbolKind::Method);
         assert!(decl_of(&node(COMMIT)).is_none());
-    }
-
-    #[test]
-    fn a_symbol_without_a_site_is_not_offered() {
+        // A symbol without a site is not offered.
         assert!(decl_of(&node(SEARCH_FN)).is_none());
         assert!(adapt_impact(&[node(SEARCH_FN)]).is_empty());
         assert!(adapt_flow(&[node(SEARCH_FN)]).is_empty());
@@ -1728,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn precision_and_f_half() {
+    fn precision_recall_and_f_half() {
         // p = 0.5, r = 1.0: F0.5 = 1.25 * 0.5 / (0.125 + 1.0)
         assert!((f_beta(0.5, 1.0, 0.5) - 0.625 / 1.125).abs() < 1e-12);
         assert!((f_beta(1.0, 0.5, 0.5) - 0.625 / 0.75).abs() < 1e-12);
@@ -1737,10 +1734,8 @@ mod tests {
         assert!((f_beta(1.0, 1.0, 0.5) - 1.0).abs() < 1e-12);
         // Precision weighs more than recall.
         assert!(f_beta(0.9, 0.3, 0.5) > f_beta(0.3, 0.9, 0.5));
-    }
 
-    #[test]
-    fn registration_precision_skips_neutral_files() {
+        // Registration precision skips the neutral files.
         let item = json!({
             "gold": {"form": "registration", "expected_files": ["a.rs", "b.rs"]},
             "accept": {"preferred": [{"path": "t.rs"}], "related_sites": [{"files": ["r.rs"]}]}
@@ -1754,10 +1749,8 @@ mod tests {
         let (p, r) = registration_precision_recall(&item, &answers);
         assert!((p - 0.5).abs() < 1e-12 && (r - 0.5).abs() < 1e-12);
         assert_eq!(registration_precision_recall(&item, &[]), (0.0, 0.0));
-    }
 
-    #[test]
-    fn history_precision_counts_accepted_commits() {
+        // History precision counts the accepted commits.
         let item = json!({"gold": {"commit": "0123456789abcdef"}, "accept": {}});
         let hit = json!({"commit": "0123456789abcdef0123456789abcdef01234567"});
         let miss = json!({"commit": "ffffffffffffffffffffffffffffffffffffffff"});
@@ -2009,6 +2002,15 @@ mod tests {
         assert!(raw["i2"]["skipped"].as_str().unwrap().contains("timeout"));
         assert!(raw["i3"]["skipped"].as_str().unwrap().contains("cli error"));
         assert!(cells[20].contains("skipped items are not in any metric"));
+        // A skip description names only the causes that occurred.
+        assert_eq!(Skips::default().describe(), "none");
+        let skips = Skips {
+            timeout: 2,
+            map_unavailable: 1,
+            ..Skips::default()
+        };
+        assert_eq!(skips.describe(), "timeout=2; map_unavailable=1");
+        assert_eq!(skips.total(), 3);
     }
 
     #[test]
@@ -2092,18 +2094,6 @@ mod tests {
         assert_eq!(outcome.row.cells[3], "0");
         assert_eq!(outcome.row.cells[5], "map_unavailable=1");
         assert!(outcome.row.cells[7].contains("map unavailable"));
-    }
-
-    #[test]
-    fn skips_describe_only_the_causes_that_occurred() {
-        assert_eq!(Skips::default().describe(), "none");
-        let skips = Skips {
-            timeout: 2,
-            map_unavailable: 1,
-            ..Skips::default()
-        };
-        assert_eq!(skips.describe(), "timeout=2; map_unavailable=1");
-        assert_eq!(skips.total(), 3);
     }
 
     #[test]

@@ -2059,24 +2059,41 @@ mod tests {
         (name.to_owned(), how.to_owned())
     }
 
+    /// Lines are counted from 1 in chunks and from 0 in the graph: `parse_query`
+    /// is on 0-based line 12, so on 1-based line 13, and ends on line 15.
     #[test]
-    fn a_chunk_maps_to_the_function_whose_name_it_holds() {
+    fn a_chunk_maps_to_the_function_it_defines_or_the_innermost_one_around_it() {
         let loaded = loaded();
-        for (lines, name) in [
-            ((1, 10), "search"),
-            ((13, 15), "parse_query"),
-            ((13, 13), "parse_query"),
-            ((16, 40), "rank_hits"),
+        // (lines, name, how, the only seed): only some rows pin the whole list.
+        for (lines, name, how, only) in [
+            ((1, 10), "search", "defined", false),
+            ((13, 15), "parse_query", "defined", false),
+            ((16, 40), "rank_hits", "defined", false),
             // the nested function starts here, whatever lies around it
-            ((21, 23), "score_inner"),
+            ((21, 23), "score_inner", "defined", false),
+            ((13, 13), "parse_query", "defined", true),
+            // past the name, inside the body; line 15 is its last line
+            ((14, 14), "parse_query", "inside", true),
+            ((15, 15), "parse_query", "inside", true),
+            ((16, 16), "rank_hits", "defined", true),
+            // inside `rank_hits`, before the nested function
+            ((17, 19), "rank_hits", "inside", true),
+            // inside the nested function: it, not the function around it
+            ((22, 23), "score_inner", "inside", true),
+            // past the nested function, inside the outer one again
+            ((27, 30), "rank_hits", "inside", true),
+            // straddling the end of the nested function: only the outer covers it
+            ((23, 28), "rank_hits", "inside", true),
         ] {
             let got = mapped(&loaded, "x", &[hit("src/search.rs", lines, 1)]);
-            assert_eq!(
-                got.first(),
-                Some(&pair(name, "defined")),
-                "{lines:?}: {got:?}"
-            );
+            assert_eq!(got.first(), Some(&pair(name, how)), "{lines:?}: {got:?}");
+            assert!(!only || got.len() == 1, "{lines:?}: {got:?}");
         }
+        // Line 12 (1-based) is the gap line before `parse_query`: no function.
+        assert_eq!(
+            mapped(&loaded, "x", &[hit("src/search.rs", (12, 12), 1)])[0].1,
+            "chunk"
+        );
         // A chunk in the other file.
         let got = mapped(&loaded, "x", &[hit("src/other.rs", (4, 6), 1)]);
         assert_eq!(got, [pair("helper", "defined")]);
@@ -2122,35 +2139,6 @@ mod tests {
                 .iter()
                 .all(|e| e.kind == EdgeKind::Contains && e.map == CONTAINS_MAP_ID)
         );
-    }
-
-    #[test]
-    fn lines_are_counted_from_1_in_chunks_and_from_0_in_the_graph() {
-        let loaded = loaded();
-        // `parse_query` is on 0-based line 12, so on 1-based line 13.
-        let at = |lines| mapped(&loaded, "x", &[hit("src/search.rs", lines, 1)]);
-        assert_eq!(at((13, 13)), [pair("parse_query", "defined")]);
-        // Line 12 (1-based) is the gap line before it: no function.
-        assert_eq!(at((12, 12))[0].1, "chunk");
-        // Line 14 (1-based) is inside its body, past the name.
-        assert_eq!(at((14, 14)), [pair("parse_query", "inside")]);
-        // Line 15 (1-based) is its last line; line 16 is the next function's.
-        assert_eq!(at((15, 15)), [pair("parse_query", "inside")]);
-        assert_eq!(at((16, 16)), [pair("rank_hits", "defined")]);
-    }
-
-    #[test]
-    fn a_chunk_inside_a_function_maps_to_the_innermost_function_around_it() {
-        let loaded = loaded();
-        let at = |lines| mapped(&loaded, "x", &[hit("src/search.rs", lines, 1)]);
-        // Inside `rank_hits`, before the nested function.
-        assert_eq!(at((17, 19)), [pair("rank_hits", "inside")]);
-        // Inside the nested function: it, not the function around it.
-        assert_eq!(at((22, 23)), [pair("score_inner", "inside")]);
-        // Past the nested function, inside the outer one again.
-        assert_eq!(at((27, 30)), [pair("rank_hits", "inside")]);
-        // Straddling the end of the nested function: only the outer covers it.
-        assert_eq!(at((23, 28)), [pair("rank_hits", "inside")]);
     }
 
     #[test]

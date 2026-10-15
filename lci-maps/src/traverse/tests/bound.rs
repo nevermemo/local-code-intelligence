@@ -4,43 +4,12 @@
 use super::*;
 use crate::traverse::handle::{HandleError, Snapshot};
 
-async fn resume(
-    reg: &Registry<'static>,
-    snapshot: Snapshot,
-    budget: TraversalBudget,
-    configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
-) -> TraversalResult {
-    let view = view();
-    configure(Traversal::resumed(
-        OnTheFly::new(reg, &view),
-        snapshot,
-        budget,
-    ))
-    .run()
-    .await
-}
-
-/// `parent` offers the nine names `dsts` (the ninth is above the beam gate,
-/// hop value 1/9; the others are worth 1).
-fn nine(map: &mut GraphMap, parent: &str, dsts: [&str; 9]) {
-    map.edges
-        .extend(dsts.iter().map(|d| (parent.to_string(), d.to_string())));
-}
-
 /// `s` offers `a`, `b`, `c` (value 1 each); `a` and `b` offer one more each.
 fn small() -> GraphMap {
     GraphMap::new(
         "g",
         &[("s", "a"), ("s", "b"), ("s", "c"), ("a", "d"), ("b", "e")],
     )
-}
-
-fn bound_events(result: &TraversalResult) -> Vec<&Value> {
-    result
-        .events
-        .iter()
-        .filter(|e| e["ev"] == "bound")
-        .collect()
 }
 
 fn end_event(result: &TraversalResult) -> &Value {
@@ -72,7 +41,7 @@ async fn q1_the_walk_stops_with_bound_before_its_budget_when_nothing_can_beat_th
 
     // The reason is in the trace: a `bound` event with the numbers, and the
     // `end` event.
-    let bound = bound_events(&result);
+    let bound = events_of(&result, "bound");
     assert_eq!(bound.len(), 1);
     assert_eq!(bound[0]["pop"], 1);
     assert_eq!(bound[0]["k"], 2);
@@ -105,7 +74,7 @@ async fn q1_the_bound_does_not_hold_while_the_queue_can_beat_the_kth() {
         result.totals.pops, 9,
         "the seed and the eight strong states"
     );
-    let bound = bound_events(&result);
+    let bound = events_of(&result, "bound");
     assert_eq!(bound.len(), 1);
     assert_eq!(
         bound[0]["pop"], 9,
@@ -117,34 +86,27 @@ async fn q1_the_bound_does_not_hold_while_the_queue_can_beat_the_kth() {
 }
 
 #[tokio::test]
-async fn q1_fewer_than_k_results_never_hold_the_bound() {
+async fn q1_the_bound_holds_only_with_k_results_and_no_state_that_could_beat_the_kth() {
     let reg = registry(vec![small()]);
-    let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(100, 1)).await;
-    assert_eq!(result.status, TraversalStatus::Complete);
-    assert_eq!(result.stop_reason, StopReason::Complete);
-    assert_eq!(result.totals.pops, 6);
-    assert!(bound_events(&result).is_empty());
-    // k of 0 switches it off.
-    let off = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(0, 1)).await;
-    assert_eq!(off.stop_reason, StopReason::Complete);
-    assert_eq!(off.totals.pops, 6);
-}
-
-#[tokio::test]
-async fn q1_more_expanding_maps_raise_the_ceiling_a_queued_state_could_reach() {
-    // The same walk as the first test, but two registered maps could each
-    // corroborate a queued state: its potential 1 could rank 1.1, above the
+    // Fewer than k results never hold it; a k of 0 switches it off; with two
+    // expanding maps a queued state of potential 1 could rank 1.1, above the
     // 2nd result at 1.0, so the walk goes on to the end.
-    let reg = registry(vec![small()]);
-    let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(2, 2)).await;
-    assert_eq!(result.stop_reason, StopReason::Complete);
-    assert_eq!(result.totals.pops, 6);
-    assert!(bound_events(&result).is_empty());
-}
-
-#[tokio::test]
-async fn q1_a_walk_with_targets_ends_when_they_are_reached_not_on_the_bound() {
-    let reg = registry(vec![small()]);
+    for (k, maps) in [(100, 1), (0, 1), (2, 2)] {
+        let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(k, maps)).await;
+        assert_eq!(
+            result.status,
+            TraversalStatus::Complete,
+            "k {k}, maps {maps}"
+        );
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Complete,
+            "k {k}, maps {maps}"
+        );
+        assert_eq!(result.totals.pops, 6, "k {k}, maps {maps}");
+        assert!(events_of(&result, "bound").is_empty(), "k {k}, maps {maps}");
+    }
+    // A walk with targets ends when they are reached, not on the bound.
     let result = walk(&reg, vec![seed("s")], budget(100), |t| {
         t.top_k(2, 1).targets(vec![node("e")])
     })
@@ -178,6 +140,10 @@ async fn every_exit_path_names_its_stop_reason() {
     late.deadline = Instant::now();
     let timed_out = walk(&lattice, vec![seed("n0")], late, |t| t).await;
     assert_eq!(reason_of(&timed_out), (StopReason::Deadline, "deadline"));
+    assert_eq!(
+        (timed_out.totals.pops, timed_out.status),
+        (0, TraversalStatus::BudgetExhausted)
+    );
 
     let mut dry = budget(50);
     dry.est_tokens = 0;

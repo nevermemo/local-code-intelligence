@@ -9,25 +9,6 @@ use crate::traverse::frontier::Frontier;
 use crate::walk::SplitMix;
 use std::time::Instant as Clock;
 
-fn expand_events(result: &TraversalResult) -> Vec<&Value> {
-    result
-        .events
-        .iter()
-        .filter(|e| e["ev"] == "expand")
-        .collect()
-}
-
-async fn resume(
-    reg: &Registry<'static>,
-    snapshot: handle::Snapshot,
-    budget: TraversalBudget,
-) -> TraversalResult {
-    let view = view();
-    Traversal::resumed(OnTheFly::new(reg, &view), snapshot, budget)
-        .run()
-        .await
-}
-
 /// `a` offers `count` files `x00..`, then `zzz` last in offer order.
 fn wide_with_zzz_last(count: usize) -> GraphMap {
     let mut map = GraphMap::new("g", &[]);
@@ -52,17 +33,12 @@ async fn r1_the_beam_picks_before_the_tokens_do() {
     assert!(result.reached(&node("zzz")), "{:?}", hops(&result));
     assert_eq!(result.totals.hops, 3);
     assert_eq!(result.totals.tokens, 3 * TOKENS_PER_EDGE);
-}
-
-#[tokio::test]
-async fn r1_the_expand_event_reports_adopted_and_offered_apart() {
-    let reg = registry(vec![wide_with_zzz_last(40)]);
-    let mut limits = budget(100);
-    limits.est_tokens = 3 * TOKENS_PER_EDGE;
-    let result = walk(&reg, vec![seed("a")], limits, |t| t).await;
-    let events = expand_events(&result);
-    assert_eq!(events[0]["offered"], 41);
-    assert_eq!(events[0]["adopted"], 3);
+    // The expand event reports what was offered and what was adopted apart.
+    let expand = events_of(&result, "expand");
+    assert_eq!(
+        (expand[0]["offered"].as_u64(), expand[0]["adopted"].as_u64()),
+        (Some(41), Some(3))
+    );
 }
 
 #[tokio::test]
@@ -80,32 +56,6 @@ async fn r1_a_beam_that_fits_the_tokens_is_not_truncated() {
         "the seed was finished, not put back: {:?}",
         snapshot.frontier
     );
-}
-
-#[tokio::test]
-async fn r1_a_truncated_pop_charges_its_call_once() {
-    let reg = registry(vec![
-        GraphMap::new(
-            "g",
-            &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"), ("a", "h")],
-        )
-        .cost(10, 0),
-    ]);
-    let tight = TraversalBudget {
-        est_tokens: 30,
-        ..budget(10)
-    };
-    let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
-    assert_eq!(first.status, TraversalStatus::BudgetExhausted);
-    assert!(first.totals.tokens <= 30);
-    let second = resume(&reg, first.snapshot.unwrap(), budget(10)).await;
-    assert_eq!(second.status, TraversalStatus::Complete);
-    // Six pops (a and its five children) cost one call each, plus five hops,
-    // whatever the cut: the cut pop did not pay for its call twice.
-    let straight = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
-    assert_eq!(straight.totals.tokens, 6 * 10 + 5 * TOKENS_PER_EDGE);
-    assert_eq!(second.totals.tokens, straight.totals.tokens);
-    assert_eq!(second.totals.hops, straight.totals.hops);
 }
 
 // ---- R2: a call costs once, whatever it returns -----------------------------
@@ -148,7 +98,7 @@ mod r2 {
         let result = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
         assert_eq!(result.totals.hops, 0);
         assert_eq!(result.totals.external_calls, 1, "the embedding call");
-        let events = expand_events(&result);
+        let events = events_of(&result, "expand");
         assert_eq!(events[0]["calls"][0]["external_calls"], 1);
     }
 }
@@ -268,7 +218,7 @@ fn r6_the_frontier_pops_in_logarithmic_time() {
 }
 
 #[test]
-fn r6_a_changed_priority_is_seen_by_the_next_pop() {
+fn r6_a_changed_priority_is_seen_by_the_next_pop_and_a_requeued_item_keeps_its_place() {
     let mut frontier = Frontier::default();
     for (state, priority) in [(0, 0.5), (1, 0.9), (2, 0.7)] {
         frontier.push(state, priority);
@@ -282,11 +232,8 @@ fn r6_a_changed_priority_is_seen_by_the_next_pop() {
     let order: Vec<usize> = std::iter::from_fn(|| frontier.pop().map(|i| i.state)).collect();
     assert_eq!(order, [0, 2]);
     assert!(frontier.is_empty());
-}
 
-#[test]
-fn r6_a_requeued_item_keeps_its_place() {
-    let mut frontier = Frontier::default();
+    // A requeued item keeps its place: its discovery number.
     frontier.push(0, 1.0);
     frontier.push(1, 1.0);
     let first = frontier.pop().unwrap();

@@ -6,42 +6,6 @@ use super::*;
 use crate::traverse::{handle::Snapshot, steer::Steer};
 use serde_json::json;
 
-async fn resume(
-    reg: &Registry<'static>,
-    snapshot: Snapshot,
-    budget: TraversalBudget,
-    configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
-) -> TraversalResult {
-    let view = view();
-    configure(Traversal::resumed(
-        OnTheFly::new(reg, &view),
-        snapshot,
-        budget,
-    ))
-    .run()
-    .await
-}
-
-fn state_of<'r>(result: &'r TraversalResult, name: &str) -> (usize, &'r State) {
-    result
-        .states
-        .iter()
-        .enumerate()
-        .find(|(_, s)| s.node == node(name))
-        .unwrap_or_else(|| panic!("no state for {name}"))
-}
-
-fn events_of<'r>(result: &'r TraversalResult, ev: &str) -> Vec<&'r Value> {
-    result.events.iter().filter(|e| e["ev"] == ev).collect()
-}
-
-/// `parent` offers the nine names `dsts` (the last is at rank 8 above the
-/// gate, hop value 1/9; the first is at rank 0, value 1).
-fn nine(map: &mut GraphMap, parent: &str, dsts: [&str; 9]) {
-    map.edges
-        .extend(dsts.iter().map(|d| (parent.to_string(), d.to_string())));
-}
-
 // ---- R7a: a relaxed state may have a parent that comes later ------------------
 
 /// `s1` offers nine files with `zx` last (hop value 1/9); `s2` offers `y`,
@@ -70,30 +34,6 @@ async fn r7a_a_relaxed_state_with_a_later_parent_still_makes_a_readable_handle()
     let snapshot = result.snapshot.expect("work is left");
     let back = Snapshot::from_json(&snapshot.to_json()).expect("the handle reads back");
     assert_eq!(back, snapshot);
-}
-
-#[tokio::test]
-async fn r7a_a_handle_with_a_parent_cycle_or_a_parent_out_of_range_is_refused() {
-    let (_, snapshot) = cut_snapshot().await;
-    let base = snapshot.to_json();
-    // States 1 and 2 are the children of state 0.
-    let with = |one: Value, two: Value| {
-        let mut value = base.clone();
-        value["states"][1]["parent"] = one;
-        value["states"][2]["parent"] = two;
-        Snapshot::from_json(&value)
-    };
-    let err = with(json!(2), json!(1)).unwrap_err();
-    assert!(err.contains("cycle"), "{err}");
-    let err = with(json!(1), json!(0)).unwrap_err();
-    assert!(
-        err.contains("cycle"),
-        "a state is not its own parent: {err}"
-    );
-    let err = with(json!(99), json!(0)).unwrap_err();
-    assert!(err.contains("range"), "{err}");
-    // A parent that comes later is fine when it leads to a root.
-    assert!(with(json!(2), json!(0)).is_ok());
 }
 
 // ---- R7b: a relaxed node's children follow it ---------------------------------
@@ -288,23 +228,48 @@ async fn cut_snapshot() -> (Registry<'static>, Snapshot) {
 }
 
 #[tokio::test]
-async fn r9_a_handle_that_queues_a_state_twice_is_refused() {
+async fn r7a_r9_a_handle_with_a_parent_cycle_a_parent_out_of_range_or_a_bad_queue_is_refused() {
     let (_, snapshot) = cut_snapshot().await;
-    let mut value = snapshot.to_json();
-    let first = value["frontier"][0].clone();
-    value["frontier"].as_array_mut().unwrap().push(first);
-    let err = Snapshot::from_json(&value).unwrap_err();
-    assert!(err.contains("twice"), "{err}");
-}
-
-#[tokio::test]
-async fn r9_a_handle_that_queues_an_expanded_state_is_refused() {
-    let (_, snapshot) = cut_snapshot().await;
-    let mut value = snapshot.to_json();
-    let queued = value["frontier"][0][0].clone();
-    value["expanded"].as_array_mut().unwrap().push(queued);
-    let err = Snapshot::from_json(&value).unwrap_err();
-    assert!(err.contains("expanded"), "{err}");
+    let base = snapshot.to_json();
+    // States 1 and 2 are the children of state 0.
+    let parents = |one: Value, two: Value| {
+        let mut value = base.clone();
+        value["states"][1]["parent"] = one;
+        value["states"][2]["parent"] = two;
+        value
+    };
+    let queued_twice = {
+        let mut value = base.clone();
+        let first = value["frontier"][0].clone();
+        value["frontier"].as_array_mut().unwrap().push(first);
+        value
+    };
+    let queued_expanded = {
+        let mut value = base.clone();
+        let queued = value["frontier"][0][0].clone();
+        value["expanded"].as_array_mut().unwrap().push(queued);
+        value
+    };
+    for (what, value, wanted) in [
+        ("a parent cycle", parents(json!(2), json!(1)), "cycle"),
+        (
+            "a state its own parent",
+            parents(json!(1), json!(0)),
+            "cycle",
+        ),
+        (
+            "a parent out of range",
+            parents(json!(99), json!(0)),
+            "range",
+        ),
+        ("a state queued twice", queued_twice, "twice"),
+        ("an expanded state queued", queued_expanded, "expanded"),
+    ] {
+        let err = Snapshot::from_json(&value).unwrap_err();
+        assert!(err.contains(wanted), "{what}: {err}");
+    }
+    // A parent that comes later is fine when it leads to a root.
+    assert!(Snapshot::from_json(&parents(json!(2), json!(0))).is_ok());
 }
 
 #[tokio::test]
@@ -384,10 +349,14 @@ async fn f1_a_spent_external_allowance_skips_external_maps_and_structure_goes_on
     assert!(result.reached(&node("d")), "the structural map went on");
     assert!(!result.reached(&node("y")) && !result.reached(&node("z")));
     assert_eq!(result.status, TraversalStatus::Complete);
+    assert!(
+        result.events.iter().any(|e| e["external_spent"] == true),
+        "the trace says the maps were given no call"
+    );
 }
 
 #[tokio::test]
-async fn f1_a_retried_pop_does_not_pay_its_calls_again() {
+async fn f1_a_cut_pop_is_requeued_and_its_retry_does_not_pay_its_calls_again() {
     // Each expansion costs 10 tokens and one external call. The first call
     // cuts the seed's pop after one hop; the retry runs the call again but
     // owes nothing for it.
@@ -409,6 +378,15 @@ async fn f1_a_retried_pop_does_not_pay_its_calls_again() {
     // The handle says what the cut pop already paid: the seed (state 0), 10
     // tokens, 1 call; and it reads back.
     assert_eq!(snapshot.paid, [(0, 10, 1)]);
+    // The cut pop is requeued, not expanded.
+    assert!(snapshot.expanded.is_empty());
+    assert!(
+        snapshot
+            .frontier
+            .iter()
+            .any(|(s, _, _)| snapshot.states[*s].node == node("a")),
+        "the cut seed is queued again"
+    );
     let back = Snapshot::from_json(&snapshot.to_json()).unwrap();
     assert_eq!(back.paid, snapshot.paid);
     let second = resume(&reg, snapshot, budget(10), |t| t).await;
@@ -421,5 +399,12 @@ async fn f1_a_retried_pop_does_not_pay_its_calls_again() {
         "a, b, c, d, e, h: one call each"
     );
     assert_eq!(second.totals.tokens, straight.totals.tokens);
+    assert_eq!(second.totals.hops, straight.totals.hops);
+    // Six pops (a and its five children) cost one call each, plus five hops,
+    // whatever the cut.
+    assert_eq!(straight.totals.tokens, 6 * 10 + 5 * TOKENS_PER_EDGE);
+    for name in ["b", "c", "d", "e", "h"] {
+        assert!(second.reached(&node(name)), "{name}");
+    }
     assert!(second.snapshot.is_none());
 }

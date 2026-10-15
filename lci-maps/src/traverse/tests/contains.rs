@@ -154,7 +154,7 @@ async fn a_file_contains_its_symbols_top_level_first_then_members() {
 }
 
 #[tokio::test]
-async fn a_chunk_contains_the_symbols_its_lines_overlap() {
+async fn a_chunk_contains_the_symbols_its_lines_overlap_from_its_own_lines_or_the_snapshot_view() {
     let scip = demo_scip();
     let (alpha, inner, method) = (
         symbol(&scip, "a/alpha()."),
@@ -198,16 +198,8 @@ async fn a_chunk_contains_the_symbols_its_lines_overlap() {
             .await
             .is_empty()
     );
-}
 
-#[tokio::test]
-async fn chunk_lines_come_from_the_snapshot_view_when_it_holds_the_chunk() {
-    let scip = demo_scip();
-    let (alpha, inner, method) = (
-        symbol(&scip, "a/alpha()."),
-        symbol(&scip, "a/alpha()./inner()."),
-        symbol(&scip, "a/impl#[T]method()."),
-    );
+    // The lines come from the snapshot view when it holds the chunk.
     let chunks = [
         file_chunk("src/a.rs", 1, 3, "h1"),
         file_chunk("src/a.rs", 10, 12, "h2"),
@@ -395,20 +387,6 @@ async fn a_chunk_in_an_import_header_reaches_the_files_functions_and_then_scip_n
     assert!(result.totals.cross_map_hops >= 1);
 }
 
-#[tokio::test]
-async fn a_walk_can_climb_to_the_file_and_down_to_its_siblings() {
-    let scip = demo_scip();
-    let (inner, method) = (
-        symbol(&scip, "a/alpha()./inner()."),
-        symbol(&scip, "a/impl#[T]method()."),
-    );
-    let file = NodeId::file("src/a.rs").unwrap();
-    let reg = registry_of(demo_scip(), Some(ContainsMap::new(&scip)));
-    let result = walk(&reg, vec![Seed::from(inner.clone())], budget(20), |t| t).await;
-    let seen = visited(&result);
-    assert!(seen.contains(&file) && seen.contains(&method), "{seen:?}");
-}
-
 // ---- equivalence of the two sources ----------------------------------------
 
 fn file_chunk(path: &str, start: u32, end: u32, hash: &str) -> Chunk {
@@ -494,18 +472,8 @@ fn a_hop_under_the_gate_is_valued_at_its_kind_prior() {
         kinded(EdgeKind::Contains, "contains"),
         kinded(EdgeKind::DefinedIn, "defined"),
     ]);
-    let cands: Vec<Candidate> = fused
-        .iter()
-        .map(|edge| Candidate {
-            edge,
-            in_seen: 0,
-            card: MapCard::default(),
-        })
-        .collect();
-    let ctx = ScoreCtx {
-        query: &[],
-        nodes_seen: 10,
-    };
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
     let value_of = |dst: &str| {
         let at = fused.iter().position(|f| f.best.dst == node(dst)).unwrap();
         let steps = hop(&mut RulesScorer, &ctx, &cands, HopPrice::default());
@@ -521,7 +489,7 @@ fn a_hop_under_the_gate_is_valued_at_its_kind_prior() {
 }
 
 #[tokio::test]
-async fn a_call_neighbour_outranks_the_file_and_its_siblings() {
+async fn a_call_neighbour_outranks_the_file_and_its_siblings_which_a_walk_reaches_by_climbing() {
     let scip = demo_scip();
     let (alpha, beta) = (symbol(&scip, "a/alpha()."), symbol(&scip, "b/beta()."));
     let method = symbol(&scip, "a/impl#[T]method().");
@@ -552,4 +520,11 @@ async fn a_call_neighbour_outranks_the_file_and_its_siblings() {
         .collect();
     assert!(!structural.is_empty());
     assert!(structural.iter().all(|s| s.potential <= 0.5));
+
+    // A walk can climb from a nested function to the file and down to its
+    // siblings.
+    let inner = symbol(&scip, "a/alpha()./inner().");
+    let result = walk(&reg, vec![Seed::from(inner)], budget(20), |t| t).await;
+    let seen = visited(&result);
+    assert!(seen.contains(&file) && seen.contains(&method), "{seen:?}");
 }

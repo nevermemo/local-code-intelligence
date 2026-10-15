@@ -1,0 +1,434 @@
+//! A seeded, model-based check of the engine. Each seed makes a small random
+//! graph (one to three maps, cycles and duplicates allowed), a random budget,
+//! price, scorer, score bound and handler, and runs it. Invariants: no budget
+//! is exceeded, no state is expanded twice, a seed gives identical results and
+//! events, a paused run resumed equals the straight run, the bound never fires
+//! with fewer than `k` results, and every end names its stop reason.
+//!
+//! 64 seeds run by default. To replay one:
+//! `LCI_TRAVERSE_SEED=<n> cargo test -p lci-maps harness`.
+
+use super::*;
+use crate::{traverse::handle::Snapshot, walk::SplitMix};
+
+const DEFAULT_SEEDS: u64 = 64;
+const HUGE_TOKENS: u64 = u64::MAX / 2;
+const HUGE_CALLS: u32 = u32::MAX / 2;
+
+macro_rules! ensure {
+    ($cond:expr, $($message:tt)+) => {
+        if !$cond {
+            return Err(format!($($message)+));
+        }
+    };
+}
+
+fn below(rng: &mut SplitMix, n: usize) -> usize {
+    (rng.next_u64() % n.max(1) as u64) as usize
+}
+
+fn pick<T: Copy>(rng: &mut SplitMix, options: &[T]) -> T {
+    options[below(rng, options.len())]
+}
+
+#[derive(Debug)]
+struct MapSpec {
+    id: MapId,
+    edges: Vec<(String, String)>,
+    conf: u8,
+    witness: WitnessClass,
+    dependent: bool,
+    cost: (u64, u32),
+}
+
+/// Everything a seed decides.
+#[derive(Debug)]
+struct Case {
+    seed: u64,
+    maps: Vec<MapSpec>,
+    seeds: Vec<(usize, bool)>,
+    pops: u32,
+    depth: u32,
+    tokens: u64,
+    calls: u32,
+    price: (usize, usize),
+    /// 0 rules, 1 unscored, 2 random.
+    scorer: usize,
+    top_k: Option<usize>,
+    every: Option<u32>,
+    pause_at: u32,
+}
+
+impl Case {
+    fn new(seed: u64) -> Self {
+        let mut rng = SplitMix(seed);
+        let nodes = 3 + below(&mut rng, 8);
+        let maps = (0..1 + below(&mut rng, 3))
+            .map(|i| MapSpec {
+                id: ["m0", "m1", "m2"][i],
+                edges: (0..below(&mut rng, 3 * nodes))
+                    .map(|_| {
+                        let (a, b) = (below(&mut rng, nodes), below(&mut rng, nodes));
+                        (format!("n{a}"), format!("n{b}"))
+                    })
+                    .collect(),
+                conf: 20 + below(&mut rng, 76) as u8,
+                witness: pick(
+                    &mut rng,
+                    &[
+                        WitnessClass::Compiler,
+                        WitnessClass::Text,
+                        WitnessClass::Vector,
+                    ],
+                ),
+                dependent: i > 0 && below(&mut rng, 3) == 0,
+                cost: (
+                    pick(&mut rng, &[0, 0, 3, 10, 25]),
+                    pick(&mut rng, &[0, 0, 0, 1, 2]),
+                ),
+            })
+            .collect();
+        let first = below(&mut rng, nodes);
+        let mut seeds = vec![(first, below(&mut rng, 3) == 0)];
+        if below(&mut rng, 2) == 0 {
+            seeds.push(((first + 1 + below(&mut rng, nodes - 1)) % nodes, false));
+        }
+        let pops = pick(&mut rng, &[0, 1, 3, 6, 10, 20, 40]);
+        Self {
+            seed,
+            maps,
+            seeds,
+            pops,
+            depth: pick(&mut rng, &[1, 2, 3, 6, 20]),
+            tokens: pick(
+                &mut rng,
+                &[HUGE_TOKENS, HUGE_TOKENS, HUGE_TOKENS, 0, 20, 60, 150, 400],
+            ),
+            calls: pick(&mut rng, &[HUGE_CALLS, HUGE_CALLS, HUGE_CALLS, 0, 1, 3, 6]),
+            price: (
+                pick(&mut rng, &[0, 1, 2, 8]),
+                pick(&mut rng, &[1, 2, 4, 16]),
+            ),
+            scorer: below(&mut rng, 3),
+            top_k: (below(&mut rng, 2) == 0).then(|| 1 + below(&mut rng, 4)),
+            every: (below(&mut rng, 3) == 0).then(|| 1 + below(&mut rng, 4) as u32),
+            pause_at: (1 + below(&mut rng, pops as usize) as u32).min(pops),
+        }
+    }
+
+    fn budget(&self, pops: u32) -> TraversalBudget {
+        TraversalBudget {
+            pops,
+            max_depth: self.depth,
+            deadline: Instant::now() + Duration::from_secs(60),
+            est_tokens: self.tokens,
+            external_calls: self.calls,
+        }
+    }
+}
+
+/// The calls the maps made (they keep to the allowance they are given).
+type Runs = Vec<Arc<AtomicU32>>;
+
+/// One call of the case: fresh, or a resume of `snapshot`.
+async fn run(case: &Case, pops: u32, snapshot: Option<Snapshot>) -> (TraversalResult, u32) {
+    let runs: Runs = case.maps.iter().map(|_| Arc::default()).collect();
+    let maps = case
+        .maps
+        .iter()
+        .zip(&runs)
+        .map(|(spec, count)| {
+            let mut map = GraphMap::new(spec.id, &[])
+                .conf(spec.conf)
+                .witness(spec.witness)
+                .cost(spec.cost.0, spec.cost.1)
+                .counted(count);
+            map.edges = spec.edges.clone();
+            map.dependent = spec.dependent;
+            map
+        })
+        .collect();
+    let reg = registry(maps);
+    let view = view();
+    let source = OnTheFly::new(&reg, &view);
+    let budget = case.budget(pops);
+    let mut traversal = match snapshot {
+        Some(snapshot) => Traversal::resumed(source, snapshot, budget),
+        None => Traversal::new(
+            source,
+            case.seeds
+                .iter()
+                .map(|&(at, from_map)| Seed {
+                    node: node(&format!("n{at}")),
+                    map: from_map.then_some("seeds.x"),
+                })
+                .collect(),
+            budget,
+        ),
+    }
+    .price(HopPrice {
+        gate: case.price.0,
+        beam: case.price.1,
+    });
+    traversal = match case.scorer {
+        1 => traversal.scorer(BfsScorer),
+        2 => traversal.scorer(RandomScorer::new(case.seed)),
+        _ => traversal,
+    };
+    if let Some(k) = case.top_k {
+        traversal = traversal.top_k(k, reg.independent_expanders());
+    }
+    if let Some(n) = case.every {
+        traversal = traversal.handler(scripted(prune_last), every(n));
+    }
+    let result = traversal.run().await;
+    let made = runs.iter().map(|count| count.load(Ordering::Relaxed)).sum();
+    (result, made)
+}
+
+fn results(result: &TraversalResult) -> usize {
+    result
+        .states
+        .iter()
+        .filter(|s| s.parent.is_some() && !result.cleared.contains(&s.node))
+        .count()
+}
+
+/// The events of the walk itself: no call markers, no hashes of checkpoints
+/// (they show the budget of their own call).
+fn walk_events(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| {
+            !["start", "end", "resume", "stop", "return"].contains(&e["ev"].as_str().unwrap())
+        })
+        .cloned()
+        .map(|mut e| {
+            e.as_object_mut().map(|o| o.remove("inputs_hash"));
+            e
+        })
+        .collect()
+}
+
+/// What two runs that did the same work agree on.
+fn same_walk(a: &TraversalResult, b: &TraversalResult) -> bool {
+    let totals = |r: &TraversalResult| Totals {
+        elapsed_ms: 0.0,
+        ..r.totals.clone()
+    };
+    a.status == b.status
+        && a.stop_reason == b.stop_reason
+        && a.states == b.states
+        && a.popped == b.popped
+        && a.cleared == b.cleared
+        && a.maps == b.maps
+        && totals(a) == totals(b)
+}
+
+fn invariants(case: &Case, pops: u32, result: &TraversalResult, made: u32) -> Result<(), String> {
+    let totals = &result.totals;
+    ensure!(
+        totals.pops <= pops && result.popped.len() == totals.pops as usize,
+        "pops {} over {pops}",
+        totals.pops
+    );
+    ensure!(
+        totals.tokens <= case.tokens,
+        "tokens {} over {}",
+        totals.tokens,
+        case.tokens
+    );
+    ensure!(
+        totals.external_calls <= case.calls,
+        "external calls {} over {}",
+        totals.external_calls,
+        case.calls
+    );
+    ensure!(
+        made == totals.external_calls,
+        "{made} calls ran, {} charged",
+        totals.external_calls
+    );
+
+    // Visit once: a node is one state, and a state is popped at most once.
+    let mut nodes: Vec<_> = result.states.iter().map(|s| &s.node).collect();
+    nodes.sort();
+    nodes.dedup();
+    ensure!(nodes.len() == result.states.len(), "a node has two states");
+    let mut popped = result.popped.clone();
+    popped.sort_unstable();
+    popped.dedup();
+    ensure!(
+        popped.len() == result.popped.len(),
+        "a state was popped twice: {:?}",
+        result.popped
+    );
+    let expanded: Vec<&str> = result
+        .events
+        .iter()
+        .filter(|e| e["ev"] == "expand")
+        .map(|e| e["node"].as_str().unwrap())
+        .collect();
+    let mut once = expanded.clone();
+    once.sort_unstable();
+    once.dedup();
+    ensure!(
+        once.len() == expanded.len(),
+        "a node was expanded twice: {expanded:?}"
+    );
+    ensure!(
+        result
+            .popped
+            .iter()
+            .all(|&i| result.states[i].depth < case.depth),
+        "a state at max_depth was expanded"
+    );
+
+    // Every end names its reason, and the reason fits the status.
+    let end = result.events.last().ok_or("no events")?;
+    ensure!(
+        end["ev"] == "end" && end["stop_reason"] == result.stop_reason.as_str(),
+        "end event {end}"
+    );
+    use stop::StopReason::{Bound, Budget, Complete, Deadline, Pops};
+    ensure!(
+        result.status != TraversalStatus::Stopped
+            && result.checkpoint.is_some() == result.snapshot.is_some(),
+        "status {:?}",
+        result.status
+    );
+    let fits = match result.status {
+        TraversalStatus::Complete => {
+            matches!(result.stop_reason, Complete | Bound) && result.snapshot.is_none()
+        }
+        TraversalStatus::BudgetExhausted => {
+            matches!(result.stop_reason, Pops | Budget | Deadline) && result.snapshot.is_some()
+        }
+        _ => false,
+    };
+    ensure!(
+        fits,
+        "status {:?} with reason {:?}",
+        result.status,
+        result.stop_reason
+    );
+    ensure!(
+        result.stop_reason != Pops || totals.pops >= pops,
+        "pops reason at {} of {pops}",
+        totals.pops
+    );
+
+    // The bound holds only with a limit, enough results, and a frontier that
+    // cannot beat the k-th.
+    let bounds: Vec<&Value> = result
+        .events
+        .iter()
+        .filter(|e| e["ev"] == "bound")
+        .collect();
+    ensure!(
+        bounds.len() == usize::from(result.stop_reason == Bound),
+        "bound events {bounds:?}"
+    );
+    if let Some(bound) = bounds.first() {
+        let k = case.top_k.ok_or("a bound without a limit")?;
+        ensure!(
+            results(result) >= k,
+            "bound with {} of {k} results",
+            results(result)
+        );
+        let ceiling =
+            bound["frontier_best"].as_f64().unwrap() * bound["max_factor"].as_f64().unwrap();
+        let beaten = ceiling > bound["kth"].as_f64().unwrap();
+        ensure!(!beaten, "{bound}");
+    }
+    Ok(())
+}
+
+async fn check(case: &Case, tally: &mut BTreeMap<&'static str, usize>) -> Result<(), String> {
+    let (straight, made) = run(case, case.pops, None).await;
+    invariants(case, case.pops, &straight, made)?;
+
+    // The same seed gives the same walk, event for event.
+    let (again, _) = run(case, case.pops, None).await;
+    ensure!(
+        same_walk(&straight, &again) && straight.events == again.events,
+        "two runs differ"
+    );
+
+    // A walk paused and resumed through its JSON handle equals the straight
+    // one (the random scorer keeps its state outside the handle).
+    if case.scorer != 2 {
+        let (first, made) = run(case, case.pause_at, None).await;
+        invariants(case, case.pause_at, &first, made)?;
+        let mut events = walk_events(&first.events);
+        let paused = first
+            .snapshot
+            .clone()
+            .filter(|_| first.stop_reason == stop::StopReason::Pops && case.pause_at < case.pops);
+        let last = if let Some(snapshot) = paused {
+            let back = Snapshot::from_json(&snapshot.to_json())?;
+            ensure!(back == snapshot, "the handle does not read back");
+            *tally.entry("resumed").or_default() += 1;
+            let (second, made) = run(case, case.pops, Some(back)).await;
+            invariants(case, case.pops, &second, first.totals.external_calls + made)?;
+            events.extend(walk_events(&second.events));
+            second
+        } else {
+            first
+        };
+        ensure!(
+            same_walk(&straight, &last),
+            "resume differs from the straight run"
+        );
+        ensure!(
+            walk_events(&straight.events) == events,
+            "resume events differ from the straight run"
+        );
+    }
+
+    let mut count = |what: &'static str, hit: bool| {
+        if hit {
+            *tally.entry(what).or_default() += 1;
+        }
+    };
+    let has = |ev: &str| straight.events.iter().any(|e| e["ev"] == ev);
+    count("bound", straight.stop_reason == stop::StopReason::Bound);
+    count("pops", straight.stop_reason == stop::StopReason::Pops);
+    count("budget", straight.stop_reason == stop::StopReason::Budget);
+    count(
+        "complete",
+        straight.stop_reason == stop::StopReason::Complete,
+    );
+    count("relax", has("relax"));
+    count("alt_path", has("alt_path"));
+    count("steer", has("steer"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn harness_random_walks_keep_the_engine_invariants() {
+    let replay = std::env::var("LCI_TRAVERSE_SEED")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("LCI_TRAVERSE_SEED is a number"));
+    let seeds: Vec<u64> = replay.map_or_else(|| (0..DEFAULT_SEEDS).collect(), |seed| vec![seed]);
+    let mut tally = BTreeMap::new();
+    for seed in seeds {
+        let case = Case::new(seed);
+        if let Err(why) = check(&case, &mut tally).await {
+            panic!(
+                "{why}\n  replay: LCI_TRAVERSE_SEED={seed} cargo test -p lci-maps harness\n  {case:?}"
+            );
+        }
+    }
+    if replay.is_none() {
+        // The seeds reach the cases the invariants are about.
+        for what in [
+            "bound", "pops", "budget", "complete", "relax", "alt_path", "steer", "resumed",
+        ] {
+            assert!(
+                tally.get(what).copied().unwrap_or(0) > 0,
+                "no seed reached `{what}`: {tally:?}"
+            );
+        }
+    }
+}
