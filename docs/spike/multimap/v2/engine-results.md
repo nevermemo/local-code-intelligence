@@ -23,16 +23,20 @@ sets at once.
 
 ## Score bound (Q1, B1)
 
-- With the bound off, where-to and flow keep their quality at 16 to 21 times
-  the pops; impact decl_recall rose .067 to .079.
+- With the bound off, where-to and flow reach similar aggregate quality at
+  15 to 20 times the pops (where-to reg_mrr .687 to .680; flow path_recall
+  .328 to .324 and tau .933 to .872, over 30 and 26 items); impact
+  decl_recall rose .067 to .079.
 - B1 made the bound also wait for results below the top k that a later
-  arrival could corroborate past the k-th. It changed nothing on impact,
-  where-to or flow (identical rows); on history with git.history it costs
-  5.7 times the pops (646 to 3695 on the holdout) with the same mrr.
+  arrival could corroborate past the k-th. It changed no quality on impact,
+  where-to or flow (pops equal, hops within 0.2%); on history with
+  git.history it costs 5.7 times the pops (646 to 3695 on the holdout) with
+  the same mrr.
 - Diagnosis of the impact gap: in all 73 items whose top 10 differ between
   the bound on and off, the differing results are tied at the k-th ranked
-  score (1.0 or 0.5). The bound does not miss better answers; longer walks
-  fill the tie slots differently. Ranked potentials are products of a few
+  score (1.0 or 0.5). By ranked potential the bound misses nothing; by the
+  gold it does (decl_recall .067 against .079), because longer walks fill
+  the tie slots differently. Ranked potentials are products of a few
   discrete priors, so ties are common and their order (discovery order) is
   arbitrary. This is what Q5 (a fitted tie-break) addresses.
 
@@ -51,8 +55,9 @@ The normalised tables: impact prices `defined_in` at 1.0 and graph calls at
 
 ## Reranker frontier (W0c2b)
 
-One batched reranker call per expansion rates the kept destinations (path
-plus SCIP signature, at most 1000 characters); each kept hop is multiplied by
+One batched reranker call per expansion rates the kept destinations (file
+path, kind and name of a SCIP node; the path of a file; the id of any other
+node; at most 1000 characters); each kept hop is multiplied by
 `floor + (1 - floor) * s` with floor 0.25, at most 1, so the bound stays
 sound.
 
@@ -71,7 +76,7 @@ Held-out items, learned priors with and without the reranker:
 | --- | --- | --- |
 | where-to | reg_hit@3 .750, reg_mrr .644, precision .342 | .833, .799, .482 |
 | impact | decl_recall .051, decl_f1 .046 | .069, .055 |
-| flow | path_recall .403, tau 1.000 | .364, .667 |
+| flow | path_recall .403, tau 1.000 | .364, .667 (tau over 6 items) |
 
 The reranker helps where-to and impact and hurts flow: it ranks by relevance
 to the question, which scrambles the order along a call path (tau falls from
@@ -80,10 +85,16 @@ also repairs the learned priors' loss. It costs 16 calls per item on average
 (about 90 documents per impact item, no failures) and 50 to 76% more pops.
 On history (with git.history) the reranker is the largest gain so far: over
 all 110 items mrr .128 to .230, hit@10 .191 to .382, precision .063 to .102,
-with 42% fewer pops (16734 to 9733); with learned priors on the held-out
-items, mrr .222 to .227 and hit@10 .379 to .517. It is also the most
-expensive arm: 80 reranker calls and about 670 rated documents per item, and
-50 of 8825 calls failed (timeouts while four sets shared one reranker).
+and fewer pops (16734 to 9733); with learned priors on the held-out items,
+mrr .222 to .227 and hit@10 .379 to .517. These history rows are not clean
+estimates: 52 of 110 reranker walks (9 of 29 with learned priors) stopped
+on the 60 s deadline, against none in the control, so the pop count is cut
+by the clock, not saved, and the quality is that of a deadline-limited,
+partly failed policy. It is also the most expensive arm: 80 reranker calls
+and about 670 rated documents per item, and 50 of 8825 calls failed while
+four sets shared one reranker. History walks are also not reproducible
+under load (git calls time out), so two arms that should walk alike can
+differ (Q5 below).
 
 ## Fitted tie-break (Q5)
 
@@ -107,11 +118,47 @@ At k 10 on the held-out items (guessed priors, Q5-none against Q5-tb):
 The pair gain on impact does not reach the top 10: at k 10 the bound ends the
 walk before most tied candidates are found, so the tie-break can only reorder
 the few that are. It stays opt-in; history is the only set where it helps, and
-that choice was made on the holdout.
+that choice was made on the holdout. The history pair also walked differently
+(pops 4626 against 4506) although the tie-break did not change the walk then:
+the git calls depend on load, so the history gain is not tie-break-only.
+
+The bound at that commit was not sound for the final order with a tie-break:
+it stopped while a state that could tie the k-th result, and win the tie, was
+still reachable. The review fix 19e84c4 makes the comparison strict when a tie-break
+is in use; its cost in pops is not yet measured.
 
 ## Fusion and pass-through (Q2, Q4)
 
-- RRF fusion is worse than the corroboration boost on every set; the default
+- RRF fusion (bench-1016, rows H1c-rrf in `trend.md`) is worse than the
+  corroboration boost on every set, also against the bound-off boost walk of
+  the same pops (where-to reg_hit@3 .480 against .840, impact decl_recall
+  .056 against .079, flow path_recall .285 against .324); RRF switches the
+  bound off. This is one RRF construction (fused over map ranks); the default
   stays `boost`.
-- Pass-through of connective nodes changes no quality and saves 19% of the
-  history pops; the default stays off.
+- Pass-through of connective nodes changes no quality and cuts 19% of the
+  history pops; pass-through pops were not counted then, so this is not yet
+  a saving in total expansions (bench rows now report them). The default
+  stays off.
+
+## Boundary review (2026-10-15)
+
+Two independent read-only reviews (Fable; GPT-6 Astra on the public tree)
+found, and the fixes 19e84c4 and 6ffe410 address: the bound with a tie-break (above); a resumed walk
+whose maps changed could undercount the corroboration a state can still gain;
+prior tables accepted negative values, and a pair missing from a fitted table
+fell back to the guess on the unfitted scale. 6ffe410 adds a salted, commit-grouped
+hold-out split, an `UNRELIABLE` marker on rows with deadline stops or call
+failures, total expansions, and `maps compare` (paired per-item deltas with a
+bootstrap interval). Every comparison above used the same held-out ids, so
+they are development data; preset choices wait for a fresh split.
+
+The impact `grep_baseline` of M0b (decl_recall .988, stored per item by
+`cargo xtask gold baseline`) is far above every engine row here, but it is
+not a same-size competitor: it is handed the gold seed name
+(`m1.4-prereg.md`, arm G) and returns every enclosing declaration with no
+cap, while the engine is cut to 10. The nearer comparison is M1.4 arm N
+(anchors from the question's names, then the exact closure) capped at the
+same k; that row is planned. The impact gold is built from the same SCIP
+closure, so N reproduces it nearly by construction (`m1.4-results.md`): a
+typed impact query should route to the closure, and the walk's value on
+impact is for questions that name no symbol.
