@@ -160,6 +160,27 @@ pub struct Anchor {
     pub segments: usize,
 }
 
+/// One declaration of a [`RankedClosure`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankedDecl {
+    /// Index into [`ImpactIndex::defs`].
+    pub def: usize,
+    /// Non-definition occurrences of the anchor symbol inside this declaration.
+    pub held: usize,
+    pub decl: Decl,
+}
+
+/// What arm N makes of one question: see [`ImpactIndex::ranked_closure`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankedClosure {
+    /// Code names the question gave.
+    pub names: usize,
+    /// Whether a name matched a symbol of the index.
+    pub anchored: bool,
+    /// The anchor's closure, ordered; empty unless `anchored`.
+    pub decls: Vec<RankedDecl>,
+}
+
 fn is_unit_kind(kind: Kind) -> bool {
     matches!(
         kind,
@@ -415,6 +436,51 @@ impl ImpactIndex {
             chunk_rank: None,
             segments,
         })
+    }
+
+    /// Arm N for one question: the code names of the question, the anchor
+    /// ([`ImpactIndex::anchor_n`]) and its one-hop reverse closure, ordered by
+    /// the anchor's occurrences each declaration holds (most first), then path,
+    /// line and symbol. The whole closure is returned; a caller cuts it.
+    pub fn ranked_closure(&self, question: &str) -> RankedClosure {
+        let (names, _) = code_names(question);
+        let Some(anchor) = self.anchor_n(&names) else {
+            return RankedClosure {
+                names: names.len(),
+                anchored: false,
+                decls: Vec::new(),
+            };
+        };
+        let symbol = &self.defs[anchor.def].symbol;
+        let mut held: HashMap<usize, usize> = HashMap::new();
+        for (path, line, col) in self.occurrences(symbol) {
+            if let Some(unit) = self.unit_at(&path, line, col) {
+                *held.entry(unit).or_default() += 1;
+            }
+        }
+        let mut decls: Vec<RankedDecl> = self
+            .closure(symbol)
+            .into_iter()
+            .map(|def| RankedDecl {
+                def,
+                held: held.get(&def).copied().unwrap_or(0),
+                decl: self.decl(def),
+            })
+            .collect();
+        decls.sort_by(|a, b| {
+            b.held.cmp(&a.held).then_with(|| {
+                (&a.decl.path, a.decl.line, &a.decl.symbol).cmp(&(
+                    &b.decl.path,
+                    b.decl.line,
+                    &b.decl.symbol,
+                ))
+            })
+        });
+        RankedClosure {
+            names: names.len(),
+            anchored: true,
+            decls,
+        }
     }
 }
 
@@ -824,5 +890,61 @@ mod tests {
         assert_eq!(a.len(), 7);
         assert_eq!(a.iter().collect::<BTreeSet<_>>().len(), 7);
         assert_ne!(a, arm_r(&units, 7, 4));
+    }
+
+    /// a.rs: `struct Foo` (line 1), `fn alpha` uses Foo once (line 2), `fn beta`
+    /// twice (line 3), `fn gamma` once (line 4).
+    fn held_demo() -> ImpactIndex {
+        let (foo, alpha, beta, gamma) = (
+            sym("a/Foo#"),
+            sym("a/alpha()."),
+            sym("a/beta()."),
+            sym("a/gamma()."),
+        );
+        let docs = vec![RawDocument {
+            path: "a.rs".into(),
+            occurrences: vec![
+                occ((0, 7, 0, 10), &foo, 1, Some((0, 0, 0, 14))),
+                occ((1, 3, 1, 8), &alpha, 1, Some((1, 0, 1, 30))),
+                occ((1, 12, 1, 15), &foo, 0, None),
+                occ((2, 3, 2, 7), &beta, 1, Some((2, 0, 2, 40))),
+                occ((2, 12, 2, 15), &foo, 0, None),
+                occ((2, 20, 2, 23), &foo, 0, None),
+                occ((3, 3, 3, 8), &gamma, 1, Some((3, 0, 3, 30))),
+                occ((3, 12, 3, 15), &foo, 0, None),
+            ],
+        }];
+        let kinds: HashMap<String, Kind> = [
+            (foo, Kind::Struct),
+            (alpha, Kind::Function),
+            (beta, Kind::Function),
+            (gamma, Kind::Function),
+        ]
+        .into_iter()
+        .collect();
+        ImpactIndex::build(docs, &kinds, None)
+    }
+
+    #[test]
+    fn ranked_closure_orders_by_references_held_then_position() {
+        let ix = held_demo();
+        let ranked = ix.ranked_closure("What breaks if `Foo` changes?");
+        assert!(ranked.anchored);
+        assert_eq!(ranked.names, 1);
+        // beta holds two references, alpha and gamma one each (path, line order).
+        let order: Vec<(u32, usize)> = ranked.decls.iter().map(|r| (r.decl.line, r.held)).collect();
+        assert_eq!(order, [(3, 2), (2, 1), (4, 1)]);
+        assert!(ranked.decls.iter().all(|r| r.decl == ix.decl(r.def)));
+        assert!(ranked.decls.iter().all(|r| r.decl.path == "a.rs"));
+    }
+
+    #[test]
+    fn ranked_closure_without_a_name_or_an_anchor_is_empty() {
+        let ix = held_demo();
+        let none = ix.ranked_closure("What breaks if the parser changes?");
+        assert_eq!((none.names, none.anchored, none.decls.len()), (0, false, 0));
+        let unknown = ix.ranked_closure("What breaks if `Nowhere` changes?");
+        assert_eq!((unknown.names, unknown.anchored), (1, false));
+        assert!(unknown.decls.is_empty());
     }
 }
