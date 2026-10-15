@@ -200,6 +200,9 @@ pub struct Call<'a> {
     pub steer: &'a SteerArgs,
     /// Continue the traversal this handle names.
     pub handle: Option<&'a str>,
+    /// The settings `lsp.live` starts its language servers with (server
+    /// paths, `lsp_timeout_seconds`); `None` is the defaults.
+    pub lsp: Option<&'a lci_core::config::Config>,
 }
 
 /// Where a call keeps what it writes.
@@ -1158,8 +1161,8 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     }
     let mut lsp_live = None;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
-        // The servers of the default `[lsp]` settings; the server starts at
-        // the first expansion and stops when the map drops.
+        // The servers of the call's settings; a server starts at the first
+        // expansion and stops when the map drops.
         let workspace = dunce::canonicalize(root)
             .map(|path| lci_core::workspace::Workspace {
                 id: lci_core::workspace::hash(&path.to_string_lossy()),
@@ -1168,7 +1171,8 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .map_err(|error| error.to_string());
         let backend = match workspace {
             Ok(workspace) => {
-                ManagerBackend::open(workspace, &lci_core::config::Config::default()).await
+                let defaults = lci_core::config::Config::default();
+                ManagerBackend::open(workspace, call.lsp.unwrap_or(&defaults)).await
             }
             Err(error) => Err(error),
         };
@@ -1843,6 +1847,7 @@ pub async fn search(
         budget: budget.unwrap_or(&no_budget),
         steer: steer.unwrap_or(&no_steer),
         handle,
+        lsp: Some(config),
     };
     Ok(run(limits, &Dirs::under(&config.data_dir), &call)
         .await?
@@ -2080,6 +2085,7 @@ mod tests {
             budget: &budget,
             steer: &steer,
             handle: None,
+            lsp: None,
         };
         let stamped = |len: u64| {
             let mut loaded = loaded();
@@ -2478,6 +2484,7 @@ mod tests {
             budget: &budget,
             steer: &steer,
             handle: None,
+            lsp: None,
         };
         find_seeds(&limits(), &call, &loaded(), wanted)
             .await
@@ -2570,6 +2577,7 @@ mod tests {
                     budget: &budget,
                     steer: &steer,
                     handle: None,
+                    lsp: None,
                 };
                 run(&limits(), &dirs, &call)
                     .await
@@ -2600,5 +2608,35 @@ mod tests {
                 && unknown.contains("scip.impact"),
             "{unknown}"
         );
+    }
+
+    #[tokio::test]
+    async fn lsp_live_starts_the_servers_the_call_configures() {
+        let tree = tempfile::tempdir().unwrap();
+        let index = tree.path().join("index.scip");
+        std::fs::write(&index, []).unwrap();
+        let lsp = lci_core::config::Config {
+            rust_analyzer_path: "lci-no-such-language-server".into(),
+            ..Default::default()
+        };
+        let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+        let maps = [LSP_LIVE_ID.to_owned()];
+        let call = Call {
+            scip_index: &index,
+            scip_root: Some(tree.path()),
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: Some(&maps),
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: Some(&lsp),
+        };
+        let dirs = Dirs::under(tree.path());
+        let report = run(&limits(), &dirs, &call).await.unwrap();
+        let notes = report.response["notes"].to_string();
+        assert!(notes.contains("lsp.live is unavailable"), "{notes}");
     }
 }

@@ -400,8 +400,13 @@ struct TraverseArgs {
     /// scratch copy; seconds per node), search.lexical (the lexical search
     /// from a node's own name, to the chunks it finds), search.vector (the
     /// chunks nearest to a node's stored embedding; needs the embedder only
-    /// for a node with no stored vector) and scip.impact (the declarations
-    /// that reference a symbol, from the SCIP impact index).
+    /// for a node with no stored vector), scip.impact (the declarations
+    /// that reference a symbol, from the SCIP impact index) and lsp.live
+    /// (definition, references and document symbols from a running language
+    /// server, with the server paths and lsp_timeout_seconds of the
+    /// configuration; the server starts at the first expansion, so a cold
+    /// start can exceed [traverse] deadline_ms and the walk then ends
+    /// with the deadline note).
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// The `[search_profiles.<name>]` the hybrid search for the start nodes
@@ -567,6 +572,7 @@ async fn run_traverse(
             budget: &budget,
             steer: &steer,
             handle: args.handle.as_deref(),
+            lsp: Some(&config),
         },
     )
     .await?;

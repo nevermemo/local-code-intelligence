@@ -36,6 +36,11 @@
 //! recorded failure ([`LspLive::last_error`]) and no edges, and the server keeps
 //! starting for the next call.
 //!
+//! A cold server start can exceed the default `[traverse] deadline_ms` (5000):
+//! a cold rust-analyzer took about 8 s to answer its first request, so the
+//! walk that starts a cold server may return [`DEADLINE_NOTE`] and no edges
+//! from this map (the server stops with the map, when the walk ends).
+//!
 //! The server starts at the first request (not when the map is built), is
 //! reused for the walk and stops when the map is dropped:
 //! [`ManagerBackend`] owns the `lci-core` language-server manager, whose client
