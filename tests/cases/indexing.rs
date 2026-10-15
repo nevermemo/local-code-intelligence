@@ -372,119 +372,76 @@ async fn a_path_filter_gets_semantic_hits_beyond_the_nearest_unfiltered_rows() {
 }
 
 #[tokio::test]
-async fn go_source_is_indexed_and_searchable() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("go-service");
-    write(
-        &workspace,
-        "main.go",
-        "package main\n\n// Greet returns a friendly greeting for name.\nfunc Greet(name string) string {\n\treturn \"hello \" + name\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
+async fn go_java_c_and_cpp_source_is_indexed_and_searchable() {
+    // (language, directory, file, source, expected chunks, query, text the
+    // top hit must contain). Where there are 2 chunks, the file has a
+    // mandatory top-level statement (`package main`) next to the doc-commented
+    // declaration, and the container splits them; C and C++ have none, so a
+    // single top-level function (with its leading comment attached) collapses
+    // into one chunk.
+    let cases = [
+        (
+            "go",
+            "go-service",
+            "main.go",
+            "package main\n\n// Greet returns a friendly greeting for name.\nfunc Greet(name string) string {\n\treturn \"hello \" + name\n}\n",
+            2,
+            "Greet",
+            "func Greet",
+        ),
+        (
+            "java",
+            "java-service",
+            "Greeter.java",
+            // The class gets its single member attached (attaches_header_to_child).
+            "package main;\n\n// Greet returns a friendly greeting for name.\npublic class Greeter {\n    public static String greet(String name) {\n        return \"hello \" + name;\n    }\n}\n",
+            2,
+            "greet",
+            "static String greet",
+        ),
+        (
+            "c",
+            "c-service",
+            "greet.c",
+            "// Greet returns a friendly greeting for name.\nconst char *greet(const char *name) {\n    return name;\n}\n",
+            1,
+            "greet",
+            "const char *greet",
+        ),
+        (
+            "cpp",
+            "cpp-service",
+            "greet.cpp",
+            "// Greet returns a friendly greeting for name.\nstd::string greet(const std::string &name) {\n    return name;\n}\n",
+            1,
+            "greet",
+            "std::string greet",
+        ),
+    ];
+    // Each case has its own fixture, so they run side by side.
+    futures::future::join_all(cases.into_iter().map(
+        |(language, directory, file, source, chunks, query, code)| async move {
+            let (temp, config, _fake, task) = fixture().await;
+            let workspace = temp.path().join(directory);
+            write(&workspace, file, source);
+            let app = App::open(config).await.unwrap();
 
-    let report = app.index(&workspace).await.unwrap();
-    assert_eq!(report.files, 1);
-    // "package main" and the doc-commented Greet function are separate
-    // top-level chunks (source_file is a container), so 2 not 1.
-    assert_eq!(report.chunks, 2);
+            let report = app.index(&workspace).await.unwrap();
+            assert_eq!(report.files, 1, "{language}");
+            assert_eq!(report.chunks, chunks, "{language}");
 
-    let indexed = app.indexed_files(&workspace).await.unwrap();
-    assert_eq!(indexed.files.len(), 1);
-    assert_eq!(indexed.files[0].language, "go");
-    assert_eq!(indexed.files[0].chunks, 2);
+            let indexed = app.indexed_files(&workspace).await.unwrap();
+            assert_eq!(indexed.files.len(), 1, "{language}");
+            assert_eq!(indexed.files[0].language, language);
+            assert_eq!(indexed.files[0].chunks, chunks, "{language}");
 
-    let found = app.search(&workspace, "Greet", Some(1)).await.unwrap();
-    assert_eq!(found.results[0].chunk.language, "go");
-    assert!(found.results[0].chunk.code.contains("func Greet"));
-    task.abort();
-}
-
-#[tokio::test]
-async fn java_source_is_indexed_and_searchable() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("java-service");
-    write(
-        &workspace,
-        "Greeter.java",
-        "package main;\n\n// Greet returns a friendly greeting for name.\npublic class Greeter {\n    public static String greet(String name) {\n        return \"hello \" + name;\n    }\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
-
-    let report = app.index(&workspace).await.unwrap();
-    assert_eq!(report.files, 1);
-    // "package main" and the doc-commented class (with its single member
-    // attached, per attaches_header_to_child) are separate top-level
-    // chunks (program is a container), so 2 not 1.
-    assert_eq!(report.chunks, 2);
-
-    let indexed = app.indexed_files(&workspace).await.unwrap();
-    assert_eq!(indexed.files.len(), 1);
-    assert_eq!(indexed.files[0].language, "java");
-    assert_eq!(indexed.files[0].chunks, 2);
-
-    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
-    assert_eq!(found.results[0].chunk.language, "java");
-    assert!(found.results[0].chunk.code.contains("static String greet"));
-    task.abort();
-}
-
-#[tokio::test]
-async fn c_source_is_indexed_and_searchable() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("c-service");
-    write(
-        &workspace,
-        "greet.c",
-        "// Greet returns a friendly greeting for name.\nconst char *greet(const char *name) {\n    return name;\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
-
-    let report = app.index(&workspace).await.unwrap();
-    assert_eq!(report.files, 1);
-    // A single top-level function (with its leading comment attached) is
-    // the only child of translation_unit, so it collapses into one chunk --
-    // unlike Go/Java, C has no mandatory top-level statement that would
-    // force a second chunk.
-    assert_eq!(report.chunks, 1);
-
-    let indexed = app.indexed_files(&workspace).await.unwrap();
-    assert_eq!(indexed.files.len(), 1);
-    assert_eq!(indexed.files[0].language, "c");
-    assert_eq!(indexed.files[0].chunks, 1);
-
-    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
-    assert_eq!(found.results[0].chunk.language, "c");
-    assert!(found.results[0].chunk.code.contains("const char *greet"));
-    task.abort();
-}
-
-#[tokio::test]
-async fn cpp_source_is_indexed_and_searchable() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("cpp-service");
-    write(
-        &workspace,
-        "greet.cpp",
-        "// Greet returns a friendly greeting for name.\nstd::string greet(const std::string &name) {\n    return name;\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
-
-    let report = app.index(&workspace).await.unwrap();
-    assert_eq!(report.files, 1);
-    // Same shape as the C smoke test: a single top-level function (with its
-    // leading comment attached) is the only child of translation_unit, so
-    // it collapses into one chunk.
-    assert_eq!(report.chunks, 1);
-
-    let indexed = app.indexed_files(&workspace).await.unwrap();
-    assert_eq!(indexed.files.len(), 1);
-    assert_eq!(indexed.files[0].language, "cpp");
-    assert_eq!(indexed.files[0].chunks, 1);
-
-    let found = app.search(&workspace, "greet", Some(1)).await.unwrap();
-    assert_eq!(found.results[0].chunk.language, "cpp");
-    assert!(found.results[0].chunk.code.contains("std::string greet"));
-    task.abort();
+            let found = app.search(&workspace, query, Some(1)).await.unwrap();
+            assert_eq!(found.results[0].chunk.language, language);
+            assert!(found.results[0].chunk.code.contains(code), "{language}");
+            task.abort();
+        },
+    ))
+    .await;
 }
 
 #[tokio::test]

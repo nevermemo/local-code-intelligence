@@ -2083,125 +2083,128 @@ mod tests {
     ];
 
     #[test]
-    fn cap_zero_is_the_identity() {
-        let hits = fused_order(&INTERLEAVED);
-        let capped = cap_chunks_per_file(hits.clone(), 0);
-        assert_eq!(order(&capped), INTERLEAVED);
-        for (before, after) in hits.iter().zip(&capped) {
-            assert_eq!(before.fusion_score.to_bits(), after.fusion_score.to_bits());
+    fn the_per_file_cap_reorders_and_never_removes() {
+        // cap zero is the identity
+        {
+            let hits = fused_order(&INTERLEAVED);
+            let capped = cap_chunks_per_file(hits.clone(), 0);
+            assert_eq!(order(&capped), INTERLEAVED);
+            for (before, after) in hits.iter().zip(&capped) {
+                assert_eq!(before.fusion_score.to_bits(), after.fusion_score.to_bits());
+            }
+            assert!(cap_chunks_per_file(Vec::new(), 0).is_empty());
+            assert!(cap_chunks_per_file(Vec::new(), 2).is_empty());
         }
-        assert!(cap_chunks_per_file(Vec::new(), 0).is_empty());
-        assert!(cap_chunks_per_file(Vec::new(), 2).is_empty());
-    }
 
-    #[test]
-    fn cap_one_moves_every_repeat_of_a_file_behind_the_first_chunk_of_each_file() {
-        let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), 1);
-        // Head: the first chunk of each file, in fused order. Tail: the
-        // demoted chunks, in fused order.
-        assert_eq!(
-            order(&capped),
-            [
-                ("a.rs", 1),
-                ("b.rs", 1),
-                ("c.rs", 1),
-                ("a.rs", 11),
-                ("a.rs", 21),
-                ("b.rs", 11),
-            ]
-        );
-        // A top 3 is now three distinct files instead of a.rs, b.rs, a.rs.
-        let top_three: HashSet<_> = order(&capped[..3]).into_iter().map(|(p, _)| p).collect();
-        assert_eq!(top_three.len(), 3);
-        // Nothing is removed: the full list is still there.
-        assert_eq!(capped.len(), INTERLEAVED.len());
-    }
-
-    #[test]
-    fn cap_two_demotes_only_the_third_chunk_of_a_file() {
-        let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), 2);
-        assert_eq!(
-            order(&capped),
-            [
-                ("a.rs", 1),
-                ("b.rs", 1),
-                ("a.rs", 11),
-                ("c.rs", 1),
-                ("b.rs", 11),
-                ("a.rs", 21),
-            ]
-        );
-        // A cap at or above the largest per-file count changes nothing.
-        for max in [3, 4, 100] {
-            let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), max);
-            assert_eq!(order(&capped), INTERLEAVED, "cap {max}");
+        // cap one moves every repeat of a file behind the first chunk of each file
+        {
+            let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), 1);
+            // Head: the first chunk of each file, in fused order. Tail: the
+            // demoted chunks, in fused order.
+            assert_eq!(
+                order(&capped),
+                [
+                    ("a.rs", 1),
+                    ("b.rs", 1),
+                    ("c.rs", 1),
+                    ("a.rs", 11),
+                    ("a.rs", 21),
+                    ("b.rs", 11),
+                ]
+            );
+            // A top 3 is now three distinct files instead of a.rs, b.rs, a.rs.
+            let top_three: HashSet<_> = order(&capped[..3]).into_iter().map(|(p, _)| p).collect();
+            assert_eq!(top_three.len(), 3);
+            // Nothing is removed: the full list is still there.
+            assert_eq!(capped.len(), INTERLEAVED.len());
         }
-    }
 
-    #[test]
-    fn the_cap_changes_only_the_order_never_a_score_or_a_chunk() {
-        let hits = fused_order(&INTERLEAVED);
-        let capped = cap_chunks_per_file(hits.clone(), 1);
-        // Same chunks, bit-identical scores and fields, by chunk identity.
-        for hit in &hits {
-            let moved = capped
-                .iter()
-                .find(|other| other.chunk.content_hash == hit.chunk.content_hash)
-                .expect("a demoted chunk is still in the list");
-            assert_eq!(moved.fusion_score.to_bits(), hit.fusion_score.to_bits());
-            assert_eq!(moved.source_role_prior, hit.source_role_prior);
-            assert_eq!(moved.chunk.start_line, hit.chunk.start_line);
-        }
-        // Scores are not rescaled, so the order is no longer by score: a.rs
-        // line 11 (0.98) now follows c.rs line 1 (0.97).
-        assert!(capped[3].fusion_score > capped[2].fusion_score);
-        assert_eq!(order(&capped)[2], ("c.rs", 1));
-        assert_eq!(order(&capped)[3], ("a.rs", 11));
-    }
-
-    #[test]
-    fn the_cap_is_stable_for_the_kept_chunks_and_for_the_demoted_ones() {
-        // Four files, five chunks each, round-robin: x1 y1 z1 w1 x2 y2 ...
-        let mut chunks = Vec::new();
-        for line in 1..=5_u32 {
-            for path in ["w.rs", "x.rs", "y.rs", "z.rs"] {
-                chunks.push((path, line));
+        // cap two demotes only the third chunk of a file
+        {
+            let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), 2);
+            assert_eq!(
+                order(&capped),
+                [
+                    ("a.rs", 1),
+                    ("b.rs", 1),
+                    ("a.rs", 11),
+                    ("c.rs", 1),
+                    ("b.rs", 11),
+                    ("a.rs", 21),
+                ]
+            );
+            // A cap at or above the largest per-file count changes nothing.
+            for max in [3, 4, 100] {
+                let capped = cap_chunks_per_file(fused_order(&INTERLEAVED), max);
+                assert_eq!(order(&capped), INTERLEAVED, "cap {max}");
             }
         }
-        for max in 1..=4_u32 {
-            let capped = cap_chunks_per_file(fused_order(&chunks), max);
-            assert_eq!(capped.len(), chunks.len(), "cap {max}");
 
-            // The first `max` chunks of every file are the head; the rest are
-            // the tail. Both keep the original relative order.
-            let keep = |(_, line): &&(&str, u32)| *line <= max;
-            let head: Vec<_> = chunks.iter().filter(keep).copied().collect();
-            let tail: Vec<_> = chunks.iter().filter(|c| !keep(c)).copied().collect();
-            let expected: Vec<_> = head.iter().chain(&tail).copied().collect();
-            assert_eq!(order(&capped), expected, "cap {max}");
-
-            // Applying it again changes nothing.
-            let again = cap_chunks_per_file(capped.clone(), max);
-            assert_eq!(order(&again), order(&capped), "cap {max} idempotent");
+        // the cap changes only the order, never a score or a chunk
+        {
+            let hits = fused_order(&INTERLEAVED);
+            let capped = cap_chunks_per_file(hits.clone(), 1);
+            // Same chunks, bit-identical scores and fields, by chunk identity.
+            for hit in &hits {
+                let moved = capped
+                    .iter()
+                    .find(|other| other.chunk.content_hash == hit.chunk.content_hash)
+                    .expect("a demoted chunk is still in the list");
+                assert_eq!(moved.fusion_score.to_bits(), hit.fusion_score.to_bits());
+                assert_eq!(moved.source_role_prior, hit.source_role_prior);
+                assert_eq!(moved.chunk.start_line, hit.chunk.start_line);
+            }
+            // Scores are not rescaled, so the order is no longer by score: a.rs
+            // line 11 (0.98) now follows c.rs line 1 (0.97).
+            assert!(capped[3].fusion_score > capped[2].fusion_score);
+            assert_eq!(order(&capped)[2], ("c.rs", 1));
+            assert_eq!(order(&capped)[3], ("a.rs", 11));
         }
-    }
 
-    #[test]
-    fn a_single_file_keeps_its_order_whatever_the_cap() {
-        let only_a = [("a.rs", 1), ("a.rs", 11), ("a.rs", 21), ("a.rs", 31)];
-        for max in [0, 1, 2, 3, 4, 100] {
-            let capped = cap_chunks_per_file(fused_order(&only_a), max);
-            assert_eq!(order(&capped), only_a, "cap {max}");
+        // the cap is stable for the kept chunks and for the demoted ones
+        {
+            // Four files, five chunks each, round-robin: x1 y1 z1 w1 x2 y2 ...
+            let mut chunks = Vec::new();
+            for line in 1..=5_u32 {
+                for path in ["w.rs", "x.rs", "y.rs", "z.rs"] {
+                    chunks.push((path, line));
+                }
+            }
+            for max in 1..=4_u32 {
+                let capped = cap_chunks_per_file(fused_order(&chunks), max);
+                assert_eq!(capped.len(), chunks.len(), "cap {max}");
+
+                // The first `max` chunks of every file are the head; the rest are
+                // the tail. Both keep the original relative order.
+                let keep = |(_, line): &&(&str, u32)| *line <= max;
+                let head: Vec<_> = chunks.iter().filter(keep).copied().collect();
+                let tail: Vec<_> = chunks.iter().filter(|c| !keep(c)).copied().collect();
+                let expected: Vec<_> = head.iter().chain(&tail).copied().collect();
+                assert_eq!(order(&capped), expected, "cap {max}");
+
+                // Applying it again changes nothing.
+                let again = cap_chunks_per_file(capped.clone(), max);
+                assert_eq!(order(&again), order(&capped), "cap {max} idempotent");
+            }
         }
-    }
 
-    #[test]
-    fn files_are_told_apart_by_relative_path_not_by_name() {
-        // `src/lib.rs` and `tests/lib.rs` share a file name but are two files,
-        // so a cap of 1 demotes nothing.
-        let chunks = [("src/lib.rs", 1), ("tests/lib.rs", 1), ("a.rs", 1)];
-        let capped = cap_chunks_per_file(fused_order(&chunks), 1);
-        assert_eq!(order(&capped), chunks);
+        // a single file keeps its order whatever the cap
+        {
+            let only_a = [("a.rs", 1), ("a.rs", 11), ("a.rs", 21), ("a.rs", 31)];
+            for max in [0, 1, 2, 3, 4, 100] {
+                let capped = cap_chunks_per_file(fused_order(&only_a), max);
+                assert_eq!(order(&capped), only_a, "cap {max}");
+            }
+        }
+
+        // files are told apart by relative path, not by name
+        {
+            // `src/lib.rs` and `tests/lib.rs` share a file name but are two files,
+            // so a cap of 1 demotes nothing.
+            let chunks = [("src/lib.rs", 1), ("tests/lib.rs", 1), ("a.rs", 1)];
+            let capped = cap_chunks_per_file(fused_order(&chunks), 1);
+            assert_eq!(order(&capped), chunks);
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -815,86 +815,89 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn port_8765_is_refused_for_every_host_spelling_and_scheme() {
-        for url in [
-            "http://127.0.0.1:8765/v1",
-            "http://localhost:8765/v1",
-            "http://LocalHost:8765/v1",
-            "http://[::1]:8765/v1",
-            "http://127.1:8765/v1",
-            "http://0.0.0.0:8765/rerank",
-            "http://192.168.1.20:8765/v1",
-            "http://models.example.com:8765/v1",
-            "https://models.example.com:8765",
-            "http://user:secret@127.0.0.1:8765/v1",
-            "http://127.0.0.1:08765/v1",
-            "https://localhost:8765/v1/models?x=1#frag",
-            "ftp://localhost:8765/x",
-        ] {
-            assert_eq!(
-                probe_refusal(url),
-                Some(ProbeRefusal::GenerationModelPort),
-                "{url}"
+    fn probe_refusal_judges_every_url() {
+        // port 8765 is refused for every host spelling and scheme
+        {
+            for url in [
+                "http://127.0.0.1:8765/v1",
+                "http://localhost:8765/v1",
+                "http://LocalHost:8765/v1",
+                "http://[::1]:8765/v1",
+                "http://127.1:8765/v1",
+                "http://0.0.0.0:8765/rerank",
+                "http://192.168.1.20:8765/v1",
+                "http://models.example.com:8765/v1",
+                "https://models.example.com:8765",
+                "http://user:secret@127.0.0.1:8765/v1",
+                "http://127.0.0.1:08765/v1",
+                "https://localhost:8765/v1/models?x=1#frag",
+                "ftp://localhost:8765/x",
+            ] {
+                assert_eq!(
+                    probe_refusal(url),
+                    Some(ProbeRefusal::GenerationModelPort),
+                    "{url}"
+                );
+                assert!(!probe_allowed(url), "{url}");
+            }
+            assert!(
+                ProbeRefusal::GenerationModelPort
+                    .message()
+                    .contains("port 8765 is the generation model; LCI never contacts it")
             );
-            assert!(!probe_allowed(url), "{url}");
         }
-        assert!(
-            ProbeRefusal::GenerationModelPort
-                .message()
-                .contains("port 8765 is the generation model; LCI never contacts it")
-        );
-    }
 
-    #[test]
-    fn only_loopback_hosts_are_allowed() {
-        for url in [
-            "http://127.0.0.1:8766/v1",
-            "http://127.0.0.1/v1",
-            "http://127.0.0.2:9000/v1",
-            "http://localhost:8767/rerank",
-            "http://LOCALHOST:9000",
-            "https://localhost/v1",
-            "http://[::1]:9000/v1",
-            "http://user:secret@127.0.0.1:9000/v1",
-            "http://127.1:9000/v1",
-            // Ports around 8765 are other services' or nobody's, not refused.
-            "http://127.0.0.1:8764/v1",
-            "http://127.0.0.1:8766/v1",
-            "http://127.0.0.1:18765/v1",
-            "http://127.0.0.1:50000/v1",
-        ] {
-            assert_eq!(probe_refusal(url), None, "{url}");
-            assert!(probe_allowed(url), "{url}");
+        // only loopback hosts are allowed
+        {
+            for url in [
+                "http://127.0.0.1:8766/v1",
+                "http://127.0.0.1/v1",
+                "http://127.0.0.2:9000/v1",
+                "http://localhost:8767/rerank",
+                "http://LOCALHOST:9000",
+                "https://localhost/v1",
+                "http://[::1]:9000/v1",
+                "http://user:secret@127.0.0.1:9000/v1",
+                "http://127.1:9000/v1",
+                // Ports around 8765 are other services' or nobody's, not refused.
+                "http://127.0.0.1:8764/v1",
+                "http://127.0.0.1:8766/v1",
+                "http://127.0.0.1:18765/v1",
+                "http://127.0.0.1:50000/v1",
+            ] {
+                assert_eq!(probe_refusal(url), None, "{url}");
+                assert!(probe_allowed(url), "{url}");
+            }
+            for url in [
+                "http://192.0.2.10:8766/v1",
+                "http://192.168.1.20:9000/v1",
+                "http://models.example.com:8766/v1",
+                "https://models.example.com/v1",
+                "http://0.0.0.0:9000/v1",
+                "http://[2001:db8::1]:9000/v1",
+                "http://localhost.example.com:9000/v1",
+                "http://localhost.:9000/v1",
+            ] {
+                assert_eq!(probe_refusal(url), Some(ProbeRefusal::NotLoopback), "{url}");
+            }
         }
-        for url in [
-            "http://192.0.2.10:8766/v1",
-            "http://192.168.1.20:9000/v1",
-            "http://models.example.com:8766/v1",
-            "https://models.example.com/v1",
-            "http://0.0.0.0:9000/v1",
-            "http://[2001:db8::1]:9000/v1",
-            "http://localhost.example.com:9000/v1",
-            "http://localhost.:9000/v1",
-        ] {
-            assert_eq!(probe_refusal(url), Some(ProbeRefusal::NotLoopback), "{url}");
-        }
-    }
 
-    #[test]
-    fn a_url_that_is_not_http_or_not_a_url_is_refused() {
-        assert_eq!(
-            probe_refusal("ftp://127.0.0.1:9000/x"),
-            Some(ProbeRefusal::NotHttp)
-        );
-        assert_eq!(
-            probe_refusal("file:///etc/hosts"),
-            Some(ProbeRefusal::NotHttp)
-        );
-        for url in ["", "not a url", "127.0.0.1:8766/v1", "http://"] {
-            assert_eq!(probe_refusal(url), Some(ProbeRefusal::Invalid), "{url:?}");
+        // a URL that is not http or not a URL is refused
+        {
+            assert_eq!(
+                probe_refusal("ftp://127.0.0.1:9000/x"),
+                Some(ProbeRefusal::NotHttp)
+            );
+            assert_eq!(
+                probe_refusal("file:///etc/hosts"),
+                Some(ProbeRefusal::NotHttp)
+            );
+            for url in ["", "not a url", "127.0.0.1:8766/v1", "http://"] {
+                assert_eq!(probe_refusal(url), Some(ProbeRefusal::Invalid), "{url:?}");
+            }
+            // A scheme with a default port of its own is judged by that port.
+            assert_eq!(probe_refusal("https://localhost"), None);
         }
-        // A scheme with a default port of its own is judged by that port.
-        assert_eq!(probe_refusal("https://localhost"), None);
     }
 
     #[test]

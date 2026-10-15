@@ -232,17 +232,45 @@ fn state_count_so_far(state: &std::path::Path, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-#[tokio::test]
-async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
+/// What one language's fake server must answer in each of its three modes.
+struct NavigationExpectation {
+    language: &'static str,
+    provider: &'static str,
+    /// The declaring file, which every answer starts with, and the file that
+    /// calls it, which the references must include.
+    primary: String,
+    secondary: String,
+    /// Where the definition (in `secondary`) and the references (in
+    /// `primary`) are asked for: (line, character).
+    definition_at: (u32, u32),
+    references_at: (u32, u32),
+}
+
+/// Symbols, definition and references through the fake server of one
+/// language, each in its own mode, all mapped to the expected file, language
+/// and provider.
+async fn assert_fake_lsp_maps_symbols_definitions_and_references(
+    expected: NavigationExpectation,
+    fixture: impl Fn(&tempfile::TempDir, &str) -> (Config, Workspace, std::path::PathBuf),
+    adapter_of: impl Fn(&Manager) -> Arc<dyn LspAdapter>,
+) {
+    let NavigationExpectation {
+        language,
+        provider,
+        primary,
+        secondary,
+        definition_at,
+        references_at,
+    } = expected;
     for (mode, operation) in [
         ("workspace-symbols", "symbols"),
         ("definition", "definition"),
         ("references", "references"),
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, _) = fake_csharp_fixture(&temp, mode);
+        let (config, workspace, _) = fixture(&temp, mode);
         let manager = Manager::new(&config);
-        let adapter = csharp_adapter(&manager);
+        let adapter = adapter_of(&manager);
         let results = match operation {
             "symbols" => manager
                 .symbols(&adapter, &workspace, "Calculator")
@@ -252,10 +280,10 @@ async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
                 .definition(
                     &adapter,
                     &workspace,
-                    &workspace.path.join("src/CallSite.cs"),
-                    "src/CallSite.cs",
-                    1,
-                    72,
+                    &workspace.path.join(&secondary),
+                    &secondary,
+                    definition_at.0,
+                    definition_at.1,
                 )
                 .await
                 .unwrap(),
@@ -263,34 +291,98 @@ async fn fake_csharp_lsp_maps_symbols_definitions_and_references() {
                 .references(
                     &adapter,
                     &workspace,
-                    &workspace.path.join("src/Calculator.cs"),
-                    "src/Calculator.cs",
-                    1,
-                    49,
+                    &workspace.path.join(&primary),
+                    &primary,
+                    references_at.0,
+                    references_at.1,
                     true,
                 )
                 .await
                 .unwrap(),
             _ => unreachable!(),
         };
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|result| {
-            result.language.as_deref() == Some("csharp")
-                && result.provider.as_deref() == Some("csharp-ls")
-                && result.start_line >= 1
-        }));
+        assert!(!results.is_empty(), "{language} {operation}");
+        assert!(
+            results.iter().all(|result| {
+                result.language.as_deref() == Some(language)
+                    && result.provider.as_deref() == Some(provider)
+                    && result.start_line >= 1
+            }),
+            "{language} {operation}"
+        );
         assert_eq!(
             results[0].relative_file_path.as_deref(),
-            Some("src/Calculator.cs")
+            Some(primary.as_str()),
+            "{language} {operation}"
         );
         if operation == "references" {
             assert!(
-                results.iter().any(|result| {
-                    result.relative_file_path.as_deref() == Some("src/CallSite.cs")
-                })
+                results
+                    .iter()
+                    .any(|result| result.relative_file_path.as_deref() == Some(secondary.as_str())),
+                "{language} {operation}"
             );
         }
     }
+}
+
+/// C# and the ECMAScript and Python servers, and one shared ClangdServer
+/// instance navigating both `c` and `cpp` (the same one-adapter-many-languages
+/// contract as TypeScript's four ECMAScript-family languages).
+#[tokio::test]
+async fn fake_lsps_map_symbols_definitions_and_references() {
+    let csharp = assert_fake_lsp_maps_symbols_definitions_and_references(
+        NavigationExpectation {
+            language: "csharp",
+            provider: "csharp-ls",
+            primary: "src/Calculator.cs".to_owned(),
+            secondary: "src/CallSite.cs".to_owned(),
+            definition_at: (1, 72),
+            references_at: (1, 49),
+        },
+        fake_csharp_fixture,
+        csharp_adapter,
+    );
+    let typescript = assert_fake_lsp_maps_symbols_definitions_and_references(
+        NavigationExpectation {
+            language: "typescript",
+            provider: "typescript-language-server",
+            primary: "src/Calculator.ts".to_owned(),
+            secondary: "src/CallSite.ts".to_owned(),
+            definition_at: (1, 40),
+            references_at: (1, 20),
+        },
+        fake_typescript_fixture,
+        typescript_adapter,
+    );
+    let python = assert_fake_lsp_maps_symbols_definitions_and_references(
+        NavigationExpectation {
+            language: "python",
+            provider: "pyright",
+            primary: "src/Calculator.py".to_owned(),
+            secondary: "src/CallSite.py".to_owned(),
+            definition_at: (1, 30),
+            references_at: (1, 10),
+        },
+        fake_python_fixture,
+        python_adapter,
+    );
+    let clangd = |extension: &'static str| {
+        assert_fake_lsp_maps_symbols_definitions_and_references(
+            NavigationExpectation {
+                language: extension,
+                provider: "clangd",
+                primary: format!("src/Calculator.{extension}"),
+                secondary: format!("src/CallSite.{extension}"),
+                definition_at: (1, 16),
+                references_at: (1, 4),
+            },
+            |temp, mode| fake_clangd_fixture(temp, mode, extension),
+            |manager| clangd_adapter(manager, extension),
+        )
+    };
+    // The servers are separate processes, so the languages run side by side.
+    tokio::join!(csharp, typescript, python, clangd("c"), clangd("cpp"));
 }
 
 /// `JsonRpcClient::request` bounds its wait by inactivity, not total call
@@ -3378,67 +3470,6 @@ async fn releasing_a_server_that_is_still_starting_does_not_fail_the_waiting_cal
 }
 
 #[tokio::test]
-async fn fake_typescript_lsp_maps_symbols_definitions_and_references() {
-    for (mode, operation) in [
-        ("workspace-symbols", "symbols"),
-        ("definition", "definition"),
-        ("references", "references"),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, _) = fake_typescript_fixture(&temp, mode);
-        let manager = Manager::new(&config);
-        let adapter = typescript_adapter(&manager);
-        let results = match operation {
-            "symbols" => manager
-                .symbols(&adapter, &workspace, "Calculator")
-                .await
-                .unwrap(),
-            "definition" => manager
-                .definition(
-                    &adapter,
-                    &workspace,
-                    &workspace.path.join("src/CallSite.ts"),
-                    "src/CallSite.ts",
-                    1,
-                    40,
-                )
-                .await
-                .unwrap(),
-            "references" => manager
-                .references(
-                    &adapter,
-                    &workspace,
-                    &workspace.path.join("src/Calculator.ts"),
-                    "src/Calculator.ts",
-                    1,
-                    20,
-                    true,
-                )
-                .await
-                .unwrap(),
-            _ => unreachable!(),
-        };
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|result| {
-            result.language.as_deref() == Some("typescript")
-                && result.provider.as_deref() == Some("typescript-language-server")
-                && result.start_line >= 1
-        }));
-        assert_eq!(
-            results[0].relative_file_path.as_deref(),
-            Some("src/Calculator.ts")
-        );
-        if operation == "references" {
-            assert!(
-                results.iter().any(|result| {
-                    result.relative_file_path.as_deref() == Some("src/CallSite.ts")
-                })
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn a_file_above_the_did_open_cap_is_navigated_without_sending_its_text() {
     use local_code_intelligence::lsp::adapter::MAX_DID_OPEN_BYTES;
     let did_opens = |state: &std::path::Path| {
@@ -3476,136 +3507,6 @@ async fn a_file_above_the_did_open_cap_is_navigated_without_sending_its_text() {
         "the request is still sent and answered"
     );
     assert_eq!(did_opens(&state), opened, "the oversized file was not sent");
-}
-
-#[tokio::test]
-async fn fake_python_lsp_maps_symbols_definitions_and_references() {
-    for (mode, operation) in [
-        ("workspace-symbols", "symbols"),
-        ("definition", "definition"),
-        ("references", "references"),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, _) = fake_python_fixture(&temp, mode);
-        let manager = Manager::new(&config);
-        let adapter = python_adapter(&manager);
-        let results = match operation {
-            "symbols" => manager
-                .symbols(&adapter, &workspace, "Calculator")
-                .await
-                .unwrap(),
-            "definition" => manager
-                .definition(
-                    &adapter,
-                    &workspace,
-                    &workspace.path.join("src/CallSite.py"),
-                    "src/CallSite.py",
-                    1,
-                    30,
-                )
-                .await
-                .unwrap(),
-            "references" => manager
-                .references(
-                    &adapter,
-                    &workspace,
-                    &workspace.path.join("src/Calculator.py"),
-                    "src/Calculator.py",
-                    1,
-                    10,
-                    true,
-                )
-                .await
-                .unwrap(),
-            _ => unreachable!(),
-        };
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|result| {
-            result.language.as_deref() == Some("python")
-                && result.provider.as_deref() == Some("pyright")
-                && result.start_line >= 1
-        }));
-        assert_eq!(
-            results[0].relative_file_path.as_deref(),
-            Some("src/Calculator.py")
-        );
-        if operation == "references" {
-            assert!(
-                results.iter().any(|result| {
-                    result.relative_file_path.as_deref() == Some("src/CallSite.py")
-                })
-            );
-        }
-    }
-}
-
-/// Confirms one shared ClangdServer instance correctly navigates both `c`
-/// and `cpp` -- the same one-adapter-many-languages contract already
-/// exercised for TypeScript's four ECMAScript-family languages.
-#[tokio::test]
-async fn fake_clangd_lsp_maps_symbols_definitions_and_references() {
-    for extension in ["c", "cpp"] {
-        for (mode, operation) in [
-            ("workspace-symbols", "symbols"),
-            ("definition", "definition"),
-            ("references", "references"),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let (config, workspace, _) = fake_clangd_fixture(&temp, mode, extension);
-            let manager = Manager::new(&config);
-            let adapter = clangd_adapter(&manager, extension);
-            let primary = format!("src/Calculator.{extension}");
-            let secondary = format!("src/CallSite.{extension}");
-            let results = match operation {
-                "symbols" => manager
-                    .symbols(&adapter, &workspace, "Calculator")
-                    .await
-                    .unwrap(),
-                "definition" => manager
-                    .definition(
-                        &adapter,
-                        &workspace,
-                        &workspace.path.join(&secondary),
-                        &secondary,
-                        1,
-                        16,
-                    )
-                    .await
-                    .unwrap(),
-                "references" => manager
-                    .references(
-                        &adapter,
-                        &workspace,
-                        &workspace.path.join(&primary),
-                        &primary,
-                        1,
-                        4,
-                        true,
-                    )
-                    .await
-                    .unwrap(),
-                _ => unreachable!(),
-            };
-            assert!(!results.is_empty());
-            assert!(results.iter().all(|result| {
-                result.language.as_deref() == Some(extension)
-                    && result.provider.as_deref() == Some("clangd")
-                    && result.start_line >= 1
-            }));
-            assert_eq!(
-                results[0].relative_file_path.as_deref(),
-                Some(primary.as_str())
-            );
-            if operation == "references" {
-                assert!(
-                    results
-                        .iter()
-                        .any(|result| result.relative_file_path.as_deref()
-                            == Some(secondary.as_str()))
-                );
-            }
-        }
-    }
 }
 
 #[tokio::test]
@@ -3723,264 +3624,141 @@ async fn typescript_javascript_only_search_and_navigation_keep_typescript_lsp_op
     task.abort();
 }
 
-#[tokio::test]
-async fn python_only_search_and_navigation_keep_python_lsp_optional() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("python-only");
-    write(
-        &workspace,
-        "src/revenue.py",
-        "# Quarterly revenue summary implementation.\ndef compute_quarterly_revenue_summary(rows):\n    return [row for row in rows if row.get(\"amount\")]\n",
-    );
-    let app = App::open(config).await.unwrap();
-    let indexed = app.index(&workspace).await.unwrap();
-    assert_eq!(indexed.files, 1);
-    assert_eq!(indexed.parsed_files, 1);
-    assert_eq!(indexed.embedded_chunks, 1);
-
-    let report = app
-        .search(&workspace, "compute_quarterly_revenue_summary", Some(4))
-        .await
-        .unwrap();
-    assert_eq!(report.results[0].chunk.language, "python");
-    assert_eq!(report.results[0].chunk.relative_file_path, "src/revenue.py");
-    assert!(
-        report
-            .warning
-            .as_deref()
-            .is_none_or(|warning| !warning.contains("LSP")),
-        "unexpected warning: {:?}",
-        report.warning
-    );
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
-
-    let definition_error = app
-        .definition(&workspace, "src/revenue.py", 1, 0)
-        .await
-        .unwrap_err();
-    assert!(
-        definition_error.to_string().contains("pyright is disabled"),
-        "unexpected error: {definition_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
-
-    let references_error = app
-        .references(&workspace, "src/revenue.py", 1, 0, true)
-        .await
-        .unwrap_err();
-    assert!(
-        references_error.to_string().contains("pyright is disabled"),
-        "unexpected error: {references_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
-    task.abort();
+/// One workspace of a single optional-server language: search works without
+/// the language server and never starts it, and navigation names the
+/// disabled server.
+struct OptionalServerCase {
+    language: &'static str,
+    directory: &'static str,
+    file: &'static str,
+    source: &'static str,
+    query: &'static str,
+    /// Where the navigation calls point (line, character).
+    position: (u32, u32),
+    /// What the disabled server is called in the navigation error.
+    server: &'static str,
+    running: fn(&local_code_intelligence::app::Status) -> bool,
+    /// Only the Python workspace also checks the embedded chunk count.
+    embedded_chunks: Option<usize>,
 }
 
 #[tokio::test]
-async fn go_only_search_and_navigation_keep_go_lsp_optional() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("go-only");
-    write(
-        &workspace,
-        "revenue.go",
-        "package revenue\n\n// ComputeQuarterlyRevenueSummary sums quarterly revenue rows.\nfunc ComputeQuarterlyRevenueSummary(rows []int) int {\n\ttotal := 0\n\tfor _, row := range rows {\n\t\ttotal += row\n\t}\n\treturn total\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
-    let indexed = app.index(&workspace).await.unwrap();
-    assert_eq!(indexed.files, 1);
-    assert_eq!(indexed.parsed_files, 1);
-
-    let report = app
-        .search(&workspace, "ComputeQuarterlyRevenueSummary", Some(4))
-        .await
-        .unwrap();
-    assert_eq!(report.results[0].chunk.language, "go");
-    assert_eq!(report.results[0].chunk.relative_file_path, "revenue.go");
-    assert!(
-        report
-            .warning
-            .as_deref()
-            .is_none_or(|warning| !warning.contains("LSP")),
-        "unexpected warning: {:?}",
-        report.warning
-    );
-    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
-
-    let definition_error = app
-        .definition(&workspace, "revenue.go", 1, 0)
-        .await
-        .unwrap_err();
-    assert!(
-        definition_error.to_string().contains("gopls is disabled"),
-        "unexpected error: {definition_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
-
-    let references_error = app
-        .references(&workspace, "revenue.go", 1, 0, true)
-        .await
-        .unwrap_err();
-    assert!(
-        references_error.to_string().contains("gopls is disabled"),
-        "unexpected error: {references_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().go_analyzer_running);
-    task.abort();
+async fn single_language_search_and_navigation_keep_each_optional_lsp_optional() {
+    let cases = [
+        OptionalServerCase {
+            language: "python",
+            directory: "python-only",
+            file: "src/revenue.py",
+            source: "# Quarterly revenue summary implementation.\ndef compute_quarterly_revenue_summary(rows):\n    return [row for row in rows if row.get(\"amount\")]\n",
+            query: "compute_quarterly_revenue_summary",
+            position: (1, 0),
+            server: "pyright",
+            running: |status| status.python_analyzer_running,
+            embedded_chunks: Some(1),
+        },
+        OptionalServerCase {
+            language: "go",
+            directory: "go-only",
+            file: "revenue.go",
+            source: "package revenue\n\n// ComputeQuarterlyRevenueSummary sums quarterly revenue rows.\nfunc ComputeQuarterlyRevenueSummary(rows []int) int {\n\ttotal := 0\n\tfor _, row := range rows {\n\t\ttotal += row\n\t}\n\treturn total\n}\n",
+            query: "ComputeQuarterlyRevenueSummary",
+            position: (1, 0),
+            server: "gopls",
+            running: |status| status.go_analyzer_running,
+            embedded_chunks: None,
+        },
+        OptionalServerCase {
+            language: "c",
+            directory: "c-only",
+            file: "revenue.c",
+            source: "// compute_quarterly_revenue_summary sums quarterly revenue rows.\nint compute_quarterly_revenue_summary(int *rows, int count) {\n    int total = 0;\n    for (int i = 0; i < count; i++) {\n        total += rows[i];\n    }\n    return total;\n}\n",
+            query: "compute_quarterly_revenue_summary",
+            position: (1, 0),
+            server: "clangd",
+            running: |status| status.clangd_analyzer_running,
+            embedded_chunks: None,
+        },
+        OptionalServerCase {
+            language: "java",
+            directory: "java-only",
+            file: "RevenueService.java",
+            source: "package revenue;\n\n// Computes quarterly revenue summaries.\npublic final class RevenueService {\n    public static int computeQuarterlyRevenueSummary(int[] rows) {\n        int total = 0;\n        for (int row : rows) {\n            total += row;\n        }\n        return total;\n    }\n}\n",
+            query: "computeQuarterlyRevenueSummary",
+            position: (1, 0),
+            server: "jdtls",
+            running: |status| status.java_analyzer_running,
+            embedded_chunks: None,
+        },
+        OptionalServerCase {
+            language: "csharp",
+            directory: "csharp-only",
+            file: "src/RevenueService.cs",
+            source: "namespace Billing;\npublic sealed class RevenueService { public decimal ComputeQuarterlyRevenue() => 42m; }\n",
+            query: "ComputeQuarterlyRevenue",
+            position: (2, 28),
+            server: "csharp-ls",
+            running: |status| status.analyzer_running,
+            embedded_chunks: None,
+        },
+    ];
+    // Each case has its own fixture, so they run side by side.
+    futures::future::join_all(cases.into_iter().map(assert_optional_server_stays_off)).await;
 }
 
-#[tokio::test]
-async fn c_only_search_and_navigation_keep_clangd_lsp_optional() {
+async fn assert_optional_server_stays_off(case: OptionalServerCase) {
+    let name = case.language;
     let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("c-only");
-    write(
-        &workspace,
-        "revenue.c",
-        "// compute_quarterly_revenue_summary sums quarterly revenue rows.\nint compute_quarterly_revenue_summary(int *rows, int count) {\n    int total = 0;\n    for (int i = 0; i < count; i++) {\n        total += rows[i];\n    }\n    return total;\n}\n",
-    );
+    let workspace = temp.path().join(case.directory);
+    write(&workspace, case.file, case.source);
     let app = App::open(config).await.unwrap();
     let indexed = app.index(&workspace).await.unwrap();
-    assert_eq!(indexed.files, 1);
-    assert_eq!(indexed.parsed_files, 1);
+    assert_eq!(indexed.files, 1, "{name}");
+    assert_eq!(indexed.parsed_files, 1, "{name}");
+    if let Some(embedded) = case.embedded_chunks {
+        assert_eq!(indexed.embedded_chunks, embedded, "{name}");
+    }
 
-    let report = app
-        .search(&workspace, "compute_quarterly_revenue_summary", Some(4))
-        .await
-        .unwrap();
-    assert_eq!(report.results[0].chunk.language, "c");
-    assert_eq!(report.results[0].chunk.relative_file_path, "revenue.c");
-    assert!(
-        report
-            .warning
-            .as_deref()
-            .is_none_or(|warning| !warning.contains("LSP")),
-        "unexpected warning: {:?}",
-        report.warning
-    );
-    assert!(
-        !app.status(&workspace)
-            .await
-            .unwrap()
-            .clangd_analyzer_running
-    );
-
-    let definition_error = app
-        .definition(&workspace, "revenue.c", 1, 0)
-        .await
-        .unwrap_err();
-    assert!(
-        definition_error.to_string().contains("clangd is disabled"),
-        "unexpected error: {definition_error}"
-    );
-    assert!(
-        !app.status(&workspace)
-            .await
-            .unwrap()
-            .clangd_analyzer_running
-    );
-
-    let references_error = app
-        .references(&workspace, "revenue.c", 1, 0, true)
-        .await
-        .unwrap_err();
-    assert!(
-        references_error.to_string().contains("clangd is disabled"),
-        "unexpected error: {references_error}"
-    );
-    assert!(
-        !app.status(&workspace)
-            .await
-            .unwrap()
-            .clangd_analyzer_running
-    );
-    task.abort();
-}
-
-#[tokio::test]
-async fn java_only_search_and_navigation_keep_java_lsp_optional() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("java-only");
-    write(
-        &workspace,
-        "RevenueService.java",
-        "package revenue;\n\n// Computes quarterly revenue summaries.\npublic final class RevenueService {\n    public static int computeQuarterlyRevenueSummary(int[] rows) {\n        int total = 0;\n        for (int row : rows) {\n            total += row;\n        }\n        return total;\n    }\n}\n",
-    );
-    let app = App::open(config).await.unwrap();
-    let indexed = app.index(&workspace).await.unwrap();
-    assert_eq!(indexed.files, 1);
-    assert_eq!(indexed.parsed_files, 1);
-
-    let report = app
-        .search(&workspace, "computeQuarterlyRevenueSummary", Some(4))
-        .await
-        .unwrap();
-    assert_eq!(report.results[0].chunk.language, "java");
+    let report = app.search(&workspace, case.query, Some(4)).await.unwrap();
+    assert_eq!(report.results[0].chunk.language, case.language, "{name}");
     assert_eq!(
-        report.results[0].chunk.relative_file_path,
-        "RevenueService.java"
+        report.results[0].chunk.relative_file_path, case.file,
+        "{name}"
     );
     assert!(
         report
             .warning
             .as_deref()
             .is_none_or(|warning| !warning.contains("LSP")),
-        "unexpected warning: {:?}",
+        "{name}: unexpected warning: {:?}",
         report.warning
     );
-    assert!(!app.status(&workspace).await.unwrap().java_analyzer_running);
+    assert!(
+        !(case.running)(&app.status(&workspace).await.unwrap()),
+        "{name}"
+    );
 
+    let (line, character) = case.position;
     let definition_error = app
-        .definition(&workspace, "RevenueService.java", 1, 0)
+        .definition(&workspace, case.file, line, character)
         .await
         .unwrap_err();
-    assert!(
-        definition_error.to_string().contains("jdtls is disabled"),
-        "unexpected error: {definition_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().java_analyzer_running);
-
+    let after_definition = (case.running)(&app.status(&workspace).await.unwrap());
     let references_error = app
-        .references(&workspace, "RevenueService.java", 1, 0, true)
+        .references(&workspace, case.file, line, character, true)
         .await
         .unwrap_err();
-    assert!(
-        references_error.to_string().contains("jdtls is disabled"),
-        "unexpected error: {references_error}"
-    );
-    assert!(!app.status(&workspace).await.unwrap().java_analyzer_running);
-    task.abort();
-}
-
-#[tokio::test]
-async fn csharp_only_search_and_navigation_keep_csharp_lsp_optional() {
-    let (temp, config, _fake, task) = fixture().await;
-    let workspace = temp.path().join("csharp-only");
-    write(
-        &workspace,
-        "src/RevenueService.cs",
-        "namespace Billing;\npublic sealed class RevenueService { public decimal ComputeQuarterlyRevenue() => 42m; }\n",
-    );
-    let app = App::open(config).await.unwrap();
-    assert_eq!(app.index(&workspace).await.unwrap().files, 1);
-    let report = app
-        .search(&workspace, "ComputeQuarterlyRevenue", Some(4))
-        .await
-        .unwrap();
-    assert_eq!(report.results[0].chunk.language, "csharp");
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
-
-    for error in [
-        app.definition(&workspace, "src/RevenueService.cs", 2, 28)
-            .await
-            .unwrap_err(),
-        app.references(&workspace, "src/RevenueService.cs", 2, 28, true)
-            .await
-            .unwrap_err(),
+    let after_references = (case.running)(&app.status(&workspace).await.unwrap());
+    for (what, error, running) in [
+        ("definition", definition_error, after_definition),
+        ("references", references_error, after_references),
     ] {
         assert!(
-            error.to_string().contains("csharp-ls is disabled"),
-            "unexpected error: {error}"
+            error
+                .to_string()
+                .contains(&format!("{} is disabled", case.server)),
+            "{name} {what}: unexpected error: {error}"
         );
+        assert!(!running, "{name} {what}: the server was started");
     }
-    assert!(!app.status(&workspace).await.unwrap().analyzer_running);
     task.abort();
 }

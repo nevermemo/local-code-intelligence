@@ -510,98 +510,102 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_over_the_line_cap_is_cut_with_a_marker_naming_the_rest() {
-        let code = numbered_lines(100);
-        let view = view_of(
-            &report(vec![hit("src/big.rs", 10, &code)]),
-            limits(40, 100_000),
-        )
-        .unwrap();
-        let first = &results(&view)[0];
-        // The locator still names the whole chunk (lines 10 to 109); only
-        // `code` is shortened.
-        assert_eq!(first["start_line"], 10);
-        assert_eq!(first["end_line"], 109);
-        assert_eq!(first["code_truncated"], true);
-        assert_eq!(first["excerpt_end_line"], 49);
-        let shown = first["code"].as_str().unwrap();
-        let kept: String = numbered_lines(40);
-        assert!(shown.starts_with(&kept), "{shown}");
-        let closing = &shown[kept.len()..];
-        assert!(
-            closing.starts_with("[lci:") && closing.ends_with(']'),
-            "{closing}"
-        );
-        assert!(closing.contains("lines 50-109"), "{closing}");
-        assert_eq!(closing.lines().count(), 1, "one closing line");
-        assert!(view.get("response_truncated").is_none());
-    }
+    fn the_line_cap_cuts_with_a_marker_and_leaves_exact_fits_alone() {
+        // a hit over the line cap is cut with a marker naming the rest
+        {
+            let code = numbered_lines(100);
+            let view = view_of(
+                &report(vec![hit("src/big.rs", 10, &code)]),
+                limits(40, 100_000),
+            )
+            .unwrap();
+            let first = &results(&view)[0];
+            // The locator still names the whole chunk (lines 10 to 109); only
+            // `code` is shortened.
+            assert_eq!(first["start_line"], 10);
+            assert_eq!(first["end_line"], 109);
+            assert_eq!(first["code_truncated"], true);
+            assert_eq!(first["excerpt_end_line"], 49);
+            let shown = first["code"].as_str().unwrap();
+            let kept: String = numbered_lines(40);
+            assert!(shown.starts_with(&kept), "{shown}");
+            let closing = &shown[kept.len()..];
+            assert!(
+                closing.starts_with("[lci:") && closing.ends_with(']'),
+                "{closing}"
+            );
+            assert!(closing.contains("lines 50-109"), "{closing}");
+            assert_eq!(closing.lines().count(), 1, "one closing line");
+            assert!(view.get("response_truncated").is_none());
+        }
 
-    #[test]
-    fn the_cap_leaves_a_chunk_of_exactly_the_limit_alone_and_cuts_one_line_more() {
-        let exact = numbered_lines(40);
-        let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
-        assert_eq!(results(&view)[0]["code"], exact.as_str());
-        assert!(results(&view)[0].get("code_truncated").is_none());
-        assert!(results(&view)[0].get("excerpt_end_line").is_none());
-        let one_more = numbered_lines(41);
-        let view = view_of(
-            &report(vec![hit("a.rs", 1, &one_more)]),
-            limits(40, 100_000),
-        )
-        .unwrap();
-        assert_eq!(results(&view)[0]["code_truncated"], true);
-        assert_eq!(results(&view)[0]["excerpt_end_line"], 40);
-        assert!(
-            results(&view)[0]["code"]
-                .as_str()
-                .unwrap()
-                .contains("lines 41-41")
-        );
-        // A chunk without a final newline keeps that too.
-        let unterminated = "fn f() {\n}";
-        let view = view_of(
-            &report(vec![hit("a.rs", 1, unterminated)]),
-            limits(40, 100_000),
-        )
-        .unwrap();
-        assert_eq!(results(&view)[0]["code"], unterminated);
-    }
+        // a chunk of exactly the limit is left alone and one line more is cut
+        {
+            let exact = numbered_lines(40);
+            let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
+            assert_eq!(results(&view)[0]["code"], exact.as_str());
+            assert!(results(&view)[0].get("code_truncated").is_none());
+            assert!(results(&view)[0].get("excerpt_end_line").is_none());
+            let one_more = numbered_lines(41);
+            let view = view_of(
+                &report(vec![hit("a.rs", 1, &one_more)]),
+                limits(40, 100_000),
+            )
+            .unwrap();
+            assert_eq!(results(&view)[0]["code_truncated"], true);
+            assert_eq!(results(&view)[0]["excerpt_end_line"], 40);
+            assert!(
+                results(&view)[0]["code"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lines 41-41")
+            );
+            // A chunk without a final newline keeps that too.
+            let unterminated = "fn f() {\n}";
+            let view = view_of(
+                &report(vec![hit("a.rs", 1, unterminated)]),
+                limits(40, 100_000),
+            )
+            .unwrap();
+            assert_eq!(results(&view)[0]["code"], unterminated);
+        }
 
-    #[test]
-    fn the_cap_counts_lines_not_bytes_and_keeps_crlf_endings_and_multibyte_text() {
-        let line = |n: usize| format!("// zeile {n} \u{e4}\u{f6}\u{fc}\r\n");
-        let crlf: String = (1..=50).map(line).collect();
-        let view = view_of(&report(vec![hit("a.rs", 1, &crlf)]), limits(5, 100_000)).unwrap();
-        let shown = results(&view)[0]["code"].as_str().unwrap();
-        let prefix: String = (1..=5).map(line).collect();
-        assert!(shown.starts_with(&prefix), "{shown:?}");
-        assert!(shown.contains("lines 6-50"), "{shown:?}");
-        assert_eq!(results(&view)[0]["excerpt_end_line"], 5);
-    }
+        // the cap counts lines, not bytes, and keeps CRLF endings and multibyte text
+        {
+            let line = |n: usize| format!("// zeile {n} \u{e4}\u{f6}\u{fc}\r\n");
+            let crlf: String = (1..=50).map(line).collect();
+            let view = view_of(&report(vec![hit("a.rs", 1, &crlf)]), limits(5, 100_000)).unwrap();
+            let shown = results(&view)[0]["code"].as_str().unwrap();
+            let prefix: String = (1..=5).map(line).collect();
+            assert!(shown.starts_with(&prefix), "{shown:?}");
+            assert!(shown.contains("lines 6-50"), "{shown:?}");
+            assert_eq!(results(&view)[0]["excerpt_end_line"], 5);
+        }
 
-    #[test]
-    fn a_huge_single_line_is_cut_on_a_character_boundary_and_marked() {
-        // 3000 two-byte characters on one line: a minified file's chunk.
-        let line = "\u{e9}".repeat(3000);
-        let code = format!("{line}\n");
-        let view = view_of(&report(vec![hit("min.js", 7, &code)]), limits(40, 100_000)).unwrap();
-        let first = &results(&view)[0];
-        let shown = first["code"].as_str().unwrap();
-        assert!(
-            shown.starts_with(&"\u{e9}".repeat(COMPACT_MAX_LINE_CHARS)),
-            "{shown}"
-        );
-        assert!(shown.chars().count() < 800, "{}", shown.chars().count());
-        assert!(shown.contains("[+2500 characters]"), "{shown}");
-        assert!(shown.contains("long lines were cut"), "{shown}");
-        assert!(shown.contains("lines 7-7"), "{shown}");
-        assert_eq!(first["code_truncated"], true);
-        assert_eq!(first["excerpt_end_line"], 7);
-        // A line of exactly the limit is left alone.
-        let exact = format!("{}\n", "x".repeat(COMPACT_MAX_LINE_CHARS));
-        let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
-        assert_eq!(results(&view)[0]["code"], exact.as_str());
+        // a huge single line is cut on a character boundary and marked
+        {
+            // 3000 two-byte characters on one line: a minified file's chunk.
+            let line = "\u{e9}".repeat(3000);
+            let code = format!("{line}\n");
+            let view =
+                view_of(&report(vec![hit("min.js", 7, &code)]), limits(40, 100_000)).unwrap();
+            let first = &results(&view)[0];
+            let shown = first["code"].as_str().unwrap();
+            assert!(
+                shown.starts_with(&"\u{e9}".repeat(COMPACT_MAX_LINE_CHARS)),
+                "{shown}"
+            );
+            assert!(shown.chars().count() < 800, "{}", shown.chars().count());
+            assert!(shown.contains("[+2500 characters]"), "{shown}");
+            assert!(shown.contains("long lines were cut"), "{shown}");
+            assert!(shown.contains("lines 7-7"), "{shown}");
+            assert_eq!(first["code_truncated"], true);
+            assert_eq!(first["excerpt_end_line"], 7);
+            // A line of exactly the limit is left alone.
+            let exact = format!("{}\n", "x".repeat(COMPACT_MAX_LINE_CHARS));
+            let view = view_of(&report(vec![hit("a.rs", 1, &exact)]), limits(40, 100_000)).unwrap();
+            assert_eq!(results(&view)[0]["code"], exact.as_str());
+        }
     }
 
     fn forty_hits() -> SearchReport {
