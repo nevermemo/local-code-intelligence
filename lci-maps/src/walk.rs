@@ -364,6 +364,14 @@ pub struct RandomScorer {
     pub rng: SplitMix,
 }
 
+impl RandomScorer {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: SplitMix(seed),
+        }
+    }
+}
+
 impl Scorer for RandomScorer {
     fn label(&self) -> String {
         "random".to_string()

@@ -42,7 +42,7 @@
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
-    edge::{CONF_MAX, Edge, Expanded, Site, WitnessClass, cap_edges, sort_edges},
+    edge::{CONF_MAX, Edge, Expanded, MapCard, Site, WitnessClass, cap_edges, sort_edges},
     scip_graph::{FnKind, GraphEdgeKind, ScipMap},
 };
 use lci_core::node::{NodeId, NodeKind};
@@ -281,6 +281,13 @@ impl ContainsMap {
 impl Map for ContainsMap {
     fn describe(&self) -> &MapDescriptor {
         &self.descriptor
+    }
+
+    fn card(&self) -> MapCard {
+        MapCard {
+            dependent: true,
+            ..MapCard::from_descriptor(self.describe())
+        }
     }
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {

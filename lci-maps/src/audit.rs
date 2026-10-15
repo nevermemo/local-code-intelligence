@@ -151,7 +151,8 @@ pub fn canonical_fused(fused: &FusedEdge) -> String {
 }
 
 /// What an expansion says, in canonical form and in the source's order: its
-/// edges, then the calls it reports (map, edge count, whether it failed).
+/// edges, then the calls it reports (map, edge count, whether it failed, and
+/// the tokens it is charged).
 fn canonical_expansion(expansion: &Expansion) -> Vec<String> {
     expansion
         .edges
@@ -159,10 +160,11 @@ fn canonical_expansion(expansion: &Expansion) -> Vec<String> {
         .map(|fused| format!("edge {}", canonical_fused(fused)))
         .chain(expansion.calls.iter().map(|call| {
             format!(
-                "call {} n={} failed={}",
+                "call {} n={} failed={} tokens={}",
                 call.map,
                 call.n_edges,
-                call.failure.is_some()
+                call.failure.is_some(),
+                call.cost.est_tokens
             )
         }))
         .collect()
@@ -178,7 +180,11 @@ pub struct SourceReport {
 
 /// Contract S5, the equivalence auditor: for every node of `nodes`, the two
 /// sources must give the same edges (as a set), in the same order, and report
-/// the same calls (cost aside). Used for the pre-merged source against the
+/// the same calls with the same token cost. The time a call took is a
+/// measurement and is left out, and so are its external calls: a map that
+/// caches (`git.history` runs git once more on a cold cache) reports a count
+/// that depends on when it was asked, and a pre-merged row keeps the cold
+/// one. Used for the pre-merged source against the
 /// on-the-fly one on fixtures (spine brief 1.3); the first difference fails.
 /// Whatever switches the caller wants audited are applied to both sources
 /// before the call.

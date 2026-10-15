@@ -44,6 +44,8 @@ struct GraphMap {
     /// not run when its call would pass it. `runs` adds the calls it made.
     honors_calls: bool,
     runs: Option<Arc<AtomicU32>>,
+    /// The card says the map derives from a graph shared with other maps.
+    dependent: bool,
 }
 
 impl GraphMap {
@@ -72,7 +74,14 @@ impl GraphMap {
             site_path: None,
             honors_calls: false,
             runs: None,
+            dependent: false,
         }
+    }
+
+    /// Marks the map as derived from a shared graph (see `MapCard::dependent`).
+    fn dependent(mut self) -> Self {
+        self.dependent = true;
+        self
     }
 
     fn site(mut self, path: &str) -> Self {
@@ -166,6 +175,13 @@ impl Map for GraphMap {
             .collect();
         // A call that has a cost reports it once, even for no edges.
         crate::edge::Expanded::new(edges, self.cost)
+    }
+
+    fn card(&self) -> crate::edge::MapCard {
+        crate::edge::MapCard {
+            dependent: self.dependent,
+            ..crate::edge::MapCard::from_descriptor(&self.descriptor)
+        }
     }
 }
 
@@ -466,10 +482,7 @@ async fn maps_are_asked_only_about_kinds_they_accept_and_while_enabled() {
     let result = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
     assert!(result.reached(&node("b")));
     assert!(!result.reached(&node("c")) && !result.reached(&node("d")));
-    assert_eq!(
-        result.totals.per_map.keys().copied().collect::<Vec<_>>(),
-        ["files"]
-    );
+    assert_eq!(result.maps.keys().copied().collect::<Vec<_>>(), ["files"]);
 }
 
 // ---- fusion ----------------------------------------------------------------
@@ -633,7 +646,7 @@ async fn without_a_handler_the_order_is_discovery_order() {
 }
 
 #[tokio::test]
-async fn expand_boost_and_rerank_reorder_the_frontier() {
+async fn expand_and_boost_reorder_the_frontier() {
     let expand = walk(&fan(), vec![seed("a")], budget(3), |t| {
         t.handler(
             scripted(|_| vec![act(Some(&node("d")), Action::Expand)]),
@@ -661,41 +674,6 @@ async fn expand_boost_and_rerank_reorder_the_frontier() {
     })
     .await;
     assert_eq!(&popped_names(&demote)[1..], ["src/c.rs", "src/d.rs"]);
-}
-
-#[tokio::test]
-async fn rerank_by_witness_puts_the_strongest_class_first() {
-    // b is offered by a text map, c by a compiler-grade one: b is found first.
-    let reg = registry(vec![
-        GraphMap::new("m1", &[("a", "b")]).witness(WitnessClass::Text),
-        GraphMap::new("m2", &[("a", "c")]),
-    ]);
-    let plain = walk(&reg, vec![seed("a")], budget(2), |t| t).await;
-    assert_eq!(popped_names(&plain)[1], "src/b.rs");
-    let result = walk(&reg, vec![seed("a")], budget(2), |t| {
-        t.handler(
-            scripted(|_| vec![act(None, Action::Rerank(RerankBy::Witness))]),
-            every(1),
-        )
-    })
-    .await;
-    assert_eq!(popped_names(&result)[1], "src/c.rs");
-}
-
-#[test]
-fn rerank_permutes_the_priorities_it_was_given() {
-    let mut frontier = Frontier::default();
-    for (state, priority) in [(0, 0.9), (1, 0.5), (2, 0.1)] {
-        frontier.push(state, priority);
-    }
-    // Largest state number first.
-    frontier.rerank(std::cmp::Reverse);
-    let order: Vec<(usize, f64)> = frontier
-        .sorted()
-        .iter()
-        .map(|i| (i.state, i.priority))
-        .collect();
-    assert_eq!(order, [(2, 0.9), (1, 0.5), (0, 0.1)]);
 }
 
 #[tokio::test]
@@ -980,7 +958,6 @@ async fn no_handler_can_raise_a_budget() {
             scripted(|cp| {
                 let mut out = vec![
                     act(None, Action::MapWeight("g".into(), 1e9)),
-                    act(None, Action::Rerank(RerankBy::Witness)),
                     act(None, Action::Emit("x".repeat(10_000))),
                 ];
                 for item in &cp.frontier {
@@ -1325,7 +1302,7 @@ mod persist {
                 b.steers
             )
         );
-        assert_eq!(a.per_map, b.per_map);
+        assert_eq!(second.maps, straight.maps);
         assert_eq!(without_marks(&both), without_marks(&straight.events));
         // The stop at pop 6 fired once, in the first call. The first call's
         // stops saw a budget of 6 pops, so their checkpoints (and hashes)
@@ -1890,8 +1867,10 @@ mod steering {
             via: Some("scip"),
             witness: Some(WitnessClass::Compiler),
             potential: 0.5,
+            ranked_potential: 0.5,
             depth: 2,
             maps: vec!["scip"],
+            n_maps: 1,
         };
         assert_eq!(card.text(), "file:src/a.rs | scip/compiler | p0.50 d2");
         let long = Card {
@@ -2107,7 +2086,7 @@ mod steering {
         .await;
         assert_eq!(cut.status, TraversalStatus::BudgetExhausted);
         let checkpoint = cut.checkpoint.as_ref().expect("a budget hit is returned");
-        assert_eq!(checkpoint.reason, stop::StopReason::Budget);
+        assert_eq!(checkpoint.reason, stop::StopReason::Pops);
         assert_eq!(checkpoint.pops, 3);
         assert_eq!(of(&cut, "return")[0]["reason"], "budget");
         assert!(of(&cut, "steer").is_empty(), "no rung was consulted");
@@ -2239,7 +2218,6 @@ mod steering {
             {"node": "file:src/a.rs", "action": "prune"},
             {"node": "file:src/b.rs", "action": {"boost": 2.0}},
             {"action": {"map_off": "vector"}},
-            {"action": {"rerank": "depth"}},
             {"action": {"redirect": ["file:src/c.rs"]}},
             {"action": {"budget": {"pops": 20, "tokens": 2000}}},
             {"action": {"budget": {"pops": 5}}},
@@ -2250,18 +2228,18 @@ mod steering {
         assert_eq!(
             names,
             [
-                "prune", "boost", "map_off", "rerank", "redirect", "budget", "budget", "stop"
+                "prune", "boost", "map_off", "redirect", "budget", "budget", "stop"
             ]
         );
         assert_eq!(ok.actions[0].node, Some(node("a")));
         assert_eq!(
-            ok.actions[5].action,
+            ok.actions[4].action,
             Action::Budget {
                 pops: 20,
                 tokens: 2000
             }
         );
-        assert_eq!(ok.actions[6].action, Action::Budget { pops: 5, tokens: 0 });
+        assert_eq!(ok.actions[5].action, Action::Budget { pops: 5, tokens: 0 });
 
         let bad = |value: Value| Steer::from_json(&value).unwrap_err();
         assert_eq!(bad(json!([])), SteerError::NotAnObject);
@@ -2558,7 +2536,10 @@ mod start_plan {
     #[tokio::test]
     async fn the_start_event_lists_the_maps_and_the_policy() {
         let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
-        let policy = StopPolicy::every(1).max_stops(3);
+        let policy = StopPolicy::every(1)
+            .max_stops(3)
+            .on_disagreement(4)
+            .likely_complete(90);
         let result = walk(&reg, vec![seed("a")], budget(10), |t| {
             t.handler(noop(), policy).plan(plan())
         })
@@ -2577,6 +2558,9 @@ mod start_plan {
         assert_eq!(start["policy"]["rules"], 2);
         assert_eq!(start["policy"]["stops"], start["stops"]);
         assert_eq!(start["policy"]["stops"]["max_stops"], 3);
+        // Every trigger is shown, so a reader knows when the walk could stop.
+        assert_eq!(start["policy"]["stops"]["on_disagreement"], 4);
+        assert_eq!(start["policy"]["stops"]["likely_complete"], 90);
         assert_eq!(start["seed_source"], "hybrid");
         assert_eq!(start["seed_hits"][0]["score"], 0.5);
 
@@ -2588,6 +2572,7 @@ mod start_plan {
         assert_eq!(policy.tau, Some(0.8));
         assert_eq!(policy.rules, 2);
         assert_eq!(policy.stops, start["stops"]);
+        assert_eq!(policy.stops["on_disagreement"], 4);
         assert_eq!(read.seed_source.as_deref(), Some("hybrid"));
         assert_eq!(read.seeds, ["a".to_string()].map(|n| node(&n).to_string()));
     }

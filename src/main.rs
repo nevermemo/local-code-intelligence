@@ -419,7 +419,8 @@ struct TraverseArgs {
     /// Most pops, up to the `[traverse]` cap.
     #[arg(long)]
     pops: Option<u32>,
-    /// Deepest state expanded, up to the `[traverse]` cap.
+    /// Depth at which states are recorded, not expanded (the deepest state
+    /// expanded is at one less), up to the `[traverse]` cap.
     #[arg(long)]
     max_depth: Option<u32>,
     /// Results to print.

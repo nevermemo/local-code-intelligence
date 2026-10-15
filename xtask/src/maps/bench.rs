@@ -14,9 +14,8 @@
 //! its file nor its impl type, so a declaration is identified by the `site`
 //! (path and line of the definition) the result card carries, which is what
 //! the scorers match on (a line inside the gold span, or the gold's own
-//! `file:line`). Only a symbol with no site falls back to the frozen tree, by
-//! the module-path rule the node ids were made with, and then offers its file
-//! alone. When no selected map can emit the node kind a set needs (commits for
+//! `file:line`). A symbol with no site is not offered: its id names a module
+//! path, not a file, and the cards of every symbol result carry a site. When no selected map can emit the node kind a set needs (commits for
 //! history, document sections for instructions), the row says so
 //! (`structural-zero`) instead of reporting zeros.
 //!
@@ -27,7 +26,7 @@ use super::trend::{self, NCOLS, TrendRow};
 use crate::gold::{self, Answer, Set};
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use lci_core::node::{NodeId, NodeKind, SymbolKind, rust_module_path};
+use lci_core::node::{NodeId, NodeKind, SymbolKind};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -84,10 +83,9 @@ pub struct BenchArgs {
     /// The SCIP index of the frozen tree (not needed with --rescore).
     #[arg(long)]
     scip: Option<PathBuf>,
-    /// The frozen tree the index describes (also read to find the file of a
-    /// symbol that has no site).
+    /// The frozen tree the index describes (not needed with --rescore).
     #[arg(long)]
-    tree: PathBuf,
+    tree: Option<PathBuf>,
     /// Maps to use, comma separated (default: the maps the CLI turns on when
     /// it is not told, read from a probe call; with --rescore, name the maps
     /// the run used).
@@ -142,7 +140,6 @@ pub fn run(args: BenchArgs) -> Result<()> {
         "default" => None,
         other => Some(other.to_string()),
     };
-    let tree = TreeIndex::scan(&args.tree)?;
     let trend_path = args
         .trend
         .clone()
@@ -157,10 +154,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
         ));
     }
     if let Some(dir) = &args.rescore {
-        return rescore(&args, dir, sets[0], &gold_items[0], &tree, &trend_path);
+        return rescore(&args, dir, sets[0], &gold_items[0], &trend_path);
     }
 
     let scip = args.scip.clone().context("--scip is required")?;
+    let tree = args.tree.clone().context("--tree is required")?;
     let out_dir = args.out_dir.clone().context("--out-dir is required")?;
     let lci = match &args.lci {
         Some(path) => path.clone(),
@@ -169,7 +167,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let mut traverser = CliTraverser {
         lci,
         scip,
-        tree: args.tree.clone(),
+        tree,
         maps: args.maps.clone(),
         policy,
         top_k: args.top_k,
@@ -209,7 +207,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     traverser.maps = config.available_maps();
     for (set, items) in sets.into_iter().zip(&gold_items) {
         eprintln!("{}: {} items", set_name(set), items.len());
-        let outcome = bench_set(set, items, &traverser, &tree, &config)?;
+        let outcome = bench_set(set, items, &traverser, &config)?;
         write_outputs(
             &out_dir.join(slug(&args.wave)).join(set_name(set)),
             &outcome,
@@ -228,7 +226,6 @@ fn rescore(
     dir: &Path,
     set: Set,
     items: &[Value],
-    tree: &TreeIndex,
     trend_path: &Path,
 ) -> Result<()> {
     if args.set == SetArg::All {
@@ -257,7 +254,7 @@ fn rescore(
         items.len(),
         dir.display()
     );
-    let mut outcome = bench_set(set, items, &raw, tree, &config)?;
+    let mut outcome = bench_set(set, items, &raw, &config)?;
     // The raw outputs stay where they are.
     outcome.raw.clear();
     if let Some(out_dir) = &args.out_dir {
@@ -639,7 +636,9 @@ pub fn check_probe(
         Some((_, false)) => return Err(format!("{map} was registered but switched off")),
         Some(_) => {}
     }
-    let calls = response["totals"]["per_map"][map].as_u64().unwrap_or(0);
+    // `{"expands": n, "ms": t}`; the first traces kept a bare count.
+    let stat = &response["totals"]["per_map"][map];
+    let calls = stat["expands"].as_u64().or(stat.as_u64()).unwrap_or(0);
     if calls == 0 {
         return Err(format!(
             "{map} was never called on the probe start nodes (per-map calls: {}){}",
@@ -876,67 +875,6 @@ impl Traverser for RawOutputs {
     }
 }
 
-// ------------------------------------------------------------- tree index
-
-/// The `.rs` files of the frozen tree by module path, to find the file of a
-/// symbol id (which names its module path, not its file).
-#[derive(Debug, Default)]
-pub struct TreeIndex {
-    by_module: BTreeMap<Vec<String>, String>,
-}
-
-impl TreeIndex {
-    pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> TreeIndex {
-        let mut paths: Vec<&str> = paths.into_iter().filter(|p| p.ends_with(".rs")).collect();
-        paths.sort_unstable();
-        let mut by_module = BTreeMap::new();
-        for path in paths {
-            by_module
-                .entry(rust_module_path(path))
-                .or_insert_with(|| path.to_string());
-        }
-        TreeIndex { by_module }
-    }
-
-    pub fn scan(root: &Path) -> Result<TreeIndex> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
-            for entry in
-                std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if entry.file_type()?.is_dir() {
-                    if !matches!(name.as_ref(), ".git" | "target" | "node_modules") {
-                        walk(&path, root, out)?;
-                    }
-                } else if name.ends_with(".rs")
-                    && let Ok(relative) = path.strip_prefix(root)
-                {
-                    out.push(relative.to_string_lossy().replace('\\', "/"));
-                }
-            }
-            Ok(())
-        }
-        let mut files = Vec::new();
-        walk(root, root, &mut files)?;
-        if files.is_empty() {
-            bail!("no .rs files under the tree {}", root.display());
-        }
-        Ok(TreeIndex::from_paths(files.iter().map(String::as_str)))
-    }
-
-    /// The file for a module path: the longest prefix that is a file (a symbol
-    /// in an inline module belongs to the file around it).
-    pub fn file_of(&self, module_path: &[String]) -> Option<&str> {
-        (0..=module_path.len())
-            .rev()
-            .find_map(|n| self.by_module.get(&module_path[..n]))
-            .map(String::as_str)
-    }
-}
-
 // ------------------------------------------------------------- adapters
 
 /// A symbol node as the scorers see a declaration: where it is defined. The
@@ -945,25 +883,22 @@ impl TreeIndex {
 /// the gold's own `file:line`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decl {
-    pub path: Option<String>,
-    /// The line of the definition; `None` when the card had no site.
-    pub line: Option<u64>,
+    pub path: String,
+    /// The line of the definition.
+    pub line: u64,
     pub kind: SymbolKind,
 }
 
-/// The declaration a symbol result stands for: the site of its card, else
-/// (no site) the file the tree gives its module path, with no line.
-pub fn decl_of(node: &ResultNode, tree: &TreeIndex) -> Option<Decl> {
+/// The declaration a symbol result stands for: the site of its card (none
+/// for a symbol the card could not place).
+pub fn decl_of(node: &ResultNode) -> Option<Decl> {
     let NodeId::Symbol(key) = parsed(&node.id)? else {
         return None;
     };
-    let (path, line) = match &node.site {
-        Some(site) => (Some(site.path.clone()), Some(site.line)),
-        None => (tree.file_of(&key.module_path).map(str::to_string), None),
-    };
+    let site = node.site.as_ref()?;
     Some(Decl {
-        path,
-        line,
+        path: site.path.clone(),
+        line: site.line,
         kind: key.kind,
     })
 }
@@ -973,10 +908,10 @@ fn parsed(id: &str) -> Option<NodeId> {
 }
 
 /// The file a node stands for: a file, chunk or doc node names it, a symbol
-/// is placed by its site (or the tree).
-fn path_of(node: &ResultNode, tree: &TreeIndex) -> Option<String> {
+/// is placed by its site.
+fn path_of(node: &ResultNode) -> Option<String> {
     match parsed(&node.id)? {
-        NodeId::Symbol(_) => decl_of(node, tree)?.path,
+        NodeId::Symbol(_) => Some(decl_of(node)?.path),
         other => other.path().map(str::to_string),
     }
 }
@@ -993,7 +928,7 @@ fn answer(path: Option<&str>, line: Option<u64>) -> Value {
 }
 
 fn decl_answer(decl: &Decl) -> Value {
-    answer(decl.path.as_deref(), decl.line)
+    answer(Some(&decl.path), Some(decl.line))
 }
 
 fn dedup(answers: Vec<Value>) -> Vec<Value> {
@@ -1004,22 +939,22 @@ fn dedup(answers: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn paths_only(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+fn paths_only(nodes: &[ResultNode]) -> Vec<Value> {
     dedup(
         nodes
             .iter()
-            .filter_map(|n| path_of(n, tree))
+            .filter_map(path_of)
             .map(|p| answer(Some(&p), None))
             .collect(),
     )
 }
 
 /// The function and method declarations among `nodes`, as located answers.
-fn function_decls(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+fn function_decls(nodes: &[ResultNode]) -> Vec<Value> {
     dedup(
         nodes
             .iter()
-            .filter_map(|n| decl_of(n, tree))
+            .filter_map(decl_of)
             .filter(|d| matches!(d.kind, SymbolKind::Function | SymbolKind::Method))
             .map(|d| decl_answer(&d))
             .collect(),
@@ -1028,11 +963,11 @@ fn function_decls(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
 
 /// Turns the nodes a traversal returned, best first, into the run-file answers
 /// the set's scorer reads.
-pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
     match set {
-        Set::Impact => adapt_impact(nodes, tree),
-        Set::Flow => adapt_flow(nodes, tree),
-        Set::WhereTo => adapt_where_to(item, nodes, tree),
+        Set::Impact => adapt_impact(nodes),
+        Set::Flow => adapt_flow(nodes),
+        Set::WhereTo => adapt_where_to(item, nodes),
         Set::History => adapt_history(nodes),
         Set::Instructions => adapt_instructions(nodes),
     }
@@ -1040,12 +975,12 @@ pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode], tree: &TreeIndex) -> 
 
 /// Impact: every symbol is a declaration (path and line of its definition), a
 /// file node is a file.
-pub fn adapt_impact(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+pub fn adapt_impact(nodes: &[ResultNode]) -> Vec<Value> {
     dedup(
         nodes
             .iter()
             .filter_map(|n| match parsed(&n.id)? {
-                NodeId::Symbol(_) => Some(decl_answer(&decl_of(n, tree)?)),
+                NodeId::Symbol(_) => Some(decl_answer(&decl_of(n)?)),
                 other => other.path().map(|p| answer(Some(p), None)),
             })
             .collect(),
@@ -1056,22 +991,22 @@ pub fn adapt_impact(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
 /// of its definition (the gold names a node by `file:line` too); other nodes
 /// are not offered (an offered node that is no known node would count as
 /// spurious).
-pub fn adapt_flow(nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
-    function_decls(nodes, tree)
+pub fn adapt_flow(nodes: &[ResultNode]) -> Vec<Value> {
+    function_decls(nodes)
 }
 
 /// Where-to: registration items want files, ranked; convention items want an
 /// implementation per file (a path-only answer matches when one implementation
 /// lives in the file); exemplar items want members by location, or files when
 /// the item is file-granular.
-pub fn adapt_where_to(item: &Value, nodes: &[ResultNode], tree: &TreeIndex) -> Vec<Value> {
+pub fn adapt_where_to(item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
     let gold = &item["gold"];
     let by_member =
         gold["form"].as_str() == Some("exemplar") && gold["granularity"].as_str() != Some("file");
     if !by_member {
-        return paths_only(nodes, tree);
+        return paths_only(nodes);
     }
-    function_decls(nodes, tree)
+    function_decls(nodes)
 }
 
 /// History: commit nodes, by hash.
@@ -1460,7 +1395,6 @@ pub fn bench_set(
     set: Set,
     items: &[Value],
     traverser: &dyn Traverser,
-    tree: &TreeIndex,
     config: &RunConfig,
 ) -> Result<SetOutcome> {
     let n_gold = items.len();
@@ -1507,7 +1441,7 @@ pub fn bench_set(
                     }));
                 }
                 nodes.extend(traversed.results.iter().cloned());
-                let answers = adapt(set, item, &nodes, tree);
+                let answers = adapt(set, item, &nodes);
                 if traversed.status == "no_seeds" {
                     sums.no_seeds += 1;
                 }
@@ -1635,16 +1569,6 @@ pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn tree() -> TreeIndex {
-        TreeIndex::from_paths([
-            "src/app/search.rs",
-            "src/app/mod.rs",
-            "src/lib.rs",
-            "lci-core/src/chunk.rs",
-            "README.md",
-        ])
-    }
-
     /// A result with no site (the card did not locate it).
     fn node(id: &str) -> ResultNode {
         ResultNode {
@@ -1683,57 +1607,27 @@ mod tests {
     }
 
     #[test]
-    fn tree_resolves_module_paths_by_longest_prefix() {
-        let t = tree();
-        let module = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            t.file_of(&module(&["app", "search"])),
-            Some("src/app/search.rs")
-        );
-        assert_eq!(
-            t.file_of(&module(&["app", "search", "inner"])),
-            Some("src/app/search.rs")
-        );
-        assert_eq!(t.file_of(&module(&["app"])), Some("src/app/mod.rs"));
-        assert_eq!(
-            t.file_of(&module(&["lci-core", "chunk"])),
-            Some("lci-core/src/chunk.rs")
-        );
-        // The crate root has the empty module path, so an unknown module falls back to it.
-        assert_eq!(t.file_of(&module(&["nope"])), Some("src/lib.rs"));
-    }
-
-    #[test]
     fn symbols_become_declarations_at_their_site() {
-        let t = tree();
-        let d = decl_of(&located(SEARCH_FN, "src/app/other.rs", 12), &t).unwrap();
-        // The site wins over the module path.
-        assert_eq!(d.path.as_deref(), Some("src/app/other.rs"));
-        assert_eq!(d.line, Some(12));
-        let m = decl_of(&located(METHOD, "lci-core/src/chunk.rs", 30), &t).unwrap();
+        let d = decl_of(&located(SEARCH_FN, "src/app/other.rs", 12)).unwrap();
+        assert_eq!((d.path.as_str(), d.line), ("src/app/other.rs", 12));
+        let m = decl_of(&located(METHOD, "lci-core/src/chunk.rs", 30)).unwrap();
         assert_eq!(m.kind, SymbolKind::Method);
-        assert!(decl_of(&node(COMMIT), &t).is_none());
+        assert!(decl_of(&node(COMMIT)).is_none());
     }
 
     #[test]
-    fn a_symbol_without_a_site_falls_back_to_its_file_alone() {
-        let t = tree();
-        let d = decl_of(&node(SEARCH_FN), &t).unwrap();
-        assert_eq!(d.path.as_deref(), Some("src/app/search.rs"));
-        assert_eq!(d.line, None);
-        assert_eq!(
-            adapt_impact(&[node(SEARCH_FN)], &t),
-            vec![json!({"path": "src/app/search.rs"})]
-        );
+    fn a_symbol_without_a_site_is_not_offered() {
+        assert!(decl_of(&node(SEARCH_FN)).is_none());
+        assert!(adapt_impact(&[node(SEARCH_FN)]).is_empty());
+        assert!(adapt_flow(&[node(SEARCH_FN)]).is_empty());
     }
 
     #[test]
     fn impact_adapter_offers_declarations_and_dedups() {
-        let t = tree();
         let mut nodes = located_nodes();
         nodes.push(located(SEARCH_FN, "src/app/search.rs", 12));
         nodes.push(node(COMMIT));
-        let answers = adapt_impact(&nodes, &t);
+        let answers = adapt_impact(&nodes);
         assert_eq!(
             answers,
             vec![
@@ -1747,8 +1641,7 @@ mod tests {
 
     #[test]
     fn flow_adapter_keeps_functions_and_methods_only() {
-        let t = tree();
-        let answers = adapt_flow(&located_nodes(), &t);
+        let answers = adapt_flow(&located_nodes());
         let lines: Vec<(&str, u64)> = answers
             .iter()
             .map(|a| (a["path"].as_str().unwrap(), a["line"].as_u64().unwrap()))
@@ -1765,27 +1658,26 @@ mod tests {
 
     #[test]
     fn where_to_adapter_follows_the_item_form() {
-        let t = tree();
         let nodes = located_nodes();
         let registration = json!({"gold": {"form": "registration"}});
         assert_eq!(
-            adapt_where_to(&registration, &nodes, &t),
+            adapt_where_to(&registration, &nodes),
             vec![
                 json!({"path": "src/app/search.rs"}),
                 json!({"path": "lci-core/src/chunk.rs"})
             ]
         );
         let convention = json!({"gold": {"form": "convention"}});
-        assert_eq!(adapt_where_to(&convention, &nodes, &t).len(), 2);
+        assert_eq!(adapt_where_to(&convention, &nodes).len(), 2);
         let exemplar = json!({"gold": {"form": "exemplar", "granularity": "member"}});
-        let by_member = adapt_where_to(&exemplar, &nodes, &t);
+        let by_member = adapt_where_to(&exemplar, &nodes);
         assert_eq!(by_member.len(), 3);
         assert_eq!(
             by_member[0],
             json!({"path": "src/app/search.rs", "line": 12})
         );
         let file_level = json!({"gold": {"form": "exemplar", "granularity": "file"}});
-        assert_eq!(adapt_where_to(&file_level, &nodes, &t).len(), 2);
+        assert_eq!(adapt_where_to(&file_level, &nodes).len(), 2);
     }
 
     #[test]
@@ -1827,8 +1719,7 @@ mod tests {
         let mut answers = BTreeMap::new();
         answers.insert("q".into(), raw);
         let items = vec![impact_item("i1", "q", "src/app/search.rs", "x")];
-        let outcome =
-            bench_set(Set::Impact, &items, &Fixture::new(answers), &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::Impact, &items, &Fixture::new(answers), &cfg).unwrap();
         // The seed leads, located by its checkpoint card.
         assert_eq!(
             outcome.run["i1"][0],
@@ -2015,7 +1906,6 @@ mod tests {
 
     #[test]
     fn three_item_run_scores_and_appends_a_trend_row() {
-        let t = tree();
         let items = vec![
             impact_item(
                 "i1",
@@ -2039,7 +1929,6 @@ mod tests {
             Set::Impact,
             &items,
             &Fixture::new(answers),
-            &t,
             &config(&["graph.scip", "seeds.scip_names"]),
         )
         .unwrap();
@@ -2103,7 +1992,6 @@ mod tests {
             Set::Impact,
             &items,
             &Fixture::new(answers),
-            &tree(),
             &progress_config,
         )
         .unwrap();
@@ -2130,7 +2018,6 @@ mod tests {
             Set::Impact,
             &items,
             &Fixture::new(BTreeMap::new()),
-            &tree(),
             &config(&["graph.scip"]),
         )
         .unwrap();
@@ -2146,14 +2033,7 @@ mod tests {
     fn a_set_no_map_can_answer_gets_the_no_map_row() {
         let items = vec![json!({"id": "h1", "question": "q", "gold": {"commit": "abc"}}); 2];
         let fixture = Fixture::new(BTreeMap::new());
-        let outcome = bench_set(
-            Set::History,
-            &items,
-            &fixture,
-            &tree(),
-            &config(&["graph.scip"]),
-        )
-        .unwrap();
+        let outcome = bench_set(Set::History, &items, &fixture, &config(&["graph.scip"])).unwrap();
         let cells = &outcome.row.cells;
         assert_eq!(counts(cells), ("2", "0", "0"));
         assert_eq!(cells[5], "no_answer_type=2");
@@ -2192,7 +2072,7 @@ mod tests {
             "src/app/search.rs",
             "search::rerank_document",
         )];
-        let outcome = bench_set(Set::Impact, &items, &fixture, &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::Impact, &items, &fixture, &cfg).unwrap();
         assert!(
             outcome.row.cells[18].starts_with("graph.scip (cli error: graph.scip is down"),
             "{}",
@@ -2207,7 +2087,7 @@ mod tests {
             .iter()
             .map(|m| (m.clone(), "down".into()))
             .collect();
-        let outcome = bench_set(Set::Impact, &items, &fixture, &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::Impact, &items, &fixture, &cfg).unwrap();
         assert_eq!(fixture.calls.get(), 1);
         assert_eq!(outcome.row.cells[3], "0");
         assert_eq!(outcome.row.cells[5], "map_unavailable=1");
@@ -2238,8 +2118,7 @@ mod tests {
             "src/app/search.rs",
             "search::rerank_document",
         )];
-        let outcome =
-            bench_set(Set::Impact, &items, &Fixture::new(answers), &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::Impact, &items, &Fixture::new(answers), &cfg).unwrap();
         assert!(outcome.row.cells[15].ends_with("(under load)"));
         assert!(outcome.row.cells[20].contains("under load"));
     }
@@ -2303,9 +2182,8 @@ mod tests {
             card(SPLIT_A, "src/app/search.rs", 10),
             card(SPLIT_B, "src/app/search.rs", 40),
         ]);
-        let t = tree();
-        assert_eq!(adapt_impact(&nodes, &t).len(), 2);
-        assert_eq!(adapt_flow(&nodes, &t).len(), 2);
+        assert_eq!(adapt_impact(&nodes).len(), 2);
+        assert_eq!(adapt_flow(&nodes).len(), 2);
     }
 
     #[test]
@@ -2329,7 +2207,6 @@ mod tests {
             Set::Flow,
             &items,
             &Fixture::new(answers),
-            &tree(),
             &config(&["graph.scip"]),
         )
         .unwrap();
@@ -2342,7 +2219,6 @@ mod tests {
     fn a_declaration_is_found_in_the_file_the_result_names() {
         // `app::search` is both `search.rs` and `search/mod.rs`; the module
         // path cannot tell them apart, the site can.
-        let t = TreeIndex::from_paths(["src/app/search.rs", "src/app/search/mod.rs"]);
         let items = vec![impact_item(
             "i1",
             "q",
@@ -2359,7 +2235,6 @@ mod tests {
             Set::Impact,
             &items,
             &Fixture::new(answers),
-            &t,
             &config(&["graph.scip"]),
         )
         .unwrap();
@@ -2381,7 +2256,7 @@ mod tests {
         ];
         let mut cfg = config(&four);
         cfg.note = "tree x".into();
-        let outcome = bench_set(Set::History, &items, &fixture, &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::History, &items, &fixture, &cfg).unwrap();
         assert_eq!(outcome.row.cells[7], NO_MAP);
         assert_eq!(outcome.row.cells[20], "tree x; structural-zero");
         assert_eq!(fixture.calls.get(), 0);
@@ -2389,14 +2264,8 @@ mod tests {
         let mut answers = BTreeMap::new();
         answers.insert("q".into(), traversal(&["x"], &[SEARCH_FN], 1));
         let impact = vec![impact_item("i1", "q", "src/app/search.rs", "x")];
-        let outcome = bench_set(
-            Set::Impact,
-            &impact,
-            &Fixture::new(answers),
-            &tree(),
-            &config(&four),
-        )
-        .unwrap();
+        let outcome =
+            bench_set(Set::Impact, &impact, &Fixture::new(answers), &config(&four)).unwrap();
         assert!(!outcome.row.cells[20].contains("structural-zero"));
     }
 
@@ -2446,11 +2315,14 @@ mod tests {
 
     #[test]
     fn a_map_the_call_never_ran_fails_the_probe() {
-        let called = json!({"totals": {"per_map": {"graph.scip": 3}}});
-        let uncalled = json!({"totals": {"per_map": {"graph.scip": 3}},
+        let called = json!({"totals": {"per_map": {"graph.scip": {"expands": 3, "ms": 1.5}}}});
+        let uncalled = json!({"totals": {"per_map": {"graph.scip": {"expands": 3, "ms": 1.5}}},
                               "notes": ["git.history is unavailable: no repository"]});
         let on = plan(&[("graph.scip", true), ("git.history", true)]);
         assert!(check_probe("graph.scip", &called, Some(&on)).is_ok());
+        // A trace from before the count had a time beside it.
+        let bare = json!({"totals": {"per_map": {"graph.scip": 3}}});
+        assert!(check_probe("graph.scip", &bare, Some(&on)).is_ok());
         // Registered and on, but the start nodes never reached it.
         let error = check_probe("git.history", &uncalled, Some(&on)).unwrap_err();
         assert!(error.contains("never called"), "{error}");
@@ -2502,7 +2374,7 @@ mod tests {
         let raw = RawOutputs {
             dir: dir.join("raw"),
         };
-        let outcome = bench_set(Set::Impact, &items, &raw, &tree(), &cfg).unwrap();
+        let outcome = bench_set(Set::Impact, &items, &raw, &cfg).unwrap();
         let cells = &outcome.row.cells;
         assert_eq!(counts(cells), ("4", "4", "1"));
         // The missing raw file is a cli error like the stored one.

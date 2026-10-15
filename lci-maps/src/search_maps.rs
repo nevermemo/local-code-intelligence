@@ -547,6 +547,7 @@ impl Map for LexicalChunks<'_> {
             expand_p50_ms: self.log.p50(),
             coverage: self.descriptor.emits.clone(),
             freshness_lag: None,
+            dependent: false,
             good_for: vec![QuestionType::WhereTo, QuestionType::Impact],
         }
     }
@@ -748,6 +749,7 @@ impl Map for VectorChunks<'_> {
             expand_p50_ms: self.log.p50(),
             coverage: self.descriptor.emits.clone(),
             freshness_lag: None,
+            dependent: false,
             good_for: vec![QuestionType::WhereTo],
         }
     }

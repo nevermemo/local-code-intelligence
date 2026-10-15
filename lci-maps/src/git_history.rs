@@ -895,6 +895,7 @@ impl Map for GitHistoryMap {
             expand_p50_ms: Some(p50.unwrap_or(PRIOR_EXPAND_MS)),
             coverage: self.descriptor.emits.clone(),
             freshness_lag: None,
+            dependent: false,
             good_for: vec![QuestionType::History],
         }
     }

@@ -90,7 +90,9 @@
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
 //! reason `bound`, once `k` results exist and nothing queued can lift a result
 //! above the `k`-th; see [`stop`]. The `bound` event and the `end` event carry
-//! it, and the result's [`TraversalResult::stop_reason`] is `Some(Bound)`.
+//! it, and the result's [`TraversalResult::stop_reason`] is `Bound`. Every other end
+//! has one too (`complete`, `pops`, `deadline`, `budget`, `steer`, or a stop
+//! trigger), on the `end` event and on the result.
 //!
 //! The run is recorded as JSON events ([`TraversalResult::events`]), written as
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
@@ -113,7 +115,7 @@ use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
 use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop};
 use handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
-    RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, RerankBy, StopBudget,
+    RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, StopBudget,
     StopPolicy,
 };
 use lci_core::node::NodeId;
@@ -125,8 +127,8 @@ use std::{
 };
 use steer::Steer;
 use stop::{
-    ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, Pause,
-    Regions, StopReason, Tally, is_structural, likely_complete,
+    ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, MapStat,
+    Pause, Regions, StopReason, Tally, is_structural, likely_complete,
 };
 
 /// Tokens charged per adopted edge: roughly one ~12-token card line (a guess).
@@ -202,20 +204,24 @@ pub struct State {
     /// The maps whose edges reached the node, by any route. A seed's own map
     /// (`Seed::map`) is not here.
     pub maps: BTreeSet<MapId>,
+    /// The part of `maps` whose cards say `dependent` (derived from one
+    /// shared graph): together they count as one map.
+    pub dependent: BTreeSet<MapId>,
     /// The witness classes of those edges.
     pub witnesses: BTreeSet<WitnessClass>,
 }
 
 impl State {
-    /// How many independent maps reached the node.
+    /// How many independent maps reached the node: the dependent maps count
+    /// once among them.
     pub fn n_maps(&self) -> usize {
-        self.maps.len()
+        self.maps.len() - self.dependent.len() + usize::from(!self.dependent.is_empty())
     }
 
     /// `potential * (1 + boost * (n_maps - 1))`: the value results are ranked
     /// by. A node no map reached counts as one map.
     pub fn ranked_potential(&self, boost: f64) -> f64 {
-        let extra = self.maps.len().saturating_sub(1) as f64;
+        let extra = self.n_maps().saturating_sub(1) as f64;
         self.potential * (1.0 + boost * extra)
     }
 }
@@ -231,8 +237,6 @@ pub struct Totals {
     pub stops: u32,
     /// Directives applied at stops.
     pub steers: u32,
-    /// Expansions adopted, per map asked.
-    pub per_map: BTreeMap<&'static str, u32>,
     pub elapsed_ms: f64,
 }
 
@@ -255,9 +259,17 @@ pub struct TraversalResult {
     pub checkpoint: Option<Checkpoint>,
     /// The corroboration boost the run ranked with.
     pub corroboration_boost: f64,
-    /// `Some(Bound)` when the score bound ended the walk (status `Complete`,
-    /// no snapshot). Other ends report through `status` and the checkpoint.
-    pub stop_reason: Option<StopReason>,
+    /// Why the call ended, on every exit path: `Complete` (nothing left or
+    /// every target reached), `Bound` (the score bound held), `Pops` or
+    /// `Deadline` or `Budget` (a cap), `Steer`, or the trigger a handler's
+    /// stop answered.
+    pub stop_reason: StopReason,
+    /// What each map did over the whole traversal (a resume carries the
+    /// counts of the calls before it).
+    pub maps: BTreeMap<MapId, MapStat>,
+    /// Milliseconds each map spent answering expansions in this call. Wall
+    /// clock: kept out of the events, the checkpoint and the handle.
+    pub map_ms: BTreeMap<MapId, f64>,
 }
 
 impl TraversalResult {
@@ -447,8 +459,8 @@ struct Run<'s> {
     /// Per cut pop, what its calls were already charged: `(tokens, external
     /// calls)`. The retry owes only the difference.
     paid: BTreeMap<usize, (u64, u32)>,
-    /// Set when the score bound ended the call.
-    stop_reason: Option<StopReason>,
+    /// Milliseconds each map spent answering expansions in this call.
+    map_ms: BTreeMap<MapId, f64>,
 }
 
 impl<'s> Run<'s> {
@@ -478,7 +490,7 @@ impl<'s> Run<'s> {
             deferred: BTreeSet::new(),
             partial: HashSet::new(),
             paid: BTreeMap::new(),
-            stop_reason: None,
+            map_ms: BTreeMap::new(),
         }
     }
 
@@ -536,6 +548,7 @@ impl<'s> Run<'s> {
             potential: 1.0,
             fanout,
             maps: BTreeSet::new(),
+            dependent: BTreeSet::new(),
             witnesses: BTreeSet::new(),
         });
         self.state_of.insert(seed.node.clone(), index);
@@ -584,6 +597,8 @@ impl<'s> Run<'s> {
             None => false,
         };
 
+        // Why the loop below ended, when no stop or steer says so.
+        let mut ended = StopReason::Complete;
         let status = loop {
             if steer_stop {
                 break TraversalStatus::Stopped;
@@ -598,7 +613,7 @@ impl<'s> Run<'s> {
             }
             if let Some(bound) = self.bound_holds() {
                 self.events.push(bound);
-                self.stop_reason = Some(StopReason::Bound);
+                ended = StopReason::Bound;
                 break self.end_status(false);
             }
             let due = self.due();
@@ -611,10 +626,16 @@ impl<'s> Run<'s> {
             // The external-call allowance is not checked here: once it is
             // spent the maps are given none and the walk goes on with the
             // ones that need none (see `expand`).
-            if self.totals.pops >= self.pops_cap()
-                || Instant::now() >= self.t.budget.deadline
-                || self.tokens_left() == 0
-            {
+            if self.totals.pops >= self.pops_cap() {
+                ended = StopReason::Pops;
+                break self.end_status(true);
+            }
+            if Instant::now() >= self.t.budget.deadline {
+                ended = StopReason::Deadline;
+                break self.end_status(true);
+            }
+            if self.tokens_left() == 0 {
+                ended = StopReason::Budget;
                 break self.end_status(true);
             }
             let item = self.frontier.pop().expect("a non-empty frontier pops");
@@ -642,6 +663,11 @@ impl<'s> Run<'s> {
                     self.totals.pops -= 1;
                     self.popped.pop();
                 }
+                ended = if Instant::now() >= self.t.budget.deadline {
+                    StopReason::Deadline
+                } else {
+                    StopReason::Budget
+                };
                 break self.end_status(true);
             }
         };
@@ -653,12 +679,10 @@ impl<'s> Run<'s> {
         ) && !self.frontier.is_empty();
         // The call ends with work left: build what goes back to the caller.
         let mut checkpoint = None;
+        // A stop or a steer says why; otherwise the loop did.
+        let (pause, stop_reason) = self.pause.take().unwrap_or((Pause::Budget, ended));
         if resumable {
-            let (pause, reason) = self
-                .pause
-                .take()
-                .unwrap_or((Pause::Budget, StopReason::Budget));
-            let cp = self.checkpoint(reason);
+            let cp = self.checkpoint(stop_reason);
             let hash = trace::checkpoint_hash(&cp);
             self.events.push(json!({
                 "ev": "return", "reason": pause.as_str(), "stop": cp.stop,
@@ -679,11 +703,10 @@ impl<'s> Run<'s> {
                 "external_calls": self.totals.external_calls,
                 "stops": self.totals.stops,
                 "steers": self.totals.steers,
-                "per_map": self.totals.per_map,
             },
         });
-        if let (Some(reason), Some(object)) = (self.stop_reason, end.as_object_mut()) {
-            object.insert("stop_reason".into(), json!(reason.as_str()));
+        if let Some(object) = end.as_object_mut() {
+            object.insert("stop_reason".into(), json!(stop_reason.as_str()));
         }
         self.events.push(end);
         let snapshot = resumable.then(|| self.snapshot());
@@ -700,7 +723,9 @@ impl<'s> Run<'s> {
             totals: self.totals,
             events: self.events,
             corroboration_boost: self.t.boost,
-            stop_reason: self.stop_reason,
+            stop_reason,
+            maps: self.tally.maps,
+            map_ms: self.map_ms,
         }
     }
 
@@ -793,6 +818,9 @@ impl<'s> Run<'s> {
         self.counted.clear();
         let Expansion { edges, calls } = self.t.source.edges(&node, budget).await;
 
+        for call in &calls {
+            *self.map_ms.entry(call.map).or_default() += call.ms;
+        }
         let call_tokens: u64 = calls.iter().map(|c| c.cost.est_tokens).sum();
         let call_external: u32 = calls
             .iter()
@@ -913,9 +941,11 @@ impl<'s> Run<'s> {
                 witness: Some(edge.best.witness),
                 potential,
                 fanout,
-                maps: edge.maps.iter().copied().collect(),
-                witnesses: edge.witnesses.iter().copied().collect(),
+                maps: BTreeSet::new(),
+                dependent: BTreeSet::new(),
+                witnesses: BTreeSet::new(),
             });
+            self.add_evidence(child, edge);
             self.state_of.insert(dst.clone(), child);
             self.totals.hops += 1;
             self.totals.cross_map_hops += u32::from(cross);
@@ -967,7 +997,6 @@ impl<'s> Run<'s> {
         }
         if !cut {
             for call in &calls {
-                *self.totals.per_map.entry(call.map).or_default() += 1;
                 let stat = self.tally.maps.entry(call.map).or_default();
                 stat.calls += 1;
                 stat.failures += u32::from(call.failure.is_some());
@@ -1017,9 +1046,27 @@ impl<'s> Run<'s> {
     /// An edge into `reached` that was not followed: its maps and witness
     /// classes still count as evidence for the node.
     fn corroborate(&mut self, reached: usize, edge: &FusedEdge) {
-        let state = &mut self.states[reached];
-        state.maps.extend(edge.maps.iter().copied());
-        state.witnesses.extend(edge.witnesses.iter().copied());
+        self.add_evidence(reached, edge);
+    }
+
+    /// The maps and witness classes of `edge` join the evidence of a state;
+    /// returns the maps that were new to it.
+    fn add_evidence(&mut self, index: usize, edge: &FusedEdge) -> Vec<MapId> {
+        let mut new_maps = Vec::new();
+        for &map in &edge.maps {
+            let dependent = self.card(map).dependent;
+            let state = &mut self.states[index];
+            if state.maps.insert(map) {
+                new_maps.push(map);
+                if dependent {
+                    state.dependent.insert(map);
+                }
+            }
+        }
+        self.states[index]
+            .witnesses
+            .extend(edge.witnesses.iter().copied());
+        new_maps
     }
 
     /// A route from the expanding state `from` (`parent`) to a node that
@@ -1054,14 +1101,8 @@ impl<'s> Run<'s> {
         let old_src = self.states[reached]
             .parent
             .map(|p| self.states[p].node.to_string());
+        let new_maps = self.add_evidence(reached, edge);
         let state = &mut self.states[reached];
-        let new_maps: Vec<MapId> = edge
-            .maps
-            .iter()
-            .copied()
-            .filter(|map| state.maps.insert(*map))
-            .collect();
-        state.witnesses.extend(edge.witnesses.iter().copied());
 
         let old = state.potential;
         let own_parent = state.parent == Some(from);
@@ -1242,15 +1283,7 @@ impl<'s> Run<'s> {
     }
 
     fn card_of(&self, state: usize) -> Card {
-        let s = &self.states[state];
-        Card {
-            node: s.node.clone(),
-            via: s.via,
-            witness: s.witness,
-            potential: s.potential,
-            depth: s.depth,
-            maps: s.maps.iter().copied().collect(),
-        }
+        Card::of(&self.states[state], self.t.boost)
     }
 
     fn checkpoint(&self, reason: StopReason) -> Checkpoint {
@@ -1499,17 +1532,6 @@ impl<'s> Run<'s> {
                 (None, Action::MapOff(id)) => self.switch(id, false),
                 (None, Action::MapWeight(id, weight)) if weight.is_finite() => {
                     self.weights.insert(id.clone(), weight.clamp(0.0, 1.0));
-                    true
-                }
-                (None, Action::Rerank(by)) => {
-                    let states = &self.states;
-                    match by {
-                        RerankBy::Witness => self
-                            .frontier
-                            .rerank(|s| states[s].witness.map_or(0u32, |w| w as u32 + 1)),
-                        RerankBy::Depth => self.frontier.rerank(|s| states[s].depth),
-                        RerankBy::Fanout => self.frontier.rerank(|s| states[s].fanout),
-                    }
                     true
                 }
                 (None, Action::Redirect(nodes)) => {

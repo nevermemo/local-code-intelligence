@@ -380,6 +380,39 @@ async fn an_edge_site_in_another_file_ties_the_row_to_that_files_blob() {
 }
 
 #[tokio::test]
+async fn a_node_whose_own_file_is_absent_waits_for_it_to_appear() {
+    // x is asked for though the view has no src/x.rs; its edge was seen in
+    // c.rs. When x.rs arrives, c.rs is as it was, yet x's row is stale.
+    let graph = || registry(vec![GraphMap::new("g", &[("x", "c")]).site("src/c.rs")]);
+    let options = BuildOptions {
+        roots: vec![node("x")],
+        ..BuildOptions::default()
+    };
+    let chunks = files(&WORLD);
+    let mut adjacency = MergedAdjacency::default();
+    let first = adjacency
+        .update(&graph(), &view_of(&chunks, "f1"), &options)
+        .await;
+    assert_eq!((first.expanded, first.undated), (5, 0), "{first:?}");
+    let arrived = files(&[
+        ("a", "h1"),
+        ("b", "h2"),
+        ("c", "h3"),
+        ("d", "h4"),
+        ("x", "h5"),
+    ]);
+    let second = adjacency
+        .update(&graph(), &view_of(&arrived, "f2"), &options)
+        .await;
+    assert_eq!((second.expanded, second.reused), (1, 4), "{second:?}");
+    let mut fresh = MergedAdjacency::default();
+    fresh
+        .update(&graph(), &view_of(&arrived, "f2"), &options)
+        .await;
+    assert_eq!(adjacency.canonical(), fresh.canonical());
+}
+
+#[tokio::test]
 async fn a_row_with_no_known_dependency_is_reused_only_when_nothing_changed() {
     // The site's file is not in the view, so the row has no blob to wait on.
     let graph = || registry(vec![GraphMap::new("g", &[("a", "b")]).site("src/gone.rs")]);

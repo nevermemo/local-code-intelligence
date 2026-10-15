@@ -2232,6 +2232,22 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
         "best hit first: {ranks:?}"
     );
 
+    // A card shows the rank beside the potential, and how many independent
+    // maps reached the node (`structure.contains` and `graph.scip` count once).
+    for card in answer["results"].as_array().unwrap() {
+        let (potential, ranked) = (
+            card["potential"].as_f64().unwrap(),
+            card["ranked_potential"].as_f64().unwrap(),
+        );
+        let n_maps = card["n_maps"].as_u64().unwrap();
+        let listed = card["maps"].as_array().unwrap().len() as u64;
+        assert!(n_maps >= 1 && n_maps <= listed, "{card}");
+        assert!(
+            (ranked - potential * (1.0 + 0.1 * (n_maps - 1) as f64)).abs() < 1e-9,
+            "{card}"
+        );
+    }
+
     // The walk goes on from the seeds along the call edges.
     let reached: Vec<&str> = answer["results"]
         .as_array()
@@ -2249,9 +2265,19 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
     // `structure.contains` is on by default: the walk also climbs to the file.
     assert!(reached.contains(&"file:src/lib.rs"), "{answer}");
     assert!(
-        answer["totals"]["per_map"]["structure.contains"]
+        answer["totals"]["per_map"]["structure.contains"]["expands"]
             .as_u64()
             .is_some_and(|calls| calls > 0),
+        "{answer}"
+    );
+    assert!(
+        answer["totals"]["per_map"]["structure.contains"]["ms"].is_number(),
+        "{answer}"
+    );
+    // Every call names why it ended.
+    assert!(
+        ["complete", "bound", "pops", "deadline", "budget"]
+            .contains(&answer["stop_reason"].as_str().unwrap_or_default()),
         "{answer}"
     );
 

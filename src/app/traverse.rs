@@ -36,8 +36,8 @@ use crate::{app::App, config::TraverseConfig, filter::FilterRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
-    Budget, Contribution, EdgeKind, Evidence, FreshnessModel, Map, MapDescriptor, MapHit, MapId,
-    MapRequest, MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    Budget, Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse,
+    MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
@@ -122,7 +122,9 @@ const MAX_HANDLE: usize = 64;
 pub struct BudgetArgs {
     /// Most node expansions (pops).
     pub pops: Option<u32>,
-    /// Deepest state that is expanded.
+    /// Depth at which states are recorded without being expanded: a state at
+    /// `max_depth` is in the results but not expanded, so the deepest state
+    /// expanded is at `max_depth - 1`.
     pub max_depth: Option<u32>,
     /// Most estimated tokens the expansions may cost.
     pub est_tokens: Option<u64>,
@@ -141,8 +143,7 @@ pub struct SteerArgs {
     /// `score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,
     /// `not`. Actions: `prune`, `expand`, `continue`, `stop`, `{"boost": f}`,
     /// `{"map_on": id}`, `{"map_off": id}`, `{"map_weight": {"id", "weight"}}`,
-    /// `{"rerank": "witness"|"depth"|"fanout"}`, `{"redirect": [node ids]}`,
-    /// `{"emit": note}`. They can only shrink, reorder or redirect the walk.
+    /// `{"redirect": [node ids]}`, `{"emit": note}`. They can only shrink, reorder or redirect the walk.
     pub rules: Option<Value>,
     /// Reserved for an embedded script handler; not available yet.
     pub script: Option<String>,
@@ -302,26 +303,54 @@ async fn load(index: &Path, root: Option<&Path>) -> Result<Arc<Loaded>> {
     Ok(loaded)
 }
 
-type ConfigKeyCache =
-    Mutex<HashMap<(PathBuf, PathBuf), ((Option<SystemTime>, u64), Arc<ConfigKeyMap>)>>;
+type Stamp = (Option<SystemTime>, u64);
+
+/// The maps built from a SCIP index and a tree, one per (index, tree), each
+/// valid for the stamp of the index it was built from.
+struct StampCache<M>(Mutex<HashMap<(PathBuf, PathBuf), Built<M>>>);
+
+/// A map with the stamp of the index it was built from.
+type Built<M> = (Stamp, Arc<M>);
+
+impl<M> Default for StampCache<M> {
+    fn default() -> Self {
+        Self(Mutex::default())
+    }
+}
+
+impl<M> StampCache<M> {
+    fn get(&self, index: &Path, root: &Path, stamp: Stamp) -> Option<Arc<M>> {
+        let cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (built_at, map) = cache.get(&(index.to_path_buf(), root.to_path_buf()))?;
+        (*built_at == stamp).then(|| map.clone())
+    }
+
+    fn put(&self, index: &Path, root: &Path, stamp: Stamp, map: M) -> Arc<M> {
+        let map = Arc::new(map);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                (index.to_path_buf(), root.to_path_buf()),
+                (stamp, map.clone()),
+            );
+        map
+    }
+}
 
 /// The `config.key` map of a SCIP index and a tree, built once per index
 /// stamp (a tree edit after that is not seen; the map's freshness is
 /// `global`). Declarations take the ids of the SCIP graph.
 async fn config_key_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<ConfigKeyMap>> {
-    static CACHE: OnceLock<ConfigKeyCache> = OnceLock::new();
+    static CACHE: OnceLock<StampCache<ConfigKeyMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (index.to_path_buf(), root.to_path_buf());
-    if let Some((stamp, map)) = cache
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        && *stamp == loaded.stamp
-    {
-        return Ok(map.clone());
+    if let Some(map) = cache.get(index, root, loaded.stamp) {
+        return Ok(map);
     }
-    let (index, root, scip) = (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
+    let (index_buf, root_buf, scip) =
+        (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
     let map = tokio::task::spawn_blocking(move || -> Result<ConfigKeyMap> {
+        let (index, root) = (index_buf, root_buf);
         let source = DirSource(root.clone());
         let ix = ImpactIndex::load(&index, Some(&source)).map_err(|error| anyhow!(error))?;
         let resolve = |decl: &Decl| {
@@ -334,32 +363,21 @@ async fn config_key_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Ar
     })
     .await
     .context("build config.key")??;
-    let map = Arc::new(map);
-    cache
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, (loaded.stamp, map.clone()));
-    Ok(map)
+    Ok(cache.put(index, root, loaded.stamp, map))
 }
-
-type ImpactCache = Mutex<HashMap<(PathBuf, PathBuf), ((Option<SystemTime>, u64), Arc<ImpactMap>)>>;
 
 /// The `scip.impact` map of a SCIP index and a tree, built once per index
 /// stamp. Units the SCIP graph holds take its node ids.
 async fn impact_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<ImpactMap>> {
-    static CACHE: OnceLock<ImpactCache> = OnceLock::new();
+    static CACHE: OnceLock<StampCache<ImpactMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (index.to_path_buf(), root.to_path_buf());
-    if let Some((stamp, map)) = cache
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        && *stamp == loaded.stamp
-    {
-        return Ok(map.clone());
+    if let Some(map) = cache.get(index, root, loaded.stamp) {
+        return Ok(map);
     }
-    let (index, root, scip) = (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
+    let (index_buf, root_buf, scip) =
+        (index.to_path_buf(), root.to_path_buf(), loaded.scip.clone());
     let map = tokio::task::spawn_blocking(move || -> Result<ImpactMap> {
+        let (index, root) = (index_buf, root_buf);
         let source = DirSource(root);
         let ix = ImpactIndex::load(&index, Some(&source)).map_err(|error| anyhow!(error))?;
         let resolve = |symbol: &str| {
@@ -371,19 +389,12 @@ async fn impact_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<Im
     })
     .await
     .context("build scip.impact")??;
-    let map = Arc::new(map);
-    cache
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, (loaded.stamp, map.clone()));
-    Ok(map)
+    Ok(cache.put(index, root, loaded.stamp, map))
 }
 
-/// Matches the question's words against symbol names. Text only: it never
-/// expands a node. A stand-in for the lexical and vector channels until they
-/// are wrapped as maps.
+/// Matches the question's words against symbol names: the stand-in for the
+/// lexical and vector channels until they are wrapped as maps.
 struct NameSeeds {
-    descriptor: MapDescriptor,
     names: Vec<(NodeId, HashSet<String>)>,
 }
 
@@ -391,17 +402,6 @@ impl NameSeeds {
     fn new(scip: &ScipMap) -> Self {
         let graph = scip.graph();
         Self {
-            descriptor: MapDescriptor {
-                id: SEEDS_MAP,
-                version: 1,
-                contribution: Contribution::RankList,
-                accepts_text: true,
-                accepts: Vec::new(),
-                emits: vec![NodeKind::Symbol],
-                freshness: FreshnessModel::PerFile,
-                source_labels: vec![SourceLabel::Lexical],
-                needs: Vec::new(),
-            },
             names: (0..graph.nodes.len())
                 .map(|i| {
                     (
@@ -429,34 +429,6 @@ impl NameSeeds {
             .take(limit)
             .map(|(n, id)| (id.clone(), n))
             .collect()
-    }
-}
-
-#[lci_maps::async_trait]
-impl Map for NameSeeds {
-    fn describe(&self) -> &MapDescriptor {
-        &self.descriptor
-    }
-
-    async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
-        let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
-        response.hits = self
-            .matches(request.text.unwrap_or_default(), request.limit)
-            .into_iter()
-            .zip(1..)
-            .map(|((node, _), rank)| MapHit {
-                node,
-                rank,
-                score: None,
-                evidence: vec![Evidence {
-                    via: None,
-                    edge: EdgeKind::QueryMatch,
-                    label: SourceLabel::Lexical,
-                    detail: None,
-                }],
-            })
-            .collect();
-        response
     }
 }
 
@@ -597,8 +569,6 @@ struct MappedSeed {
     node: NodeId,
     /// The `seed_hits` record of the response and the trace.
     info: Value,
-    /// The label of the first retriever that found it.
-    label: SourceLabel,
 }
 
 /// Where in the graph a hit's chunk is.
@@ -658,14 +628,6 @@ fn place(loaded: &Loaded, hit: &SeedHit, words: &[String]) -> Place {
             (to - from, std::cmp::Reverse(from), i)
         });
     around.map_or(Place::Nowhere, Place::Inside)
-}
-
-fn label_of(retriever: &str) -> SourceLabel {
-    match retriever {
-        "lexical" => SourceLabel::Lexical,
-        "lsp" => SourceLabel::Lsp,
-        _ => SourceLabel::Vector,
-    }
 }
 
 /// Maps the hits of the hybrid search to start nodes, best hit first: a
@@ -743,71 +705,63 @@ fn map_hits(loaded: &Loaded, question: &str, hits: &[SeedHit]) -> Vec<MappedSeed
                 }
             }
             at.insert(node.clone(), seeds.len());
-            seeds.push(MappedSeed {
-                node,
-                info,
-                label: hit
-                    .retrievers
-                    .first()
-                    .map_or(SourceLabel::Vector, |r| label_of(r)),
-            });
+            seeds.push(MappedSeed { node, info });
         }
     }
     seeds
 }
 
-/// The start nodes the hybrid search found, as a rank-list map (they are
-/// computed before the walk; the map only reports them).
-struct HybridSeeds {
+/// A start-node source as a registered map: its descriptor only. The walk
+/// never queries it; registering it puts its id in the selectors, the maps
+/// list and the trace (`seeds.hybrid`, `seeds.scip_names`).
+struct SeedMap {
     descriptor: MapDescriptor,
-    hits: Vec<(NodeId, SourceLabel)>,
 }
 
-impl HybridSeeds {
-    fn new(hits: Vec<(NodeId, SourceLabel)>) -> Self {
+impl SeedMap {
+    fn new(id: MapId, emits: Vec<NodeKind>, labels: Vec<SourceLabel>) -> Self {
         Self {
             descriptor: MapDescriptor {
-                id: SEEDS_HYBRID,
+                id,
                 version: 1,
                 contribution: Contribution::RankList,
                 accepts_text: true,
                 accepts: Vec::new(),
-                emits: vec![NodeKind::Symbol, NodeKind::Chunk, NodeKind::File],
+                emits,
                 freshness: FreshnessModel::PerFile,
-                source_labels: vec![SourceLabel::Vector, SourceLabel::Lexical, SourceLabel::Lsp],
+                source_labels: labels,
                 needs: Vec::new(),
             },
-            hits,
         }
+    }
+
+    /// The hits of the hybrid search.
+    fn hybrid() -> Self {
+        Self::new(
+            SEEDS_HYBRID,
+            vec![NodeKind::Symbol, NodeKind::Chunk, NodeKind::File],
+            vec![SourceLabel::Vector, SourceLabel::Lexical, SourceLabel::Lsp],
+        )
+    }
+
+    /// The symbols whose names hold the question's words.
+    fn name_tokens() -> Self {
+        Self::new(
+            SEEDS_MAP,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Lexical],
+        )
     }
 }
 
 #[lci_maps::async_trait]
-impl Map for HybridSeeds {
+impl Map for SeedMap {
     fn describe(&self) -> &MapDescriptor {
         &self.descriptor
     }
 
-    async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
-        let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
-        response.hits = self
-            .hits
-            .iter()
-            .take(request.limit)
-            .zip(1..)
-            .map(|((node, label), rank)| MapHit {
-                node: node.clone(),
-                rank,
-                score: None,
-                evidence: vec![Evidence {
-                    via: None,
-                    edge: EdgeKind::QueryMatch,
-                    label: *label,
-                    detail: None,
-                }],
-            })
-            .collect();
-        response
+    async fn query(&self, _request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        MapResponse::empty(&self.descriptor, view, MapStatus::Ok)
     }
 }
 
@@ -1085,23 +1039,16 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
 
     let mut registry = Registry::new(60.0);
     let mut plan_maps = Vec::new();
-    let hybrid_hits = found
-        .nodes
-        .iter()
-        .filter(|seed| seed.map == Some(SEEDS_HYBRID))
-        .zip(&found.labels)
-        .map(|(seed, label)| (seed.node.clone(), *label))
-        .collect();
     register(
         &mut registry,
         &mut plan_maps,
-        Box::new(HybridSeeds::new(hybrid_hits)),
+        Box::new(SeedMap::hybrid()),
         wants(SEEDS_HYBRID),
     )?;
     register(
         &mut registry,
         &mut plan_maps,
-        Box::new(Shared(loaded.names.clone())),
+        Box::new(SeedMap::name_tokens()),
         wants(SEEDS_MAP),
     )?;
     register(
@@ -1264,12 +1211,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
-    // The maps that expand nodes: the most a state can be corroborated by,
-    // which the score bound needs (the seed maps only start the walk).
-    let expanding = plan_maps
-        .iter()
-        .filter(|map| map.enabled && map.id != SEEDS_HYBRID && map.id != SEEDS_MAP)
-        .count();
+    // The most a state can be corroborated by, which the score bound needs
+    // (the seed maps only start the walk; maps over one graph count once).
+    let expanding = registry.independent_expanders();
     let traversal = match snapshot {
         Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
         None => {
@@ -1290,7 +1234,10 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                 .plan(plan)
         }
     };
-    let traversal = traversal.identity(identity).top_k(call.top_k, expanding);
+    let traversal = traversal
+        .identity(identity)
+        .corroboration_boost(limits.corroboration_boost)
+        .top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),
         None => traversal,
@@ -1420,8 +1367,6 @@ struct Seeds {
     source: &'static str,
     /// One record per start node: the retrievers that found it and its score.
     details: Vec<Value>,
-    /// The label of each hybrid seed's first retriever, in order.
-    labels: Vec<SourceLabel>,
     /// Why the stand-in replaced the hybrid search, if it did.
     fallback: Option<String>,
     notes: Vec<String>,
@@ -1493,7 +1438,6 @@ async fn find_seeds(
                             node: seed.node,
                             map: Some(SEEDS_HYBRID),
                         });
-                        found.labels.push(seed.label);
                         found.details.push(seed.info);
                     }
                     return Ok(found);
@@ -1537,6 +1481,7 @@ fn no_seeds_response(call: &Call<'_>, found: &Seeds, notes: Vec<String>) -> Valu
     let mut response = json!({
         "mode": "traverse",
         "status": "no_seeds",
+        "stop_reason": "no_seeds",
         "question": call.question,
         "seeds": [],
         "seed_source": found.source,
@@ -1602,16 +1547,7 @@ fn response_json(
     let results: Vec<Value> = results
         .into_iter()
         .take(call.top_k)
-        .map(|(_, state)| {
-            trace::card_json(&Card {
-                node: state.node.clone(),
-                via: state.via,
-                witness: state.witness,
-                potential: state.potential,
-                depth: state.depth,
-                maps: state.maps.iter().copied().collect(),
-            })
-        })
+        .map(|(_, state)| trace::card_json(&Card::of(state, result.corroboration_boost)))
         .collect();
     let steering: Vec<Value> = result
         .events
@@ -1629,6 +1565,23 @@ fn response_json(
         })
         .collect();
     let totals = &result.totals;
+    // Per map: the expansions it answered over the whole traversal and the
+    // milliseconds it took in this call.
+    let per_map: serde_json::Map<String, Value> = result
+        .maps
+        .iter()
+        .map(|(id, stat)| {
+            let ms = result.map_ms.get(id).copied().unwrap_or(0.0);
+            ((*id).to_owned(), json!({"expands": stat.calls, "ms": ms}))
+        })
+        .collect();
+    let mut notes = notes;
+    if result.events.iter().any(|e| e["external_spent"] == true) {
+        notes.push(
+            "the external-call allowance was spent: from then on only maps that need no external call were asked"
+                .to_owned(),
+        );
+    }
     let mut response = json!({
         "mode": "traverse",
         "status": result.status.as_str(),
@@ -1642,7 +1595,7 @@ fn response_json(
             "tokens": totals.tokens,
             "stops": totals.stops,
             "steers": totals.steers,
-            "per_map": totals.per_map,
+            "per_map": per_map,
             "elapsed_ms": totals.elapsed_ms,
         },
         "steering": steering,
@@ -1660,9 +1613,7 @@ fn response_json(
                 object.insert("seed_fallback".into(), json!(reason));
             }
         }
-        if let Some(reason) = result.stop_reason {
-            object.insert("stop_reason".into(), json!(reason.as_str()));
-        }
+        object.insert("stop_reason".into(), json!(result.stop_reason.as_str()));
         if let Some(checkpoint) = &result.checkpoint {
             object.insert("handle".into(), json!(handle));
             object.insert("checkpoint".into(), checkpoint_response(checkpoint));
@@ -1824,6 +1775,7 @@ pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": inste
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lci_maps::EdgeKind;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -1832,6 +1784,14 @@ mod tests {
             enabled: true,
             ..TraverseConfig::default()
         }
+    }
+
+    #[test]
+    fn the_configured_boost_starts_at_the_engines_default() {
+        assert_eq!(
+            TraverseConfig::default().corroboration_boost,
+            lci_maps::traverse::DEFAULT_CORROBORATION_BOOST
+        );
     }
 
     #[test]
@@ -2333,7 +2293,7 @@ mod tests {
         found.reranker_score = None;
         found.fusion_score = 0.5;
         let seeds = map_hits(&loaded, "x", &[found]);
-        let (info, label) = (&seeds[0].info, seeds[0].label);
+        let info = &seeds[0].info;
         assert_eq!(info["kind"], "symbol");
         assert_eq!(info["retrievers"], json!(["lexical"]));
         assert_eq!(info["score"], 0.5);
@@ -2343,12 +2303,10 @@ mod tests {
         assert_eq!(info["channel_ranks"]["semantic"], json!(null));
         assert_eq!(info["path"], "src/search.rs");
         assert_eq!(info["lines"], json!([13, 15]));
-        assert_eq!(label, SourceLabel::Lexical);
         // With a reranker score, that is the score.
         let seeds = map_hits(&loaded, "x", &[hit("src/search.rs", (13, 15), 1)]);
         assert_eq!(seeds[0].info["score"], 0.75);
         assert_eq!(seeds[0].info["score_kind"], "reranker");
-        assert_eq!(seeds[0].label, SourceLabel::Vector);
     }
 
     /// A search with a canned answer that counts its calls.
@@ -2413,7 +2371,6 @@ mod tests {
         assert_eq!(found.nodes.len(), 2);
         assert!(found.nodes.iter().all(|s| s.map == Some(SEEDS_HYBRID)));
         assert_eq!(found.details.len(), 2);
-        assert_eq!(found.labels.len(), 2);
         assert_eq!(
             *search.asked.lock().unwrap(),
             [("how are queries parsed".to_owned(), 8)],

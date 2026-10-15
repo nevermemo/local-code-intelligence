@@ -24,8 +24,8 @@
 //! budget; each takes `{"lt"|"le"|"eq"|"ge"|"gt": n}`), `seen_before`
 //! (`true`), `all`, `any`, `not`. Actions: `continue`, `prune`, `expand`,
 //! `stop` (strings) and `{"boost": f}`, `{"map_on": id}`, `{"map_off": id}`,
-//! `{"map_weight": {"id": id, "weight": w}}`, `{"rerank": "witness"|"depth"|
-//! "fanout"}`, `{"redirect": [node ids]}`, `{"emit": note}`.
+//! `{"map_weight": {"id": id, "weight": w}}`, `{"redirect": [node ids]}`,
+//! `{"emit": note}`.
 //!
 //! First match per frontier node wins among the node actions (`continue`,
 //! `prune`, `expand`, `boost`). The other actions are checkpoint rules: each
@@ -41,7 +41,7 @@
 use crate::edge::WitnessClass;
 use crate::traverse::handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, EMIT_MAX, FrontierItem, Handler,
-    REDIRECT_MAX, RerankBy, StopBudget,
+    REDIRECT_MAX, StopBudget,
 };
 use lci_core::node::{NodeId, NodeKind};
 use serde_json::Value;
@@ -201,20 +201,6 @@ fn parse_count(value: &Value, max: u32) -> Result<(Cmp, u32), Fail> {
     }
 }
 
-fn parse_witness(name: &str) -> Option<WitnessClass> {
-    [
-        WitnessClass::Compiler,
-        WitnessClass::Lsp,
-        WitnessClass::Exact,
-        WitnessClass::Text,
-        WitnessClass::Vector,
-        WitnessClass::Heuristic,
-        WitnessClass::Agent,
-    ]
-    .into_iter()
-    .find(|class| class.as_str() == name)
-}
-
 fn parse_predicate(value: &Value, depth: usize) -> Result<Predicate, Fail> {
     if depth > MAX_NESTING {
         return invalid(format!("predicates nest deeper than {MAX_NESTING}"));
@@ -250,7 +236,7 @@ fn parse_predicate(value: &Value, depth: usize) -> Result<Predicate, Fail> {
             };
             let classes: Option<Vec<_>> = list
                 .iter()
-                .map(|name| name.as_str().and_then(parse_witness))
+                .map(|name| name.as_str().and_then(WitnessClass::parse))
                 .collect();
             match classes {
                 Some(classes) => Predicate::Witness(classes),
@@ -321,12 +307,6 @@ fn parse_action(value: &Value) -> Result<Action, Fail> {
                 _ => return invalid("map_weight takes an id and a weight from 0 to 1"),
             }
         }
-        "rerank" => Action::Rerank(match body.as_str() {
-            Some("witness") => RerankBy::Witness,
-            Some("depth") => RerankBy::Depth,
-            Some("fanout") => RerankBy::Fanout,
-            _ => return invalid("rerank takes witness, depth or fanout"),
-        }),
         "redirect" => {
             let list = body
                 .as_array()
@@ -914,13 +894,16 @@ mod tests {
     fn checkpoint_rules_fire_once_in_list_order() {
         let cp = checkpoint(vec![item("src/a.rs", 1), item("src/b.rs", 2)]);
         let list = parse(json!([
-            {"when": {"depth": {"ge": 1}}, "then": {"rerank": "depth"}},
+            {"when": {"depth": {"ge": 1}}, "then": {"map_weight": {"id": "lexical", "weight": 0.5}}},
             {"when": {"budget_left": {"lt": 90}}, "then": {"map_off": "lexical"}},
             {"when": {"budget_left": {"lt": 10}}, "then": "stop"},
             {"when": {"seen_before": true}, "then": {"emit": "never"}}
         ]));
         let decision = decide(&list, &cp);
-        assert_eq!(actions(&decision), [(None, "rerank"), (None, "map_off")]);
+        assert_eq!(
+            actions(&decision),
+            [(None, "map_weight"), (None, "map_off")]
+        );
     }
 
     #[test]

@@ -31,6 +31,22 @@ pub enum WitnessClass {
 }
 
 impl WitnessClass {
+    /// Every class, strongest first.
+    pub const ALL: [WitnessClass; 7] = [
+        Self::Compiler,
+        Self::Lsp,
+        Self::Exact,
+        Self::Text,
+        Self::Vector,
+        Self::Heuristic,
+        Self::Agent,
+    ];
+
+    /// The class named `name` (the inverse of [`WitnessClass::as_str`]).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == name)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Compiler => "compiler",
@@ -215,6 +231,10 @@ pub struct MapCard {
     /// How far behind the snapshot the map typically is.
     pub freshness_lag: Option<Duration>,
     pub good_for: Vec<QuestionType>,
+    /// The map derives its evidence from the same graph as the other maps
+    /// that say so (the SCIP index and the containment map built from it), so
+    /// together they corroborate once, not twice.
+    pub dependent: bool,
 }
 
 impl MapCard {
@@ -448,18 +468,10 @@ mod tests {
 
     #[test]
     fn default_read_classes_are_compiler_and_exact() {
-        let read: Vec<_> = [
-            WitnessClass::Compiler,
-            WitnessClass::Lsp,
-            WitnessClass::Exact,
-            WitnessClass::Text,
-            WitnessClass::Vector,
-            WitnessClass::Heuristic,
-            WitnessClass::Agent,
-        ]
-        .into_iter()
-        .filter(|w| w.read_by_default())
-        .collect();
+        let read: Vec<_> = WitnessClass::ALL
+            .into_iter()
+            .filter(|w| w.read_by_default())
+            .collect();
         assert_eq!(read, [WitnessClass::Compiler, WitnessClass::Exact]);
         assert_eq!(
             WitnessClass::of_label(SourceLabel::Scip),

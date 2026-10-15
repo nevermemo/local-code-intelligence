@@ -33,14 +33,17 @@
 //! A file's blob ([`FileBlobs`]) is a hash of its content as the snapshot
 //! holds it. A row depends on bindings of path to blob: the file the node
 //! belongs to (when its id names a path) and the files its edges' sites are
-//! in, each with the blob it had when the row was asked.
+//! in, each with the blob it had when the row was asked (a file the view did
+//! not hold counts as a binding to no blob: the row is asked again when the
+//! file appears).
 //! [`MergedAdjacency::update`] reuses a row when every such path still has
 //! that blob. The counts of blobs are not enough: two files that trade
 //! contents keep the same counts, and a row built from one file's content is
 //! stale once the content is in the other. What forces a row to be asked
 //! again:
 //!
-//! * a dependency file has another blob, or is no longer in the view;
+//! * a dependency file has another blob, or is no longer in the view, or is
+//!   in the view now and was not when the row was asked;
 //! * the row has no dependency at all (a node with no path and no edges with
 //!   a site) or one of its sites is in a file the view does not hold: such a
 //!   row is reused only when no file of the view changed its blob;
@@ -217,6 +220,10 @@ pub struct BuildStats {
     pub elapsed_ms: f64,
 }
 
+/// The blob a row records for a file the view did not hold (no content hash is
+/// empty).
+const ABSENT: &str = "";
+
 #[derive(Debug, Clone, PartialEq)]
 struct StoredCall {
     map: MapId,
@@ -234,9 +241,10 @@ struct Row {
     /// `fuse(raw)`.
     fused: Vec<FusedEdge>,
     calls: Vec<StoredCall>,
-    /// The files the row depends on, each with the blob it had: the file the
-    /// node belongs to and the files its edges' sites are in. Valid while
-    /// every path still has that blob; empty means no dependency is known.
+    /// The files the row depends on, each with the blob it had ([`ABSENT`]
+    /// for a file the view lacked): the file the node belongs to and the
+    /// files its edges' sites are in. Valid while every path still has that
+    /// blob; empty means no dependency is known.
     deps: BTreeMap<String, String>,
     complete: bool,
 }
@@ -255,11 +263,13 @@ impl Row {
         };
         let (raw, calls) = source.ask(node, budget).await;
         let mut deps = BTreeMap::new();
-        if let Some((path, blob)) = node
-            .path()
-            .and_then(|path| blobs.blob(path).map(|blob| (path, blob)))
-        {
-            deps.insert(path.to_string(), blob.to_string());
+        // The node's own file, even when the view does not hold it: that is a
+        // binding too (to no blob), and the row is asked again once it does.
+        if let Some(path) = node.path() {
+            deps.insert(
+                path.to_string(),
+                blobs.blob(path).unwrap_or(ABSENT).to_string(),
+            );
         }
         let mut unresolved = false;
         for site in raw.iter().filter_map(|edge| edge.site.as_ref()) {
@@ -395,9 +405,10 @@ impl MergedAdjacency {
                 && !row.calls.iter().any(|call| live.contains(call.map))
                 && (same_world
                     || (!row.deps.is_empty()
-                        && row.deps.iter().all(|(path, blob)| {
-                            blobs.blob(path).is_some_and(|now| now == blob.as_str())
-                        })))
+                        && row
+                            .deps
+                            .iter()
+                            .all(|(path, blob)| blobs.blob(path).unwrap_or(ABSENT) == blob)))
         };
 
         // The roots: the view's files and chunks, then the caller's.
@@ -558,6 +569,7 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> EdgeSource for PreMerged<A> {
                         n_edges: 0,
                         cost: Cost::default(),
                         failure: Some("not in the pre-merged adjacency".into()),
+                        ms: 0.0,
                     }],
                 }
             } else {
@@ -584,6 +596,7 @@ impl<A: Borrow<MergedAdjacency> + Send + Sync> EdgeSource for PreMerged<A> {
                 n_edges: call.n_edges,
                 cost: call.cost,
                 failure: call.failure.clone(),
+                ms: 0.0,
             })
             .collect();
         Expansion { edges, calls }

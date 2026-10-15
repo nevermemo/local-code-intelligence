@@ -92,7 +92,7 @@ pub fn fuse(edges: Vec<Edge>) -> Vec<FusedEdge> {
 }
 
 /// One map's part in an expansion.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExpandCall {
     pub map: MapId,
     pub n_edges: usize,
@@ -101,6 +101,19 @@ pub struct ExpandCall {
     pub cost: Cost,
     /// Set when the call panicked or missed the deadline; the walk goes on.
     pub failure: Option<String>,
+    /// Wall-clock time the call took, in milliseconds (0 from a pre-merged
+    /// adjacency, which makes no call). Only reported: it is left out of the
+    /// comparison, so equal expansions are equal whatever the machine did.
+    pub ms: f64,
+}
+
+impl PartialEq for ExpandCall {
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+            && self.n_edges == other.n_edges
+            && self.cost == other.cost
+            && self.failure == other.failure
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -250,34 +263,37 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
                     ..budget
                 };
                 let answer = self.call(entry, node, share).await;
-                left = left.saturating_sub(answer.2.external_calls);
+                left = left.saturating_sub(answer.0.cost.external_calls);
                 answers.push(answer);
             }
             answers
         };
         let mut all = Vec::new();
         let mut report = Vec::new();
-        for (map, edges, cost, failure) in answers {
-            report.push(ExpandCall {
-                map,
-                n_edges: edges.len(),
-                cost,
-                failure,
-            });
+        for (call, edges) in answers {
+            report.push(call);
             all.extend(edges);
         }
         (all, report)
     }
 
-    /// One map's answer: its id, its sanitised edges, the cost of the call and
-    /// the note when it did not answer.
+    /// One map's answer: the call as reported (id, cost, time, the note when
+    /// it did not answer) and its sanitised edges.
     async fn call(
         &self,
         entry: &crate::Entry<'_>,
         node: &NodeId,
         budget: Budget,
-    ) -> (MapId, Vec<Edge>, Cost, Option<String>) {
+    ) -> (ExpandCall, Vec<Edge>) {
         let id = entry.map.describe().id;
+        let started = Instant::now();
+        let report = |edges: &[Edge], cost: Cost, failure: Option<String>| ExpandCall {
+            map: id,
+            n_edges: edges.len(),
+            cost,
+            failure,
+            ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
         let remaining = budget.deadline.saturating_duration_since(Instant::now());
         let answer = tokio::time::timeout(
             remaining,
@@ -286,16 +302,16 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
         .await;
         match answer {
             Err(_) => (
-                id,
+                report(
+                    &[],
+                    Cost::default(),
+                    Some("did not answer before the deadline".into()),
+                ),
                 Vec::new(),
-                Cost::default(),
-                Some("did not answer before the deadline".into()),
             ),
             Ok(Err(_)) => (
-                id,
+                report(&[], Cost::default(), Some("panicked".to_string())),
                 Vec::new(),
-                Cost::default(),
-                Some("panicked".to_string()),
             ),
             Ok(Ok(expanded)) => {
                 // A map is trusted with its edges, not with their bookkeeping.
@@ -307,7 +323,7 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
                 }
                 edges.truncate(EXPAND_LIMIT);
                 self.blobs().fill(&mut edges);
-                (id, edges, expanded.cost, None)
+                (report(&edges, expanded.cost, None), edges)
             }
         }
     }

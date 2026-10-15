@@ -333,6 +333,7 @@ impl Map for ImpactMap {
             expand_p50_ms: self.log.p50(),
             coverage: self.descriptor.emits.clone(),
             freshness_lag: None,
+            dependent: false,
             good_for: vec![QuestionType::Impact, QuestionType::Flow],
         }
     }

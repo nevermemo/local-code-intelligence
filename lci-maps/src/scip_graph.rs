@@ -26,8 +26,8 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
     edge::{
-        CONF_MAX, Edge as TypedEdge, Expanded, Site, WitnessClass, cap_edges, conf_from_unit,
-        sort_edges,
+        CONF_MAX, Edge as TypedEdge, Expanded, MapCard, Site, WitnessClass, cap_edges,
+        conf_from_unit, sort_edges,
     },
 };
 use lci_core::node::{NodeId, NodeKind, SymbolKey, SymbolKind, rust_module_path};
@@ -865,6 +865,13 @@ impl ScipMap {
 impl Map for ScipMap {
     fn describe(&self) -> &MapDescriptor {
         &self.descriptor
+    }
+
+    fn card(&self) -> MapCard {
+        MapCard {
+            dependent: true,
+            ..MapCard::from_descriptor(self.describe())
+        }
     }
 
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {

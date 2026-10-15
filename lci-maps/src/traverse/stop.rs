@@ -54,7 +54,7 @@
 //! independently, which maps over one code base do not fully; read it as a
 //! hint, not a bound. No estimate exists before the two maps share a node.
 
-use super::rules::node_path;
+use super::{State, rules::node_path};
 use crate::{MapId, edge::WitnessClass};
 use lci_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,14 +81,21 @@ pub enum StopReason {
     Disagreement,
     Stagnation,
     LikelyComplete,
-    /// The call ended on a budget.
+    /// The call ended on the token or external-call budget.
     Budget,
+    /// The call ended on the pop cap.
+    Pops,
+    /// The call ended on its deadline.
+    Deadline,
     /// The agent's steer ended the walk.
     Steer,
     /// The score bound held: nothing left in the frontier can reach the
     /// ranks of the results already found (see the module docs). This ends
     /// the call as `complete`, with no handle.
     Bound,
+    /// Nothing was left to expand (or every target was reached): the walk
+    /// ran to its end within budget.
+    Complete,
 }
 
 impl StopReason {
@@ -100,8 +107,11 @@ impl StopReason {
             Self::Stagnation => "stagnation",
             Self::LikelyComplete => "likely_complete",
             Self::Budget => "budget",
+            Self::Pops => "pops",
+            Self::Deadline => "deadline",
             Self::Steer => "steer",
             Self::Bound => "bound",
+            Self::Complete => "complete",
         }
     }
 }
@@ -212,13 +222,34 @@ pub struct Card {
     pub witness: Option<WitnessClass>,
     /// The path potential.
     pub potential: f64,
+    /// The value results rank by: the potential, lifted by the corroboration
+    /// boost for each independent map beyond the first
+    /// ([`State::ranked_potential`]).
+    pub ranked_potential: f64,
     pub depth: u32,
     /// The maps whose edges reached the node, sorted (seed maps are not
-    /// counted; see `State::maps`). `n_maps` is its length.
+    /// counted; see `State::maps`).
     pub maps: Vec<MapId>,
+    /// How many of them are independent evidence ([`State::n_maps`]): maps
+    /// derived from the same graph count once.
+    pub n_maps: usize,
 }
 
 impl Card {
+    /// The card of a state, ranked with `boost`.
+    pub fn of(state: &State, boost: f64) -> Self {
+        Self {
+            node: state.node.clone(),
+            via: state.via,
+            witness: state.witness,
+            potential: state.potential,
+            ranked_potential: state.ranked_potential(boost),
+            depth: state.depth,
+            maps: state.maps.iter().copied().collect(),
+            n_maps: state.n_maps(),
+        }
+    }
+
     /// `node | map/witness | p0.50 d2`, at most [`CARD_CHARS`] characters; a
     /// long node id loses its start.
     pub fn text(&self) -> String {

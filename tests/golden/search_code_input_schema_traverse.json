@@ -23,7 +23,7 @@
           ]
         },
         "max_depth": {
-          "description": "Deepest state that is expanded.",
+          "description": "Depth at which states are recorded without being expanded: a state at\n`max_depth` is in the results but not expanded, so the deepest state\nexpanded is at `max_depth - 1`.",
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -98,7 +98,7 @@
           ]
         },
         "rules": {
-          "description": "Rung 1 of the ladder: an array of `{\"when\": predicate, \"then\": action}`\nrules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,\n`score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,\n`not`. Actions: `prune`, `expand`, `continue`, `stop`, `{\"boost\": f}`,\n`{\"map_on\": id}`, `{\"map_off\": id}`, `{\"map_weight\": {\"id\", \"weight\"}}`,\n`{\"rerank\": \"witness\"|\"depth\"|\"fanout\"}`, `{\"redirect\": [node ids]}`,\n`{\"emit\": note}`. They can only shrink, reorder or redirect the walk."
+          "description": "Rung 1 of the ladder: an array of `{\"when\": predicate, \"then\": action}`\nrules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,\n`score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,\n`not`. Actions: `prune`, `expand`, `continue`, `stop`, `{\"boost\": f}`,\n`{\"map_on\": id}`, `{\"map_off\": id}`, `{\"map_weight\": {\"id\", \"weight\"}}`,\n`{\"redirect\": [node ids]}`, `{\"emit\": note}`. They can only shrink, reorder or redirect the walk."
         },
         "script": {
           "description": "Reserved for an embedded script handler; not available yet.",

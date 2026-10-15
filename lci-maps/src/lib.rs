@@ -575,6 +575,24 @@ impl<'a> Registry<'a> {
         found
     }
 
+    /// How many independent maps can offer a traversal edge: the enabled
+    /// maps that accept some node kind (a start-node source accepts none),
+    /// with the maps whose cards say `dependent` counted once together. The
+    /// most a node can be corroborated by.
+    pub fn independent_expanders(&self) -> usize {
+        let (mut independent, mut dependent) = (0, false);
+        for entry in &self.entries {
+            if entry.enabled && !entry.map.describe().accepts.is_empty() {
+                if entry.map.card().dependent {
+                    dependent = true;
+                } else {
+                    independent += 1;
+                }
+            }
+        }
+        independent + usize::from(dependent)
+    }
+
     /// The registered ids in fusion order.
     pub fn ids(&self) -> Vec<MapId> {
         self.entries.iter().map(|e| e.map.describe().id).collect()

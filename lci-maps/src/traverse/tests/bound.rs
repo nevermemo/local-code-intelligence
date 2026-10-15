@@ -1,4 +1,5 @@
-//! The score bound (stop reason `bound`) and the identity a handle is bound to.
+//! The score bound (stop reason `bound`), the stop reason every other exit
+//! names, and the identity a handle is bound to.
 
 use super::*;
 use crate::traverse::handle::{HandleError, Snapshot};
@@ -56,13 +57,13 @@ async fn q1_the_walk_stops_with_bound_before_its_budget_when_nothing_can_beat_th
         full.totals.pops, 6,
         "without a bound every node is expanded"
     );
-    assert_eq!(full.stop_reason, None);
+    assert_eq!(full.stop_reason, StopReason::Complete);
 
     // After the seed's pop three results sit at potential 1 and the queue
     // holds nothing above 1: the second best cannot be beaten.
     let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(2, 1)).await;
     assert_eq!(result.status, TraversalStatus::Complete);
-    assert_eq!(result.stop_reason, Some(StopReason::Bound));
+    assert_eq!(result.stop_reason, StopReason::Bound);
     assert_eq!(
         result.totals.pops, 1,
         "stopped well inside the budget of 100"
@@ -81,8 +82,8 @@ async fn q1_the_walk_stops_with_bound_before_its_budget_when_nothing_can_beat_th
     assert_eq!(bound[0]["frontier"], 3);
     assert_eq!(end_event(&result)["stop_reason"], "bound");
     assert_eq!(end_event(&result)["status"], "complete");
-    // A walk that ended otherwise names no reason.
-    assert!(end_event(&full).get("stop_reason").is_none());
+    // A walk that ended otherwise names its own reason.
+    assert_eq!(end_event(&full)["stop_reason"], "complete");
 }
 
 #[tokio::test]
@@ -99,7 +100,7 @@ async fn q1_the_bound_does_not_hold_while_the_queue_can_beat_the_kth() {
     );
     let reg = registry(vec![map]);
     let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(9, 1)).await;
-    assert_eq!(result.stop_reason, Some(StopReason::Bound));
+    assert_eq!(result.stop_reason, StopReason::Bound);
     assert_eq!(
         result.totals.pops, 9,
         "the seed and the eight strong states"
@@ -120,12 +121,12 @@ async fn q1_fewer_than_k_results_never_hold_the_bound() {
     let reg = registry(vec![small()]);
     let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(100, 1)).await;
     assert_eq!(result.status, TraversalStatus::Complete);
-    assert_eq!(result.stop_reason, None);
+    assert_eq!(result.stop_reason, StopReason::Complete);
     assert_eq!(result.totals.pops, 6);
     assert!(bound_events(&result).is_empty());
     // k of 0 switches it off.
     let off = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(0, 1)).await;
-    assert_eq!(off.stop_reason, None);
+    assert_eq!(off.stop_reason, StopReason::Complete);
     assert_eq!(off.totals.pops, 6);
 }
 
@@ -136,7 +137,7 @@ async fn q1_more_expanding_maps_raise_the_ceiling_a_queued_state_could_reach() {
     // 2nd result at 1.0, so the walk goes on to the end.
     let reg = registry(vec![small()]);
     let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(2, 2)).await;
-    assert_eq!(result.stop_reason, None);
+    assert_eq!(result.stop_reason, StopReason::Complete);
     assert_eq!(result.totals.pops, 6);
     assert!(bound_events(&result).is_empty());
 }
@@ -148,8 +149,94 @@ async fn q1_a_walk_with_targets_ends_when_they_are_reached_not_on_the_bound() {
         t.top_k(2, 1).targets(vec![node("e")])
     })
     .await;
-    assert_eq!(result.stop_reason, None);
+    assert_eq!(result.stop_reason, StopReason::Complete);
     assert!(result.reached(&node("e")));
+}
+
+// ---- every exit names its reason and the maps that ran --------------------------------
+
+fn reason_of(result: &TraversalResult) -> (StopReason, &str) {
+    (
+        result.stop_reason,
+        end_event(result)["stop_reason"].as_str().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn every_exit_path_names_its_stop_reason() {
+    let chain = registry(vec![GraphMap::new("g", &[("a", "b"), ("b", "c")])]);
+    let lattice = registry(vec![lattice_map("g", 60)]);
+
+    let done = walk(&chain, vec![seed("a")], budget(10), |t| t).await;
+    assert_eq!(reason_of(&done), (StopReason::Complete, "complete"));
+
+    let capped = walk(&lattice, vec![seed("n0")], budget(3), |t| t).await;
+    assert_eq!(reason_of(&capped), (StopReason::Pops, "pops"));
+    assert_eq!(capped.checkpoint.as_ref().unwrap().reason, StopReason::Pops);
+
+    let mut late = budget(50);
+    late.deadline = Instant::now();
+    let timed_out = walk(&lattice, vec![seed("n0")], late, |t| t).await;
+    assert_eq!(reason_of(&timed_out), (StopReason::Deadline, "deadline"));
+
+    let mut dry = budget(50);
+    dry.est_tokens = 0;
+    let no_tokens = walk(&lattice, vec![seed("n0")], dry, |t| t).await;
+    assert_eq!(reason_of(&no_tokens), (StopReason::Budget, "budget"));
+
+    // Tokens for two of the seed's edges only: the expansion is cut.
+    let mut tight = budget(50);
+    tight.est_tokens = 2 * TOKENS_PER_EDGE;
+    let cut = walk(&lattice, vec![seed("n0")], tight, |t| t).await;
+    assert_eq!(reason_of(&cut), (StopReason::Budget, "budget"));
+
+    let first = walk(&lattice, vec![seed("n0")], budget(3), |t| t).await;
+    let steered = resume(&lattice, first.snapshot.unwrap(), budget(10), |t| {
+        t.steer(Steer::new(vec![act(None, Action::Stop)]))
+    })
+    .await;
+    assert_eq!(reason_of(&steered), (StopReason::Steer, "steer"));
+
+    let stopped = walk(&lattice, vec![seed("n0")], budget(10), |t| {
+        t.handler(scripted(|_| vec![act(None, Action::Stop)]), every(2))
+    })
+    .await;
+    assert_eq!(reason_of(&stopped), (StopReason::EveryPops, "every_pops"));
+
+    let bounded = walk(
+        &registry(vec![small()]),
+        vec![seed("s")],
+        budget(100),
+        |t| t.top_k(2, 1),
+    )
+    .await;
+    assert_eq!(reason_of(&bounded), (StopReason::Bound, "bound"));
+}
+
+#[tokio::test]
+async fn every_exit_path_reports_the_expansions_and_time_of_each_map() {
+    let reg = registry(vec![
+        GraphMap::new("slow", &[("n0", "n1"), ("n1", "n2")]).delay(Duration::from_millis(5)),
+        GraphMap::new("fast", &[("n0", "n3")]),
+    ]);
+    let done = walk(&reg, vec![seed("n0")], budget(10), |t| t).await;
+    let capped = walk(&reg, vec![seed("n0")], budget(1), |t| t).await;
+    let mut late = budget(10);
+    late.deadline = Instant::now();
+    let timed_out = walk(&reg, vec![seed("n0")], late, |t| t).await;
+
+    for (result, pops) in [(&done, 4), (&capped, 1)] {
+        assert_eq!(result.maps["slow"].calls, pops, "{:?}", result.status);
+        assert_eq!(result.maps["fast"].calls, pops);
+        assert!(result.map_ms["slow"] >= 5.0 * f64::from(pops));
+        assert!(result.map_ms["fast"] < result.map_ms["slow"]);
+    }
+    // No expansion ran, so no map did anything.
+    assert!(timed_out.maps.is_empty() && timed_out.map_ms.is_empty());
+    // The times are wall clock: they are in no event and not in the handle.
+    assert!(!done.events_jsonl().contains("\"ms\""));
+    let handle = capped.snapshot.as_ref().unwrap().to_json().to_string();
+    assert!(!handle.contains("map_ms") && !handle.contains("\"ms\""));
 }
 
 // ---- R10: a handle is bound to its workspace and index -----------------------------

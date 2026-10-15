@@ -175,15 +175,10 @@ async fn two_maps_reaching_a_node_are_both_recorded_and_outrank_one() {
 }
 
 fn card_json_of(result: &TraversalResult, name: &str) -> Value {
-    let s = state(result, name);
-    trace::card_json(&stop::Card {
-        node: s.node.clone(),
-        via: s.via,
-        witness: s.witness,
-        potential: s.potential,
-        depth: s.depth,
-        maps: s.maps.iter().copied().collect(),
-    })
+    trace::card_json(&stop::Card::of(
+        state(result, name),
+        result.corroboration_boost,
+    ))
 }
 
 #[tokio::test]
@@ -384,4 +379,102 @@ fn above_the_gate_a_hop_is_the_rank_value_times_its_kind_prior() {
     // The unscored arm keeps 1 for every edge.
     let steps = hop(&mut BfsScorer, &ctx, &cands, HopPrice { gate: 1, beam: 3 });
     assert!(steps.iter().all(|s| s.1 == 1.0));
+}
+
+#[tokio::test]
+async fn maps_derived_from_one_graph_corroborate_once() {
+    // m1 and m2 are both views of the same graph: together they are one
+    // piece of evidence for `z`, but both stay in the display list.
+    let shared = registry(vec![
+        GraphMap::new("m1", &[("s", "a"), ("a", "z")]).dependent(),
+        GraphMap::new("m2", &[("s", "b"), ("b", "z")]).dependent(),
+    ]);
+    let result = walk(&shared, vec![seed("s")], budget(20), |t| t).await;
+    let z = state(&result, "z");
+    assert_eq!(z.maps.iter().copied().collect::<Vec<_>>(), ["m1", "m2"]);
+    assert_eq!(z.n_maps(), 1);
+    assert_eq!(result.ranked_potential(z), z.potential);
+    let card = card_json_of(&result, "z");
+    assert_eq!(
+        (
+            card["n_maps"].as_u64(),
+            card["maps"].as_array().map(Vec::len)
+        ),
+        (Some(1), Some(2))
+    );
+
+    // A map that does not share their graph is independent evidence.
+    let mixed = registry(vec![
+        GraphMap::new("m1", &[("s", "a"), ("a", "z")]).dependent(),
+        GraphMap::new("m2", &[("s", "b"), ("b", "z")]).dependent(),
+        GraphMap::new("m3", &[("s", "c"), ("c", "z")]),
+    ]);
+    let result = walk(&mixed, vec![seed("s")], budget(20), |t| t).await;
+    let z = state(&result, "z");
+    assert_eq!((z.maps.len(), z.n_maps()), (3, 2));
+    assert!((result.ranked_potential(z) - z.potential * 1.1).abs() < 1e-12);
+
+    // The dependent maps survive a pause: the resumed walk counts the same.
+    let first = walk(&mixed, vec![seed("s")], budget(3), |t| t).await;
+    let snapshot = first.snapshot.expect("the walk paused");
+    let restored = crate::traverse::handle::Snapshot::from_json(&snapshot.to_json()).unwrap();
+    assert_eq!(restored, snapshot);
+    assert!(restored.states.iter().any(|s| !s.dependent.is_empty()));
+}
+
+#[tokio::test]
+async fn a_card_shows_the_rank_next_to_the_potential() {
+    let reg = two_maps_one_node();
+    let result = walk(&reg, vec![seed("s")], budget(20), |t| t).await;
+    let card = card_json_of(&result, "z");
+    let potential = card["potential"].as_f64().unwrap();
+    let ranked = card["ranked_potential"].as_f64().unwrap();
+    assert!((ranked - potential * 1.1).abs() < 1e-12, "{card}");
+    let single = card_json_of(&result, "y");
+    assert_eq!(single["ranked_potential"], single["potential"]);
+}
+
+#[tokio::test]
+async fn a_resumed_walk_ranks_with_the_boost_the_handle_holds() {
+    let reg = two_maps_one_node();
+    let first = walk(&reg, vec![seed("s")], budget(2), |t| {
+        t.corroboration_boost(0.5)
+    })
+    .await;
+    let snapshot = first.snapshot.expect("the walk paused");
+    assert_eq!(snapshot.boost, 0.5);
+    // The second call is configured with the default boost; the handle wins.
+    let view = view();
+    let second = Traversal::resumed(OnTheFly::new(&reg, &view), snapshot, budget(20))
+        .run()
+        .await;
+    assert_eq!(second.corroboration_boost, 0.5);
+    assert_eq!(
+        events(&second, "resume")[0]["rank"]["corroboration_boost"],
+        0.5
+    );
+    let z = state(&second, "z");
+    assert!((second.ranked_potential(z) - z.potential * 1.5).abs() < 1e-12);
+}
+
+#[test]
+fn the_most_a_node_can_be_corroborated_by_counts_dependent_maps_once() {
+    let mut reg = registry(vec![
+        GraphMap::new("m1", &[]).dependent(),
+        GraphMap::new("m2", &[]).dependent(),
+        GraphMap::new("m3", &[]),
+        GraphMap::new("m4", &[]),
+        // A start-node source accepts no kind: it never offers an edge.
+        GraphMap::new("seeds", &[]).accepts(Vec::new()),
+    ]);
+    assert_eq!(reg.independent_expanders(), 3);
+    reg.set_enabled("m4", false);
+    reg.set_enabled("m1", false);
+    assert_eq!(
+        reg.independent_expanders(),
+        2,
+        "m2 still stands for the graph"
+    );
+    reg.set_enabled("m2", false);
+    assert_eq!(reg.independent_expanders(), 1);
 }

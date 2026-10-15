@@ -46,16 +46,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 3;
-const WITNESSES: [WitnessClass; 7] = [
-    WitnessClass::Compiler,
-    WitnessClass::Lsp,
-    WitnessClass::Exact,
-    WitnessClass::Text,
-    WitnessClass::Vector,
-    WitnessClass::Heuristic,
-    WitnessClass::Agent,
-];
+const VERSION: u32 = 4;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -151,6 +142,9 @@ pub struct Snapshot {
     /// What the traversal is bound to: the workspace and the index it walks,
     /// as the caller fingerprinted them (empty when the caller gave none).
     pub identity: String,
+    /// The corroboration boost the first call ranked with; a resume ranks with
+    /// it too, so the order of results does not change between calls.
+    pub boost: f64,
 }
 
 impl Snapshot {
@@ -180,6 +174,7 @@ impl Snapshot {
                 "potential": s.potential,
                 "fanout": s.fanout,
                 "maps": s.maps,
+                "dependent": s.dependent,
                 "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "frontier": self.frontier.iter()
@@ -201,7 +196,6 @@ impl Snapshot {
                 "external_calls": self.totals.external_calls,
                 "stops": self.totals.stops,
                 "steers": self.totals.steers,
-                "per_map": self.totals.per_map,
             },
             "last_stop_at": self.last_stop_at,
             "tally": tally_json(&self.tally),
@@ -212,6 +206,7 @@ impl Snapshot {
                 .map(|&(state, tokens, calls)| json!([state, tokens, calls]))
                 .collect::<Vec<_>>(),
             "identity": self.identity,
+            "boost": self.boost,
         })
     }
 
@@ -261,6 +256,10 @@ impl Snapshot {
                     fanout: u32_of(get(s, "fanout")?)?,
                     // Handles kept before corroboration existed have neither.
                     maps: strings(s.get("maps"))?
+                        .iter()
+                        .map(|m| intern(m))
+                        .collect::<Result<_, _>>()?,
+                    dependent: strings(s.get("dependent"))?
                         .iter()
                         .map(|m| intern(m))
                         .collect::<Result<_, _>>()?,
@@ -394,12 +393,6 @@ impl Snapshot {
         let totals = get(obj, "totals")?
             .as_object()
             .ok_or("totals is not an object")?;
-        let per_map = get(totals, "per_map")?
-            .as_object()
-            .ok_or("per_map is not an object")?
-            .iter()
-            .map(|(k, v)| Ok((intern(k)?, u32_of(v)?)))
-            .collect::<Result<BTreeMap<MapId, u32>, String>>()?;
         Ok(Self {
             question: string_of(get(obj, "question")?)?,
             targets: array(obj, "targets")?
@@ -436,7 +429,6 @@ impl Snapshot {
                 external_calls: u32_of(get(totals, "external_calls")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
                 steers: u32_of(get(totals, "steers")?)?,
-                per_map,
                 elapsed_ms: 0.0,
             },
             last_stop_at: opt_u64(get(obj, "last_stop_at")?)?.map(|p| p as u32),
@@ -449,6 +441,7 @@ impl Snapshot {
             deferred,
             paid,
             identity: string_of(get(obj, "identity")?)?,
+            boost: f64_of(get(obj, "boost")?)?,
         })
     }
 }
@@ -595,10 +588,7 @@ fn strings(value: Option<&Value>) -> Result<Vec<&str>, String> {
 }
 
 fn witness_of(name: &str) -> Result<WitnessClass, String> {
-    WITNESSES
-        .into_iter()
-        .find(|w| w.as_str() == name)
-        .ok_or_else(|| format!("unknown witness class {name:?}"))
+    WitnessClass::parse(name).ok_or_else(|| format!("unknown witness class {name:?}"))
 }
 
 /// Map ids are `&'static str`; a handle names them by text, so the text is
@@ -666,6 +656,7 @@ impl Run<'_> {
                 .map(|(&state, &(tokens, calls))| (state, tokens, calls))
                 .collect(),
             identity: self.t.identity.clone(),
+            boost: self.t.boost,
         }
     }
 
@@ -692,11 +683,13 @@ impl Run<'_> {
             deferred,
             paid,
             identity,
+            boost,
             ..
         } = snapshot;
         if self.t.identity.is_empty() {
             self.t.identity = identity;
         }
+        self.t.boost = boost;
         self.state_of = states
             .iter()
             .enumerate()

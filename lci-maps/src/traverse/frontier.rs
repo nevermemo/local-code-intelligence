@@ -16,11 +16,12 @@
 //! fused confidence, the in-degree seen so far, the query overlap and the map
 //! card's cost, so a hop into another map is priced like any other.
 
+pub use crate::walk::{BfsScorer, RandomScorer};
 use crate::{
     EdgeKind,
     edge::{MapCard, WitnessClass},
     traverse::source::FusedEdge,
-    walk::{SplitMix, W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
+    walk::{W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
 };
 use std::{
     cmp::Ordering,
@@ -220,25 +221,6 @@ impl Frontier {
             None => false,
         }
     }
-
-    /// Hands the existing queue positions (priority and discovery number)
-    /// out again in the order of `key` (smaller first; equal keys keep the
-    /// current order). The set of positions does not change.
-    pub fn rerank<K: Ord>(&mut self, key: impl Fn(usize) -> K) {
-        let current = self.sorted();
-        let slots: Vec<(f64, u64)> = current
-            .iter()
-            .map(|item| (item.priority, item.seq))
-            .collect();
-        let mut order: Vec<usize> = (0..current.len()).collect();
-        order.sort_by_key(|&i| key(current[i].state));
-        for (rank, &i) in order.iter().enumerate() {
-            if let Some(item) = self.live.get_mut(&current[i].state) {
-                (item.priority, item.seq) = slots[rank];
-            }
-        }
-        self.rebuild();
-    }
 }
 
 /// How many edges are followed whole, and how many are kept above that.
@@ -355,19 +337,8 @@ impl HopScorer for RulesScorer {
     }
 }
 
-/// Control: a seeded random order.
-pub struct RandomScorer {
-    rng: SplitMix,
-}
-
-impl RandomScorer {
-    pub fn new(seed: u64) -> Self {
-        Self {
-            rng: SplitMix(seed),
-        }
-    }
-}
-
+/// The controls of `walk.rs` order traversal hops too: a seeded random order
+/// ([`RandomScorer::new`]) and unscored first-in-first-out ([`BfsScorer`]).
 impl HopScorer for RandomScorer {
     fn label(&self) -> &'static str {
         "random"
@@ -377,9 +348,6 @@ impl HopScorer for RandomScorer {
         cands.iter().map(|_| self.rng.next_f64()).collect()
     }
 }
-
-/// Control: unscored, edges in offer order.
-pub struct BfsScorer;
 
 impl HopScorer for BfsScorer {
     fn label(&self) -> &'static str {

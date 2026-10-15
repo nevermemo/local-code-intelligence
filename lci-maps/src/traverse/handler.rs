@@ -9,7 +9,7 @@
 //!
 //! The engine applies directives under its own limits, whatever the handler
 //! asks: a directive can shrink the frontier (`Prune`), reorder it (`Expand`,
-//! `Boost`, `Rerank`), switch a map off or scale its hops down, or `Redirect`
+//! `Boost`), switch a map off or scale its hops down, or `Redirect`
 //! to other seeds. The one action that raises a budget, `Budget`, is applied
 //! only when the outer agent sends it in a [`Steer`](super::steer::Steer), and
 //! only up to a fixed cap.
@@ -103,26 +103,6 @@ pub struct Checkpoint {
     pub likely_complete: Option<LikelyComplete>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RerankBy {
-    /// Strongest witness class first.
-    Witness,
-    /// Shallowest first.
-    Depth,
-    /// Smallest fan-out first.
-    Fanout,
-}
-
-impl RerankBy {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Witness => "witness",
-            Self::Depth => "depth",
-            Self::Fanout => "fanout",
-        }
-    }
-}
-
 /// What a handler can do. Node actions take a frontier node; the others act
 /// on the traversal.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,7 +119,6 @@ pub enum Action {
     MapOff(String),
     /// Scale the hop values of a map by a weight in `0..=1`.
     MapWeight(String, f64),
-    Rerank(RerankBy),
     /// Replace the frontier with these seeds.
     Redirect(Vec<NodeId>),
     Stop,
@@ -165,7 +144,6 @@ impl Action {
             Self::MapOn(_) => "map_on",
             Self::MapOff(_) => "map_off",
             Self::MapWeight(..) => "map_weight",
-            Self::Rerank(_) => "rerank",
             Self::Redirect(_) => "redirect",
             Self::Stop => "stop",
             Self::Emit(_) => "emit",

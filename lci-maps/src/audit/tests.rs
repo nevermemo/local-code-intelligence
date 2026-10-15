@@ -379,3 +379,59 @@ fn c4_commit_replay() {
     let moved = &subject.syncs[3];
     assert_eq!(moved.1, 2, "{moved:?}");
 }
+
+/// A source that answers every node with one fixed call.
+struct FixedCall(crate::Cost);
+
+#[crate::async_trait]
+impl EdgeSource for FixedCall {
+    async fn edges(&self, _node: &NodeId, _budget: Budget) -> Expansion {
+        Expansion {
+            edges: Vec::new(),
+            calls: vec![crate::traverse::source::ExpandCall {
+                map: "g",
+                n_edges: 0,
+                cost: self.0,
+                failure: None,
+                ms: 0.0,
+            }],
+        }
+    }
+
+    fn card(&self, _map: crate::MapId) -> crate::edge::MapCard {
+        crate::edge::MapCard::default()
+    }
+
+    fn set_enabled(&mut self, _id: &str, _on: bool) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn s5_sources_that_charge_different_costs_differ() {
+    let node = NodeId::file("src/a.rs").unwrap();
+    let cost = |est_tokens, external_calls, elapsed_ms| crate::Cost {
+        est_tokens,
+        external_calls,
+        elapsed_ms,
+        ..crate::Cost::default()
+    };
+    let audit = |left: crate::Cost, right: crate::Cost| {
+        let nodes = [node.clone()];
+        async move {
+            audit_edge_sources(
+                &FixedCall(left),
+                &FixedCall(right),
+                &nodes,
+                Duration::from_secs(1),
+            )
+            .await
+        }
+    };
+    // The time a call took and the external calls a cache saved are not
+    // differences; the tokens charged are.
+    assert!(audit(cost(5, 1, 3.0), cost(5, 2, 9.0)).await.is_ok());
+    let failure = audit(cost(5, 1, 3.0), cost(6, 1, 3.0)).await.unwrap_err();
+    assert_eq!(failure.contract, "S5");
+    assert!(failure.detail.contains("tokens="), "{}", failure.detail);
+}

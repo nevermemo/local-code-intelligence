@@ -54,9 +54,10 @@ pub fn card_json(card: &Card) -> Value {
         "via": card.via,
         "witness": card.witness.map(|w| w.as_str()),
         "potential": card.potential,
+        "ranked_potential": card.ranked_potential,
         "depth": card.depth,
         "maps": card.maps,
-        "n_maps": card.maps.len(),
+        "n_maps": card.n_maps,
         "text": card.text(),
     })
 }
