@@ -27,6 +27,7 @@ use crate::gold::{self, Answer, Set};
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use lci_core::node::{NodeId, NodeKind, SymbolKind};
+use lci_maps::traverse::priors::PriorTable;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -109,6 +110,15 @@ pub struct BenchArgs {
     /// note says `no-bound`.
     #[arg(long)]
     no_score_bound: bool,
+    /// A table of fitted hop priors (`lci traverse --priors`, given
+    /// `--question-type` the name of the set). The row's note says
+    /// `priors=<file stem>`.
+    #[arg(long)]
+    priors: Option<PathBuf>,
+    /// Run only the items in the table's hold-out list (impact: of the
+    /// primary items). The row's note says `holdout-only`.
+    #[arg(long, requires = "priors")]
+    holdout_only: bool,
     /// Run only the first N items of each set (impact: of the primary items).
     #[arg(long)]
     limit: Option<usize>,
@@ -159,12 +169,21 @@ pub fn run(args: BenchArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| repo_root().join(DEFAULT_TREND));
     let sets = args.set.sets();
+    let holdout = match (&args.priors, args.holdout_only) {
+        (Some(path), true) => Some(
+            PriorTable::load(path)
+                .with_context(|| format!("read the prior table {}", path.display()))?
+                .holdout,
+        ),
+        _ => None,
+    };
     let mut gold_items = Vec::new();
     for set in &sets {
         gold_items.push(select_items(
             *set,
             gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(*set))))?,
             args.limit,
+            holdout.as_ref(),
         ));
     }
     if let Some(dir) = &args.rescore {
@@ -187,6 +206,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
         fusion: fusion_arg(&args.fusion),
         pass_through: args.pass_through,
         no_score_bound: args.no_score_bound,
+        priors: args
+            .priors
+            .clone()
+            .map(|path| (path, set_name(sets[0]).to_owned())),
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -222,12 +245,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
             &args.fusion,
             args.pass_through,
             args.no_score_bound,
+            priors_note(&args),
         ),
         progress: true,
         rescored: false,
     };
     traverser.maps = config.available_maps();
     for (set, items) in sets.into_iter().zip(&gold_items) {
+        // The table's column for this set is the set's name.
+        if let Some((_, question_type)) = &mut traverser.priors {
+            *question_type = set_name(set).to_owned();
+        }
         eprintln!("{}: {} items", set_name(set), items.len());
         let outcome = bench_set(set, items, &traverser, &config)?;
         write_outputs(
@@ -268,6 +296,7 @@ fn rescore(
             &args.fusion,
             args.pass_through,
             args.no_score_bound,
+            priors_note(args),
         ),
         progress: false,
         rescored: true,
@@ -349,11 +378,13 @@ fn note_with_flags(
     fusion: &str,
     pass_through: bool,
     no_score_bound: bool,
+    priors: Option<String>,
 ) -> String {
     let flags = [
         fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
         pass_through.then(|| "pass-through".to_owned()),
         no_score_bound.then(|| "no-bound".to_owned()),
+        priors,
     ];
     let parts = note
         .filter(|note| !note.is_empty())
@@ -361,6 +392,17 @@ fn note_with_flags(
         .into_iter()
         .chain(flags.into_iter().flatten());
     parts.collect::<Vec<_>>().join("; ")
+}
+
+/// `priors=<file stem>` and `holdout-only`, for the row's note.
+fn priors_note(args: &BenchArgs) -> Option<String> {
+    let stem = args.priors.as_ref()?.file_stem()?.to_string_lossy();
+    let holdout = if args.holdout_only {
+        ", holdout-only"
+    } else {
+        ""
+    };
+    Some(format!("priors={stem}{holdout}"))
 }
 
 fn policy_label(policy: &str) -> String {
@@ -392,12 +434,20 @@ pub fn set_name(set: Set) -> &'static str {
     }
 }
 
-/// The scored population of a set (impact keeps its `primary` items), cut to
-/// the first `limit`.
-fn select_items(set: Set, items: Vec<Value>, limit: Option<usize>) -> Vec<Value> {
-    let kept = items.into_iter().filter(|item| match set {
-        Set::Impact => item.get("primary").and_then(Value::as_bool) == Some(true),
-        _ => true,
+/// The scored population of a set (impact keeps its `primary` items), limited
+/// to the ids in `holdout` when given, cut to the first `limit`.
+fn select_items(
+    set: Set,
+    items: Vec<Value>,
+    limit: Option<usize>,
+    holdout: Option<&BTreeSet<String>>,
+) -> Vec<Value> {
+    let kept = items.into_iter().filter(|item| {
+        let primary = match set {
+            Set::Impact => item.get("primary").and_then(Value::as_bool) == Some(true),
+            _ => true,
+        };
+        primary && holdout.is_none_or(|ids| item["id"].as_str().is_some_and(|id| ids.contains(id)))
     });
     match limit {
         Some(n) => kept.take(n).collect(),
@@ -721,6 +771,9 @@ pub struct CliTraverser {
     pub pass_through: bool,
     /// `--no-score-bound` for the CLI.
     pub no_score_bound: bool,
+    /// `--priors` and `--question-type` for the CLI: the table file and the
+    /// question type (the name of the set being run).
+    pub priors: Option<(PathBuf, String)>,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -773,6 +826,10 @@ impl CliTraverser {
         }
         if self.no_score_bound {
             command.arg("--no-score-bound");
+        }
+        if let Some((table, question_type)) = &self.priors {
+            command.arg("--priors").arg(table);
+            command.arg(format!("--question-type={question_type}"));
         }
         command
             .stdin(Stdio::null())
@@ -1350,6 +1407,8 @@ struct Sums {
     no_seeds: usize,
     precision: f64,
     f05: f64,
+    /// Scored items per `stop_reason` of their raw output.
+    stop_reasons: BTreeMap<String, usize>,
 }
 
 /// Nearest-rank percentile of an unsorted sample.
@@ -1505,6 +1564,9 @@ pub fn bench_set(
         let question = item["question"].as_str().unwrap_or_default();
         match traverser.traverse(id, question) {
             Ok((traversed, raw_json)) => {
+                if let Some(reason) = raw_json["stop_reason"].as_str() {
+                    *sums.stop_reasons.entry(reason.to_owned()).or_default() += 1;
+                }
                 raw.push((id.to_string(), raw_json));
                 let mut nodes: Vec<ResultNode> = Vec::new();
                 if config.include_seeds {
@@ -1597,6 +1659,20 @@ pub fn bench_set(
     }
     if sums.no_seeds > 0 {
         notes.push(format!("{} scored items found no seeds", sums.no_seeds));
+    }
+    if !sums.stop_reasons.is_empty() {
+        let counts: Vec<String> = sums
+            .stop_reasons
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect();
+        notes.push(format!("stops: {}", counts.join(" ")));
+    }
+    if let Some(n) = sums.stop_reasons.get("deadline") {
+        eprintln!(
+            "warning: {} stopped by the deadline for {n} item(s): machine load can cut walks",
+            set_name(set)
+        );
     }
     if skips.total() > 0 {
         notes.push("skipped items are not in any metric; reasons in raw/".into());
@@ -1954,7 +2030,7 @@ mod tests {
 
     fn traversal(seeds: &[&str], results: &[&str], pops: u64) -> Value {
         json!({
-            "mode": "traverse", "status": "complete", "seeds": seeds,
+            "mode": "traverse", "status": "complete", "stop_reason": "bound", "seeds": seeds,
             "results": results.iter().map(|id| json!({
                 "node": id, "text": format!("{id} | graph.scip/compiler | p1.00 d1"),
                 "via": "graph.scip", "witness": "compiler", "potential": 1.0, "depth": 1,
@@ -2010,10 +2086,12 @@ mod tests {
         // i1: the one gold declaration plus one wrong one; i2: exactly right;
         // i3: no seeds (a scored empty answer, not a skip).
         answers.insert("q one".into(), traversal(&["x"], &[SEARCH_FN, TYPE], 6));
-        answers.insert("q two".into(), traversal(&["x"], &[METHOD], 4));
+        let mut two = traversal(&["x"], &[METHOD], 4);
+        two["stop_reason"] = json!("deadline");
+        answers.insert("q two".into(), two);
         answers.insert(
             "q three".into(),
-            json!({"mode": "traverse", "status": "no_seeds", "results": [], "seeds": []}),
+            json!({"mode": "traverse", "status": "no_seeds", "stop_reason": "no_seeds", "results": [], "seeds": []}),
         );
         let outcome = bench_set(
             Set::Impact,
@@ -2047,6 +2125,7 @@ mod tests {
         assert_eq!((cells[12].as_str(), cells[13].as_str()), ("2", "2"));
         assert_eq!(cells[15], "4/4");
         assert!(cells[20].contains("1 scored items found no seeds"));
+        assert!(cells[20].contains("stops: bound=1 deadline=1 no_seeds=1"));
         assert!(cells[7].contains("decl_recall=0.667") && cells[7].contains("(over 3)"));
         assert_eq!(cells[18], "none");
 
@@ -2223,14 +2302,23 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            ids(select_items(Set::Impact, items.clone(), None)),
+            ids(select_items(Set::Impact, items.clone(), None, None)),
             ["b", "c"]
         );
         assert_eq!(
-            ids(select_items(Set::Impact, items.clone(), Some(1))),
+            ids(select_items(Set::Impact, items.clone(), Some(1), None)),
             ["b"]
         );
-        assert_eq!(ids(select_items(Set::Flow, items, Some(2))), ["a", "b"]);
+        assert_eq!(
+            ids(select_items(Set::Flow, items.clone(), Some(2), None)),
+            ["a", "b"]
+        );
+        // The hold-out list keeps its ids, after the population and before the limit.
+        let held: BTreeSet<String> = ["a", "c"].map(String::from).into();
+        let held_ids = |set, limit| ids(select_items(set, items.clone(), limit, Some(&held)));
+        assert_eq!(held_ids(Set::Impact, None), ["c"]);
+        assert_eq!(held_ids(Set::Flow, None), ["a", "c"]);
+        assert_eq!(held_ids(Set::Flow, Some(1)), ["a"]);
     }
 
     // ---- R11: declarations are identified by where the result says they are.

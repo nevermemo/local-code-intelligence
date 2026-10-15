@@ -143,6 +143,7 @@ use handler::{
     StopPolicy,
 };
 use lci_core::node::{NodeId, NodeKind};
+use priors::HopPriors;
 use serde_json::{Value, json};
 use source::{EdgeSource, Expansion, FusedEdge};
 use std::{
@@ -376,6 +377,7 @@ pub struct Traversal<'s> {
     fusion: Fusion,
     pass_through: bool,
     score_bound: bool,
+    priors: HopPriors,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
     identity: String,
@@ -401,6 +403,7 @@ impl<'s> Traversal<'s> {
             fusion: Fusion::Boost,
             pass_through: false,
             score_bound: true,
+            priors: HopPriors::default(),
             bound: None,
             identity: String::new(),
         }
@@ -463,6 +466,15 @@ impl<'s> Traversal<'s> {
     /// was made with.
     pub fn score_bound(mut self, on: bool) -> Self {
         self.score_bound = on;
+        self
+    }
+
+    /// The hop priors (default: the guessed [`frontier::kind_prior`] table).
+    /// A handle keeps the question type and the content hash of a fitted
+    /// table, not the table: the caller passes it again on a resume and checks
+    /// it with [`handle::Snapshot::check_priors`].
+    pub fn priors(mut self, priors: HopPriors) -> Self {
+        self.priors = priors;
         self
     }
 
@@ -685,6 +697,9 @@ impl<'s> Run<'s> {
             }
             if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
                 object.insert("score_bound".into(), json!(false));
+            }
+            if let (Some(priors), Some(object)) = (self.t.priors.json(), start.as_object_mut()) {
+                object.insert("priors".into(), priors);
             }
             if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
                 for (key, value) in plan.fields(stops_json(&self.t.stops)) {
@@ -1077,6 +1092,7 @@ impl<'s> Run<'s> {
         let ctx = ScoreCtx {
             query: &self.query,
             nodes_seen: self.states.len(),
+            priors: &self.t.priors,
         };
         let steps = hop(self.t.scorer.as_mut(), &ctx, &cands, self.t.price);
 

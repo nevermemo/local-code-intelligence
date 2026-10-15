@@ -274,6 +274,7 @@ pub fn run(args: FitPriorsArgs) -> Result<()> {
     )?;
     let table: PriorTable = fitted.fit.fit(args.smoothing, fitted.holdout.clone());
     table.save(&args.out)?;
+    let normalised = table.normalised();
     println!(
         "wrote {} ({} hold-out items)",
         args.out.display(),
@@ -301,13 +302,14 @@ pub fn run(args: FitPriorsArgs) -> Result<()> {
             .iter()
             .map(|((map, kind), count)| {
                 let prior = table.lookup(question_type, map, *kind);
-                (prior - kind_prior(*kind), map, *kind, *count, prior)
+                let norm = normalised.lookup(question_type, map, *kind);
+                (prior - kind_prior(*kind), map, *kind, *count, prior, norm)
             })
             .collect();
         changes.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
-        for (_, map, kind, count, prior) in changes.into_iter().take(5) {
+        for (_, map, kind, count, prior, norm) in changes {
             println!(
-                "  {map} {}: n={} positive={} prior={prior:.4} guess={:.2}",
+                "  {map} {}: n={} positive={} prior={prior:.4} normalised={norm:.3} guess={:.2}",
                 kind.as_str(),
                 count.n,
                 count.positives,

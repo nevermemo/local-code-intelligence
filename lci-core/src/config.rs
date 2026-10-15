@@ -578,6 +578,18 @@ pub struct TraverseConfig {
     /// `bound`). `false`: the walk runs to its budgets or a dry frontier. A
     /// resumed traversal keeps the setting its handle was made with.
     pub score_bound: bool,
+    /// A table of fitted hop priors (`cargo xtask maps fit-priors` writes
+    /// one), read when a traversal starts; a relative path is taken from the
+    /// working directory. Needs `question_type`. Absent: hops are priced by
+    /// the guessed table. A continuation handle keeps the table's content hash
+    /// and is refused when the file has changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priors: Option<String>,
+    /// The question type (`impact`, `flow`, `where-to`, `history`) whose
+    /// priors in `priors` price the hops; a type the table does not hold is
+    /// priced by the guess. Needs `priors`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_type: Option<String>,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
@@ -649,6 +661,19 @@ impl TraverseConfig {
             Self::MAX_SEED_K_LIMIT,
             self.seed_k
         );
+        ensure!(
+            self.priors.is_some() == self.question_type.is_some(),
+            "traverse.priors and traverse.question_type go together: a table is read for one question type"
+        );
+        for (key, value) in [
+            ("priors", &self.priors),
+            ("question_type", &self.question_type),
+        ] {
+            ensure!(
+                value.as_deref().is_none_or(|v| !v.trim().is_empty()),
+                "traverse.{key} must be nonempty"
+            );
+        }
         Ok(())
     }
 }
@@ -668,6 +693,8 @@ impl Default for TraverseConfig {
             fusion: TraverseFusion::Boost,
             pass_through: false,
             score_bound: true,
+            priors: None,
+            question_type: None,
             seed_k: 8,
         }
     }
@@ -2888,7 +2915,7 @@ fusion = \"{fusion}\"
             assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
         }
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 15] = [
+        let bad: [(&str, Set); 18] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2907,6 +2934,12 @@ fusion = \"{fusion}\"
             ("corroboration_boost", |t| t.corroboration_boost = 1e308),
             ("corroboration_boost", |t| {
                 t.corroboration_boost = TraverseConfig::MAX_CORROBORATION_BOOST + 0.5
+            }),
+            ("priors", |t| t.priors = Some("table.json".into())),
+            ("question_type", |t| t.question_type = Some("flow".into())),
+            ("priors", |t| {
+                t.priors = Some(" ".into());
+                t.question_type = Some("flow".into())
             }),
             ("seed_k", |t| t.seed_k = 0),
             ("seed_k", |t| {
@@ -2932,6 +2965,9 @@ fusion = \"{fusion}\"
             config.traverse.corroboration_boost = boost;
             config.validate().unwrap();
         }
+        config.traverse.priors = Some("table.json".into());
+        config.traverse.question_type = Some("flow".into());
+        config.validate().unwrap();
     }
 
     #[test]

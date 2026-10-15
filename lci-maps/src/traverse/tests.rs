@@ -51,6 +51,8 @@ struct GraphMap {
     invoked: Arc<AtomicU32>,
     /// The card says the map derives from a graph shared with other maps.
     dependent: bool,
+    /// The kind of every edge.
+    kind: EdgeKind,
 }
 
 impl GraphMap {
@@ -81,7 +83,13 @@ impl GraphMap {
             runs: None,
             invoked: Arc::default(),
             dependent: false,
+            kind: EdgeKind::CallsOrRefs,
         }
+    }
+
+    fn kind(mut self, kind: EdgeKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Marks the map as derived from a shared graph (see `MapCard::dependent`).
@@ -168,7 +176,7 @@ impl Map for GraphMap {
             .map(|(a, b)| Edge {
                 src: node(a),
                 dst: node(b),
-                kind: EdgeKind::CallsOrRefs,
+                kind: self.kind,
                 map: self.descriptor.id,
                 witness: self.witness,
                 conf: self.conf,
@@ -342,6 +350,7 @@ fn score_ctx() -> ScoreCtx<'static> {
     ScoreCtx {
         query: &[],
         nodes_seen: 10,
+        priors: &crate::traverse::priors::GUESSED,
     }
 }
 
@@ -2449,3 +2458,5 @@ mod continuation;
 mod harness;
 
 mod fusion;
+
+mod priors;

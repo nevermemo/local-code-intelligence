@@ -17,9 +17,9 @@
 //! negatives; a type with no positive hop at all is left out (its fit would
 //! only shrink every pair toward 0), so it keeps the guess.
 
-use super::frontier::kind_prior;
+use super::{frontier::kind_prior, trace::hash16};
 use crate::EdgeKind;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs, io,
@@ -86,6 +86,28 @@ impl PriorTable {
             .and_then(|kinds| kinds.get(&kind))
             .copied()
             .unwrap_or_else(|| kind_prior(kind))
+    }
+
+    /// The table the engine prices hops with: per question type, every prior
+    /// divided by that type's largest, so the best hop kind is 1 and the rest
+    /// keep their ratios (fitted base rates are far below the guess, whose
+    /// scale the gate and beam arithmetic assumes). A type whose largest
+    /// prior is not positive is left as it is.
+    pub fn normalised(&self) -> Self {
+        let mut table = self.clone();
+        for maps in table.types.values_mut() {
+            let top = maps
+                .values()
+                .flat_map(BTreeMap::values)
+                .copied()
+                .fold(0.0, f64::max);
+            if top > 0.0 && top.is_finite() {
+                maps.values_mut()
+                    .flat_map(BTreeMap::values_mut)
+                    .for_each(|prior| *prior /= top);
+            }
+        }
+        table
     }
 
     /// Pretty JSON with every key sorted, ending in a newline.
@@ -170,6 +192,65 @@ impl PriorTable {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, self.to_json_string())
+    }
+}
+
+/// The hop priors of one engine run: the guessed [`kind_prior`], or a fitted
+/// table read for one question type (normalised, see
+/// [`PriorTable::normalised`]). It remembers the hash of the file's bytes,
+/// which a continuation handle keeps so a resume refuses a changed table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HopPriors {
+    learned: Option<Learned>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Learned {
+    table: PriorTable,
+    question_type: String,
+    hash: String,
+}
+
+/// The guessed priors, for a caller that holds none of its own.
+pub static GUESSED: HopPriors = HopPriors { learned: None };
+
+impl HopPriors {
+    /// The table in the file at `path`, for `question_type`.
+    pub fn open(path: impl AsRef<Path>, question_type: &str) -> io::Result<Self> {
+        Self::from_text(&fs::read_to_string(path)?, question_type)
+    }
+
+    /// The table in `text` (the content of a table file).
+    pub fn from_text(text: &str, question_type: &str) -> io::Result<Self> {
+        Ok(Self {
+            learned: Some(Learned {
+                table: PriorTable::from_json_str(text)?.normalised(),
+                question_type: question_type.to_owned(),
+                hash: hash16(text.as_bytes()),
+            }),
+        })
+    }
+
+    /// The prior of a hop of `kind` offered by `map`.
+    pub fn prior(&self, map: &str, kind: EdgeKind) -> f64 {
+        match &self.learned {
+            Some(learned) => learned.table.lookup(&learned.question_type, map, kind),
+            None => kind_prior(kind),
+        }
+    }
+
+    /// The question type and the content hash of the table; none when the
+    /// priors are the guess.
+    pub fn fingerprint(&self) -> Option<(&str, &str)> {
+        self.learned
+            .as_ref()
+            .map(|learned| (learned.question_type.as_str(), learned.hash.as_str()))
+    }
+
+    /// The fingerprint as the `start` and `resume` events show it.
+    pub(super) fn json(&self) -> Option<Value> {
+        self.fingerprint()
+            .map(|(question_type, hash)| json!({"question_type": question_type, "hash": hash}))
     }
 }
 
@@ -408,5 +489,41 @@ mod tests {
         assert!(text.find("calls_or_refs").unwrap() < text.find("contains").unwrap());
         assert!(text.find("\"a\"").unwrap() < text.find("\"b\"").unwrap());
         assert!(PriorTable::from_json_str("{\"version\": 9, \"priors\": {}}").is_err());
+    }
+
+    #[test]
+    fn normalising_scales_each_type_by_its_largest_prior_and_leaves_the_rest() {
+        let mut table = PriorTable::default();
+        for (question_type, map, kind, prior) in [
+            ("impact", "graph.scip", EdgeKind::DefinedIn, 0.13),
+            ("impact", "graph.scip", EdgeKind::CallsOrRefs, 0.013),
+            ("impact", "scip.impact", EdgeKind::CallsOrRefs, 0.065),
+            ("flow", "graph.scip", EdgeKind::CallsOrRefs, 0.4),
+            ("dead", "graph.scip", EdgeKind::CallsOrRefs, 0.0),
+        ] {
+            table
+                .types
+                .entry(question_type.into())
+                .or_default()
+                .entry(map.into())
+                .or_default()
+                .insert(kind, prior);
+        }
+        let got = table.normalised();
+        let at = |question_type: &str, map: &str, kind| got.lookup(question_type, map, kind);
+        assert_eq!(at("impact", "graph.scip", EdgeKind::DefinedIn), 1.0);
+        assert!((at("impact", "graph.scip", EdgeKind::CallsOrRefs) - 0.1).abs() < 1e-12);
+        assert!((at("impact", "scip.impact", EdgeKind::CallsOrRefs) - 0.5).abs() < 1e-12);
+        assert_eq!(at("flow", "graph.scip", EdgeKind::CallsOrRefs), 1.0);
+        assert_eq!(at("dead", "graph.scip", EdgeKind::CallsOrRefs), 0.0);
+        // The file keeps the raw values; an absent pair is still the guess.
+        assert_eq!(
+            table.lookup("impact", "graph.scip", EdgeKind::DefinedIn),
+            0.13
+        );
+        assert_eq!(
+            at("impact", "graph.scip", EdgeKind::Tests),
+            kind_prior(EdgeKind::Tests)
+        );
     }
 }

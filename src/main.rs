@@ -446,6 +446,14 @@ struct TraverseArgs {
     /// started with.
     #[arg(long)]
     no_score_bound: bool,
+    /// A table of fitted hop priors (the `[traverse] priors` setting); needs
+    /// --question-type. A continuation must be given the same table.
+    #[arg(long, requires = "question_type")]
+    priors: Option<String>,
+    /// The question type whose priors price the hops (the `[traverse]
+    /// question_type` setting); needs a table.
+    #[arg(long)]
+    question_type: Option<String>,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -495,6 +503,8 @@ async fn run_traverse(
     }
     config.traverse.pass_through |= args.pass_through;
     config.traverse.score_bound &= !args.no_score_bound;
+    config.traverse.priors = args.priors.clone().or(config.traverse.priors);
+    config.traverse.question_type = args.question_type.clone().or(config.traverse.question_type);
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(text) => match json_argument(text)? {

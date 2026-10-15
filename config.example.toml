@@ -354,5 +354,12 @@ pass_through = false
 # reason `bound`. false: the walk runs to its budgets or a dry frontier. A resumed
 # traversal keeps the setting its handle was made with.
 score_bound = true
+# A table of fitted hop priors (written by `cargo xtask maps fit-priors`) and the
+# question type whose priors price the hops; both or neither. Per question type
+# the priors are divided by the largest, and a pair the table lacks keeps the
+# guessed prior. A continuation handle keeps the table's content hash and is
+# refused when the file changed.
+# priors = "hop-priors.json"
+# question_type = "flow"
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8

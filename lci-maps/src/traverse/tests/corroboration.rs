@@ -241,7 +241,7 @@ async fn corroboration_and_its_boost_survive_a_handle() {
     assert_eq!(again, snapshot);
     assert!(again.states.iter().any(|s| s.n_maps() > 0));
     // A handle of an older version is refused, not read as a current one.
-    for version in [3, 4, 5] {
+    for version in [3, 4, 5, 6] {
         let mut old = snapshot.to_json();
         old["version"] = Value::from(version);
         assert_eq!(

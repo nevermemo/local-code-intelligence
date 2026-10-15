@@ -20,7 +20,7 @@ pub use crate::walk::{BfsScorer, RandomScorer};
 use crate::{
     EdgeKind,
     edge::{MapCard, WitnessClass},
-    traverse::source::FusedEdge,
+    traverse::{priors::HopPriors, source::FusedEdge},
     walk::{W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
 };
 use std::{
@@ -262,6 +262,8 @@ pub struct ScoreCtx<'a> {
     pub query: &'a [String],
     /// States discovered so far.
     pub nodes_seen: usize,
+    /// What a hop of each kind is worth: the guess, or a fitted table.
+    pub priors: &'a HopPriors,
 }
 
 /// An ordering arm. Scores are higher-is-better; ties keep offer order.
@@ -339,7 +341,7 @@ impl HopScorer for RulesScorer {
                     .clamp(0.0, 1.0);
                 let cost = 1.0 / (1.0 + c.card.expand_p50_ms.unwrap_or(0.0).max(0.0) / COST_REF_MS);
                 witness_prior(c.edge.best.witness)
-                    * kind_prior(c.edge.best.kind)
+                    * ctx.priors.prior(c.edge.best.map, c.edge.best.kind)
                     * (f64::from(c.edge.conf) / 100.0)
                     * cost
                     * (W_BASE + W_INDEGREE_IDF * idf + W_OVERLAP * overlap(ctx.query, c))
@@ -390,7 +392,7 @@ pub fn hop(
         return cands
             .iter()
             .enumerate()
-            .map(|(i, c)| (i, kind_prior(c.edge.best.kind)))
+            .map(|(i, c)| (i, ctx.priors.prior(c.edge.best.map, c.edge.best.kind)))
             .collect();
     }
     let scores = scorer.score(ctx, cands);
@@ -400,6 +402,12 @@ pub fn hop(
         .into_iter()
         .take(price.beam)
         .enumerate()
-        .map(|(rank, i)| (i, kind_prior(cands[i].edge.best.kind) / (1.0 + rank as f64)))
+        .map(|(rank, i)| {
+            let edge = &cands[i].edge.best;
+            (
+                i,
+                ctx.priors.prior(edge.map, edge.kind) / (1.0 + rank as f64),
+            )
+        })
         .collect()
 }

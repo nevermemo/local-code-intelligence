@@ -55,6 +55,7 @@ use lci_maps::{
         handle::HandleStore,
         handler::{Checkpoint, StopPolicy},
         ladder::Ladder,
+        priors::HopPriors,
         rules::RuleList,
         source::OnTheFly,
         steer::Steer,
@@ -1002,6 +1003,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     if wanted.iter().any(|id| OPT_IN_MAPS.contains(id)) && call.scip_root.is_none() {
         bail!("the maps named beyond the defaults read the tree: give its root");
     }
+    let priors = match (&limits.priors, &limits.question_type) {
+        (None, None) => HopPriors::default(),
+        (Some(path), Some(question_type)) => HopPriors::open(path, question_type)
+            .map_err(|e| anyhow!("[traverse] priors {path}: {e}"))?,
+        _ => bail!("[traverse] priors and question_type go together"),
+    };
     let (mut budget, mut notes) = clamp_budget(limits, call.budget);
     let handler = build_ladder(limits, call.steer, budget.pops, &mut notes)?;
     let actions = match (&call.steer.actions, call.handle) {
@@ -1034,6 +1041,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         snapshot
             .check_identity(&identity)
             .map_err(|e| anyhow!("{e}"))?;
+        snapshot.check_priors(&priors).map_err(|e| anyhow!("{e}"))?;
     }
     let wants = |id: MapId| wanted.contains(&id);
 
@@ -1279,6 +1287,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .fusion(limits.fusion)
         .pass_through(limits.pass_through)
         .score_bound(limits.score_bound)
+        .priors(priors)
         .top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),

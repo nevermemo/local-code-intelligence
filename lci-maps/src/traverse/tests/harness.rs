@@ -9,6 +9,9 @@
 //! invariants hold, the score bound does not apply (it is off), and every
 //! result has a positive fused score that a resume reproduces.
 //!
+//! One seed in four prices hops with a random fitted table instead of the
+//! guess: the same invariants hold.
+//!
 //! Every seed runs twice, with pass-through off and on. On, the odd nodes are
 //! symbols and the even ones files, so some pops are free: counted pops stay
 //! within the pop cap, free pops stay within it too, and the token budget
@@ -18,7 +21,10 @@
 //! `LCI_TRAVERSE_SEED=<n> cargo test -p lci-maps harness`.
 
 use super::*;
-use crate::{traverse::handle::Snapshot, walk::SplitMix};
+use crate::{
+    traverse::{handle::Snapshot, priors::HopPriors},
+    walk::SplitMix,
+};
 
 const DEFAULT_SEEDS: u64 = 512;
 const HUGE_TOKENS: u64 = u64::MAX / 2;
@@ -68,6 +74,8 @@ struct Case {
     pause_at: u32,
     fusion: Fusion,
     pass_through: bool,
+    /// One seed in four prices hops with a random fitted table.
+    priors: bool,
 }
 
 impl Case {
@@ -141,7 +149,28 @@ impl Case {
                 Fusion::Boost
             },
             pass_through,
+            priors: seed % 4 == 1,
         }
+    }
+
+    /// The guess, or a table with a random prior for each map's calls.
+    fn hop_priors(&self) -> HopPriors {
+        if !self.priors {
+            return HopPriors::default();
+        }
+        let mut rng = SplitMix(self.seed);
+        let by_map: Vec<String> = ["m0", "m1", "m2"]
+            .iter()
+            .map(|id| {
+                let prior = (1 + below(&mut rng, 500)) as f64 / 1000.0;
+                format!(r#""{id}": {{"calls_or_refs": {prior}}}"#)
+            })
+            .collect();
+        let text = format!(
+            r#"{{"version": 1, "priors": {{"flow": {{{}}}}}}}"#,
+            by_map.join(", ")
+        );
+        HopPriors::from_text(&text, "flow").expect("a valid table")
     }
 
     fn budget(&self, pops: u32) -> TraversalBudget {
@@ -244,7 +273,8 @@ async fn run_with(
         beam: case.price.1,
     })
     .fusion(case.fusion)
-    .pass_through(case.pass_through);
+    .pass_through(case.pass_through)
+    .priors(case.hop_priors());
     traversal = match case.scorer {
         1 => traversal.scorer(BfsScorer),
         2 => traversal.scorer(RandomScorer::new(case.seed)),

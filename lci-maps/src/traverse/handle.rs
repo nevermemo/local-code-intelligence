@@ -32,6 +32,7 @@
 use super::{
     Fusion, Run, State, Totals, Traversal, TraversalBudget,
     frontier::Frontier,
+    priors::HopPriors,
     rank_json,
     stop::{Disagreement, MapStat, Tally},
     stops_json,
@@ -47,7 +48,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -64,6 +65,14 @@ pub enum HandleError {
     /// The handle was made for another workspace or index than the one the
     /// caller is walking (see [`Snapshot::check_identity`]).
     WrongIdentity {
+        handle: String,
+        found: String,
+        expected: String,
+    },
+    /// The handle was made with other hop priors than the caller gives (see
+    /// [`Snapshot::check_priors`]); each side is `question type @ table hash`,
+    /// or `none` for the guessed table.
+    WrongPriors {
         handle: String,
         found: String,
         expected: String,
@@ -94,6 +103,15 @@ impl fmt::Display for HandleError {
                      start a new traversal instead of resuming it"
                 )
             }
+            Self::WrongPriors {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the hop priors {found}, this call has \
+                 {expected}; give the same table and question type, or start a new traversal"
+            ),
         }
     }
 }
@@ -154,6 +172,10 @@ pub struct Snapshot {
     pub pass_through: bool,
     /// Whether the score bound could end the walk; a resume keeps it.
     pub score_bound: bool,
+    /// The question type and content hash of the fitted hop priors the first
+    /// call priced with (none: the guess). Written to the handle only when
+    /// there are some.
+    pub priors: Option<(String, String)>,
 }
 
 impl Snapshot {
@@ -174,6 +196,12 @@ impl Snapshot {
             // Left out under `boost`, so those handles are what they were.
             if self.fusion == Fusion::Rrf {
                 object.insert("fusion".into(), json!(self.fusion.as_str()));
+            }
+            if let Some((question_type, hash)) = &self.priors {
+                object.insert(
+                    "priors".into(),
+                    json!({"question_type": question_type, "hash": hash}),
+                );
             }
         }
         value
@@ -240,6 +268,27 @@ impl Snapshot {
                 expected: expected.to_string(),
             })
         }
+    }
+
+    /// Refuses a snapshot made with other hop priors than `priors`: a
+    /// different question type, a table whose content hash changed, or one
+    /// side being the guess.
+    pub fn check_priors(&self, priors: &HopPriors) -> Result<(), HandleError> {
+        let current = priors
+            .fingerprint()
+            .map(|(question_type, hash)| (question_type.to_owned(), hash.to_owned()));
+        if self.priors == current {
+            return Ok(());
+        }
+        let show = |priors: &Option<(String, String)>| match priors {
+            Some((question_type, hash)) => format!("{question_type} @ {hash}"),
+            None => "none".to_owned(),
+        };
+        Err(HandleError::WrongPriors {
+            handle: self.handle(),
+            found: show(&self.priors),
+            expected: show(&current),
+        })
     }
 
     /// Reads and checks a snapshot: every index in range, every id valid.
@@ -475,6 +524,16 @@ impl Snapshot {
             score_bound: get(obj, "score_bound")?
                 .as_bool()
                 .ok_or("score_bound is not a boolean")?,
+            priors: match obj.get("priors") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let v = v.as_object().ok_or("priors is not an object")?;
+                    Some((
+                        string_of(get(v, "question_type")?)?,
+                        string_of(get(v, "hash")?)?,
+                    ))
+                }
+            },
         })
     }
 }
@@ -721,6 +780,11 @@ impl Run<'_> {
             fusion: self.t.fusion,
             pass_through: self.t.pass_through,
             score_bound: self.t.score_bound,
+            priors: self
+                .t
+                .priors
+                .fingerprint()
+                .map(|(question_type, hash)| (question_type.to_owned(), hash.to_owned())),
         }
     }
 
@@ -830,6 +894,9 @@ impl Run<'_> {
         }
         if let (false, Some(object)) = (score_bound, resume.as_object_mut()) {
             object.insert("score_bound".into(), json!(false));
+        }
+        if let (Some(priors), Some(object)) = (self.t.priors.json(), resume.as_object_mut()) {
+            object.insert("priors".into(), priors);
         }
         self.events.push(resume);
     }
