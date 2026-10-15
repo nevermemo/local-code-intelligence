@@ -293,11 +293,9 @@ async fn lexical_from_a_symbol_offers_the_other_chunks_that_hold_the_name() {
                 _ => unreachable!(),
             }
         );
-        assert_eq!(
-            edge.cost.external_calls, 0,
-            "ripgrep is not an external call"
-        );
     }
+    let cost = map.expand(&compute_total(), budget(10), &view()).await.cost;
+    assert_eq!(cost.external_calls, 0, "ripgrep is not an external call");
     let by = |hash: &str| {
         edges
             .iter()
@@ -452,9 +450,10 @@ async fn vector_uses_the_stored_embedding_and_makes_no_embed_call() {
         assert_eq!(edge.kind, EdgeKind::Near);
         assert_eq!(edge.map, SEARCH_VECTOR_ID);
         assert_eq!(edge.witness, WitnessClass::Heuristic);
-        assert_eq!(edge.cost.external_calls, 0);
         assert!(edge.site.as_ref().unwrap().blob.is_empty());
     }
+    let cost = map.expand(&compute_total(), budget(10), &view()).await.cost;
+    assert_eq!(cost.external_calls, 0, "a stored vector needs no embedding");
     // conf is the cosine in whole percent: 0.9 / sqrt(0.82) = 0.9939.
     assert_eq!(edges[0].conf, 99);
     assert_eq!(edges[1].conf, 97);
@@ -470,7 +469,9 @@ async fn vector_embeds_once_when_no_vector_is_stored_and_counts_the_call() {
     let edges = expand(&map, &file("src/omega.rs")).await;
     assert_eq!(mem.embed_calls.load(Ordering::Relaxed), 1);
     assert!(!edges.is_empty());
-    assert!(edges.iter().all(|e| e.cost.external_calls == 1));
+    // One embedding call, reported once beside the edges.
+    let again = map.expand(&file("src/omega.rs"), budget(10), &view()).await;
+    assert_eq!(again.cost.external_calls, 1);
     // The fixture embeds to [0, 0, 1]: delta is the nearest.
     assert_eq!(edges[0].dst, chunk_node("src/delta.rs", "d1"));
     assert_eq!(edges[0].conf, 100);
@@ -479,11 +480,14 @@ async fn vector_embeds_once_when_no_vector_is_stored_and_counts_the_call() {
     // left for an external call: no edges and no call.
     let mem = Mem::new();
     let map = vector(&mem);
-    let none = map.expand(&file("src/omega.rs"), budget(0), &view()).await;
+    let none = map
+        .expand(&file("src/omega.rs"), budget(0), &view())
+        .await
+        .edges;
     assert!(none.is_empty());
     assert_eq!(mem.embed_calls.load(Ordering::Relaxed), 0);
     // The same budget does not stop a stored vector from being used.
-    let some = map.expand(&compute_total(), budget(0), &view()).await;
+    let some = map.expand(&compute_total(), budget(0), &view()).await.edges;
     assert!(!some.is_empty());
 }
 
@@ -494,13 +498,18 @@ async fn vector_embeds_the_name_of_a_node_the_index_does_not_hold() {
     let edges = expand(&map, &compute_total()).await;
     assert_eq!(mem.embed_calls.load(Ordering::Relaxed), 1);
     assert!(!edges.is_empty());
-    assert!(edges.iter().all(|e| e.cost.external_calls == 1));
+    let again = map.expand(&compute_total(), budget(10), &view()).await;
+    assert_eq!(again.cost.external_calls, 1);
     // Nothing to embed for a node that names nothing.
     let commit = NodeId::Commit {
         sha: "d".repeat(40),
     };
     assert!(expand(&map, &commit).await.is_empty());
-    assert_eq!(mem.embed_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        mem.embed_calls.load(Ordering::Relaxed),
+        2,
+        "the commit embeds nothing"
+    );
 }
 
 #[tokio::test]

@@ -235,7 +235,8 @@ fn an_error_site_in_a_unit_becomes_an_edge_to_that_unit() {
     let canned = Canned::new(|dir| vec![error_at(dir, "src/lib.rs", 3, 27)]);
     let map = fixture.map(&canned);
     let helper = node_named(&map.inner.scip, "helper");
-    let edges = map.edges_blocking(&helper, WAIT);
+    let found = map.inner.edges_for(&helper, WAIT);
+    let (edges, cost) = (found.edges, found.cost);
     assert_eq!(edges.len(), 1, "{edges:?}");
     let edge = &edges[0];
     assert_eq!(edge.src, helper);
@@ -254,8 +255,8 @@ fn an_error_site_in_a_unit_becomes_an_edge_to_that_unit() {
             col: 26
         })
     );
-    assert_eq!(edge.cost.external_calls, 1);
-    assert!(edge.cost.elapsed_ms > 0.0);
+    assert_eq!(cost.external_calls, 1);
+    assert!(cost.elapsed_ms > 0.0);
     assert_eq!(
         check_edge_invariants(&helper, map.describe(), &edges, EXPAND_LIMIT),
         Ok(())
@@ -423,7 +424,7 @@ async fn expand_and_query_go_through_the_blocking_probe() {
         max_external_calls: u32::MAX,
         max_nodes_touched: u64::MAX,
     };
-    let edges = map.expand(&helper, budget, &view).await;
+    let edges = map.expand(&helper, budget, &view).await.edges;
     assert_eq!(edges.len(), 1);
     let seeds = [(helper.clone(), 1.0)];
     let params = serde_json::Value::Null;

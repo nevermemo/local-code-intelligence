@@ -8,9 +8,9 @@
 //! symbol, W2 is `rg -w` of the field name, rule L reads TOML text inside Rust
 //! string literals. Nothing here reads a gold.
 
+use crate::EdgeKind;
 use crate::impact::{Chunk, Decl, ImpactIndex, SourceCache, code_names, rg_hits};
 use crate::scip_graph::SourceText;
-use crate::{Cost, EdgeKind};
 use lci_core::node::{ConfigNamespace, NodeId, SymbolKey, SymbolKind, rust_module_path};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -175,7 +175,6 @@ impl From<&Edge> for crate::edge::Edge {
                 line: edge.decl.line,
                 col: 0,
             }),
-            cost: Cost::default(),
         }
     }
 }

@@ -43,7 +43,7 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, Need, SnapshotView,
     SourceLabel,
-    edge::{CONF_MAX, Edge, MapCard, QuestionType, WitnessClass, cap_edges},
+    edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, WitnessClass, cap_edges},
     probe_map::run_limited,
     scip_graph::ScipMap,
 };
@@ -277,7 +277,7 @@ impl GitHistoryMap {
     /// The edges leaving `node`, synchronously (what [`Map::expand`] runs on a
     /// blocking thread).
     pub fn edges_blocking(&self, node: &NodeId) -> Result<Vec<Edge>, String> {
-        self.inner.edges_for(node)
+        self.inner.edges_for(node).map(|expanded| expanded.edges)
     }
 }
 
@@ -381,7 +381,7 @@ impl Inner {
         }
     }
 
-    fn edges_for(&self, node: &NodeId) -> Result<Vec<Edge>, String> {
+    fn edges_for(&self, node: &NodeId) -> Result<Expanded, String> {
         let started = Instant::now();
         let mut tally = Tally::default();
         let mut edges = match node {
@@ -406,15 +406,12 @@ impl Inner {
             bytes_read: tally.bytes,
             est_tokens: 0,
         };
-        for edge in &mut edges {
-            edge.cost = cost;
-        }
         let mut timings = lock(&self.timings);
         if timings.len() >= 256 {
             timings.remove(0);
         }
         timings.push(elapsed_ms);
-        Ok(edges)
+        Ok(Expanded::new(edges, cost))
     }
 
     fn file_edges(
@@ -454,7 +451,6 @@ impl Inner {
                     witness: WitnessClass::Exact,
                     conf: scale(base, pct),
                     site: None,
-                    cost: Cost::default(),
                 });
             }
             self.remember(&commits);
@@ -504,7 +500,6 @@ impl Inner {
                 witness: WitnessClass::Heuristic,
                 conf: conf as u8,
                 site: None,
-                cost: Cost::default(),
             });
         }
         Ok(edges)
@@ -562,7 +557,6 @@ impl Inner {
                 witness: WitnessClass::Exact,
                 conf,
                 site: None,
-                cost: Cost::default(),
             })
             .collect())
     }
@@ -694,11 +688,9 @@ impl Map for GitHistoryMap {
             let mut tally_cost = Cost::default();
             for seed in &seeds {
                 let found = inner.edges_for(seed)?;
-                if let Some(first) = found.first() {
-                    tally_cost.external_calls += first.cost.external_calls;
-                    tally_cost.bytes_read += first.cost.bytes_read;
-                }
-                edges.extend(found);
+                tally_cost.external_calls += found.cost.external_calls;
+                tally_cost.bytes_read += found.cost.bytes_read;
+                edges.extend(found.edges);
             }
             Ok::<_, String>((edges, tally_cost))
         })
@@ -758,18 +750,22 @@ impl Map for GitHistoryMap {
         response
     }
 
-    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
+        // Every expansion runs git: with no call left it does not run.
+        if budget.max_external_calls == 0 {
+            return Expanded::default();
+        }
         let inner = self.inner.clone();
         let node = node.clone();
         match tokio::task::spawn_blocking(move || inner.edges_for(&node)).await {
-            Ok(Ok(edges)) => edges,
+            Ok(Ok(expanded)) => expanded,
             Ok(Err(error)) => {
                 *lock(&self.inner.last_error) = Some(error);
-                Vec::new()
+                Expanded::default()
             }
             Err(_) => {
                 *lock(&self.inner.last_error) = Some("git history worker panicked".into());
-                Vec::new()
+                Expanded::default()
             }
         }
     }

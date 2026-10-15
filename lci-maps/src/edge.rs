@@ -100,8 +100,26 @@ pub struct Edge {
     /// Whole percent, `0..=CONF_MAX`.
     pub conf: u8,
     pub site: Option<Site>,
-    /// What producing this edge cost: the call's cost, not a share of it.
+}
+
+/// What one [`crate::Map::expand`] call returns: the edges and what the call
+/// cost. The cost belongs to the call, so it is reported once however many
+/// edges come back, and an expansion with no edges still has one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Expanded {
+    pub edges: Vec<Edge>,
     pub cost: Cost,
+}
+
+impl Expanded {
+    pub fn new(edges: Vec<Edge>, cost: Cost) -> Self {
+        Self { edges, cost }
+    }
+
+    /// Edges of a call that reports no cost.
+    pub fn free(edges: Vec<Edge>) -> Self {
+        Self::new(edges, Cost::default())
+    }
 }
 
 /// Sorts by confidence (high first), then destination, kind, map, witness,
@@ -168,7 +186,6 @@ pub fn edges_from_response(
                 witness: label.map_or(WitnessClass::Heuristic, WitnessClass::of_label),
                 conf: hit.score.map_or(CONF_UNKNOWN, conf_from_unit),
                 site: None,
-                cost: response.cost,
             }
         })
         .collect();
@@ -231,7 +248,6 @@ mod tests {
             witness: WitnessClass::Compiler,
             conf,
             site: None,
-            cost: Cost::default(),
         }
     }
 
@@ -342,7 +358,7 @@ mod tests {
         let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
         let node = file("s");
 
-        let edges = map.expand(&node, budget(), &view).await;
+        let edges = map.expand(&node, budget(), &view).await.edges;
 
         // The query the default asks: the node as the only seed, no text.
         let seeds = [(node.clone(), 1.0)];
@@ -408,7 +424,7 @@ mod tests {
             hits: vec![bare],
         };
         let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
-        let edges = map.expand(&file("s"), budget(), &view).await;
+        let edges = map.expand(&file("s"), budget(), &view).await.edges;
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].witness, WitnessClass::Compiler);
         assert_eq!(edges[0].kind, EdgeKind::QueryMatch);

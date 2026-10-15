@@ -162,17 +162,22 @@ async fn a_declaration_reaches_the_keys_it_reads() {
     assert_eq!(edges[0].site.as_ref().unwrap().line, 9);
     // A declaration only text names has no edge by default.
     let text_reader = function("b", "text_reader");
-    assert!(map.expand(&text_reader, budget(), &view()).await.is_empty());
+    assert!(
+        map.expand(&text_reader, budget(), &view())
+            .await
+            .edges
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn text_edges_are_off_by_default_and_a_switch_turns_them_on() {
     let node = key("channels.lsp");
-    let off = map(false).expand(&node, budget(), &view()).await;
+    let off = map(false).expand(&node, budget(), &view()).await.edges;
     assert_eq!(off.len(), 2);
 
     let on_map = map(true);
-    let on = on_map.expand(&node, budget(), &view()).await;
+    let on = on_map.expand(&node, budget(), &view()).await.edges;
     assert_eq!(on.len(), 3);
     let text = on.iter().find(|e| e.witness == WitnessClass::Text).unwrap();
     assert_eq!(
@@ -183,6 +188,7 @@ async fn text_edges_are_off_by_default_and_a_switch_turns_them_on() {
         on_map
             .expand(&function("b", "text_reader"), budget(), &view())
             .await
+            .edges
             .len(),
         1,
         "the reverse edge too"
@@ -215,10 +221,16 @@ async fn text_edges_are_off_by_default_and_a_switch_turns_them_on() {
 #[tokio::test]
 async fn unknown_nodes_have_no_edges_and_the_build_is_counted() {
     let map = map(false);
-    assert!(map.expand(&key("nope"), budget(), &view()).await.is_empty());
+    assert!(
+        map.expand(&key("nope"), budget(), &view())
+            .await
+            .edges
+            .is_empty()
+    );
     assert!(
         map.expand(&NodeId::file("src/a.rs").unwrap(), budget(), &view())
             .await
+            .edges
             .is_empty()
     );
     let stats = map.stats();
@@ -235,7 +247,7 @@ async fn unknown_nodes_have_no_edges_and_the_build_is_counted() {
 async fn query_names_the_same_destinations_as_expand() {
     let map = map(false);
     let node = key("channels.lsp");
-    let edges = map.expand(&node, budget(), &view()).await;
+    let edges = map.expand(&node, budget(), &view()).await.edges;
     let seeds = [(node, 1.0)];
     let params = serde_json::Value::Null;
     let response = map

@@ -42,7 +42,7 @@
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
-    edge::{CONF_MAX, Edge, Site, WitnessClass, cap_edges, sort_edges},
+    edge::{CONF_MAX, Edge, Expanded, Site, WitnessClass, cap_edges, sort_edges},
     scip_graph::{FnKind, GraphEdgeKind, ScipMap},
 };
 use lci_core::node::{NodeId, NodeKind};
@@ -199,7 +199,6 @@ impl ContainsMap {
             witness: WitnessClass::Exact,
             conf: CONF_MAX,
             site: Some(self.site(symbol)),
-            cost: Cost::default(),
         }
     }
 
@@ -219,10 +218,10 @@ impl ContainsMap {
         })
     }
 
-    /// The out-edges of `node`, unsorted, with the cost of the call.
+    /// The out-edges of `node`, unsorted.
     fn edges_of(&self, node: &NodeId, view: &SnapshotView<'_>) -> Vec<Edge> {
         let structure = &*self.structure;
-        let mut edges = match node {
+        match node {
             NodeId::Symbol(_) => {
                 let Some(&at) = structure.index.get(node) else {
                     return Vec::new();
@@ -273,16 +272,8 @@ impl ContainsMap {
                     self.contains(node, overlapping.into_iter())
                 }
             }
-            _ => return Vec::new(),
-        };
-        let cost = Cost {
-            nodes_touched: edges.len() as u64,
-            ..Cost::default()
-        };
-        for edge in &mut edges {
-            edge.cost = cost;
+            _ => Vec::new(),
         }
-        edges
     }
 }
 
@@ -321,9 +312,13 @@ impl Map for ContainsMap {
         response
     }
 
-    async fn expand(&self, node: &NodeId, _budget: Budget, view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, _budget: Budget, view: &SnapshotView<'_>) -> Expanded {
         let mut edges = self.edges_of(node, view);
         cap_edges(&mut edges, EXPAND_LIMIT);
-        edges
+        let cost = Cost {
+            nodes_touched: edges.len() as u64,
+            ..Cost::default()
+        };
+        Expanded::new(edges, cost)
     }
 }

@@ -47,7 +47,7 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, Observed, SnapshotView,
     SourceLabel,
-    edge::{CONF_MAX, Edge, MapCard, QuestionType, Site, WitnessClass, cap_edges},
+    edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     probe::parse_cargo_json,
     scip_graph::ScipMap,
 };
@@ -517,14 +517,14 @@ impl ProbeMap {
 
     /// The edges of `node` for every configured patch, synchronously.
     pub fn edges_blocking(&self, node: &NodeId, timeout: Duration) -> Vec<Edge> {
-        self.inner.edges_for(node, timeout)
+        self.inner.edges_for(node, timeout).edges
     }
 
     /// The edges for a unified diff the caller made (paths relative to the
     /// tree root, `a/` and `b/` prefixes), applied in the scratch checkout
     /// with `git apply`.
     pub fn probe_diff(&self, node: &NodeId, diff: &str, timeout: Duration) -> Vec<Edge> {
-        self.inner.probe(node, Patch::Diff(diff), timeout)
+        self.inner.probe(node, Patch::Diff(diff), timeout).edges
     }
 }
 
@@ -557,12 +557,20 @@ impl Drop for Restore {
 }
 
 impl Inner {
-    fn edges_for(&self, node: &NodeId, timeout: Duration) -> Vec<Edge> {
+    /// The edges of every configured patch, and the cost of all the checks
+    /// that ran.
+    fn edges_for(&self, node: &NodeId, timeout: Duration) -> Expanded {
         let started = Instant::now();
         let mut best: HashMap<NodeId, Edge> = HashMap::new();
+        let mut cost = Cost::default();
         for kind in &self.config.kinds {
             let left = timeout.saturating_sub(started.elapsed());
-            for edge in self.probe(node, Patch::Fixed(*kind), left) {
+            let probed = self.probe(node, Patch::Fixed(*kind), left);
+            cost.external_calls = cost
+                .external_calls
+                .saturating_add(probed.cost.external_calls);
+            cost.bytes_read += probed.cost.bytes_read;
+            for edge in probed.edges {
                 match best.get(&edge.dst) {
                     Some(have) if have.conf >= edge.conf => {}
                     _ => {
@@ -579,12 +587,14 @@ impl Inner {
             timings.remove(0);
         }
         timings.push(elapsed);
-        edges
+        cost.elapsed_ms = elapsed;
+        cost.nodes_touched = edges.len() as u64;
+        Expanded::new(edges, cost)
     }
 
-    fn fail(&self, message: String) -> Vec<Edge> {
+    fn fail(&self, message: String) -> Expanded {
         *lock(&self.last_error) = Some(message);
-        Vec::new()
+        Expanded::default()
     }
 
     /// The innermost graph node whose lines hold the 0-based `line` of `file`.
@@ -598,9 +608,9 @@ impl Inner {
             .min_by_key(|&i| (nodes[i].span.1 - nodes[i].span.0, i))
     }
 
-    fn probe(&self, node: &NodeId, patch: Patch<'_>, timeout: Duration) -> Vec<Edge> {
+    fn probe(&self, node: &NodeId, patch: Patch<'_>, timeout: Duration) -> Expanded {
         let Some(&index) = self.node_index.get(node) else {
-            return Vec::new();
+            return Expanded::default();
         };
         let graph = self.scip.graph();
         let unit = &graph.nodes[index];
@@ -687,7 +697,6 @@ impl Inner {
                     line: line0,
                     col: site.col.saturating_sub(1),
                 }),
-                cost: Cost::default(),
             });
         }
         cap_edges(&mut edges, EXPAND_LIMIT);
@@ -698,9 +707,6 @@ impl Inner {
             bytes_read: output.stdout.len() as u64,
             est_tokens: 0,
         };
-        for edge in &mut edges {
-            edge.cost = cost;
-        }
         let mut problems = Vec::new();
         if output.timed_out {
             problems.push(format!(
@@ -732,7 +738,7 @@ impl Inner {
             cargo_ms,
             files_copied: copied,
         });
-        edges
+        Expanded::new(edges, cost)
     }
 }
 
@@ -879,12 +885,15 @@ impl Map for ProbeMap {
     async fn query(&self, request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
         let started = Instant::now();
         let mut edges = Vec::new();
+        let mut external_calls = 0u32;
         for (seed, _) in request.seeds {
             let timeout = request
                 .budget
                 .deadline
                 .saturating_duration_since(Instant::now());
-            edges.extend(self.expand_blocking(seed.clone(), timeout).await);
+            let expanded = self.expand_blocking(seed.clone(), timeout).await;
+            external_calls = external_calls.saturating_add(expanded.cost.external_calls);
+            edges.extend(expanded.edges);
         }
         cap_edges(&mut edges, usize::MAX);
         let mut seen = HashSet::new();
@@ -900,7 +909,7 @@ impl Map for ProbeMap {
         }
         response.cost = Cost {
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            external_calls: edges.first().map_or(0, |e| e.cost.external_calls),
+            external_calls,
             nodes_touched: edges.len() as u64,
             bytes_read: 0,
             est_tokens: 0,
@@ -923,7 +932,11 @@ impl Map for ProbeMap {
         response
     }
 
-    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
+        // Every check is an external call: with none left nothing runs.
+        if budget.max_external_calls == 0 {
+            return Expanded::default();
+        }
         let timeout = budget.deadline.saturating_duration_since(Instant::now());
         self.expand_blocking(node.clone(), timeout).await
     }
@@ -948,7 +961,7 @@ impl Map for ProbeMap {
 }
 
 impl ProbeMap {
-    async fn expand_blocking(&self, node: NodeId, timeout: Duration) -> Vec<Edge> {
+    async fn expand_blocking(&self, node: NodeId, timeout: Duration) -> Expanded {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.edges_for(&node, timeout))
             .await

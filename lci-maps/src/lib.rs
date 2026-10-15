@@ -373,12 +373,17 @@ pub trait Map: Send + Sync {
     /// The edges leaving `node`, sorted and capped at [`EXPAND_LIMIT`]. The
     /// default is a seeded query: `node` the only seed, no text, hits turned
     /// into edges ([`edge::edges_from_response`]). Graph maps override it.
+    ///
+    /// The answer carries the cost of the call beside the edges
+    /// ([`edge::Expanded`]), once, whatever the number of edges: a call that
+    /// found nothing still cost. A map that makes external calls keeps to
+    /// `budget.max_external_calls` and reports the calls it made.
     async fn expand(
         &self,
         node: &NodeId,
         budget: Budget,
         view: &SnapshotView<'_>,
-    ) -> Vec<edge::Edge> {
+    ) -> edge::Expanded {
         let seeds = [(node.clone(), 1.0)];
         let params = serde_json::Value::Null;
         let request = MapRequest {
@@ -390,7 +395,10 @@ pub trait Map: Send + Sync {
             as_of: None,
         };
         let response = self.query(&request, view).await;
-        edge::edges_from_response(node, self.describe(), &response, EXPAND_LIMIT)
+        edge::Expanded::new(
+            edge::edges_from_response(node, self.describe(), &response, EXPAND_LIMIT),
+            response.cost,
+        )
     }
 
     /// What this map says about itself to a traversal that prices hops.

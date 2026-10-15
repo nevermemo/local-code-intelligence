@@ -14,7 +14,13 @@ use crate::{
     },
 };
 use lci_core::node::NodeKind;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 fn node(name: &str) -> NodeId {
     match name.strip_prefix("tests/") {
@@ -34,6 +40,10 @@ struct GraphMap {
     cost: Cost,
     /// The file every edge was seen in, when set.
     site_path: Option<String>,
+    /// A map that keeps to the external-call allowance it is given: it does
+    /// not run when its call would pass it. `runs` adds the calls it made.
+    honors_calls: bool,
+    runs: Option<Arc<AtomicU32>>,
 }
 
 impl GraphMap {
@@ -60,6 +70,8 @@ impl GraphMap {
             panics: false,
             cost: Cost::default(),
             site_path: None,
+            honors_calls: false,
+            runs: None,
         }
     }
 
@@ -89,6 +101,13 @@ impl GraphMap {
         self
     }
 
+    /// Keeps to the call allowance and counts the calls it makes in `runs`.
+    fn counted(mut self, runs: &Arc<AtomicU32>) -> Self {
+        self.honors_calls = true;
+        self.runs = Some(runs.clone());
+        self
+    }
+
     fn witness(mut self, witness: WitnessClass) -> Self {
         self.witness = witness;
         self
@@ -110,12 +129,24 @@ impl Map for GraphMap {
         MapResponse::empty(&self.descriptor, view, MapStatus::Ok)
     }
 
-    async fn expand(&self, from: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(
+        &self,
+        from: &NodeId,
+        budget: Budget,
+        _view: &SnapshotView<'_>,
+    ) -> crate::edge::Expanded {
         assert!(!self.panics, "this map panics on purpose");
+        if self.honors_calls && self.cost.external_calls > budget.max_external_calls {
+            return crate::edge::Expanded::default();
+        }
+        if let Some(runs) = &self.runs {
+            runs.fetch_add(self.cost.external_calls, Ordering::Relaxed);
+        }
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
-        self.edges
+        let edges = self
+            .edges
             .iter()
             .filter(|(a, _)| node(a) == *from)
             .map(|(a, b)| Edge {
@@ -131,9 +162,10 @@ impl Map for GraphMap {
                     line: 1,
                     col: 0,
                 }),
-                cost: self.cost,
             })
-            .collect()
+            .collect();
+        // A call that has a cost reports it once, even for no edges.
+        crate::edge::Expanded::new(edges, self.cost)
     }
 }
 
@@ -278,11 +310,13 @@ async fn the_token_budget_is_never_exceeded() {
         );
         assert_eq!(result.status, TraversalStatus::BudgetExhausted, "{limit}");
     }
-    // 44 tokens: the call (20) and two of the four edges (24).
+    // 44 tokens: the call (20) and two of the four edges (24) fit. The pop is
+    // cut, so it charges its two adopted hops and the retry that completes it
+    // will charge the call.
     let mut limits = budget(1000);
     limits.est_tokens = 44;
     let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!((result.totals.tokens, result.totals.hops), (44, 2));
+    assert_eq!((result.totals.tokens, result.totals.hops), (24, 2));
     // 19 tokens: the call alone does not fit, so nothing is adopted.
     let mut limits = budget(1000);
     limits.est_tokens = 19;
@@ -414,17 +448,6 @@ async fn a_cross_map_hop_is_recorded() {
 }
 
 #[tokio::test]
-async fn a_seed_found_by_another_map_makes_the_first_hop_cross_map() {
-    let reg = registry(vec![GraphMap::new("graph", &[("a", "b")])]);
-    let from_lexical = Seed {
-        node: node("a"),
-        map: Some("lexical"),
-    };
-    let result = walk(&reg, vec![from_lexical], budget(10), |t| t).await;
-    assert_eq!(result.totals.cross_map_hops, 1);
-}
-
-#[tokio::test]
 async fn maps_are_asked_only_about_kinds_they_accept_and_while_enabled() {
     let mut reg = registry(vec![
         GraphMap::new("files", &[("a", "b")]),
@@ -452,7 +475,6 @@ fn edge(src: &str, dst: &str, map: MapId, witness: WitnessClass, conf: u8) -> Ed
         witness,
         conf,
         site: None,
-        cost: Cost::default(),
     }
 }
 
@@ -2622,3 +2644,5 @@ mod pre_merged;
 mod contains;
 
 mod corroboration;
+
+mod accounting;

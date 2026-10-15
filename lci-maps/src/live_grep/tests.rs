@@ -173,7 +173,8 @@ async fn without_a_locator_the_edges_go_to_files_only() {
     let map = LiveGrep::new(tree.path(), None);
     let edges = map
         .expand(&symbol("compute_total", "alpha"), budget(), &view())
-        .await;
+        .await
+        .edges;
     assert_eq!(edges.len(), 4, "{edges:#?}");
     assert!(edges.iter().all(|e| e.dst.kind() == NodeKind::File));
     // The definition's own file now counts: nothing says the line is the
@@ -185,7 +186,10 @@ async fn without_a_locator_the_edges_go_to_files_only() {
 async fn a_file_or_chunk_node_looks_for_its_stem_and_not_in_itself() {
     let tree = fixture();
     let map = LiveGrep::new(tree.path(), Some(spans()));
-    let from_file = map.expand(&file("src/alpha.rs"), budget(), &view()).await;
+    let from_file = map
+        .expand(&file("src/alpha.rs"), budget(), &view())
+        .await
+        .edges;
     // "alpha" appears in beta (use and call) and gamma (comment).
     let dsts: Vec<_> = from_file
         .iter()
@@ -199,7 +203,7 @@ async fn a_file_or_chunk_node_looks_for_its_stem_and_not_in_itself() {
     assert_eq!(beta.conf, 65, "two exact occurrences in beta");
 
     let chunk = NodeId::chunk("src/alpha.rs", "h", 0).unwrap();
-    let from_chunk = map.expand(&chunk, budget(), &view()).await;
+    let from_chunk = map.expand(&chunk, budget(), &view()).await.edges;
     assert_eq!(from_chunk.len(), from_file.len());
     assert!(from_chunk.iter().all(|e| e.src == chunk));
 }
@@ -210,13 +214,21 @@ async fn names_that_match_everywhere_and_nodes_without_a_name_make_no_edges() {
     write(tree.path(), "src/zeta.rs", "fn new() {} fn default() {}\n");
     let map = LiveGrep::new(tree.path(), Some(spans()));
     for name in ["new", "default", "ab"] {
-        let edges = map.expand(&symbol(name, "zeta"), budget(), &view()).await;
+        let edges = map
+            .expand(&symbol(name, "zeta"), budget(), &view())
+            .await
+            .edges;
         assert!(edges.is_empty(), "{name}");
     }
     let commit = NodeId::Commit {
         sha: "a".repeat(40),
     };
-    assert!(map.expand(&commit, budget(), &view()).await.is_empty());
+    assert!(
+        map.expand(&commit, budget(), &view())
+            .await
+            .edges
+            .is_empty()
+    );
     assert_eq!(map.log().len(), 0, "no scan ran for any of them");
 }
 
@@ -316,7 +328,7 @@ async fn an_edit_after_construction_is_seen_by_the_next_call() {
     let tree = fixture();
     let map = LiveGrep::new(tree.path(), Some(spans()));
     let node = symbol("compute_total", "alpha");
-    let before = map.expand(&node, budget(), &view()).await;
+    let before = map.expand(&node, budget(), &view()).await.edges;
     assert!(before.iter().all(|e| e.dst != file("src/epsilon.rs")));
     let beta_blob = by_dst(&before, &file("src/beta.rs"))
         .site
@@ -335,7 +347,7 @@ async fn an_edit_after_construction_is_seen_by_the_next_call() {
         "src/beta.rs",
         "use crate::alpha;\nfn caller() {\n    alpha::compute_total();\n    compute_total();\n}\n",
     );
-    let after = map.expand(&node, budget(), &view()).await;
+    let after = map.expand(&node, budget(), &view()).await.edges;
     let epsilon = by_dst(&after, &file("src/epsilon.rs"));
     assert_eq!(
         (epsilon.witness, site_of(epsilon)),
@@ -351,7 +363,7 @@ async fn an_edit_after_construction_is_seen_by_the_next_call() {
 
     // And an occurrence that was removed is gone.
     write(tree.path(), "src/delta.rs", "fn x() {}\n");
-    let gone = map.expand(&node, budget(), &view()).await;
+    let gone = map.expand(&node, budget(), &view()).await.edges;
     assert!(gone.iter().all(|e| e.dst != file("src/delta.rs")));
 }
 
@@ -360,7 +372,7 @@ async fn query_names_the_same_destinations_and_reports_the_live_tree() {
     let tree = fixture();
     let map = LiveGrep::new(tree.path(), Some(spans()));
     let node = symbol("compute_total", "alpha");
-    let edges = map.expand(&node, budget(), &view()).await;
+    let edges = map.expand(&node, budget(), &view()).await.edges;
     let seeds = [(node.clone(), 1.0)];
     let params = serde_json::Value::Null;
     let mut request = MapRequest {

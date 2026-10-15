@@ -22,7 +22,10 @@ use crate::{
     traverse::source::FusedEdge,
     walk::{SplitMix, W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
 };
-use std::{cmp::Ordering, collections::HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Item {
@@ -39,49 +42,98 @@ impl Item {
             .total_cmp(&self.priority)
             .then(self.seq.cmp(&other.seq))
     }
+
+    /// The same queue entry: priorities compare by bits, so a NaN is itself.
+    fn same(&self, other: &Self) -> bool {
+        self.state == other.state
+            && self.seq == other.seq
+            && self.priority.to_bits() == other.priority.to_bits()
+    }
 }
 
+/// A heap entry. [`BinaryHeap`] pops its greatest entry, so the best item
+/// compares greatest.
+#[derive(Debug, Clone, Copy)]
+struct Entry(Item);
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Entry {}
+
+impl PartialOrd for Entry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.order(&self.0)
+    }
+}
+
+/// A binary heap with lazy deletion: `push`, `pop` and the priority changes
+/// are `O(log n)`. `live` holds the queued items by state (a state is queued
+/// at most once; pushing a queued state does nothing); the heap may also hold
+/// entries that are out of date, left by a priority change or a removal, and
+/// `pop` skips them by checking them against `live`.
 #[derive(Debug, Default)]
 pub struct Frontier {
-    items: Vec<Item>,
+    live: HashMap<usize, Item>,
+    heap: BinaryHeap<Entry>,
     next_seq: u64,
 }
 
 impl Frontier {
     pub fn push(&mut self, state: usize, priority: f64) {
-        self.items.push(Item {
+        if self.live.contains_key(&state) {
+            return;
+        }
+        let item = Item {
             state,
             priority,
             seq: self.next_seq,
-        });
+        };
         self.next_seq += 1;
+        self.live.insert(state, item);
+        self.heap.push(Entry(item));
     }
 
     /// Puts a popped item back at its old place (same priority and
     /// discovery number).
     pub fn requeue(&mut self, item: Item) {
-        self.items.push(item);
+        self.live.insert(item.state, item);
+        self.heap.push(Entry(item));
     }
 
     pub fn pop(&mut self) -> Option<Item> {
-        let best = (0..self.items.len()).min_by(|&a, &b| self.items[a].order(&self.items[b]))?;
-        Some(self.items.swap_remove(best))
+        while let Some(Entry(item)) = self.heap.pop() {
+            if self.live.get(&item.state).is_some_and(|l| l.same(&item)) {
+                self.live.remove(&item.state);
+                return Some(item);
+            }
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.live.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.live.is_empty()
     }
 
     /// The queue as `(state, priority, discovery number)` in discovery
     /// order, and the next discovery number: all a handle needs to rebuild it.
     pub fn parts(&self) -> (Vec<(usize, f64, u64)>, u64) {
         let mut items: Vec<_> = self
-            .items
-            .iter()
+            .live
+            .values()
             .map(|item| (item.state, item.priority, item.seq))
             .collect();
         items.sort_by_key(|&(_, _, seq)| seq);
@@ -90,49 +142,62 @@ impl Frontier {
 
     /// The inverse of [`Frontier::parts`].
     pub fn from_parts(items: &[(usize, f64, u64)], next_seq: u64) -> Self {
-        Self {
-            items: items
-                .iter()
-                .map(|&(state, priority, seq)| Item {
-                    state,
-                    priority,
-                    seq,
-                })
-                .collect(),
+        let mut frontier = Self {
             next_seq,
+            ..Self::default()
+        };
+        for &(state, priority, seq) in items {
+            frontier.live.entry(state).or_insert(Item {
+                state,
+                priority,
+                seq,
+            });
+        }
+        frontier.rebuild();
+        frontier
+    }
+
+    /// A heap of exactly the live items.
+    fn rebuild(&mut self) {
+        self.heap = self.live.values().map(|item| Entry(*item)).collect();
+    }
+
+    /// Puts a changed item in the heap; the old entry is now out of date.
+    fn reinsert(&mut self, item: Item) {
+        self.heap.push(Entry(item));
+        // Many changes would leave the heap mostly dead entries.
+        if self.heap.len() > 4 * self.live.len() + 64 {
+            self.rebuild();
         }
     }
 
     pub fn clear(&mut self) {
-        self.items.clear();
+        self.live.clear();
+        self.heap.clear();
     }
 
     /// The items best first.
     pub fn sorted(&self) -> Vec<Item> {
-        let mut items = self.items.clone();
+        let mut items: Vec<Item> = self.live.values().copied().collect();
         items.sort_by(Item::order);
         items
     }
 
     pub fn remove(&mut self, state: usize) -> bool {
-        match self.items.iter().position(|item| item.state == state) {
-            Some(at) => {
-                self.items.swap_remove(at);
-                true
-            }
-            None => false,
-        }
+        self.live.remove(&state).is_some()
     }
 
     pub fn contains(&self, state: usize) -> bool {
-        self.items.iter().any(|item| item.state == state)
+        self.live.contains_key(&state)
     }
 
     /// Sets the priority of a queued state; false when it is not queued.
     pub fn set_priority(&mut self, state: usize, priority: f64) -> bool {
-        match self.items.iter_mut().find(|item| item.state == state) {
+        match self.live.get_mut(&state) {
             Some(item) => {
                 item.priority = priority;
+                let item = *item;
+                self.reinsert(item);
                 true
             }
             None => false,
@@ -141,15 +206,12 @@ impl Frontier {
 
     /// The priority of a queued state.
     pub fn priority_of(&self, state: usize) -> Option<f64> {
-        self.items
-            .iter()
-            .find(|item| item.state == state)
-            .map(|item| item.priority)
+        self.live.get(&state).map(|item| item.priority)
     }
 
     pub fn scale(&mut self, state: usize, factor: f64) -> bool {
-        match self.items.iter().find(|item| item.state == state) {
-            Some(item) => self.set_priority(state, (item.priority * factor).min(f64::MAX)),
+        match self.priority_of(state) {
+            Some(priority) => self.set_priority(state, (priority * factor).min(f64::MAX)),
             None => false,
         }
     }
@@ -166,14 +228,11 @@ impl Frontier {
         let mut order: Vec<usize> = (0..current.len()).collect();
         order.sort_by_key(|&i| key(current[i].state));
         for (rank, &i) in order.iter().enumerate() {
-            if let Some(item) = self
-                .items
-                .iter_mut()
-                .find(|it| it.state == current[i].state)
-            {
+            if let Some(item) = self.live.get_mut(&current[i].state) {
                 (item.priority, item.seq) = slots[rank];
             }
         }
+        self.rebuild();
     }
 }
 

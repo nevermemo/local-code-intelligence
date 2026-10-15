@@ -819,7 +819,7 @@ impl<M: Map> Map for Shared<M> {
         node: &NodeId,
         budget: Budget,
         view: &SnapshotView<'_>,
-    ) -> Vec<lci_maps::edge::Edge> {
+    ) -> lci_maps::edge::Expanded {
         self.0.expand(node, budget, view).await
     }
 
@@ -1991,7 +1991,7 @@ mod tests {
             max_external_calls: u32::MAX,
             max_nodes_touched: u64::MAX,
         };
-        let edges = map.expand(&lines[0].0, budget, &view).await;
+        let edges = map.expand(&lines[0].0, budget, &view).await.edges;
         // No function lies on those lines: all the file's functions follow.
         assert_eq!(edges.len(), 9, "{edges:?}");
         assert!(

@@ -56,7 +56,7 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, Freshness, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, Need, Observed, SnapshotView,
     SourceLabel,
-    edge::{Edge, MapCard, QuestionType, Site, WitnessClass, cap_edges, conf_from_unit},
+    edge::{Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges, conf_from_unit},
     live_grep::{CostLog, GrepOptions, needle_of},
     scip_graph::ScipMap,
 };
@@ -302,6 +302,8 @@ fn site_of_chunk(hit: &ChunkHit) -> Site {
 struct Outcome {
     edges: Vec<Edge>,
     error: Option<String>,
+    /// What the expansion cost, found or not.
+    cost: Cost,
 }
 
 impl Outcome {
@@ -309,13 +311,16 @@ impl Outcome {
         Self {
             edges: Vec::new(),
             error: None,
+            cost: Cost::default(),
         }
     }
 
-    fn failed(why: String) -> Self {
+    /// A search that failed after `cost` was spent.
+    fn failed(why: String, cost: Cost) -> Self {
         Self {
             edges: Vec::new(),
             error: Some(why),
+            cost,
         }
     }
 }
@@ -339,8 +344,10 @@ async fn query_via(
     let mut response = MapResponse::empty(map.descriptor(), view, MapStatus::Ok);
     let mut edges = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut external_calls = 0u32;
     for (seed, _) in request.seeds {
         let outcome = map.outcome(seed, request.budget).await;
+        external_calls = external_calls.saturating_add(outcome.cost.external_calls);
         edges.extend(outcome.edges);
         errors.extend(outcome.error);
     }
@@ -361,7 +368,7 @@ async fn query_via(
     response.cost = Cost {
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         nodes_touched: edges.len() as u64,
-        external_calls: edges.first().map_or(0, |e| e.cost.external_calls),
+        external_calls,
         ..Cost::default()
     };
     if map.descriptor().freshness == FreshnessModel::Live {
@@ -473,7 +480,7 @@ impl Expander for LexicalChunks<'_> {
             Err(why) => {
                 let why = format!("search.lexical: {why}");
                 self.failures.record(&why);
-                return Outcome::failed(why);
+                return Outcome::failed(why, Cost::default());
             }
         };
         let own = Own::of(node, self.decls.as_deref());
@@ -505,12 +512,15 @@ impl Expander for LexicalChunks<'_> {
                     witness,
                     conf: base.saturating_sub(place.min(7)),
                     site: Some(site_of_chunk(hit)),
-                    cost,
                 }
             })
             .collect();
         cap_edges(&mut edges, EXPAND_LIMIT);
-        Outcome { edges, error: None }
+        Outcome {
+            edges,
+            error: None,
+            cost,
+        }
     }
 }
 
@@ -524,8 +534,9 @@ impl Map for LexicalChunks<'_> {
         query_via(self, request, view).await
     }
 
-    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
-        self.outcome(node, budget).await.edges
+    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
+        let outcome = self.outcome(node, budget).await;
+        Expanded::new(outcome.edges, outcome.cost)
     }
 
     fn card(&self) -> MapCard {
@@ -617,28 +628,34 @@ impl<'a> VectorChunks<'a> {
         }
     }
 
-    /// The vector of `node` and the external calls it took.
+    /// The vector of `node` and the external calls it took, which count
+    /// whether the call worked or not.
     async fn vector_of(
         &self,
         node: &NodeId,
         budget: Budget,
-    ) -> Result<Option<(Vec<f32>, u32)>, String> {
-        let anchor = self.anchor(node).await?;
+    ) -> (Result<Option<Vec<f32>>, String>, u32) {
+        let anchor = match self.anchor(node).await {
+            Ok(anchor) => anchor,
+            Err(why) => return (Err(why), 0),
+        };
         let mut text = None;
         if let Some(anchor) = &anchor {
-            if let Some(vector) = self.search.stored_vector(&anchor.node).await? {
-                return Ok(Some((vector, 0)));
+            match self.search.stored_vector(&anchor.node).await {
+                Ok(Some(vector)) => return (Ok(Some(vector)), 0),
+                Ok(None) => {}
+                Err(why) => return (Err(why), 0),
             }
             text = Some(anchor.code.clone()).filter(|code| !code.trim().is_empty());
         }
         let text = text.or_else(|| needle_of(node));
         let Some(text) = text else {
-            return Ok(None);
+            return (Ok(None), 0);
         };
         if budget.max_external_calls == 0 {
-            return Ok(None);
+            return (Ok(None), 0);
         }
-        Ok(Some((self.search.embed(&text).await?, 1)))
+        (self.search.embed(&text).await.map(Some), 1)
     }
 }
 
@@ -654,20 +671,26 @@ impl Expander for VectorChunks<'_> {
 
     async fn outcome(&self, node: &NodeId, budget: Budget) -> Outcome {
         let started = Instant::now();
-        let fail = |why: String| {
+        let fail = |why: String, calls: u32| {
             let why = format!("search.vector: {why}");
             self.failures.record(&why);
-            Outcome::failed(why)
+            let cost = Cost {
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                external_calls: calls,
+                ..Cost::default()
+            };
+            Outcome::failed(why, cost)
         };
-        let (vector, calls) = match self.vector_of(node, budget).await {
+        let (vector, calls) = self.vector_of(node, budget).await;
+        let vector = match vector {
             Ok(Some(found)) => found,
             Ok(None) => return Outcome::none(),
-            Err(why) => return fail(why),
+            Err(why) => return fail(why, calls),
         };
         let limit = self.options.k * OVERFETCH + OVERFETCH_PLUS;
         let hits = match self.search.nearest(&vector, limit).await {
             Ok(hits) => hits,
-            Err(why) => return fail(why),
+            Err(why) => return fail(why, calls),
         };
         let own = Own::of(node, self.decls.as_deref());
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -691,11 +714,14 @@ impl Expander for VectorChunks<'_> {
                 witness: WitnessClass::Heuristic,
                 conf: conf_from_unit(hit.score),
                 site: Some(site_of_chunk(hit)),
-                cost,
             })
             .collect();
         cap_edges(&mut edges, EXPAND_LIMIT);
-        Outcome { edges, error: None }
+        Outcome {
+            edges,
+            error: None,
+            cost,
+        }
     }
 }
 
@@ -709,8 +735,9 @@ impl Map for VectorChunks<'_> {
         query_via(self, request, view).await
     }
 
-    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
-        self.outcome(node, budget).await.edges
+    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
+        let outcome = self.outcome(node, budget).await;
+        Expanded::new(outcome.edges, outcome.cost)
     }
 
     fn card(&self) -> MapCard {

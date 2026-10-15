@@ -215,9 +215,9 @@ async fn chunk_lines_come_from_the_snapshot_view_when_it_holds_the_chunk() {
     let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
     let (header, tail) = (view.ids()[0].clone(), view.ids()[1].clone());
     let map = ContainsMap::new(&scip);
-    let edges = map.expand(&tail, call_budget(), &view).await;
+    let edges = map.expand(&tail, call_budget(), &view).await.edges;
     assert_eq!(dsts(&edges), set(&[&method]));
-    let edges = map.expand(&header, call_budget(), &view).await;
+    let edges = map.expand(&header, call_budget(), &view).await.edges;
     assert_eq!(dsts(&edges), set(&[&alpha, &inner, &method]));
 }
 

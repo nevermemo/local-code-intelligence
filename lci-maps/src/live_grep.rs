@@ -46,7 +46,7 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, Freshness, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, Observed, SnapshotView,
     SourceLabel,
-    edge::{Edge, MapCard, QuestionType, Site, WitnessClass, cap_edges},
+    edge::{Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     scip_graph::ScipMap,
 };
 use ignore::WalkBuilder;
@@ -472,12 +472,6 @@ impl LiveGrep {
                 bucket(symbols.entry(symbol).or_default());
             }
         }
-        let cost = Cost {
-            elapsed_ms: found.elapsed_ms,
-            nodes_touched: found.files_read,
-            bytes_read: found.bytes_read,
-            ..Cost::default()
-        };
         let edge = |dst: NodeId, group: &Group| -> Edge {
             let (first, count, witness, base, step) = match group.exact.first() {
                 Some(&first) => (first, group.exact.len(), WitnessClass::Exact, CONF_EXACT, 5),
@@ -503,7 +497,6 @@ impl LiveGrep {
                     line: hit.line,
                     col: hit.col,
                 }),
-                cost,
             }
         };
         let mut edges: Vec<Edge> = files
@@ -567,10 +560,18 @@ impl Map for LiveGrep {
         response
     }
 
-    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
         match self.search(node, budget).await {
-            Some(found) => self.edges_of(node, &found),
-            None => Vec::new(),
+            Some(found) => {
+                let cost = Cost {
+                    elapsed_ms: found.elapsed_ms,
+                    nodes_touched: found.files_read,
+                    bytes_read: found.bytes_read,
+                    ..Cost::default()
+                };
+                Expanded::new(self.edges_of(node, &found), cost)
+            }
+            None => Expanded::default(),
         }
     }
 

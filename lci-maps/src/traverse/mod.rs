@@ -28,16 +28,33 @@
 //!
 //! Budget (all checked, none exceeded): `pops` before every pop, `deadline`
 //! before every pop and inside every map call, `est_tokens` and
-//! `external_calls` after every expansion. An expansion that would pass the
-//! token or call budget is not adopted (a token budget that fits only some of
-//! its edges keeps the best of them), and the walk ends `BudgetExhausted`.
-//! Totals count adopted work only. A token is charged per adopted edge
-//! ([`TOKENS_PER_EDGE`]) plus the `est_tokens` the maps report.
+//! `external_calls` around every expansion. The maps share the external calls
+//! left, in map order ([`source`]), so a map is not given calls another one
+//! used; when none are left the walk ends `BudgetExhausted`.
 //!
-//! A pop that was cut by a budget (nothing adopted, only some edges adopted,
+//! An expansion prices and selects first: [`frontier::hop`] ranks every
+//! candidate (fresh nodes and arrivals alike) and keeps the beam. Only then is
+//! anything charged. Totals count adopted work only: a token per adopted hop
+//! ([`TOKENS_PER_EDGE`]) plus the `est_tokens` the maps report for the call,
+//! and the hops the remaining tokens afford are the best ranked ones (a
+//! selected hop they cannot afford makes the pop `truncated`). The one thing
+//! charged that was not adopted is an external call that ran: it was spent,
+//! so it counts whatever becomes of the edges, even none. A map call's cost is
+//! reported once per call ([`ExpandCall`]), not once per edge.
+//!
+//! A pop that was cut by a budget (nothing adopted, only some hops adopted,
 //! or a map that timed out) is put back in the queue at its old place, so a
-//! resume expands the node again and finds the rest. A pop that adopted
+//! resume expands the node again and finds the rest. A cut pop charges the
+//! hops it adopted but not its calls' tokens, and the retry that completes it
+//! charges them, so a pop pays for its calls' tokens once; a retry runs the
+//! maps again, so their external calls are counted again. A pop that adopted
 //! nothing is also taken off the pop count.
+//!
+//! Arrivals outside the beam still corroborate: the maps and witness classes
+//! of an edge into a node that has a state join its sets even when the beam
+//! did not keep the edge, at no cost; such an edge never relaxes the node and
+//! is not a hop. A hop out of a seed is the first step of the walk, never a
+//! cross-map hop, whichever map found the seed.
 //!
 //! Budgets across calls: `pops`, `est_tokens` and `external_calls` are
 //! absolute caps for the whole traversal (the totals persist in a handle);
@@ -516,6 +533,7 @@ impl<'s> Run<'s> {
             if self.totals.pops >= self.pops_cap()
                 || Instant::now() >= self.t.budget.deadline
                 || self.tokens_left() == 0
+                || (self.t.budget.external_calls > 0 && self.calls_left() == 0)
             {
                 break self.end_status(true);
             }
@@ -612,12 +630,27 @@ impl<'s> Run<'s> {
 
     /// Expands one state. `Some` when a budget (or a timeout) cut the
     /// expansion short: true if some of its work was adopted, false if none.
+    ///
+    /// The order is: ask the maps; price and select every candidate with
+    /// [`hop`]; only then charge. A fresh hop is adopted while the tokens
+    /// left afford [`TOKENS_PER_EDGE`] for it, so what the beam ranks first is
+    /// what the budget buys; a selected hop it cannot afford makes the pop
+    /// `truncated`. Charges:
+    ///
+    /// - External calls are charged where they ran, adopted or not.
+    /// - Tokens are charged for adopted work: [`TOKENS_PER_EDGE`] per hop, and
+    ///   the maps' `est_tokens` once the pop is not cut. A cut pop (truncated
+    ///   or timed out) charges its adopted hops only and is put back, so the
+    ///   retry that completes it is the one that charges the calls' tokens: a
+    ///   pop pays for its calls' tokens once. Its external calls are charged
+    ///   each time they run, since each run spent them.
     async fn expand(&mut self, index: usize) -> Option<bool> {
         let node = self.states[index].node.clone();
         let depth = self.states[index].depth;
+        let calls_before = self.calls_left();
         let budget = Budget {
             deadline: self.t.budget.deadline,
-            max_external_calls: self.calls_left(),
+            max_external_calls: calls_before,
             max_nodes_touched: u64::MAX,
         };
         self.counted.clear();
@@ -628,19 +661,29 @@ impl<'s> Run<'s> {
             .iter()
             .map(|c| c.cost.external_calls)
             .fold(0, u32::saturating_add);
+        // The calls ran: they are charged whatever becomes of the edges.
+        self.totals.external_calls = self.totals.external_calls.saturating_add(call_external);
         let call_report: Vec<Value> = calls
             .iter()
-            .map(|c| json!({"map": c.map, "n_edges": c.n_edges, "failure": c.failure}))
+            .map(|c| {
+                json!({
+                    "map": c.map, "n_edges": c.n_edges,
+                    "est_tokens": c.cost.est_tokens,
+                    "external_calls": c.cost.external_calls,
+                    "failure": c.failure,
+                })
+            })
             .collect();
-        if call_tokens > self.tokens_left() || call_external > self.calls_left() {
+        if call_tokens > self.tokens_left() || call_external > calls_before {
             self.events.push(json!({
                 "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
-                "n_edges": 0, "calls": call_report, "dropped": "budget",
+                "offered": edges.len(), "adopted": 0, "calls": call_report,
+                "dropped": "budget",
             }));
             return Some(false);
         }
 
-        // Candidates: never a cleared node or one that already has a state.
+        // Candidates: never a cleared node.
         let offered = edges
             .into_iter()
             .filter(|e| !self.cleared.contains(&e.best.dst))
@@ -661,68 +704,18 @@ impl<'s> Run<'s> {
         // Edges to a node that has a state are arrivals, not discoveries; an
         // edge back to the expanding node or its own path is a cycle and is
         // neither.
-        let mut path = HashSet::new();
-        let mut at = Some(index);
-        while let Some(i) = at {
-            path.insert(i);
-            at = self.states[i].parent;
-        }
-        let affordable = ((self.tokens_left() - call_tokens) / TOKENS_PER_EDGE) as usize;
-        let n_fresh = offered
-            .iter()
-            .filter(|e| !self.state_of.contains_key(&e.best.dst))
-            .count();
-        let truncated = n_fresh > affordable;
-        // The edges to price, in offer order: the fresh ones the tokens
-        // afford (`None`) and the arrivals (the state reached).
         let mut kept: Vec<FusedEdge> = Vec::new();
         let mut target: Vec<Option<usize>> = Vec::new();
-        let mut fresh_taken = 0;
         for edge in offered {
-            match self.state_of.get(&edge.best.dst).copied() {
-                Some(state) if path.contains(&state) => {}
-                Some(state) => {
-                    kept.push(edge);
-                    target.push(Some(state));
-                }
-                None if fresh_taken < affordable => {
-                    fresh_taken += 1;
-                    kept.push(edge);
-                    target.push(None);
-                }
-                None => {}
+            let state = self.state_of.get(&edge.best.dst).copied();
+            if state.is_some_and(|s| self.on_path(index, s)) {
+                continue;
             }
+            kept.push(edge);
+            target.push(state);
         }
 
-        self.totals.tokens += call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE;
-        self.totals.external_calls = self.totals.external_calls.saturating_add(call_external);
-        for call in &calls {
-            *self.totals.per_map.entry(call.map).or_default() += 1;
-            let stat = self.tally.maps.entry(call.map).or_default();
-            stat.calls += 1;
-            stat.failures += u32::from(call.failure.is_some());
-            stat.tokens += call.cost.est_tokens;
-        }
-        for (edge, _) in kept.iter().zip(&target).filter(|(_, t)| t.is_none()) {
-            self.tally.maps.entry(edge.best.map).or_default().edges += 1;
-        }
-        let spent = call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE;
-        let cost = self
-            .tally
-            .kind_cost
-            .entry(node.kind().prefix().to_string())
-            .or_default();
-        cost.0 += 1;
-        cost.1 += spent;
-        if fresh_taken > 0 {
-            self.tally.last_fresh_pop = self.totals.pops;
-        }
-        self.events.push(json!({
-            "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
-            "n_edges": fresh_taken, "calls": call_report,
-            "tokens": call_tokens + fresh_taken as u64 * TOKENS_PER_EDGE,
-        }));
-
+        // Price and select first.
         let cards: Vec<MapCard> = kept.iter().map(|e| self.card(e.best.map)).collect();
         let cands: Vec<Candidate> = kept
             .iter()
@@ -739,18 +732,33 @@ impl<'s> Run<'s> {
         };
         let steps = hop(self.t.scorer.as_mut(), &ctx, &cands, self.t.price);
 
+        // Then adopt what the tokens afford, best first.
+        let affordable = ((self.tokens_left() - call_tokens) / TOKENS_PER_EDGE) as usize;
+        let at = self.events.len();
         let parent = self.states[index].clone();
+        let mut chosen = vec![false; kept.len()];
+        let mut adopted = 0usize;
+        let mut truncated = false;
         for (i, value) in steps {
+            chosen[i] = true;
             let edge = &kept[i];
             let dst = &edge.best.dst;
             let map = edge.best.map;
             let value = value * self.weights.get(map).copied().unwrap_or(1.0);
             let potential = parent.potential * value;
-            let cross = parent.via.is_some_and(|via| via != map);
+            // A hop out of a seed is the first step of the walk, not a switch
+            // between maps, whichever map found the seed.
+            let cross = parent.parent.is_some() && parent.via != Some(map);
             if let Some(reached) = target[i] {
                 self.arrive(index, &parent, reached, edge, potential, fanout, cross);
                 continue;
             }
+            if adopted >= affordable {
+                truncated = true;
+                continue;
+            }
+            adopted += 1;
+            self.tally.maps.entry(map).or_default().edges += 1;
             let child = self.states.len();
             self.states.push(State {
                 node: dst.clone(),
@@ -776,10 +784,74 @@ impl<'s> Run<'s> {
                 self.frontier.push(child, potential);
             }
         }
+        // An arrival outside the beam is still evidence: the maps that
+        // offered it join the node's corroboration at no cost. It is not a
+        // route, so it never relaxes the node and is not a hop.
+        let mut corroborated = 0;
+        for (i, edge) in kept.iter().enumerate() {
+            if let (false, Some(reached)) = (chosen[i], target[i]) {
+                self.corroborate(reached, edge);
+                corroborated += 1;
+            }
+        }
+
         // A call that failed after the deadline left the node half-explored.
         let timed_out =
             calls.iter().any(|c| c.failure.is_some()) && Instant::now() >= self.t.budget.deadline;
-        (truncated || timed_out).then_some(true)
+        let cut = truncated || timed_out;
+
+        // Now charge.
+        let hop_tokens = adopted as u64 * TOKENS_PER_EDGE;
+        let call_charge = if cut { 0 } else { call_tokens };
+        self.totals.tokens += call_charge + hop_tokens;
+        if !cut {
+            for call in &calls {
+                *self.totals.per_map.entry(call.map).or_default() += 1;
+                let stat = self.tally.maps.entry(call.map).or_default();
+                stat.calls += 1;
+                stat.failures += u32::from(call.failure.is_some());
+                stat.tokens += call.cost.est_tokens;
+            }
+        }
+        let cost = self
+            .tally
+            .kind_cost
+            .entry(node.kind().prefix().to_string())
+            .or_default();
+        cost.0 += u32::from(!cut);
+        cost.1 += call_charge + hop_tokens;
+        if adopted > 0 {
+            self.tally.last_fresh_pop = self.totals.pops;
+        }
+        self.events.insert(
+            at,
+            json!({
+                "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
+                "offered": fanout, "adopted": adopted, "corroborated": corroborated,
+                "calls": call_report, "tokens": call_charge + hop_tokens, "cut": cut,
+            }),
+        );
+        cut.then_some(adopted > 0 || timed_out)
+    }
+
+    /// Whether `target` is `from` or one of its ancestors.
+    fn on_path(&self, from: usize, target: usize) -> bool {
+        let mut at = Some(from);
+        while let Some(i) = at {
+            if i == target {
+                return true;
+            }
+            at = self.states[i].parent;
+        }
+        false
+    }
+
+    /// An edge into `reached` that was not followed: its maps and witness
+    /// classes still count as evidence for the node.
+    fn corroborate(&mut self, reached: usize, edge: &FusedEdge) {
+        let state = &mut self.states[reached];
+        state.maps.extend(edge.maps.iter().copied());
+        state.witnesses.extend(edge.witnesses.iter().copied());
     }
 
     /// A route from the expanding state `from` (`parent`) to a node that

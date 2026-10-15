@@ -1,10 +1,18 @@
 //! Where a traversal gets edges (spine brief 1.3).
 //!
 //! [`OnTheFly`] asks every enabled map of a [`Registry`] whose `accepts`
-//! holds the node's kind, side by side, with the registry's fail-open rules
-//! (a panic or a missed deadline becomes a note on the call, never an error),
-//! and fuses the edges that reach the same destination: noisy-OR of the best
-//! confidence per map, provenance (maps and witness classes) as a union.
+//! holds the node's kind, with the registry's fail-open rules (a panic or a
+//! missed deadline becomes a note on the call, never an error), and fuses the
+//! edges that reach the same destination: noisy-OR of the best confidence per
+//! map, provenance (maps and witness classes) as a union.
+//!
+//! External calls are reserved before the maps run. With a finite allowance
+//! the maps are asked one after the other in registry order, each with what
+//! the maps before it left (`Budget::max_external_calls`), so the allowance
+//! is shared deterministically and the calls that ran never pass it; with no
+//! limit ([`u32::MAX`]) they are asked side by side. Each call reports its
+//! cost once ([`ExpandCall::cost`]), whatever it returned.
+//!
 //! The pre-merged source ([`super::merged::PreMerged`]) answers from a
 //! materialised union built with this same fusion.
 
@@ -88,6 +96,8 @@ pub fn fuse(edges: Vec<Edge>) -> Vec<FusedEdge> {
 pub struct ExpandCall {
     pub map: MapId,
     pub n_edges: usize,
+    /// What the call cost, once, however many edges it returned (none when
+    /// it did not answer).
     pub cost: Cost,
     /// Set when the call panicked or missed the deadline; the walk goes on.
     pub failure: Option<String>,
@@ -142,9 +152,8 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
     /// (sanitised, sites with their blobs) in registry order, and the calls
     /// made. [`EdgeSource::edges`] fuses exactly these.
     pub async fn ask(&self, node: &NodeId, budget: Budget) -> (Vec<Edge>, Vec<ExpandCall>) {
-        let blobs = self.blobs();
         let kind = node.kind();
-        let calls = self
+        let eligible: Vec<_> = self
             .registry
             .entries
             .iter()
@@ -154,47 +163,82 @@ impl<'r, 'a, 'v> OnTheFly<'r, 'a, 'v> {
                     && !self.off.contains(descriptor.id)
                     && descriptor.accepts.contains(&kind)
             })
-            .map(|entry| async move {
-                let id = entry.map.describe().id;
-                let remaining = budget.deadline.saturating_duration_since(Instant::now());
-                let answer = tokio::time::timeout(
-                    remaining,
-                    AssertUnwindSafe(entry.map.expand(node, budget, self.view)).catch_unwind(),
-                )
-                .await;
-                match answer {
-                    Err(_) => (
-                        id,
-                        Vec::new(),
-                        Some("did not answer before the deadline".into()),
-                    ),
-                    Ok(Err(_)) => (id, Vec::new(), Some("panicked".to_string())),
-                    Ok(Ok(mut edges)) => {
-                        // A map is trusted with its edges, not with their
-                        // bookkeeping.
-                        edges.retain(|edge| edge.dst != *node);
-                        for edge in &mut edges {
-                            edge.map = id;
-                            edge.conf = edge.conf.min(CONF_MAX);
-                        }
-                        edges.truncate(EXPAND_LIMIT);
-                        blobs.fill(&mut edges);
-                        (id, edges, None)
-                    }
-                }
-            });
+            .collect();
+        let answers = if budget.max_external_calls == u32::MAX {
+            // No limit to share: side by side.
+            futures::future::join_all(eligible.iter().map(|entry| self.call(entry, node, budget)))
+                .await
+        } else {
+            // A finite allowance is shared in registry order: each map gets
+            // what the maps before it left.
+            let mut left = budget.max_external_calls;
+            let mut answers = Vec::with_capacity(eligible.len());
+            for entry in eligible {
+                let share = Budget {
+                    max_external_calls: left,
+                    ..budget
+                };
+                let answer = self.call(entry, node, share).await;
+                left = left.saturating_sub(answer.2.external_calls);
+                answers.push(answer);
+            }
+            answers
+        };
         let mut all = Vec::new();
         let mut report = Vec::new();
-        for (map, edges, failure) in futures::future::join_all(calls).await {
+        for (map, edges, cost, failure) in answers {
             report.push(ExpandCall {
                 map,
                 n_edges: edges.len(),
-                cost: edges.first().map(|edge| edge.cost).unwrap_or_default(),
+                cost,
                 failure,
             });
             all.extend(edges);
         }
         (all, report)
+    }
+
+    /// One map's answer: its id, its sanitised edges, the cost of the call and
+    /// the note when it did not answer.
+    async fn call(
+        &self,
+        entry: &crate::Entry<'_>,
+        node: &NodeId,
+        budget: Budget,
+    ) -> (MapId, Vec<Edge>, Cost, Option<String>) {
+        let id = entry.map.describe().id;
+        let remaining = budget.deadline.saturating_duration_since(Instant::now());
+        let answer = tokio::time::timeout(
+            remaining,
+            AssertUnwindSafe(entry.map.expand(node, budget, self.view)).catch_unwind(),
+        )
+        .await;
+        match answer {
+            Err(_) => (
+                id,
+                Vec::new(),
+                Cost::default(),
+                Some("did not answer before the deadline".into()),
+            ),
+            Ok(Err(_)) => (
+                id,
+                Vec::new(),
+                Cost::default(),
+                Some("panicked".to_string()),
+            ),
+            Ok(Ok(expanded)) => {
+                // A map is trusted with its edges, not with their bookkeeping.
+                let mut edges = expanded.edges;
+                edges.retain(|edge| edge.dst != *node);
+                for edge in &mut edges {
+                    edge.map = id;
+                    edge.conf = edge.conf.min(CONF_MAX);
+                }
+                edges.truncate(EXPAND_LIMIT);
+                self.blobs().fill(&mut edges);
+                (id, edges, expanded.cost, None)
+            }
+        }
     }
 }
 

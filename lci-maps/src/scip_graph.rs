@@ -26,7 +26,8 @@ use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
     edge::{
-        CONF_MAX, Edge as TypedEdge, Site, WitnessClass, cap_edges, conf_from_unit, sort_edges,
+        CONF_MAX, Edge as TypedEdge, Expanded, Site, WitnessClass, cap_edges, conf_from_unit,
+        sort_edges,
     },
 };
 use lci_core::node::{NodeId, NodeKind, SymbolKey, SymbolKind, rust_module_path};
@@ -752,7 +753,6 @@ impl From<ScipEdgeRef<'_>> for TypedEdge {
                 line: r.edge.witness.line,
                 col: r.edge.witness.col,
             }),
-            cost: Cost::default(),
         }
     }
 }
@@ -848,20 +848,14 @@ impl ScipMap {
 
     /// The out-edges of graph node `from`, unsorted.
     fn typed_edges(&self, from: usize) -> Vec<TypedEdge> {
-        let cost = Cost {
-            nodes_touched: self.graph.out[from].len() as u64,
-            ..Cost::default()
-        };
         self.graph.out[from]
             .iter()
             .map(|edge| {
-                let mut typed = TypedEdge::from(ScipEdgeRef {
+                TypedEdge::from(ScipEdgeRef {
                     src: &self.ids[from],
                     dst: &self.ids[edge.to],
                     edge,
-                });
-                typed.cost = cost;
-                typed
+                })
             })
             .collect()
     }
@@ -904,18 +898,17 @@ impl Map for ScipMap {
         response
     }
 
-    async fn expand(
-        &self,
-        node: &NodeId,
-        _budget: Budget,
-        _view: &SnapshotView<'_>,
-    ) -> Vec<TypedEdge> {
+    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
         let Some(&from) = self.index.get(node) else {
-            return Vec::new();
+            return Expanded::default();
         };
         let mut edges = self.typed_edges(from);
         cap_edges(&mut edges, EXPAND_LIMIT);
-        edges
+        let cost = Cost {
+            nodes_touched: edges.len() as u64,
+            ..Cost::default()
+        };
+        Expanded::new(edges, cost)
     }
 }
 
@@ -1140,7 +1133,12 @@ mod tests {
         );
         // An unknown node has no edges.
         let unknown = NodeId::file("nowhere.rs").unwrap();
-        assert!(map.expand(&unknown, test_budget(), &view).await.is_empty());
+        assert!(
+            map.expand(&unknown, test_budget(), &view)
+                .await
+                .edges
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1159,7 +1157,7 @@ mod tests {
             .node_id(map.graph().node_index(&sym("a/f().")).unwrap())
             .clone();
         let view = empty_view();
-        let edges = map.expand(&f, test_budget(), &view).await;
+        let edges = map.expand(&f, test_budget(), &view).await.edges;
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].conf, 50);
 

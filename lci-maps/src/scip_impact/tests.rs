@@ -333,7 +333,7 @@ async fn unknown_and_foreign_nodes_give_no_edges() {
             sha: "a".repeat(40),
         },
     ] {
-        assert!(map.expand(&node, budget(), &view()).await.is_empty());
+        assert!(map.expand(&node, budget(), &view()).await.edges.is_empty());
     }
     let empty = ImpactMap::empty(ImpactOptions::default());
     assert_eq!(empty.stats(), ImpactStats::default());
@@ -341,6 +341,7 @@ async fn unknown_and_foreign_nodes_give_no_edges() {
         empty
             .expand(&function("use_foo"), budget(), &view())
             .await
+            .edges
             .is_empty()
     );
     assert!(!empty.log().is_empty());

@@ -40,7 +40,7 @@
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, Evidence, FreshnessModel, Map, MapDescriptor, MapHit,
     MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
-    edge::{Edge, MapCard, QuestionType, WitnessClass, cap_edges},
+    edge::{Edge, Expanded, MapCard, QuestionType, WitnessClass, cap_edges},
     impact::{Decl, ImpactIndex},
     live_grep::CostLog,
     reads_key,
@@ -100,10 +100,6 @@ impl ConfigKeyMap {
             if let Some(dst) = resolve(&raw.decl) {
                 forward.dst = dst;
             }
-            forward.cost = Cost {
-                nodes_touched: 1,
-                ..Cost::default()
-            };
             match forward.witness {
                 WitnessClass::Exact => stats.exact += 1,
                 _ => stats.text += 1,
@@ -233,11 +229,17 @@ impl Map for ConfigKeyMap {
         response
     }
 
-    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
         let started = Instant::now();
         let edges = self.edges_of(node, self.options.text_edges);
-        self.log.record(started.elapsed().as_secs_f64() * 1000.0);
-        edges
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.log.record(elapsed_ms);
+        let cost = Cost {
+            elapsed_ms,
+            nodes_touched: edges.len() as u64,
+            ..Cost::default()
+        };
+        Expanded::new(edges, cost)
     }
 
     fn card(&self) -> MapCard {

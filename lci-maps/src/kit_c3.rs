@@ -469,7 +469,7 @@ pub async fn check_expand(
         max_external_calls: u32::MAX,
         max_nodes_touched: u64::MAX,
     };
-    let edges = map.expand(node, budget, view).await;
+    let edges = map.expand(node, budget, view).await.edges;
     check_edge_invariants(node, map.describe(), &edges, EXPAND_LIMIT)?;
     Ok(edges)
 }

@@ -47,7 +47,7 @@
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
     MapDescriptor, MapHit, MapId, MapRequest, MapResponse, MapStatus, SnapshotView, SourceLabel,
-    edge::{CONF_MAX, Edge, MapCard, QuestionType, Site, WitnessClass, cap_edges},
+    edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     impact::ImpactIndex,
     live_grep::CostLog,
 };
@@ -230,10 +230,6 @@ impl ImpactMap {
                 first.entry(unit).or_insert((path, line, col));
             }
         }
-        let cost = Cost {
-            nodes_touched: read,
-            ..Cost::default()
-        };
         let edges = first
             .into_iter()
             .filter_map(|(unit, (path, line, col))| {
@@ -250,26 +246,27 @@ impl ImpactMap {
                         line,
                         col,
                     }),
-                    cost,
                 })
             })
             .collect();
         (edges, read)
     }
 
-    /// The edges leaving `node`, sorted and capped, and how many there were
-    /// before the cap.
-    fn edges_of(&self, node: &NodeId) -> (Vec<Edge>, usize) {
+    /// The edges leaving `node`, sorted and capped, with the cost of the
+    /// call, and how many edges there were before the cap.
+    fn edges_of(&self, node: &NodeId) -> (Expanded, usize) {
         let started = Instant::now();
-        let (mut edges, _) = self.all_edges(node);
+        let (mut edges, read) = self.all_edges(node);
         let total = edges.len();
         cap_edges(&mut edges, self.options.cap.min(EXPAND_LIMIT));
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        for edge in &mut edges {
-            edge.cost.elapsed_ms = elapsed_ms;
-        }
         self.log.record(elapsed_ms);
-        (edges, total)
+        let cost = Cost {
+            elapsed_ms,
+            nodes_touched: read,
+            ..Cost::default()
+        };
+        (Expanded::new(edges, cost), total)
     }
 }
 
@@ -285,8 +282,8 @@ impl Map for ImpactMap {
         let mut dropped = 0;
         for (seed, _) in request.seeds {
             let (found, total) = self.edges_of(seed);
-            dropped += total - found.len();
-            edges.extend(found);
+            dropped += total - found.edges.len();
+            edges.extend(found.edges);
         }
         cap_edges(&mut edges, usize::MAX);
         let mut seen = HashSet::new();
@@ -327,7 +324,7 @@ impl Map for ImpactMap {
         response
     }
 
-    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Vec<Edge> {
+    async fn expand(&self, node: &NodeId, _budget: Budget, _view: &SnapshotView<'_>) -> Expanded {
         self.edges_of(node).0
     }
 

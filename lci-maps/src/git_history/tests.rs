@@ -123,7 +123,8 @@ fn a_file_gets_its_commits_newest_first_across_a_rename() {
     let (repo, shas) = lineage();
     let map = GitHistoryMap::open(repo.path()).unwrap();
     assert_eq!(map.head(), shas[4]);
-    let edges = map.edges_blocking(&file("a2.rs")).unwrap();
+    let found = map.inner.edges_for(&file("a2.rs")).unwrap();
+    let (edges, cost) = (found.edges, found.cost);
     let touched: Vec<_> = edges
         .iter()
         .filter(|e| e.kind == EdgeKind::Touched)
@@ -141,8 +142,8 @@ fn a_file_gets_its_commits_newest_first_across_a_rename() {
     assert!(touched.iter().all(|e| e.witness == WitnessClass::Exact
         && e.map == GIT_HISTORY_ID
         && e.src == file("a2.rs")));
-    // The cost is the call's: git processes were run.
-    assert!(edges[0].cost.external_calls >= 1 && edges[0].cost.elapsed_ms > 0.0);
+    // The cost is the call's, reported once: git processes were run.
+    assert!(cost.external_calls >= 1 && cost.elapsed_ms > 0.0);
 }
 
 #[test]
@@ -354,11 +355,8 @@ fn edges_are_sorted_capped_deterministic_and_pass_the_edge_invariants() {
     let map = GitHistoryMap::open(repo.path()).unwrap();
     let node = file("x.rs");
     let first = map.edges_blocking(&node).unwrap();
-    let mut second = map.edges_blocking(&node).unwrap();
-    // Only the measured cost differs between two calls.
-    for (a, b) in first.iter().zip(second.iter_mut()) {
-        b.cost = a.cost;
-    }
+    let second = map.edges_blocking(&node).unwrap();
+    // The measured cost is not on the edges, so two calls give equal edges.
     assert_eq!(first, second);
     assert_eq!(
         check_edge_invariants(&node, map.describe(), &first, EXPAND_LIMIT),
@@ -384,7 +382,7 @@ async fn expand_and_query_agree_and_query_names_the_commit() {
     let map = GitHistoryMap::open(repo.path()).unwrap();
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
     let node = file("b.rs");
-    let edges = map.expand(&node, budget(), &view).await;
+    let edges = map.expand(&node, budget(), &view).await.edges;
     assert_eq!(edges.len(), 3);
     assert_eq!(edges[0].dst, commit_id(&shas[4]));
     let seeds = [(node.clone(), 1.0)];
@@ -419,7 +417,8 @@ async fn expand_and_query_agree_and_query_names_the_commit() {
             budget(),
             &view,
         )
-        .await;
+        .await
+        .edges;
     assert!(none.is_empty());
 }
 
