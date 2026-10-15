@@ -370,5 +370,10 @@ score_bound = true
 # refused when the file changed.
 # priors = "hop-priors.json"
 # question_type = "flow"
+# A fitted tie-break (written by `cargo xtask maps fit-tiebreak`): a weighted sum of
+# result features that orders results tied at the same rank, which otherwise keep
+# discovery order. It never lifts a result over a higher rank. A continuation
+# handle keeps the file's content hash and is refused when the file changed.
+# tie_break = "tie-break.json"
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8

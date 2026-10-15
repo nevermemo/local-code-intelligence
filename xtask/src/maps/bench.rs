@@ -124,12 +124,21 @@ pub struct BenchArgs {
     /// primary items). The row's note says `holdout-only`.
     #[arg(long, requires = "priors")]
     holdout_only: bool,
+    /// A fitted tie-break file (`lci traverse --tie-break`) that orders results
+    /// tied at the same rank. The row's note says `tie-break=<file stem>`.
+    #[arg(long)]
+    tie_break: Option<PathBuf>,
     /// Run only the first N items of each set (impact: of the primary items).
     #[arg(long)]
     limit: Option<usize>,
     /// Answers requested per item (`lci traverse --top-k`, at most 40).
     #[arg(long, default_value_t = 10)]
     top_k: usize,
+    /// Score only the first N answers of each traversal (default: all of
+    /// them), so `--top-k` can ask for more candidates, such as a pool to fit a
+    /// tie-break on, while the metrics stay those of the first N.
+    #[arg(long)]
+    score_k: Option<usize>,
     /// Label of this measurement; the trend keeps one row per (wave, set).
     #[arg(long, default_value = "unlabelled")]
     wave: String,
@@ -216,6 +225,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             .priors
             .clone()
             .map(|path| (path, set_name(sets[0]).to_owned())),
+        tie_break: args.tie_break.clone(),
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -251,10 +261,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            priors_note(&args),
+            [priors_note(&args), tie_break_note(&args)],
         ),
         progress: true,
         rescored: false,
+        score_k: args.score_k,
     };
     traverser.maps = config.available_maps();
     for (set, items) in sets.into_iter().zip(&gold_items) {
@@ -302,10 +313,11 @@ fn rescore(
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            priors_note(args),
+            [priors_note(args), tie_break_note(args)],
         ),
         progress: false,
         rescored: true,
+        score_k: args.score_k,
     };
     let raw = RawOutputs {
         dir: dir.join("raw"),
@@ -384,20 +396,19 @@ fn note_with_flags(
     fusion: &str,
     [pass_through, rerank_frontier]: [bool; 2],
     no_score_bound: bool,
-    priors: Option<String>,
+    models: [Option<String>; 2],
 ) -> String {
     let flags = [
         fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
         pass_through.then(|| "pass-through".to_owned()),
         rerank_frontier.then(|| "rerank-frontier".to_owned()),
         no_score_bound.then(|| "no-bound".to_owned()),
-        priors,
     ];
     let parts = note
         .filter(|note| !note.is_empty())
         .map(str::to_owned)
         .into_iter()
-        .chain(flags.into_iter().flatten());
+        .chain(flags.into_iter().chain(models).flatten());
     parts.collect::<Vec<_>>().join("; ")
 }
 
@@ -410,6 +421,12 @@ fn priors_note(args: &BenchArgs) -> Option<String> {
         ""
     };
     Some(format!("priors={stem}{holdout}"))
+}
+
+/// `tie-break=<file stem>`, for the row's note.
+fn tie_break_note(args: &BenchArgs) -> Option<String> {
+    let stem = args.tie_break.as_ref()?.file_stem()?.to_string_lossy();
+    Some(format!("tie-break={stem}"))
 }
 
 fn policy_label(policy: &str) -> String {
@@ -512,7 +529,7 @@ pub struct Site {
 }
 
 impl Site {
-    fn from_json(value: &Value) -> Option<Site> {
+    pub(super) fn from_json(value: &Value) -> Option<Site> {
         let line = value["line"].as_u64().filter(|line| *line >= 1)?;
         Some(Site {
             path: value["path"].as_str()?.replace('\\', "/"),
@@ -790,6 +807,8 @@ pub struct CliTraverser {
     /// `--priors` and `--question-type` for the CLI: the table file and the
     /// question type (the name of the set being run).
     pub priors: Option<(PathBuf, String)>,
+    /// `--tie-break` for the CLI.
+    pub tie_break: Option<PathBuf>,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -849,6 +868,9 @@ impl CliTraverser {
         if let Some((table, question_type)) = &self.priors {
             command.arg("--priors").arg(table);
             command.arg(format!("--question-type={question_type}"));
+        }
+        if let Some(file) = &self.tie_break {
+            command.arg("--tie-break").arg(file);
         }
         command
             .stdin(Stdio::null())
@@ -1354,6 +1376,8 @@ pub struct RunConfig {
     pub progress: bool,
     /// The answers come from the raw outputs of an earlier run.
     pub rescored: bool,
+    /// Score only this many of the first answers of each traversal.
+    pub score_k: Option<usize>,
 }
 
 impl RunConfig {
@@ -1597,7 +1621,13 @@ pub fn bench_set(
                         site: traversed.sites.get(s).cloned(),
                     }));
                 }
-                nodes.extend(traversed.results.iter().cloned());
+                nodes.extend(
+                    traversed
+                        .results
+                        .iter()
+                        .take(config.score_k.unwrap_or(usize::MAX))
+                        .cloned(),
+                );
                 let answers = adapt(set, item, &nodes);
                 if traversed.status == "no_seeds" {
                     sums.no_seeds += 1;
@@ -2097,6 +2127,7 @@ mod tests {
             note: String::new(),
             progress: false,
             rescored: false,
+            score_k: None,
         }
     }
 
@@ -2596,6 +2627,30 @@ mod tests {
         assert_eq!(cells[10], "5", "totals come from the raw output");
         assert_eq!(cells[16], "-", "wall latency was not recorded");
         assert!(cells[20].contains("rescored"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn score_k_scores_the_first_answers_of_a_longer_list() {
+        let dir = std::env::temp_dir().join(format!("xtask-score-k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        let both = traversal(&["x"], &[METHOD, SEARCH_FN], 5);
+        std::fs::write(dir.join("raw/i1.json"), both.to_string()).unwrap();
+        let items = vec![impact_item("i1", "q1", "src/app/search.rs", "n")];
+        let raw = RawOutputs {
+            dir: dir.join("raw"),
+        };
+        let answers = |score_k| {
+            let mut cfg = config(&["graph.scip"]);
+            cfg.score_k = score_k;
+            let outcome = bench_set(Set::Impact, &items, &raw, &cfg).unwrap();
+            outcome.run["i1"].as_array().unwrap().len()
+        };
+        assert_eq!(
+            (answers(None), answers(Some(1)), answers(Some(9))),
+            (2, 1, 2)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,6 +5,7 @@
 
 pub mod bench;
 pub mod fit_priors;
+pub mod fit_tiebreak;
 pub mod trend;
 
 use anyhow::Result;
@@ -20,11 +21,16 @@ pub enum MapsCommand {
     /// Fit the per-question-type hop priors from the traces of bench runs and
     /// write them as JSON, with the item ids held out of the fit.
     FitPriors(fit_priors::FitPriorsArgs),
+    /// Fit the tie-break (a weighted sum of result features that orders results
+    /// tied at the same rank) from the raw outputs of a bench run of one set,
+    /// leaving the hold-out items out of the fit.
+    FitTiebreak(fit_tiebreak::FitTiebreakArgs),
 }
 
 pub fn run(command: MapsCommand) -> Result<()> {
     match command {
         MapsCommand::Bench(args) => bench::run(*args),
         MapsCommand::FitPriors(args) => fit_priors::run(args),
+        MapsCommand::FitTiebreak(args) => fit_tiebreak::run(args),
     }
 }

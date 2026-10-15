@@ -601,6 +601,14 @@ pub struct TraverseConfig {
     /// priced by the guess. Needs `priors`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_type: Option<String>,
+    /// A fitted tie-break file (`cargo xtask maps fit-tiebreak` writes one): a
+    /// weighted sum of result features that orders results tied at the same
+    /// rank. Read when a traversal starts; a relative path is taken from the
+    /// working directory. Absent: ties keep discovery order. A continuation
+    /// handle keeps the file's content hash and is refused when the file has
+    /// changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tie_break: Option<String>,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
@@ -684,6 +692,7 @@ impl TraverseConfig {
         for (key, value) in [
             ("priors", &self.priors),
             ("question_type", &self.question_type),
+            ("tie_break", &self.tie_break),
         ] {
             ensure!(
                 value.as_deref().is_none_or(|v| !v.trim().is_empty()),
@@ -713,6 +722,7 @@ impl Default for TraverseConfig {
             score_bound: true,
             priors: None,
             question_type: None,
+            tie_break: None,
             seed_k: 8,
         }
     }
@@ -2946,7 +2956,7 @@ fusion = \"{fusion}\"
             assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
         }
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 21] = [
+        let bad: [(&str, Set); 22] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2975,6 +2985,7 @@ fusion = \"{fusion}\"
                 t.priors = Some(" ".into());
                 t.question_type = Some("flow".into())
             }),
+            ("tie_break", |t| t.tie_break = Some(" ".into())),
             ("seed_k", |t| t.seed_k = 0),
             ("seed_k", |t| {
                 t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1
@@ -3001,6 +3012,7 @@ fusion = \"{fusion}\"
         }
         config.traverse.priors = Some("table.json".into());
         config.traverse.question_type = Some("flow".into());
+        config.traverse.tie_break = Some("tie-break.json".into());
         config.validate().unwrap();
     }
 

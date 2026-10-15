@@ -37,6 +37,7 @@ use super::{
     rank_json,
     stop::{Disagreement, MapStat, Tally},
     stops_json,
+    tiebreak::TieBreak,
     trace::{disagreement_json, value_hash},
 };
 use crate::{MapId, edge::WitnessClass, traverse::source::EdgeSource};
@@ -49,7 +50,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -82,6 +83,13 @@ pub enum HandleError {
     /// caller gives (see [`Snapshot::check_rerank`]); each side is the floor,
     /// or `off`.
     WrongRerank {
+        handle: String,
+        found: String,
+        expected: String,
+    },
+    /// The handle was made with another tie-break file than the caller gives (see
+    /// [`Snapshot::check_tie_break`]); each side is the file hash, or `none`.
+    WrongTieBreak {
         handle: String,
         found: String,
         expected: String,
@@ -129,6 +137,14 @@ impl fmt::Display for HandleError {
                 f,
                 "handle {handle} was made with the reranker frontier {found}, this call has \
                  {expected}; give the same rerank_frontier and rerank_floor, or start a new traversal"
+            ),
+            Self::WrongTieBreak {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the tie-break {found}, this call has \n                 {expected}; give the same file, or start a new traversal"
             ),
         }
     }
@@ -198,6 +214,9 @@ pub struct Snapshot {
     /// call priced with (none: the guess). Written to the handle only when
     /// there are some.
     pub priors: Option<(String, String)>,
+    /// The content hash of the tie-break file the first call ranked with (none:
+    /// discovery order). Written to the handle only when there is one.
+    pub tie_break: Option<String>,
 }
 
 impl Snapshot {
@@ -224,6 +243,9 @@ impl Snapshot {
                     "priors".into(),
                     json!({"question_type": question_type, "hash": hash}),
                 );
+            }
+            if let Some(hash) = &self.tie_break {
+                object.insert("tie_break".into(), json!(hash));
             }
         }
         value
@@ -313,6 +335,21 @@ impl Snapshot {
         Err(HandleError::WrongPriors {
             handle: self.handle(),
             found: show(&self.priors),
+            expected: show(&current),
+        })
+    }
+
+    /// Refuses a snapshot made with another tie-break file than `tie_break`
+    /// (a changed file, or one side having none).
+    pub fn check_tie_break(&self, tie_break: Option<&TieBreak>) -> Result<(), HandleError> {
+        let current = tie_break.map(|t| t.hash().to_owned());
+        if self.tie_break == current {
+            return Ok(());
+        }
+        let show = |hash: &Option<String>| hash.clone().unwrap_or_else(|| "none".to_owned());
+        Err(HandleError::WrongTieBreak {
+            handle: self.handle(),
+            found: show(&self.tie_break),
             expected: show(&current),
         })
     }
@@ -583,6 +620,10 @@ impl Snapshot {
                     ))
                 }
             },
+            tie_break: match obj.get("tie_break") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(string_of(v)?),
+            },
         })
     }
 }
@@ -835,6 +876,7 @@ impl Run<'_> {
                 .priors
                 .fingerprint()
                 .map(|(question_type, hash)| (question_type.to_owned(), hash.to_owned())),
+            tie_break: self.t.tie_break.as_ref().map(|t| t.hash().to_owned()),
         }
     }
 

@@ -130,7 +130,7 @@ fn hit_metrics(set: Set, answer: &Value) -> &'static [&'static str] {
 
 /// Whether the set's scorer credits the answer the bench would offer for the
 /// node when it is the only answer.
-fn is_gold(set: Set, item: &Value, node: ResultNode) -> Result<bool> {
+pub(super) fn is_gold(set: Set, item: &Value, node: ResultNode) -> Result<bool> {
     let Some(answer) = bench::adapt(set, item, &[node]).into_iter().next() else {
         return Ok(false);
     };

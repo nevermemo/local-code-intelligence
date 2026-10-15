@@ -63,6 +63,7 @@ use lci_maps::{
         source::OnTheFly,
         steer::Steer,
         stop::Card,
+        tiebreak::TieBreak,
         trace::{self, PlanMap, PlanPolicy, StartPlan},
     },
     walk::tokenize,
@@ -1122,6 +1123,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .map_err(|e| anyhow!("[traverse] priors {path}: {e}"))?,
         _ => bail!("[traverse] priors and question_type go together"),
     };
+    let tie_break = (limits.tie_break.as_deref())
+        .map(|path| TieBreak::open(path).map_err(|e| anyhow!("[traverse] tie_break {path}: {e}")))
+        .transpose()?;
     let (steer, preset) = presets::resolve(call.steer)?;
     let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
     let mut notes = Vec::new();
@@ -1164,6 +1168,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .check_identity(&identity)
             .map_err(|e| anyhow!("{e}"))?;
         snapshot.check_priors(&priors).map_err(|e| anyhow!("{e}"))?;
+        snapshot
+            .check_tie_break(tie_break.as_ref())
+            .map_err(|e| anyhow!("{e}"))?;
         snapshot
             .check_rerank(limits.rerank_frontier.then_some(limits.rerank_floor))
             .map_err(|e| anyhow!("{e}"))?;
@@ -1431,6 +1438,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .pass_through(limits.pass_through)
         .score_bound(limits.score_bound)
         .priors(priors)
+        .tie_break(tie_break)
         .top_k(call.top_k, expanding);
     let traversal = match &rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
@@ -1822,7 +1830,15 @@ fn response_json(
         .take(call.top_k)
         .map(|at| {
             let state = &result.states[at];
-            trace::card_json(&Card::ranked(state, result.ranked_potential(state)))
+            let mut card = trace::card_json(&Card::ranked(state, result.ranked_potential(state)));
+            // The tie-break features a card does not already carry, so a fit can
+            // read them from the raw output.
+            if let Some(object) = card.as_object_mut() {
+                object.extend(
+                    (result.facts(state).card_fields()).map(|(key, value)| (key.to_owned(), value)),
+                );
+            }
+            card
         })
         .collect();
     let steering: Vec<Value> = result
@@ -3069,5 +3085,34 @@ mod tests {
         let report = run(&limits(), &dirs, &call).await.unwrap();
         let notes = report.response["notes"].to_string();
         assert!(notes.contains("lsp.live is unavailable"), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn a_tie_break_file_that_cannot_be_read_is_an_error() {
+        let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+        let call = Call {
+            scip_index: Path::new("unused"),
+            scip_root: None,
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        let limits = TraverseConfig {
+            tie_break: Some("no-such-tie-break.json".into()),
+            ..limits()
+        };
+        let dirs = Dirs::under(Path::new("unused"));
+        let error = run(&limits, &dirs, &call).await.err().expect("an error");
+        let error = error.to_string();
+        assert!(
+            error.contains("tie_break no-such-tie-break.json"),
+            "{error}"
+        );
     }
 }

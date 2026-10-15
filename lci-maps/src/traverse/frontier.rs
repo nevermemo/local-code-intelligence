@@ -23,6 +23,7 @@ use crate::{
     traverse::{priors::HopPriors, source::FusedEdge},
     walk::{W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
 };
+use lci_core::node::NodeId;
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
@@ -314,12 +315,15 @@ pub const COST_REF_MS: f64 = 100.0;
 
 /// Share of the query tokens that the node's id tokens contain; 0 to 1.
 fn overlap(query: &[String], candidate: &Candidate) -> f64 {
+    node_overlap(query, &candidate.edge.best.dst)
+}
+
+/// [`overlap`] of a node.
+pub(super) fn node_overlap(query: &[String], node: &NodeId) -> f64 {
     if query.is_empty() {
         return 0.0;
     }
-    let tokens: HashSet<String> = tokenize(&candidate.edge.best.dst.to_string())
-        .into_iter()
-        .collect();
+    let tokens: HashSet<String> = tokenize(&node.to_string()).into_iter().collect();
     query.iter().filter(|t| tokens.contains(*t)).count() as f64 / query.len() as f64
 }
 

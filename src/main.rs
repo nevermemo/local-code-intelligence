@@ -461,6 +461,10 @@ struct TraverseArgs {
     /// question_type` setting); needs a table.
     #[arg(long)]
     question_type: Option<String>,
+    /// A fitted tie-break file (the `[traverse] tie_break` setting) that orders
+    /// results tied at the same rank. A continuation must be given the same file.
+    #[arg(long)]
+    tie_break: Option<String>,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -513,6 +517,7 @@ async fn run_traverse(
     config.traverse.score_bound &= !args.no_score_bound;
     config.traverse.priors = args.priors.clone().or(config.traverse.priors);
     config.traverse.question_type = args.question_type.clone().or(config.traverse.question_type);
+    config.traverse.tie_break = args.tie_break.clone().or(config.traverse.tie_break);
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(name) if traverse::presets::is_preset(name) => SteerArgs {

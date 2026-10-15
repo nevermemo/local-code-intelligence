@@ -142,6 +142,7 @@ pub mod rules;
 pub mod source;
 pub mod steer;
 pub mod stop;
+pub mod tiebreak;
 pub mod trace;
 
 #[cfg(test)]
@@ -168,6 +169,7 @@ use stop::{
     ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, MapStat,
     Pause, Regions, StopReason, Tally, is_structural, likely_complete,
 };
+use tiebreak::{Facts, TieBreak};
 
 pub use fusion::RRF_K;
 /// How results are ranked (`[traverse] fusion`); see the module docs.
@@ -339,9 +341,18 @@ pub struct TraversalResult {
     /// Milliseconds the rescorer calls took in this call. Wall clock: kept
     /// out of the events, the checkpoint and the handle.
     pub rerank_ms: f64,
+    /// The tie-break the run ordered tied results with (see [`tiebreak`]).
+    pub tie_break: Option<TieBreak>,
+    /// The question's tokens, which a tie-break's `overlap` is measured on.
+    pub query: Vec<String>,
 }
 
 impl TraversalResult {
+    /// The facts a tie-break (and a fit of one) scores `state` by.
+    pub fn facts(&self, state: &State) -> Facts {
+        Facts::of(state, &self.query)
+    }
+
     /// The rank of a state of this result: [`State::ranked_potential`] under
     /// `boost` fusion, the fused score under `rrf` (0 for a state that is not
     /// a result, such as a start node).
@@ -353,20 +364,30 @@ impl TraversalResult {
     }
 
     /// The results, best first: the states reached by an edge that are not
-    /// pruned, as indexes into `states`. Equal ranks keep discovery order
-    /// under `boost` fusion and go by node id under `rrf`.
+    /// pruned, as indexes into `states`. Equal ranks go by the tie-break's
+    /// score when the run has one, then keep discovery order, under `boost`
+    /// fusion; they go by node id under `rrf`.
     pub fn ranked(&self) -> Vec<usize> {
         let mut results: Vec<usize> = (0..self.states.len())
             .filter(|&i| {
                 self.states[i].parent.is_some() && !self.cleared.contains(&self.states[i].node)
             })
             .collect();
+        let tie_scores: Vec<f64> = match (&self.tie_break, self.fusion) {
+            (Some(tie_break), Fusion::Boost) => self
+                .states
+                .iter()
+                .map(|state| tie_break.score(&self.facts(state)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let tie_score = |i: usize| tie_scores.get(i).copied().unwrap_or(0.0);
         results.sort_by(|&a, &b| {
             let (x, y) = (&self.states[a], &self.states[b]);
             self.ranked_potential(y)
                 .total_cmp(&self.ranked_potential(x))
                 .then_with(|| match self.fusion {
-                    Fusion::Boost => a.cmp(&b),
+                    Fusion::Boost => tie_score(b).total_cmp(&tie_score(a)).then(a.cmp(&b)),
                     Fusion::Rrf => x.node.cmp(&y.node),
                 })
         });
@@ -404,6 +425,7 @@ pub struct Traversal<'s> {
     rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
     score_bound: bool,
     priors: HopPriors,
+    tie_break: Option<TieBreak>,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
     identity: String,
@@ -431,6 +453,7 @@ impl<'s> Traversal<'s> {
             rerank: None,
             score_bound: true,
             priors: HopPriors::default(),
+            tie_break: None,
             bound: None,
             identity: String::new(),
         }
@@ -513,6 +536,15 @@ impl<'s> Traversal<'s> {
     /// it with [`handle::Snapshot::check_priors`].
     pub fn priors(mut self, priors: HopPriors) -> Self {
         self.priors = priors;
+        self
+    }
+
+    /// Orders results that tie at the same rank (default: discovery order);
+    /// see [`tiebreak`]. It does not change the walk or the score bound. A
+    /// handle keeps the file's hash, not the file: the caller passes it again
+    /// on a resume and checks it with [`handle::Snapshot::check_tie_break`].
+    pub fn tie_break(mut self, tie_break: Option<TieBreak>) -> Self {
+        self.tie_break = tie_break;
         self
     }
 
@@ -934,6 +966,8 @@ impl<'s> Run<'s> {
             map_ms: self.map_ms,
             rerank_floor: self.t.rerank.as_ref().map(|(_, floor)| *floor),
             rerank_ms: self.rerank_ms,
+            tie_break: self.t.tie_break,
+            query: self.query,
         }
     }
 
