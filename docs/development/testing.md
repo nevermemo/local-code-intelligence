@@ -66,6 +66,15 @@ The integration cases remain one Cargo test binary. Their source is divided by
 behavior so agents can read and run a narrow group without paying the compile
 and link cost of many separate integration binaries.
 
+## Optional: cargo-nextest
+
+`.config/nextest.toml` defines a `ci` profile for
+[cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`):
+`cargo nextest run --workspace --locked --features local-code-intelligence/spike-maps --profile ci`
+retries a failed test once and reports it as flaky, ends a test that runs past
+5 minutes, and runs the language-server, model-client and process tests at
+most two at a time. `cargo xtask test` does not use it.
+
 ## Optional: sccache and a faster linker
 
 Neither is required, and neither belongs in a commit: `rustc-wrapper` and
