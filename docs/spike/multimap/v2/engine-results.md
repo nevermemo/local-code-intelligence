@@ -125,7 +125,9 @@ the git calls depend on load, so the history gain is not tie-break-only.
 The bound at that commit was not sound for the final order with a tie-break:
 it stopped while a state that could tie the k-th result, and win the tie, was
 still reachable. The review fix 19e84c4 makes the comparison strict when a tie-break
-is in use; its cost in pops is not yet measured.
+is in use. Its cost (bench-1022, release build, held-out impact items): pops
+rise from 515 to 7303 and 30 of 44 walks end on the pop budget instead of
+the bound, with the same quality (decl_recall .046 against .045).
 
 ## Fusion and pass-through (Q2, Q4)
 
@@ -162,3 +164,56 @@ same k; that row is planned. The impact gold is built from the same SCIP
 closure, so N reproduces it nearly by construction (`m1.4-results.md`): a
 typed impact query should route to the closure, and the walk's value on
 impact is for questions that name no symbol.
+
+## Seeds, one hop and the steering ceiling (bench-1022)
+
+Release build of `40e495f`, all items, guessed priors, two sets at once, no
+deadline stops or call failures in any row (waves `W-*` in `trend.md`).
+Paired deltas are `maps compare` with a 95% bootstrap interval.
+
+| set | walk (W-plain) | search only (W-search) | one hop + seeds (W-onehop) | oracle steer (W-oracle) |
+| --- | --- | --- | --- | --- |
+| where-to | reg_mrr .687, set_f1 .242, precision .333 | .837, .314, .343 | .837, .306, .310 | .900, .356, .661 |
+| flow | path_recall .328, tau .933 (30), precision .138 | .219, -.273 (11), .220 | .467, .167 (44), .230 | .402, .855 (46), .186 |
+
+- The walk does not return its own seeds (the hybrid search hits), and on
+  where-to those are its best answers: search alone beats the walk (reg_mrr
+  +.150 [+.027, +.293], set_f1 +.072 [+.033, +.117]). On flow one hop with
+  the seeds beats the full walk (path_recall +.139 [+.072, +.208], precision
+  +.092 [+.070, +.117]) at 1.7 times the answer tokens and with the order
+  along the path lost (tau .167).
+- Merging run files offline (no new engine run): seeds interleaved with the
+  walk's answers, cut to 10, give flow path_recall .444 and tau .615 at the
+  walk's own answer count (about 10 per item), and where-to reg_mrr .847,
+  reg_hit@3 .960. Appended in full, flow reaches path_recall .547.
+- The oracle steer (`maps oracle-policy`: per-item prune rules built from the
+  gold, bench only) bounds what steering can add with these maps: where-to
+  precision +.328 [+.239, +.417] and set_f1 +.114, flow path_recall +.074
+  [+.037, +.115]. A gold-aware filter of the plain walk's 40-result pool
+  (`maps oracle-filter`, no steering) reaches about the same: where-to
+  precision .660, reg_mrr .840; flow path_recall .418, tau .842. Most of the
+  ceiling is choosing among results the walk already finds (4 of 59 oracle
+  where-to walks returned nothing), so a result
+  filter can be tried before steering the walk itself.
+- A larger pool (top 40, scored on 10) changes little (where-to reg_mrr .680, flow path_recall .324).
+
+## Exact operators and the walk (offline merges)
+
+The exact operators of BR3 against the walk's run files, merged per item
+(exact answers first; no new engine run):
+
+- Impact: the uncapped closure (arm N) has decl_recall .961; appending the
+  walk with `scip.impact` and the reranker (RR-scipimpact) adds almost no
+  first-ring declarations (.965) but raises second-ring recall .487 to .572,
+  tests recall .446 to .505 and file recall .963 to .981. At an equal 20
+  answers, interleaving loses first-ring recall (.953 to .893) for second-ring
+  (.482 to .534): exact first, the walk after it.
+- History: interleaving the git pickaxe baseline with the reranked walk
+  (RR-git), cut to 10, raises hit@10 .645 to .727 and mrr .492 to .521. The
+  walk rows stopped on the deadline on 52 of 110 items, so the gain is a lower
+  bound for that arm.
+
+On every set a first stage (search hits or an exact operator) gives the best
+early answers and the walk adds answers the first stage does not reach. BR4
+puts this in the engine: exact operators that abstain when the question names
+nothing, the seeds kept in the answers, and a merge of the two lists.
