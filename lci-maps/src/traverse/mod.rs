@@ -116,6 +116,7 @@ pub mod handle;
 pub mod handler;
 pub mod ladder;
 pub mod merged;
+pub mod priors;
 pub mod rules;
 pub mod source;
 pub mod steer;

@@ -4,6 +4,7 @@
 //! gold scorers and appends a row to the trend file (see `bench.rs`).
 
 pub mod bench;
+pub mod fit_priors;
 pub mod trend;
 
 use anyhow::Result;
@@ -16,10 +17,14 @@ pub enum MapsCommand {
     /// docs/spike/multimap/v2/trend.md. The gold files and the frozen tree are
     /// private and passed with --gold-dir and --tree.
     Bench(Box<bench::BenchArgs>),
+    /// Fit the per-question-type hop priors from the traces of bench runs and
+    /// write them as JSON, with the item ids held out of the fit.
+    FitPriors(fit_priors::FitPriorsArgs),
 }
 
 pub fn run(command: MapsCommand) -> Result<()> {
     match command {
         MapsCommand::Bench(args) => bench::run(*args),
+        MapsCommand::FitPriors(args) => fit_priors::run(args),
     }
 }
