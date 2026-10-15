@@ -296,95 +296,116 @@ mod tests {
     }
 
     #[test]
-    fn adapter_reports_java() {
-        let jdtls = fake_jdtls_install();
-        let config = config_with_java(JavaLspConfig {
-            path: Some(jdtls.path().to_string_lossy().into_owned()),
-            args: vec![],
-            disabled: false,
-        });
-        let server = JavaServer::new(&config, Duration::from_secs(60));
-        assert_eq!(server.languages(), &["java"]);
-        assert!(server.enabled());
+    fn the_java_adapter_follows_the_adapter_contract() {
+        // it reports java
+        {
+            let jdtls = fake_jdtls_install();
+            let config = config_with_java(JavaLspConfig {
+                path: Some(jdtls.path().to_string_lossy().into_owned()),
+                args: vec![],
+                disabled: false,
+            });
+            let server = JavaServer::new(&config, Duration::from_secs(60));
+            assert_eq!(server.languages(), &["java"]);
+            assert!(server.enabled());
+        }
+
+        // it is enabled only with a usable path
+        {
+            let missing = config_with_java(JavaLspConfig::default());
+            assert!(!JavaServer::new(&missing, Duration::from_secs(60)).enabled());
+            assert!(
+                JavaServer::new(&missing, Duration::from_secs(60))
+                    .transport_config(Path::new("/tmp"))
+                    .is_none()
+            );
+
+            let empty = config_with_java(JavaLspConfig {
+                path: Some("   ".into()),
+                args: vec![],
+                disabled: false,
+            });
+            assert!(!JavaServer::new(&empty, Duration::from_secs(60)).enabled());
+
+            let jdtls = fake_jdtls_install();
+            let disabled = config_with_java(JavaLspConfig {
+                path: Some(jdtls.path().to_string_lossy().into_owned()),
+                args: vec![],
+                disabled: true,
+            });
+            assert!(!JavaServer::new(&disabled, Duration::from_secs(60)).enabled());
+        }
+
+        // it can be represented without a process
+        {
+            let jdtls = fake_jdtls_install();
+            let config = config_with_java(JavaLspConfig {
+                path: Some(jdtls.path().to_string_lossy().into_owned()),
+                args: vec![],
+                disabled: false,
+            });
+            let server = JavaServer::new(&config, Duration::from_secs(30));
+            let workspace = tempfile::tempdir().unwrap();
+            let params = server.initialize_params(workspace.path()).unwrap();
+            assert_eq!(params["processId"], std::process::id());
+            assert!(params["rootUri"].as_str().is_some());
+        }
     }
 
     #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        let missing = config_with_java(JavaLspConfig::default());
-        assert!(!JavaServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            JavaServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
-        );
+    fn the_jdtls_transport() {
+        // a missing launcher jar yields no transport
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+            let config = config_with_java(JavaLspConfig {
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                args: vec![],
+                disabled: false,
+            });
+            let server = JavaServer::new(&config, Duration::from_secs(30));
+            let workspace = tempfile::tempdir().unwrap();
+            assert!(server.transport_config(workspace.path()).is_none());
+        }
 
-        let empty = config_with_java(JavaLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        });
-        assert!(!JavaServer::new(&empty, Duration::from_secs(60)).enabled());
+        // java is spawned directly with the launcher and data flags
+        {
+            let jdtls = fake_jdtls_install();
+            let config = config_with_java(JavaLspConfig {
+                path: Some(jdtls.path().to_string_lossy().into_owned()),
+                args: vec!["-Xmx2G".into()],
+                disabled: false,
+            });
+            let server = JavaServer::new(&config, Duration::from_secs(30));
+            let workspace = tempfile::tempdir().unwrap();
+            let transport = server.transport_config(workspace.path()).unwrap();
+            assert_eq!(transport.executable, "java");
+            assert!(transport.args.iter().any(|a| a == "-jar"));
+            assert!(
+                transport
+                    .args
+                    .iter()
+                    .any(|a| a.contains("org.eclipse.equinox.launcher"))
+            );
+            assert!(transport.args.iter().any(|a| a == "-data"));
+            assert_eq!(transport.args.last(), Some(&"-Xmx2G".to_string()));
+        }
 
-        let jdtls = fake_jdtls_install();
-        let disabled = config_with_java(JavaLspConfig {
-            path: Some(jdtls.path().to_string_lossy().into_owned()),
-            args: vec![],
-            disabled: true,
-        });
-        assert!(!JavaServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
-
-    #[test]
-    fn missing_launcher_jar_yields_no_transport() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
-        let config = config_with_java(JavaLspConfig {
-            path: Some(dir.path().to_string_lossy().into_owned()),
-            args: vec![],
-            disabled: false,
-        });
-        let server = JavaServer::new(&config, Duration::from_secs(30));
-        let workspace = tempfile::tempdir().unwrap();
-        assert!(server.transport_config(workspace.path()).is_none());
-    }
-
-    #[test]
-    fn transport_spawns_java_directly_with_launcher_and_data_flags() {
-        let jdtls = fake_jdtls_install();
-        let config = config_with_java(JavaLspConfig {
-            path: Some(jdtls.path().to_string_lossy().into_owned()),
-            args: vec!["-Xmx2G".into()],
-            disabled: false,
-        });
-        let server = JavaServer::new(&config, Duration::from_secs(30));
-        let workspace = tempfile::tempdir().unwrap();
-        let transport = server.transport_config(workspace.path()).unwrap();
-        assert_eq!(transport.executable, "java");
-        assert!(transport.args.iter().any(|a| a == "-jar"));
-        assert!(
-            transport
-                .args
-                .iter()
-                .any(|a| a.contains("org.eclipse.equinox.launcher"))
-        );
-        assert!(transport.args.iter().any(|a| a == "-data"));
-        assert_eq!(transport.args.last(), Some(&"-Xmx2G".to_string()));
-    }
-
-    #[test]
-    fn same_workspace_gets_a_stable_data_dir_across_calls() {
-        let jdtls = fake_jdtls_install();
-        let config = config_with_java(JavaLspConfig {
-            path: Some(jdtls.path().to_string_lossy().into_owned()),
-            args: vec![],
-            disabled: false,
-        });
-        let server = JavaServer::new(&config, Duration::from_secs(30));
-        let workspace = tempfile::tempdir().unwrap();
-        let first = server.transport_config(workspace.path()).unwrap();
-        let second = server.transport_config(workspace.path()).unwrap();
-        let data_index = first.args.iter().position(|a| a == "-data").unwrap() + 1;
-        assert_eq!(first.args[data_index], second.args[data_index]);
+        // the same workspace gets a stable data dir
+        {
+            let jdtls = fake_jdtls_install();
+            let config = config_with_java(JavaLspConfig {
+                path: Some(jdtls.path().to_string_lossy().into_owned()),
+                args: vec![],
+                disabled: false,
+            });
+            let server = JavaServer::new(&config, Duration::from_secs(30));
+            let workspace = tempfile::tempdir().unwrap();
+            let first = server.transport_config(workspace.path()).unwrap();
+            let second = server.transport_config(workspace.path()).unwrap();
+            let data_index = first.args.iter().position(|a| a == "-data").unwrap() + 1;
+            assert_eq!(first.args[data_index], second.args[data_index]);
+        }
     }
 
     #[test]
@@ -403,20 +424,5 @@ mod tests {
         assert!(!predicate(
             &json!({"method": "textDocument/publishDiagnostics"})
         ));
-    }
-
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let jdtls = fake_jdtls_install();
-        let config = config_with_java(JavaLspConfig {
-            path: Some(jdtls.path().to_string_lossy().into_owned()),
-            args: vec![],
-            disabled: false,
-        });
-        let server = JavaServer::new(&config, Duration::from_secs(30));
-        let workspace = tempfile::tempdir().unwrap();
-        let params = server.initialize_params(workspace.path()).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
     }
 }

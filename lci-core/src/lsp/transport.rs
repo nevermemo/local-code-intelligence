@@ -720,75 +720,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_response_with_a_result_and_an_error_is_not_an_rpc_error() {
-        let error = json!({"code": -32801, "message": "content modified"});
-        let both = json!({"jsonrpc": "2.0", "id": 1, "result": [1], "error": error});
-        let failure = response_outcome(&both).unwrap_err();
-        assert!(failure.downcast_ref::<RpcError>().is_none(), "{failure}");
-        // A null result beside the error carries no answer.
-        for message in [
-            json!({"id": 1, "result": null, "error": error}),
-            json!({"id": 1, "error": error}),
-        ] {
-            let failure = response_outcome(&message).unwrap_err();
-            let typed = failure.downcast_ref::<RpcError>().expect("an RpcError");
-            assert_eq!(typed.code, RpcError::CONTENT_MODIFIED);
+    fn rpc_errors_are_read_from_error_responses_only() {
+        // a response with a result and an error is not an RPC error
+        {
+            let error = json!({"code": -32801, "message": "content modified"});
+            let both = json!({"jsonrpc": "2.0", "id": 1, "result": [1], "error": error});
+            let failure = response_outcome(&both).unwrap_err();
+            assert!(failure.downcast_ref::<RpcError>().is_none(), "{failure}");
+            // A null result beside the error carries no answer.
+            for message in [
+                json!({"id": 1, "result": null, "error": error}),
+                json!({"id": 1, "error": error}),
+            ] {
+                let failure = response_outcome(&message).unwrap_err();
+                let typed = failure.downcast_ref::<RpcError>().expect("an RpcError");
+                assert_eq!(typed.code, RpcError::CONTENT_MODIFIED);
+            }
+            assert_eq!(
+                response_outcome(&json!({"id": 1, "result": {"k": 1}})).unwrap(),
+                json!({"k": 1})
+            );
+            assert_eq!(response_outcome(&json!({"id": 1})).unwrap(), Value::Null);
         }
-        assert_eq!(
-            response_outcome(&json!({"id": 1, "result": {"k": 1}})).unwrap(),
-            json!({"k": 1})
-        );
-        assert_eq!(response_outcome(&json!({"id": 1})).unwrap(), Value::Null);
-    }
 
-    #[test]
-    fn an_error_object_keeps_its_code_and_message() {
-        let error =
-            RpcError::from_response(&json!({"code": -32801, "message": "content modified"}))
-                .unwrap();
-        assert_eq!(error.code, RpcError::CONTENT_MODIFIED);
-        assert_eq!(error.message, "content modified");
-        assert_eq!(error.to_string(), "JSON-RPC error -32801: content modified");
-        // Extra members (`data`) are allowed.
-        assert!(
-            RpcError::from_response(&json!({"code": 1, "message": "m", "data": {"k": 1}}))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn a_malformed_error_member_is_not_an_rpc_error() {
-        for malformed in [
-            json!(null),
-            json!("plain text"),
-            json!(7),
-            json!([1, 2]),
-            json!({"reason": "boom"}),
-            json!({"message": "no code"}),
-            json!({"code": 1}),
-            json!({"code": "1", "message": "string code"}),
-            json!({"code": 1.5, "message": "fractional code"}),
-            json!({"code": 1, "message": 5}),
-            json!({"code": null, "message": "null code"}),
-        ] {
-            assert!(RpcError::from_response(&malformed).is_none(), "{malformed}");
+        // an error object keeps its code and message
+        {
+            let error =
+                RpcError::from_response(&json!({"code": -32801, "message": "content modified"}))
+                    .unwrap();
+            assert_eq!(error.code, RpcError::CONTENT_MODIFIED);
+            assert_eq!(error.message, "content modified");
+            assert_eq!(error.to_string(), "JSON-RPC error -32801: content modified");
+            // Extra members (`data`) are allowed.
+            assert!(
+                RpcError::from_response(&json!({"code": 1, "message": "m", "data": {"k": 1}}))
+                    .is_some()
+            );
         }
-    }
 
-    #[test]
-    fn only_an_error_response_carries_an_rpc_error() {
-        let response = anyhow::Error::new(
-            RpcError::from_response(&json!({"code": -32603, "message": "file not found"})).unwrap(),
-        )
-        .context("workspace/symbol");
-        // Context layers added by callers do not hide the root cause.
-        let found = response.downcast_ref::<RpcError>().unwrap();
-        assert_eq!(found.code, RpcError::INTERNAL_ERROR);
-        assert!(
-            anyhow::anyhow!("rust-analyzer exited")
-                .downcast_ref::<RpcError>()
-                .is_none()
-        );
+        // a malformed error member is not an RPC error
+        {
+            for malformed in [
+                json!(null),
+                json!("plain text"),
+                json!(7),
+                json!([1, 2]),
+                json!({"reason": "boom"}),
+                json!({"message": "no code"}),
+                json!({"code": 1}),
+                json!({"code": "1", "message": "string code"}),
+                json!({"code": 1.5, "message": "fractional code"}),
+                json!({"code": 1, "message": 5}),
+                json!({"code": null, "message": "null code"}),
+            ] {
+                assert!(RpcError::from_response(&malformed).is_none(), "{malformed}");
+            }
+        }
+
+        // only an error response carries an RPC error
+        {
+            let response = anyhow::Error::new(
+                RpcError::from_response(&json!({"code": -32603, "message": "file not found"}))
+                    .unwrap(),
+            )
+            .context("workspace/symbol");
+            // Context layers added by callers do not hide the root cause.
+            let found = response.downcast_ref::<RpcError>().unwrap();
+            assert_eq!(found.code, RpcError::INTERNAL_ERROR);
+            assert!(
+                anyhow::anyhow!("rust-analyzer exited")
+                    .downcast_ref::<RpcError>()
+                    .is_none()
+            );
+        }
     }
 
     async fn frame_of(bytes: &[u8], max_body: usize) -> (Result<Option<Vec<u8>>>, Vec<u8>) {
@@ -800,99 +804,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_frame_is_read_whole_and_the_next_one_is_left_alone() {
-        let bytes = b"Content-Length: 5\r\nContent-Type: application/vscode-jsonrpc\r\n\r\nhelloContent-Length: 1\r\n\r\nx";
-        let (first, rest) = frame_of(bytes, MAX_FRAME_BYTES).await;
-        assert_eq!(first.unwrap().unwrap(), b"hello");
-        assert_eq!(rest, b"Content-Length: 1\r\n\r\nx");
-        // A bare line feed ends the headers too, and the name's case is free.
-        let (lenient, _) = frame_of(b"content-length: 2\n\nab", MAX_FRAME_BYTES).await;
-        assert_eq!(lenient.unwrap().unwrap(), b"ab");
-    }
-
-    #[tokio::test]
-    async fn the_end_of_the_output_is_not_an_error_before_a_frame() {
-        for bytes in [&b""[..], b"Content-Length: 5\r\n"] {
-            let (outcome, _) = frame_of(bytes, MAX_FRAME_BYTES).await;
-            assert!(outcome.unwrap().is_none());
+    async fn frame_reading() {
+        // a frame is read whole and the next one is left alone
+        {
+            let bytes = b"Content-Length: 5\r\nContent-Type: application/vscode-jsonrpc\r\n\r\nhelloContent-Length: 1\r\n\r\nx";
+            let (first, rest) = frame_of(bytes, MAX_FRAME_BYTES).await;
+            assert_eq!(first.unwrap().unwrap(), b"hello");
+            assert_eq!(rest, b"Content-Length: 1\r\n\r\nx");
+            // A bare line feed ends the headers too, and the name's case is free.
+            let (lenient, _) = frame_of(b"content-length: 2\n\nab", MAX_FRAME_BYTES).await;
+            assert_eq!(lenient.unwrap().unwrap(), b"ab");
         }
-        let (cut, _) = frame_of(b"Content-Length: 5\r\n\r\nhe", MAX_FRAME_BYTES).await;
-        assert!(cut.is_err(), "a body that ends early is a failure");
-    }
 
-    /// The announced length is checked before the body is allocated or read:
-    /// the bytes after the headers are still unread when the error comes.
-    #[tokio::test]
-    async fn a_frame_over_the_limit_is_refused_before_its_body_is_read() {
-        let (at_limit, _) = frame_of(b"Content-Length: 16\r\n\r\n0123456789abcdef", 16).await;
-        assert_eq!(at_limit.unwrap().unwrap().len(), 16);
-        for announced in ["17", "4294967296", "18446744073709551615"] {
-            let message = format!("Content-Length: {announced}\r\n\r\nBODY");
-            let (outcome, rest) = frame_of(message.as_bytes(), 16).await;
-            let error = outcome.unwrap_err();
-            assert!(
-                format!("{error:#}").contains("over the limit"),
-                "{announced}: {error:#}"
-            );
-            assert_eq!(rest, b"BODY", "{announced}: the body must not be consumed");
+        // the end of the output is not an error before a frame
+        {
+            for bytes in [&b""[..], b"Content-Length: 5\r\n"] {
+                let (outcome, _) = frame_of(bytes, MAX_FRAME_BYTES).await;
+                assert!(outcome.unwrap().is_none());
+            }
+            let (cut, _) = frame_of(b"Content-Length: 5\r\n\r\nhe", MAX_FRAME_BYTES).await;
+            assert!(cut.is_err(), "a body that ends early is a failure");
         }
-    }
 
-    #[tokio::test]
-    async fn a_header_line_over_the_bound_is_refused_without_buffering_it() {
-        let longest = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE_BYTES - 9));
-        assert_eq!(longest.len(), MAX_HEADER_LINE_BYTES);
-        let framed = format!("{longest}Content-Length: 2\r\n\r\nok");
-        let (accepted, _) = frame_of(framed.as_bytes(), MAX_FRAME_BYTES).await;
-        assert_eq!(accepted.unwrap().unwrap(), b"ok");
+        // a frame over the limit is refused before its body is read
+        // The announced length is checked before the body is allocated or read:
+        // the bytes after the headers are still unread when the error comes.
+        {
+            let (at_limit, _) = frame_of(b"Content-Length: 16\r\n\r\n0123456789abcdef", 16).await;
+            assert_eq!(at_limit.unwrap().unwrap().len(), 16);
+            for announced in ["17", "4294967296", "18446744073709551615"] {
+                let message = format!("Content-Length: {announced}\r\n\r\nBODY");
+                let (outcome, rest) = frame_of(message.as_bytes(), 16).await;
+                let error = outcome.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("over the limit"),
+                    "{announced}: {error:#}"
+                );
+                assert_eq!(rest, b"BODY", "{announced}: the body must not be consumed");
+            }
+        }
 
-        let endless = vec![b'a'; MAX_HEADER_LINE_BYTES * 4];
-        let (outcome, rest) = frame_of(&endless, MAX_FRAME_BYTES).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("header line longer"));
-        assert!(
-            rest.len() >= MAX_HEADER_LINE_BYTES * 3 - 1,
-            "only about one bound of the line may be read, {} bytes left",
-            rest.len()
-        );
-    }
+        // a header line over the bound is refused without buffering it
+        {
+            let longest = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE_BYTES - 9));
+            assert_eq!(longest.len(), MAX_HEADER_LINE_BYTES);
+            let framed = format!("{longest}Content-Length: 2\r\n\r\nok");
+            let (accepted, _) = frame_of(framed.as_bytes(), MAX_FRAME_BYTES).await;
+            assert_eq!(accepted.unwrap().unwrap(), b"ok");
 
-    #[tokio::test]
-    async fn too_many_header_lines_a_missing_length_and_a_bad_length_are_refused() {
-        let mut many = "X: 1\r\n".repeat(MAX_HEADER_LINES);
-        many.push_str("Content-Length: 2\r\n\r\nok");
-        let (outcome, _) = frame_of(many.as_bytes(), MAX_FRAME_BYTES).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("header lines"));
-
-        let (missing, _) = frame_of(b"X: 1\r\n\r\nbody", MAX_FRAME_BYTES).await;
-        assert!(format!("{:#}", missing.unwrap_err()).contains("missing Content-Length"));
-
-        let (bad, _) = frame_of(b"Content-Length: lots\r\n\r\n", MAX_FRAME_BYTES).await;
-        assert!(bad.is_err());
-        let (not_utf8, _) = frame_of(b"X: \xff\r\n\r\n", MAX_FRAME_BYTES).await;
-        assert!(format!("{:#}", not_utf8.unwrap_err()).contains("UTF-8"));
-    }
-
-    /// A second Content-Length is refused, whatever it says, and before the
-    /// body: with the last one winning, `100` then `1` would read one byte of
-    /// the body and take the rest for the next message.
-    #[tokio::test]
-    async fn a_second_content_length_is_refused_before_the_body_is_read() {
-        for headers in [
-            "Content-Length: 100\r\nContent-Length: 1\r\n",
-            "Content-Length: 1\r\nX: y\r\ncontent-length: 1\r\n",
-        ] {
-            let message = format!("{headers}\r\nBODY");
-            let (outcome, rest) = frame_of(message.as_bytes(), MAX_FRAME_BYTES).await;
-            let error = outcome.unwrap_err();
+            let endless = vec![b'a'; MAX_HEADER_LINE_BYTES * 4];
+            let (outcome, rest) = frame_of(&endless, MAX_FRAME_BYTES).await;
+            assert!(format!("{:#}", outcome.unwrap_err()).contains("header line longer"));
             assert!(
-                format!("{error:#}").contains("more than one Content-Length"),
-                "{headers:?}: {error:#}"
+                rest.len() >= MAX_HEADER_LINE_BYTES * 3 - 1,
+                "only about one bound of the line may be read, {} bytes left",
+                rest.len()
             );
-            // Only the header lines were read: the blank line and the body are left.
-            assert_eq!(
-                rest, b"\r\nBODY",
-                "{headers:?}: the body must not be consumed"
-            );
+        }
+
+        // too many header lines, a missing length and a bad length are refused
+        {
+            let mut many = "X: 1\r\n".repeat(MAX_HEADER_LINES);
+            many.push_str("Content-Length: 2\r\n\r\nok");
+            let (outcome, _) = frame_of(many.as_bytes(), MAX_FRAME_BYTES).await;
+            assert!(format!("{:#}", outcome.unwrap_err()).contains("header lines"));
+
+            let (missing, _) = frame_of(b"X: 1\r\n\r\nbody", MAX_FRAME_BYTES).await;
+            assert!(format!("{:#}", missing.unwrap_err()).contains("missing Content-Length"));
+
+            let (bad, _) = frame_of(b"Content-Length: lots\r\n\r\n", MAX_FRAME_BYTES).await;
+            assert!(bad.is_err());
+            let (not_utf8, _) = frame_of(b"X: \xff\r\n\r\n", MAX_FRAME_BYTES).await;
+            assert!(format!("{:#}", not_utf8.unwrap_err()).contains("UTF-8"));
+        }
+
+        // a second Content-Length is refused before the body is read
+        // A second Content-Length is refused, whatever it says, and before the
+        // body: with the last one winning, `100` then `1` would read one byte of
+        // the body and take the rest for the next message.
+        {
+            for headers in [
+                "Content-Length: 100\r\nContent-Length: 1\r\n",
+                "Content-Length: 1\r\nX: y\r\ncontent-length: 1\r\n",
+            ] {
+                let message = format!("{headers}\r\nBODY");
+                let (outcome, rest) = frame_of(message.as_bytes(), MAX_FRAME_BYTES).await;
+                let error = outcome.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("more than one Content-Length"),
+                    "{headers:?}: {error:#}"
+                );
+                // Only the header lines were read: the blank line and the body are left.
+                assert_eq!(
+                    rest, b"\r\nBODY",
+                    "{headers:?}: the body must not be consumed"
+                );
+            }
         }
     }
 }

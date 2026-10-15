@@ -1283,30 +1283,71 @@ mod tests {
     }
 
     #[test]
-    fn skips_locations_with_out_of_range_positions_or_invalid_uris() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace {
-            id: "test".into(),
-            path: dunce::canonicalize(temp.path()).unwrap(),
-        };
-        let file = workspace.path.join("src").join("lib.rs");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
-        let result = locations_for(
-            json!([
-                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"line":4294967295u64,"character":0},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
-                {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}
-            ]),
-            &workspace,
-            "rust-analyzer",
-        )
-        .unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].relative_file_path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(result[0].start_line, 1);
+    fn a_location_that_cannot_be_represented_is_dropped_alone() {
+        // (name, items built from the file's uri, the surviving location's
+        // start line and end character)
+        type Case<'a> = (&'a str, Box<dyn Fn(&str) -> Value>, u32, u32);
+        let cases: [Case; 4] = [
+            (
+                "a line that does not fit u32 after the 1-based shift, a character that does not fit u32, and an invalid uri",
+                Box::new(|uri| {
+                    json!([
+                        {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"line":4294967295u64,"character":0},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
+                        {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}
+                    ])
+                }),
+                1,
+                1,
+            ),
+            (
+                "a character that does not fit u32 at either end",
+                Box::new(|uri| {
+                    json!([
+                        {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"line":0,"character":4294967296u64},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
+                    ])
+                }),
+                1,
+                1,
+            ),
+            (
+                "a missing or negative position",
+                Box::new(|uri| {
+                    json!([
+                        {"uri":uri,"range":{"start":{"line":2,"character":3},"end":{"line":2,"character":5}}},
+                        {"uri":uri,"range":{"start":{"line":-1,"character":0},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"character":0},"end":{"line":0,"character":1}}},
+                    ])
+                }),
+                3,
+                5,
+            ),
+            (
+                "a uri that does not parse",
+                Box::new(|uri| {
+                    json!([
+                        {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                        {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                    ])
+                }),
+                1,
+                1,
+            ),
+        ];
+        for (name, items, start_line, end_character) in cases {
+            let result = locations_in_temp_workspace(items);
+            assert_eq!(result.len(), 1, "{name}");
+            assert_eq!(
+                result[0].relative_file_path.as_deref(),
+                Some("src/lib.rs"),
+                "{name}"
+            );
+            assert_eq!(result[0].start_line, start_line, "{name}");
+            assert_eq!(result[0].end_character, end_character, "{name}");
+        }
     }
 
     /// `locations_for` over `items`, where each item is built from the
@@ -1321,44 +1362,6 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
         locations_for(items(&uri), &workspace, "rust-analyzer").unwrap()
-    }
-
-    #[test]
-    fn a_character_that_does_not_fit_u32_drops_only_its_location() {
-        let result = locations_in_temp_workspace(|uri| {
-            json!([
-                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"line":0,"character":4294967296u64},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4294967296u64}}},
-            ])
-        });
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].end_character, 1);
-    }
-
-    #[test]
-    fn a_missing_or_negative_position_drops_only_its_location() {
-        let result = locations_in_temp_workspace(|uri| {
-            json!([
-                {"uri":uri,"range":{"start":{"line":2,"character":3},"end":{"line":2,"character":5}}},
-                {"uri":uri,"range":{"start":{"line":-1,"character":0},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"character":0},"end":{"line":0,"character":1}}},
-            ])
-        });
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].start_line, 3);
-    }
-
-    #[test]
-    fn a_uri_that_does_not_parse_drops_only_its_location() {
-        let result = locations_in_temp_workspace(|uri| {
-            json!([
-                {"uri":"not a uri","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
-                {"uri":uri,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
-            ])
-        });
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].relative_file_path.as_deref(), Some("src/lib.rs"));
     }
 
     #[test]
@@ -1462,132 +1465,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transient_error_is_repeated_until_the_server_answers() {
-        let policy = fast_policy(Duration::from_secs(5));
-        let (result, attempts, _) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 3).await;
-        assert_eq!(result.unwrap(), json!("answer"));
-        assert_eq!(attempts, 3);
-    }
+    async fn same_server_repeats() {
+        // a transient error is repeated until the server answers
+        {
+            let policy = fast_policy(Duration::from_secs(5));
+            let (result, attempts, _) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 3).await;
+            assert_eq!(result.unwrap(), json!("answer"));
+            assert_eq!(attempts, 3);
+        }
 
-    #[tokio::test]
-    async fn the_repeats_stop_after_the_last_wait() {
-        let policy = fast_policy(Duration::from_secs(5));
-        let (result, attempts, _) = ask(&policy, 1, RpcError::SERVER_CANCELLED, 99).await;
-        let error = result.unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<RpcError>().map(|e| e.code),
-            Some(RpcError::SERVER_CANCELLED)
-        );
-        assert_eq!(attempts, 3, "the request and its two repeats");
-    }
+        // the repeats stop after the last wait
+        {
+            let policy = fast_policy(Duration::from_secs(5));
+            let (result, attempts, _) = ask(&policy, 1, RpcError::SERVER_CANCELLED, 99).await;
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RpcError>().map(|e| e.code),
+                Some(RpcError::SERVER_CANCELLED)
+            );
+            assert_eq!(attempts, 3, "the request and its two repeats");
+        }
 
-    #[tokio::test]
-    async fn an_error_that_is_not_transient_is_not_repeated() {
-        let policy = fast_policy(Duration::from_secs(5));
-        let (result, attempts, _) = ask(&policy, 1, -32602, 99).await;
-        assert!(result.is_err());
-        assert_eq!(attempts, 1);
-    }
+        // an error that is not transient is not repeated
+        {
+            let policy = fast_policy(Duration::from_secs(5));
+            let (result, attempts, _) = ask(&policy, 1, -32602, 99).await;
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
 
-    /// The window decides before the wait: a repeat that cannot start inside
-    /// it is not even waited for.
-    #[tokio::test]
-    async fn a_repeat_whose_wait_does_not_fit_in_the_window_is_not_waited_for() {
-        const LONG_WAIT: [Duration; 1] = [Duration::from_millis(400)];
-        let policy = RepeatPolicy {
-            waits: &LONG_WAIT,
-            window: Duration::from_millis(50),
-        };
-        let (result, attempts, waits) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 2).await;
-        assert!(result.is_err());
-        assert_eq!(attempts, 1);
-        assert_eq!(waits, 0, "the wait must not be started");
-    }
+        // a repeat whose wait does not fit in the window is not waited for
+        // The window decides before the wait: a repeat that cannot start inside
+        // it is not even waited for.
+        {
+            const LONG_WAIT: [Duration; 1] = [Duration::from_millis(400)];
+            let policy = RepeatPolicy {
+                waits: &LONG_WAIT,
+                window: Duration::from_millis(50),
+            };
+            let (result, attempts, waits) = ask(&policy, 1, RpcError::CONTENT_MODIFIED, 2).await;
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+            assert_eq!(waits, 0, "the wait must not be started");
+        }
 
-    /// The window is checked again after the wait, because a timer can run
-    /// late: here the 10 ms wait fits when it is decided on, but the timer
-    /// returns after 60 ms, past the 50 ms window, so the repeat is not sent.
-    /// Without the second check the repeat would go out (2 requests, not 1).
-    #[tokio::test]
-    async fn the_window_is_checked_again_after_the_wait() {
-        let policy = fast_policy(Duration::from_millis(50));
-        let (result, attempts, _) = ask(&policy, 6, RpcError::CONTENT_MODIFIED, 99).await;
-        assert!(result.is_err());
-        assert_eq!(
-            attempts, 1,
-            "no repeat may start after the window has passed"
-        );
+        // the window is checked again after the wait
+        // The window is checked again after the wait, because a timer can run
+        // late: here the 10 ms wait fits when it is decided on, but the timer
+        // returns after 60 ms, past the 50 ms window, so the repeat is not sent.
+        // Without the second check the repeat would go out (2 requests, not 1).
+        {
+            let policy = fast_policy(Duration::from_millis(50));
+            let (result, attempts, _) = ask(&policy, 6, RpcError::CONTENT_MODIFIED, 99).await;
+            assert!(result.is_err());
+            assert_eq!(
+                attempts, 1,
+                "no repeat may start after the window has passed"
+            );
+        }
     }
 
     const LIMIT: Duration = Duration::from_secs(900);
 
     #[test]
-    fn a_streak_needs_two_transient_answers_a_limit_apart() {
-        let start = Instant::now();
-        let mut streak = TransientStreak::default();
-        assert_eq!(streak.transient(start, 0, LIMIT), None, "the first answer");
-        assert_eq!(
-            streak.transient(start + LIMIT - Duration::from_millis(1), 0, LIMIT),
-            None,
-            "just under the limit"
-        );
-        assert_eq!(
-            streak.transient(start + LIMIT, 0, LIMIT),
-            Some(LIMIT),
-            "at the limit the session is stuck"
-        );
-    }
+    fn transient_streaks() {
+        // a streak needs two transient answers a limit apart
+        {
+            let start = Instant::now();
+            let mut streak = TransientStreak::default();
+            assert_eq!(streak.transient(start, 0, LIMIT), None, "the first answer");
+            assert_eq!(
+                streak.transient(start + LIMIT - Duration::from_millis(1), 0, LIMIT),
+                None,
+                "just under the limit"
+            );
+            assert_eq!(
+                streak.transient(start + LIMIT, 0, LIMIT),
+                Some(LIMIT),
+                "at the limit the session is stuck"
+            );
+        }
 
-    /// A server that answers (a result, or an error that is not transient)
-    /// is not stuck, and the span starts over with its next transient error.
-    #[test]
-    fn an_answer_ends_the_streak() {
-        let start = Instant::now();
-        let mut streak = TransientStreak::default();
-        assert_eq!(streak.transient(start, 0, LIMIT), None);
-        streak.answered();
-        let later = start + LIMIT * 2;
-        assert_eq!(
-            streak.transient(later, 0, LIMIT),
-            None,
-            "a new streak begins here, not at the first error"
-        );
-        assert_eq!(streak.transient(later + LIMIT, 0, LIMIT), Some(LIMIT));
-    }
+        // an answer ends the streak
+        // A server that answers (a result, or an error that is not transient)
+        // is not stuck, and the span starts over with its next transient error.
+        {
+            let start = Instant::now();
+            let mut streak = TransientStreak::default();
+            assert_eq!(streak.transient(start, 0, LIMIT), None);
+            streak.answered();
+            let later = start + LIMIT * 2;
+            assert_eq!(
+                streak.transient(later, 0, LIMIT),
+                None,
+                "a new streak begins here, not at the first error"
+            );
+            assert_eq!(streak.transient(later + LIMIT, 0, LIMIT), Some(LIMIT));
+        }
 
-    /// An answer that arrives with an earlier timestamp than the streak's start
-    /// (clocks of concurrent requests) is no span at all, not a panic.
-    #[test]
-    fn a_transient_answer_before_the_streak_began_is_not_a_span() {
-        let start = Instant::now();
-        let mut streak = TransientStreak::default();
-        assert_eq!(streak.transient(start + LIMIT, 0, LIMIT), None);
-        assert_eq!(streak.transient(start, 0, LIMIT), None);
-    }
+        // a transient answer before the streak began is not a span
+        // An answer that arrives with an earlier timestamp than the streak's start
+        // (clocks of concurrent requests) is no span at all, not a panic.
+        {
+            let start = Instant::now();
+            let mut streak = TransientStreak::default();
+            assert_eq!(streak.transient(start + LIMIT, 0, LIMIT), None);
+            assert_eq!(streak.transient(start, 0, LIMIT), None);
+        }
 
-    /// Progress means the server is working: a span that straddles a
-    /// progress notification starts over at the answer that saw it, and only
-    /// a span in which the count stayed the same can reach the limit.
-    #[test]
-    fn progress_restarts_the_streak() {
-        let start = Instant::now();
-        let mut streak = TransientStreak::default();
-        assert_eq!(streak.transient(start, 1, LIMIT), None);
-        assert_eq!(
-            streak.transient(start + LIMIT, 2, LIMIT),
-            None,
-            "the count moved: a new span begins here"
-        );
-        assert_eq!(
-            streak.transient(start + LIMIT * 2 - Duration::from_millis(1), 2, LIMIT),
-            None,
-            "just under the limit since the progress"
-        );
-        assert_eq!(
-            streak.transient(start + LIMIT * 2, 2, LIMIT),
-            Some(LIMIT),
-            "no more progress for the whole limit: stuck"
-        );
+        // progress restarts the streak
+        // Progress means the server is working: a span that straddles a
+        // progress notification starts over at the answer that saw it, and only
+        // a span in which the count stayed the same can reach the limit.
+        {
+            let start = Instant::now();
+            let mut streak = TransientStreak::default();
+            assert_eq!(streak.transient(start, 1, LIMIT), None);
+            assert_eq!(
+                streak.transient(start + LIMIT, 2, LIMIT),
+                None,
+                "the count moved: a new span begins here"
+            );
+            assert_eq!(
+                streak.transient(start + LIMIT * 2 - Duration::from_millis(1), 2, LIMIT),
+                None,
+                "just under the limit since the progress"
+            );
+            assert_eq!(
+                streak.transient(start + LIMIT * 2, 2, LIMIT),
+                Some(LIMIT),
+                "no more progress for the whole limit: stuck"
+            );
+        }
     }
 
     #[test]

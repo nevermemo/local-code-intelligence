@@ -169,77 +169,39 @@ fn language_id_for(relative: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::adapter::contract;
 
-    #[test]
-    fn adapter_reports_c_and_cpp() {
+    fn server(path: Option<&str>, args: &[&str], disabled: bool) -> ClangdServer {
         let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: false,
+            path: path.map(str::to_owned),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            disabled,
         };
-        let server = ClangdServer::new(&config, Duration::from_secs(60));
-        assert_eq!(server.languages(), &["c", "cpp"]);
-        assert!(server.enabled());
+        ClangdServer::new(&config, Duration::from_secs(60))
     }
 
     #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        let missing = ClangdLspConfig::default();
-        assert!(!ClangdServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            ClangdServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
+    fn the_clangd_adapter_follows_the_adapter_contract() {
+        let usable = server(Some("clangd"), &[], false);
+        assert_eq!(usable.languages(), &["c", "cpp"]);
+        contract::assert_enabled_only_with_a_usable_path(
+            |path, disabled| server(path, &[], disabled),
+            "clangd",
         );
-
-        let empty = ClangdLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        };
-        assert!(!ClangdServer::new(&empty, Duration::from_secs(60)).enabled());
-
-        let disabled = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: true,
-        };
-        assert!(!ClangdServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
-
-    #[test]
-    fn transport_has_no_forced_leading_flag() {
         // Unlike pyright/typescript-language-server, clangd needs no
         // --stdio-equivalent flag forced before configured args: its
         // default communication mode already is stdio.
-        let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec!["--log=verbose".into()],
-            disabled: false,
-        };
-        let server = ClangdServer::new(&config, Duration::from_secs(30));
-        let transport = server.transport_config(Path::new("/tmp")).unwrap();
+        let transport = server(Some("clangd"), &["--log=verbose"], false)
+            .transport_config(Path::new("/tmp"))
+            .unwrap();
         assert_eq!(transport.args, vec!["--log=verbose".to_string()]);
-    }
 
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = ClangdServer::new(&config, Duration::from_secs(30));
-        let temp = tempfile::tempdir().unwrap();
-        let params = server.initialize_params(temp.path()).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
-    }
-
-    #[test]
-    fn language_id_matches_extension() {
         assert_eq!(language_id_for("src/a.c"), "c");
         assert_eq!(language_id_for("src/a.cpp"), "cpp");
         assert_eq!(language_id_for("src/a.hpp"), "cpp");
+        contract::assert_initialize_params_name_this_process(
+            &usable,
+            tempfile::tempdir().unwrap().path(),
+        );
     }
 }

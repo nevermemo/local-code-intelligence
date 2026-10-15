@@ -67,21 +67,26 @@ fn write_multilanguage_tree(root: &Path) {
 }
 
 /// Compares the hook with today's chunker on every source file under
-/// `root`; returns how many files and chunks were compared.
-fn assert_hook_matches_chunker(root: &Path) -> (usize, usize) {
+/// `root`; returns how many files and chunks were compared. With
+/// `compare_chunker` false only the hook runs (and its declarations are
+/// checked): the two are one function, so a second, equally expensive pass
+/// over a large tree would compare it with itself.
+fn assert_hook_matches_chunker(root: &Path, compare_chunker: bool) -> (usize, usize) {
     let mut files = 0;
     let mut chunks = 0;
     for file in sources(root).unwrap().files {
         let path = &file.relative_path;
-        let today = chunks_with_adapter(path, &file.source, file.adapter).unwrap();
         let hooked = extract_with_adapter(path, &file.source, file.adapter).unwrap();
-        // JSON text: byte identity of every field and of the order, with a
-        // readable difference on failure.
-        assert_eq!(
-            serde_json::to_string(&hooked.chunks).unwrap(),
-            serde_json::to_string(&today).unwrap(),
-            "{path}: the hook's chunks differ from chunks_with_adapter's"
-        );
+        if compare_chunker {
+            let today = chunks_with_adapter(path, &file.source, file.adapter).unwrap();
+            // JSON text: byte identity of every field and of the order, with a
+            // readable difference on failure.
+            assert_eq!(
+                serde_json::to_string(&hooked.chunks).unwrap(),
+                serde_json::to_string(&today).unwrap(),
+                "{path}: the hook's chunks differ from chunks_with_adapter's"
+            );
+        }
         let declarations =
             (file.adapter.identifier() == "rust").then(|| rust_declarations(&file.source).unwrap());
         assert_eq!(
@@ -89,7 +94,7 @@ fn assert_hook_matches_chunker(root: &Path) -> (usize, usize) {
             "{path}: the hook's declarations differ from the S1 extractor's"
         );
         files += 1;
-        chunks += today.len();
+        chunks += hooked.chunks.len();
     }
     (files, chunks)
 }
@@ -98,7 +103,7 @@ fn assert_hook_matches_chunker(root: &Path) -> (usize, usize) {
 fn hook_chunks_are_byte_identical_on_a_tree_of_every_language() {
     let temp = tempfile::tempdir().unwrap();
     write_multilanguage_tree(temp.path());
-    let (files, chunks) = assert_hook_matches_chunker(temp.path());
+    let (files, chunks) = assert_hook_matches_chunker(temp.path(), true);
     // One file per registered adapter, and every adapter is some file's:
     // a language added later without a file here fails this test.
     assert_eq!(files, language::ADAPTERS.len());
@@ -139,12 +144,14 @@ fn hook_chunks_are_byte_identical_on_a_tree_of_every_language() {
 #[test]
 fn hook_chunks_are_byte_identical_on_this_repository() {
     // The workspace root (lci-core's parent): every tracked Rust and Python
-    // file of this repository, walked as a scan walks it. Both chunkers run
+    // file of this repository, walked as a scan walks it. The chunker runs
     // the test-only uncovered-bytes check, so a new file that exposes a
     // chunker coverage gap fails here with "uncovered byte" even though the
-    // hook and the chunker still agree: fix the chunker, not this test.
+    // hook and the chunker still agree: fix the chunker, not this test. Only
+    // the hook runs here: the chunker is the same function, and the fixture
+    // tree compares the two.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let (files, chunks) = assert_hook_matches_chunker(root);
+    let (files, chunks) = assert_hook_matches_chunker(root, false);
     assert!(files >= 100, "{files} files");
     assert!(chunks >= 2000, "{chunks} chunks");
 }

@@ -628,19 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn chunks_have_exact_source_lines_and_stable_hashes() {
-        let source =
-            "// café\nfn first() { println!(\"hello\"); }\n\nimpl A {\nfn second() {}\n}\n";
-        let chunks = rust_chunks("lib.rs", source).unwrap();
-        assert!(chunks.iter().any(|c| c.code.contains("fn second")));
-        for c in chunks {
-            assert!(source.contains(&c.code));
-            assert_eq!(c.content_hash, hash(&c.code));
-            assert!(c.end_line >= c.start_line);
-        }
-    }
-
-    #[test]
     fn leading_bom_does_not_change_rust_typescript_or_csharp_chunks() {
         let fixtures = [
             ("lib.rs", "fn rust_value() { let _ = 1; }\n"),
@@ -747,6 +734,10 @@ mod tests {
                 (4, 6, "{\nfn second() {}\n}"),
             ]
         );
+        for chunk in chunks {
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+        }
     }
 
     #[test]
@@ -1330,27 +1321,6 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
-    fn oversized_function_splits_at_syntax_without_losing_statements() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("    let value_{i} = {i};\n"))
-            .collect();
-        let source = format!("fn large() {{\n{}}}\n", statements.concat());
-        let chunks = rust_chunks("lib.rs", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            assert!(chunks.iter().any(|c| c.code.contains(statement.trim())));
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
-            assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
-            );
-        }
-    }
-
-    #[test]
     fn oversized_trailing_comment_run_splits_at_syntax_boundaries() {
         let body = "    let value = 42;\n".repeat(2000);
         assert!(body.len() > MAX_DECLARATION_BYTES);
@@ -1481,26 +1451,16 @@ export interface TelemetryLifecycle {
         );
     }
 
-    /// The traced example of N22: an oversized call whose two arguments are
-    /// joined by `+`. The operator lies between the two split children and used
-    /// to be in no chunk.
-    #[test]
-    fn oversized_expression_keeps_the_traced_operator() {
-        let left = "a".repeat(3500);
-        let right = "b".repeat(3500);
-        let expression = format!("emit(\"{left}\" + \"{right}\")");
-        let statements = format!("    {expression};\n").repeat(4);
-        let source = format!("fn main() {{\n{statements}}}\n");
-
-        assert_non_whitespace_coverage(&source, &expression);
-    }
-
+    /// Includes the traced example of N22: an oversized call whose two arguments
+    /// are joined by `+`. The operator lies between the two split children and
+    /// used to be in no chunk.
     #[test]
     fn oversized_containers_cover_non_whitespace_bytes_across_inputs() {
         let left = "a".repeat(3500);
         let middle = "b".repeat(3500);
         let right = "c".repeat(3500);
         let expressions = [
+            format!("emit(\"{left}\" + \"{middle}\")"),
             format!("emit([\"{left}\", \"{middle}\"])"),
             format!("emit((\"{left}\", \"{middle}\"))"),
             format!("emit(\"{left}\" + \"{middle}\" + \"{right}\")"),
@@ -1675,8 +1635,302 @@ if TOP:
     }
 
     #[test]
-    fn chunks_csharp_namespaces_types_members_attributes_and_top_level_statements() {
-        let source = r#"using System;
+    fn parser_recovery_keeps_following_declarations_searchable() {
+        for (path, source, healthy) in [
+            (
+                "Recovered.cs",
+                "public class Broken { void Run( { }\npublic record HealthyRecord(int Value);\n",
+                "HealthyRecord",
+            ),
+            (
+                "Recovered.java",
+                "public class Broken { void run( { }\npublic record HealthyRecord(int value) {}\n",
+                "HealthyRecord",
+            ),
+            (
+                "recovered.c",
+                "int broken( {\nint healthy_value(void) { return 42; }\n",
+                "healthy_value",
+            ),
+            (
+                "recovered.cpp",
+                "class Broken { void run( { }\nint healthy_value() { return 42; }\n",
+                "healthy_value",
+            ),
+        ] {
+            let chunks = chunks_for_path(path, source).unwrap();
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(healthy)),
+                "{path}: valid declaration after syntax damage was lost: {chunks:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_member_splits_at_statements_and_keeps_its_header() {
+        let statements = (0..1200)
+            .map(|i| format!("        total += {i};\n"))
+            .collect::<String>();
+        // (path, source, the member's header line, a header attribute)
+        let cases = [
+            (
+                "LargeCalculator.cs",
+                format!(
+                    "public class LargeCalculator\n{{\n    [Obsolete]\n    public int Calculate()\n    {{\n        var total = 0;\n{statements}        return total;\n    }}\n}}\n"
+                ),
+                "public int Calculate",
+                "[Obsolete]",
+            ),
+            (
+                "LargeCalculator.java",
+                format!(
+                    "public class LargeCalculator {{\n    @Deprecated\n    public int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}}\n"
+                ),
+                "public int calculate",
+                "@Deprecated",
+            ),
+            (
+                "LargeCalculator.cpp",
+                format!(
+                    "class LargeCalculator {{\npublic:\n    int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}};\n"
+                ),
+                "int calculate",
+                "int calculate",
+            ),
+        ];
+        for (path, source, header_line, attribute) in cases {
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(
+                chunks.len() > 2,
+                "{path}: oversized member was not split: {chunks:#?}"
+            );
+            let header = chunks
+                .iter()
+                .find(|chunk| chunk.code.contains(header_line))
+                .unwrap();
+            assert!(header.code.contains(attribute), "{path}");
+            assert!(
+                chunks
+                    .iter()
+                    .any(|chunk| chunk.code.contains("return total;")),
+                "{path}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| source.contains(&chunk.code)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_function_splits_at_statements_without_losing_them() {
+        let rust: Vec<_> = (0..2000)
+            .map(|i| format!("    let value_{i} = {i};\n"))
+            .collect();
+        let go: Vec<_> = (0..2000)
+            .map(|i| format!("\tvalue{i} := {i}\n\t_ = value{i}\n"))
+            .collect();
+        let c: Vec<_> = (0..2000)
+            .map(|i| format!("\tint value{i} = {i};\n\t(void)value{i};\n"))
+            .collect();
+        let cases = [
+            (
+                "lib.rs",
+                format!("fn large() {{\n{}}}\n", rust.concat()),
+                rust,
+            ),
+            (
+                "large.go",
+                format!("package example\n\nfunc large() {{\n{}}}\n", go.concat()),
+                go,
+            ),
+            (
+                "large.c",
+                format!("int large(void) {{\n{}\treturn 0;\n}}\n", c.concat()),
+                c,
+            ),
+        ];
+        for (path, source, statements) in cases {
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(chunks.len() > 1, "{path}");
+            for statement in statements {
+                for line in statement.lines().filter(|line| !line.trim().is_empty()) {
+                    assert!(
+                        chunks.iter().any(|c| c.code.contains(line.trim())),
+                        "{path}: missing statement: {line}"
+                    );
+                }
+            }
+            let lines: Vec<_> = source.lines().collect();
+            for c in chunks {
+                assert!(
+                    lines[(c.start_line - 1) as usize..c.end_line as usize]
+                        .join("\n")
+                        .contains(&c.code),
+                    "{path}: invalid range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_go_and_c_declarations_with_leading_comments_attached() {
+        let go = r#"package example
+
+// Add returns the sum of two numbers.
+func Add(a, b int) int {
+	return a + b
+}
+
+// Counter tracks a running total.
+type Counter struct {
+	Total int
+}
+
+// Increment adds n to the counter's total.
+func (c *Counter) Increment(n int) {
+	c.Total += n
+}
+
+const MaxRetries = 3
+
+var DefaultTimeout = 30
+"#;
+        let c = r#"#include <stdio.h>
+
+// Add returns the sum of two numbers.
+int add(int a, int b) {
+    return a + b;
+}
+
+// Counter tracks a running total.
+struct Counter {
+    int total;
+};
+
+// increment adds n to the counter's total.
+void increment(struct Counter *c, int n) {
+    c->total += n;
+}
+
+#define MAX_RETRIES 3
+
+int default_timeout = 30;
+"#;
+        // (path, language, source, [(declaration, the chunk starts with)], other
+        // chunk fragments, a declaration that appears in exactly one chunk)
+        let cases = [
+            (
+                "service.go",
+                "go",
+                go,
+                [
+                    (
+                        "func Add",
+                        "// Add returns the sum of two numbers.\nfunc Add",
+                    ),
+                    (
+                        "type Counter struct",
+                        "// Counter tracks a running total.\ntype Counter",
+                    ),
+                    (
+                        "func (c *Counter) Increment",
+                        "// Increment adds n to the counter's total.\nfunc (c *Counter) Increment",
+                    ),
+                ],
+                ["const MaxRetries = 3", "var DefaultTimeout = 30"],
+                "func Add",
+            ),
+            (
+                "service.c",
+                "c",
+                c,
+                [
+                    ("int add", "// Add returns the sum of two numbers.\nint add"),
+                    (
+                        "struct Counter",
+                        "// Counter tracks a running total.\nstruct Counter",
+                    ),
+                    (
+                        "void increment",
+                        "// increment adds n to the counter's total.\nvoid increment",
+                    ),
+                ],
+                ["#define MAX_RETRIES 3", "int default_timeout = 30;"],
+                "int add",
+            ),
+        ];
+        for (path, language, source, attached, others, unique) in cases {
+            let chunks = chunks_for_path(path, source).unwrap();
+
+            assert!(!chunks.is_empty(), "{path}");
+            assert!(chunks.iter().all(|chunk| chunk.language == language));
+            assert!(chunks.iter().all(|chunk| chunk.relative_file_path == path));
+            for (declaration, prefix) in attached {
+                let chunk = chunks
+                    .iter()
+                    .find(|chunk| chunk.code.contains(declaration))
+                    .unwrap_or_else(|| panic!("{path}: no chunk for {declaration}"));
+                assert!(
+                    chunk.code.starts_with(prefix),
+                    "{path}: {declaration} lost its comment"
+                );
+            }
+            for fragment in others {
+                assert!(
+                    chunks.iter().any(|chunk| chunk.code.contains(fragment)),
+                    "{path}: missing {fragment}"
+                );
+            }
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| chunk.code.contains(unique))
+                    .count(),
+                1,
+                "{path}"
+            );
+
+            let lines: Vec<_> = source.lines().collect();
+            for chunk in chunks {
+                assert!(
+                    lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                        .join("\n")
+                        .contains(&chunk.code),
+                    "{path}: invalid range for {chunk:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_java_csharp_and_cpp_declarations_keep_their_attachments() {
+        let java = r#"package com.example.telemetry;
+
+import java.util.List;
+
+/**
+ * Processes production telemetry.
+ */
+@Deprecated
+public class TelemetryProcessor {
+    private String name = "production";
+
+    public TelemetryProcessor(String name) {
+        this.name = name;
+    }
+
+    public String normalize(String value) {
+        String trimmed = value.trim();
+        return trimmed.toLowerCase();
+    }
+}
+
+interface TelemetrySink {
+    void write(String value);
+}
+"#;
+        let csharp = r#"using System;
 
 Console.WriteLine("startup");
 
@@ -1703,429 +1957,7 @@ public interface ITelemetrySink
     void Write(string value);
 }
 "#;
-        let chunks = chunks_for_path("TelemetryProcessor.cs", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "csharp"));
-        for expected in [
-            "using System",
-            "Console.WriteLine",
-            "class TelemetryProcessor",
-            "event EventHandler",
-            "string Name",
-            "TelemetryProcessor(string name)",
-            "string Normalize",
-            "string Trimmed()",
-            "interface ITelemetrySink",
-            "void Write",
-        ] {
-            assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
-            );
-        }
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
-            .unwrap();
-        assert!(class.code.contains("/// <summary>"));
-        assert!(class.code.contains("[Obsolete]"));
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_csharp_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "public class LargeCalculator\n{{\n    [Obsolete]\n    public int Calculate()\n    {{\n        var total = 0;\n{statements}        return total;\n    }}\n}}\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.cs", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("public int Calculate"))
-            .unwrap();
-        assert!(header.code.contains("[Obsolete]"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn csharp_parser_recovery_keeps_following_declarations_searchable() {
-        let source =
-            "public class Broken { void Run( { }\npublic record HealthyRecord(int Value);\n";
-        let chunks = chunks_for_path("Recovered.cs", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("HealthyRecord")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_go_declarations_with_leading_comments_attached() {
-        let source = r#"package example
-
-// Add returns the sum of two numbers.
-func Add(a, b int) int {
-	return a + b
-}
-
-// Counter tracks a running total.
-type Counter struct {
-	Total int
-}
-
-// Increment adds n to the counter's total.
-func (c *Counter) Increment(n int) {
-	c.Total += n
-}
-
-const MaxRetries = 3
-
-var DefaultTimeout = 30
-"#;
-        let chunks = chunks_for_path("service.go", source).unwrap();
-
-        assert!(!chunks.is_empty());
-        assert!(chunks.iter().all(|chunk| chunk.language == "go"));
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.relative_file_path == "service.go")
-        );
-
-        let add = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("func Add"))
-            .unwrap();
-        assert!(
-            add.code
-                .starts_with("// Add returns the sum of two numbers.\nfunc Add")
-        );
-
-        let counter = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("type Counter struct"))
-            .unwrap();
-        assert!(
-            counter
-                .code
-                .starts_with("// Counter tracks a running total.\ntype Counter")
-        );
-
-        let increment = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("func (c *Counter) Increment"))
-            .unwrap();
-        assert!(increment.code.starts_with(
-            "// Increment adds n to the counter's total.\nfunc (c *Counter) Increment"
-        ));
-
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("const MaxRetries = 3"))
-        );
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("var DefaultTimeout = 30"))
-        );
-        assert_eq!(
-            chunks
-                .iter()
-                .filter(|chunk| chunk.code.contains("func Add"))
-                .count(),
-            1
-        );
-
-        let lines: Vec<_> = source.lines().collect();
-        for chunk in chunks {
-            assert!(
-                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
-                    .join("\n")
-                    .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_go_function_splits_at_statements_without_losing_them() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("\tvalue{i} := {i}\n\t_ = value{i}\n"))
-            .collect();
-        let source = format!(
-            "package example\n\nfunc large() {{\n{}}}\n",
-            statements.concat()
-        );
-        let chunks = chunks_for_path("large.go", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
-                assert!(
-                    chunks.iter().any(|c| c.code.contains(line.trim())),
-                    "missing statement: {line}"
-                );
-            }
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
-            assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
-            );
-        }
-    }
-
-    #[test]
-    fn chunks_java_packages_types_members_annotations_and_javadoc() {
-        let source = r#"package com.example.telemetry;
-
-import java.util.List;
-
-/**
- * Processes production telemetry.
- */
-@Deprecated
-public class TelemetryProcessor {
-    private String name = "production";
-
-    public TelemetryProcessor(String name) {
-        this.name = name;
-    }
-
-    public String normalize(String value) {
-        String trimmed = value.trim();
-        return trimmed.toLowerCase();
-    }
-}
-
-interface TelemetrySink {
-    void write(String value);
-}
-"#;
-        let chunks = chunks_for_path("TelemetryProcessor.java", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "java"));
-        for expected in [
-            "import java.util.List",
-            "class TelemetryProcessor",
-            "private String name",
-            "TelemetryProcessor(String name)",
-            "String normalize",
-            "interface TelemetrySink",
-            "void write",
-        ] {
-            assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
-            );
-        }
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
-            .unwrap();
-        assert!(class.code.contains("/**"));
-        assert!(class.code.contains("@Deprecated"));
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_java_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "public class LargeCalculator {{\n    @Deprecated\n    public int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}}\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.java", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("public int calculate"))
-            .unwrap();
-        assert!(header.code.contains("@Deprecated"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn java_parser_recovery_keeps_following_declarations_searchable() {
-        let source =
-            "public class Broken { void run( { }\npublic record HealthyRecord(int value) {}\n";
-        let chunks = chunks_for_path("Recovered.java", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("HealthyRecord")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_c_declarations_with_leading_comments_attached() {
-        let source = r#"#include <stdio.h>
-
-// Add returns the sum of two numbers.
-int add(int a, int b) {
-    return a + b;
-}
-
-// Counter tracks a running total.
-struct Counter {
-    int total;
-};
-
-// increment adds n to the counter's total.
-void increment(struct Counter *c, int n) {
-    c->total += n;
-}
-
-#define MAX_RETRIES 3
-
-int default_timeout = 30;
-"#;
-        let chunks = chunks_for_path("service.c", source).unwrap();
-
-        assert!(!chunks.is_empty());
-        assert!(chunks.iter().all(|chunk| chunk.language == "c"));
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.relative_file_path == "service.c")
-        );
-
-        let add = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("int add"))
-            .unwrap();
-        assert!(
-            add.code
-                .starts_with("// Add returns the sum of two numbers.\nint add")
-        );
-
-        let counter = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("struct Counter"))
-            .unwrap();
-        assert!(
-            counter
-                .code
-                .starts_with("// Counter tracks a running total.\nstruct Counter")
-        );
-
-        let increment = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("void increment"))
-            .unwrap();
-        assert!(
-            increment
-                .code
-                .starts_with("// increment adds n to the counter's total.\nvoid increment")
-        );
-
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("#define MAX_RETRIES 3"))
-        );
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("int default_timeout = 30;"))
-        );
-        assert_eq!(
-            chunks
-                .iter()
-                .filter(|chunk| chunk.code.contains("int add"))
-                .count(),
-            1
-        );
-
-        let lines: Vec<_> = source.lines().collect();
-        for chunk in chunks {
-            assert!(
-                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
-                    .join("\n")
-                    .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_c_function_splits_at_statements_without_losing_them() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("\tint value{i} = {i};\n\t(void)value{i};\n"))
-            .collect();
-        let source = format!(
-            "int large(void) {{\n{}\treturn 0;\n}}\n",
-            statements.concat()
-        );
-        let chunks = chunks_for_path("large.c", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
-                assert!(
-                    chunks.iter().any(|c| c.code.contains(line.trim())),
-                    "missing statement: {line}"
-                );
-            }
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
-            assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
-            );
-        }
-    }
-
-    #[test]
-    fn c_parser_recovery_keeps_following_declarations_searchable() {
-        let source = "int broken( {\nint healthy_value(void) { return 42; }\n";
-        let chunks = chunks_for_path("recovered.c", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("healthy_value")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_cpp_namespaces_classes_members_templates_and_leading_comments() {
-        let source = r#"namespace telemetry {
+        let cpp = r#"namespace telemetry {
 
 // Processes production telemetry events.
 class Processor {
@@ -2147,85 +1979,105 @@ T add(T a, T b) {
 
 }
 "#;
-        let chunks = chunks_for_path("processor.cpp", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "cpp"));
-        for expected in [
-            "class Processor",
-            "std::string normalize",
-            "int count_;",
-            "T add(T a, T b)",
-        ] {
+        // (path, language, source, fragments some chunk must contain,
+        // [(a chunk's identifying text, fragments that chunk must also contain)])
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+            &'a [(&'a str, &'a [&'a str])],
+        );
+        let cases: [Case; 3] = [
+            (
+                "TelemetryProcessor.java",
+                "java",
+                java,
+                &[
+                    "import java.util.List",
+                    "class TelemetryProcessor",
+                    "private String name",
+                    "TelemetryProcessor(String name)",
+                    "String normalize",
+                    "interface TelemetrySink",
+                    "void write",
+                ],
+                &[("class TelemetryProcessor", &["/**", "@Deprecated"])],
+            ),
+            (
+                "TelemetryProcessor.cs",
+                "csharp",
+                csharp,
+                &[
+                    "using System",
+                    "Console.WriteLine",
+                    "class TelemetryProcessor",
+                    "event EventHandler",
+                    "string Name",
+                    "TelemetryProcessor(string name)",
+                    "string Normalize",
+                    "string Trimmed()",
+                    "interface ITelemetrySink",
+                    "void Write",
+                ],
+                &[("class TelemetryProcessor", &["/// <summary>", "[Obsolete]"])],
+            ),
+            (
+                "processor.cpp",
+                "cpp",
+                cpp,
+                &[
+                    "class Processor",
+                    "std::string normalize",
+                    "int count_;",
+                    "T add(T a, T b)",
+                ],
+                &[
+                    (
+                        "class Processor",
+                        &["// Processes production telemetry events."],
+                    ),
+                    (
+                        "T add(T a, T b)",
+                        &[
+                            "template<typename T>",
+                            "// add returns the sum of two values of any numeric type.",
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        for (path, language, source, expected, attachments) in cases {
+            let chunks = chunks_for_path(path, source).unwrap();
             assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
+                chunks.iter().all(|chunk| chunk.language == language),
+                "{path}"
             );
+            for fragment in expected {
+                assert!(
+                    chunks.iter().any(|chunk| chunk.code.contains(fragment)),
+                    "{path}: missing {fragment}: {chunks:#?}"
+                );
+            }
+            for (identity, fragments) in attachments {
+                let chunk = chunks
+                    .iter()
+                    .find(|chunk| chunk.code.contains(identity))
+                    .unwrap();
+                for fragment in *fragments {
+                    assert!(
+                        chunk.code.contains(fragment),
+                        "{path}: {identity} lost {fragment}"
+                    );
+                }
+            }
+            for chunk in &chunks {
+                assert!(source.contains(&chunk.code), "{path}");
+                assert_eq!(chunk.content_hash, hash(&chunk.code), "{path}");
+                assert!(chunk.start_line >= 1, "{path}");
+                assert!(chunk.end_line >= chunk.start_line, "{path}");
+            }
         }
-
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class Processor"))
-            .unwrap();
-        assert!(
-            class
-                .code
-                .contains("// Processes production telemetry events.")
-        );
-
-        let template_fn = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("T add(T a, T b)"))
-            .unwrap();
-        assert!(template_fn.code.contains("template<typename T>"));
-        assert!(
-            template_fn
-                .code
-                .contains("// add returns the sum of two values of any numeric type.")
-        );
-
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_cpp_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "class LargeCalculator {{\npublic:\n    int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}};\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.cpp", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("int calculate"))
-            .unwrap();
-        assert!(header.code.contains("int calculate"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn cpp_parser_recovery_keeps_following_declarations_searchable() {
-        let source = "class Broken { void run( { }\nint healthy_value() { return 42; }\n";
-        let chunks = chunks_for_path("recovered.cpp", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("healthy_value")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
     }
 
     #[test]

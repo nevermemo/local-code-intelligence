@@ -176,78 +176,45 @@ fn language_id_for(relative: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::adapter::contract;
+
+    fn server(path: Option<&str>, args: &[&str], disabled: bool) -> TypeScriptServer {
+        let config = TypeScriptLspConfig {
+            path: path.map(str::to_owned),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            disabled,
+        };
+        TypeScriptServer::new(&config, Duration::from_secs(60))
+    }
 
     #[test]
-    fn adapter_reports_all_four_ecmascript_languages() {
-        let config = TypeScriptLspConfig {
-            path: Some("typescript-language-server".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = TypeScriptServer::new(&config, Duration::from_secs(60));
+    fn the_typescript_adapter_follows_the_adapter_contract() {
+        let usable = server(Some("typescript-language-server"), &[], false);
         assert_eq!(
-            server.languages(),
+            usable.languages(),
             &["typescript", "tsx", "javascript", "jsx"]
         );
-        assert!(server.enabled());
-    }
-
-    #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        let missing = TypeScriptLspConfig::default();
-        assert!(!TypeScriptServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            TypeScriptServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
+        contract::assert_enabled_only_with_a_usable_path(
+            |path, disabled| server(path, &[], disabled),
+            "typescript-language-server",
         );
-
-        let empty = TypeScriptLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        };
-        assert!(!TypeScriptServer::new(&empty, Duration::from_secs(60)).enabled());
-
-        let disabled = TypeScriptLspConfig {
-            path: Some("typescript-language-server".into()),
-            args: vec![],
-            disabled: true,
-        };
-        assert!(!TypeScriptServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
-
-    #[test]
-    fn transport_always_includes_stdio_before_configured_args() {
-        let config = TypeScriptLspConfig {
-            path: Some("typescript-language-server".into()),
-            args: vec!["--log-level".into(), "4".into()],
-            disabled: false,
-        };
-        let server = TypeScriptServer::new(&config, Duration::from_secs(30));
-        let transport = server.transport_config(Path::new("/tmp")).unwrap();
+        // --stdio always comes before the configured args.
+        let transport = server(
+            Some("typescript-language-server"),
+            &["--log-level", "4"],
+            false,
+        )
+        .transport_config(Path::new("/tmp"))
+        .unwrap();
         assert_eq!(transport.args, vec!["--stdio", "--log-level", "4"]);
-    }
 
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let config = TypeScriptLspConfig {
-            path: Some("typescript-language-server".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = TypeScriptServer::new(&config, Duration::from_secs(30));
-        let temp = tempfile::tempdir().unwrap();
-        let params = server.initialize_params(temp.path()).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
-    }
-
-    #[test]
-    fn language_id_matches_extension() {
         assert_eq!(language_id_for("src/a.ts"), "typescript");
         assert_eq!(language_id_for("src/a.tsx"), "typescriptreact");
         assert_eq!(language_id_for("src/a.jsx"), "javascriptreact");
         assert_eq!(language_id_for("src/a.js"), "javascript");
+        contract::assert_initialize_params_name_this_process(
+            &usable,
+            tempfile::tempdir().unwrap().path(),
+        );
     }
 }

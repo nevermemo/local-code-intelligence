@@ -895,7 +895,51 @@ mod tests {
     }
 
     #[test]
-    fn extracts_useful_terms() {
+    fn query_terms_extract_split_and_filter() {
+        // (query, the terms `query_terms` keeps, in order)
+        let cases: &[(&str, &[&str])] = &[
+            // identifiers split, the original first
+            ("parseConfig", &["parseconfig", "parse", "config"]),
+            (
+                "build_production_feature_pipeline",
+                &[
+                    "build_production_feature_pipeline",
+                    "build",
+                    "production",
+                    "feature",
+                    "pipeline",
+                ],
+            ),
+            // Acronym runs split before the last capital; letter/digit
+            // boundaries split; fragments under three characters and purely
+            // numeric fragments are dropped, but a whole token is never
+            // dropped for being numeric.
+            (
+                "HTTPServer sha256 404",
+                &["httpserver", "http", "server", "sha256", "sha", "404"],
+            ),
+            // Duplicates collapse, whatever their case or origin.
+            ("config Config", &["config"]),
+            ("ab c", &[]),
+            // The stop list drops generic verbs...
+            (
+                "add fix the update handler for ensures when parsing",
+                &["handler", "parsing"],
+            ),
+            // ...sub-tokens too; the original identifier survives.
+            ("addUserName", &["addusername", "user", "name"]),
+            ("add fix when the", &[]),
+            // Bare code nouns stay searchable: the document-frequency cut
+            // removes them when they are common; the stop list must not, or
+            // a query about `get` or `run` loses its word.
+            ("set get new run", &["set", "get", "new", "run"]),
+            ("getUserName", &["getusername", "get", "user", "name"]),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(query_terms(query), *expected, "{query:?}");
+        }
+
+        // `terms` applies the same filters.
         assert_eq!(
             terms("lower syn AST expressions into generated Slang compute shader code"),
             vec![
@@ -908,35 +952,11 @@ mod tests {
                 "syn"
             ]
         );
-    }
-
-    #[test]
-    fn splits_identifiers_original_first() {
         assert_eq!(
-            query_terms("parseConfig"),
-            vec!["parseconfig", "parse", "config"]
+            terms("add fix the update handler for ensures when parsing"),
+            vec!["handler", "parsing"]
         );
-        assert_eq!(
-            query_terms("build_production_feature_pipeline"),
-            vec![
-                "build_production_feature_pipeline",
-                "build",
-                "production",
-                "feature",
-                "pipeline"
-            ]
-        );
-        // Acronym runs split before the last capital; letter/digit
-        // boundaries split; fragments under three characters and purely
-        // numeric fragments are dropped, but a whole token is never dropped
-        // for being numeric.
-        assert_eq!(
-            query_terms("HTTPServer sha256 404"),
-            vec!["httpserver", "http", "server", "sha256", "sha", "404"]
-        );
-        // Duplicates collapse, whatever their case or origin.
-        assert_eq!(query_terms("config Config"), vec!["config"]);
-        assert_eq!(query_terms("ab c"), Vec::<String>::new());
+        assert_eq!(terms("handle call"), vec!["handle", "call"]);
     }
 
     #[test]
@@ -949,39 +969,6 @@ mod tests {
         assert_eq!(terms.last().map(String::as_str), Some("longestwordhere"));
         assert!(terms.contains(&"xqzw".to_owned()));
         assert!(!terms.contains(&"xqzx".to_owned()));
-    }
-
-    #[test]
-    fn stop_list_drops_generic_verbs() {
-        assert_eq!(
-            query_terms("add fix the update handler for ensures when parsing"),
-            vec!["handler", "parsing"]
-        );
-        assert_eq!(
-            terms("add fix the update handler for ensures when parsing"),
-            vec!["handler", "parsing"]
-        );
-        // Sub-tokens are filtered too; the original identifier survives.
-        assert_eq!(
-            query_terms("addUserName"),
-            vec!["addusername", "user", "name"]
-        );
-        assert_eq!(query_terms("add fix when the"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn bare_code_nouns_stay_searchable() {
-        // The document-frequency cut removes them when they are common; the
-        // stop list must not, or a query about `get` or `run` loses its word.
-        assert_eq!(
-            query_terms("set get new run"),
-            vec!["set", "get", "new", "run"]
-        );
-        assert_eq!(
-            query_terms("getUserName"),
-            vec!["getusername", "get", "user", "name"]
-        );
-        assert_eq!(terms("handle call"), vec!["handle", "call"]);
     }
 
     #[tokio::test]
@@ -1210,146 +1197,158 @@ mod tests {
     }
 
     #[test]
-    fn preserves_an_explicit_ripgrep_path() {
-        let resolved = resolve_ripgrep_path_from(r"D:\tools\custom-rg.exe", None, None, None, true);
-        assert_eq!(resolved, PathBuf::from(r"D:\tools\custom-rg.exe"));
-    }
-
-    #[test]
-    fn resolves_ripgrep_from_path_first() {
-        let temp = TempDir::new().unwrap();
-        let path_rg = temp.path().join("rg.exe");
-        std::fs::write(&path_rg, b"").unwrap();
-        let resolved =
-            resolve_ripgrep_path_from("rg", Some(temp.path().as_os_str()), None, None, true);
-        assert_eq!(resolved, path_rg);
-    }
-
-    #[test]
-    fn resolves_versioned_vscode_bundled_ripgrep() {
-        let temp = TempDir::new().unwrap();
-        let bundled = temp
-            .path()
-            .join("Programs/Microsoft VS Code/645f29cc31/resources/app")
-            .join("node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe");
-        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
-        std::fs::write(&bundled, b"").unwrap();
-
-        let resolved =
-            resolve_ripgrep_path_from("rg.exe", None, Some(temp.path().as_os_str()), None, true);
-        assert_eq!(resolved, bundled);
-    }
-
-    #[test]
-    fn leaves_default_command_when_ripgrep_is_not_found() {
-        let temp = TempDir::new().unwrap();
-        let resolved = resolve_ripgrep_path_from(
-            "rg",
-            Some(temp.path().as_os_str()),
-            Some(temp.path().as_os_str()),
-            None,
-            true,
-        );
-        assert_eq!(resolved, PathBuf::from("rg"));
-    }
-
-    #[test]
-    fn resolves_ripgrep_from_path_on_non_windows() {
-        // On non-Windows, only the bare `rg` name is tried (no `.exe`
-        // variant), and the Windows-only VS Code bundle probe is skipped
-        // entirely even when local_app_data/program_files are supplied.
-        let temp = TempDir::new().unwrap();
-        let path_rg = temp.path().join("rg");
-        std::fs::write(&path_rg, b"").unwrap();
-        let resolved = resolve_ripgrep_path_from(
-            "rg",
-            Some(temp.path().as_os_str()),
-            Some(temp.path().as_os_str()),
-            Some(temp.path().as_os_str()),
-            false,
-        );
-        assert_eq!(resolved, path_rg);
-    }
-
-    #[test]
-    fn find_on_path_tries_exe_then_cmd_then_the_bare_name_on_windows() {
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-        for name in ["tool", "tool.cmd", "tool.exe"] {
-            std::fs::write(dir.join(name), b"").unwrap();
+    fn ripgrep_path_resolution() {
+        // an explicit path is preserved
+        {
+            let resolved =
+                resolve_ripgrep_path_from(r"D:\tools\custom-rg.exe", None, None, None, true);
+            assert_eq!(resolved, PathBuf::from(r"D:\tools\custom-rg.exe"));
         }
-        let path = Some(dir.as_os_str());
-        assert_eq!(
-            find_on_path_in("tool", path, true),
-            Some(dir.join("tool.exe"))
-        );
-        std::fs::remove_file(dir.join("tool.exe")).unwrap();
-        assert_eq!(
-            find_on_path_in("tool", path, true),
-            Some(dir.join("tool.cmd"))
-        );
-        // The bare script is the last resort, never preferred over a shim.
-        std::fs::remove_file(dir.join("tool.cmd")).unwrap();
-        assert_eq!(find_on_path_in("tool", path, true), Some(dir.join("tool")));
-        std::fs::remove_file(dir.join("tool")).unwrap();
-        assert_eq!(find_on_path_in("tool", path, true), None);
-    }
 
-    #[test]
-    fn find_on_path_tries_only_the_bare_name_off_windows() {
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-        std::fs::write(dir.join("tool.exe"), b"").unwrap();
-        std::fs::write(dir.join("tool.cmd"), b"").unwrap();
-        assert_eq!(find_on_path_in("tool", Some(dir.as_os_str()), false), None);
-        std::fs::write(dir.join("tool"), b"").unwrap();
-        assert_eq!(
-            find_on_path_in("tool", Some(dir.as_os_str()), false),
-            Some(dir.join("tool"))
-        );
-    }
-
-    #[test]
-    fn find_on_path_takes_the_first_directory_that_has_the_tool() {
-        let temp = TempDir::new().unwrap();
-        let first = temp.path().join("first");
-        let second = temp.path().join("second");
-        for dir in [&first, &second] {
-            std::fs::create_dir_all(dir).unwrap();
+        // rg on PATH comes first
+        {
+            let temp = TempDir::new().unwrap();
+            let path_rg = temp.path().join("rg.exe");
+            std::fs::write(&path_rg, b"").unwrap();
+            let resolved =
+                resolve_ripgrep_path_from("rg", Some(temp.path().as_os_str()), None, None, true);
+            assert_eq!(resolved, path_rg);
         }
-        // A `.cmd` in an earlier directory beats an `.exe` in a later one:
-        // directory order comes before name order.
-        std::fs::write(first.join("tool.cmd"), b"").unwrap();
-        std::fs::write(second.join("tool.exe"), b"").unwrap();
-        let path = std::env::join_paths([&first, &second]).unwrap();
-        assert_eq!(
-            find_on_path_in("tool", Some(path.as_os_str()), true),
-            Some(first.join("tool.cmd"))
-        );
-        // A directory named like the tool is not a tool.
-        std::fs::remove_file(first.join("tool.cmd")).unwrap();
-        std::fs::create_dir(first.join("tool.exe")).unwrap();
-        assert_eq!(
-            find_on_path_in("tool", Some(path.as_os_str()), true),
-            Some(second.join("tool.exe"))
-        );
-        // No PATH, or an empty name, finds nothing.
-        assert_eq!(find_on_path_in("tool", None, true), None);
-        assert_eq!(find_on_path_in("", Some(path.as_os_str()), true), None);
+
+        // the versioned VS Code bundled ripgrep
+        {
+            let temp = TempDir::new().unwrap();
+            let bundled = temp
+                .path()
+                .join("Programs/Microsoft VS Code/645f29cc31/resources/app")
+                .join("node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe");
+            std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+            std::fs::write(&bundled, b"").unwrap();
+
+            let resolved = resolve_ripgrep_path_from(
+                "rg.exe",
+                None,
+                Some(temp.path().as_os_str()),
+                None,
+                true,
+            );
+            assert_eq!(resolved, bundled);
+        }
+
+        // the default command stays when ripgrep is not found
+        {
+            let temp = TempDir::new().unwrap();
+            let resolved = resolve_ripgrep_path_from(
+                "rg",
+                Some(temp.path().as_os_str()),
+                Some(temp.path().as_os_str()),
+                None,
+                true,
+            );
+            assert_eq!(resolved, PathBuf::from("rg"));
+        }
+
+        // on non-Windows only the bare rg name is tried, and the Windows-only VS Code bundle probe is skipped even when local_app_data and program_files are supplied
+        {
+            // On non-Windows, only the bare `rg` name is tried (no `.exe`
+            // variant), and the Windows-only VS Code bundle probe is skipped
+            // entirely even when local_app_data/program_files are supplied.
+            let temp = TempDir::new().unwrap();
+            let path_rg = temp.path().join("rg");
+            std::fs::write(&path_rg, b"").unwrap();
+            let resolved = resolve_ripgrep_path_from(
+                "rg",
+                Some(temp.path().as_os_str()),
+                Some(temp.path().as_os_str()),
+                Some(temp.path().as_os_str()),
+                false,
+            );
+            assert_eq!(resolved, path_rg);
+        }
+
+        // the VS Code bundle is not probed on non-Windows
+        {
+            let temp = TempDir::new().unwrap();
+            let bundled = temp
+                .path()
+                .join("Programs/Microsoft VS Code/resources/app")
+                .join("node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe");
+            std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+            std::fs::write(&bundled, b"").unwrap();
+
+            let resolved =
+                resolve_ripgrep_path_from("rg", None, Some(temp.path().as_os_str()), None, false);
+            assert_eq!(resolved, PathBuf::from("rg"));
+        }
     }
 
     #[test]
-    fn does_not_probe_vscode_bundle_on_non_windows() {
-        let temp = TempDir::new().unwrap();
-        let bundled = temp
-            .path()
-            .join("Programs/Microsoft VS Code/resources/app")
-            .join("node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe");
-        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
-        std::fs::write(&bundled, b"").unwrap();
+    fn find_on_path_in_orders_names_and_directories() {
+        // on Windows: exe, then cmd, then the bare name
+        {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path();
+            for name in ["tool", "tool.cmd", "tool.exe"] {
+                std::fs::write(dir.join(name), b"").unwrap();
+            }
+            let path = Some(dir.as_os_str());
+            assert_eq!(
+                find_on_path_in("tool", path, true),
+                Some(dir.join("tool.exe"))
+            );
+            std::fs::remove_file(dir.join("tool.exe")).unwrap();
+            assert_eq!(
+                find_on_path_in("tool", path, true),
+                Some(dir.join("tool.cmd"))
+            );
+            // The bare script is the last resort, never preferred over a shim.
+            std::fs::remove_file(dir.join("tool.cmd")).unwrap();
+            assert_eq!(find_on_path_in("tool", path, true), Some(dir.join("tool")));
+            std::fs::remove_file(dir.join("tool")).unwrap();
+            assert_eq!(find_on_path_in("tool", path, true), None);
+        }
 
-        let resolved =
-            resolve_ripgrep_path_from("rg", None, Some(temp.path().as_os_str()), None, false);
-        assert_eq!(resolved, PathBuf::from("rg"));
+        // off Windows: only the bare name
+        {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path();
+            std::fs::write(dir.join("tool.exe"), b"").unwrap();
+            std::fs::write(dir.join("tool.cmd"), b"").unwrap();
+            assert_eq!(find_on_path_in("tool", Some(dir.as_os_str()), false), None);
+            std::fs::write(dir.join("tool"), b"").unwrap();
+            assert_eq!(
+                find_on_path_in("tool", Some(dir.as_os_str()), false),
+                Some(dir.join("tool"))
+            );
+        }
+
+        // the first directory that has the tool wins
+        {
+            let temp = TempDir::new().unwrap();
+            let first = temp.path().join("first");
+            let second = temp.path().join("second");
+            for dir in [&first, &second] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            // A `.cmd` in an earlier directory beats an `.exe` in a later one:
+            // directory order comes before name order.
+            std::fs::write(first.join("tool.cmd"), b"").unwrap();
+            std::fs::write(second.join("tool.exe"), b"").unwrap();
+            let path = std::env::join_paths([&first, &second]).unwrap();
+            assert_eq!(
+                find_on_path_in("tool", Some(path.as_os_str()), true),
+                Some(first.join("tool.cmd"))
+            );
+            // A directory named like the tool is not a tool.
+            std::fs::remove_file(first.join("tool.cmd")).unwrap();
+            std::fs::create_dir(first.join("tool.exe")).unwrap();
+            assert_eq!(
+                find_on_path_in("tool", Some(path.as_os_str()), true),
+                Some(second.join("tool.exe"))
+            );
+            // No PATH, or an empty name, finds nothing.
+            assert_eq!(find_on_path_in("tool", None, true), None);
+            assert_eq!(find_on_path_in("", Some(path.as_os_str()), true), None);
+        }
     }
 }

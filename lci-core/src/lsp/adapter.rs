@@ -154,3 +154,42 @@ pub async fn probe_subprocess_version(resolved: &Path, timeout: Duration) -> Res
     );
     Ok(())
 }
+
+/// Checks the unit tests of the optional adapters share.
+#[cfg(test)]
+pub(crate) mod contract {
+    use super::LspAdapter;
+    use std::path::Path;
+
+    /// An adapter is enabled only with a usable path that is not disabled; a
+    /// missing or blank path is never silently enabled and yields no
+    /// transport. `make` builds the adapter from a path and a disabled flag.
+    pub(crate) fn assert_enabled_only_with_a_usable_path<A: LspAdapter>(
+        make: impl Fn(Option<&str>, bool) -> A,
+        usable_path: &str,
+    ) {
+        assert!(make(Some(usable_path), false).enabled(), "a usable path");
+        for (name, path) in [("missing", None), ("blank", Some("   "))] {
+            let adapter = make(path, false);
+            assert!(!adapter.enabled(), "{name} path");
+            assert!(
+                adapter.transport_config(Path::new("/tmp")).is_none(),
+                "{name} path"
+            );
+        }
+        assert!(
+            !make(Some(usable_path), true).enabled(),
+            "explicitly disabled even with a path"
+        );
+    }
+
+    /// The initialize payload can be built without a process.
+    pub(crate) fn assert_initialize_params_name_this_process(
+        adapter: &impl LspAdapter,
+        root: &Path,
+    ) {
+        let params = adapter.initialize_params(root).unwrap();
+        assert_eq!(params["processId"], std::process::id());
+        assert!(params["rootUri"].as_str().is_some());
+    }
+}

@@ -822,26 +822,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_embedding_retries_a_connection_closed_before_the_response() {
-        let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
-        let models = server.models();
+    async fn document_embedding_retries_a_connection_closed_or_reset_before_the_response() {
+        for (name, lost) in [("closed", Step::Close), ("reset", Step::Reset)] {
+            let server = FakeModelServer::start(vec![vec![lost], vec![Step::Reply]]).await;
+            let models = server.models();
 
-        let vectors = models.embed(&documents()).await.unwrap();
+            let vectors = models.embed(&documents()).await.unwrap();
 
-        assert_eq!(vectors, vec![vec![0.5, 0.25]]);
-        assert_eq!(server.connections(), 2, "one failed attempt, one retry");
-        assert_eq!(server.requests(), 2);
-    }
-
-    #[tokio::test]
-    async fn document_embedding_retries_a_connection_reset_before_the_response() {
-        let server = FakeModelServer::start(vec![vec![Step::Reset], vec![Step::Reply]]).await;
-        let models = server.models();
-
-        let vectors = models.embed(&documents()).await.unwrap();
-
-        assert_eq!(vectors, vec![vec![0.5, 0.25]]);
-        assert_eq!(server.connections(), 2, "one failed attempt, one retry");
+            assert_eq!(vectors, vec![vec![0.5, 0.25]], "{name}");
+            assert_eq!(
+                server.connections(),
+                2,
+                "{name}: one failed attempt, one retry"
+            );
+            assert_eq!(server.requests(), 2, "{name}");
+        }
     }
 
     /// The measured failure: a keep-alive connection the server closed while
@@ -948,19 +943,57 @@ mod tests {
 
     #[tokio::test]
     async fn reranker_http_error_body_redacts_query_values() {
-        for status in [401, 500] {
-            let server = FakeModelServer::start(vec![vec![Step::EchoError(status, "none")]]).await;
-            let mut models = server.models();
-            models.config.reranker_url.push_str("?api_key=n89-marker");
-            let error = models.rerank("query", &documents()).await.unwrap_err();
-            assert_redacted_http_error(
-                &error,
-                status,
-                "reranker",
+        // (name, step, status, query appended to the URL, expected body, secrets)
+        type Case<'a> = (&'a str, Step, u16, &'a str, &'a str, &'a [&'a str]);
+        let cases: [Case; 5] = [
+            (
+                "plain value, 401",
+                Step::EchoError(401, "none"),
+                401,
+                "?api_key=n89-marker",
                 "rejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: none; retry later",
                 &["n89-marker"],
-            );
-            assert_eq!(server.requests(), 1);
+            ),
+            (
+                "plain value, 500",
+                Step::EchoError(500, "none"),
+                500,
+                "?api_key=n89-marker",
+                "rejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: none; retry later",
+                &["n89-marker"],
+            ),
+            (
+                "encoded and overlapping values",
+                Step::EchoError(500, "n89 encoded+value"),
+                500,
+                "?api_key=n89%20encoded%2Bvalue&short=n89-overlap&long=n89-overlap-long&literal=redacted",
+                "rejected POST /rerank?api_key=[redacted]&short=[redacted]&long=[redacted]&literal=[redacted] HTTP/1.1; userinfo: [redacted]; retry later",
+                &["n89%20encoded%2Bvalue", "n89 encoded+value", "n89-overlap"],
+            ),
+            (
+                "values redacted before trimming",
+                Step::EchoEdgeValue(" n89-edge "),
+                401,
+                "?api_key=%20n89-edge%20",
+                "[redacted]\nrejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: [redacted]",
+                &["n89-edge"],
+            ),
+            (
+                "short values are redacted without mangling the body",
+                Step::EchoError(401, "none"),
+                401,
+                "?k=a&v=1&n=on",
+                "rejected POST /rerank?k=[redacted]&v=[redacted]&n=[redacted] HTTP/1.1; userinfo: none; retry later",
+                &[],
+            ),
+        ];
+        for (name, step, status, query, body, secrets) in cases {
+            let server = FakeModelServer::start(vec![vec![step]]).await;
+            let mut models = server.models();
+            models.config.reranker_url.push_str(query);
+            let error = models.rerank("query", &documents()).await.unwrap_err();
+            assert_redacted_http_error(&error, status, "reranker", body, secrets);
+            assert_eq!(server.requests(), 1, "{name}");
         }
     }
 
@@ -1006,92 +1039,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reranker_http_error_body_redacts_encoded_and_overlapping_values() {
-        let server =
-            FakeModelServer::start(vec![vec![Step::EchoError(500, "n89 encoded+value")]]).await;
-        let mut models = server.models();
-        models.config.reranker_url.push_str(
-            "?api_key=n89%20encoded%2Bvalue&short=n89-overlap&long=n89-overlap-long&literal=redacted",
-        );
-        let error = models.rerank("query", &documents()).await.unwrap_err();
-        assert_redacted_http_error(
-            &error,
-            500,
-            "reranker",
-            "rejected POST /rerank?api_key=[redacted]&short=[redacted]&long=[redacted]&literal=[redacted] HTTP/1.1; userinfo: [redacted]; retry later",
-            &["n89%20encoded%2Bvalue", "n89 encoded+value", "n89-overlap"],
-        );
-    }
-
-    #[tokio::test]
     async fn embedding_http_error_body_redacts_before_truncation() {
-        let server = FakeModelServer::start(vec![vec![Step::EchoError(401, "none")]]).await;
-        let mut models = server.models();
-        let path = format!("/{}", "x".repeat(546));
-        let secret = "n89-long-query-value-crossing-the-character-limit";
-        models.config.embedding_url = format!("http://{}{path}?api_key={secret}", server.address);
-        let error = models.embed(&documents()).await.unwrap_err();
-        let expected: String = format!(
-            "rejected POST {path}/embeddings?api_key=[redacted] HTTP/1.1; userinfo: none; retry later"
-        )
-        .chars()
-        .take(MAX_ERROR_BODY_CHARS)
-        .collect();
-        assert!(expected.contains("[redacted]"));
-        assert_redacted_http_error(
-            &error,
-            401,
-            "embedding service",
-            &expected,
-            &[secret, "n89-long"],
-        );
-    }
-
-    #[tokio::test]
-    async fn a_redaction_marker_at_the_cap_is_kept_whole() {
-        let server = FakeModelServer::start(vec![vec![Step::EchoError(401, "none")]]).await;
-        let mut models = server.models();
-        let path = format!("/{}", "x".repeat(559));
-        let secret = "n89-value-at-the-character-limit";
-        models.config.embedding_url = format!("http://{}{path}?api_key={secret}", server.address);
-        let error = models.embed(&documents()).await.unwrap_err();
-        let expected = format!("rejected POST {path}/embeddings?api_key=[redacted]");
-        assert!(expected.chars().count() > MAX_ERROR_BODY_CHARS);
-        assert_redacted_http_error(&error, 401, "embedding service", &expected, &[secret]);
-    }
-
-    #[tokio::test]
-    async fn reranker_http_error_body_redacts_values_before_trimming() {
-        let secret = " n89-edge ";
-        let server = FakeModelServer::start(vec![vec![Step::EchoEdgeValue(secret)]]).await;
-        let mut models = server.models();
-        models
-            .config
-            .reranker_url
-            .push_str("?api_key=%20n89-edge%20");
-        let error = models.rerank("query", &documents()).await.unwrap_err();
-        assert_redacted_http_error(
-            &error,
-            401,
-            "reranker",
-            "[redacted]\nrejected POST /rerank?api_key=[redacted] HTTP/1.1; userinfo: [redacted]",
-            &["n89-edge"],
-        );
-    }
-
-    #[tokio::test]
-    async fn short_query_values_are_redacted_without_mangling_the_body() {
-        let server = FakeModelServer::start(vec![vec![Step::EchoError(401, "none")]]).await;
-        let mut models = server.models();
-        models.config.reranker_url.push_str("?k=a&v=1&n=on");
-        let error = models.rerank("query", &documents()).await.unwrap_err();
-        assert_redacted_http_error(
-            &error,
-            401,
-            "reranker",
-            "rejected POST /rerank?k=[redacted]&v=[redacted]&n=[redacted] HTTP/1.1; userinfo: none; retry later",
-            &[],
-        );
+        // (path length, query secret, whether the body is cut at the cap)
+        for (path_length, secret, truncated) in [
+            (
+                546,
+                "n89-long-query-value-crossing-the-character-limit",
+                true,
+            ),
+            // A redaction marker that ends past the cap is kept whole.
+            (559, "n89-value-at-the-character-limit", false),
+        ] {
+            let server = FakeModelServer::start(vec![vec![Step::EchoError(401, "none")]]).await;
+            let mut models = server.models();
+            let path = format!("/{}", "x".repeat(path_length));
+            models.config.embedding_url =
+                format!("http://{}{path}?api_key={secret}", server.address);
+            let error = models.embed(&documents()).await.unwrap_err();
+            let expected = if truncated {
+                let full = format!(
+                    "rejected POST {path}/embeddings?api_key=[redacted] HTTP/1.1; userinfo: none; retry later"
+                );
+                let expected: String = full.chars().take(MAX_ERROR_BODY_CHARS).collect();
+                assert!(expected.contains("[redacted]"));
+                expected
+            } else {
+                let expected = format!("rejected POST {path}/embeddings?api_key=[redacted]");
+                assert!(expected.chars().count() > MAX_ERROR_BODY_CHARS);
+                expected
+            };
+            assert_redacted_http_error(
+                &error,
+                401,
+                "embedding service",
+                &expected,
+                &[secret, "n89-long"],
+            );
+        }
     }
 
     #[tokio::test]
@@ -1176,49 +1160,35 @@ mod tests {
     async fn oversized_success_body_is_rejected_at_the_response_limit() {
         let server = FakeModelServer::start(vec![vec![Step::OversizedReply]]).await;
         let models = server.models();
-
         let error = models.embed(&documents()).await.unwrap_err();
-
         assert!(
             format!("{error:#}").contains("response body exceeds"),
-            "{error:#}"
+            "embedding: {error:#}"
         );
-    }
 
-    #[tokio::test]
-    async fn oversized_reranker_body_is_rejected_at_the_response_limit() {
         let server = FakeModelServer::start(vec![vec![Step::OversizedRerank]]).await;
         let models = server.models();
-
         let error = models.rerank("query", &documents()).await.unwrap_err();
-
         assert!(
             format!("{error:#}").contains("reranker response body exceeds"),
-            "{error:#}"
+            "reranker: {error:#}"
         );
     }
 
     #[tokio::test]
-    async fn the_query_embedding_makes_one_attempt_on_a_dropped_connection() {
+    async fn the_query_embedding_and_the_reranker_make_one_attempt_on_a_dropped_connection() {
         let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
         let models = server.models();
-
         let error = models.query("anything").await.unwrap_err();
-
-        assert!(is_dropped(&error), "{error:#}");
-        assert_eq!(server.connections(), 1, "fail-fast: no retry");
+        assert!(is_dropped(&error), "query: {error:#}");
+        assert_eq!(server.connections(), 1, "query: fail-fast, no retry");
         assert_eq!(server.requests(), 1);
-    }
 
-    #[tokio::test]
-    async fn the_reranker_makes_one_attempt_on_a_dropped_connection() {
         let server = FakeModelServer::start(vec![vec![Step::Close], vec![Step::Reply]]).await;
         let models = server.models();
-
         let error = models.rerank("query", &documents()).await.unwrap_err();
-
-        assert!(is_dropped(&error), "{error:#}");
-        assert_eq!(server.connections(), 1, "fail-fast: no retry");
+        assert!(is_dropped(&error), "rerank: {error:#}");
+        assert_eq!(server.connections(), 1, "rerank: fail-fast, no retry");
         // A dropped connection is not a refused one, so the reranker is not
         // skipped afterwards.
         assert_eq!(models.reranker_breaker.remaining(Instant::now()), None);
@@ -1242,7 +1212,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_query_template_is_the_former_hard_coded_instruction() {
+    fn query_templates_format_the_query() {
+        // The default is the former hard-coded instruction.
         assert_eq!(
             crate::config::DEFAULT_EMBEDDING_QUERY_TEMPLATE,
             format!("{QUERY_INSTRUCTION}{{query}}")
@@ -1256,10 +1227,8 @@ mod tests {
             models.query_text("find the parser"),
             format!("{QUERY_INSTRUCTION}find the parser")
         );
-    }
 
-    #[test]
-    fn a_custom_query_template_formats_the_query() {
+        // A custom template.
         let config = Config {
             embedding_query_template: "task: code retrieval | query: {query}".into(),
             ..Config::default()
@@ -1351,20 +1320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_embedding_error_does_not_carry_the_url_credentials() {
-        let config = Config {
-            embedding_url: format!("http://{}/v1?api_key=marker", closed_local_address()),
-            ..Config::default()
-        };
-        let models = Models::new(&config).unwrap();
-
-        let error = models.query("anything").await.unwrap_err();
-        assert!(is_connect_error(&error), "{error:#}");
-        assert!(!format!("{error:#}").contains("marker"), "{error:#}");
-        assert!(!format!("{error:?}").contains("marker"), "{error:?}");
-    }
-
-    #[tokio::test]
     async fn a_refused_reranker_error_does_not_carry_the_url_credentials() {
         let config = Config {
             reranker_url: format!("http://{}/rerank?api_key=marker", closed_local_address()),
@@ -1380,9 +1335,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_query_embedding_makes_one_attempt_on_a_refused_connection() {
+    async fn a_refused_query_embedding_makes_one_attempt_and_hides_the_url_credentials() {
         let config = Config {
-            embedding_url: format!("http://{}/v1", closed_local_address()),
+            embedding_url: format!("http://{}/v1?api_key=marker", closed_local_address()),
             ..Config::default()
         };
         let models = Models::new(&config).unwrap();
@@ -1397,5 +1352,7 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+        assert!(!format!("{error:#}").contains("marker"), "{error:#}");
+        assert!(!format!("{error:?}").contains("marker"), "{error:?}");
     }
 }
