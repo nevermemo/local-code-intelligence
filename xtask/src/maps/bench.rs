@@ -176,6 +176,21 @@ pub struct BenchArgs {
     /// Also answer with the traversal's seed nodes, ahead of what it reached.
     #[arg(long)]
     include_seeds: bool,
+    /// The engine's first stage (`lci traverse --first-stage`): `off`, `append`
+    /// or `interleave`. The answers are the engine's results in order, exact
+    /// and seed cards included. The row's note says `first-stage=<mode>`.
+    #[arg(long, value_parser = ["off", "append", "interleave"])]
+    first_stage: Option<String>,
+    /// `lci traverse --first-k` (0: no cap). The row's note says `first_k=N`.
+    #[arg(long)]
+    first_k: Option<u32>,
+    /// `lci traverse --answer-seeds`: the engine answers with the start nodes
+    /// after the exact cards (with a first stage other than `off`).
+    #[arg(long)]
+    answer_seeds: bool,
+    /// `lci traverse --exact-seeds`: exact cards the graph holds start the walk.
+    #[arg(long)]
+    exact_seeds: bool,
     /// Free text for the row's note column (build profile, tree, seeding).
     #[arg(long)]
     note: Option<String>,
@@ -258,6 +273,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
             .clone()
             .map(|path| (path, set_name(sets[0]).to_owned())),
         tie_break: args.tie_break.clone(),
+        first_stage: args.first_stage.clone(),
+        first_k: args.first_k,
+        answer_seeds: args.answer_seeds,
+        exact_seeds: args.exact_seeds,
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -469,6 +488,9 @@ fn extra_notes(args: &BenchArgs) -> Vec<Option<String>> {
         priors_note(args),
         tie_break_note(args),
         args.max_depth.map(|depth| format!("max-depth={depth}")),
+        first_stage_note(args),
+        args.answer_seeds.then(|| "answer-seeds".to_owned()),
+        args.exact_seeds.then(|| "exact-seeds".to_owned()),
         args.policy_dir.as_ref().map(|_| {
             "ORACLE: per-item policies built from the gold (bench-only, gold-aware steering ceiling)"
                 .to_owned()
@@ -486,6 +508,40 @@ fn policy_label_of(args: &BenchArgs) -> String {
         ),
         None => policy_label(&args.policy),
     }
+}
+
+/// `first-stage=<mode> first_k=N`, for the row's note, when a first-stage flag
+/// was given (`first_k=config` when only the configuration's cap applies).
+fn first_stage_note(args: &BenchArgs) -> Option<String> {
+    if args.first_stage.is_none() && args.first_k.is_none() {
+        return None;
+    }
+    let mode = args.first_stage.as_deref().unwrap_or("config");
+    let k = args
+        .first_k
+        .map_or_else(|| "config".to_owned(), |k| k.to_string());
+    Some(format!("first-stage={mode} first_k={k}"))
+}
+
+/// The engine's exact operators: descriptor-only maps whose cards are the first
+/// stage, never walked and so never called.
+const EXACT_MAPS: [&str; 2] = ["exact.closure", "exact.pickaxe"];
+
+/// Items whose response says an exact operator answered (made cards), of the
+/// items that returned one; `None` when the run selected no exact map.
+fn exact_answered(maps: &[String], raws: &[&Value]) -> Option<String> {
+    if !maps.iter().any(|m| EXACT_MAPS.contains(&m.as_str())) {
+        return None;
+    }
+    let answered = raws
+        .iter()
+        .filter(|raw| {
+            raw["exact"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op["answered"] == true))
+        })
+        .count();
+    Some(format!("exact answered={answered}/{}", raws.len()))
 }
 
 /// `tie-break=<file stem>`, for the row's note.
@@ -555,7 +611,8 @@ const SEED_MAPS: [&str; 2] = ["seeds.hybrid", "seeds.scip_names"];
 fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
     use NodeKind::{Chunk, Commit, ConfigKey, File, Symbol};
     match map {
-        "seeds.scip_names" | "graph.scip" | "scip.impact" => Some(&[Symbol]),
+        "seeds.scip_names" | "graph.scip" | "scip.impact" | "exact.closure" => Some(&[Symbol]),
+        "exact.pickaxe" => Some(&[Commit]),
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
         "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),
         "git.history" => Some(&[Commit, File]),
@@ -877,6 +934,10 @@ pub fn check_probe(
         Some((_, false)) => return Err(format!("{map} was registered but switched off")),
         Some(_) => {}
     }
+    // The exact operators are never walked: registered and on is the check.
+    if EXACT_MAPS.contains(&map) {
+        return Ok(());
+    }
     // `{"expands": n, "ms": t}`; the first traces kept a bare count.
     let stat = &response["totals"]["per_map"][map];
     let calls = stat["expands"].as_u64().or(stat.as_u64()).unwrap_or(0);
@@ -915,6 +976,12 @@ pub struct CliTraverser {
     pub priors: Option<(PathBuf, String)>,
     /// `--tie-break` for the CLI.
     pub tie_break: Option<PathBuf>,
+    /// `--first-stage`, `--first-k`, `--answer-seeds` and `--exact-seeds` for
+    /// the CLI; unset leaves the configuration's.
+    pub first_stage: Option<String>,
+    pub first_k: Option<u32>,
+    pub answer_seeds: bool,
+    pub exact_seeds: bool,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -988,6 +1055,18 @@ impl CliTraverser {
         }
         if let Some(file) = &self.tie_break {
             command.arg("--tie-break").arg(file);
+        }
+        if let Some(mode) = &self.first_stage {
+            command.arg(format!("--first-stage={mode}"));
+        }
+        if let Some(k) = self.first_k {
+            command.arg(format!("--first-k={k}"));
+        }
+        if self.answer_seeds {
+            command.arg("--answer-seeds");
+        }
+        if self.exact_seeds {
+            command.arg("--exact-seeds");
         }
         command
     }
@@ -1915,6 +1994,12 @@ pub fn bench_set(
     if !config.note.is_empty() {
         notes.push(config.note.clone());
     }
+    let returned: Vec<&Value> = raw
+        .iter()
+        .map(|(_, value)| value)
+        .filter(|value| value.get("skipped").is_none())
+        .collect();
+    notes.extend(exact_answered(&config.maps, &returned));
     if sums.pass_through_pops > 0 {
         notes.push(format!(
             "expansions={} (pops {} + pass-through pops {})",
@@ -2994,6 +3079,10 @@ mod tests {
             no_score_bound: false,
             priors: None,
             tie_break: None,
+            first_stage: None,
+            first_k: None,
+            answer_seeds: false,
+            exact_seeds: false,
             top_k: 10,
             out: PathBuf::from("out"),
             timeout: Duration::from_secs(1),
@@ -3080,5 +3169,122 @@ mod tests {
         assert_eq!(policy_label_of(&oracle), "oracle:oracle-impact");
         let note = note_with_flags(None, "boost", [false, false], false, extra_notes(&oracle));
         assert!(note.contains("max-depth=1") && note.contains("ORACLE"));
+    }
+
+    // ---- BR4b: the engine's first stage
+
+    #[test]
+    fn the_first_stage_flags_reach_the_cli_and_the_row_names_them() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: BenchArgs,
+        }
+        let mut t = cli_traverser();
+        let plain = args_of(&t.command(&t.maps, &[], "q", None));
+        assert!(!plain.iter().any(|a| a.contains("first")
+            || a.contains("answer-seeds")
+            || a.contains("exact-seeds")));
+        t.first_stage = Some("interleave".into());
+        t.first_k = Some(0);
+        t.answer_seeds = true;
+        t.exact_seeds = true;
+        let args = args_of(&t.command(&t.maps, &[], "q", None));
+        for flag in [
+            "--first-stage=interleave",
+            "--first-k=0",
+            "--answer-seeds",
+            "--exact-seeds",
+        ] {
+            assert!(args.contains(&flag.to_owned()), "{flag} in {args:?}");
+        }
+        let none = Wrapper::parse_from(["x", "--set", "impact", "--gold-dir", "g"]).args;
+        assert_eq!(first_stage_note(&none), None);
+        let given = Wrapper::parse_from([
+            "x",
+            "--set",
+            "impact",
+            "--gold-dir",
+            "g",
+            "--first-stage",
+            "append",
+            "--first-k",
+            "10",
+            "--answer-seeds",
+        ])
+        .args;
+        let notes: Vec<String> = extra_notes(&given).into_iter().flatten().collect();
+        assert_eq!(notes, ["first-stage=append first_k=10", "answer-seeds"]);
+        let off = Wrapper::parse_from([
+            "x",
+            "--set",
+            "impact",
+            "--gold-dir",
+            "g",
+            "--first-stage",
+            "off",
+        ])
+        .args;
+        assert_eq!(
+            first_stage_note(&off).as_deref(),
+            Some("first-stage=off first_k=config")
+        );
+    }
+
+    #[test]
+    fn the_exact_maps_are_checked_by_registration_alone() {
+        // Descriptor-only: never walked, so no per-map call count exists.
+        let response = json!({"totals": {"per_map": {}}});
+        let on = plan(&[("exact.closure", true)]);
+        assert!(check_probe("exact.closure", &response, Some(&on)).is_ok());
+        let off = plan(&[("exact.closure", false)]);
+        assert!(check_probe("exact.closure", &response, Some(&off)).is_err());
+        let left_out = plan(&[("graph.scip", true)]);
+        assert!(check_probe("exact.pickaxe", &response, Some(&left_out)).is_err());
+        let maps = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        assert!(can_answer(Set::History, &maps(&["exact.pickaxe"])));
+        assert!(!can_answer(Set::History, &maps(&["exact.closure"])));
+        assert!(can_answer(Set::Impact, &maps(&["exact.closure"])));
+    }
+
+    #[test]
+    fn exact_cards_are_scored_by_their_site_in_the_engines_order_and_the_row_counts_them() {
+        // The engine's results: an exact card first (a declaration the graph
+        // does not hold, located by its site), then a walk card.
+        let mut raw = traversal(&["x"], &[TYPE, SEARCH_FN], 1);
+        raw["results"][0]["origin"] = json!("exact");
+        raw["results"][0]["site"] = json!({"path": "src/app/search.rs", "line": 12, "col": 4});
+        raw["results"][1]["origin"] = json!("walk");
+        raw["exact"] = json!([{"map": "exact.closure", "answered": true, "cards": 1}]);
+        let mut abstained = traversal(&["x"], &[SEARCH_FN], 1);
+        abstained["exact"] = json!([{"map": "exact.closure", "answered": false, "cards": 0}]);
+        let answers = BTreeMap::from([("q1".to_owned(), raw), ("q2".to_owned(), abstained)]);
+        let items = vec![
+            impact_item("i1", "q1", "src/app/search.rs", "search::rerank_document"),
+            impact_item("i2", "q2", "src/app/search.rs", "search::rerank_document"),
+        ];
+        let mut cfg = config(&["exact.closure", "graph.scip"]);
+        cfg.note = "first-stage=append first_k=10".into();
+        let outcome = bench_set(Set::Impact, &items, &Fixture::new(answers), &cfg).unwrap();
+        let note = &outcome.row.cells[20];
+        assert!(note.contains("first-stage=append first_k=10"), "{note}");
+        assert!(note.contains("exact answered=1/2"), "{note}");
+        // The exact card is the first answer, scored by its own site.
+        let first = &outcome.run["i1"][0];
+        assert_eq!(first["path"], "src/app/search.rs");
+        assert_eq!(first["line"], 12);
+        // No exact map selected: no such note.
+        let plain = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(BTreeMap::from([
+                ("q1".to_owned(), traversal(&["x"], &[SEARCH_FN], 1)),
+                ("q2".to_owned(), traversal(&["x"], &[SEARCH_FN], 1)),
+            ])),
+            &config(&["graph.scip"]),
+        )
+        .unwrap();
+        assert!(!plain.row.cells[20].contains("exact answered"));
     }
 }

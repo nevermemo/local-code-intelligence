@@ -561,6 +561,47 @@ impl std::str::FromStr for TraverseRerankScores {
     }
 }
 
+/// How the first-stage answers (the exact operators' cards and, with
+/// `answer_seeds`, the start nodes) join the walk's results
+/// (`[traverse] first_stage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraverseFirstStage {
+    /// The results are the walk's alone, as without the setting.
+    #[default]
+    Off,
+    /// The first-stage list (at most `first_k`), then the walk's results.
+    Append,
+    /// First-stage and walk results alternately, first stage first, cut to
+    /// `top_k` in total.
+    Interleave,
+}
+
+impl TraverseFirstStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Append => "append",
+            Self::Interleave => "interleave",
+        }
+    }
+}
+
+impl std::str::FromStr for TraverseFirstStage {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "off" => Ok(Self::Off),
+            "append" => Ok(Self::Append),
+            "interleave" => Ok(Self::Interleave),
+            other => Err(format!(
+                "first_stage must be \"off\", \"append\" or \"interleave\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[traverse]`: the multimap traversal behind `search_code`'s
 /// `mode = "traverse"` (spine brief 1.7). The limits are also the caps of a
 /// request: a `budget` in the request may lower them, never raise them.
@@ -661,9 +702,25 @@ pub struct TraverseConfig {
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
     pub seed_k: u32,
+    /// How the first-stage answers join the walk's results: `"off"` (default;
+    /// the results are the walk's alone), `"append"` or `"interleave"`. The
+    /// first stage is the cards of the exact operators the call selected
+    /// (`exact.closure`, `exact.pickaxe`), in the order of the maps list, then,
+    /// with `answer_seeds`, the start nodes. A node is listed once, at its
+    /// first place. A continuation (`handle`) returns the walk alone.
+    pub first_stage: TraverseFirstStage,
+    /// Most first-stage answers returned; `0` is no cap, `0..=200`.
+    pub first_k: u32,
+    /// Also answer with the start nodes (cards with `origin: "seed"`) after
+    /// the exact cards. Only with `first_stage` other than `"off"`.
+    pub answer_seeds: bool,
+    /// Add the exact cards whose node the SCIP graph holds to the walk's start
+    /// nodes, after the others.
+    pub exact_seeds: bool,
 }
 
 impl TraverseConfig {
+    pub const MAX_FIRST_K_LIMIT: u32 = 200;
     pub const MAX_POPS_LIMIT: u32 = 2000;
     pub const MAX_SEED_K_LIMIT: u32 = 40;
     pub const MAX_DEPTH_LIMIT: u32 = 32;
@@ -738,6 +795,12 @@ impl TraverseConfig {
             self.seed_k
         );
         ensure!(
+            self.first_k <= Self::MAX_FIRST_K_LIMIT,
+            "traverse.first_k must be 0..={} (got {})",
+            Self::MAX_FIRST_K_LIMIT,
+            self.first_k
+        );
+        ensure!(
             self.priors.is_some() == self.question_type.is_some(),
             "traverse.priors and traverse.question_type go together: a table is read for one question type"
         );
@@ -778,6 +841,10 @@ impl Default for TraverseConfig {
             question_type: None,
             tie_break: None,
             seed_k: 8,
+            first_stage: TraverseFirstStage::Off,
+            first_k: 10,
+            answer_seeds: false,
+            exact_seeds: false,
         }
     }
 }
@@ -3016,6 +3083,62 @@ fusion = \"rrf\"
                 .traverse
                 .score_bound
         );
+    }
+
+    #[test]
+    fn the_first_stage_keys_default_to_off_and_parse() {
+        let defaults = TraverseConfig::default();
+        assert_eq!(defaults.first_stage, TraverseFirstStage::Off);
+        assert_eq!(defaults.first_k, 10);
+        assert!(!defaults.answer_seeds && !defaults.exact_seeds);
+        let on: Config = toml::from_str(&format!(
+            "{}[traverse]
+first_stage = \"interleave\"
+first_k = 0
+answer_seeds = true
+exact_seeds = true
+",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert_eq!(on.traverse.first_stage, TraverseFirstStage::Interleave);
+        assert_eq!(on.traverse.first_k, 0);
+        assert!(on.traverse.answer_seeds && on.traverse.exact_seeds);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["traverse"]["first_stage"], "interleave");
+        assert_eq!(json["traverse"]["first_k"], 0);
+        let append: Config = toml::from_str(&format!(
+            "{}[traverse]
+first_stage = \"append\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        append.validate().unwrap();
+        assert_eq!(append.traverse.first_stage, TraverseFirstStage::Append);
+        assert_eq!(append.traverse.first_k, 10);
+        for bad in ["nope", "Append", ""] {
+            let text = format!(
+                "{}[traverse]
+first_stage = \"{bad}\"
+",
+                base_toml()
+            );
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad:?}");
+            assert!(bad.parse::<TraverseFirstStage>().is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            "interleave".parse::<TraverseFirstStage>(),
+            Ok(TraverseFirstStage::Interleave)
+        );
+        let mut config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.traverse.first_k = TraverseConfig::MAX_FIRST_K_LIMIT + 1;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("first_k"), "{error}");
     }
 
     #[test]

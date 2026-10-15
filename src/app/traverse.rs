@@ -31,10 +31,20 @@
 //! on a continuation, within the engine's own limits.
 
 mod chunks;
+mod first_stage;
 pub mod presets;
 
-use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
+use crate::{
+    app::App,
+    config::{TraverseConfig, TraverseFirstStage},
+    filter::FilterRequest,
+    models::Models,
+};
 use anyhow::{Context, Result, anyhow, bail};
+use first_stage::{
+    EXACT_CLOSURE_ID, EXACT_PICKAXE_ID, ExactCard, FirstStage, closure_cards, merge, origin_counts,
+    pickaxe_cards, seed_cards,
+};
 use lci_core::{
     config::TraverseRerankScores,
     models::HttpStatusError,
@@ -45,6 +55,7 @@ use lci_maps::{
     MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
+    exact_history::RealGit,
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     impact::{Decl, ImpactIndex},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
@@ -108,8 +119,12 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// `scip.impact` (the declarations that reference a symbol, the reverse
 /// closure of the SCIP impact index). `lsp.live` asks a language server for
 /// definition, references and document symbols (starts the server at the first
-/// expansion; needs its binary).
-pub const OPT_IN_MAPS: [MapId; 8] = [
+/// expansion; needs its binary). The two exact operators `exact.closure` (the
+/// declarations that reference the symbol the question names, from the same
+/// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
+/// finds for a history question) are never walked: their cards are the first
+/// stage (see [`first_stage`] and `[traverse] first_stage`).
+pub const OPT_IN_MAPS: [MapId; 10] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -118,6 +133,8 @@ pub const OPT_IN_MAPS: [MapId; 8] = [
     SEARCH_VECTOR_ID,
     SCIP_IMPACT_ID,
     LSP_LIVE_ID,
+    EXACT_CLOSURE_ID,
+    EXACT_PICKAXE_ID,
 ];
 /// Start nodes the name-token stand-in takes from the question.
 const SEED_COUNT: usize = 3;
@@ -130,6 +147,10 @@ const EXTERNAL_CALLS: u32 = 100;
 const MAX_TOP_K: usize = 40;
 /// Longest accepted handle text.
 const MAX_HANDLE: usize = 64;
+/// Longest one `git log` call of `exact.pickaxe` may run.
+const EXACT_GIT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Commits `exact.pickaxe` asks for when `[traverse] first_k` is 0 (no cap).
+const PICKAXE_UNCAPPED: usize = 100;
 
 /// `budget` of a traversal request. Each value may lower the `[traverse]`
 /// cap of the same name, never raise it.
@@ -932,9 +953,10 @@ fn map_hits(loaded: &Loaded, question: &str, hits: &[SeedHit]) -> Vec<MappedSeed
     seeds
 }
 
-/// A start-node source as a registered map: its descriptor only. The walk
-/// never queries it; registering it puts its id in the selectors, the maps
-/// list and the trace (`seeds.hybrid`, `seeds.scip_names`).
+/// A start-node or first-stage source as a registered map: its descriptor
+/// only. The walk never queries it; registering it puts its id in the
+/// selectors, the maps list and the trace (`seeds.hybrid`, `seeds.scip_names`,
+/// `exact.closure`, `exact.pickaxe`).
 struct SeedMap {
     descriptor: MapDescriptor,
 }
@@ -971,6 +993,24 @@ impl SeedMap {
             SEEDS_MAP,
             vec![NodeKind::Symbol],
             vec![SourceLabel::Lexical],
+        )
+    }
+
+    /// The declarations that reference the symbol the question names.
+    fn exact_closure() -> Self {
+        Self::new(
+            EXACT_CLOSURE_ID,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Scip],
+        )
+    }
+
+    /// The commits `git log -G/-S/--grep` finds for a history question.
+    fn exact_pickaxe() -> Self {
+        Self::new(
+            EXACT_PICKAXE_ID,
+            vec![NodeKind::Commit],
+            vec![SourceLabel::Git],
         )
     }
 }
@@ -1483,6 +1523,118 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             }
         }
     }
+    // The exact operators are descriptor-only maps; their cards are the first
+    // stage, made once per call and not on a continuation.
+    if wants(EXACT_CLOSURE_ID) {
+        register(
+            &mut registry,
+            &mut plan_maps,
+            Box::new(SeedMap::exact_closure()),
+            true,
+        )?;
+    }
+    if wants(EXACT_PICKAXE_ID) {
+        register(
+            &mut registry,
+            &mut plan_maps,
+            Box::new(SeedMap::exact_pickaxe()),
+            true,
+        )?;
+    }
+    let exact_wanted = wants(EXACT_CLOSURE_ID) || wants(EXACT_PICKAXE_ID);
+    let mut stage = FirstStage::off();
+    let mut exact_report: Vec<Value> = Vec::new();
+    if snapshot.is_some() {
+        if exact_wanted || limits.first_stage != TraverseFirstStage::Off || limits.exact_seeds {
+            notes.push(
+                "the first stage is not run again on a continuation: the results are the walk's alone (the first response carried the first-stage list)"
+                    .to_owned(),
+            );
+        }
+    } else if let Some(root) = call.scip_root {
+        let mut exact: Vec<ExactCard> = Vec::new();
+        for id in wanted.iter().copied() {
+            if id == EXACT_CLOSURE_ID {
+                match impact_map(call.scip_index, root, &loaded).await {
+                    Ok(map) => {
+                        let scip = loaded.scip.clone();
+                        let in_graph = |symbol: &str| scip.graph().node_index(symbol).is_some();
+                        let found = closure_cards(&map, &in_graph, call.question);
+                        notes.push(found.note);
+                        exact_report.push(json!({
+                            "map": id,
+                            "answered": !found.cards.is_empty(),
+                            "cards": found.cards.len(),
+                        }));
+                        exact.extend(found.cards);
+                    }
+                    Err(error) => {
+                        notes.push(format!("{id}: no index to read: {error:#}"));
+                        exact_report.push(json!({"map": id, "answered": false, "cards": 0}));
+                    }
+                }
+            } else if id == EXACT_PICKAXE_ID {
+                let (tree, question) = (root.to_path_buf(), call.question.to_owned());
+                let k = match limits.first_k {
+                    0 => PICKAXE_UNCAPPED,
+                    k => k as usize,
+                };
+                let found = tokio::task::spawn_blocking(move || {
+                    let git = RealGit {
+                        git: PathBuf::from("git"),
+                        tree,
+                        timeout: EXACT_GIT_TIMEOUT,
+                    };
+                    pickaxe_cards(&git, &question, k)
+                })
+                .await
+                .context("run exact.pickaxe")?;
+                notes.push(found.note);
+                exact_report.push(json!({
+                    "map": id,
+                    "answered": !found.cards.is_empty(),
+                    "cards": found.cards.len(),
+                    "git_calls": found.git_calls,
+                }));
+                stage.git_calls += found.git_calls;
+                exact.extend(found.cards);
+            }
+        }
+        if limits.first_stage != TraverseFirstStage::Off {
+            stage.mode = limits.first_stage;
+            stage.first_k = limits.first_k as usize;
+            stage.cards = exact.iter().map(|card| card.card.clone()).collect();
+            if limits.answer_seeds {
+                stage.cards.extend(seed_cards(&found.nodes, &found.details));
+            }
+        }
+        if limits.exact_seeds {
+            // After the others, and only nodes the graph holds.
+            let aligned = found.details.len() == found.nodes.len();
+            for card in exact.iter().filter(|card| card.in_graph) {
+                if found.nodes.iter().any(|seed| seed.node == card.node) {
+                    continue;
+                }
+                found.nodes.push(Seed {
+                    node: card.node.clone(),
+                    map: Some(card.op),
+                });
+                if aligned {
+                    found.details.push(json!({
+                        "node": card.node.to_string(),
+                        "kind": "symbol",
+                        "how": "exact",
+                        "retrievers": [card.op],
+                        "score": card.held,
+                        "score_kind": "references_held",
+                    }));
+                }
+            }
+            if matches!(found.source, "" | "none") && !found.nodes.is_empty() {
+                found.source = "exact";
+            }
+        }
+    }
     let mut search_maps: (
         Option<Arc<LexicalChunks<'_>>>,
         Option<Arc<VectorChunks<'_>>>,
@@ -1534,6 +1686,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         None => {
             if found.nodes.is_empty() {
                 let mut response = no_seeds_response(call, &found, notes);
+                add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, warnings);
                 return Ok(Report {
                     response,
@@ -1660,7 +1813,11 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         handle.as_deref(),
         trace_path.as_deref(),
         notes,
+        &stage,
     );
+    if let (false, Some(object)) = (exact_report.is_empty(), response.as_object_mut()) {
+        object.insert("exact".into(), json!(exact_report));
+    }
     add_policy(&mut response, effective, warnings);
     add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
     if let Some(history) = &git_history {
@@ -1949,6 +2106,27 @@ fn notes_with(mut notes: Vec<String>, note: &str) -> Vec<String> {
     notes
 }
 
+/// Gives a response that has no walk (no start node) the first-stage cards as
+/// its results, and the report of the exact operators.
+fn add_first_stage_only(
+    response: &mut Value,
+    stage: &FirstStage,
+    top_k: usize,
+    exact_report: &[Value],
+) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    if stage.active() {
+        let results = merge(stage.mode, &stage.cards, &[], stage.first_k, top_k);
+        object.insert("first_stage".into(), origin_counts(&results));
+        object.insert("results".into(), json!(results));
+    }
+    if !exact_report.is_empty() {
+        object.insert("exact".into(), json!(exact_report));
+    }
+}
+
 fn response_json(
     call: &Call<'_>,
     result: &TraversalResult,
@@ -1956,11 +2134,19 @@ fn response_json(
     handle: Option<&str>,
     trace_path: Option<&Path>,
     notes: Vec<String>,
+    stage: &FirstStage,
 ) -> Value {
+    // With a first stage the walk gives as many cards as can be left once the
+    // first stage's repeats are skipped.
+    let walk_cards = if stage.active() {
+        call.top_k + stage.cards.len()
+    } else {
+        call.top_k
+    };
     let results: Vec<Value> = result
         .ranked()
         .into_iter()
-        .take(call.top_k)
+        .take(walk_cards)
         .map(|at| {
             let state = &result.states[at];
             let mut card = trace::card_json(&Card::ranked(state, result.ranked_potential(state)));
@@ -1974,6 +2160,18 @@ fn response_json(
             card
         })
         .collect();
+    let results = if stage.active() {
+        merge(
+            stage.mode,
+            &stage.cards,
+            &results,
+            stage.first_k,
+            call.top_k,
+        )
+    } else {
+        results
+    };
+    let first_stage_counts = stage.active().then(|| origin_counts(&results));
     let steering: Vec<Value> = result
         .events
         .iter()
@@ -2029,7 +2227,8 @@ fn response_json(
             // calls they made.
             "external_calls": totals.external_calls,
             "physical_map_calls": totals.physical_map_calls,
-            "physical_external_calls": totals.physical_external_calls,
+            // The git calls of `exact.pickaxe` are physical external calls too.
+            "physical_external_calls": totals.physical_external_calls + stage.git_calls,
             "stops": totals.stops,
             "steers": totals.steers,
             "per_map": per_map,
@@ -2051,6 +2250,12 @@ fn response_json(
             }
         }
         object.insert("stop_reason".into(), json!(result.stop_reason.as_str()));
+        if let (Some(counts), Some(totals)) = (
+            first_stage_counts,
+            object.get_mut("totals").and_then(Value::as_object_mut),
+        ) {
+            totals.insert("first_stage".into(), counts);
+        }
         if let (true, Some(totals)) = (
             result.pass_through,
             object.get_mut("totals").and_then(Value::as_object_mut),
@@ -3600,6 +3805,8 @@ mod tests {
             SEARCH_VECTOR_ID,
             SCIP_IMPACT_ID,
             LSP_LIVE_ID,
+            EXACT_CLOSURE_ID,
+            EXACT_PICKAXE_ID,
         ] {
             assert!(!MAPS.contains(&id), "{id} is opt-in");
             let no_root = run_with(&[id]).await.unwrap();
@@ -3614,6 +3821,166 @@ mod tests {
                 && unknown.contains("scip.impact"),
             "{unknown}"
         );
+    }
+
+    /// One call over the three-file tree: the given maps and first-stage keys.
+    async fn first_stage_run(tree: &Tree, limits: &TraverseConfig, maps: Option<&[&str]>) -> Value {
+        let maps: Option<Vec<String>> =
+            maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+        let (budget, steer) = (
+            BudgetArgs {
+                pops: Some(1),
+                ..BudgetArgs::default()
+            },
+            SteerArgs::default(),
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: Some(tree.dir.path()),
+            question: "q",
+            seeds: &tree.seeds,
+            seed_search: None,
+            top_k: 8,
+            maps: maps.as_deref(),
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        run(limits, &Dirs::under(tree.dir.path()), &call)
+            .await
+            .unwrap()
+            .response
+    }
+
+    #[tokio::test]
+    async fn the_first_stage_is_off_by_default_and_leaves_the_output_as_it_was() {
+        let tree = Tree::new();
+        let response = first_stage_run(&tree, &limits(), None).await;
+        let results = response["results"].as_array().expect("results");
+        assert!(
+            results.iter().all(|card| card.get("origin").is_none()),
+            "{response}"
+        );
+        // The other keys do nothing while the mode is off.
+        let others = TraverseConfig {
+            first_k: 3,
+            answer_seeds: true,
+            ..limits()
+        };
+        let same = first_stage_run(&tree, &others, None).await;
+        assert_eq!(same["results"], response["results"]);
+        assert!(same["totals"].get("first_stage").is_none(), "{same}");
+        assert!(
+            response["totals"].get("first_stage").is_none(),
+            "{response}"
+        );
+        assert!(response.get("exact").is_none(), "{response}");
+
+        // Naming the exact maps without turning the first stage on changes
+        // no card either; the report says what each map answered.
+        let named =
+            first_stage_run(&tree, &limits(), Some(&["graph.scip", EXACT_CLOSURE_ID])).await;
+        assert!(
+            named["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|card| card.get("origin").is_none()),
+            "{named}"
+        );
+        assert!(named["totals"].get("first_stage").is_none(), "{named}");
+        assert_eq!(named["exact"][0]["map"], EXACT_CLOSURE_ID, "{named}");
+        assert_eq!(named["exact"][0]["answered"], false, "{named}");
+    }
+
+    #[tokio::test]
+    async fn an_exact_map_that_resolves_nothing_abstains_with_a_note() {
+        let tree = Tree::new();
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        let response =
+            first_stage_run(&tree, &limits, Some(&["graph.scip", EXACT_CLOSURE_ID])).await;
+        let notes = response["notes"].to_string();
+        assert!(notes.contains("exact.closure"), "{response}");
+        assert_eq!(response["exact"][0]["answered"], false, "{response}");
+        // The first stage is the seeds, then the walk's cards after them.
+        let results = response["results"].as_array().expect("results");
+        let origins: Vec<&str> = results
+            .iter()
+            .map(|card| card["origin"].as_str().expect("origin"))
+            .collect();
+        assert!(origins.contains(&"seed"), "{origins:?}");
+        let first_walk = origins.iter().position(|o| *o == "walk");
+        let last_seed = origins.iter().rposition(|o| *o == "seed").unwrap();
+        assert!(
+            first_walk.is_none_or(|walk| walk > last_seed),
+            "{origins:?}"
+        );
+        let counts = &response["totals"]["first_stage"];
+        assert_eq!(
+            counts["seeds"].as_u64().unwrap() as usize,
+            origins.iter().filter(|o| **o == "seed").count(),
+            "{response}"
+        );
+        // No node is listed twice.
+        let mut nodes: Vec<&str> = results
+            .iter()
+            .map(|card| card["node"].as_str().unwrap())
+            .collect();
+        let listed = nodes.len();
+        nodes.sort_unstable();
+        nodes.dedup();
+        assert_eq!(nodes.len(), listed, "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_continuation_does_not_run_the_first_stage_again() {
+        let tree = Tree::new();
+        let named = ["graph.scip", EXACT_CLOSURE_ID];
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        let first = first_stage_run(&tree, &limits, Some(&named)).await;
+        if first.get("handle").is_none() {
+            return; // the walk finished within one pop: nothing to continue
+        }
+        let handle = handle_of(&first);
+        let maps: Vec<String> = named.iter().map(|id| (*id).to_owned()).collect();
+        let (budget, steer) = (
+            BudgetArgs {
+                pops: Some(1),
+                ..BudgetArgs::default()
+            },
+            SteerArgs::default(),
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: Some(tree.dir.path()),
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: Some(&maps),
+            budget: &budget,
+            steer: &steer,
+            handle: Some(&handle),
+            lsp: None,
+        };
+        let next = run(&limits, &Dirs::under(tree.dir.path()), &call)
+            .await
+            .unwrap()
+            .response;
+        assert!(
+            next["notes"].to_string().contains("not run again"),
+            "{next}"
+        );
+        assert!(next["totals"].get("first_stage").is_none(), "{next}");
     }
 
     #[tokio::test]

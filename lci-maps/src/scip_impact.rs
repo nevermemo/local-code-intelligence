@@ -196,6 +196,11 @@ impl ImpactMap {
         )
     }
 
+    /// The SCIP index the map was built over (read only).
+    pub fn index(&self) -> &ImpactIndex {
+        &self.ix
+    }
+
     pub fn stats(&self) -> ImpactStats {
         self.stats
     }

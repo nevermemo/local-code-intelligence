@@ -386,3 +386,20 @@ score_bound = true
 # tie_break = "tie-break.json"
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8
+# First stage: answers that join the walk's results ahead of or among them. The
+# first stage is the cards of the exact operators the call selects (the maps
+# exact.closure and exact.pickaxe, named in the maps list and needing the tree;
+# each abstains with a note when nothing the question names resolves), in the
+# order of the maps list, then, with answer_seeds, the start nodes. Cards say
+# where they came from (origin: exact, seed or walk) and a node is listed once,
+# at its first place. "off" (default): the results are the walk's alone and the
+# response is as without these keys. "append": the first stage (at most
+# first_k), then the walk's results. "interleave": first-stage and walk results
+# alternately, first stage first, cut to top_k in total. first_k caps the first
+# stage, 0 to 200 (0: no cap). A continuation (handle) returns the walk alone.
+first_stage = "off"
+first_k = 10
+answer_seeds = false
+# Add the exact cards whose node the SCIP graph holds to the walk's start nodes,
+# after the others (independent of first_stage).
+exact_seeds = false

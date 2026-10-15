@@ -406,7 +406,10 @@ struct TraverseArgs {
     /// server, with the server paths and lsp_timeout_seconds of the
     /// configuration; the server starts at the first expansion, so a cold
     /// start can exceed [traverse] deadline_ms and the walk then ends
-    /// with the deadline note).
+    /// with the deadline note), exact.closure (the declarations that
+    /// reference the symbol the question names) and exact.pickaxe (the commits
+    /// git log -G/-S/--grep finds for a history question); the two exact maps
+    /// are never walked, their cards are the first stage (--first-stage).
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// The `[search_profiles.<name>]` the hybrid search for the start nodes
@@ -465,6 +468,23 @@ struct TraverseArgs {
     /// results tied at the same rank. A continuation must be given the same file.
     #[arg(long)]
     tie_break: Option<String>,
+    /// How the first-stage answers (the cards of the maps exact.closure and
+    /// exact.pickaxe, then with --answer-seeds the start nodes) join the walk's
+    /// results: `off`, `append` or `interleave` (default: the `[traverse]
+    /// first_stage` setting). A continuation returns the walk alone.
+    #[arg(long)]
+    first_stage: Option<local_code_intelligence::config::TraverseFirstStage>,
+    /// Most first-stage answers, 0 for no cap (default: the `[traverse]
+    /// first_k` setting).
+    #[arg(long)]
+    first_k: Option<u32>,
+    /// Also answer with the start nodes (the `[traverse] answer_seeds` setting).
+    #[arg(long)]
+    answer_seeds: bool,
+    /// Add the exact cards the SCIP graph holds to the start nodes (the
+    /// `[traverse] exact_seeds` setting).
+    #[arg(long)]
+    exact_seeds: bool,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -518,6 +538,14 @@ async fn run_traverse(
     config.traverse.priors = args.priors.clone().or(config.traverse.priors);
     config.traverse.question_type = args.question_type.clone().or(config.traverse.question_type);
     config.traverse.tie_break = args.tie_break.clone().or(config.traverse.tie_break);
+    if let Some(first_stage) = args.first_stage {
+        config.traverse.first_stage = first_stage;
+    }
+    if let Some(first_k) = args.first_k {
+        config.traverse.first_k = first_k;
+    }
+    config.traverse.answer_seeds |= args.answer_seeds;
+    config.traverse.exact_seeds |= args.exact_seeds;
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(name) if traverse::presets::is_preset(name) => SteerArgs {
