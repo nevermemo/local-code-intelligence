@@ -13,6 +13,31 @@ embedding_url = "http://localhost:8766/v1"
 embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
 reranker_model = "qwen3-reranker-4b"
+# Each model service (the embedder and reranker above, System One below) is a
+# URL, a model name and, optionally, the NAME of an environment variable that
+# holds an API key (sent as a bearer token). The key itself never belongs in a
+# configuration file; the name is upper-case letters, digits and '_'. Each
+# service can be a local server, a server on another machine, or a hosted
+# provider; the defaults point at local servers.
+# embedding_api_key_env = "EMBEDDING_API_KEY"
+# reranker_api_key_env = "RERANKER_API_KEY"
+#
+# [system_one] is the small model that steers a traversal. Off when the
+# section is absent. It must be a table, so uncomment it after the last
+# top-level key of this file (it is shown here beside the other model
+# settings).
+#   provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)
+#   url = "http://127.0.0.1:8080/v1"   # base URL; /chat/completions or /completions is appended
+#   model = "your-model-name"
+#   api = "chat"                 # "chat" or "completion"
+#   timeout_ms = 30000           # 100 to 600000; one attempt, no retry
+#   api_key_env = "SYSTEM_ONE_API_KEY"
+#   allow_remote = false         # a non-loopback host in url is refused unless true
+#   replay_file = "pairs.json"   # provider = "mock" only
+#   [system_one.capabilities]
+#   constraint = "json_schema"   # "gbnf" (llama.cpp grammar), "json_schema" or "none"
+#   logprobs = false             # the server returns top log-probabilities
+#   batch = false
 default_top_k = 8
 # Defaults to the OS-native local data directory joined with
 # "local-code-intelligence": %LOCALAPPDATA% on Windows, ~/Library/Application

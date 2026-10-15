@@ -1,4 +1,7 @@
-use crate::config::{Config, fill_template};
+use crate::{
+    config::{Config, fill_template},
+    endpoint::ApiKey,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
@@ -142,7 +145,7 @@ impl ConnectBreaker {
 /// Whether `error` was caused by failing to connect to the service at all
 /// (refused, unreachable, or a connect timeout), as opposed to a service that
 /// answered badly or took too long to answer.
-fn is_connect_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_connect_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<reqwest::Error>()
@@ -214,14 +217,17 @@ pub fn is_input_rejected(error: &anyhow::Error) -> bool {
 const MAX_ERROR_BODY_CHARS: usize = 600;
 
 /// Maximum number of bytes buffered from a model response body.
-const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-struct LimitedBody {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(crate) struct LimitedBody {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
-async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Result<LimitedBody> {
+pub(crate) async fn read_limited_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<LimitedBody> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         let remaining = limit.saturating_sub(bytes.len());
@@ -315,10 +321,19 @@ fn redact_error_body(body: &str, endpoint: &str) -> String {
     redacted.trim_end().to_owned()
 }
 
-async fn check_status(
+/// Replaces `key`, wherever a server echoed it, in `body`.
+pub(crate) fn redact_secret(body: &str, key: Option<&ApiKey>) -> String {
+    match key {
+        Some(key) => body.replace(key.expose(), "[redacted]"),
+        None => body.to_owned(),
+    }
+}
+
+pub(crate) async fn check_status(
     response: reqwest::Response,
     label: &str,
     endpoint: &str,
+    key: Option<&ApiKey>,
 ) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
@@ -330,7 +345,8 @@ async fn check_status(
             bytes: Vec::new(),
             truncated: false,
         });
-    let mut body = redact_error_body(&String::from_utf8_lossy(&bounded.bytes), endpoint);
+    let text = redact_secret(&String::from_utf8_lossy(&bounded.bytes), key);
+    let mut body = redact_error_body(&text, endpoint);
     if bounded.truncated {
         body.push_str(" [truncated]");
     }
@@ -339,6 +355,14 @@ async fn check_status(
         body,
     })
     .context(format!("{label} HTTP error")))
+}
+
+/// Adds the bearer token of the endpoint's API key, when it has one.
+fn with_bearer(builder: reqwest::RequestBuilder, key: Option<&ApiKey>) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) => builder.bearer_auth(key.expose()),
+        None => builder,
+    }
 }
 
 impl Models {
@@ -438,13 +462,17 @@ impl Models {
             "encoding_format": "float"
         });
         let timeout = Duration::from_secs(self.config.embedding_timeout_seconds);
+        let key = self.config.embedder_endpoint().api_key()?;
         let response = self
             .send_with_retry("embedding service", policy, || {
-                self.client.post(url.clone()).timeout(timeout).json(&body)
+                with_bearer(
+                    self.client.post(url.clone()).timeout(timeout).json(&body),
+                    key.as_ref(),
+                )
             })
             .await?;
         let bounded = read_limited_body(
-            check_status(response, "embedding service", url.as_str()).await?,
+            check_status(response, "embedding service", url.as_str(), key.as_ref()).await?,
             MAX_RESPONSE_BODY_BYTES,
         )
         .await
@@ -526,12 +554,16 @@ impl Models {
             "top_n": documents.len()
         });
         let timeout = Duration::from_secs(self.config.reranker_timeout_seconds);
+        let key = self.config.reranker_endpoint().api_key()?;
         let response = match self
             .send_with_retry("reranker", RetryPolicy::FailFast, || {
-                self.client
-                    .post(&self.config.reranker_url)
-                    .timeout(timeout)
-                    .json(&body)
+                with_bearer(
+                    self.client
+                        .post(&self.config.reranker_url)
+                        .timeout(timeout)
+                        .json(&body),
+                    key.as_ref(),
+                )
             })
             .await
         {
@@ -549,7 +581,13 @@ impl Models {
             }
         };
         let bounded = read_limited_body(
-            check_status(response, "reranker", &self.config.reranker_url).await?,
+            check_status(
+                response,
+                "reranker",
+                &self.config.reranker_url,
+                key.as_ref(),
+            )
+            .await?,
             MAX_RESPONSE_BODY_BYTES,
         )
         .await
@@ -1367,5 +1405,58 @@ mod tests {
         );
         assert!(!format!("{error:#}").contains("marker"), "{error:#}");
         assert!(!format!("{error:?}").contains("marker"), "{error:?}");
+    }
+
+    /// The API key goes out as a bearer token, and a server that echoes the
+    /// request back in an error cannot put it into the error.
+    #[tokio::test]
+    async fn the_bearer_key_is_sent_and_redacted_from_an_echoed_error() {
+        const SECRET: &str = "sk-echo-me-123";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buffer).await.unwrap();
+                seen.extend_from_slice(&buffer[..n]);
+            }
+            let echoed = String::from_utf8_lossy(&seen).into_owned();
+            let line = echoed
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization"))
+                .unwrap_or("no authorization header");
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{line}",
+                line.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let endpoint = crate::endpoint::Endpoint {
+            url: format!("http://{address}/rerank"),
+            model: "m".into(),
+            api_key_env: Some("TEST_KEY".into()),
+            allow_remote: true,
+        };
+        let key = endpoint
+            .api_key_from(|_| Some(SECRET.into()))
+            .unwrap()
+            .unwrap();
+        let response = with_bearer(reqwest::Client::new().post(&endpoint.url), Some(&key))
+            .send()
+            .await
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            check_status(response, "reranker", &endpoint.url, Some(&key))
+                .await
+                .unwrap_err()
+        );
+        assert!(!error.contains(SECRET), "{error}");
+        assert!(
+            error.contains("[redacted]"),
+            "the header was not sent: {error}"
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::{endpoint::validate_api_key_env, provider::SystemOneConfig};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -354,6 +355,14 @@ pub struct Config {
     pub embedding_model: String,
     pub reranker_url: String,
     pub reranker_model: String,
+    /// The NAME of the environment variable holding the embedder's API key,
+    /// sent as a bearer token; the key itself is never configured. Absent:
+    /// no credential is sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_api_key_env: Option<String>,
+    /// Like `embedding_api_key_env`, for the reranker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reranker_api_key_env: Option<String>,
     pub data_dir: PathBuf,
     /// Loopback port `serve` binds (`127.0.0.1:<port>`) and the one the URLs
     /// `lci config` derives name. `serve --port` overrides it. Never one of
@@ -476,6 +485,10 @@ pub struct Config {
     /// reports stay as they were.
     #[serde(skip_serializing_if = "TraverseConfig::is_default")]
     pub traverse: TraverseConfig,
+    /// `[system_one]`: the small model that steers a traversal (a local
+    /// server, a hosted provider or another machine). Off when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_one: Option<SystemOneConfig>,
 }
 
 /// How a traversal ranks its results (`[traverse] fusion`).
@@ -911,6 +924,8 @@ impl Default for Config {
             embedding_model: "qwen3-embedding-4b".into(),
             reranker_url: "http://localhost:8767/rerank".into(),
             reranker_model: "qwen3-reranker-4b".into(),
+            embedding_api_key_env: None,
+            reranker_api_key_env: None,
             data_dir: base.join("local-code-intelligence"),
             port: DEFAULT_PORT,
             default_top_k: 8,
@@ -946,6 +961,7 @@ impl Default for Config {
             fusion: FusionConfig::default(),
             search_profiles: BTreeMap::new(),
             traverse: TraverseConfig::default(),
+            system_one: None,
         }
     }
 }
@@ -970,6 +986,9 @@ impl Config {
         self.embedding_model = self.embedding_model.trim().to_owned();
         self.reranker_url = self.reranker_url.trim().to_owned();
         self.reranker_model = self.reranker_model.trim().to_owned();
+        if let Some(system_one) = &mut self.system_one {
+            system_one.trim();
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1188,6 +1207,14 @@ impl Config {
             !self.reranker_model.trim().is_empty(),
             "reranker_model must be nonempty"
         );
+        validate_api_key_env(
+            "embedding_api_key_env",
+            self.embedding_api_key_env.as_deref(),
+        )?;
+        validate_api_key_env("reranker_api_key_env", self.reranker_api_key_env.as_deref())?;
+        if let Some(system_one) = &self.system_one {
+            system_one.validate()?;
+        }
         Ok(())
     }
 
@@ -2877,5 +2904,63 @@ fusion = \"{fusion}\"
             config.traverse.corroboration_boost = boost;
             config.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn system_one_is_off_when_absent_and_read_from_its_section() {
+        let off: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(off.system_one.is_none());
+        // Absent keys stay out of the serialized configuration.
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(json.get("system_one").is_none());
+        assert!(json.get("embedding_api_key_env").is_none());
+
+        let on: Config = toml::from_str(&format!(
+            "{}embedding_api_key_env = \"EMBED_KEY\"
+[system_one]
+model = \"m\"
+timeout_ms = 500
+
+[system_one.capabilities]
+constraint = \"gbnf\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        let system_one = on.system_one.unwrap();
+        assert_eq!(system_one.timeout_ms, 500);
+        assert_eq!(system_one.url, "http://127.0.0.1:8080/v1");
+        assert_eq!(
+            system_one.capabilities.constraint,
+            crate::provider::ConstraintSupport::Gbnf
+        );
+        assert_eq!(on.embedding_api_key_env.as_deref(), Some("EMBED_KEY"));
+
+        let remote: Config = toml::from_str(&format!(
+            "{}[system_one]
+url = \"https://api.example.com/v1\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        assert!(
+            remote
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("system_one.allow_remote")
+        );
+        let pasted: Config = toml::from_str(&format!(
+            "{}reranker_api_key_env = \"sk-pasted-key\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        let error = pasted.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("reranker_api_key_env") && !error.contains("sk-pasted"),
+            "{error}"
+        );
     }
 }
