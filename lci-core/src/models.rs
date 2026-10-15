@@ -593,13 +593,22 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
 
-    /// An address on which nothing listens: bind to learn a free port, then
-    /// release it.
-    fn closed_local_address() -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        address
+    /// An address on which nothing listens. The socket is bound but never
+    /// listens, so connections are refused and, while it lives, no parallel
+    /// test's server can take the port (releasing it raced with them).
+    struct Refused(#[allow(dead_code)] tokio::net::TcpSocket, SocketAddr);
+
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.1.fmt(f)
+        }
+    }
+
+    fn closed_local_address() -> Refused {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let address = socket.local_addr().unwrap();
+        Refused(socket, address)
     }
 
     /// What the fake model server does with one request on a connection.
@@ -1203,7 +1212,8 @@ mod tests {
         assert!(!is_connection_dropped(&invalid), "{invalid:#}");
 
         // A refused connection is a connect error, not a dropped one.
-        let url = format!("http://{}/", closed_local_address());
+        let closed = closed_local_address();
+        let url = format!("http://{closed}/");
         let refused = models.client().get(url).send().await.unwrap_err();
         assert!(
             refused.is_connect() && !is_connection_dropped(&refused),
@@ -1287,8 +1297,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_reranker_connection_is_skipped_for_the_window_then_probed_again() {
+        let closed = closed_local_address();
         let config = Config {
-            reranker_url: format!("http://{}/rerank", closed_local_address()),
+            reranker_url: format!("http://{closed}/rerank"),
             ..Config::default()
         };
         let mut models = Models::new(&config).unwrap();
@@ -1321,8 +1332,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_reranker_error_does_not_carry_the_url_credentials() {
+        let closed = closed_local_address();
         let config = Config {
-            reranker_url: format!("http://{}/rerank?api_key=marker", closed_local_address()),
+            reranker_url: format!("http://{closed}/rerank?api_key=marker"),
             ..Config::default()
         };
         let models = Models::new(&config).unwrap();
@@ -1336,8 +1348,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_query_embedding_makes_one_attempt_and_hides_the_url_credentials() {
+        let closed = closed_local_address();
         let config = Config {
-            embedding_url: format!("http://{}/v1?api_key=marker", closed_local_address()),
+            embedding_url: format!("http://{closed}/v1?api_key=marker"),
             ..Config::default()
         };
         let models = Models::new(&config).unwrap();
