@@ -17,9 +17,11 @@ How to read a row:
   use it). Nothing is dropped without a count: n_gold = n_scored + skipped
   (+ the items of a set that was not attempted at all).
 - Every metric, precision, F0.5 and total below is over the `n_scored` items
-  only; a skipped item is in no mean. `answered` is how many of the scored
-  items returned at least one answer; an item that returns nothing scores 0,
-  including in precision.
+  only; a skipped item is in no mean. `non-empty` is how many of the scored
+  items returned at least one answer of the set's type: it counts answers, not
+  correct answers (the metrics say how right they are). An item that returns
+  nothing scores 0, including in precision. Rows written before the rename
+  (the column was called `answered`) mean the same thing.
 - `metrics` are the gold scorer's own metrics for the set (means over the
   scored items where defined; `(k)` marks a metric defined on only k items).
 - `precision` and `F0.5` are of the returned answer set against gold, per item,
@@ -40,12 +42,21 @@ How to read a row:
   `wall ms` is the whole `lci traverse` process per item (it loads the index
   each time), p50/p95. A latency marked `under load` was measured while other
   work ran on the machine and is not comparable with a clean run.
-- `maps` are the maps asked for; `maps unavailable` lists those whose preflight
-  failed (they were not used).
-- A set no selected map can answer gets `no map yields this answer type`
-  instead of zeros.
+- `maps` are the maps asked for (when none were, the list the CLI itself turns
+  on); `maps unavailable` lists those whose preflight failed (they were not
+  used). The preflight gives each map start nodes it can expand, then checks
+  that the CLI registered the map and that the per-map totals show it was
+  called; a seeds map is checked by the start nodes it gave.
+- A set no selected map can answer (no selected map emits the node kind its
+  answers are made of) gets `no map yields this answer type` instead of zeros,
+  and the note `structural-zero`: the zero is the shape of the map list, not a
+  result, so such a row is left out of any average over sets or waves. This
+  file computes no average; a reader that does must skip those rows.
+- A row whose note says `rescored` was scored again from the raw outputs of an
+  earlier run with the current adapters (`--rescore`); its traversal columns
+  are the earlier run's and its wall latency is `-`.
 
-| wave | set | n_gold | n_attempted | n_scored | skipped | answered | metrics (over n_scored) | precision | F0.5 | pops | hops | xhops | stops | ans tok | engine ms p50/p95 | wall ms p50/p95 | maps | maps unavailable | policy | note |
+| wave | set | n_gold | n_attempted | n_scored | skipped | non-empty | metrics (over n_scored) | precision | F0.5 | pops | hops | xhops | stops | ans tok | engine ms p50/p95 | wall ms p50/p95 | maps | maps unavailable | policy | note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | S7-stand-in-seeds | impact | 141 | 141 | 141 | none | 140/141 | decl_recall=0.014; decl_f1=0.013; decl_ndcg@10=0.018; file_f1=0.188 (over 141) | 0.016 | 0.014 | 7601 | 8103 | 1166 | 0 | 23534 | 14/54 | 480/819 | seeds.scip_names,graph.scip | none | default | tree bfaff44; debug build; name-token stand-in seeds; ans tok = chars/4 |
 | S7-stand-in-seeds | flow | 111 | 111 | 111 | none | 111/111 | path_recall=0.035; tau=n/a (0); spurious=9.766 (over 111) | 0.012 | 0.011 | 8656 | 9657 | 1148 | 0 | 20220 | 18/63 | 533/716 | seeds.scip_names,graph.scip | none | default | tree bfaff44; debug build; name-token stand-in seeds; ans tok = chars/4 |

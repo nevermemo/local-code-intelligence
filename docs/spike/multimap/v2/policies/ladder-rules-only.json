@@ -1,0 +1,15 @@
+{
+  "rules": [
+    {"when": {"kind": "test"}, "then": "prune"},
+    {"when": {"path_glob": "**/tests/**"}, "then": "prune"},
+    {"when": {"path_glob": "**/tests"}, "then": "prune"},
+    {"when": {"path_glob": "**/generated/**"}, "then": "prune"},
+    {"when": {"path_glob": "**/*.pb.rs"}, "then": "prune"},
+    {"when": {"budget_left": {"lt": 10}}, "then": "stop"},
+    {"when": {"budget_left": {"ge": 0}}, "then": "continue"}
+  ],
+  "ladder": ["rules", "agent"],
+  "max_stops": 8,
+  "tau": 0.5,
+  "stop_every": 20
+}

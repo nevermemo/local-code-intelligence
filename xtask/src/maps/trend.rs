@@ -26,9 +26,10 @@ How to read a row:
   use it). Nothing is dropped without a count: n_gold = n_scored + skipped
   (+ the items of a set that was not attempted at all).
 - Every metric, precision, F0.5 and total below is over the `n_scored` items
-  only; a skipped item is in no mean. `answered` is how many of the scored
-  items returned at least one answer; an item that returns nothing scores 0,
-  including in precision.
+  only; a skipped item is in no mean. `non-empty` is how many of the scored
+  items returned at least one answer of the set's type: it counts answers, not
+  correct answers (the metrics say how right they are). An item that returns
+  nothing scores 0, including in precision.
 - `metrics` are the gold scorer's own metrics for the set (means over the
   scored items where defined; `(k)` marks a metric defined on only k items).
 - `precision` and `F0.5` are of the returned answer set against gold, per item,
@@ -49,10 +50,19 @@ How to read a row:
   `wall ms` is the whole `lci traverse` process per item (it loads the index
   each time), p50/p95. A latency marked `under load` was measured while other
   work ran on the machine and is not comparable with a clean run.
-- `maps` are the maps asked for; `maps unavailable` lists those whose preflight
-  failed (they were not used).
-- A set no selected map can answer gets `no map yields this answer type`
-  instead of zeros.
+- `maps` are the maps asked for (when none were, the list the CLI itself turns
+  on); `maps unavailable` lists those whose preflight failed (they were not
+  used). The preflight gives each map start nodes it can expand, then checks
+  that the CLI registered the map and that the per-map totals show it was
+  called; a seeds map is checked by the start nodes it gave.
+- A set no selected map can answer (no selected map emits the node kind its
+  answers are made of) gets `no map yields this answer type` instead of zeros,
+  and the note `structural-zero`: the zero is the shape of the map list, not a
+  result, so such a row is left out of any average over sets or waves. This
+  file computes no average; a reader that does must skip those rows.
+- A row whose note says `rescored` was scored again from the raw outputs of an
+  earlier run with the current adapters (`--rescore`); its traversal columns
+  are the earlier run's and its wall latency is `-`.
 
 ";
 
@@ -63,7 +73,7 @@ const COLUMNS: [&str; NCOLS] = [
     "n_attempted",
     "n_scored",
     "skipped",
-    "answered",
+    "non-empty",
     "metrics (over n_scored)",
     "precision",
     "F0.5",
@@ -196,6 +206,14 @@ mod tests {
         assert!(error.contains("already has a row"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         append(&path, &row("w2", "impact")).unwrap();
+    }
+
+    #[test]
+    fn the_answer_column_says_it_counts_answers_not_correct_ones() {
+        assert!(COLUMNS.contains(&"non-empty"));
+        assert!(!COLUMNS.contains(&"answered"));
+        assert!(PREFACE.contains("it counts answers"));
+        assert!(PREFACE.contains("structural-zero"));
     }
 
     #[test]
