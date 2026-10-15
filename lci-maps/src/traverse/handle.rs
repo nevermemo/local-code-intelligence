@@ -2,13 +2,21 @@
 //! leaves a [`Snapshot`] of its state, a [`HandleStore`] keeps it under a
 //! content hash (the handle), and [`Traversal::resumed`] continues from it.
 //!
-//! A snapshot holds everything the engine needs to go on as if it had not
-//! paused: the states, the queue (priorities and discovery numbers), the
-//! counters, the cleared set, map weights and switches, the pop count, and
-//! the events so far. The handle is the hash of the snapshot's JSON, so equal
-//! runs give equal handles and a stored file can be checked on load. The
-//! wall-clock value of a call (`elapsed_ms`) is not kept: a resumed call
-//! measures its own.
+//! A snapshot holds what the engine needs to go on as if it had not paused:
+//! the states, the queue (priorities and discovery numbers), the states held
+//! back at the depth limit, the counters, the cleared set, map weights and
+//! switches, the pop count, what a cut pop already paid for its calls, the
+//! `alt_path` pairs already traced, and the identity of the workspace and
+//! index it walks. It does not hold the event log: each call writes its own
+//! trace (a resumed call starts with its `resume` event, which names the
+//! handle), so a handle stays the size of the walk, not of its history. The
+//! handle is the hash of the snapshot's JSON, so equal runs give equal
+//! handles and a stored file can be checked on load. The wall-clock value of
+//! a call (`elapsed_ms`) is not kept: a resumed call measures its own.
+//!
+//! A handle is bound to the workspace and index it was made on
+//! ([`Snapshot::identity`]); a caller that knows them refuses a handle that
+//! names others ([`Snapshot::check_identity`]).
 //!
 //! What a resume does not carry: the edge source, the scorer, the price and
 //! the handler. The caller passes them again, and may change them (a changed
@@ -16,7 +24,10 @@
 //! whole traversal (`pops`, `est_tokens` and `external_calls` count from the
 //! first call), with a fresh deadline; what the outer agent raised stays with
 //! the traversal and is added to the caps a call passes (see [`super::steer`]).
-//! A resumed call may carry the agent's [`Steer`](super::steer::Steer).
+//! The depth limit is the call's own: a resume with a lower limit does not
+//! expand what the first call queued below it, and one with a higher limit
+//! queues the states the first call held back. A resumed call may carry the
+//! agent's [`Steer`](super::steer::Steer).
 
 use super::{
     Run, State, Totals, Traversal, TraversalBudget,
@@ -35,7 +46,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const WITNESSES: [WitnessClass; 7] = [
     WitnessClass::Compiler,
     WitnessClass::Lsp,
@@ -58,6 +69,13 @@ pub enum HandleError {
     /// The stored snapshot does not parse, is inconsistent, or does not
     /// hash to its handle.
     Corrupt(String),
+    /// The handle was made for another workspace or index than the one the
+    /// caller is walking (see [`Snapshot::check_identity`]).
+    WrongIdentity {
+        handle: String,
+        found: String,
+        expected: String,
+    },
 }
 
 impl fmt::Display for HandleError {
@@ -67,6 +85,23 @@ impl fmt::Display for HandleError {
             Self::Unknown(h) => write!(f, "unknown handle {h}"),
             Self::Io(e) => write!(f, "handle store: {e}"),
             Self::Corrupt(why) => write!(f, "corrupt handle: {why}"),
+            Self::WrongIdentity {
+                handle,
+                found,
+                expected,
+            } => {
+                let found = if found.is_empty() {
+                    "none"
+                } else {
+                    found.as_str()
+                };
+                write!(
+                    f,
+                    "handle {handle} belongs to another workspace or index \
+                     (it was made for {found}, this call walks {expected}); \
+                     start a new traversal instead of resuming it"
+                )
+            }
         }
     }
 }
@@ -105,8 +140,17 @@ pub struct Snapshot {
     /// The hash of the checkpoint the paused call returned, which a steer
     /// answers.
     pub returned: Option<String>,
-    /// The trace so far, ending with the paused call's `end` event.
-    pub events: Vec<Value>,
+    /// `(state reached, state that offered the edge)` pairs already traced
+    /// as `alt_path`, so a resume does not trace them again.
+    pub alts: Vec<(usize, usize)>,
+    /// States found at or beyond the depth limit, which are not queued.
+    pub deferred: Vec<usize>,
+    /// Per cut pop `(state, tokens, external calls)` its calls were already
+    /// charged, so the retry owes only the difference.
+    pub paid: Vec<(usize, u64, u32)>,
+    /// What the traversal is bound to: the workspace and the index it walks,
+    /// as the caller fingerprinted them (empty when the caller gave none).
+    pub identity: String,
 }
 
 impl Snapshot {
@@ -162,8 +206,33 @@ impl Snapshot {
             "last_stop_at": self.last_stop_at,
             "tally": tally_json(&self.tally),
             "returned": self.returned,
-            "events": self.events,
+            "alts": self.alts.iter().map(|&(a, b)| json!([a, b])).collect::<Vec<_>>(),
+            "deferred": self.deferred,
+            "paid": self.paid.iter()
+                .map(|&(state, tokens, calls)| json!([state, tokens, calls]))
+                .collect::<Vec<_>>(),
+            "identity": self.identity,
         })
+    }
+
+    /// What the traversal is bound to (see [`Snapshot::check_identity`]).
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Refuses a snapshot made for another workspace or index than
+    /// `expected`; a snapshot that names none is another identity than any
+    /// that is given. An `expected` of none matches anything.
+    pub fn check_identity(&self, expected: &str) -> Result<(), HandleError> {
+        if expected.is_empty() || self.identity == expected {
+            Ok(())
+        } else {
+            Err(HandleError::WrongIdentity {
+                handle: self.handle(),
+                found: self.identity.clone(),
+                expected: expected.to_string(),
+            })
+        }
     }
 
     /// Reads and checks a snapshot: every index in range, every id valid.
@@ -211,14 +280,34 @@ impl Snapshot {
             }
         };
         let mut seen_nodes = HashSet::new();
-        for (i, s) in states.iter().enumerate() {
+        for s in &states {
             if !seen_nodes.insert(&s.node) {
                 return Err(format!("node {} has two states", s.node));
             }
-            if let Some(p) = s.parent
-                && p >= i
-            {
-                return Err(format!("state {i} has parent {p}"));
+            if let Some(p) = s.parent {
+                in_range(p, "parent")?;
+            }
+        }
+        // A relax can give a state a parent found after it, so the parents
+        // are checked for a cycle rather than for order: every chain must
+        // reach a root. 0 = not seen, 1 = on the chain being walked, 2 = ok.
+        let mut mark = vec![0u8; n];
+        for start in 0..n {
+            let mut chain = Vec::new();
+            let mut at = Some(start);
+            while let Some(i) = at {
+                match mark[i] {
+                    2 => break,
+                    1 => return Err(format!("state {i} is its own ancestor (parent cycle)")),
+                    _ => {
+                        mark[i] = 1;
+                        chain.push(i);
+                        at = states[i].parent;
+                    }
+                }
+            }
+            for i in chain {
+                mark[i] = 2;
             }
         }
         let frontier = array(obj, "frontier")?
@@ -237,12 +326,62 @@ impl Snapshot {
         if frontier.iter().any(|&(_, _, seq)| seq >= next_seq) {
             return Err("frontier discovery number past next_seq".into());
         }
+        let mut queued = HashSet::new();
+        if let Some(&(state, _, _)) = frontier.iter().find(|(s, _, _)| !queued.insert(*s)) {
+            return Err(format!("state {state} is queued twice"));
+        }
         let indexes = |key: &str| {
             array(obj, key)?
                 .iter()
                 .map(|v| in_range(usize_of(v)?, key))
                 .collect::<Result<Vec<usize>, String>>()
         };
+        let expanded = indexes("expanded")?;
+        if let Some(state) = expanded.iter().find(|s| queued.contains(*s)) {
+            return Err(format!("state {state} is both queued and expanded"));
+        }
+        let deferred = indexes("deferred")?;
+        let mut held = HashSet::new();
+        for state in &deferred {
+            if !held.insert(*state) {
+                return Err(format!("state {state} is deferred twice"));
+            }
+            if queued.contains(state) || expanded.contains(state) {
+                return Err(format!(
+                    "state {state} is deferred and also queued or expanded"
+                ));
+            }
+        }
+        let paid = array(obj, "paid")?
+            .iter()
+            .map(|row| match row.as_array().map(Vec::as_slice) {
+                Some([state, tokens, calls]) => Ok((
+                    in_range(usize_of(state)?, "paid")?,
+                    u64_of(tokens)?,
+                    u32_of(calls)?,
+                )),
+                _ => Err("paid row is not [state, tokens, calls]".to_string()),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut owing = HashSet::new();
+        for &(state, _, _) in &paid {
+            if !owing.insert(state) {
+                return Err(format!("state {state} has two paid rows"));
+            }
+            if expanded.contains(&state) {
+                return Err(format!("state {state} is expanded but owes a retry"));
+            }
+        }
+        let alts = array(obj, "alts")?
+            .iter()
+            .map(|row| match row.as_array().map(Vec::as_slice) {
+                Some([a, b]) => Ok((
+                    in_range(usize_of(a)?, "alts")?,
+                    in_range(usize_of(b)?, "alts")?,
+                )),
+                _ => Err("alts row is not a pair".to_string()),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let pairs = |key: &str| -> Result<Vec<(Value, Value)>, String> {
             array(obj, key)?
                 .iter()
@@ -275,7 +414,7 @@ impl Snapshot {
                 .iter()
                 .map(|(a, b)| Ok((node_id(a)?, u32_of(b)?)))
                 .collect::<Result<_, String>>()?,
-            expanded: indexes("expanded")?,
+            expanded,
             popped: indexes("popped")?,
             cleared: array(obj, "cleared")?
                 .iter()
@@ -306,7 +445,10 @@ impl Snapshot {
                 Value::Null => None,
                 v => Some(string_of(v)?),
             },
-            events: array(obj, "events")?.clone(),
+            alts,
+            deferred,
+            paid,
+            identity: string_of(get(obj, "identity")?)?,
         })
     }
 }
@@ -512,7 +654,18 @@ impl Run<'_> {
             last_stop_at: self.last_stop_at,
             tally: self.tally.clone(),
             returned: self.returned.clone(),
-            events: self.events.clone(),
+            alts: {
+                let mut alts: Vec<(usize, usize)> = self.alts.iter().copied().collect();
+                alts.sort_unstable();
+                alts
+            },
+            deferred: self.deferred.iter().copied().collect(),
+            paid: self
+                .paid
+                .iter()
+                .map(|(&state, &(tokens, calls))| (state, tokens, calls))
+                .collect(),
+            identity: self.t.identity.clone(),
         }
     }
 
@@ -535,9 +688,15 @@ impl Run<'_> {
             last_stop_at,
             tally,
             returned,
-            events,
+            alts,
+            deferred,
+            paid,
+            identity,
             ..
         } = snapshot;
+        if self.t.identity.is_empty() {
+            self.t.identity = identity;
+        }
         self.state_of = states
             .iter()
             .enumerate()
@@ -558,12 +717,38 @@ impl Run<'_> {
         self.last_stop_at = last_stop_at;
         self.tally = tally;
         self.returned = returned;
-        self.events = events;
+        self.alts = alts.into_iter().collect();
+        self.paid = paid
+            .into_iter()
+            .map(|(state, tokens, calls)| (state, (tokens, calls)))
+            .collect();
+        // A cut pop that adopted something left children behind.
+        self.partial = self
+            .states
+            .iter()
+            .filter_map(|s| s.parent)
+            .filter(|p| !self.expanded.contains(p))
+            .collect();
+        // What the first call held back at its depth limit is queued when
+        // this call's limit lets it be expanded.
+        let max_depth = self.t.budget.max_depth;
+        let mut unblocked = 0;
+        for state in deferred {
+            let s = &self.states[state];
+            if s.depth < max_depth && !self.cleared.contains(&s.node) {
+                self.frontier.push(state, s.potential);
+                unblocked += 1;
+            } else {
+                self.deferred.insert(state);
+            }
+        }
         debug_assert_eq!(question, self.t.question);
+        self.events.clear();
         self.events.push(json!({
             "ev": "resume",
             "handle": handle,
             "pops": self.totals.pops,
+            "unblocked": unblocked,
             "budget": {
                 "pops": self.t.budget.pops,
                 "max_depth": self.t.budget.max_depth,

@@ -311,12 +311,12 @@ async fn the_token_budget_is_never_exceeded() {
         assert_eq!(result.status, TraversalStatus::BudgetExhausted, "{limit}");
     }
     // 44 tokens: the call (20) and two of the four edges (24) fit. The pop is
-    // cut, so it charges its two adopted hops and the retry that completes it
-    // will charge the call.
+    // cut; the call ran, so it is charged now and the retry owes nothing for
+    // it (see `f1_a_retried_pop_does_not_pay_its_calls_again`).
     let mut limits = budget(1000);
     limits.est_tokens = 44;
     let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
-    assert_eq!((result.totals.tokens, result.totals.hops), (24, 2));
+    assert_eq!((result.totals.tokens, result.totals.hops), (44, 2));
     // 19 tokens: the call alone does not fit, so nothing is adopted.
     let mut limits = budget(1000);
     limits.est_tokens = 19;
@@ -326,12 +326,20 @@ async fn the_token_budget_is_never_exceeded() {
 
 #[tokio::test]
 async fn the_external_call_budget_is_never_exceeded() {
-    let reg = registry(vec![lattice_map("g", 30).cost(0, 1)]);
+    // A map that keeps to its allowance is given none once it is spent, so it
+    // is not asked again; with nothing else to expand the walk ends.
+    let runs = Arc::new(AtomicU32::new(0));
+    let reg = registry(vec![lattice_map("g", 30).cost(0, 1).counted(&runs)]);
     let mut limits = budget(1000);
     limits.external_calls = 3;
     let result = walk(&reg, vec![seed("n0")], limits, |t| t).await;
     assert_eq!(result.totals.external_calls, 3);
-    assert_eq!(result.status, TraversalStatus::BudgetExhausted);
+    assert_eq!(runs.load(Ordering::Relaxed), 3);
+    assert_eq!(result.status, TraversalStatus::Complete);
+    assert!(
+        result.events.iter().any(|e| e["external_spent"] == true),
+        "the trace says the maps were given no call"
+    );
 }
 
 #[tokio::test]
@@ -1162,8 +1170,11 @@ mod persist {
     }
 
     fn stop_hashes(result: &TraversalResult) -> Vec<String> {
-        result
-            .events
+        stop_hashes_of(&result.events)
+    }
+
+    fn stop_hashes_of(events: &[Value]) -> Vec<String> {
+        events
             .iter()
             .filter(|e| e["ev"] == "stop")
             .map(|e| e["checkpoint_hash"].as_str().unwrap().to_string())
@@ -1285,7 +1296,10 @@ mod persist {
             .find(|e| e["ev"] == "resume")
             .expect("the resume is in the trace");
         assert_eq!(resumed["pops"], 6);
-        assert_eq!(second.events[..first.events.len()], first.events[..]);
+        // A handle holds no event log: the second call's trace starts at its
+        // `resume`, and the walk's whole trace is the two calls' in order.
+        assert_eq!(second.events[0]["ev"], "resume");
+        let both: Vec<Value> = first.events.iter().chain(&second.events).cloned().collect();
         assert_eq!(second.totals.pops, 12);
 
         assert_eq!(second.status, straight.status);
@@ -1312,15 +1326,12 @@ mod persist {
             )
         );
         assert_eq!(a.per_map, b.per_map);
-        assert_eq!(
-            without_marks(&second.events),
-            without_marks(&straight.events)
-        );
+        assert_eq!(without_marks(&both), without_marks(&straight.events));
         // The stop at pop 6 fired once, in the first call. The first call's
         // stops saw a budget of 6 pops, so their checkpoints (and hashes)
         // differ from the straight run's; the stops of the second call saw
         // the same budget and the same state.
-        let (hs, hr) = (stop_hashes(&second), stop_hashes(&straight));
+        let (hs, hr) = (stop_hashes_of(&both), stop_hashes(&straight));
         assert_eq!((hs.len(), hr.len()), (4, 4));
         assert_ne!(hs[..2], hr[..2]);
         assert_eq!(hs[2..], hr[2..]);
@@ -1414,9 +1425,9 @@ mod persist {
             HandleStore::in_dir(&dir).get(&handle),
             Err(HandleError::Corrupt(_))
         ));
-        // A state naming a parent that does not precede it is refused.
+        // A state naming a parent outside the states is refused.
         let mut value: Value = serde_json::from_str(&text).unwrap();
-        value["states"][1]["parent"] = 7.into();
+        value["states"][1]["parent"] = 9999.into();
         std::fs::write(&file, value.to_string()).unwrap();
         assert!(matches!(
             HandleStore::in_dir(&dir).get(&handle),
@@ -2140,7 +2151,10 @@ mod steering {
                 .steer(steer)
         })
         .await;
-        assert_eq!(second.events[..first.events.len()], first.events[..]);
+        assert_eq!(
+            second.events[0]["ev"], "resume",
+            "a handle holds no event log"
+        );
         assert_eq!(second.status, TraversalStatus::Complete);
 
         let order = popped_names(&second);
@@ -2646,3 +2660,6 @@ mod contains;
 mod corroboration;
 
 mod accounting;
+
+mod bound;
+mod continuation;

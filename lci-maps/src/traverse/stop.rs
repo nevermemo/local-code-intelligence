@@ -17,6 +17,24 @@
 //! the call and returns the checkpoint to the agent (rung 3) whatever the
 //! policy says.
 //!
+//! The score bound is not a trigger either and consults no handler: when a
+//! result limit `k` is given ([`super::Traversal::top_k`]), the walk ends with
+//! the stop reason `bound` (status `complete`, no handle) once at least `k`
+//! results exist and no state still in the frontier can lift a result above
+//! the `k`-th one. The bound is
+//!
+//! `best frontier potential * (1 + boost * (n_maps - 1)) <= ranked potential of the k-th result`
+//!
+//! where `n_maps` is the number of registered maps that expand nodes (the
+//! caller passes it with `k`: [`super::Traversal::top_k`]; seed-only maps are
+//! not counted), the most a state can be corroborated by. A hop value is at most 1, so no state found from the
+//! frontier has a potential above the frontier's best; ranks only rise by
+//! corroboration, at most by the factor above. What it does not cover: a
+//! result already found can still gain maps from later arrivals. The stop
+//! ends the discovery of new results (and of better routes to queued nodes),
+//! not the corroboration of old ones; this is the price of stopping early.
+//! The `bound` event of the trace gives the numbers.
+//!
 //! The rest of the module is the payload of a stop: [`Card`]s (one line of
 //! about 40 tokens per node), [`MapStat`]s, [`Regions`], [`Disagreement`]s and
 //! the [`LikelyComplete`] estimate, and the [`Tally`] of facts the engine
@@ -67,6 +85,10 @@ pub enum StopReason {
     Budget,
     /// The agent's steer ended the walk.
     Steer,
+    /// The score bound held: nothing left in the frontier can reach the
+    /// ranks of the results already found (see the module docs). This ends
+    /// the call as `complete`, with no handle.
+    Bound,
 }
 
 impl StopReason {
@@ -79,6 +101,7 @@ impl StopReason {
             Self::LikelyComplete => "likely_complete",
             Self::Budget => "budget",
             Self::Steer => "steer",
+            Self::Bound => "bound",
         }
     }
 }

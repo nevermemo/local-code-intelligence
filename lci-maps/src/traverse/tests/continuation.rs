@@ -1,0 +1,425 @@
+//! Continuation and depth semantics (slice F2): relaxing, depth blocking,
+//! duplicate frontier entries, what a handle holds, and what a cut pop has
+//! already paid.
+
+use super::*;
+use crate::traverse::{handle::Snapshot, steer::Steer};
+use serde_json::json;
+
+async fn resume(
+    reg: &Registry<'static>,
+    snapshot: Snapshot,
+    budget: TraversalBudget,
+    configure: impl for<'t> FnOnce(Traversal<'t>) -> Traversal<'t>,
+) -> TraversalResult {
+    let view = view();
+    configure(Traversal::resumed(
+        OnTheFly::new(reg, &view),
+        snapshot,
+        budget,
+    ))
+    .run()
+    .await
+}
+
+fn state_of<'r>(result: &'r TraversalResult, name: &str) -> (usize, &'r State) {
+    result
+        .states
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.node == node(name))
+        .unwrap_or_else(|| panic!("no state for {name}"))
+}
+
+fn events_of<'r>(result: &'r TraversalResult, ev: &str) -> Vec<&'r Value> {
+    result.events.iter().filter(|e| e["ev"] == ev).collect()
+}
+
+/// `parent` offers the nine names `dsts` (the last is at rank 8 above the
+/// gate, hop value 1/9; the first is at rank 0, value 1).
+fn nine(map: &mut GraphMap, parent: &str, dsts: [&str; 9]) {
+    map.edges
+        .extend(dsts.iter().map(|d| (parent.to_string(), d.to_string())));
+}
+
+// ---- R7a: a relaxed state may have a parent that comes later ------------------
+
+/// `s1` offers nine files with `zx` last (hop value 1/9); `s2` offers `y`,
+/// which offers `zx` at value 1 and so relaxes it: its parent `y` is a state
+/// created after it.
+fn relax_graph() -> GraphMap {
+    let mut map = GraphMap::new("g", &[("s2", "y"), ("y", "zx")]);
+    nine(
+        &mut map,
+        "s1",
+        ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "zx"],
+    );
+    map
+}
+
+#[tokio::test]
+async fn r7a_a_relaxed_state_with_a_later_parent_still_makes_a_readable_handle() {
+    let reg = registry(vec![relax_graph()]);
+    let result = walk(&reg, vec![seed("s1"), seed("s2")], budget(4), |t| t).await;
+    let (index, zx) = state_of(&result, "zx");
+    assert!(
+        zx.parent.unwrap() > index,
+        "the relax gave it a later parent"
+    );
+    assert_eq!(events_of(&result, "relax").len(), 1);
+    let snapshot = result.snapshot.expect("work is left");
+    let back = Snapshot::from_json(&snapshot.to_json()).expect("the handle reads back");
+    assert_eq!(back, snapshot);
+}
+
+#[tokio::test]
+async fn r7a_a_handle_with_a_parent_cycle_or_a_parent_out_of_range_is_refused() {
+    let (_, snapshot) = cut_snapshot().await;
+    let base = snapshot.to_json();
+    // States 1 and 2 are the children of state 0.
+    let with = |one: Value, two: Value| {
+        let mut value = base.clone();
+        value["states"][1]["parent"] = one;
+        value["states"][2]["parent"] = two;
+        Snapshot::from_json(&value)
+    };
+    let err = with(json!(2), json!(1)).unwrap_err();
+    assert!(err.contains("cycle"), "{err}");
+    let err = with(json!(1), json!(0)).unwrap_err();
+    assert!(
+        err.contains("cycle"),
+        "a state is not its own parent: {err}"
+    );
+    let err = with(json!(99), json!(0)).unwrap_err();
+    assert!(err.contains("range"), "{err}");
+    // A parent that comes later is fine when it leads to a root.
+    assert!(with(json!(2), json!(0)).is_ok());
+}
+
+// ---- R7b: a relaxed node's children follow it ---------------------------------
+
+/// `s` offers nine files: `ay` first (rank 0, value 1), `x` fifth (rank 4,
+/// value 1/5). `ay` offers `x`; `x` offers `k1..k4`.
+fn follow_graph() -> GraphMap {
+    let mut map = GraphMap::new(
+        "g",
+        &[
+            ("ay", "x"),
+            ("x", "k1"),
+            ("x", "k2"),
+            ("x", "k3"),
+            ("x", "k4"),
+        ],
+    );
+    nine(
+        &mut map,
+        "s",
+        ["ay", "b0", "b1", "b2", "x", "z0", "z1", "z2", "z3"],
+    );
+    map
+}
+
+#[tokio::test]
+async fn r7b_the_children_of_a_cut_node_follow_it_when_it_is_relaxed() {
+    let reg = registry(vec![follow_graph()]);
+    // Call 1: `x` is boosted so it pops second, before `ay`, and the tokens
+    // afford two of its four children: the pop is cut and put back.
+    let mut tight = budget(100);
+    tight.est_tokens = 9 * TOKENS_PER_EDGE + 2 * TOKENS_PER_EDGE;
+    let x = node("x");
+    let first = walk(&reg, vec![seed("s")], tight, |t| {
+        t.handler(
+            scripted(move |cp| {
+                if cp.stop == 1 {
+                    vec![act(Some(&x), Action::Boost(8.0))]
+                } else {
+                    Vec::new()
+                }
+            }),
+            every(1),
+        )
+    })
+    .await;
+    assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+    let (_, k1) = state_of(&first, "k1");
+    assert!((k1.potential - 0.2).abs() < 1e-12, "{}", k1.potential);
+    let snapshot = first.snapshot.unwrap();
+
+    // Call 2: the agent expands `ay` and then `k1` before `x` is retried. `ay`
+    // reaches `x` at value 1 and relaxes it; `k1` is popped under it.
+    let steer = Steer::new(vec![
+        act(Some(&node("ay")), Action::Expand),
+        act(Some(&node("k1")), Action::Expand),
+    ]);
+    let second = resume(&reg, snapshot, budget(100), |t| t.steer(steer)).await;
+    assert_eq!(second.status, TraversalStatus::Complete);
+    let (_, x_state) = state_of(&second, "x");
+    assert!((x_state.potential - 1.0).abs() < 1e-12);
+    assert_eq!(x_state.depth, 2);
+    for name in ["k1", "k2", "k3", "k4"] {
+        let (_, k) = state_of(&second, name);
+        assert!(
+            (k.potential - 1.0).abs() < 1e-9,
+            "{name} keeps the potential of the route through x: {}",
+            k.potential
+        );
+        assert_eq!(k.depth, 3, "{name}");
+    }
+    let relax = events_of(&second, "relax");
+    assert_eq!(relax.len(), 1, "{relax:?}");
+    assert_eq!(relax[0]["dst"], node("x").to_string());
+    assert_eq!(relax[0]["rescaled"], 2, "k1 and k2 had been adopted");
+}
+
+// ---- R7c: alt_path events survive a resume ---------------------------------------
+
+#[tokio::test]
+async fn r7c_a_resume_does_not_repeat_an_alt_path() {
+    // `q` offers the popped `p` (an alt_path) and three fresh nodes; the
+    // tokens afford one, so the pop is cut after the alt_path was traced.
+    let reg = registry(vec![GraphMap::new(
+        "g",
+        &[
+            ("s", "p"),
+            ("s", "q"),
+            ("q", "k1"),
+            ("q", "k2"),
+            ("q", "k3"),
+            ("q", "p"),
+        ],
+    )]);
+    let mut tight = budget(100);
+    tight.est_tokens = 3 * TOKENS_PER_EDGE;
+    let first = walk(&reg, vec![seed("s")], tight, |t| t).await;
+    assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+    let snapshot = first.snapshot.clone().unwrap();
+    let second = resume(&reg, snapshot, budget(100), |t| t).await;
+    assert_eq!(second.status, TraversalStatus::Complete);
+    let to = |result: &TraversalResult, dst: &str| {
+        events_of(result, "alt_path")
+            .into_iter()
+            .filter(|e| e["dst"] == node(dst).to_string())
+            .count()
+    };
+    assert_eq!(to(&first, "p") + to(&second, "p"), 1, "p, once");
+    // The retry's own route to its first child is not an alternative.
+    assert_eq!(to(&first, "k1") + to(&second, "k1"), 0);
+}
+
+// ---- R8: depth ----------------------------------------------------------------------
+
+/// `a` offers `aa` (rank 0, value 1) and `zb` (rank 8, value 1/9) among nine;
+/// `aa -> n1 -> zq` reaches `zq` at depth 3, which is `max_depth`; `zb -> zq`
+/// is a shallower (depth 2) but weaker route; `zq -> w`.
+fn blocked_graph() -> GraphMap {
+    let mut map = GraphMap::new(
+        "g",
+        &[("aa", "n1"), ("n1", "zq"), ("zb", "zq"), ("zq", "w")],
+    );
+    nine(
+        &mut map,
+        "a",
+        ["aa", "f0", "f1", "f2", "f3", "f4", "f5", "f6", "zb"],
+    );
+    map
+}
+
+#[tokio::test]
+async fn r8_a_shallower_but_weaker_route_queues_a_depth_blocked_node() {
+    let reg = registry(vec![blocked_graph()]);
+    let mut limits = budget(100);
+    limits.max_depth = 3;
+    let result = walk(&reg, vec![seed("a")], limits, |t| t).await;
+    let (_, zq) = state_of(&result, "zq");
+    assert_eq!((zq.depth, zq.via), (2, Some("g")));
+    assert!(zq.potential < 0.2, "the weaker route: {}", zq.potential);
+    assert!(
+        result.reached(&node("w")),
+        "zq was expanded: {:?}",
+        popped_names(&result)
+    );
+    let relax = events_of(&result, "relax");
+    assert_eq!(relax.len(), 1);
+    assert_eq!(relax[0]["unblocked"], true);
+}
+
+#[tokio::test]
+async fn r8_a_resume_enforces_the_depth_of_its_own_call() {
+    let reg = registry(vec![GraphMap::new(
+        "g",
+        &[("a", "b"), ("b", "c"), ("c", "d")],
+    )]);
+    let first = walk(&reg, vec![seed("a")], budget(2), |t| t).await;
+    assert!(first.reached(&node("c")));
+    let snapshot = first.snapshot.unwrap();
+    // `c` is queued at depth 2; this call allows no state at depth 2 to expand.
+    let mut shallow = budget(100);
+    shallow.max_depth = 2;
+    let second = resume(&reg, snapshot, shallow, |t| t).await;
+    assert!(!second.reached(&node("d")));
+    assert_eq!(second.totals.pops, 2, "the blocked entry is not a pop");
+    assert_eq!(second.status, TraversalStatus::Complete);
+}
+
+#[tokio::test]
+async fn r8_a_resume_with_a_deeper_limit_expands_the_states_the_first_call_blocked() {
+    let reg = registry(vec![GraphMap::new(
+        "g",
+        &[("a", "b"), ("a", "x"), ("b", "c"), ("c", "d")],
+    )]);
+    let mut shallow = budget(2);
+    shallow.max_depth = 2;
+    let first = walk(&reg, vec![seed("a")], shallow, |t| t).await;
+    assert!(first.reached(&node("c")) && !first.reached(&node("d")));
+    let snapshot = first.snapshot.unwrap();
+    let mut deeper = budget(100);
+    deeper.max_depth = 4;
+    let second = resume(&reg, snapshot, deeper, |t| t).await;
+    assert!(second.reached(&node("d")), "c was queued by the new limit");
+}
+
+// ---- R9: duplicates and expanded entries in the frontier --------------------------------
+
+async fn cut_snapshot() -> (Registry<'static>, Snapshot) {
+    let reg = registry(vec![GraphMap::new("g", &[("a", "b"), ("a", "c")])]);
+    let first = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
+    let snapshot = first.snapshot.unwrap();
+    (reg, snapshot)
+}
+
+#[tokio::test]
+async fn r9_a_handle_that_queues_a_state_twice_is_refused() {
+    let (_, snapshot) = cut_snapshot().await;
+    let mut value = snapshot.to_json();
+    let first = value["frontier"][0].clone();
+    value["frontier"].as_array_mut().unwrap().push(first);
+    let err = Snapshot::from_json(&value).unwrap_err();
+    assert!(err.contains("twice"), "{err}");
+}
+
+#[tokio::test]
+async fn r9_a_handle_that_queues_an_expanded_state_is_refused() {
+    let (_, snapshot) = cut_snapshot().await;
+    let mut value = snapshot.to_json();
+    let queued = value["frontier"][0][0].clone();
+    value["expanded"].as_array_mut().unwrap().push(queued);
+    let err = Snapshot::from_json(&value).unwrap_err();
+    assert!(err.contains("expanded"), "{err}");
+}
+
+#[tokio::test]
+async fn r9_a_pop_skips_a_queue_entry_that_is_already_expanded() {
+    let (reg, mut snapshot) = cut_snapshot().await;
+    // Built by hand, past the checks of a stored handle: the seed (state 0)
+    // was expanded and is queued again.
+    assert!(snapshot.expanded.contains(&0));
+    let seq = snapshot.next_seq;
+    snapshot.frontier.push((0, 1.0, seq));
+    snapshot.next_seq += 1;
+    let second = resume(&reg, snapshot, budget(100), |t| t).await;
+    let expansions = second.popped.iter().filter(|&&s| s == 0).count();
+    assert_eq!(
+        expansions, 1,
+        "the seed was expanded once: {:?}",
+        second.popped
+    );
+    assert_eq!(second.totals.pops, 3);
+}
+
+#[tokio::test]
+async fn r9_redirect_targets_are_counted_once() {
+    let (reg, snapshot) = cut_snapshot().await;
+    let z = node("z");
+    let steer = Steer::new(vec![act(
+        None,
+        Action::Redirect(vec![z.clone(), z.clone()]),
+    )]);
+    let second = resume(&reg, snapshot, budget(100), |t| t.steer(steer)).await;
+    let (_, state) = state_of(&second, "z");
+    assert_eq!(state.fanout, 1);
+    assert_eq!(
+        second
+            .popped
+            .iter()
+            .filter(|&&s| second.states[s].node == z)
+            .count(),
+        1
+    );
+}
+
+// ---- R10: what a handle holds ---------------------------------------------------------
+
+#[tokio::test]
+async fn r10_a_handle_does_not_hold_the_event_log() {
+    let (reg, snapshot) = cut_snapshot().await;
+    assert!(snapshot.to_json().get("events").is_none());
+    // The resumed call writes its own trace, from its `resume` event.
+    let second = resume(&reg, snapshot.clone(), budget(100), |t| t).await;
+    assert_eq!(second.events[0]["ev"], "resume");
+    assert_eq!(second.events[0]["handle"], snapshot.handle());
+    assert!(events_of(&second, "start").is_empty());
+}
+
+// ---- F1 follow-ups ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn f1_a_spent_external_allowance_skips_external_maps_and_structure_goes_on() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let reg = registry(vec![
+        GraphMap::new("g1", &[("a", "b"), ("b", "c"), ("c", "d")]),
+        GraphMap::new("g2", &[("a", "x"), ("b", "y"), ("c", "z")])
+            .cost(0, 1)
+            .counted(&runs),
+    ]);
+    let mut limits = budget(100);
+    limits.external_calls = 1;
+    let result = walk(&reg, vec![seed("a")], limits, |t| t).await;
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "one call, at the first pop"
+    );
+    assert_eq!(result.totals.external_calls, 1);
+    assert!(result.reached(&node("x")));
+    assert!(result.reached(&node("d")), "the structural map went on");
+    assert!(!result.reached(&node("y")) && !result.reached(&node("z")));
+    assert_eq!(result.status, TraversalStatus::Complete);
+}
+
+#[tokio::test]
+async fn f1_a_retried_pop_does_not_pay_its_calls_again() {
+    // Each expansion costs 10 tokens and one external call. The first call
+    // cuts the seed's pop after one hop; the retry runs the call again but
+    // owes nothing for it.
+    let reg = registry(vec![
+        GraphMap::new(
+            "g",
+            &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e"), ("a", "h")],
+        )
+        .cost(10, 1),
+    ]);
+    let tight = TraversalBudget {
+        est_tokens: 30,
+        ..budget(10)
+    };
+    let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
+    assert_eq!(first.status, TraversalStatus::BudgetExhausted);
+    assert_eq!(first.totals.external_calls, 1);
+    let snapshot = first.snapshot.unwrap();
+    // The handle says what the cut pop already paid: the seed (state 0), 10
+    // tokens, 1 call; and it reads back.
+    assert_eq!(snapshot.paid, [(0, 10, 1)]);
+    let back = Snapshot::from_json(&snapshot.to_json()).unwrap();
+    assert_eq!(back.paid, snapshot.paid);
+    let second = resume(&reg, snapshot, budget(10), |t| t).await;
+    let retry = events_of(&second, "expand")[0];
+    assert_eq!(retry["paid_before"], json!([10, 1]));
+    let straight = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
+    assert_eq!(straight.totals.external_calls, 6);
+    assert_eq!(
+        second.totals.external_calls, 6,
+        "a, b, c, d, e, h: one call each"
+    );
+    assert_eq!(second.totals.tokens, straight.totals.tokens);
+    assert!(second.snapshot.is_none());
+}

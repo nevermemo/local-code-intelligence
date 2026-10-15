@@ -128,6 +128,11 @@ impl Frontier {
         self.live.is_empty()
     }
 
+    /// The queued states, in no particular order.
+    pub fn states(&self) -> impl Iterator<Item = usize> + '_ {
+        self.live.keys().copied()
+    }
+
     /// The queue as `(state, priority, discovery number)` in discovery
     /// order, and the next discovery number: all a handle needs to rebuild it.
     pub fn parts(&self) -> (Vec<(usize, f64, u64)>, u64) {

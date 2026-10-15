@@ -986,6 +986,32 @@ fn check_handle(handle: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a handle is bound to: the workspace (the canonical tree root, if the
+/// call has one) and the index (its canonical path, size and modification
+/// time), each as a short hash so a handle names no path. A handle made for
+/// other nodes than the index holds now would resume on the wrong graph.
+fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let workspace = call.scip_root.map_or_else(
+        || "no tree".to_owned(),
+        |root| canonical(root).to_string_lossy().into_owned(),
+    );
+    let (modified, len) = loaded.stamp;
+    let nanos = modified
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    let index = format!(
+        "{}|{len}|{nanos}",
+        canonical(call.scip_index).to_string_lossy()
+    );
+    format!(
+        "w{}.i{}",
+        trace::hash16(workspace.as_bytes()),
+        trace::hash16(index.as_bytes())
+    )
+}
+
 /// Runs one traversal call. Errors are the caller's mistakes (a bad rule, an
 /// unknown handle, a missing index) or the data directory not being writable
 /// for a handle; a failed trace write is a note, not an error.
@@ -1041,6 +1067,13 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     };
 
     let loaded = load(call.scip_index, call.scip_root).await?;
+    // A handle resumes on the workspace and index it was made for.
+    let identity = identity_of(call, &loaded);
+    if let Some(snapshot) = &snapshot {
+        snapshot
+            .check_identity(&identity)
+            .map_err(|e| anyhow!("{e}"))?;
+    }
     let wants = |id: MapId| wanted.contains(&id);
 
     // The start nodes (not on a continuation, which resumes the old ones).
@@ -1231,6 +1264,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
+    // The maps that expand nodes: the most a state can be corroborated by,
+    // which the score bound needs (the seed maps only start the walk).
+    let expanding = plan_maps
+        .iter()
+        .filter(|map| map.enabled && map.id != SEEDS_HYBRID && map.id != SEEDS_MAP)
+        .count();
     let traversal = match snapshot {
         Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
         None => {
@@ -1251,6 +1290,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                 .plan(plan)
         }
     };
+    let traversal = traversal.identity(identity).top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),
         None => traversal,
@@ -1620,6 +1660,9 @@ fn response_json(
                 object.insert("seed_fallback".into(), json!(reason));
             }
         }
+        if let Some(reason) = result.stop_reason {
+            object.insert("stop_reason".into(), json!(reason.as_str()));
+        }
         if let Some(checkpoint) = &result.checkpoint {
             object.insert("handle".into(), json!(handle));
             object.insert("checkpoint".into(), checkpoint_response(checkpoint));
@@ -1981,6 +2024,44 @@ mod tests {
             (None, 0),
             ScipMap::with_default_ids(ScipGraph::build(&docs, None)),
         )
+    }
+
+    #[test]
+    fn a_handle_is_bound_to_the_workspace_and_the_index() {
+        let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+        let call = |index: &'static str, root: Option<&'static str>| Call {
+            scip_index: Path::new(index),
+            scip_root: root.map(Path::new),
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+        };
+        let stamped = |len: u64| {
+            let mut loaded = loaded();
+            loaded.stamp = (Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5)), len);
+            loaded
+        };
+        let base = identity_of(&call("graph.scip", Some("work/a")), &stamped(10));
+        assert_eq!(
+            base,
+            identity_of(&call("graph.scip", Some("work/a")), &stamped(10)),
+            "the same workspace and index give the same identity"
+        );
+        for other in [
+            identity_of(&call("graph.scip", Some("work/b")), &stamped(10)),
+            identity_of(&call("graph.scip", None), &stamped(10)),
+            identity_of(&call("other.scip", Some("work/a")), &stamped(10)),
+            identity_of(&call("graph.scip", Some("work/a")), &stamped(11)),
+        ] {
+            assert_ne!(base, other);
+        }
+        // A short hash of each, not the paths.
+        assert!(!base.contains("work") && !base.contains("scip"), "{base}");
     }
 
     fn hit(path: &str, lines: (u32, u32), rank: usize) -> SeedHit {

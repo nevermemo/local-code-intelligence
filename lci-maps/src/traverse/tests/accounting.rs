@@ -158,7 +158,8 @@ mod r2 {
 #[tokio::test]
 async fn r3_maps_share_the_allowance_in_map_order() {
     // Two maps each need a call and one is left: the first runs, the second
-    // is given none. Both used to start with the same allowance.
+    // is given none. Both used to start with the same allowance. The walk
+    // goes on without them (no more calls are possible), so it ends complete.
     let runs = Arc::new(AtomicU32::new(0));
     let reg = registry(vec![
         GraphMap::new("g1", &[("a", "b")]).cost(0, 1).counted(&runs),
@@ -171,7 +172,7 @@ async fn r3_maps_share_the_allowance_in_map_order() {
     assert_eq!(result.totals.external_calls, 1);
     assert!(result.reached(&node("b")), "the first map's edge is kept");
     assert!(!result.reached(&node("c")));
-    assert_eq!(result.status, TraversalStatus::BudgetExhausted);
+    assert_eq!(result.status, TraversalStatus::Complete);
 }
 
 #[tokio::test]

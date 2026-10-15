@@ -10,15 +10,24 @@
 //!
 //! Later arrivals at a node that has a state are not dropped:
 //!
-//! - A node that is queued (not yet popped) and reached by a route with a
-//!   higher potential is relaxed: its potential, parent, `via`, witness,
-//!   depth and fan-out become those of the stronger route, its queue priority
-//!   is scaled by the same ratio (a handler's boost stays), and a `relax`
-//!   event is traced. A queued node is only relaxed to a depth below
-//!   `max_depth`; a node that was never queued for its depth is queued when
-//!   a route brings it below `max_depth`.
+//! - A node that is not expanded and is reached by a route with a higher
+//!   potential is relaxed: its potential, parent, `via`, witness, depth and
+//!   fan-out become those of the stronger route, its queue priority is scaled
+//!   by the same ratio (a handler's boost stays), and a `relax` event is
+//!   traced. A parent may be a later state than the node. A queued node is
+//!   only relaxed to a depth below `max_depth`. A node at `max_depth` (it is
+//!   recorded but held back, "deferred") is queued by any route that brings it
+//!   below `max_depth`, even a weaker one: that is the only way it can be
+//!   expanded (the relax event says `unblocked`). The children of a node that
+//!   was cut mid-expansion follow it: when it is relaxed their potentials and
+//!   depths are re-derived from the new route (`rescaled` counts them), so they
+//!   do not keep the old route's value. A route relaxes a node only if it beats
+//!   the node's potential by a relative 1e-9.
 //! - A node already popped keeps its state; the route is traced as an
-//!   `alt_path` event. An ancestor of the expanding node (a cycle) is neither.
+//!   `alt_path` event, once per (node, offering state), also across a resume (a
+//!   handle keeps the pairs). The node's own parent re-offering it (a retried
+//!   expansion) is not one. An ancestor of the expanding node (a cycle) is
+//!   neither.
 //! - Corroboration: a [`State`] keeps the set of maps (and witness classes)
 //!   whose edges reached it. An arrival from a map not in the set adds it. The
 //!   maps that found the seeds ([`Seed::map`]) are start points, not evidence,
@@ -30,7 +39,10 @@
 //! before every pop and inside every map call, `est_tokens` and
 //! `external_calls` around every expansion. The maps share the external calls
 //! left, in map order ([`source`]), so a map is not given calls another one
-//! used; when none are left the walk ends `BudgetExhausted`.
+//! used. Once the allowance is spent the maps are given none: a map that needs
+//! a call returns nothing, one that needs none (a structural map) goes on, and
+//! the walk ends (`Complete` if the frontier ran dry) only when nothing is
+//! left to expand; the `expand` events then say `external_spent`.
 //!
 //! An expansion prices and selects first: [`frontier::hop`] ranks every
 //! candidate (fresh nodes and arrivals alike) and keeps the beam. Only then is
@@ -44,11 +56,12 @@
 //!
 //! A pop that was cut by a budget (nothing adopted, only some hops adopted,
 //! or a map that timed out) is put back in the queue at its old place, so a
-//! resume expands the node again and finds the rest. A cut pop charges the
-//! hops it adopted but not its calls' tokens, and the retry that completes it
-//! charges them, so a pop pays for its calls' tokens once; a retry runs the
-//! maps again, so their external calls are counted again. A pop that adopted
-//! nothing is also taken off the pop count.
+//! resume expands the node again and finds the rest. The calls ran, so a cut
+//! pop charges them (tokens and external calls) and the hops it adopted, and
+//! records what the calls cost as paid (a handle keeps it): the retry runs the
+//! maps again, is given back the calls it paid for, and owes only what its
+//! calls cost beyond that, so a pop pays for its calls once. A pop that
+//! adopted nothing is also taken off the pop count.
 //!
 //! Arrivals outside the beam still corroborate: the maps and witness classes
 //! of an edge into a node that has a state join its sets even when the beam
@@ -58,8 +71,11 @@
 //!
 //! Budgets across calls: `pops`, `est_tokens` and `external_calls` are
 //! absolute caps for the whole traversal (the totals persist in a handle);
-//! `deadline` and `max_depth` belong to one call. Only the outer agent can
-//! add to the caps, through a [`steer::Steer`], within fixed limits
+//! `deadline` and `max_depth` belong to one call. A state at depth
+//! `max_depth` is recorded but not expanded (the deepest state expanded is at
+//! `max_depth - 1`), and a resume enforces its own call's limit on what an
+//! earlier call queued. Only the outer agent can add to the caps, through a
+//! [`steer::Steer`], within fixed limits
 //! ([`handler::RAISE_MAX_POPS`], [`handler::RAISE_MAX_TOKENS`]); the addition
 //! stays with the traversal. See [`steer`].
 //!
@@ -70,6 +86,11 @@
 //! cleared (pruned) nodes are never revisited. When no rung is confident, or
 //! a budget ends the call, the call ends with a [`TraversalResult::checkpoint`]
 //! and a handle, and the next call carries the agent's steer.
+//!
+//! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
+//! reason `bound`, once `k` results exist and nothing queued can lift a result
+//! above the `k`-th; see [`stop`]. The `bound` event and the `end` event carry
+//! it, and the result's [`TraversalResult::stop_reason`] is `Some(Bound)`.
 //!
 //! The run is recorded as JSON events ([`TraversalResult::events`]), written as
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
@@ -115,6 +136,9 @@ pub const CHECKPOINT_FRONTIER: usize = 256;
 /// The default share added to a node's rank for each map beyond the first
 /// that reached it (see [`State::ranked_potential`]).
 pub const DEFAULT_CORROBORATION_BOOST: f64 = 0.1;
+/// A route relaxes a node only when it is worth more than the node's own by
+/// this relative margin, so float noise in a rescaled subtree is not a route.
+const RELAX_TOLERANCE: f64 = 1e-9;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TraversalBudget {
@@ -231,6 +255,9 @@ pub struct TraversalResult {
     pub checkpoint: Option<Checkpoint>,
     /// The corroboration boost the run ranked with.
     pub corroboration_boost: f64,
+    /// `Some(Bound)` when the score bound ended the walk (status `Complete`,
+    /// no snapshot). Other ends report through `status` and the checkpoint.
+    pub stop_reason: Option<StopReason>,
 }
 
 impl TraversalResult {
@@ -267,6 +294,9 @@ pub struct Traversal<'s> {
     steer: Option<Steer>,
     plan: Option<trace::StartPlan>,
     boost: f64,
+    /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
+    bound: Option<(usize, usize)>,
+    identity: String,
 }
 
 impl<'s> Traversal<'s> {
@@ -286,7 +316,31 @@ impl<'s> Traversal<'s> {
             steer: None,
             plan: None,
             boost: DEFAULT_CORROBORATION_BOOST,
+            bound: None,
+            identity: String::new(),
         }
+    }
+
+    /// Ends the walk with the stop reason `bound` once `k` results exist and
+    /// nothing in the frontier can lift a result above the `k`-th (see
+    /// [`stop`]). `n_maps` is how many registered maps expand nodes (seed-only
+    /// maps do not count): the most a state can be corroborated by. Not kept
+    /// in a handle; a resumed traversal passes it again. Without targets only:
+    /// a walk with targets ends when they are reached. `k` of 0 switches the
+    /// bound off.
+    pub fn top_k(mut self, k: usize, n_maps: usize) -> Self {
+        self.bound = (k > 0).then_some((k, n_maps));
+        self
+    }
+
+    /// What the handle of this traversal is bound to (the workspace and the
+    /// index it walks, as the caller fingerprints them). It is written into
+    /// the snapshot; a resume with a different identity is the caller's to
+    /// refuse, see [`handle::Snapshot::check_identity`]. A resumed traversal
+    /// that is given none keeps the snapshot's.
+    pub fn identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = identity.into();
+        self
     }
 
     /// The rank share added per corroborating map (default
@@ -380,8 +434,21 @@ struct Run<'s> {
     /// The hash of the checkpoint the previous call returned.
     returned: Option<String>,
     /// `(state reached, state that offered the edge)` pairs already traced as
-    /// `alt_path`, so a retried expansion does not repeat them.
+    /// `alt_path`, so a retried expansion does not repeat them (a handle keeps
+    /// them, so neither does a resumed one).
     alts: HashSet<(usize, usize)>,
+    /// States found at or beyond `max_depth` (or popped past the limit of a
+    /// later call) that are not queued, and not expanded. A route that brings
+    /// one below the limit queues it; a resume with a deeper limit does too.
+    deferred: BTreeSet<usize>,
+    /// States that were cut mid-expansion: not expanded, but with children.
+    /// Their children follow them when a stronger route relaxes them.
+    partial: HashSet<usize>,
+    /// Per cut pop, what its calls were already charged: `(tokens, external
+    /// calls)`. The retry owes only the difference.
+    paid: BTreeMap<usize, (u64, u32)>,
+    /// Set when the score bound ended the call.
+    stop_reason: Option<StopReason>,
 }
 
 impl<'s> Run<'s> {
@@ -408,6 +475,10 @@ impl<'s> Run<'s> {
             pause: None,
             returned: None,
             alts: HashSet::new(),
+            deferred: BTreeSet::new(),
+            partial: HashSet::new(),
+            paid: BTreeMap::new(),
+            stop_reason: None,
         }
     }
 
@@ -470,6 +541,8 @@ impl<'s> Run<'s> {
         self.state_of.insert(seed.node.clone(), index);
         if self.t.budget.max_depth > 0 {
             self.frontier.push(index, 1.0);
+        } else {
+            self.deferred.insert(index);
         }
     }
 
@@ -523,6 +596,11 @@ impl<'s> Run<'s> {
             if self.frontier.is_empty() {
                 break self.end_status(false);
             }
+            if let Some(bound) = self.bound_holds() {
+                self.events.push(bound);
+                self.stop_reason = Some(StopReason::Bound);
+                break self.end_status(false);
+            }
             let due = self.due();
             if !due.is_empty() && self.stop(&due) {
                 break TraversalStatus::Stopped;
@@ -530,14 +608,27 @@ impl<'s> Run<'s> {
             if self.frontier.is_empty() {
                 continue;
             }
+            // The external-call allowance is not checked here: once it is
+            // spent the maps are given none and the walk goes on with the
+            // ones that need none (see `expand`).
             if self.totals.pops >= self.pops_cap()
                 || Instant::now() >= self.t.budget.deadline
                 || self.tokens_left() == 0
-                || (self.t.budget.external_calls > 0 && self.calls_left() == 0)
             {
                 break self.end_status(true);
             }
             let item = self.frontier.pop().expect("a non-empty frontier pops");
+            // An entry for a state that was expanded already is stale.
+            if self.expanded.contains(&item.state)
+                || self.cleared.contains(&self.states[item.state].node)
+            {
+                continue;
+            }
+            // This call's depth limit holds for what an earlier call queued.
+            if self.states[item.state].depth >= self.t.budget.max_depth {
+                self.deferred.insert(item.state);
+                continue;
+            }
             self.totals.pops += 1;
             self.popped.push(item.state);
             self.expanded.insert(item.state);
@@ -576,7 +667,7 @@ impl<'s> Run<'s> {
             self.returned = Some(hash);
             checkpoint = Some(cp);
         }
-        self.events.push(json!({
+        let mut end = json!({
             "ev": "end",
             "status": status.as_str(),
             "answer_nodes": self.states.len(),
@@ -590,7 +681,11 @@ impl<'s> Run<'s> {
                 "steers": self.totals.steers,
                 "per_map": self.totals.per_map,
             },
-        }));
+        });
+        if let (Some(reason), Some(object)) = (self.stop_reason, end.as_object_mut()) {
+            object.insert("stop_reason".into(), json!(reason.as_str()));
+        }
+        self.events.push(end);
         let snapshot = resumable.then(|| self.snapshot());
         if let (Some(cp), Some(snapshot)) = (checkpoint.as_mut(), &snapshot) {
             cp.handle = Some(snapshot.handle());
@@ -605,7 +700,46 @@ impl<'s> Run<'s> {
             totals: self.totals,
             events: self.events,
             corroboration_boost: self.t.boost,
+            stop_reason: self.stop_reason,
         }
+    }
+
+    /// The `bound` event when the score bound holds (see [`stop`]): a result
+    /// limit is set, no targets are asked for, at least `k` results exist and
+    /// the best state in the frontier, at the most corroboration a state can
+    /// have, cannot rank above the `k`-th result.
+    fn bound_holds(&self) -> Option<Value> {
+        let (k, n_maps) = self.t.bound?;
+        if !self.t.targets.is_empty() {
+            return None;
+        }
+        // The results: every state reached by an edge that is not pruned.
+        let mut ranks: Vec<f64> = self
+            .states
+            .iter()
+            .filter(|s| s.parent.is_some() && !self.cleared.contains(&s.node))
+            .map(|s| s.ranked_potential(self.t.boost))
+            .collect();
+        if ranks.len() < k {
+            return None;
+        }
+        let (_, kth, _) = ranks.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+        let kth = *kth;
+        // Descendants of a state have at most its potential (a hop is worth
+        // at most 1); a priority a handler scaled does not change that.
+        let best = self
+            .frontier
+            .states()
+            .map(|s| self.states[s].potential)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let factor = 1.0 + self.t.boost * n_maps.saturating_sub(1) as f64;
+        (best * factor <= kth).then(|| {
+            json!({
+                "ev": "bound", "pop": self.totals.pops, "k": k, "kth": kth,
+                "frontier_best": best, "max_factor": factor, "maps": n_maps,
+                "frontier": self.frontier.len(),
+            })
+        })
     }
 
     fn end_status(&self, exhausted: bool) -> TraversalStatus {
@@ -647,10 +781,13 @@ impl<'s> Run<'s> {
     async fn expand(&mut self, index: usize) -> Option<bool> {
         let node = self.states[index].node.clone();
         let depth = self.states[index].depth;
+        // What an earlier run of this pop already paid for its calls.
+        let (paid_tokens, paid_calls) = self.paid.get(&index).copied().unwrap_or((0, 0));
         let calls_before = self.calls_left();
         let budget = Budget {
             deadline: self.t.budget.deadline,
-            max_external_calls: calls_before,
+            // The retry of a pop is given again the calls it paid for.
+            max_external_calls: calls_before.saturating_add(paid_calls),
             max_nodes_touched: u64::MAX,
         };
         self.counted.clear();
@@ -661,8 +798,11 @@ impl<'s> Run<'s> {
             .iter()
             .map(|c| c.cost.external_calls)
             .fold(0, u32::saturating_add);
-        // The calls ran: they are charged whatever becomes of the edges.
-        self.totals.external_calls = self.totals.external_calls.saturating_add(call_external);
+        // The calls ran: they are charged whatever becomes of the edges, but
+        // a retry owes only what its earlier run did not pay.
+        let owed_tokens = call_tokens.saturating_sub(paid_tokens);
+        let owed_calls = call_external.saturating_sub(paid_calls);
+        self.totals.external_calls = self.totals.external_calls.saturating_add(owed_calls);
         let call_report: Vec<Value> = calls
             .iter()
             .map(|c| {
@@ -674,7 +814,12 @@ impl<'s> Run<'s> {
                 })
             })
             .collect();
-        if call_tokens > self.tokens_left() || call_external > calls_before {
+        if owed_tokens > self.tokens_left() || owed_calls > calls_before {
+            // The external calls that ran are paid; the tokens were not.
+            if owed_calls > 0 {
+                self.paid
+                    .insert(index, (paid_tokens, call_external.max(paid_calls)));
+            }
             self.events.push(json!({
                 "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
                 "offered": edges.len(), "adopted": 0, "calls": call_report,
@@ -733,7 +878,7 @@ impl<'s> Run<'s> {
         let steps = hop(self.t.scorer.as_mut(), &ctx, &cands, self.t.price);
 
         // Then adopt what the tokens afford, best first.
-        let affordable = ((self.tokens_left() - call_tokens) / TOKENS_PER_EDGE) as usize;
+        let affordable = ((self.tokens_left() - owed_tokens) / TOKENS_PER_EDGE) as usize;
         let at = self.events.len();
         let parent = self.states[index].clone();
         let mut chosen = vec![false; kept.len()];
@@ -782,6 +927,8 @@ impl<'s> Run<'s> {
             }));
             if depth + 1 < self.t.budget.max_depth {
                 self.frontier.push(child, potential);
+            } else {
+                self.deferred.insert(child);
             }
         }
         // An arrival outside the beam is still evidence: the maps that
@@ -802,8 +949,22 @@ impl<'s> Run<'s> {
 
         // Now charge.
         let hop_tokens = adopted as u64 * TOKENS_PER_EDGE;
-        let call_charge = if cut { 0 } else { call_tokens };
+        // The calls ran, so they are paid now, cut or not; a cut pop is marked
+        // so that its retry owes only what this run did not pay.
+        let call_charge = owed_tokens;
         self.totals.tokens += call_charge + hop_tokens;
+        if cut {
+            self.paid.insert(
+                index,
+                (paid_tokens.max(call_tokens), paid_calls.max(call_external)),
+            );
+            if adopted > 0 {
+                self.partial.insert(index);
+            }
+        } else {
+            self.paid.remove(&index);
+            self.partial.remove(&index);
+        }
         if !cut {
             for call in &calls {
                 *self.totals.per_map.entry(call.map).or_default() += 1;
@@ -823,14 +984,21 @@ impl<'s> Run<'s> {
         if adopted > 0 {
             self.tally.last_fresh_pop = self.totals.pops;
         }
-        self.events.insert(
-            at,
-            json!({
-                "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
-                "offered": fanout, "adopted": adopted, "corroborated": corroborated,
-                "calls": call_report, "tokens": call_charge + hop_tokens, "cut": cut,
-            }),
-        );
+        let mut event = json!({
+            "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
+            "offered": fanout, "adopted": adopted, "corroborated": corroborated,
+            "calls": call_report, "tokens": call_charge + hop_tokens, "cut": cut,
+        });
+        if let Some(object) = event.as_object_mut() {
+            if (paid_tokens, paid_calls) != (0, 0) {
+                object.insert("paid_before".into(), json!([paid_tokens, paid_calls]));
+            }
+            // The maps were given no external call for this expansion.
+            if self.t.budget.external_calls > 0 && calls_before == 0 {
+                object.insert("external_spent".into(), json!(true));
+            }
+        }
+        self.events.insert(at, event);
         cut.then_some(adopted > 0 || timed_out)
     }
 
@@ -856,10 +1024,17 @@ impl<'s> Run<'s> {
 
     /// A route from the expanding state `from` (`parent`) to a node that
     /// already has a state (`reached`), at `potential`. The maps and witness
-    /// classes of the edge join the node's corroboration. A node that is not
-    /// popped and is reached at a higher potential is relaxed onto the new
-    /// route; any other route is traced as an `alt_path`. The node is never
-    /// expanded again.
+    /// classes of the edge join the node's corroboration.
+    ///
+    /// A node that is not expanded is relaxed onto the new route when the
+    /// route is worth more, or when it brings a node that sits at the depth
+    /// limit (so it is not queued) below the limit, however weak: that is the
+    /// only way the node can be expanded. A queued node is never relaxed to
+    /// the limit. The children of a node that was cut mid-expansion follow it
+    /// (their potentials and depths are re-derived from the new route). Any
+    /// other route is traced as an `alt_path`, once per (node, offering
+    /// state), and a route that is the node's own parent is not one. The node
+    /// is never expanded again.
     #[allow(clippy::too_many_arguments)]
     fn arrive(
         &mut self,
@@ -875,6 +1050,7 @@ impl<'s> Run<'s> {
         let max_depth = self.t.budget.max_depth;
         let popped = self.expanded.contains(&reached);
         let queued = self.frontier.contains(reached);
+        let blocked = self.deferred.contains(&reached);
         let old_src = self.states[reached]
             .parent
             .map(|p| self.states[p].node.to_string());
@@ -888,12 +1064,16 @@ impl<'s> Run<'s> {
         state.witnesses.extend(edge.witnesses.iter().copied());
 
         let old = state.potential;
-        let old_depth = state.depth;
+        let own_parent = state.parent == Some(from);
+        // The tolerance keeps a retried expansion, whose subtree was
+        // rescaled, from reading its own route as a stronger one.
+        let better = potential > old * (1.0 + RELAX_TOLERANCE);
+        let unblock = blocked && depth < max_depth;
         // A queued node must stay below the depth limit.
-        let stronger = !popped && potential > old && (!queued || depth < max_depth);
+        let stronger = !popped && (unblock || (better && (!queued || depth < max_depth)));
         let dst = state.node.to_string();
         if !stronger {
-            if self.alts.insert((reached, from)) {
+            if !own_parent && self.alts.insert((reached, from)) {
                 self.events.push(json!({
                     "ev": "alt_path", "src": parent.node.to_string(), "dst": dst,
                     "kind": edge.best.kind.as_str(), "map": edge.best.map,
@@ -910,14 +1090,17 @@ impl<'s> Run<'s> {
         state.witness = Some(edge.best.witness);
         state.potential = potential;
         state.fanout = fanout;
-        self.events.push(json!({
+        let mut event = json!({
             "ev": "relax", "src": parent.node.to_string(), "dst": dst,
             "kind": edge.best.kind.as_str(), "map": edge.best.map,
             "maps": edge.maps, "witness": edge.best.witness.as_str(),
             "old_potential": old, "potential": potential, "old_src": old_src,
             "depth": depth, "cross_map": cross, "new_maps": new_maps,
-        }));
-        if queued {
+        });
+        if unblock {
+            self.deferred.remove(&reached);
+            self.frontier.push(reached, potential);
+        } else if queued {
             match self.frontier.priority_of(reached) {
                 // A handler's boost or reorder stays: scale by the ratio.
                 Some(priority) if priority != old && old > 0.0 => {
@@ -927,10 +1110,66 @@ impl<'s> Run<'s> {
                     self.frontier.set_priority(reached, potential);
                 }
             }
-        } else if !popped && old_depth >= max_depth && depth < max_depth {
-            // It was too deep to queue; the new route is not.
-            self.frontier.push(reached, potential);
         }
+        let rescaled = if self.partial.contains(&reached) && old > 0.0 {
+            self.rescale_below(reached, potential / old)
+        } else {
+            0
+        };
+        if let Some(object) = event.as_object_mut() {
+            if unblock {
+                object.insert("unblocked".into(), json!(true));
+            }
+            if rescaled > 0 {
+                object.insert("rescaled".into(), json!(rescaled));
+            }
+        }
+        self.events.push(event);
+    }
+
+    /// The states found through `root`, whose route has just changed: their
+    /// potential is multiplied by `ratio` (a route's value is the product of
+    /// its hops, and the hops below `root` did not change), their depth is
+    /// re-derived from `root`'s, and the queue follows: a queued state keeps
+    /// the share a handler gave it, one that now sits at the depth limit
+    /// leaves the queue, one that no longer does joins it. Returns how many.
+    fn rescale_below(&mut self, root: usize, ratio: f64) -> usize {
+        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, s) in self.states.iter().enumerate() {
+            if let Some(p) = s.parent {
+                children.entry(p).or_default().push(i);
+            }
+        }
+        let max_depth = self.t.budget.max_depth;
+        let mut work = vec![root];
+        let mut count = 0;
+        while let Some(at) = work.pop() {
+            let depth = self.states[at].depth;
+            for &child in children.get(&at).into_iter().flatten() {
+                if child == root {
+                    continue;
+                }
+                let state = &mut self.states[child];
+                state.potential *= ratio;
+                state.depth = depth + 1;
+                let potential = state.potential;
+                count += 1;
+                if !self.expanded.contains(&child)
+                    && !self.cleared.contains(&self.states[child].node)
+                {
+                    if self.states[child].depth >= max_depth {
+                        self.frontier.remove(child);
+                        self.deferred.insert(child);
+                    } else if self.frontier.contains(child) {
+                        self.frontier.scale(child, ratio);
+                    } else if self.deferred.remove(&child) {
+                        self.frontier.push(child, potential);
+                    }
+                }
+                work.push(child);
+            }
+        }
+        count
     }
 
     /// Takes the latest expansion's edges off `in_seen`: its pop is put back
@@ -1321,18 +1560,29 @@ impl<'s> Run<'s> {
 
     /// Replaces the frontier with `nodes` (at most [`REDIRECT_MAX`]):
     /// a node that was queued keeps its path, a new one starts a path; an
-    /// expanded or cleared node is skipped.
+    /// expanded or cleared node is skipped. A node named twice counts once,
+    /// and one at the depth limit stays out of the queue (it is deferred).
     fn redirect(&mut self, nodes: &[NodeId]) {
         self.frontier.clear();
-        let fanout = nodes.len().min(REDIRECT_MAX) as u32;
-        for node in nodes.iter().take(REDIRECT_MAX) {
+        let mut seen = HashSet::new();
+        let nodes: Vec<&NodeId> = nodes
+            .iter()
+            .filter(|node| seen.insert(*node))
+            .take(REDIRECT_MAX)
+            .collect();
+        let fanout = nodes.len() as u32;
+        for node in nodes {
             if self.cleared.contains(node) {
                 continue;
             }
             match self.state_of.get(node).copied() {
                 Some(state) if self.expanded.contains(&state) => {}
+                Some(state) if self.states[state].depth >= self.t.budget.max_depth => {
+                    self.deferred.insert(state);
+                }
                 Some(state) => {
                     let potential = self.states[state].potential;
+                    self.deferred.remove(&state);
                     self.frontier.push(state, potential);
                 }
                 None => self.add_seed(&Seed::from(node.clone()), fanout),

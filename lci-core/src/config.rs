@@ -495,7 +495,8 @@ pub struct TraverseConfig {
     pub scip_index: String,
     /// Most pops (node expansions) of one traversal, `1..=2000`.
     pub max_pops: u32,
-    /// Deepest state that is expanded, `1..=32`.
+    /// Depth at which a traversal records states without expanding them, so
+    /// the deepest state it expands is at `max_depth - 1`; `1..=32`.
     pub max_depth: u32,
     /// Most estimated tokens the expansions of one traversal may cost,
     /// `1..=1000000`.
