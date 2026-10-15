@@ -31,6 +31,7 @@
 //! on a continuation, within the engine's own limits.
 
 mod chunks;
+pub mod presets;
 
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow, bail};
@@ -53,8 +54,9 @@ use lci_maps::{
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
         handle::HandleStore,
-        handler::{Checkpoint, StopPolicy},
+        handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
         ladder::Ladder,
+        lint::{LintContext, lint},
         priors::HopPriors,
         rescore::FrontierRescorer,
         rules::RuleList,
@@ -144,6 +146,10 @@ pub struct BudgetArgs {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SteerArgs {
+    /// A named policy: `explore` (what a call with no policy runs), `impact`,
+    /// `flow` or `where-to`. Its settings apply; the fields given beside it
+    /// replace the preset's. The response's `effective_policy` shows what ran.
+    pub policy: Option<String>,
     /// Rung 1 of the ladder: an array of `{"when": predicate, "then": action}`
     /// rules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,
     /// `score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,
@@ -1116,9 +1122,11 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .map_err(|e| anyhow!("[traverse] priors {path}: {e}"))?,
         _ => bail!("[traverse] priors and question_type go together"),
     };
-    let (mut budget, mut notes) = clamp_budget(limits, call.budget);
-    let handler = build_ladder(limits, call.steer, budget.pops, &mut notes)?;
-    let actions = match (&call.steer.actions, call.handle) {
+    let (steer, preset) = presets::resolve(call.steer)?;
+    let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
+    let mut notes = Vec::new();
+    let handler = build_ladder(limits, &steer, budget.pops, &mut warnings)?;
+    let actions = match (&steer.actions, call.handle) {
         (Some(_), None) => {
             bail!("steer.actions answers a checkpoint: give the handle it came with")
         }
@@ -1128,6 +1136,13 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         ),
         (None, _) => None,
     };
+    warnings.extend(lint_steer(
+        &steer,
+        handler.as_ref().map(|(_, stops, _)| stops),
+        actions.as_ref(),
+        &budget,
+        &wanted,
+    ));
     let store = HandleStore::in_dir(&dirs.handles);
     let snapshot = match call.handle {
         Some(handle) => {
@@ -1377,6 +1392,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
+    let (effective, plan_effective) = presets::effective(
+        preset,
+        &steer,
+        handler.as_ref().map(|(_, stops, plan)| (stops, plan)),
+        &plan_maps,
+    );
     // The most a state can be corroborated by, which the score bound needs
     // (the seed maps only start the walk; maps over one graph count once).
     let expanding = registry.independent_expanders();
@@ -1384,14 +1405,17 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
         None => {
             if found.nodes.is_empty() {
+                let mut response = no_seeds_response(call, &found, notes);
+                add_policy(&mut response, effective, warnings);
                 return Ok(Report {
-                    response: no_seeds_response(call, &found, notes),
+                    response,
                     trace: None,
                 });
             }
             let plan = StartPlan {
                 maps: plan_maps,
                 policy: policy.unwrap_or_default(),
+                effective: Some(plan_effective),
                 seed_source: Some(found.source.to_owned()),
                 seed_hits: found.details.clone(),
             };
@@ -1496,6 +1520,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         trace_path.as_deref(),
         notes,
     );
+    add_policy(&mut response, effective, warnings);
     add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
@@ -1504,6 +1529,76 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         response,
         trace: trace_path,
     })
+}
+
+/// `effective_policy` (every response) and `warnings` (when there are any).
+fn add_policy(response: &mut Value, effective: Value, warnings: Vec<String>) {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("effective_policy".into(), effective);
+        if !warnings.is_empty() {
+            object.insert("warnings".into(), json!(warnings));
+        }
+    }
+}
+
+/// The steer lint of a call (see [`lci_maps::traverse::lint`]), plus the two
+/// checks that need the steer's own fields: a ladder that omits `rules` while
+/// rules are given, and `budget` actions that add more than the engine
+/// allows in total. The lint reads the call; nothing it finds stops the run.
+fn lint_steer(
+    steer: &SteerArgs,
+    stops: Option<&StopPolicy>,
+    actions: Option<&Steer>,
+    budget: &TraversalBudget,
+    selected: &[MapId],
+) -> Vec<String> {
+    let mut found = Vec::new();
+    if let Some(stops) = stops {
+        let known: Vec<&str> = MAPS.iter().chain(&OPT_IN_MAPS).copied().collect();
+        let list = steer
+            .rules
+            .as_ref()
+            .and_then(|r| RuleList::from_json(r).ok());
+        let cx = LintContext {
+            pops: budget.pops,
+            max_depth: budget.max_depth,
+            known_maps: &known,
+            selected_maps: selected,
+        };
+        found.extend(lint(
+            list.as_ref().map_or(&[][..], RuleList::rules),
+            stops,
+            &cx,
+        ));
+    }
+    if steer.rules.is_some()
+        && steer
+            .ladder
+            .as_ref()
+            .is_some_and(|ladder| !ladder.iter().any(|rung| rung == "rules"))
+    {
+        found.push(
+            "steer.ladder lists no `rules` rung while steer.rules is given: the rules rung runs first regardless"
+                .to_owned(),
+        );
+    }
+    let (pops, tokens) = actions.map_or((0, 0), |steer| {
+        steer
+            .actions
+            .iter()
+            .fold((0u64, 0u64), |(pops, tokens), directive| {
+                match &directive.action {
+                    Action::Budget { pops: p, tokens: t } => (pops + u64::from(*p), tokens + t),
+                    _ => (pops, tokens),
+                }
+            })
+    });
+    if pops > u64::from(RAISE_MAX_POPS) || tokens > RAISE_MAX_TOKENS {
+        found.push(format!(
+            "steer.actions raise the budget by {pops} pops and {tokens} tokens; the most a traversal accepts is {RAISE_MAX_POPS} pops and {RAISE_MAX_TOKENS} tokens in total, and the cap applies"
+        ));
+    }
+    found
 }
 
 /// The lines of the chunk start nodes (1-based, inclusive), which a chunk's
@@ -2166,6 +2261,113 @@ mod tests {
 
         // Unknown keys are still refused.
         assert!(serde_json::from_value::<SteerArgs>(json!({"on_stagnation": 3})).is_err());
+    }
+
+    // ---- steer lint and the effective policy (slice S9a) -------------------
+
+    /// The warnings of `steer` in a call with the default budget and maps.
+    fn warnings_of(steer: &SteerArgs) -> Vec<String> {
+        let (steer, _) = presets::resolve(steer).unwrap();
+        let limits = TraverseConfig {
+            max_stops: 8,
+            ..limits()
+        };
+        let (budget, mut warnings) = clamp_budget(&limits, &BudgetArgs::default());
+        let handler = build_ladder(&limits, &steer, budget.pops, &mut warnings).unwrap();
+        let actions = steer
+            .actions
+            .as_ref()
+            .map(|value| Steer::from_json(&json!({ "actions": value })).unwrap());
+        warnings.extend(lint_steer(
+            &steer,
+            handler.as_ref().map(|(_, stops, _)| stops),
+            actions.as_ref(),
+            &budget,
+            &MAPS,
+        ));
+        warnings
+    }
+
+    #[test]
+    fn the_presets_and_the_shipped_policy_file_lint_clean() {
+        let file = include_str!("../../docs/spike/multimap/v2/policies/ladder-rules-only.json");
+        let mut steers: Vec<SteerArgs> = vec![serde_json::from_str(file).unwrap()];
+        steers.extend(presets::FILES.iter().map(|(name, _)| SteerArgs {
+            policy: Some((*name).to_owned()),
+            ..SteerArgs::default()
+        }));
+        for steer in steers {
+            assert_eq!(warnings_of(&steer), Vec::<String>::new(), "{steer:?}");
+        }
+    }
+
+    #[test]
+    fn the_steer_checks_that_need_the_steer_fields_fire_on_a_minimal_bad_input() {
+        let steer = |body: Value| serde_json::from_value::<SteerArgs>(body).unwrap();
+        for (body, needle) in [
+            (
+                json!({"rules": [], "ladder": ["agent"]}),
+                "lists no `rules` rung",
+            ),
+            (
+                json!({"rules": [{"when": {"map": "nope"}, "then": "prune"}]}),
+                "rule 0 cannot fire",
+            ),
+            (json!({"stop_every": 5000}), "stop_every 5000"),
+            (json!({"rules": [], "max_stops": 99}), "max_stops 99"),
+            (json!({"max_stops": 2}), "do nothing"),
+            (
+                json!({"rules": [], "actions": [{"action": {"budget": {"pops": 500}}}]}),
+                "raise the budget by 500 pops",
+            ),
+        ] {
+            let found = warnings_of(&steer(body.clone()));
+            assert!(
+                found.iter().any(|line| line.contains(needle)),
+                "{body}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_effective_policy_shows_the_defaults_a_call_ran_with() {
+        let steer = SteerArgs {
+            rules: Some(json!([{"when": {"kind": "test"}, "then": "prune"}])),
+            stop_every: Some(7),
+            ..SteerArgs::default()
+        };
+        let handler = build_ladder(&limits(), &steer, 100, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        let maps = [PlanMap {
+            id: "graph.scip".into(),
+            version: 1,
+            weight: 1.0,
+            enabled: true,
+        }];
+        let (body, plan) = presets::effective(
+            Some("impact".into()),
+            &steer,
+            Some((&handler.1, &handler.2)),
+            &maps,
+        );
+        assert_eq!(body["preset"], "impact");
+        assert_eq!(body["stops"]["every_pops"], 7);
+        assert_eq!(body["stops"]["max_stops"], 4, "the configured cap");
+        assert_eq!(body["ladder"], json!(["rules", "agent"]));
+        assert_eq!(body["tau"], 0.8);
+        assert_eq!(body["maps"][0]["weight"], 1.0);
+        assert_eq!(
+            (body["hash"].as_str(), plan.preset.as_deref()),
+            (Some(plan.hash.as_str()), Some("impact"))
+        );
+        // The hash is of the content, not of the name.
+        let (renamed, _) = presets::effective(None, &steer, Some((&handler.1, &handler.2)), &maps);
+        assert_eq!(renamed["hash"], body["hash"]);
+        let (none, _) =
+            presets::effective(Some("explore".into()), &SteerArgs::default(), None, &maps);
+        assert_eq!(none["stops"], Value::Null);
+        assert_ne!(none["hash"], body["hash"]);
     }
 
     // ---- start nodes from the hybrid search (slice S6b) --------------------

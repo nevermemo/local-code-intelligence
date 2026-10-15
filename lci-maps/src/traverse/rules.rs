@@ -462,7 +462,7 @@ fn eval(predicate: &Predicate, cx: &Cx) -> bool {
 
 /// Whether two node actions on one node pull opposite ways: one drops it,
 /// the other expands it or raises its priority.
-fn contradicts(a: &Action, b: &Action) -> bool {
+pub(crate) fn contradicts(a: &Action, b: &Action) -> bool {
     let drops = |x: &Action| matches!(x, Action::Prune);
     let wants = |x: &Action| match x {
         Action::Expand => true,

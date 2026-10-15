@@ -1,0 +1,4 @@
+{
+  "description": "Question type: how control or data gets from one place to another. Untuned: it sets the same as explore, because no rule or number is justified by a measurement yet. To be tuned from traces.",
+  "steer": {}
+}

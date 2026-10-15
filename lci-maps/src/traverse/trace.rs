@@ -193,15 +193,26 @@ pub struct PlanPolicy {
     pub rules: u32,
 }
 
+/// Which policy a run resolved to: the preset it took, if any, and a hash of
+/// the effective stops, rules, ladder and map weights (the full object is in
+/// the response, not in the trace).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanEffective {
+    pub preset: Option<String>,
+    pub hash: String,
+}
+
 /// What the caller says about a run that the engine cannot know: the maps
 /// registered (ids, versions, weights), the steering policy and where the
 /// start nodes came from. Set with `Traversal::plan`; the `start` event then
 /// carries `maps`, `policy` (the stop policy as `stops` plus the fields of
-/// [`PlanPolicy`]), and, when given, `seed_source` and `seed_hits`.
+/// [`PlanPolicy`]), `effective_policy` (a [`PlanEffective`]) when given, and,
+/// when given, `seed_source` and `seed_hits`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StartPlan {
     pub maps: Vec<PlanMap>,
     pub policy: PlanPolicy,
+    pub effective: Option<PlanEffective>,
     /// `hybrid`, `name_tokens` or `given`.
     pub seed_source: Option<String>,
     /// Per start node: the retrievers that found it and their scores (the
@@ -229,6 +240,12 @@ impl StartPlan {
                 }),
             ),
         ];
+        if let Some(effective) = &self.effective {
+            fields.push((
+                "effective_policy",
+                json!({"preset": effective.preset, "hash": effective.hash}),
+            ));
+        }
         if let Some(source) = &self.seed_source {
             fields.push(("seed_source", json!(source)));
         }

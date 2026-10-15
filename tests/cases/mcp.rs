@@ -2111,6 +2111,168 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
     models_task.abort();
 }
 
+/// The first line of a trace file: its `start` event.
+fn start_event_json(data_dir: &Path, response: &Value) -> Value {
+    let file = response["trace"]["file"].as_str().unwrap();
+    let text = std::fs::read_to_string(data_dir.join("traces").join(file)).unwrap();
+    serde_json::from_str(text.lines().next().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_traverse_call_echoes_the_policy_it_ran_and_lints_the_steer() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    let workspace = temp.path().join("scip-on");
+    write_scip_workspace(&workspace);
+    let data_dir = config.data_dir.clone();
+    let app = Arc::new(App::open(config).await.unwrap());
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let call = |steer: Option<Value>| {
+        let mut arguments = json!({
+            "workspace_path": workspace, "query": "how does search rank hits",
+            "top_k": 20, "mode": "traverse",
+        });
+        if let Some(steer) = steer {
+            arguments["steer"] = steer;
+        }
+        mcp_search_call(&client, &base, &session, arguments)
+    };
+    let answer = |result: Value| {
+        assert_ne!(result["isError"], true, "{result}");
+        result["structuredContent"].clone()
+    };
+
+    // No policy: the first preset, nothing to warn about, and the stops,
+    // rules and ladder of a walk without a handler.
+    let plain = answer(call(None).await);
+    let effective = &plain["effective_policy"];
+    assert_eq!(effective["preset"], "explore", "{plain}");
+    assert_eq!(effective["hash"].as_str().unwrap().len(), 16);
+    assert_eq!(effective["stops"], Value::Null);
+    assert_eq!(effective["rules"], json!([]));
+    assert_eq!(effective["ladder"], json!([]));
+    let maps: Vec<&str> = effective["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|map| map["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        maps,
+        [
+            "seeds.hybrid",
+            "seeds.scip_names",
+            "graph.scip",
+            "structure.contains"
+        ]
+    );
+    assert!(plain.get("warnings").is_none(), "{plain}");
+    // The start event names the preset and carries the hash, not the object.
+    assert_eq!(
+        start_event_json(&data_dir, &plain)["effective_policy"],
+        json!({"preset": "explore", "hash": effective["hash"]})
+    );
+
+    // The name of a preset gives the answer of the policy it holds; `explore`
+    // is the same call as no policy.
+    let explore = answer(call(Some(json!({"policy": "explore"}))).await);
+    assert_eq!(explore["trace"]["hash"], plain["trace"]["hash"]);
+    for name in ["impact", "flow", "where-to"] {
+        let named = answer(call(Some(json!({"policy": name}))).await);
+        assert_eq!(named["effective_policy"]["preset"], name);
+        assert_eq!(named["effective_policy"]["hash"], effective["hash"]);
+        assert_eq!(named["results"], plain["results"], "{name}");
+        assert_eq!(named["totals"]["pops"], plain["totals"]["pops"], "{name}");
+        assert!(named.get("warnings").is_none(), "{named}");
+    }
+
+    // Fields beside the name replace the preset's, and the response shows
+    // the stops, rules and ladder after the defaults.
+    let over = answer(
+        call(Some(json!({
+            "policy": "impact", "stop_every": 3, "max_stops": 2,
+            "rules": [{"when": {"kind": "test"}, "then": "prune"}],
+        })))
+        .await,
+    );
+    let effective = &over["effective_policy"];
+    assert_eq!(effective["preset"], "impact");
+    assert_eq!(effective["stops"]["every_pops"], 3);
+    assert_eq!(effective["stops"]["max_stops"], 2);
+    assert_eq!(effective["ladder"], json!(["rules", "agent"]));
+    assert_eq!(effective["tau"], 0.8);
+    assert_eq!(effective["rules"][0]["then"], "prune");
+    assert_ne!(effective["hash"], plain["effective_policy"]["hash"]);
+    assert_eq!(
+        start_event_json(&data_dir, &over)["effective_policy"]["hash"],
+        effective["hash"]
+    );
+
+    // A steer that cannot do what it says still runs, with warnings.
+    let bad = answer(
+        call(Some(json!({
+            "stop_every": 500,
+            "rules": [
+                {"when": {"map": "nope"}, "then": "prune"},
+                {"when": {"budget_left": {"ge": 0}}, "then": "prune"},
+            ],
+        })))
+        .await,
+    );
+    assert_eq!(bad["effective_policy"]["preset"], Value::Null);
+    let warnings = bad["warnings"].to_string();
+    for needle in [
+        "rule 0 cannot fire",
+        "rule 1 prunes every node",
+        "stop_every 500",
+    ] {
+        assert!(warnings.contains(needle), "{needle}: {warnings}");
+    }
+    assert!(bad["results"].as_array().is_some(), "{bad}");
+
+    // A budget above the cap is a warning, no longer a note.
+    let raised = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({
+            "workspace_path": workspace, "query": "search rank", "mode": "traverse",
+            "budget": {"pops": 5000},
+        }),
+    )
+    .await;
+    let raised = answer(raised);
+    assert!(
+        raised["warnings"].to_string().contains("budget.pops 5000"),
+        "{raised}"
+    );
+
+    // Every answer has the field, an answer without seeds too.
+    let nothing = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path": workspace, "query": "zebra xylophone", "mode": "traverse"}),
+    )
+    .await;
+    let nothing = answer(nothing);
+    assert_eq!(nothing["status"], "no_seeds");
+    assert_eq!(nothing["effective_policy"]["preset"], "explore");
+
+    // An unknown preset is an error that names the presets.
+    let unknown = call(Some(json!({"policy": "nope"}))).await;
+    assert_eq!(unknown["isError"], true, "{unknown}");
+    let text = unknown["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("explore, impact, flow, where-to"), "{text}");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
 /// A workspace whose sources and `index.scip` agree: function `i` of
 /// `src/lib.rs` is on line `i` (0-based), as `scip_bytes` writes them. Three
 /// functions mention "translator" (the fake models rank those first); the

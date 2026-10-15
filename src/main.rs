@@ -413,9 +413,10 @@ struct TraverseArgs {
     /// runs with (default: the base configuration).
     #[arg(long)]
     search_profile: Option<String>,
-    /// The steering policy: a JSON file or inline JSON, either an array of
-    /// rules or the object of `search_code`'s `steer` (rules, ladder,
-    /// max_stops, tau, stop_every, on_disagreement, likely_complete).
+    /// The steering policy: a preset name (explore, impact, flow, where-to;
+    /// explore is what no policy runs), or a JSON file or inline JSON, either
+    /// an array of rules or the object of `search_code`'s `steer` (rules,
+    /// ladder, max_stops, tau, stop_every, on_disagreement, likely_complete).
     #[arg(long)]
     policy: Option<String>,
     /// A stop (a consultation of the rules) every this many pops.
@@ -514,6 +515,10 @@ async fn run_traverse(
     config.traverse.question_type = args.question_type.clone().or(config.traverse.question_type);
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
+        Some(name) if traverse::presets::is_preset(name) => SteerArgs {
+            policy: Some(name.clone()),
+            ..SteerArgs::default()
+        },
         Some(text) => match json_argument(text)? {
             rules @ Value::Array(_) => SteerArgs {
                 rules: Some(rules),

@@ -1,0 +1,4 @@
+{
+  "description": "The default policy, and what a call with no policy runs: no rules, no stop triggers, no map weights, the default ladder (rules, then agent). The walk ends at its budget or on the score bound.",
+  "steer": {}
+}

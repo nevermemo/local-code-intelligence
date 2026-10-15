@@ -134,6 +134,7 @@ pub mod fusion;
 pub mod handle;
 pub mod handler;
 pub mod ladder;
+pub mod lint;
 pub mod merged;
 pub mod priors;
 pub mod rescore;

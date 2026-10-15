@@ -97,6 +97,13 @@
             "null"
           ]
         },
+        "policy": {
+          "description": "A named policy: `explore` (what a call with no policy runs), `impact`,\n`flow` or `where-to`. Its settings apply; the fields given beside it\nreplace the preset's. The response's `effective_policy` shows what ran.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "rules": {
           "description": "Rung 1 of the ladder: an array of `{\"when\": predicate, \"then\": action}`\nrules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,\n`score`, `fanout`, `depth`, `budget_left`, `seen_before`, `all`, `any`,\n`not`. Actions: `prune`, `expand`, `continue`, `stop`, `{\"boost\": f}`,\n`{\"map_on\": id}`, `{\"map_off\": id}`, `{\"map_weight\": {\"id\", \"weight\"}}`,\n`{\"redirect\": [node ids]}`, `{\"emit\": note}`. They can only shrink, reorder or redirect the walk."
         },

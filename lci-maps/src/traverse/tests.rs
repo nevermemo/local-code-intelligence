@@ -2310,7 +2310,7 @@ mod steering {
 
 mod start_plan {
     use super::*;
-    use crate::traverse::trace::{self, PlanMap, PlanPolicy, StartEvent, StartPlan};
+    use crate::traverse::trace::{self, PlanEffective, PlanMap, PlanPolicy, StartEvent, StartPlan};
     use serde_json::json;
 
     fn plan() -> StartPlan {
@@ -2334,6 +2334,10 @@ mod start_plan {
                 tau: Some(0.8),
                 rules: 2,
             },
+            effective: Some(PlanEffective {
+                preset: Some("impact".into()),
+                hash: "0123456789abcdef".into(),
+            }),
             seed_source: Some("hybrid".into()),
             seed_hits: vec![json!({"node": "sym:rust:a/fn", "score": 0.5})],
         }
@@ -2367,6 +2371,10 @@ mod start_plan {
         // Every trigger is shown, so a reader knows when the walk could stop.
         assert_eq!(start["policy"]["stops"]["on_disagreement"], 4);
         assert_eq!(start["policy"]["stops"]["likely_complete"], 90);
+        assert_eq!(
+            start["effective_policy"],
+            json!({"preset": "impact", "hash": "0123456789abcdef"})
+        );
         assert_eq!(start["seed_source"], "hybrid");
         assert_eq!(start["seed_hits"][0]["score"], 0.5);
 
@@ -2388,7 +2396,13 @@ mod start_plan {
         let reg = registry(vec![GraphMap::new("g", &[("a", "b")])]);
         let result = walk(&reg, vec![seed("a")], budget(10), |t| t).await;
         let start = result.events[0].as_object().unwrap();
-        for key in ["maps", "policy", "seed_source", "seed_hits"] {
+        for key in [
+            "maps",
+            "policy",
+            "effective_policy",
+            "seed_source",
+            "seed_hits",
+        ] {
             assert!(!start.contains_key(key), "{key}");
         }
         // And a plan without a handler records an empty ladder and no tau.
