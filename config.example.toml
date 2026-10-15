@@ -343,5 +343,11 @@ corroboration_boost = 0.1
 # all the other results, and corroboration_boost does not rank. A resumed
 # traversal keeps the fusion its handle was made with.
 fusion = "boost"
+# Connective nodes (files, commits, config keys) are passed through: expanding one
+# does not cost a pop, so they do not eat the budget that answer nodes need. The
+# traversal ends when the free pops reach max_pops, a pass-through pop does not
+# make its children free, and the token budget is charged as usual. A resumed
+# traversal keeps the setting its handle was made with.
+pass_through = false
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8

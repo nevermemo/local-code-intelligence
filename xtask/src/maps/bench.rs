@@ -100,6 +100,11 @@ pub struct BenchArgs {
     /// fusion. The row's note says when it is `rrf`.
     #[arg(long, default_value = "boost", value_parser = ["boost", "rrf"])]
     fusion: String,
+    /// Pass through connective nodes (`lci traverse --pass-through`): files,
+    /// commits and config keys are expanded without costing a pop. The row's
+    /// note says when it is on.
+    #[arg(long)]
+    pass_through: bool,
     /// Run only the first N items of each set (impact: of the primary items).
     #[arg(long)]
     limit: Option<usize>,
@@ -176,6 +181,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         maps: args.maps.clone(),
         policy,
         fusion: fusion_arg(&args.fusion),
+        pass_through: args.pass_through,
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -206,7 +212,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: note_with_fusion(args.note.as_deref(), &args.fusion),
+        note: note_with_flags(args.note.as_deref(), &args.fusion, args.pass_through),
         progress: true,
         rescored: false,
     };
@@ -247,7 +253,7 @@ fn rescore(
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: note_with_fusion(args.note.as_deref(), &args.fusion),
+        note: note_with_flags(args.note.as_deref(), &args.fusion, args.pass_through),
         progress: false,
         rescored: true,
     };
@@ -321,13 +327,19 @@ fn fusion_arg(fusion: &str) -> Option<String> {
     (fusion != "boost").then(|| fusion.to_owned())
 }
 
-/// The note of the row, with the fusion when it is not the default.
-fn note_with_fusion(note: Option<&str>, fusion: &str) -> String {
-    match (note.unwrap_or_default(), fusion_arg(fusion)) {
-        (note, None) => note.to_owned(),
-        ("", Some(fusion)) => format!("fusion {fusion}"),
-        (note, Some(fusion)) => format!("{note}; fusion {fusion}"),
-    }
+/// The note of the row, with the fusion when it is not the default and
+/// `pass-through` when it is on.
+fn note_with_flags(note: Option<&str>, fusion: &str, pass_through: bool) -> String {
+    let flags = [
+        fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
+        pass_through.then(|| "pass-through".to_owned()),
+    ];
+    let parts = note
+        .filter(|note| !note.is_empty())
+        .map(str::to_owned)
+        .into_iter()
+        .chain(flags.into_iter().flatten());
+    parts.collect::<Vec<_>>().join("; ")
 }
 
 fn policy_label(policy: &str) -> String {
@@ -684,6 +696,8 @@ pub struct CliTraverser {
     pub policy: Option<String>,
     /// `--fusion` for the CLI; `None` leaves its default.
     pub fusion: Option<String>,
+    /// `--pass-through` for the CLI.
+    pub pass_through: bool,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -730,6 +744,9 @@ impl CliTraverser {
         }
         if let Some(fusion) = &self.fusion {
             command.arg(format!("--fusion={fusion}"));
+        }
+        if self.pass_through {
+            command.arg("--pass-through");
         }
         command
             .stdin(Stdio::null())

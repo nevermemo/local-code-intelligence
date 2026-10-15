@@ -431,6 +431,11 @@ struct TraverseArgs {
     /// with.
     #[arg(long)]
     fusion: Option<local_code_intelligence::config::TraverseFusion>,
+    /// Expand connective nodes (files, commits, config keys) without costing
+    /// a pop (default: the `[traverse] pass_through` setting). A continuation
+    /// keeps the setting its handle started with.
+    #[arg(long)]
+    pass_through: bool,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -478,6 +483,7 @@ async fn run_traverse(
     if let Some(fusion) = args.fusion {
         config.traverse.fusion = fusion;
     }
+    config.traverse.pass_through |= args.pass_through;
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(text) => match json_argument(text)? {

@@ -569,6 +569,11 @@ pub struct TraverseConfig {
     /// `"rrf"` the score bound is off and `corroboration_boost` does not rank.
     /// A resumed traversal keeps the fusion its handle was made with.
     pub fusion: TraverseFusion,
+    /// Connective nodes (files, commits, config keys) are expanded without
+    /// costing a pop; a traversal ends when such free pops reach `max_pops`,
+    /// and their tokens are charged as for any expansion. A resumed traversal keeps the
+    /// setting its handle was made with.
+    pub pass_through: bool,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
@@ -657,6 +662,7 @@ impl Default for TraverseConfig {
             tau: 0.8,
             corroboration_boost: 0.1,
             fusion: TraverseFusion::Boost,
+            pass_through: false,
             seed_k: 8,
         }
     }
@@ -2842,6 +2848,14 @@ fusion = \"rrf\"
         );
         assert_eq!("rrf".parse::<TraverseFusion>(), Ok(TraverseFusion::Rrf));
         assert_eq!("boost".parse::<TraverseFusion>(), Ok(TraverseFusion::Boost));
+        // Pass-through is off unless set, and only a boolean sets it.
+        assert_eq!(value["traverse"]["pass_through"], false);
+        let free: Config =
+            toml::from_str(&format!("{}[traverse]\npass_through = true\n", base_toml())).unwrap();
+        free.validate().unwrap();
+        assert!(free.traverse.pass_through);
+        let text = format!("{}[traverse]\npass_through = \"yes\"\n", base_toml());
+        assert!(toml::from_str::<Config>(&text).is_err());
     }
 
     #[test]

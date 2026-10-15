@@ -5,7 +5,7 @@
 //! does its work in logarithmic time.
 
 use super::*;
-use crate::traverse::frontier::Frontier;
+use crate::traverse::{frontier::Frontier, handle::Snapshot};
 use crate::walk::SplitMix;
 use std::time::Instant as Clock;
 
@@ -241,4 +241,106 @@ fn r6_a_changed_priority_is_seen_by_the_next_pop_and_a_requeued_item_keeps_its_p
     frontier.requeue(first);
     assert_eq!(frontier.pop().unwrap().state, 0, "its discovery number");
     assert_eq!(frontier.pop().unwrap().state, 1);
+}
+
+// ---- Q4: connective nodes pass through without a pop --------------------------
+
+/// A symbol `s` reaches the file `f`, which holds the symbols `a` and `b`;
+/// each of them reaches one more symbol.
+fn through_a_file() -> GraphMap {
+    GraphMap::new(
+        "g",
+        &[
+            ("sym/s", "f"),
+            ("f", "sym/a"),
+            ("f", "sym/b"),
+            ("sym/a", "sym/c"),
+            ("sym/b", "sym/d"),
+        ],
+    )
+    .accepts(vec![NodeKind::File, NodeKind::Symbol])
+}
+
+#[tokio::test]
+async fn q4_a_connective_node_is_expanded_without_costing_a_pop() {
+    // (pass_through, pops, the walk reaches d, counted pops, free pops, tokens)
+    let cases = [
+        // Off: the file takes a pop, so the budget ends before b is expanded.
+        (false, 3, false, 3, 0, 4 * TOKENS_PER_EDGE),
+        // On: the file is free, a and b are expanded in the same three pops.
+        (true, 3, true, 3, 1, 5 * TOKENS_PER_EDGE),
+        // On: only the file itself is free; its children wait for a pop.
+        (true, 1, false, 1, 1, 3 * TOKENS_PER_EDGE),
+    ];
+    let reg = registry(vec![through_a_file()]);
+    let mut tokens_of = Vec::new();
+    for (pass_through, pops, reaches_d, counted, free, tokens) in cases {
+        let result = walk(&reg, vec![seed("sym/s")], budget(pops), |t| {
+            t.pass_through(pass_through)
+        })
+        .await;
+        let label = format!("pass_through {pass_through}, pops {pops}");
+        assert_eq!(result.reached(&node("sym/d")), reaches_d, "{label}");
+        let totals = &result.totals;
+        assert_eq!(
+            (totals.pops, totals.pass_through_pops, totals.tokens),
+            (counted, free, tokens),
+            "{label}"
+        );
+        // Only the file's expansion is marked free, and the end event says so.
+        let flagged: Vec<&str> = events_of(&result, "expand")
+            .iter()
+            .filter(|e| e["free"] == true)
+            .map(|e| e["node"].as_str().unwrap())
+            .collect();
+        assert_eq!(flagged.len(), free as usize, "{label}");
+        assert_eq!(
+            events_of(&result, "end")[0]["totals"]["pass_through_pops"].as_u64(),
+            pass_through.then_some(u64::from(free)),
+            "{label}"
+        );
+        // An expansion costs the same tokens with or without pass-through.
+        let per_node: Vec<(String, u64)> = events_of(&result, "expand")
+            .iter()
+            .map(|e| {
+                (
+                    e["node"].as_str().unwrap().to_owned(),
+                    e["tokens"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        tokens_of.push(per_node);
+    }
+    for (name, tokens) in &tokens_of[0] {
+        assert!(tokens_of[1].contains(&(name.clone(), *tokens)), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn q4_the_handle_keeps_pass_through_and_a_resume_equals_the_straight_run() {
+    let reg = registry(vec![through_a_file()]);
+    let first = walk(&reg, vec![seed("sym/s")], budget(1), |t| {
+        t.pass_through(true)
+    })
+    .await;
+    let snapshot = first.snapshot.expect("the pop cap left work");
+    assert!(snapshot.pass_through);
+    assert_eq!(snapshot.totals.pass_through_pops, 1);
+    let back = Snapshot::from_json(&snapshot.to_json()).unwrap();
+    assert_eq!(back, snapshot);
+
+    // The resume is not told to pass through: its handle is.
+    let second = resume(&reg, back, budget(3), |t| t).await;
+    assert_eq!(events_of(&second, "resume")[0]["pass_through"], true);
+    let straight = walk(&reg, vec![seed("sym/s")], budget(3), |t| {
+        t.pass_through(true)
+    })
+    .await;
+    assert_eq!(second.states, straight.states);
+    assert_eq!(second.popped, straight.popped);
+    let totals = |r: &TraversalResult| Totals {
+        elapsed_ms: 0.0,
+        ..r.totals.clone()
+    };
+    assert_eq!(totals(&second), totals(&straight));
 }

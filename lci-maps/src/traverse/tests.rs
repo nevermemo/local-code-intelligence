@@ -23,6 +23,9 @@ use std::{
 };
 
 fn node(name: &str) -> NodeId {
+    if let Some(rest) = name.strip_prefix("sym/") {
+        return format!("sym:rust:{rest}/fn").parse().unwrap();
+    }
     match name.strip_prefix("tests/") {
         Some(rest) => NodeId::file(format!("tests/{rest}.rs")),
         None => NodeId::file(format!("src/{name}.rs")),

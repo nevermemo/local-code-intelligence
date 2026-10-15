@@ -100,6 +100,15 @@
 //! the walk ends by its budgets or when the frontier is dry. A handle keeps
 //! the fusion it started with.
 //!
+//! Pass-through (`[traverse] pass_through`, off by default): popping a
+//! connective node (a file, a commit or a config key: [`is_connective`]) is
+//! free, so it does not count toward the pop budget. Its tokens and external
+//! calls are charged as for any expansion, a free pop does not make the
+//! children of the node free, and the free pops have the pop cap too: the walk
+//! ends with the stop reason `pops` when either count reaches it, so a walk
+//! pops at most twice the cap. The free pops are counted apart in
+//! [`Totals::pass_through_pops`]. A handle keeps the setting.
+//!
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
 //! reason `bound`, once `k` results exist and nothing queued can lift a result
 //! above the `k`-th; see [`stop`]. The `bound` event and the `end` event carry
@@ -133,7 +142,7 @@ use handler::{
     RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, StopBudget,
     StopPolicy,
 };
-use lci_core::node::NodeId;
+use lci_core::node::{NodeId, NodeKind};
 use serde_json::{Value, json};
 use source::{EdgeSource, Expansion, FusedEdge};
 use std::{
@@ -259,6 +268,9 @@ pub struct Totals {
     pub cross_map_hops: u32,
     pub tokens: u64,
     pub external_calls: u32,
+    /// Pops of connective nodes that did not count toward `pops` (pass-through
+    /// only; see the module docs).
+    pub pass_through_pops: u32,
     pub stops: u32,
     /// Directives applied at stops.
     pub steers: u32,
@@ -286,6 +298,8 @@ pub struct TraversalResult {
     pub corroboration_boost: f64,
     /// How the run ranked its results.
     pub fusion: Fusion,
+    /// Whether the run passed through connective nodes (see the module docs).
+    pub pass_through: bool,
     /// Under `rrf` fusion: the fused score of every result, by node (empty
     /// otherwise).
     pub fused: HashMap<NodeId, f64>,
@@ -360,6 +374,7 @@ pub struct Traversal<'s> {
     plan: Option<trace::StartPlan>,
     boost: f64,
     fusion: Fusion,
+    pass_through: bool,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
     identity: String,
@@ -383,6 +398,7 @@ impl<'s> Traversal<'s> {
             plan: None,
             boost: DEFAULT_CORROBORATION_BOOST,
             fusion: Fusion::Boost,
+            pass_through: false,
             bound: None,
             identity: String::new(),
         }
@@ -428,6 +444,15 @@ impl<'s> Traversal<'s> {
     /// Under [`Fusion::Rrf`] the score bound is off.
     pub fn fusion(mut self, fusion: Fusion) -> Self {
         self.fusion = fusion;
+        self
+    }
+
+    /// Pops of connective nodes (see [`is_connective`]) are free: they do not
+    /// count toward the pop budget; the walk ends when they reach the pop
+    /// cap. Tokens are charged as ever. A resumed traversal keeps the setting its handle was
+    /// made with.
+    pub fn pass_through(mut self, on: bool) -> Self {
+        self.pass_through = on;
         self
     }
 
@@ -645,6 +670,9 @@ impl<'s> Run<'s> {
                 "stops": stops_json(&self.t.stops),
                 "rank": rank_json(self.t.boost, self.t.fusion),
             });
+            if let (true, Some(object)) = (self.t.pass_through, start.as_object_mut()) {
+                object.insert("pass_through".into(), json!(true));
+            }
             if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
                 for (key, value) in plan.fields(stops_json(&self.t.stops)) {
                     object.insert(key.to_owned(), value);
@@ -693,7 +721,9 @@ impl<'s> Run<'s> {
             // The external-call allowance is not checked here: once it is
             // spent the maps are given none and the walk goes on with the
             // ones that need none (see `expand`).
-            if self.totals.pops >= self.pops_cap() {
+            let free_spent =
+                self.t.pass_through && self.totals.pass_through_pops >= self.pops_cap();
+            if free_spent || (self.totals.pops >= self.pops_cap() && !self.next_pop_is_free()) {
                 ended = StopReason::Pops;
                 break self.end_status(true);
             }
@@ -717,17 +747,26 @@ impl<'s> Run<'s> {
                 self.deferred.insert(item.state);
                 continue;
             }
-            self.totals.pops += 1;
+            let free = self.is_free_pop(item.state);
+            if free {
+                self.totals.pass_through_pops += 1;
+            } else {
+                self.totals.pops += 1;
+            }
             self.popped.push(item.state);
             self.expanded.insert(item.state);
-            if let Some(adopted) = self.expand(item.state).await {
+            if let Some(adopted) = self.expand(item.state, free).await {
                 // The node is not done: back in the queue at its old place,
                 // for a resume to expand again.
                 self.expanded.remove(&item.state);
                 self.uncount();
                 self.frontier.requeue(item);
                 if !adopted {
-                    self.totals.pops -= 1;
+                    if free {
+                        self.totals.pass_through_pops -= 1;
+                    } else {
+                        self.totals.pops -= 1;
+                    }
                     self.popped.pop();
                 }
                 ended = if Instant::now() >= self.t.budget.deadline {
@@ -774,6 +813,9 @@ impl<'s> Run<'s> {
         });
         if let Some(object) = end.as_object_mut() {
             object.insert("stop_reason".into(), json!(stop_reason.as_str()));
+            if self.t.pass_through {
+                object["totals"]["pass_through_pops"] = json!(self.totals.pass_through_pops);
+            }
         }
         self.events.push(end);
         let snapshot = resumable.then(|| self.snapshot());
@@ -803,11 +845,31 @@ impl<'s> Run<'s> {
             events: self.events,
             corroboration_boost: self.t.boost,
             fusion: self.t.fusion,
+            pass_through: self.t.pass_through,
             fused: fused_by_node,
             stop_reason,
             maps: self.tally.maps,
             map_ms: self.map_ms,
         }
+    }
+
+    /// Whether popping `state` is free: pass-through is on and the node is
+    /// connective. Only the node itself is free; the children it adopts pay
+    /// when their turn comes. (The loop has ended the walk before a free pop
+    /// past the pop cap, so this need not check it; ending, rather than
+    /// counting the pop, keeps a paused run a prefix of the straight run.)
+    fn is_free_pop(&self, state: usize) -> bool {
+        self.t.pass_through && is_connective(&self.states[state].node)
+    }
+
+    /// Whether the next item of the frontier would be a free pop, so the pop
+    /// cap does not end the walk before it.
+    fn next_pop_is_free(&mut self) -> bool {
+        self.t.pass_through
+            && self
+                .frontier
+                .peek()
+                .is_some_and(|item| self.is_free_pop(item.state))
     }
 
     /// The `bound` event when the score bound holds (see [`stop`]): a result
@@ -894,7 +956,7 @@ impl<'s> Run<'s> {
     ///   retry that completes it is the one that charges the calls' tokens: a
     ///   pop pays for its calls' tokens once. Its external calls are charged
     ///   each time they run, since each run spent them.
-    async fn expand(&mut self, index: usize) -> Option<bool> {
+    async fn expand(&mut self, index: usize, free: bool) -> Option<bool> {
         let node = self.states[index].node.clone();
         let depth = self.states[index].depth;
         // What an earlier run of this pop already paid for its calls.
@@ -944,11 +1006,15 @@ impl<'s> Run<'s> {
                 self.paid
                     .insert(index, (paid_tokens, call_external.max(paid_calls)));
             }
-            self.events.push(json!({
+            let mut event = json!({
                 "ev": "expand", "pop": self.totals.pops, "node": node.to_string(),
                 "offered": edges.len(), "adopted": 0, "calls": call_report,
                 "dropped": "budget",
-            }));
+            });
+            if let (true, Some(object)) = (free, event.as_object_mut()) {
+                object.insert("free".into(), json!(true));
+            }
+            self.events.push(event);
             return Some(false);
         }
 
@@ -1113,6 +1179,9 @@ impl<'s> Run<'s> {
             "calls": call_report, "tokens": call_charge + hop_tokens, "cut": cut,
         });
         if let Some(object) = event.as_object_mut() {
+            if free {
+                object.insert("free".into(), json!(true));
+            }
             if (paid_tokens, paid_calls) != (0, 0) {
                 object.insert("paid_before".into(), json!([paid_tokens, paid_calls]));
             }
@@ -1741,6 +1810,16 @@ impl<'s> Run<'s> {
             }
         }
     }
+}
+
+/// Whether a node only connects evidence and is not an answer in itself: a
+/// file (`structure.contains`), a commit (`git.history`) or a config key
+/// (`config.key`). Popping one is free under pass-through.
+pub fn is_connective(node: &NodeId) -> bool {
+    matches!(
+        node.kind(),
+        NodeKind::File | NodeKind::Commit | NodeKind::ConfigKey
+    )
 }
 
 /// The `rank` object of the `start` and `resume` events. Under `boost` fusion

@@ -9,7 +9,12 @@
 //! invariants hold, the score bound does not apply (it is off), and every
 //! result has a positive fused score that a resume reproduces.
 //!
-//! 64 seeds run by default. To replay one:
+//! Every seed runs twice, with pass-through off and on. On, the odd nodes are
+//! symbols and the even ones files, so some pops are free: counted pops stay
+//! within the pop cap, free pops stay within it too, and the token budget
+//! holds; a resume still equals the straight run.
+//!
+//! 512 seeds run by default. To replay one:
 //! `LCI_TRAVERSE_SEED=<n> cargo test -p lci-maps harness`.
 
 use super::*;
@@ -62,10 +67,20 @@ struct Case {
     every: Option<u32>,
     pause_at: u32,
     fusion: Fusion,
+    pass_through: bool,
 }
 
 impl Case {
-    fn new(seed: u64) -> Self {
+    /// The node `n<i>`: a file, or under pass-through a symbol when `i` is odd.
+    fn name(pass_through: bool, i: usize) -> String {
+        if pass_through && i % 2 == 1 {
+            format!("sym/n{i}")
+        } else {
+            format!("n{i}")
+        }
+    }
+
+    fn new(seed: u64, pass_through: bool) -> Self {
         let mut rng = SplitMix(seed);
         let nodes = 3 + below(&mut rng, 8);
         let maps = (0..1 + below(&mut rng, 3))
@@ -74,7 +89,7 @@ impl Case {
                 edges: (0..below(&mut rng, 3 * nodes))
                     .map(|_| {
                         let (a, b) = (below(&mut rng, nodes), below(&mut rng, nodes));
-                        (format!("n{a}"), format!("n{b}"))
+                        (Self::name(pass_through, a), Self::name(pass_through, b))
                     })
                     .collect(),
                 conf: 20 + below(&mut rng, 76) as u8,
@@ -125,6 +140,7 @@ impl Case {
             } else {
                 Fusion::Boost
             },
+            pass_through,
         }
     }
 
@@ -190,7 +206,8 @@ async fn run_with(
                 .conf(spec.conf)
                 .witness(spec.witness)
                 .cost(spec.cost.0, spec.cost.1)
-                .counted(count);
+                .counted(count)
+                .accepts(vec![NodeKind::File, NodeKind::Symbol]);
             map.edges = spec.edges.clone();
             map.dependent = spec.dependent;
             map
@@ -215,7 +232,7 @@ async fn run_with(
             case.seeds
                 .iter()
                 .map(|&(at, from_map)| Seed {
-                    node: node(&format!("n{at}")),
+                    node: node(&Case::name(case.pass_through, at)),
                     map: from_map.then_some("seeds.x"),
                 })
                 .collect(),
@@ -226,7 +243,8 @@ async fn run_with(
         gate: case.price.0,
         beam: case.price.1,
     })
-    .fusion(case.fusion);
+    .fusion(case.fusion)
+    .pass_through(case.pass_through);
     traversal = match case.scorer {
         1 => traversal.scorer(BfsScorer),
         2 => traversal.scorer(RandomScorer::new(case.seed)),
@@ -328,10 +346,19 @@ fn invariants(
 ) -> Result<(), String> {
     counts_match(result, invoked)?;
     let totals = &result.totals;
+    // Counted pops and free pops are each within the pop cap; without
+    // pass-through there are no free pops.
     ensure!(
-        totals.pops <= pops && result.popped.len() == totals.pops as usize,
-        "pops {} over {pops}",
-        totals.pops
+        totals.pops <= pops
+            && totals.pass_through_pops <= pops
+            && result.popped.len() == (totals.pops + totals.pass_through_pops) as usize,
+        "pops {} and free pops {} over {pops}",
+        totals.pops,
+        totals.pass_through_pops
+    );
+    ensure!(
+        case.pass_through || totals.pass_through_pops == 0,
+        "free pops without pass-through"
     );
     ensure!(
         totals.tokens <= case.tokens,
@@ -414,9 +441,10 @@ fn invariants(
         result.stop_reason
     );
     ensure!(
-        result.stop_reason != Pops || totals.pops >= pops,
-        "pops reason at {} of {pops}",
-        totals.pops
+        result.stop_reason != Pops || totals.pops >= pops || totals.pass_through_pops >= pops,
+        "pops reason at {} (free {}) of {pops}",
+        totals.pops,
+        totals.pass_through_pops
     );
 
     // The bound holds only with a limit, enough results, and a frontier that
@@ -563,6 +591,7 @@ async fn check(case: &Case, tally: &mut BTreeMap<&'static str, usize>) -> Result
         "complete",
         straight.stop_reason == stop::StopReason::Complete,
     );
+    count("free", straight.totals.pass_through_pops > 0);
     count("relax", has("relax"));
     count("alt_path", has("alt_path"));
     count("steer", has("steer"));
@@ -577,11 +606,13 @@ async fn harness_random_walks_keep_the_engine_invariants() {
     let seeds: Vec<u64> = replay.map_or_else(|| (0..DEFAULT_SEEDS).collect(), |seed| vec![seed]);
     let mut tally = BTreeMap::new();
     for seed in seeds {
-        let case = Case::new(seed);
-        if let Err(why) = check(&case, &mut tally).await {
-            panic!(
-                "{why}\n  replay: LCI_TRAVERSE_SEED={seed} cargo test -p lci-maps harness\n  {case:?}"
-            );
+        for pass_through in [false, true] {
+            let case = Case::new(seed, pass_through);
+            if let Err(why) = check(&case, &mut tally).await {
+                panic!(
+                    "{why}\n  replay: LCI_TRAVERSE_SEED={seed} cargo test -p lci-maps harness\n  {case:?}"
+                );
+            }
         }
     }
     if replay.is_none() {
@@ -591,6 +622,7 @@ async fn harness_random_walks_keep_the_engine_invariants() {
             "pops",
             "budget",
             "complete",
+            "free",
             "relax",
             "alt_path",
             "steer",

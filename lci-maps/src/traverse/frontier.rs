@@ -121,6 +121,17 @@ impl Frontier {
         None
     }
 
+    /// The item `pop` would return, left in place.
+    pub fn peek(&mut self) -> Option<Item> {
+        while let Some(&Entry(item)) = self.heap.peek() {
+            if self.live.get(&item.state).is_some_and(|l| l.same(&item)) {
+                return Some(item);
+            }
+            self.heap.pop();
+        }
+        None
+    }
+
     pub fn len(&self) -> usize {
         self.live.len()
     }

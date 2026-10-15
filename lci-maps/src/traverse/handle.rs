@@ -47,7 +47,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -149,6 +149,9 @@ pub struct Snapshot {
     /// The fusion the first call ranked with; a resume keeps it. Written to
     /// the handle only under `rrf` (a handle without it is `boost`).
     pub fusion: Fusion,
+    /// Whether the first call passed through connective nodes (their pops
+    /// were free); a resume keeps it.
+    pub pass_through: bool,
 }
 
 impl Snapshot {
@@ -198,6 +201,7 @@ impl Snapshot {
                 "cross_map_hops": self.totals.cross_map_hops,
                 "tokens": self.totals.tokens,
                 "external_calls": self.totals.external_calls,
+                "pass_through_pops": self.totals.pass_through_pops,
                 "stops": self.totals.stops,
                 "steers": self.totals.steers,
             },
@@ -211,6 +215,7 @@ impl Snapshot {
                 .collect::<Vec<_>>(),
             "identity": self.identity,
             "boost": self.boost,
+            "pass_through": self.pass_through,
         })
     }
 
@@ -441,6 +446,7 @@ impl Snapshot {
                 cross_map_hops: u32_of(get(totals, "cross_map_hops")?)?,
                 tokens: u64_of(get(totals, "tokens")?)?,
                 external_calls: u32_of(get(totals, "external_calls")?)?,
+                pass_through_pops: u32_of(get(totals, "pass_through_pops")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
                 steers: u32_of(get(totals, "steers")?)?,
                 elapsed_ms: 0.0,
@@ -460,6 +466,9 @@ impl Snapshot {
                 None | Some(Value::Null) => Fusion::Boost,
                 Some(v) => string_of(v)?.parse::<Fusion>()?,
             },
+            pass_through: get(obj, "pass_through")?
+                .as_bool()
+                .ok_or("pass_through is not a boolean")?,
         })
     }
 }
@@ -704,6 +713,7 @@ impl Run<'_> {
             identity: self.t.identity.clone(),
             boost: self.t.boost,
             fusion: self.t.fusion,
+            pass_through: self.t.pass_through,
         }
     }
 
@@ -732,6 +742,7 @@ impl Run<'_> {
             identity,
             boost,
             fusion,
+            pass_through,
             ..
         } = snapshot;
         if self.t.identity.is_empty() {
@@ -739,6 +750,7 @@ impl Run<'_> {
         }
         self.t.boost = boost;
         self.t.fusion = fusion;
+        self.t.pass_through = pass_through;
         self.state_of = states
             .iter()
             .enumerate()
@@ -786,7 +798,7 @@ impl Run<'_> {
         }
         debug_assert_eq!(question, self.t.question);
         self.events.clear();
-        self.events.push(json!({
+        let mut resume = json!({
             "ev": "resume",
             "handle": handle,
             "pops": self.totals.pops,
@@ -803,7 +815,11 @@ impl Run<'_> {
             "scorer_changed": scorer_changed,
             "rank": rank_json(self.t.boost, self.t.fusion),
             "stops": stops_json(&self.t.stops),
-        }));
+        });
+        if let (true, Some(object)) = (pass_through, resume.as_object_mut()) {
+            object.insert("pass_through".into(), json!(true));
+        }
+        self.events.push(resume);
     }
 }
 

@@ -1238,6 +1238,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .identity(identity)
         .corroboration_boost(limits.corroboration_boost)
         .fusion(limits.fusion)
+        .pass_through(limits.pass_through)
         .top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),
@@ -1616,6 +1617,15 @@ fn response_json(
             }
         }
         object.insert("stop_reason".into(), json!(result.stop_reason.as_str()));
+        if let (true, Some(totals)) = (
+            result.pass_through,
+            object.get_mut("totals").and_then(Value::as_object_mut),
+        ) {
+            totals.insert(
+                "pass_through_pops".into(),
+                json!(result.totals.pass_through_pops),
+            );
+        }
         if let Some(checkpoint) = &result.checkpoint {
             object.insert("handle".into(), json!(handle));
             object.insert("checkpoint".into(), checkpoint_response(checkpoint));
