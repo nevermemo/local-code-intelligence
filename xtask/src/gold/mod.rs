@@ -556,6 +556,20 @@ pub struct Converted {
 /// Why an item cannot become an evaluate query.
 pub struct Dropped(pub &'static str);
 
+/// The files an item's gold expects (what `to-evaluate` writes as
+/// `expected_paths`), with the reason when the item has none. For the
+/// bench-only, gold-aware arms of `maps` (`oracle-policy`, `oracle-filter`).
+pub fn expected_files(set: Set, item: &Value) -> Result<Vec<String>, &'static str> {
+    let converted = match set {
+        Set::Impact => impact::to_query(item),
+        Set::Flow => flow::to_query(item),
+        Set::WhereTo => where_to::to_query(item),
+        Set::History => history::to_query(item),
+        Set::Instructions => instructions::to_query(item),
+    };
+    converted.map(|c| c.expected).map_err(|Dropped(why)| why)
+}
+
 pub fn to_evaluate(
     set: Set,
     items: &[Value],

@@ -97,6 +97,23 @@ pub struct BenchArgs {
     /// none.
     #[arg(long, default_value = "default")]
     policy: String,
+    /// BENCH-ONLY, GOLD-AWARE ORACLE ARM. A directory of per-item steering
+    /// policy files written by `maps oracle-policy` (`<slug of item id>.json`),
+    /// one passed to `lci traverse --policy` for each item. The policies are
+    /// built from the gold, so this violates the rule that the traversal never
+    /// sees the gold: the row says ORACLE and the arm is a steering ceiling,
+    /// not a result. An item with no file is skipped (cli_error). The
+    /// `[traverse]` config must allow the policy's `max_stops` (the cap
+    /// applies otherwise). Excludes --policy.
+    #[arg(long)]
+    policy_dir: Option<PathBuf>,
+    /// Depth at which states are recorded, not expanded (`lci traverse
+    /// --max-depth`; the deepest state expanded is at one less), up to the
+    /// `[traverse]` cap. `--max-depth 1` expands the seeds once and returns
+    /// their children (the one-hop arm; add `--include-seeds`). The row's note
+    /// says `max-depth=N`.
+    #[arg(long)]
+    max_depth: Option<u32>,
     /// How results are ranked (`lci traverse --fusion`): `boost` is the CLI's
     /// own default and passes nothing; `rrf` is the weighted reciprocal rank
     /// fusion. The row's note says when it is `rrf`.
@@ -185,6 +202,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
         "default" => None,
         other => Some(other.to_string()),
     };
+    if args.policy_dir.is_some() && policy.is_some() {
+        bail!("--policy and --policy-dir exclude each other");
+    }
     let trend_path = args
         .trend
         .clone()
@@ -227,6 +247,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
         tree,
         maps: args.maps.clone(),
         policy,
+        policy_dir: args.policy_dir.clone(),
+        max_depth: args.max_depth,
         fusion: fusion_arg(&args.fusion),
         pass_through: args.pass_through,
         rerank_frontier: args.rerank_frontier,
@@ -263,7 +285,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         wave: args.wave.clone(),
         maps: maps.clone(),
         maps_unavailable,
-        policy_label: policy_label(&args.policy),
+        policy_label: policy_label_of(&args),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
         note: note_with_flags(
@@ -271,7 +293,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            [priors_note(&args), tie_break_note(&args)],
+            extra_notes(&args),
         ),
         progress: true,
         rescored: false,
@@ -315,7 +337,7 @@ fn rescore(
         wave: args.wave.clone(),
         maps: args.maps.clone(),
         maps_unavailable: Vec::new(),
-        policy_label: policy_label(&args.policy),
+        policy_label: policy_label_of(args),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
         note: note_with_flags(
@@ -323,7 +345,7 @@ fn rescore(
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            [priors_note(args), tie_break_note(args)],
+            extra_notes(args),
         ),
         progress: false,
         rescored: true,
@@ -406,7 +428,7 @@ fn note_with_flags(
     fusion: &str,
     [pass_through, rerank_frontier]: [bool; 2],
     no_score_bound: bool,
-    models: [Option<String>; 2],
+    extras: Vec<Option<String>>,
 ) -> String {
     let flags = [
         fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
@@ -418,7 +440,7 @@ fn note_with_flags(
         .filter(|note| !note.is_empty())
         .map(str::to_owned)
         .into_iter()
-        .chain(flags.into_iter().chain(models).flatten());
+        .chain(flags.into_iter().chain(extras).flatten());
     parts.collect::<Vec<_>>().join("; ")
 }
 
@@ -438,6 +460,32 @@ fn priors_note(args: &BenchArgs) -> Option<String> {
         String::new()
     };
     Some(format!("priors={stem}{holdout}"))
+}
+
+/// The note parts that come from the model files, the depth limit and the
+/// oracle arm: priors, tie-break, `max-depth=N` and the ORACLE marker.
+fn extra_notes(args: &BenchArgs) -> Vec<Option<String>> {
+    vec![
+        priors_note(args),
+        tie_break_note(args),
+        args.max_depth.map(|depth| format!("max-depth={depth}")),
+        args.policy_dir.as_ref().map(|_| {
+            "ORACLE: per-item policies built from the gold (bench-only, gold-aware steering ceiling)"
+                .to_owned()
+        }),
+    ]
+}
+
+/// The policy column of the row: the policy file's stem, `default`, or for
+/// `--policy-dir` `oracle:<directory name>`.
+fn policy_label_of(args: &BenchArgs) -> String {
+    match &args.policy_dir {
+        Some(dir) => format!(
+            "oracle:{}",
+            dir.file_name().and_then(|n| n.to_str()).unwrap_or("dir")
+        ),
+        None => policy_label(&args.policy),
+    }
 }
 
 /// `tie-break=<file stem>`, for the row's note.
@@ -477,7 +525,7 @@ pub fn set_name(set: Set) -> &'static str {
 
 /// The scored population of a set (impact keeps its `primary` items), limited
 /// to the ids in `holdout` when given, cut to the first `limit`.
-fn select_items(
+pub(super) fn select_items(
     set: Set,
     items: Vec<Value>,
     limit: Option<usize>,
@@ -849,6 +897,11 @@ pub struct CliTraverser {
     pub tree: PathBuf,
     pub maps: Vec<String>,
     pub policy: Option<String>,
+    /// A directory of per-item policy files (`<slug of item id>.json`), the
+    /// bench-only oracle arm; excludes `policy`.
+    pub policy_dir: Option<PathBuf>,
+    /// `--max-depth` for the CLI.
+    pub max_depth: Option<u32>,
     /// `--fusion` for the CLI; `None` leaves its default.
     pub fusion: Option<String>,
     /// `--pass-through` for the CLI.
@@ -878,14 +931,16 @@ pub struct ProbeSeeds {
 }
 
 impl CliTraverser {
-    /// One `lci traverse` call. `maps` empty leaves the CLI to choose;
-    /// `seeds` empty lets it find the start nodes from the question.
-    fn invoke(
+    /// The `lci traverse` command of one call. `maps` empty leaves the CLI to
+    /// choose; `seeds` empty lets it find the start nodes from the question;
+    /// `policy_file` (an item's oracle policy) wins over `--policy`.
+    fn command(
         &self,
         maps: &[String],
         seeds: &[String],
         question: &str,
-    ) -> Result<(Traversed, Value), TraverseError> {
+        policy_file: Option<&Path>,
+    ) -> Command {
         let mut command = Command::new(&self.lci);
         command
             .arg("traverse")
@@ -903,8 +958,17 @@ impl CliTraverser {
         if !seeds.is_empty() {
             command.arg(format!("--seeds={}", seeds.join(",")));
         }
-        if let Some(policy) = &self.policy {
-            command.arg("--policy").arg(policy);
+        match (policy_file, &self.policy) {
+            (Some(file), _) => {
+                command.arg("--policy").arg(file);
+            }
+            (None, Some(policy)) => {
+                command.arg("--policy").arg(policy);
+            }
+            (None, None) => {}
+        }
+        if let Some(depth) = self.max_depth {
+            command.arg(format!("--max-depth={depth}"));
         }
         if let Some(fusion) = &self.fusion {
             command.arg(format!("--fusion={fusion}"));
@@ -925,6 +989,18 @@ impl CliTraverser {
         if let Some(file) = &self.tie_break {
             command.arg("--tie-break").arg(file);
         }
+        command
+    }
+
+    /// One `lci traverse` call (see [`Self::command`]).
+    fn invoke(
+        &self,
+        maps: &[String],
+        seeds: &[String],
+        question: &str,
+        policy_file: Option<&Path>,
+    ) -> Result<(Traversed, Value), TraverseError> {
+        let mut command = self.command(maps, seeds, question, policy_file);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -998,7 +1074,7 @@ impl CliTraverser {
             return Ok(found);
         }
         let maps = ["seeds.scip_names".to_string(), "graph.scip".to_string()];
-        let (traversed, _) = self.invoke(&maps, &[], question)?;
+        let (traversed, _) = self.invoke(&maps, &[], question, None)?;
         let Some(symbol) = traversed.seeds.iter().find(|s| s.starts_with("sym:")) else {
             return Err(TraverseError::Cli(format!(
                 "no probe start node: the name-token seeds found no symbol for the probe question (status {})",
@@ -1033,13 +1109,26 @@ impl CliTraverser {
 }
 
 impl Traverser for CliTraverser {
-    fn traverse(&self, _id: &str, question: &str) -> Result<(Traversed, Value), TraverseError> {
-        self.invoke(&self.maps, &[], question)
+    fn traverse(&self, id: &str, question: &str) -> Result<(Traversed, Value), TraverseError> {
+        let file = match &self.policy_dir {
+            Some(dir) => {
+                let file = dir.join(format!("{}.json", slug(id)));
+                if !file.is_file() {
+                    return Err(TraverseError::Cli(format!(
+                        "no oracle policy file for {id}: {}",
+                        file.display()
+                    )));
+                }
+                Some(file)
+            }
+            None => None,
+        };
+        self.invoke(&self.maps, &[], question, file.as_deref())
     }
 
     fn default_maps(&self, question: &str) -> Result<Vec<String>, TraverseError> {
         let seeds = self.probe_seeds(question)?;
-        let (_, raw) = self.invoke(&[], &seeds.nodes, question)?;
+        let (_, raw) = self.invoke(&[], &seeds.nodes, question, None)?;
         Ok(self
             .start_maps(&raw)?
             .into_iter()
@@ -1054,7 +1143,7 @@ impl Traverser for CliTraverser {
         } else {
             self.probe_seeds(question)?.nodes
         };
-        let (_, raw) = self.invoke(&[map.to_string()], &seeds, question)?;
+        let (_, raw) = self.invoke(&[map.to_string()], &seeds, question, None)?;
         let plan = if SEED_MAPS.contains(&map) {
             None
         } else {
@@ -2886,5 +2975,110 @@ mod tests {
         assert_eq!(rules.last().unwrap()["then"], "continue");
         // No machine path in a committed policy.
         assert!(!text.contains(":\\") && !text.contains("/Users/"));
+    }
+
+    // ---- BR3: --max-depth, --policy-dir
+
+    fn cli_traverser() -> CliTraverser {
+        CliTraverser {
+            lci: PathBuf::from("lci"),
+            scip: PathBuf::from("index.scip"),
+            tree: PathBuf::from("tree"),
+            maps: vec!["graph.scip".into()],
+            policy: None,
+            policy_dir: None,
+            max_depth: None,
+            fusion: None,
+            pass_through: false,
+            rerank_frontier: false,
+            no_score_bound: false,
+            priors: None,
+            tie_break: None,
+            top_k: 10,
+            out: PathBuf::from("out"),
+            timeout: Duration::from_secs(1),
+            probe: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn max_depth_and_an_items_policy_file_reach_the_cli() {
+        let mut t = cli_traverser();
+        let plain = args_of(&t.command(&t.maps, &[], "q", None));
+        assert!(!plain.iter().any(|a| a.starts_with("--max-depth")));
+        assert!(!plain.contains(&"--policy".to_owned()));
+        t.max_depth = Some(1);
+        t.policy = Some("impact".into());
+        let args = args_of(&t.command(&t.maps, &[], "q", None));
+        assert!(args.contains(&"--max-depth=1".to_owned()));
+        let at = args.iter().position(|a| a == "--policy").unwrap();
+        assert_eq!(args[at + 1], "impact");
+        // An item's file wins over --policy.
+        let file = PathBuf::from("pol/item-1.json");
+        let args = args_of(&t.command(&t.maps, &[], "q", Some(&file)));
+        let at = args.iter().position(|a| a == "--policy").unwrap();
+        assert_eq!(PathBuf::from(&args[at + 1]), file);
+        assert_eq!(args.iter().filter(|a| *a == "--policy").count(), 1);
+    }
+
+    #[test]
+    fn an_item_without_a_policy_file_is_skipped_not_run_without_steering() {
+        let dir = std::env::temp_dir().join(format!("xtask-br3-pd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("impact-1.json"), "[]").unwrap();
+        let mut t = cli_traverser();
+        t.lci = dir.join("no-such-binary");
+        t.policy_dir = Some(dir.clone());
+        // The file of impact-1 exists, so the call gets as far as running the binary.
+        let err = t.traverse("impact-1", "q").unwrap_err();
+        assert!(err.to_string().contains("run the lci binary"), "{err}");
+        // impact-2 has no file: refused before any run.
+        let err = t.traverse("impact-2", "q").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no oracle policy file for impact-2"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_row_says_max_depth_and_oracle() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: BenchArgs,
+        }
+        let plain = Wrapper::parse_from(["x", "--set", "impact", "--gold-dir", "g"]).args;
+        assert!(extra_notes(&plain).iter().all(Option::is_none));
+        assert_eq!(policy_label_of(&plain), "default");
+        let oracle = Wrapper::parse_from([
+            "x",
+            "--set",
+            "impact",
+            "--gold-dir",
+            "g",
+            "--max-depth",
+            "1",
+            "--policy-dir",
+            "work/oracle-impact",
+        ])
+        .args;
+        let notes: Vec<String> = extra_notes(&oracle).into_iter().flatten().collect();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], "max-depth=1");
+        assert!(notes[1].starts_with("ORACLE"));
+        assert_eq!(policy_label_of(&oracle), "oracle:oracle-impact");
+        let note = note_with_flags(None, "boost", [false, false], false, extra_notes(&oracle));
+        assert!(note.contains("max-depth=1") && note.contains("ORACLE"));
     }
 }

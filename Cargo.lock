@@ -6781,6 +6781,7 @@ dependencies = [
  "lci-core",
  "lci-maps",
  "reqwest 0.13.5",
+ "scip",
  "serde_json",
  "sha2 0.11.0",
  "sysinfo",

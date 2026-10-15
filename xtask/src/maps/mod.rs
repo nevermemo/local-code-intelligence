@@ -3,10 +3,12 @@
 //! `bench` runs `lci traverse` over a gold set, scores the answers with the
 //! gold scorers and appends a row to the trend file (see `bench.rs`).
 
+pub mod baseline;
 pub mod bench;
 pub mod compare;
 pub mod fit_priors;
 pub mod fit_tiebreak;
+pub mod oracle;
 pub mod trend;
 
 use anyhow::Result;
@@ -32,6 +34,24 @@ pub enum MapsCommand {
     /// stopped on the deadline or had failures on are left out unless
     /// --keep-failed.
     Compare(compare::CompareArgs),
+    /// Simple non-walk arms, written as run dirs that `maps compare` reads:
+    /// `impact` (M1.4 arm N, the exact closure of the anchor the question's
+    /// names give) and `history` (`git log -G/-S/--grep` on the frozen eval
+    /// tree). Neither is given the gold.
+    Baseline {
+        #[command(subcommand)]
+        which: baseline::BaselineCommand,
+    },
+    /// BENCH-ONLY, GOLD-AWARE (violates the rule that the traversal never sees
+    /// the gold; a steering ceiling, not a result). Writes one steering policy
+    /// file per gold item that prunes frontier nodes outside the item's gold
+    /// regions (files; see `maps bench --policy-dir`).
+    OraclePolicy(oracle::OraclePolicyArgs),
+    /// BENCH-ONLY, GOLD-AWARE control for `oracle-policy`. Keeps only the
+    /// results of a plain walk's run dir that lie in the gold regions, so the
+    /// ceiling can be read as steering (policy) versus result filtering
+    /// (this). Run the plain walk with `--top-k 40` for a pool.
+    OracleFilter(oracle::OracleFilterArgs),
 }
 
 pub fn run(command: MapsCommand) -> Result<()> {
@@ -40,5 +60,8 @@ pub fn run(command: MapsCommand) -> Result<()> {
         MapsCommand::FitPriors(args) => fit_priors::run(args),
         MapsCommand::FitTiebreak(args) => fit_tiebreak::run(args),
         MapsCommand::Compare(args) => compare::run(args),
+        MapsCommand::Baseline { which } => baseline::run(which),
+        MapsCommand::OraclePolicy(args) => oracle::run_policy(args),
+        MapsCommand::OracleFilter(args) => oracle::run_filter(args),
     }
 }
