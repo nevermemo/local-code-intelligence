@@ -156,6 +156,23 @@ async fn a_type_reaches_the_units_that_use_it_and_not_the_variant() {
     }
 }
 
+#[test]
+fn every_node_of_the_map_has_the_site_of_its_definition() {
+    let map = map();
+    // A made id (the enum, which the graph does not hold) and a resolved one.
+    let e = NodeId::Symbol(SymbolKey {
+        language: "rust".into(),
+        module_path: rust_module_path("a.rs"),
+        container: Vec::new(),
+        name: "E".into(),
+        kind: SymbolKind::Enum,
+        disambiguator: 0,
+    });
+    assert_eq!(map.site_of(&e), Some(("a.rs", 4, 5)));
+    assert_eq!(map.site_of(&function("use_foo")), Some(("a.rs", 2, 3)));
+    assert_eq!(map.site_of(&function("nowhere")), None);
+}
+
 #[tokio::test]
 async fn a_chain_of_callers_is_one_hop_at_a_time() {
     let map = map();
@@ -448,4 +465,69 @@ fn shape(edges: &[Edge]) -> Vec<(NodeId, u8, Option<Site>)> {
         .iter()
         .map(|e| (e.dst.clone(), e.conf, e.site.clone()))
         .collect()
+}
+
+// ---- the same index, one piece of evidence -----------------------------------------
+
+#[tokio::test]
+async fn graph_scip_and_scip_impact_over_one_index_corroborate_once() {
+    use crate::{
+        scip_graph::{ScipGraph, ScipMap},
+        traverse::{Seed, Traversal, TraversalBudget},
+    };
+    // `ping` and `pong` call each other: from `ping`, graph.scip offers
+    // `pong` (it calls it) and scip.impact offers `pong` (it uses `ping`).
+    let (ping, pong) = (sym("a/ping()."), sym("a/pong()."));
+    let docs = vec![RawDocument {
+        path: "a.rs".into(),
+        occurrences: vec![
+            occ((0, 3, 0, 7), &ping, 1, Some((0, 0, 0, 30))),
+            occ((0, 12, 0, 16), &pong, 0, None),
+            occ((1, 3, 1, 7), &pong, 1, Some((1, 0, 1, 30))),
+            occ((1, 12, 1, 16), &ping, 0, None),
+        ],
+    }];
+    let kinds: HashMap<String, Kind> = [(ping.clone(), Kind::Function), (pong, Kind::Function)]
+        .into_iter()
+        .collect();
+    let scip = ScipMap::with_default_ids(ScipGraph::build(&docs, None));
+    let ids = |symbol: &str| {
+        let graph = scip.graph();
+        Some(scip.node_id(graph.node_index(symbol)?).clone())
+    };
+    let impact = ImpactMap::new(
+        ImpactIndex::build(docs.clone(), &kinds, None),
+        &ids,
+        ImpactOptions::default(),
+    );
+    let start = ids(&ping).unwrap();
+    let mut registry = Registry::new(60.0);
+    registry.register(Box::new(scip), 1.0, 40).unwrap();
+    registry.register(Box::new(impact), 1.0, 40).unwrap();
+    assert_eq!(registry.independent_expanders(), 1);
+
+    let view = view();
+    let result = Traversal::new(
+        OnTheFly::new(&registry, &view),
+        vec![Seed::from(start)],
+        TraversalBudget {
+            pops: 10,
+            max_depth: 3,
+            deadline: Instant::now() + Duration::from_secs(10),
+            est_tokens: 100_000,
+            external_calls: 0,
+        },
+    )
+    .run()
+    .await;
+    let reached = result
+        .states
+        .iter()
+        .find(|s| s.parent.is_some())
+        .expect("ping reaches pong");
+    assert_eq!(
+        reached.maps.iter().copied().collect::<Vec<_>>(),
+        ["graph.scip", "scip.impact"]
+    );
+    assert_eq!(reached.n_maps(), 1, "one index, one piece of evidence");
 }

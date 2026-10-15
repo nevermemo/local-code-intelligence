@@ -387,6 +387,26 @@ async fn a_chunk_in_an_import_header_reaches_the_files_functions_and_then_scip_n
     assert!(result.totals.cross_map_hops >= 1);
 }
 
+#[tokio::test]
+async fn graph_scip_and_structure_contains_corroborate_a_node_once() {
+    let scip = demo_scip();
+    let (beta, gamma) = (symbol(&scip, "b/beta()."), symbol(&scip, "b/gamma()."));
+    let reg = registry_of(demo_scip(), Some(ContainsMap::new(&scip)));
+    assert_eq!(reg.independent_expanders(), 1);
+    // The file holds beta and gamma; beta calls gamma: both maps reach gamma.
+    let file = NodeId::file("src/b.rs").unwrap();
+    let result = walk(&reg, vec![Seed::from(file)], budget(20), |t| t).await;
+    let state = |node: &NodeId| result.states.iter().find(|s| s.node == *node).unwrap();
+    assert!(state(&beta).n_maps() == 1);
+    let gamma = state(&gamma);
+    assert_eq!(
+        gamma.maps.iter().copied().collect::<Vec<_>>(),
+        [SCIP_MAP_ID, CONTAINS_MAP_ID]
+    );
+    assert_eq!(gamma.n_maps(), 1, "two maps over one index are one map");
+    assert_eq!(result.ranked_potential(gamma), gamma.potential);
+}
+
 // ---- equivalence of the two sources ----------------------------------------
 
 fn file_chunk(path: &str, start: u32, end: u32, hash: &str) -> Chunk {

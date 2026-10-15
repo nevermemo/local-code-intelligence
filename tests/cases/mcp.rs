@@ -2240,12 +2240,27 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
             card["ranked_potential"].as_f64().unwrap(),
         );
         let n_maps = card["n_maps"].as_u64().unwrap();
-        let listed = card["maps"].as_array().unwrap().len() as u64;
-        assert!(n_maps >= 1 && n_maps <= listed, "{card}");
+        let listed: Vec<&str> = card["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|map| map.as_str().unwrap())
+            .collect();
+        assert!(n_maps >= 1 && n_maps <= listed.len() as u64, "{card}");
         assert!(
             (ranked - potential * (1.0 + 0.1 * (n_maps - 1) as f64)).abs() < 1e-9,
             "{card}"
         );
+        // Both maps read the one SCIP index: reached by them alone, a node
+        // has one independent map, however many are listed (the engine test
+        // `graph_scip_and_structure_contains_corroborate_a_node_once` has a
+        // node that both reach).
+        if listed
+            .iter()
+            .all(|map| ["graph.scip", "structure.contains"].contains(map))
+        {
+            assert_eq!(n_maps, 1, "{card}");
+        }
     }
 
     // The walk goes on from the seeds along the call edges.

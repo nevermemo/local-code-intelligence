@@ -213,6 +213,14 @@ impl ImpactMap {
         self.ids.get(self.ix.def_index(symbol)?)?.as_ref()
     }
 
+    /// Where the map's node is defined: the path and the 0-based line and
+    /// column of the name. For a unit the SCIP graph does not hold (a type, a
+    /// constant) this is the only place that knows.
+    pub fn site_of(&self, node: &NodeId) -> Option<(&str, u32, u32)> {
+        let def = &self.ix.defs[*self.by_node.get(node)?];
+        Some((&def.path, def.name_range.0, def.name_range.1))
+    }
+
     /// Every edge leaving `node` (unsorted, uncapped) and the occurrences read.
     fn all_edges(&self, node: &NodeId) -> (Vec<Edge>, u64) {
         let Some(&def) = self.by_node.get(node) else {
@@ -333,7 +341,8 @@ impl Map for ImpactMap {
             expand_p50_ms: self.log.p50(),
             coverage: self.descriptor.emits.clone(),
             freshness_lag: None,
-            dependent: false,
+            // The same SCIP index as `graph.scip`, read in reverse.
+            dependent: true,
             good_for: vec![QuestionType::Impact, QuestionType::Flow],
         }
     }

@@ -44,6 +44,8 @@ struct GraphMap {
     /// not run when its call would pass it. `runs` adds the calls it made.
     honors_calls: bool,
     runs: Option<Arc<AtomicU32>>,
+    /// How many times the engine asked the map to expand a node.
+    invoked: Arc<AtomicU32>,
     /// The card says the map derives from a graph shared with other maps.
     dependent: bool,
 }
@@ -74,6 +76,7 @@ impl GraphMap {
             site_path: None,
             honors_calls: false,
             runs: None,
+            invoked: Arc::default(),
             dependent: false,
         }
     }
@@ -144,6 +147,7 @@ impl Map for GraphMap {
         budget: Budget,
         _view: &SnapshotView<'_>,
     ) -> crate::edge::Expanded {
+        self.invoked.fetch_add(1, Ordering::Relaxed);
         assert!(!self.panics, "this map panics on purpose");
         if self.honors_calls && self.cost.external_calls > budget.max_external_calls {
             return crate::edge::Expanded::default();
@@ -379,6 +383,11 @@ async fn the_deadline_is_never_exceeded() {
     assert_eq!(
         expands[1]["calls"][0]["failure"],
         "did not answer before the deadline"
+    );
+    // The call that missed the deadline is counted, with its failure.
+    assert_eq!(
+        (result.maps["slow"].calls, result.maps["slow"].failures),
+        (2, 1)
     );
 }
 

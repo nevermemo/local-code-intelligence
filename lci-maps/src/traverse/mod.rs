@@ -204,9 +204,9 @@ pub struct State {
     /// The maps whose edges reached the node, by any route. A seed's own map
     /// (`Seed::map`) is not here.
     pub maps: BTreeSet<MapId>,
-    /// The part of `maps` whose cards say `dependent` (derived from one
+    /// How many of `maps` have a card that says `dependent` (derived from one
     /// shared graph): together they count as one map.
-    pub dependent: BTreeSet<MapId>,
+    pub dependent: usize,
     /// The witness classes of those edges.
     pub witnesses: BTreeSet<WitnessClass>,
 }
@@ -215,7 +215,7 @@ impl State {
     /// How many independent maps reached the node: the dependent maps count
     /// once among them.
     pub fn n_maps(&self) -> usize {
-        self.maps.len() - self.dependent.len() + usize::from(!self.dependent.is_empty())
+        self.maps.len() - self.dependent + usize::from(self.dependent > 0)
     }
 
     /// `potential * (1 + boost * (n_maps - 1))`: the value results are ranked
@@ -284,10 +284,7 @@ impl TraversalResult {
 
     /// The events as JSON lines.
     pub fn events_jsonl(&self) -> String {
-        self.events
-            .iter()
-            .map(|e| format!("{e}\n"))
-            .collect::<String>()
+        trace::jsonl(&self.events)
     }
 }
 
@@ -548,7 +545,7 @@ impl<'s> Run<'s> {
             potential: 1.0,
             fanout,
             maps: BTreeSet::new(),
-            dependent: BTreeSet::new(),
+            dependent: 0,
             witnesses: BTreeSet::new(),
         });
         self.state_of.insert(seed.node.clone(), index);
@@ -757,6 +754,13 @@ impl<'s> Run<'s> {
             .states()
             .map(|s| self.states[s].potential)
             .fold(f64::NEG_INFINITY, f64::max);
+        // The most a state can be corroborated by: the maps now registered, or
+        // the evidence a resumed state kept from maps that have left.
+        let n_maps = self
+            .states
+            .iter()
+            .map(State::n_maps)
+            .fold(n_maps, usize::max);
         let factor = 1.0 + self.t.boost * n_maps.saturating_sub(1) as f64;
         (best * factor <= kth).then(|| {
             json!({
@@ -779,12 +783,13 @@ impl<'s> Run<'s> {
         }
     }
 
-    fn card(&mut self, map: MapId) -> MapCard {
+    fn map_card(&mut self, map: MapId) -> &MapCard {
         let source = &self.t.source;
-        self.cards
-            .entry(map)
-            .or_insert_with(|| source.card(map))
-            .clone()
+        self.cards.entry(map).or_insert_with(|| source.card(map))
+    }
+
+    fn card(&mut self, map: MapId) -> MapCard {
+        self.map_card(map).clone()
     }
 
     /// Expands one state. `Some` when a budget (or a timeout) cut the
@@ -818,8 +823,13 @@ impl<'s> Run<'s> {
         self.counted.clear();
         let Expansion { edges, calls } = self.t.source.edges(&node, budget).await;
 
+        // Every call that ran is counted here, before any early exit, cut or
+        // retried; the tokens of a call are counted once it completes.
         for call in &calls {
             *self.map_ms.entry(call.map).or_default() += call.ms;
+            let stat = self.tally.maps.entry(call.map).or_default();
+            stat.calls += 1;
+            stat.failures += u32::from(call.failure.is_some());
         }
         let call_tokens: u64 = calls.iter().map(|c| c.cost.est_tokens).sum();
         let call_external: u32 = calls
@@ -942,7 +952,7 @@ impl<'s> Run<'s> {
                 potential,
                 fanout,
                 maps: BTreeSet::new(),
-                dependent: BTreeSet::new(),
+                dependent: 0,
                 witnesses: BTreeSet::new(),
             });
             self.add_evidence(child, edge);
@@ -967,7 +977,7 @@ impl<'s> Run<'s> {
         let mut corroborated = 0;
         for (i, edge) in kept.iter().enumerate() {
             if let (false, Some(reached)) = (chosen[i], target[i]) {
-                self.corroborate(reached, edge);
+                self.add_evidence(reached, edge);
                 corroborated += 1;
             }
         }
@@ -997,10 +1007,7 @@ impl<'s> Run<'s> {
         }
         if !cut {
             for call in &calls {
-                let stat = self.tally.maps.entry(call.map).or_default();
-                stat.calls += 1;
-                stat.failures += u32::from(call.failure.is_some());
-                stat.tokens += call.cost.est_tokens;
+                self.tally.maps.entry(call.map).or_default().tokens += call.cost.est_tokens;
             }
         }
         let cost = self
@@ -1043,25 +1050,20 @@ impl<'s> Run<'s> {
         false
     }
 
-    /// An edge into `reached` that was not followed: its maps and witness
-    /// classes still count as evidence for the node.
-    fn corroborate(&mut self, reached: usize, edge: &FusedEdge) {
-        self.add_evidence(reached, edge);
-    }
-
-    /// The maps and witness classes of `edge` join the evidence of a state;
-    /// returns the maps that were new to it.
+    /// The maps and witness classes of `edge` join the evidence of a state
+    /// (an edge that was not followed still counts for the node); returns the
+    /// maps that were new to it.
     fn add_evidence(&mut self, index: usize, edge: &FusedEdge) -> Vec<MapId> {
         let mut new_maps = Vec::new();
         for &map in &edge.maps {
-            let dependent = self.card(map).dependent;
-            let state = &mut self.states[index];
-            if state.maps.insert(map) {
-                new_maps.push(map);
-                if dependent {
-                    state.dependent.insert(map);
-                }
+            if self.states[index].maps.contains(&map) {
+                continue;
             }
+            let dependent = self.map_card(map).dependent;
+            let state = &mut self.states[index];
+            state.maps.insert(map);
+            new_maps.push(map);
+            state.dependent += usize::from(dependent);
         }
         self.states[index]
             .witnesses

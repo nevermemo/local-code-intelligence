@@ -240,19 +240,15 @@ async fn corroboration_and_its_boost_survive_a_handle() {
     let again = handle::Snapshot::from_json(&snapshot.to_json()).unwrap();
     assert_eq!(again, snapshot);
     assert!(again.states.iter().any(|s| s.n_maps() > 0));
-    // A handle from before corroboration existed reads with no maps.
-    let mut old = snapshot.to_json();
-    for s in old["states"].as_array_mut().unwrap() {
-        let s = s.as_object_mut().unwrap();
-        s.remove("maps");
-        s.remove("witnesses");
+    // A handle of an older version is refused, not read as a current one.
+    for version in [3, 4] {
+        let mut old = snapshot.to_json();
+        old["version"] = Value::from(version);
+        assert_eq!(
+            handle::Snapshot::from_json(&old).unwrap_err(),
+            "unsupported snapshot version"
+        );
     }
-    let old = handle::Snapshot::from_json(&old).unwrap();
-    assert!(
-        old.states
-            .iter()
-            .all(|s| s.maps.is_empty() && s.witnesses.is_empty())
-    );
 
     // A resumed walk ranks with the boost the handle holds, not the default.
     let first = walk(&reg, vec![seed("s")], budget(2), |t| {
@@ -369,7 +365,7 @@ async fn maps_derived_from_one_graph_corroborate_once() {
     let snapshot = first.snapshot.expect("the walk paused");
     let restored = crate::traverse::handle::Snapshot::from_json(&snapshot.to_json()).unwrap();
     assert_eq!(restored, snapshot);
-    assert!(restored.states.iter().any(|s| !s.dependent.is_empty()));
+    assert!(restored.states.iter().any(|s| s.dependent > 0));
 }
 
 #[test]

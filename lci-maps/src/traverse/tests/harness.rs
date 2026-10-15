@@ -11,7 +11,7 @@
 use super::*;
 use crate::{traverse::handle::Snapshot, walk::SplitMix};
 
-const DEFAULT_SEEDS: u64 = 64;
+const DEFAULT_SEEDS: u64 = 512;
 const HUGE_TOKENS: u64 = u64::MAX / 2;
 const HUGE_CALLS: u32 = u32::MAX / 2;
 
@@ -130,11 +130,47 @@ impl Case {
 /// The calls the maps made (they keep to the allowance they are given).
 type Runs = Vec<Arc<AtomicU32>>;
 
+/// How often the engine asked each map to expand a node.
+type Invoked = BTreeMap<MapId, u32>;
+
+/// What a call may change from the case: the maps registered (the first
+/// `maps`), the result limit of the score bound, and the budget (`roomy`: no
+/// cap on tokens or external calls).
+#[derive(Clone, Copy)]
+struct Setup {
+    maps: usize,
+    top_k: Option<usize>,
+    roomy: bool,
+}
+
+impl Setup {
+    fn of(case: &Case) -> Self {
+        Self {
+            maps: case.maps.len(),
+            top_k: case.top_k,
+            roomy: false,
+        }
+    }
+}
+
 /// One call of the case: fresh, or a resume of `snapshot`.
-async fn run(case: &Case, pops: u32, snapshot: Option<Snapshot>) -> (TraversalResult, u32) {
-    let runs: Runs = case.maps.iter().map(|_| Arc::default()).collect();
-    let maps = case
-        .maps
+async fn run(
+    case: &Case,
+    pops: u32,
+    snapshot: Option<Snapshot>,
+) -> (TraversalResult, u32, Invoked) {
+    run_with(case, pops, snapshot, Setup::of(case)).await
+}
+
+async fn run_with(
+    case: &Case,
+    pops: u32,
+    snapshot: Option<Snapshot>,
+    setup: Setup,
+) -> (TraversalResult, u32, Invoked) {
+    let specs = &case.maps[..setup.maps];
+    let runs: Runs = specs.iter().map(|_| Arc::default()).collect();
+    let maps: Vec<GraphMap> = specs
         .iter()
         .zip(&runs)
         .map(|(spec, count)| {
@@ -148,10 +184,18 @@ async fn run(case: &Case, pops: u32, snapshot: Option<Snapshot>) -> (TraversalRe
             map
         })
         .collect();
+    let invoked: Vec<(MapId, Arc<AtomicU32>)> = maps
+        .iter()
+        .map(|m| (m.descriptor.id, m.invoked.clone()))
+        .collect();
     let reg = registry(maps);
     let view = view();
     let source = OnTheFly::new(&reg, &view);
-    let budget = case.budget(pops);
+    let mut budget = case.budget(pops);
+    if setup.roomy {
+        budget.est_tokens = HUGE_TOKENS;
+        budget.external_calls = HUGE_CALLS;
+    }
     let mut traversal = match snapshot {
         Some(snapshot) => Traversal::resumed(source, snapshot, budget),
         None => Traversal::new(
@@ -175,7 +219,7 @@ async fn run(case: &Case, pops: u32, snapshot: Option<Snapshot>) -> (TraversalRe
         2 => traversal.scorer(RandomScorer::new(case.seed)),
         _ => traversal,
     };
-    if let Some(k) = case.top_k {
+    if let Some(k) = setup.top_k {
         traversal = traversal.top_k(k, reg.independent_expanders());
     }
     if let Some(n) = case.every {
@@ -183,7 +227,11 @@ async fn run(case: &Case, pops: u32, snapshot: Option<Snapshot>) -> (TraversalRe
     }
     let result = traversal.run().await;
     let made = runs.iter().map(|count| count.load(Ordering::Relaxed)).sum();
-    (result, made)
+    let invoked = invoked
+        .into_iter()
+        .map(|(id, count)| (id, count.load(Ordering::Relaxed)))
+        .collect();
+    (result, made, invoked)
 }
 
 fn results(result: &TraversalResult) -> usize {
@@ -225,7 +273,44 @@ fn same_walk(a: &TraversalResult, b: &TraversalResult) -> bool {
         && totals(a) == totals(b)
 }
 
-fn invariants(case: &Case, pops: u32, result: &TraversalResult, made: u32) -> Result<(), String> {
+/// Each map's count of calls is the number of times the engine asked it,
+/// whatever came of the expansion (cut, over the budget, retried), and a map
+/// that has time has a count.
+fn counts_match(result: &TraversalResult, invoked: &Invoked) -> Result<(), String> {
+    let ids: BTreeSet<MapId> = result.maps.keys().chain(invoked.keys()).copied().collect();
+    for id in ids {
+        let counted = result.maps.get(id).map_or(0, |stat| stat.calls);
+        let asked = invoked.get(id).copied().unwrap_or(0);
+        ensure!(
+            counted == asked,
+            "{id}: {counted} calls counted, {asked} made"
+        );
+    }
+    ensure!(
+        result.map_ms.keys().all(|id| result.maps.contains_key(id)),
+        "a map has time and no count: {:?} / {:?}",
+        result.map_ms,
+        result.maps
+    );
+    Ok(())
+}
+
+fn plus(a: &Invoked, b: &Invoked) -> Invoked {
+    let mut sum = a.clone();
+    for (id, n) in b {
+        *sum.entry(id).or_default() += n;
+    }
+    sum
+}
+
+fn invariants(
+    case: &Case,
+    pops: u32,
+    result: &TraversalResult,
+    made: u32,
+    invoked: &Invoked,
+) -> Result<(), String> {
+    counts_match(result, invoked)?;
     let totals = &result.totals;
     ensure!(
         totals.pops <= pops && result.popped.len() == totals.pops as usize,
@@ -345,21 +430,37 @@ fn invariants(case: &Case, pops: u32, result: &TraversalResult, made: u32) -> Re
 }
 
 async fn check(case: &Case, tally: &mut BTreeMap<&'static str, usize>) -> Result<(), String> {
-    let (straight, made) = run(case, case.pops, None).await;
-    invariants(case, case.pops, &straight, made)?;
+    let (straight, made, seen) = run(case, case.pops, None).await;
+    invariants(case, case.pops, &straight, made, &seen)?;
 
     // The same seed gives the same walk, event for event.
-    let (again, _) = run(case, case.pops, None).await;
+    let (again, ..) = run(case, case.pops, None).await;
     ensure!(
         same_walk(&straight, &again) && straight.events == again.events,
         "two runs differ"
     );
 
+    // A call cut by the budget, resumed with room, is counted as often as it
+    // was made.
+    if let Some(snapshot) = straight
+        .snapshot
+        .clone()
+        .filter(|_| straight.stop_reason == stop::StopReason::Budget)
+    {
+        let roomy = Setup {
+            roomy: true,
+            ..Setup::of(case)
+        };
+        let (more, _, seen_more) = run_with(case, case.pops, Some(snapshot), roomy).await;
+        counts_match(&more, &plus(&seen, &seen_more))?;
+        *tally.entry("retried").or_default() += 1;
+    }
+
     // A walk paused and resumed through its JSON handle equals the straight
     // one (the random scorer keeps its state outside the handle).
     if case.scorer != 2 {
-        let (first, made) = run(case, case.pause_at, None).await;
-        invariants(case, case.pause_at, &first, made)?;
+        let (first, made, seen_first) = run(case, case.pause_at, None).await;
+        invariants(case, case.pause_at, &first, made, &seen_first)?;
         let mut events = walk_events(&first.events);
         let paused = first
             .snapshot
@@ -369,8 +470,35 @@ async fn check(case: &Case, tally: &mut BTreeMap<&'static str, usize>) -> Result
             let back = Snapshot::from_json(&snapshot.to_json())?;
             ensure!(back == snapshot, "the handle does not read back");
             *tally.entry("resumed").or_default() += 1;
-            let (second, made) = run(case, case.pops, Some(back)).await;
-            invariants(case, case.pops, &second, first.totals.external_calls + made)?;
+
+            // Resumed with fewer maps, the score bound still counts the
+            // evidence the states kept from the maps that left.
+            if case.maps.len() > 1 {
+                let fewer = Setup {
+                    maps: case.maps.len() - 1,
+                    top_k: Some(case.top_k.unwrap_or(1)),
+                    roomy: false,
+                };
+                let (rest, ..) = run_with(case, case.pops, Some(back.clone()), fewer).await;
+                if let Some(bound) = rest.events.iter().find(|e| e["ev"] == "bound") {
+                    *tally.entry("bound_fewer_maps").or_default() += 1;
+                    let kept = rest.states.iter().map(State::n_maps).max().unwrap_or(0);
+                    ensure!(
+                        bound["maps"].as_u64().unwrap() as usize >= kept,
+                        "a bound over {} maps, states hold {kept}: {bound}",
+                        bound["maps"]
+                    );
+                }
+            }
+
+            let (second, made, seen_second) = run(case, case.pops, Some(back)).await;
+            invariants(
+                case,
+                case.pops,
+                &second,
+                first.totals.external_calls + made,
+                &plus(&seen_first, &seen_second),
+            )?;
             events.extend(walk_events(&second.events));
             second
         } else {
@@ -423,7 +551,16 @@ async fn harness_random_walks_keep_the_engine_invariants() {
     if replay.is_none() {
         // The seeds reach the cases the invariants are about.
         for what in [
-            "bound", "pops", "budget", "complete", "relax", "alt_path", "steer", "resumed",
+            "bound",
+            "pops",
+            "budget",
+            "complete",
+            "relax",
+            "alt_path",
+            "steer",
+            "resumed",
+            "retried",
+            "bound_fewer_maps",
         ] {
             assert!(
                 tally.get(what).copied().unwrap_or(0) > 0,

@@ -510,8 +510,8 @@ pub struct TraverseConfig {
     pub tau: f32,
     /// How much each independent map beyond the first that reached a node
     /// lifts the node's rank: `potential * (1 + boost * (maps - 1))`. A
-    /// finite number from `0` (rank by potential alone). A resumed traversal
-    /// keeps the boost its handle was made with.
+    /// number from `0` (rank by potential alone) to `10`. A resumed
+    /// traversal keeps the boost its handle was made with.
     pub corroboration_boost: f64,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
@@ -526,6 +526,7 @@ impl TraverseConfig {
     pub const MAX_EST_TOKENS_LIMIT: u64 = 1_000_000;
     pub const MAX_DEADLINE_MS_LIMIT: u64 = 60_000;
     pub const MAX_STOPS_LIMIT: u32 = 32;
+    pub const MAX_CORROBORATION_BOOST: f64 = 10.0;
 
     fn is_default(&self) -> bool {
         *self == Self::default()
@@ -572,8 +573,9 @@ impl TraverseConfig {
             self.tau
         );
         ensure!(
-            self.corroboration_boost.is_finite() && self.corroboration_boost >= 0.0,
-            "traverse.corroboration_boost must be a finite number from 0 (got {})",
+            (0.0..=Self::MAX_CORROBORATION_BOOST).contains(&self.corroboration_boost),
+            "traverse.corroboration_boost must be a number from 0 to {} (got {})",
+            Self::MAX_CORROBORATION_BOOST,
             self.corroboration_boost
         );
         ensure!(
@@ -2759,7 +2761,7 @@ mod tests {
         let text = format!("{}[traverse]\nnope = 1\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 13] = [
+        let bad: [(&str, Set); 15] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2775,6 +2777,10 @@ mod tests {
             ("tau", |t| t.tau = f32::NAN),
             ("corroboration_boost", |t| t.corroboration_boost = -0.1),
             ("corroboration_boost", |t| t.corroboration_boost = f64::NAN),
+            ("corroboration_boost", |t| t.corroboration_boost = 1e308),
+            ("corroboration_boost", |t| {
+                t.corroboration_boost = TraverseConfig::MAX_CORROBORATION_BOOST + 0.5
+            }),
             ("seed_k", |t| t.seed_k = 0),
             ("seed_k", |t| {
                 t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1
@@ -2795,7 +2801,9 @@ mod tests {
         };
         config.traverse.max_stops = 0;
         config.traverse.tau = 0.0;
-        config.traverse.corroboration_boost = 0.0;
-        config.validate().unwrap();
+        for boost in [0.0, TraverseConfig::MAX_CORROBORATION_BOOST] {
+            config.traverse.corroboration_boost = boost;
+            config.validate().unwrap();
+        }
     }
 }

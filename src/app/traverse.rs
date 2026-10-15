@@ -1306,11 +1306,11 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         call,
         &result,
         &found,
-        &loaded,
         handle.as_deref(),
         trace_path.as_deref(),
         notes,
     );
+    add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
     }
@@ -1531,7 +1531,6 @@ fn response_json(
     call: &Call<'_>,
     result: &TraversalResult,
     found: &Seeds,
-    loaded: &Loaded,
     handle: Option<&str>,
     trace_path: Option<&Path>,
     notes: Vec<String>,
@@ -1565,7 +1564,7 @@ fn response_json(
         })
         .collect();
     let totals = &result.totals;
-    // Per map: the expansions it answered over the whole traversal and the
+    // Per map: the calls made to it over the whole traversal and the
     // milliseconds it took in this call.
     let per_map: serde_json::Map<String, Value> = result
         .maps
@@ -1622,7 +1621,6 @@ fn response_json(
             object.insert("notes".into(), json!(notes));
         }
     }
-    add_sites(&mut response, loaded, &found.details);
     response
 }
 
@@ -1632,8 +1630,11 @@ fn response_json(
 /// and column of its name), the first line of the chunk of a hybrid seed that
 /// is a chunk node, the start of a file node. Paths are repository-relative
 /// with `/`; lines and columns count from 1, like the other line ranges of
-/// `search_code`. A node nothing locates has no `site`.
-fn add_sites(response: &mut Value, loaded: &Loaded, seeds: &[Value]) {
+/// `search_code`. A node nothing locates has no `site`. The start nodes
+/// (`seeds`, which a complete run does not return as results) are located in
+/// `seed_sites`, by node id. A symbol the SCIP graph does not hold (a type
+/// `scip.impact` offers) is located by that map.
+fn add_sites(response: &mut Value, loaded: &Loaded, impact: Option<&ImpactMap>, seeds: &[Value]) {
     const LISTS: [&str; 4] = [
         "/results",
         "/checkpoint/answer",
@@ -1650,6 +1651,13 @@ fn add_sites(response: &mut Value, loaded: &Loaded, seeds: &[Value]) {
             );
         }
     }
+    let given: Vec<String> = response["seeds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|seed| seed.as_str().map(str::to_owned))
+        .collect();
+    wanted.extend(given.iter().cloned());
     if wanted.is_empty() {
         return;
     }
@@ -1687,6 +1695,26 @@ fn add_sites(response: &mut Value, loaded: &Loaded, seeds: &[Value]) {
                 ),
             );
         }
+    }
+    if let Some(impact) = impact {
+        for node in &wanted {
+            let found = NodeId::from_str(node)
+                .ok()
+                .and_then(|id| impact.site_of(&id));
+            if let (false, Some((path, line, col))) = (sites.contains_key(node), found) {
+                sites.insert(
+                    node.clone(),
+                    site_json(path, u64::from(line) + 1, u64::from(col) + 1),
+                );
+            }
+        }
+    }
+    let seed_sites: serde_json::Map<String, Value> = given
+        .iter()
+        .filter_map(|seed| Some((seed.clone(), sites.get(seed)?.clone())))
+        .collect();
+    if let (false, Some(object)) = (seed_sites.is_empty(), response.as_object_mut()) {
+        object.insert("seed_sites".into(), Value::Object(seed_sites));
     }
     for list in LISTS {
         let Some(Value::Array(items)) = response.pointer_mut(list) else {
@@ -2209,7 +2237,7 @@ mod tests {
             },
         });
         let details: Vec<Value> = seeds.iter().map(|s| s.info.clone()).collect();
-        add_sites(&mut response, &loaded, &details);
+        add_sites(&mut response, &loaded, None, &details);
         let site = &response["results"][0]["site"];
         assert_eq!(site["path"], "src/search.rs");
         assert!(site["line"].as_u64().unwrap() >= 1 && site["col"].as_u64().unwrap() >= 1);
@@ -2228,6 +2256,63 @@ mod tests {
         // The checkpoint's cards carry the same site as the results'.
         assert_eq!(response["checkpoint"]["answer"][0]["site"], *site);
         assert_eq!(response["checkpoint"]["frontier"][0]["site"], *site);
+    }
+
+    #[test]
+    fn a_seed_has_its_site_on_a_run_that_returns_no_checkpoint() {
+        let loaded = loaded();
+        let seeds = map_hits(&loaded, "x", &[hit("src/search.rs", (13, 15), 1)]);
+        let symbol = seeds.iter().find(|s| s.info["kind"] == "symbol").unwrap();
+        let given = NodeId::file("src/given.rs").unwrap().to_string();
+        // A complete run: the seeds are not results, and there is no checkpoint.
+        let mut response = json!({
+            "seeds": [symbol.node.to_string(), given],
+            "results": [],
+        });
+        let details: Vec<Value> = seeds.iter().map(|s| s.info.clone()).collect();
+        add_sites(&mut response, &loaded, None, &details);
+        let sites = &response["seed_sites"];
+        assert_eq!(sites[symbol.node.to_string()]["path"], "src/search.rs");
+        assert!(sites[symbol.node.to_string()]["line"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            sites[&given],
+            json!({"path": "src/given.rs", "line": 1, "col": 1})
+        );
+    }
+
+    #[test]
+    fn a_symbol_outside_the_graph_is_located_by_scip_impact() {
+        // A struct is no node of the SCIP graph (functions only); scip.impact
+        // gives it an id of its own and knows where it is defined.
+        let symbol = "rust-analyzer cargo demo 0.1.0 types/Config#".to_owned();
+        let docs = vec![RawDocument {
+            path: "src/types.rs".into(),
+            occurrences: vec![RawOccurrence {
+                range: (2, 11, 2, 17),
+                symbol: symbol.clone(),
+                roles: 1,
+                enclosing: Some((2, 0, 4, 1)),
+            }],
+        }];
+        let kinds = HashMap::from([(
+            symbol.clone(),
+            scip::types::symbol_information::Kind::Struct,
+        )]);
+        let impact = ImpactMap::new(
+            ImpactIndex::build(docs, &kinds, None),
+            &|_| None,
+            ImpactOptions::default(),
+        );
+        let node = impact.node_of(&symbol).unwrap().to_string();
+        let loaded = loaded();
+        let mut response = json!({"results": [{"node": node, "via": "scip.impact"}]});
+        add_sites(&mut response, &loaded, None, &[]);
+        assert!(response["results"][0].get("site").is_none());
+        add_sites(&mut response, &loaded, Some(&impact), &[]);
+        assert_eq!(
+            response["results"][0]["site"],
+            json!({"path": "src/types.rs", "line": 3, "col": 12})
+        );
     }
 
     #[test]

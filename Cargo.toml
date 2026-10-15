@@ -40,6 +40,7 @@ spike-maps = []
 
 [dev-dependencies]
 tempfile = "3"
+scip = "0.10.0"
 
 [[bin]]
 name = "fake-lsp-server"

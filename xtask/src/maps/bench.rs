@@ -436,8 +436,8 @@ pub struct Traversed {
     pub status: String,
     pub seeds: Vec<String>,
     pub results: Vec<ResultNode>,
-    /// The site of every node a card of the response located (results and
-    /// checkpoint cards), to give the seeds theirs.
+    /// The site of every node a card of the response located (results,
+    /// checkpoint cards and `seed_sites`), to give the seeds theirs.
     pub sites: BTreeMap<String, Site>,
     pub totals: Option<Totals>,
     /// The whole process, when it was measured (a rescored run has none).
@@ -491,6 +491,12 @@ impl Traversed {
                 {
                     sites.entry(node.to_string()).or_insert(site);
                 }
+            }
+        }
+        // The seeds' own sites: a run that returns no checkpoint still has them.
+        for (node, site) in value["seed_sites"].as_object().into_iter().flatten() {
+            if let Some(site) = Site::from_json(site) {
+                sites.entry(node.clone()).or_insert(site);
             }
         }
         let totals = value
@@ -1718,6 +1724,29 @@ mod tests {
         let items = vec![impact_item("i1", "q", "src/app/search.rs", "x")];
         let outcome = bench_set(Set::Impact, &items, &Fixture::new(answers), &cfg).unwrap();
         // The seed leads, located by its checkpoint card.
+        assert_eq!(
+            outcome.run["i1"][0],
+            json!({"path": "src/app/search.rs", "line": 12})
+        );
+    }
+
+    #[test]
+    fn a_seed_keeps_its_site_on_a_run_that_returns_no_checkpoint() {
+        // A completed run has no checkpoint: the seed's site comes from
+        // `seed_sites`.
+        let raw = json!({
+            "status": "complete", "seeds": [SEARCH_FN],
+            "seed_sites": {SEARCH_FN: {"path": "src\\app\\search.rs", "line": 12, "col": 4}},
+            "results": [{"node": METHOD, "text": "t"}],
+        });
+        let traversed = Traversed::from_json(&raw, None);
+        assert_eq!(traversed.sites[SEARCH_FN].line, 12);
+        let mut cfg = config(&["graph.scip"]);
+        cfg.include_seeds = true;
+        let mut answers = BTreeMap::new();
+        answers.insert("q".into(), raw);
+        let items = vec![impact_item("i1", "q", "src/app/search.rs", "x")];
+        let outcome = bench_set(Set::Impact, &items, &Fixture::new(answers), &cfg).unwrap();
         assert_eq!(
             outcome.run["i1"][0],
             json!({"path": "src/app/search.rs", "line": 12})

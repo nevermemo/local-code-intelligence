@@ -6,9 +6,9 @@
 //!
 //! An answer matches a gold node by its `Owner::name` / `module::name`, by
 //! its bare name when that is unambiguous inside the item, or by
-//! `file:line` of the definition; case-insensitive, backticks and a trailing
-//! `()` ignored. Nodes in `accept.ignorable_nodes` are neither hits nor
-//! spurious.
+//! `file:line` of the definition (fan-out implementations too); case-insensitive,
+//! backticks and a trailing `()` ignored. Nodes in `accept.ignorable_nodes`
+//! are neither hits nor spurious.
 
 use super::metrics::kendall_tau;
 use super::{Answer, Converted, Dropped, ItemScore, arr_of, dedup_keep_order, str_of};
@@ -158,9 +158,15 @@ pub fn score_item(item: &Value, answers: &[Answer]) -> ItemScore {
                 let name = str_of(f, "name").unwrap_or_default();
                 let bare = name.rsplit("::").next().unwrap_or(name);
                 let impl_type = str_of(f, "impl_type").unwrap_or_default();
+                // The location of the definition too: a bench answer is a
+                // path and line, as for the other gold nodes.
                 (
                     str_of(f, "symbol").unwrap_or_default().to_string(),
-                    BTreeSet::from([norm(name), norm(&format!("{impl_type}::{bare}"))]),
+                    BTreeSet::from([
+                        norm(name),
+                        norm(&format!("{impl_type}::{bare}")),
+                        node(f).keys_file_line,
+                    ]),
                 )
             })
             .collect();
@@ -334,6 +340,28 @@ mod tests {
         let d = score_item(&dispatch, &named(&["X::go", "B::one"]));
         assert_eq!(metric(&d, "fanout_recall"), Some(0.5));
         assert_eq!(metric(&d, "spurious"), Some(0.0));
+    }
+
+    #[test]
+    fn a_fan_out_impl_answered_by_its_location_counts_and_is_not_spurious() {
+        // The bench answers by path and line of the definition, never by name.
+        let mut dispatch = path_item();
+        dispatch["gold"]["fan_out"] = json!([
+            {"name": "X::go", "impl_type": "X", "symbol": "sym:x", "file": "x.rs", "line": 7},
+            {"name": "Y::go", "impl_type": "Y", "symbol": "sym:y", "file": "y.rs", "line": 9}
+        ]);
+        let located =
+            |path: &str, line: u64| Answer::from_value(&json!({"path": path, "line": line}));
+        let run = vec![located("x.rs", 7).unwrap(), located("b.rs", 2).unwrap()];
+        let d = score_item(&dispatch, &run);
+        assert_eq!(metric(&d, "fanout_recall"), Some(0.5));
+        assert_eq!(metric(&d, "spurious"), Some(0.0));
+        // A location that is no gold node at all is still spurious.
+        let stray = vec![located("z.rs", 1).unwrap()];
+        assert_eq!(
+            metric(&score_item(&dispatch, &stray), "spurious"),
+            Some(1.0)
+        );
     }
 
     #[test]

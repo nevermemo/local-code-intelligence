@@ -27,7 +27,9 @@
 //!
 //! where `n_maps` is the number of registered maps that expand nodes (the
 //! caller passes it with `k`: [`super::Traversal::top_k`]; seed-only maps are
-//! not counted), the most a state can be corroborated by. A hop value is at most 1, so no state found from the
+//! not counted), the most a state can be corroborated by; a resumed state that
+//! kept the evidence of more maps than are registered now raises it to what the
+//! states hold. A hop value is at most 1, so no state found from the
 //! frontier has a potential above the frontier's best; ranks only rise by
 //! corroboration, at most by the factor above. What it does not cover: a
 //! result already found can still gain maps from later arrivals. The stop
@@ -279,10 +281,14 @@ impl Card {
 /// What one map has done in a traversal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapStat {
+    /// Calls made to the map, each one counted whatever came of it (cut by a
+    /// budget, retried by a resume, failed).
     pub calls: u32,
     pub failures: u32,
     /// Edges adopted whose best offer was this map's.
     pub edges: u32,
+    /// The estimated tokens of its calls, counted once the expansion that made
+    /// them completes.
     pub tokens: u64,
 }
 

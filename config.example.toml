@@ -302,8 +302,9 @@ deadline_ms = 5000
 max_stops = 4
 tau = 0.8
 # How much each independent map beyond the first that reaches a node lifts its
-# rank: potential * (1 + boost * (maps - 1)). 0 ranks by potential alone. Maps
-# built on one graph (structure.contains, graph.scip) count as one. A resumed
+# rank: potential * (1 + boost * (maps - 1)). 0 ranks by potential alone; the
+# most is 10 (a larger value could overflow the ranks). Maps built on one graph
+# (structure.contains, graph.scip, scip.impact) count as one. A resumed
 # traversal keeps the boost its handle was made with.
 corroboration_boost = 0.1
 # Hits of the hybrid search that become start nodes, 1 to 40.

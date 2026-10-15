@@ -46,7 +46,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -259,10 +259,7 @@ impl Snapshot {
                         .iter()
                         .map(|m| intern(m))
                         .collect::<Result<_, _>>()?,
-                    dependent: strings(s.get("dependent"))?
-                        .iter()
-                        .map(|m| intern(m))
-                        .collect::<Result<_, _>>()?,
+                    dependent: u32_of(get(s, "dependent")?)? as usize,
                     witnesses: strings(s.get("witnesses"))?
                         .iter()
                         .map(|w| witness_of(w))
@@ -282,6 +279,9 @@ impl Snapshot {
         for s in &states {
             if !seen_nodes.insert(&s.node) {
                 return Err(format!("node {} has two states", s.node));
+            }
+            if s.dependent > s.maps.len() {
+                return Err(format!("node {} has more dependent maps than maps", s.node));
             }
             if let Some(p) = s.parent {
                 in_range(p, "parent")?;
