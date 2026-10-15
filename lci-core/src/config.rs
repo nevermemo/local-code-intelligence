@@ -478,6 +478,41 @@ pub struct Config {
     pub traverse: TraverseConfig,
 }
 
+/// How a traversal ranks its results (`[traverse] fusion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraverseFusion {
+    /// The path potential lifted by `corroboration_boost` per extra independent
+    /// map.
+    #[default]
+    Boost,
+    /// Weighted reciprocal rank fusion over the evidence sources.
+    Rrf,
+}
+
+impl TraverseFusion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Boost => "boost",
+            Self::Rrf => "rrf",
+        }
+    }
+}
+
+impl std::str::FromStr for TraverseFusion {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "boost" => Ok(Self::Boost),
+            "rrf" => Ok(Self::Rrf),
+            other => Err(format!(
+                "fusion must be \"boost\" or \"rrf\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[traverse]`: the multimap traversal behind `search_code`'s
 /// `mode = "traverse"` (spine brief 1.7). The limits are also the caps of a
 /// request: a `budget` in the request may lower them, never raise them.
@@ -513,6 +548,14 @@ pub struct TraverseConfig {
     /// number from `0` (rank by potential alone) to `10`. A resumed
     /// traversal keeps the boost its handle was made with.
     pub corroboration_boost: f64,
+    /// How the results of a traversal are ranked: `"boost"` (the default) ranks
+    /// by the path potential lifted by `corroboration_boost`; `"rrf"` ranks by
+    /// weighted reciprocal rank fusion over the evidence sources (one ranked
+    /// list per independent map, the maps built on one graph counting as one
+    /// source), each node scoring `weight / (rank + 2)` per source. Under
+    /// `"rrf"` the score bound is off and `corroboration_boost` does not rank.
+    /// A resumed traversal keeps the fusion its handle was made with.
+    pub fusion: TraverseFusion,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
@@ -600,6 +643,7 @@ impl Default for TraverseConfig {
             max_stops: 4,
             tau: 0.8,
             corroboration_boost: 0.1,
+            fusion: TraverseFusion::Boost,
             seed_k: 8,
         }
     }
@@ -2754,12 +2798,40 @@ mod tests {
         assert_eq!(value["traverse"]["max_pops"], 200);
         assert_eq!(value["traverse"]["seed_k"], 8);
         assert_eq!(value["traverse"]["corroboration_boost"], 0.1);
+        assert_eq!(value["traverse"]["fusion"], "boost");
+        // The fusion is chosen by name; a changed one is reported as written.
+        let rrf: Config = toml::from_str(&format!(
+            "{}[traverse]
+fusion = \"rrf\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        rrf.validate().unwrap();
+        assert_eq!(rrf.traverse.fusion, TraverseFusion::Rrf);
+        assert_eq!(
+            serde_json::to_value(&rrf).unwrap()["traverse"]["fusion"],
+            "rrf"
+        );
+        assert_eq!("rrf".parse::<TraverseFusion>(), Ok(TraverseFusion::Rrf));
+        assert_eq!("boost".parse::<TraverseFusion>(), Ok(TraverseFusion::Boost));
     }
 
     #[test]
     fn traverse_rejects_unknown_keys_and_out_of_range_limits() {
         let text = format!("{}[traverse]\nnope = 1\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
+        // An unknown fusion is refused when the file is read, not defaulted.
+        for fusion in ["nope", "RRF", ""] {
+            let text = format!(
+                "{}[traverse]
+fusion = \"{fusion}\"
+",
+                base_toml()
+            );
+            assert!(toml::from_str::<Config>(&text).is_err(), "{fusion:?}");
+            assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
+        }
         type Set = fn(&mut TraverseConfig);
         let bad: [(&str, Set); 15] = [
             ("scip_index", |t| t.scip_index = " ".into()),

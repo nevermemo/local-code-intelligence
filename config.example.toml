@@ -307,5 +307,16 @@ tau = 0.8
 # (structure.contains, graph.scip, scip.impact) count as one. A resumed
 # traversal keeps the boost its handle was made with.
 corroboration_boost = 0.1
+# How results are ranked. "boost" (default): the path potential lifted by
+# corroboration_boost. "rrf": weighted reciprocal rank fusion, as Qdrant does:
+# each evidence source (one independent map; the maps built on one graph
+# together; a seed's own map) ranks the nodes it delivered by the best
+# potential with which it delivered them, and a node scores the sum over
+# sources of weight / (rank + 2), rank from 0, weight the map weight a steering
+# policy sets (1 by default). Ties go by node id. Under "rrf" the score bound
+# (the early stop `bound`) is off, because a fused score depends on the ranks of
+# all the other results, and corroboration_boost does not rank. A resumed
+# traversal keeps the fusion its handle was made with.
+fusion = "boost"
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8

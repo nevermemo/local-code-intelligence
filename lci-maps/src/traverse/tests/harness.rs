@@ -5,6 +5,10 @@
 //! events, a paused run resumed equals the straight run, the bound never fires
 //! with fewer than `k` results, and every end names its stop reason.
 //!
+//! One seed in three ranks by `rrf` fusion instead of `boost`: the same
+//! invariants hold, the score bound does not apply (it is off), and every
+//! result has a positive fused score that a resume reproduces.
+//!
 //! 64 seeds run by default. To replay one:
 //! `LCI_TRAVERSE_SEED=<n> cargo test -p lci-maps harness`.
 
@@ -57,6 +61,7 @@ struct Case {
     top_k: Option<usize>,
     every: Option<u32>,
     pause_at: u32,
+    fusion: Fusion,
 }
 
 impl Case {
@@ -113,6 +118,13 @@ impl Case {
             top_k: (below(&mut rng, 2) == 0).then(|| 1 + below(&mut rng, 4)),
             every: (below(&mut rng, 3) == 0).then(|| 1 + below(&mut rng, 4) as u32),
             pause_at: (1 + below(&mut rng, pops as usize) as u32).min(pops),
+            // Not drawn from the generator, so the other choices of a seed
+            // stay what they were.
+            fusion: if seed % 3 == 2 {
+                Fusion::Rrf
+            } else {
+                Fusion::Boost
+            },
         }
     }
 
@@ -213,7 +225,8 @@ async fn run_with(
     .price(HopPrice {
         gate: case.price.0,
         beam: case.price.1,
-    });
+    })
+    .fusion(case.fusion);
     traversal = match case.scorer {
         1 => traversal.scorer(BfsScorer),
         2 => traversal.scorer(RandomScorer::new(case.seed)),
@@ -269,6 +282,9 @@ fn same_walk(a: &TraversalResult, b: &TraversalResult) -> bool {
         && a.states == b.states
         && a.popped == b.popped
         && a.cleared == b.cleared
+        && a.fusion == b.fusion
+        && a.fused == b.fused
+        && a.ranked() == b.ranked()
         && a.maps == b.maps
         && totals(a) == totals(b)
 }
@@ -414,6 +430,26 @@ fn invariants(
         bounds.len() == usize::from(result.stop_reason == Bound),
         "bound events {bounds:?}"
     );
+    if case.fusion == Fusion::Rrf {
+        // A fused score has no bound on a frontier state: the bound is off.
+        ensure!(bounds.is_empty(), "a bound under rrf: {bounds:?}");
+        let ranked = result.ranked();
+        ensure!(ranked.len() == results(result), "ranked() misses results");
+        for &i in &ranked {
+            let score = result.ranked_potential(&result.states[i]);
+            ensure!(score.is_finite() && score > 0.0, "fused score {score}");
+        }
+        ensure!(
+            ranked.windows(2).all(|w| {
+                let (a, b) = (&result.states[w[0]], &result.states[w[1]]);
+                let (x, y) = (result.ranked_potential(a), result.ranked_potential(b));
+                x > y || (x == y && a.node < b.node)
+            }),
+            "results out of order"
+        );
+    } else if result.fusion != Fusion::Boost || !result.fused.is_empty() {
+        return Err("a boost run holds fused scores".into());
+    }
     if let Some(bound) = bounds.first() {
         let k = case.top_k.ok_or("a bound without a limit")?;
         ensure!(

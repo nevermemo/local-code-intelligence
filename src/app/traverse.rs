@@ -1237,6 +1237,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let traversal = traversal
         .identity(identity)
         .corroboration_boost(limits.corroboration_boost)
+        .fusion(limits.fusion)
         .top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),
@@ -1535,18 +1536,14 @@ fn response_json(
     trace_path: Option<&Path>,
     notes: Vec<String>,
 ) -> Value {
-    let mut results: Vec<(usize, &lci_maps::traverse::State)> = result
-        .states
-        .iter()
-        .enumerate()
-        .filter(|(_, state)| state.parent.is_some() && !result.cleared.contains(&state.node))
-        .collect();
-    let rank = |state: &lci_maps::traverse::State| result.ranked_potential(state);
-    results.sort_by(|a, b| rank(b.1).total_cmp(&rank(a.1)).then(a.0.cmp(&b.0)));
-    let results: Vec<Value> = results
+    let results: Vec<Value> = result
+        .ranked()
         .into_iter()
         .take(call.top_k)
-        .map(|(_, state)| trace::card_json(&Card::of(state, result.corroboration_boost)))
+        .map(|at| {
+            let state = &result.states[at];
+            trace::card_json(&Card::ranked(state, result.ranked_potential(state)))
+        })
         .collect();
     let steering: Vec<Value> = result
         .events
@@ -1575,6 +1572,12 @@ fn response_json(
         })
         .collect();
     let mut notes = notes;
+    if result.fusion == lci_maps::traverse::Fusion::Rrf {
+        notes.push(
+            "fusion rrf: results are ranked by weighted reciprocal rank fusion over the evidence sources (ranked_potential is the fused score); the score bound is off"
+                .to_owned(),
+        );
+    }
     if result.events.iter().any(|e| e["external_spent"] == true) {
         notes.push(
             "the external-call allowance was spent: from then on only maps that need no external call were asked"

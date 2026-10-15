@@ -95,6 +95,11 @@ pub struct BenchArgs {
     /// none.
     #[arg(long, default_value = "default")]
     policy: String,
+    /// How results are ranked (`lci traverse --fusion`): `boost` is the CLI's
+    /// own default and passes nothing; `rrf` is the weighted reciprocal rank
+    /// fusion. The row's note says when it is `rrf`.
+    #[arg(long, default_value = "boost", value_parser = ["boost", "rrf"])]
+    fusion: String,
     /// Run only the first N items of each set (impact: of the primary items).
     #[arg(long)]
     limit: Option<usize>,
@@ -170,6 +175,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         tree,
         maps: args.maps.clone(),
         policy,
+        fusion: fusion_arg(&args.fusion),
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -200,7 +206,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: args.note.clone().unwrap_or_default(),
+        note: note_with_fusion(args.note.as_deref(), &args.fusion),
         progress: true,
         rescored: false,
     };
@@ -241,7 +247,7 @@ fn rescore(
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: args.note.clone().unwrap_or_default(),
+        note: note_with_fusion(args.note.as_deref(), &args.fusion),
         progress: false,
         rescored: true,
     };
@@ -308,6 +314,20 @@ pub fn effective_maps(
         bail!("the CLI reported no default maps; pass --maps");
     }
     Ok(maps)
+}
+
+/// The `--fusion` value to pass the CLI: none for its default.
+fn fusion_arg(fusion: &str) -> Option<String> {
+    (fusion != "boost").then(|| fusion.to_owned())
+}
+
+/// The note of the row, with the fusion when it is not the default.
+fn note_with_fusion(note: Option<&str>, fusion: &str) -> String {
+    match (note.unwrap_or_default(), fusion_arg(fusion)) {
+        (note, None) => note.to_owned(),
+        ("", Some(fusion)) => format!("fusion {fusion}"),
+        (note, Some(fusion)) => format!("{note}; fusion {fusion}"),
+    }
 }
 
 fn policy_label(policy: &str) -> String {
@@ -662,6 +682,8 @@ pub struct CliTraverser {
     pub tree: PathBuf,
     pub maps: Vec<String>,
     pub policy: Option<String>,
+    /// `--fusion` for the CLI; `None` leaves its default.
+    pub fusion: Option<String>,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -705,6 +727,9 @@ impl CliTraverser {
         }
         if let Some(policy) = &self.policy {
             command.arg("--policy").arg(policy);
+        }
+        if let Some(fusion) = &self.fusion {
+            command.arg(format!("--fusion={fusion}"));
         }
         command
             .stdin(Stdio::null())

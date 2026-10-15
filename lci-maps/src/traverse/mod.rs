@@ -87,6 +87,19 @@
 //! a budget ends the call, the call ends with a [`TraversalResult::checkpoint`]
 //! and a handle, and the next call carries the agent's steer.
 //!
+//! Fusion ([`Fusion`], `[traverse] fusion`): `boost` (the default) ranks as
+//! above. `rrf` ranks by weighted reciprocal rank fusion instead, see
+//! [`fusion`]: each evidence source (an independent map; the dependent maps
+//! together; a seed's own map) ranks the nodes it delivered by the best
+//! potential with which it delivered them, and a node scores the sum of
+//! `weight / (rank + 2)` over the sources. The walk itself is the same in both
+//! modes (only the ranking, the cards' `ranked_potential`, the order of the
+//! results and the `start` event's `rank` object differ). The score bound
+//! below is NOT valid under `rrf` (a node's fused score depends on the ranks
+//! of all the others, so no frontier state has a bound on it): it is off, and
+//! the walk ends by its budgets or when the frontier is dry. A handle keeps
+//! the fusion it started with.
+//!
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
 //! reason `bound`, once `k` results exist and nothing queued can lift a result
 //! above the `k`-th; see [`stop`]. The `bound` event and the `end` event carry
@@ -98,6 +111,7 @@
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
 
 pub mod frontier;
+pub mod fusion;
 pub mod handle;
 pub mod handler;
 pub mod ladder;
@@ -130,6 +144,10 @@ use stop::{
     ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, MapStat,
     Pause, Regions, StopReason, Tally, is_structural, likely_complete,
 };
+
+pub use fusion::RRF_K;
+/// How results are ranked (`[traverse] fusion`); see the module docs.
+pub use lci_core::config::TraverseFusion as Fusion;
 
 /// Tokens charged per adopted edge: roughly one ~12-token card line (a guess).
 pub const TOKENS_PER_EDGE: u64 = 12;
@@ -209,6 +227,12 @@ pub struct State {
     pub dependent: usize,
     /// The witness classes of those edges.
     pub witnesses: BTreeSet<WitnessClass>,
+    /// Under `rrf` fusion only (empty otherwise): the best potential with
+    /// which each map delivered the node, a seed's own map included (at 1).
+    /// All the maps of a fused edge share the potential of its route; an
+    /// arrival outside the beam delivers at 0. When a stronger route rescales
+    /// a subtree, the entries of its states scale with their potential.
+    pub reach: BTreeMap<MapId, f64>,
 }
 
 impl State {
@@ -259,6 +283,11 @@ pub struct TraversalResult {
     pub checkpoint: Option<Checkpoint>,
     /// The corroboration boost the run ranked with.
     pub corroboration_boost: f64,
+    /// How the run ranked its results.
+    pub fusion: Fusion,
+    /// Under `rrf` fusion: the fused score of every result, by node (empty
+    /// otherwise).
+    pub fused: HashMap<NodeId, f64>,
     /// Why the call ended, on every exit path: `Complete` (nothing left or
     /// every target reached), `Bound` (the score bound held), `Pops` or
     /// `Deadline` or `Budget` (a cap), `Steer`, or the trigger a handler's
@@ -273,9 +302,35 @@ pub struct TraversalResult {
 }
 
 impl TraversalResult {
-    /// The rank of a state of this result (see [`State::ranked_potential`]).
+    /// The rank of a state of this result: [`State::ranked_potential`] under
+    /// `boost` fusion, the fused score under `rrf` (0 for a state that is not
+    /// a result, such as a start node).
     pub fn ranked_potential(&self, state: &State) -> f64 {
-        state.ranked_potential(self.corroboration_boost)
+        match self.fusion {
+            Fusion::Boost => state.ranked_potential(self.corroboration_boost),
+            Fusion::Rrf => self.fused.get(&state.node).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// The results, best first: the states reached by an edge that are not
+    /// pruned, as indexes into `states`. Equal ranks keep discovery order
+    /// under `boost` fusion and go by node id under `rrf`.
+    pub fn ranked(&self) -> Vec<usize> {
+        let mut results: Vec<usize> = (0..self.states.len())
+            .filter(|&i| {
+                self.states[i].parent.is_some() && !self.cleared.contains(&self.states[i].node)
+            })
+            .collect();
+        results.sort_by(|&a, &b| {
+            let (x, y) = (&self.states[a], &self.states[b]);
+            self.ranked_potential(y)
+                .total_cmp(&self.ranked_potential(x))
+                .then_with(|| match self.fusion {
+                    Fusion::Boost => a.cmp(&b),
+                    Fusion::Rrf => x.node.cmp(&y.node),
+                })
+        });
+        results
     }
 
     pub fn reached(&self, node: &NodeId) -> bool {
@@ -303,6 +358,7 @@ pub struct Traversal<'s> {
     steer: Option<Steer>,
     plan: Option<trace::StartPlan>,
     boost: f64,
+    fusion: Fusion,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
     identity: String,
@@ -325,6 +381,7 @@ impl<'s> Traversal<'s> {
             steer: None,
             plan: None,
             boost: DEFAULT_CORROBORATION_BOOST,
+            fusion: Fusion::Boost,
             bound: None,
             identity: String::new(),
         }
@@ -362,6 +419,14 @@ impl<'s> Traversal<'s> {
         } else {
             0.0
         };
+        self
+    }
+
+    /// How results are ranked (default [`Fusion::Boost`]); see the module
+    /// docs. A resumed traversal keeps the fusion its handle was made with.
+    /// Under [`Fusion::Rrf`] the score bound is off.
+    pub fn fusion(mut self, fusion: Fusion) -> Self {
+        self.fusion = fusion;
         self
     }
 
@@ -547,6 +612,10 @@ impl<'s> Run<'s> {
             maps: BTreeSet::new(),
             dependent: 0,
             witnesses: BTreeSet::new(),
+            reach: match (self.t.fusion, seed.map) {
+                (Fusion::Rrf, Some(map)) => BTreeMap::from([(map, 1.0)]),
+                _ => BTreeMap::new(),
+            },
         });
         self.state_of.insert(seed.node.clone(), index);
         if self.t.budget.max_depth > 0 {
@@ -573,7 +642,7 @@ impl<'s> Run<'s> {
                 },
                 "scorer": self.t.scorer.label(),
                 "stops": stops_json(&self.t.stops),
-                "rank": {"corroboration_boost": self.t.boost},
+                "rank": rank_json(self.t.boost, self.t.fusion),
             });
             if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
                 for (key, value) in plan.fields(stops_json(&self.t.stops)) {
@@ -710,6 +779,18 @@ impl<'s> Run<'s> {
         if let (Some(cp), Some(snapshot)) = (checkpoint.as_mut(), &snapshot) {
             cp.handle = Some(snapshot.handle());
         }
+        let fused = self.fused_scores();
+        let fused_by_node = fused
+            .as_ref()
+            .map(|scores| {
+                self.states
+                    .iter()
+                    .zip(scores)
+                    .filter(|(s, _)| s.parent.is_some() && !self.cleared.contains(&s.node))
+                    .map(|(s, score)| (s.node.clone(), *score))
+                    .collect()
+            })
+            .unwrap_or_default();
         TraversalResult {
             status,
             snapshot,
@@ -720,6 +801,8 @@ impl<'s> Run<'s> {
             totals: self.totals,
             events: self.events,
             corroboration_boost: self.t.boost,
+            fusion: self.t.fusion,
+            fused: fused_by_node,
             stop_reason,
             maps: self.tally.maps,
             map_ms: self.map_ms,
@@ -732,7 +815,9 @@ impl<'s> Run<'s> {
     /// have, cannot rank above the `k`-th result.
     fn bound_holds(&self) -> Option<Value> {
         let (k, n_maps) = self.t.bound?;
-        if !self.t.targets.is_empty() {
+        // A fused score depends on the ranks of all the other results, so no
+        // frontier state has a bound on it.
+        if self.t.fusion == Fusion::Rrf || !self.t.targets.is_empty() {
             return None;
         }
         // The results: every state reached by an edge that is not pruned.
@@ -954,8 +1039,9 @@ impl<'s> Run<'s> {
                 maps: BTreeSet::new(),
                 dependent: 0,
                 witnesses: BTreeSet::new(),
+                reach: BTreeMap::new(),
             });
-            self.add_evidence(child, edge);
+            self.add_evidence(child, edge, potential);
             self.state_of.insert(dst.clone(), child);
             self.totals.hops += 1;
             self.totals.cross_map_hops += u32::from(cross);
@@ -977,7 +1063,7 @@ impl<'s> Run<'s> {
         let mut corroborated = 0;
         for (i, edge) in kept.iter().enumerate() {
             if let (false, Some(reached)) = (chosen[i], target[i]) {
-                self.add_evidence(reached, edge);
+                self.add_evidence(reached, edge, 0.0);
                 corroborated += 1;
             }
         }
@@ -1053,7 +1139,17 @@ impl<'s> Run<'s> {
     /// The maps and witness classes of `edge` join the evidence of a state
     /// (an edge that was not followed still counts for the node); returns the
     /// maps that were new to it.
-    fn add_evidence(&mut self, index: usize, edge: &FusedEdge) -> Vec<MapId> {
+    ///
+    /// Under `rrf` fusion the maps of the edge also deliver the node at
+    /// `potential` (their best so far is kept): the potential of the route the
+    /// edge is on, 0 for an arrival the beam did not keep.
+    fn add_evidence(&mut self, index: usize, edge: &FusedEdge, potential: f64) -> Vec<MapId> {
+        if self.t.fusion == Fusion::Rrf {
+            for &map in &edge.maps {
+                let reach = self.states[index].reach.entry(map).or_insert(potential);
+                *reach = reach.max(potential);
+            }
+        }
         let mut new_maps = Vec::new();
         for &map in &edge.maps {
             if self.states[index].maps.contains(&map) {
@@ -1103,7 +1199,7 @@ impl<'s> Run<'s> {
         let old_src = self.states[reached]
             .parent
             .map(|p| self.states[p].node.to_string());
-        let new_maps = self.add_evidence(reached, edge);
+        let new_maps = self.add_evidence(reached, edge, potential);
         let state = &mut self.states[reached];
 
         let old = state.potential;
@@ -1194,6 +1290,9 @@ impl<'s> Run<'s> {
                 }
                 let state = &mut self.states[child];
                 state.potential *= ratio;
+                for reach in state.reach.values_mut() {
+                    *reach *= ratio;
+                }
                 state.depth = depth + 1;
                 let potential = state.potential;
                 count += 1;
@@ -1284,8 +1383,28 @@ impl<'s> Run<'s> {
         )
     }
 
-    fn card_of(&self, state: usize) -> Card {
-        Card::of(&self.states[state], self.t.boost)
+    /// The fused score of every state under `rrf` fusion (see [`fusion`]).
+    fn fused_scores(&self) -> Option<Vec<f64>> {
+        (self.t.fusion == Fusion::Rrf).then(|| {
+            fusion::state_scores(
+                &self.states,
+                &self.cleared,
+                self.t.source.as_ref(),
+                &self.weights,
+            )
+        })
+    }
+
+    /// What results rank by for a state: `fused` is [`Run::fused_scores`].
+    fn rank_of(&self, state: usize, fused: Option<&[f64]>) -> f64 {
+        match fused {
+            Some(scores) => scores[state],
+            None => self.states[state].ranked_potential(self.t.boost),
+        }
+    }
+
+    fn card_of(&self, state: usize, fused: Option<&[f64]>) -> Card {
+        Card::ranked(&self.states[state], self.rank_of(state, fused))
     }
 
     fn checkpoint(&self, reason: StopReason) -> Checkpoint {
@@ -1310,29 +1429,37 @@ impl<'s> Run<'s> {
             })
             .collect();
 
-        // Best rank first (potential, boosted by corroboration); discovery
-        // order breaks ties.
-        let rank = |s: &usize| self.states[*s].ranked_potential(self.t.boost);
-        let best_first = |a: &usize, b: &usize| rank(b).total_cmp(&rank(a)).then(a.cmp(b));
+        // Best rank first (potential, boosted by corroboration, or the fused
+        // score); discovery order breaks ties under `boost`, node id under
+        // `rrf`.
+        let fused = self.fused_scores();
+        let fused = fused.as_deref();
+        let rank = |s: &usize| self.rank_of(*s, fused);
+        let best_first = |a: &usize, b: &usize| {
+            rank(b).total_cmp(&rank(a)).then_with(|| match fused {
+                Some(_) => self.states[*a].node.cmp(&self.states[*b].node),
+                None => a.cmp(b),
+            })
+        };
         let mut visited: Vec<usize> = self.expanded.iter().copied().collect();
         visited.sort_by(best_first);
         let visited_cards = visited
             .iter()
             .take(CARD_K)
-            .map(|&s| self.card_of(s))
+            .map(|&s| self.card_of(s, fused))
             .collect();
         let mut answer: Vec<Card> = self
             .t
             .targets
             .iter()
             .filter_map(|t| self.state_of.get(t))
-            .map(|&s| self.card_of(s))
+            .map(|&s| self.card_of(s, fused))
             .collect();
         answer.extend(
             visited
                 .iter()
                 .filter(|&&s| self.states[s].parent.is_some())
-                .map(|&s| self.card_of(s))
+                .map(|&s| self.card_of(s, fused))
                 .filter(|card| !answer.iter().any(|a| a.node == card.node))
                 .take(ANSWER_K.saturating_sub(answer.len()))
                 .collect::<Vec<_>>(),
@@ -1612,6 +1739,17 @@ impl<'s> Run<'s> {
                 None => self.add_seed(&Seed::from(node.clone()), fanout),
             }
         }
+    }
+}
+
+/// The `rank` object of the `start` and `resume` events. Under `boost` fusion
+/// it is what it always was; `rrf` adds the fusion and its `k`.
+pub(crate) fn rank_json(boost: f64, fusion: Fusion) -> Value {
+    match fusion {
+        Fusion::Boost => json!({"corroboration_boost": boost}),
+        Fusion::Rrf => json!({
+            "corroboration_boost": boost, "fusion": fusion.as_str(), "rrf_k": RRF_K,
+        }),
     }
 }
 

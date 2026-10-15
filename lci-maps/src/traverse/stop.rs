@@ -226,7 +226,7 @@ pub struct Card {
     pub potential: f64,
     /// The value results rank by: the potential, lifted by the corroboration
     /// boost for each independent map beyond the first
-    /// ([`State::ranked_potential`]).
+    /// ([`State::ranked_potential`]); under `rrf` fusion the fused score.
     pub ranked_potential: f64,
     pub depth: u32,
     /// The maps whose edges reached the node, sorted (seed maps are not
@@ -240,12 +240,18 @@ pub struct Card {
 impl Card {
     /// The card of a state, ranked with `boost`.
     pub fn of(state: &State, boost: f64) -> Self {
+        Self::ranked(state, state.ranked_potential(boost))
+    }
+
+    /// The card of a state with the rank the traversal gave it (the fused
+    /// score under `rrf` fusion).
+    pub fn ranked(state: &State, ranked_potential: f64) -> Self {
         Self {
             node: state.node.clone(),
             via: state.via,
             witness: state.witness,
             potential: state.potential,
-            ranked_potential: state.ranked_potential(boost),
+            ranked_potential,
             depth: state.depth,
             maps: state.maps.iter().copied().collect(),
             n_maps: state.n_maps(),

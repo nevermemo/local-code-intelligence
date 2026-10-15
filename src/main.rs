@@ -426,6 +426,11 @@ struct TraverseArgs {
     /// Results to print.
     #[arg(long, default_value_t = 8)]
     top_k: usize,
+    /// How results are ranked: `boost` or `rrf` (default: the `[traverse]
+    /// fusion` setting). A continuation keeps the fusion its handle started
+    /// with.
+    #[arg(long)]
+    fusion: Option<local_code_intelligence::config::TraverseFusion>,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -469,7 +474,10 @@ async fn run_traverse(
             no_local_config,
         },
     )?;
-    let config = layers::resolve(&spec)?.config;
+    let mut config = layers::resolve(&spec)?.config;
+    if let Some(fusion) = args.fusion {
+        config.traverse.fusion = fusion;
+    }
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(text) => match json_argument(text)? {

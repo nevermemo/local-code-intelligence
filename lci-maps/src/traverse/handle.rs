@@ -30,8 +30,9 @@
 //! agent's [`Steer`](super::steer::Steer).
 
 use super::{
-    Run, State, Totals, Traversal, TraversalBudget,
+    Fusion, Run, State, Totals, Traversal, TraversalBudget,
     frontier::Frontier,
+    rank_json,
     stop::{Disagreement, MapStat, Tally},
     stops_json,
     trace::{disagreement_json, value_hash},
@@ -145,6 +146,9 @@ pub struct Snapshot {
     /// The corroboration boost the first call ranked with; a resume ranks with
     /// it too, so the order of results does not change between calls.
     pub boost: f64,
+    /// The fusion the first call ranked with; a resume keeps it. Written to
+    /// the handle only under `rrf` (a handle without it is `boost`).
+    pub fusion: Fusion,
 }
 
 impl Snapshot {
@@ -160,23 +164,23 @@ impl Snapshot {
     }
 
     pub fn to_json(&self) -> Value {
+        let mut value = self.base_json();
+        if let Some(object) = value.as_object_mut() {
+            // Left out under `boost`, so those handles are what they were.
+            if self.fusion == Fusion::Rrf {
+                object.insert("fusion".into(), json!(self.fusion.as_str()));
+            }
+        }
+        value
+    }
+
+    fn base_json(&self) -> Value {
         json!({
             "version": VERSION,
             "question": self.question,
             "targets": self.targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "scorer": self.scorer,
-            "states": self.states.iter().map(|s| json!({
-                "node": s.node.to_string(),
-                "parent": s.parent,
-                "depth": s.depth,
-                "via": s.via,
-                "witness": s.witness.map(WitnessClass::as_str),
-                "potential": s.potential,
-                "fanout": s.fanout,
-                "maps": s.maps,
-                "dependent": s.dependent,
-                "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
+            "states": self.states.iter().map(state_json).collect::<Vec<_>>(),
             "frontier": self.frontier.iter()
                 .map(|&(state, priority, seq)| json!([state, priority, seq]))
                 .collect::<Vec<_>>(),
@@ -264,6 +268,16 @@ impl Snapshot {
                         .iter()
                         .map(|w| witness_of(w))
                         .collect::<Result<_, _>>()?,
+                    // Only a walk under `rrf` fusion has them.
+                    reach: match s.get("reach") {
+                        None | Some(Value::Null) => BTreeMap::new(),
+                        Some(v) => v
+                            .as_object()
+                            .ok_or("reach is not an object")?
+                            .iter()
+                            .map(|(m, p)| Ok((intern(m)?, f64_of(p)?)))
+                            .collect::<Result<_, String>>()?,
+                    },
                 })
             })
             .collect::<Result<Vec<State>, String>>()?;
@@ -442,8 +456,40 @@ impl Snapshot {
             paid,
             identity: string_of(get(obj, "identity")?)?,
             boost: f64_of(get(obj, "boost")?)?,
+            fusion: match obj.get("fusion") {
+                None | Some(Value::Null) => Fusion::Boost,
+                Some(v) => string_of(v)?.parse::<Fusion>()?,
+            },
         })
     }
+}
+
+fn state_json(s: &State) -> Value {
+    let mut value = json!({
+        "node": s.node.to_string(),
+        "parent": s.parent,
+        "depth": s.depth,
+        "via": s.via,
+        "witness": s.witness.map(WitnessClass::as_str),
+        "potential": s.potential,
+        "fanout": s.fanout,
+        "maps": s.maps,
+        "dependent": s.dependent,
+        "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+    });
+    // Only a walk under `rrf` fusion keeps the best potential per map.
+    if let (false, Some(object)) = (s.reach.is_empty(), value.as_object_mut()) {
+        object.insert(
+            "reach".into(),
+            Value::Object(
+                s.reach
+                    .iter()
+                    .map(|(m, p)| ((*m).to_owned(), json!(p)))
+                    .collect(),
+            ),
+        );
+    }
+    value
 }
 
 fn tally_json(tally: &Tally) -> Value {
@@ -657,6 +703,7 @@ impl Run<'_> {
                 .collect(),
             identity: self.t.identity.clone(),
             boost: self.t.boost,
+            fusion: self.t.fusion,
         }
     }
 
@@ -684,12 +731,14 @@ impl Run<'_> {
             paid,
             identity,
             boost,
+            fusion,
             ..
         } = snapshot;
         if self.t.identity.is_empty() {
             self.t.identity = identity;
         }
         self.t.boost = boost;
+        self.t.fusion = fusion;
         self.state_of = states
             .iter()
             .enumerate()
@@ -752,7 +801,7 @@ impl Run<'_> {
             },
             "scorer": self.t.scorer.label(),
             "scorer_changed": scorer_changed,
-            "rank": {"corroboration_boost": self.t.boost},
+            "rank": rank_json(self.t.boost, self.t.fusion),
             "stops": stops_json(&self.t.stops),
         }));
     }

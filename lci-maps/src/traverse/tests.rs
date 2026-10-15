@@ -2444,3 +2444,5 @@ mod bound;
 mod continuation;
 
 mod harness;
+
+mod fusion;
