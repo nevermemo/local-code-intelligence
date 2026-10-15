@@ -47,6 +47,7 @@ async fn q1_the_walk_stops_with_bound_before_its_budget_when_nothing_can_beat_th
     assert_eq!(bound[0]["k"], 2);
     assert!((bound[0]["kth"].as_f64().unwrap() - 1.0).abs() < 1e-12);
     assert!((bound[0]["frontier_best"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert!((bound[0]["below_k_best"].as_f64().unwrap() - 1.0).abs() < 1e-12);
     assert_eq!(bound[0]["maps"], 1);
     assert_eq!(bound[0]["frontier"], 3);
     assert_eq!(end_event(&result)["stop_reason"], "bound");
@@ -81,6 +82,10 @@ async fn q1_the_bound_does_not_hold_while_the_queue_can_beat_the_kth() {
         "not at pop 1, where a value-1 state was queued"
     );
     assert_eq!(bound[0]["frontier"], 1);
+    assert!(
+        bound[0]["below_k_best"].is_null(),
+        "exactly k results: none below"
+    );
     assert!((bound[0]["kth"].as_f64().unwrap() - 1.0 / 9.0).abs() < 1e-12);
     assert!(!popped_names(&result).contains(&"src/p8.rs".to_string()));
 }
@@ -117,6 +122,35 @@ async fn q1_the_bound_holds_only_with_k_results_and_no_state_that_could_beat_the
     .await;
     assert_eq!(result.stop_reason, StopReason::Complete);
     assert!(result.reached(&node("e")));
+}
+
+#[tokio::test]
+async fn q1_a_result_below_k_that_a_queued_expansion_will_corroborate_keeps_the_bound_off() {
+    // Every hop is worth 0.8, the boost 0.5, two maps expand. `x` and `a` are
+    // the top two (0.8); `z` and `c` sit below at 0.64 and `w` is queued at
+    // 0.512. The queue alone cannot beat the 2nd (0.512 * 1.5 < 0.8), but the
+    // expansion of `w` is where map `b` reaches `z`, which lifts it to
+    // 0.64 * 1.5 = 0.96. The bound must wait for that.
+    let reg = registry(vec![
+        GraphMap::new(
+            "a",
+            &[("s", "x"), ("s", "a"), ("a", "z"), ("a", "c"), ("c", "w")],
+        )
+        .kind(EdgeKind::Imports),
+        GraphMap::new("b", &[("w", "z")]).kind(EdgeKind::Imports),
+    ]);
+    let result = walk(&reg, vec![seed("s")], budget(100), |t| {
+        t.corroboration_boost(0.5).top_k(2, 2)
+    })
+    .await;
+    assert_eq!(result.stop_reason, StopReason::Complete);
+    assert!(popped_names(&result).contains(&"src/w.rs".to_string()));
+    assert!(events_of(&result, "bound").is_empty());
+    let top: Vec<_> = result.ranked()[..2]
+        .iter()
+        .map(|&i| result.states[i].node.clone())
+        .collect();
+    assert!(top.contains(&node("z")), "{top:?}");
 }
 
 // ---- every exit names its reason and the maps that ran --------------------------------

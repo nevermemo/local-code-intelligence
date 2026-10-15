@@ -110,8 +110,9 @@
 //! [`Totals::pass_through_pops`]. A handle keeps the setting.
 //!
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
-//! reason `bound`, once `k` results exist and nothing queued can lift a result
-//! above the `k`-th; see [`stop`]. The `bound` event and the `end` event carry
+//! reason `bound`, once `k` results exist and neither a queued state nor a
+//! result below the top `k` can reach a rank above the `k`-th; it fixes the
+//! top-`k` set, not the order inside it; see [`stop`]. The `bound` event and the `end` event carry
 //! it, and the result's [`TraversalResult::stop_reason`] is `Bound`. Every other end
 //! has one too (`complete`, `pops`, `deadline`, `budget`, `steer`, or a stop
 //! trigger), on the `end` event and on the result.
@@ -410,8 +411,8 @@ impl<'s> Traversal<'s> {
     }
 
     /// Ends the walk with the stop reason `bound` once `k` results exist and
-    /// nothing in the frontier can lift a result above the `k`-th (see
-    /// [`stop`]). `n_maps` is how many registered maps expand nodes (seed-only
+    /// neither the frontier nor a result below the top `k` can lift a result
+    /// above the `k`-th (see [`stop`]). `n_maps` is how many registered maps expand nodes (seed-only
     /// maps do not count): the most a state can be corroborated by. Not kept
     /// in a handle; a resumed traversal passes it again. Without targets only:
     /// a walk with targets ends when they are reached. `k` of 0 switches the
@@ -902,8 +903,13 @@ impl<'s> Run<'s> {
 
     /// The `bound` event when the score bound holds (see [`stop`]): a result
     /// limit is set, no targets are asked for, at least `k` results exist and
-    /// the best state in the frontier, at the most corroboration a state can
-    /// have, cannot rank above the `k`-th result.
+    /// neither the best state in the frontier nor the best result below the
+    /// top `k`, at the most corroboration a state can have, can rank above the
+    /// `k`-th result. A result below the top `k` can be reached again through
+    /// another map, which corroborates it and raises its rank; the frontier
+    /// need not hold that node for the arrival to come. The bound fixes the
+    /// top-`k` set, not the order inside it: corroboration of a result in the
+    /// top `k` can still reorder it.
     fn bound_holds(&self) -> Option<Value> {
         let (k, n_maps) = self.t.bound?;
         // A fused score depends on the ranks of all the other results, so no
@@ -911,18 +917,22 @@ impl<'s> Run<'s> {
         if !self.t.score_bound || self.t.fusion == Fusion::Rrf || !self.t.targets.is_empty() {
             return None;
         }
-        // The results: every state reached by an edge that is not pruned.
-        let mut ranks: Vec<f64> = self
+        // The results: every state reached by an edge that is not pruned, as
+        // (rank, potential).
+        let mut ranks: Vec<(f64, f64)> = self
             .states
             .iter()
             .filter(|s| s.parent.is_some() && !self.cleared.contains(&s.node))
-            .map(|s| s.ranked_potential(self.t.boost))
+            .map(|s| (s.ranked_potential(self.t.boost), s.potential))
             .collect();
         if ranks.len() < k {
             return None;
         }
-        let (_, kth, _) = ranks.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-        let kth = *kth;
+        let (_, kth, below) = ranks.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+        let kth = kth.0;
+        // The strongest result outside the top `k` (none when there are
+        // exactly `k`).
+        let below_k_best = below.iter().map(|r| r.1).reduce(f64::max);
         // Descendants of a state have at most its potential (a hop is worth
         // at most 1); a priority a handler scaled does not change that.
         let best = self
@@ -938,10 +948,11 @@ impl<'s> Run<'s> {
             .map(State::n_maps)
             .fold(n_maps, usize::max);
         let factor = 1.0 + self.t.boost * n_maps.saturating_sub(1) as f64;
-        (best * factor <= kth).then(|| {
+        (best.max(below_k_best.unwrap_or(f64::NEG_INFINITY)) * factor <= kth).then(|| {
             json!({
                 "ev": "bound", "pop": self.totals.pops, "k": k, "kth": kth,
-                "frontier_best": best, "max_factor": factor, "maps": n_maps,
+                "frontier_best": best, "below_k_best": below_k_best,
+                "max_factor": factor, "maps": n_maps,
                 "frontier": self.frontier.len(),
             })
         })
