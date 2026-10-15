@@ -7,10 +7,13 @@
 //! scorer credits the answer the bench adapter offers for it (the definition
 //! site, as the bench scores it); the scorers are reused, not copied.
 //!
-//! Items split by a hash of the item id into a fit part and a hold-out part.
-//! Only the fit part is read; the hold-out ids go into the table so an
-//! evaluation can use only them. The split depends on the id alone, so it does
-//! not change when runs are added.
+//! Items split by a hash into a fit part and a hold-out part. Only the fit part
+//! is read; the hold-out ids go into the table so an evaluation can use only
+//! them. With no salt the hash is of the item id (the original split). With a
+//! salt it is of `<salt>:<group key>` ([`group_key`]), so items that share a
+//! source commit fall on the same side and a new salt draws a new split; the
+//! salt is written into the table as `holdout_salt`. The split does not change
+//! when runs are added.
 
 use super::bench::{self, ResultNode, Site, Traversed};
 use crate::gold::{self, Answer, Set};
@@ -39,9 +42,14 @@ pub struct FitPriorsArgs {
     /// out of the repository.
     #[arg(long)]
     out: PathBuf,
-    /// Share of items (by id hash) kept out of the fit.
+    /// Share of items (by hash) kept out of the fit.
     #[arg(long, default_value_t = 30)]
     holdout_percent: u64,
+    /// Split salt: the hash is of `<salt>:<group key>` (items of one source
+    /// commit stay together) instead of the item id. Empty keeps the original
+    /// id split. Written into the table as `holdout_salt`.
+    #[arg(long, default_value = "")]
+    salt: String,
     /// Pseudo-observations the guessed prior counts for.
     #[arg(long, default_value_t = 10.0)]
     smoothing: f64,
@@ -99,12 +107,73 @@ fn set_runs(root: &Path) -> Result<Vec<(PathBuf, Set, PathBuf)>> {
     Ok(runs)
 }
 
-/// Whether the item goes to the hold-out part.
+/// Whether the item id goes to the hold-out part (the unsalted split).
 pub fn is_holdout(item_id: &str, percent: u64) -> bool {
     let digest = Sha256::digest(item_id.as_bytes());
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(head) % 100 < percent
+}
+
+/// What a salted split keeps together: the first `commit:` entry of the item's
+/// `provenance` (the history gold names the commit its question is about, and
+/// several questions share one), else the item id. Gold items carry no other
+/// field that clusters related queries.
+pub fn group_key(item: &Value) -> String {
+    let commit = item["provenance"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|entry| entry.strip_prefix("commit:"));
+    match commit {
+        Some(commit) => format!("commit:{commit}"),
+        None => item["id"].as_str().unwrap_or_default().to_owned(),
+    }
+}
+
+/// Whether the item goes to the hold-out part under `salt`. An empty salt is
+/// exactly [`is_holdout`] of the item id, so tables fitted before salts exist
+/// stay valid.
+pub fn in_holdout(item: &Value, salt: &str, percent: u64) -> bool {
+    if salt.is_empty() {
+        is_holdout(item["id"].as_str().unwrap_or_default(), percent)
+    } else {
+        is_holdout(&format!("{salt}:{}", group_key(item)), percent)
+    }
+}
+
+/// The `holdout_salt` of a prior table or tie-break file (empty when the file
+/// has none: the unsalted split). `wanted` is a salt the caller expects; a
+/// different one is an error, since the hold-out list was drawn with the
+/// file's.
+pub fn file_salt(path: &Path, wanted: Option<&str>) -> Result<String> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read the hold-out file {}", path.display()))?;
+    let doc: Value = serde_json::from_str(&text).context("the hold-out file is not JSON")?;
+    let salt = doc["holdout_salt"].as_str().unwrap_or_default().to_owned();
+    if let Some(wanted) = wanted
+        && wanted != salt
+    {
+        bail!(
+            "--salt {wanted:?} does not match the holdout_salt {salt:?} of {}",
+            path.display()
+        );
+    }
+    Ok(salt)
+}
+
+/// Writes `holdout_salt` into the JSON file at `path` (the table writers in
+/// `lci-maps` do not know the field; they ignore it when reading).
+pub fn stamp_salt(path: &Path, salt: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut doc: Value = serde_json::from_str(&text).context("the file is not JSON")?;
+    doc.as_object_mut()
+        .context("the file is not a JSON object")?
+        .insert("holdout_salt".into(), Value::from(salt));
+    let mut out = serde_json::to_string_pretty(&doc)?;
+    out.push('\n');
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
 }
 
 /// The file name `maps bench` gives the raw output of an item.
@@ -164,6 +233,7 @@ pub fn fit_runs(
     runs: &[PathBuf],
     gold_dir: &Path,
     holdout_percent: u64,
+    salt: &str,
     scip_sites: &HashMap<String, Site>,
 ) -> Result<Fitted> {
     let mut out = Fitted {
@@ -182,7 +252,7 @@ pub fn fit_runs(
             let stats = out.stats.entry(name.to_owned()).or_default();
             for item in &golds[name] {
                 let id = item["id"].as_str().unwrap_or_default();
-                if is_holdout(id, holdout_percent) {
+                if in_holdout(item, salt, holdout_percent) {
                     out.holdout.insert(id.to_owned());
                     continue;
                 }
@@ -270,15 +340,18 @@ pub fn run(args: FitPriorsArgs) -> Result<()> {
         &args.runs,
         &args.gold_dir,
         args.holdout_percent,
+        &args.salt,
         &scip_sites,
     )?;
     let table: PriorTable = fitted.fit.fit(args.smoothing, fitted.holdout.clone());
     table.save(&args.out)?;
+    stamp_salt(&args.out, &args.salt)?;
     let normalised = table.normalised();
     println!(
-        "wrote {} ({} hold-out items)",
+        "wrote {} ({} hold-out items, salt {:?})",
         args.out.display(),
-        table.holdout.len()
+        table.holdout.len(),
+        args.salt,
     );
     for (question_type, pairs) in fitted.fit.counts() {
         let stats = &fitted.stats[question_type];
@@ -340,6 +413,73 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_salt_is_the_original_id_split() {
+        for i in 0..200 {
+            let id = format!("history-h1-{i:04}");
+            // Whatever the provenance says, no salt hashes the id alone.
+            let item = json!({"id": id, "provenance": [format!("commit:c{}", i % 7)]});
+            for percent in [0, 10, 30, 100] {
+                assert_eq!(in_holdout(&item, "", percent), is_holdout(&id, percent));
+            }
+        }
+        // Pinned buckets (first 8 bytes of SHA-256 of the id, mod 100): these
+        // ids must keep their side, or tables fitted before salts break.
+        for (id, bucket) in [
+            ("flow-0000", 92),
+            ("flow-0001", 6),
+            ("flow-0002", 71),
+            ("flow-0003", 21),
+        ] {
+            let item = json!({"id": id});
+            assert!(!in_holdout(&item, "", bucket) && in_holdout(&item, "", bucket + 1));
+        }
+    }
+
+    #[test]
+    fn a_salt_redraws_the_split_and_keeps_a_commit_group_together() {
+        let item = |i: usize, commit: usize| json!({"id": format!("h-{i}"), "provenance": ["note", format!("commit:c{commit}")]});
+        let items: Vec<Value> = (0..400).map(|i| item(i, i / 4)).collect();
+        // Items of one commit share a side, whatever the salt.
+        for salt in ["s1", "s2"] {
+            for group in items.chunks(4) {
+                let sides: Vec<bool> = group.iter().map(|g| in_holdout(g, salt, 30)).collect();
+                assert!(sides.iter().all(|s| *s == sides[0]), "{salt} {sides:?}");
+            }
+        }
+        // A different salt gives a different split; the share is still near the percent.
+        let side =
+            |salt: &str| -> Vec<bool> { items.iter().map(|g| in_holdout(g, salt, 30)).collect() };
+        assert_ne!(side("s1"), side("s2"));
+        assert_ne!(side("s1"), side(""));
+        let held = side("s1").iter().filter(|h| **h).count();
+        assert!((60..=180).contains(&held), "{held}");
+        // An item with no commit is grouped by its id.
+        assert_eq!(group_key(&json!({"id": "flow-1"})), "flow-1");
+        assert_eq!(
+            group_key(&json!({"id": "x", "provenance": ["file:a", "commit:abc"]})),
+            "commit:abc"
+        );
+    }
+
+    #[test]
+    fn the_salt_is_stamped_into_a_table_file_and_read_back() {
+        let root = std::env::temp_dir().join(format!("fit-priors-salt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("table.json");
+        let table = PriorTable::default();
+        table.save(&path).unwrap();
+        assert_eq!(file_salt(&path, None).unwrap(), "");
+        stamp_salt(&path, "s1").unwrap();
+        assert_eq!(file_salt(&path, None).unwrap(), "s1");
+        assert_eq!(file_salt(&path, Some("s1")).unwrap(), "s1");
+        assert!(file_salt(&path, Some("s2")).is_err());
+        // The table still loads (the unknown field is ignored).
+        assert_eq!(PriorTable::load(&path).unwrap(), table);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_synthetic_bench_dir_is_fitted_on_the_fit_part_only() {
         let root = std::env::temp_dir().join(format!("fit-priors-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -385,7 +525,14 @@ mod tests {
         std::fs::create_dir_all(&gold_dir).unwrap();
         std::fs::write(gold_dir.join("flow.json"), Value::Array(items).to_string()).unwrap();
 
-        let fitted = fit_runs(std::slice::from_ref(&out), &gold_dir, 30, &HashMap::new()).unwrap();
+        let fitted = fit_runs(
+            std::slice::from_ref(&out),
+            &gold_dir,
+            30,
+            "",
+            &HashMap::new(),
+        )
+        .unwrap();
         let held: BTreeSet<&String> = ids.iter().filter(|id| is_holdout(id, 30)).collect();
         assert_eq!(fitted.holdout.iter().collect::<BTreeSet<_>>(), held);
         let count = |kind| {

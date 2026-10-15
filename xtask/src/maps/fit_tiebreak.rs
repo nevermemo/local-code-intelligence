@@ -22,7 +22,7 @@
 
 use super::{
     bench::{self, ResultNode, Site},
-    fit_priors::is_gold,
+    fit_priors::{file_salt, is_gold, stamp_salt},
 };
 use crate::gold::{self, Set};
 use anyhow::{Context, Result, bail};
@@ -47,6 +47,11 @@ pub struct FitTiebreakArgs {
     /// A JSON file with a `holdout` array of item ids to keep out of the fit.
     #[arg(long)]
     holdout: PathBuf,
+    /// The split salt the hold-out file was drawn with (`maps fit-priors
+    /// --salt`). Only checked against the file's `holdout_salt`, which is
+    /// what is recorded in the tie-break; a mismatch is an error.
+    #[arg(long)]
+    salt: Option<String>,
     /// Where the tie-break is written. It is derived from private gold: keep
     /// it out of the repository.
     #[arg(long)]
@@ -269,6 +274,7 @@ pub fn run(args: FitTiebreakArgs) -> Result<()> {
         bail!("--l2 must be at least 0");
     }
     let holdout = holdout_ids(&args.holdout)?;
+    let salt = file_salt(&args.holdout, args.salt.as_deref())?;
     let collected = collect(args.set, &args.raw_dir, &args.gold_dir, &holdout)?;
     let weights = fit_weights(&collected.train, args.l2, args.iterations)?;
     let set = bench::set_name(args.set);
@@ -282,7 +288,11 @@ pub fn run(args: FitTiebreakArgs) -> Result<()> {
     );
     let tie_break = TieBreak::new(weights.clone(), holdout, fitted_on)?;
     tie_break.save(&args.out)?;
-    println!("wrote {} ({set})", args.out.display());
+    stamp_salt(&args.out, &salt)?;
+    println!(
+        "wrote {} ({set}, hold-out salt {salt:?})",
+        args.out.display()
+    );
     println!(
         "items: {} train, {} hold-out; skipped {} without a raw output, {} without the feature fields, {} outside the scored population",
         collected.train_items,

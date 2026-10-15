@@ -60,6 +60,13 @@ How to read a row:
   and the note `structural-zero`: the zero is the shape of the map list, not a
   result, so such a row is left out of any average over sets or waves. This
   file computes no average; a reader that does must skip those rows.
+- A note that starts with `UNRELIABLE, not decision-grade` says some scored
+  items stopped on the deadline, had reranker failures or had map call
+  failures (with the counts of items); such a row must not decide anything.
+  `maps compare` leaves those items out of a paired comparison. A note
+  `expansions=N (pops P + pass-through pops Q)` gives the total expansions of a
+  `--pass-through` run, whose `pops` column omits the pass-through pops. A
+  note `salt=...` after `holdout-only` is the split salt of the prior table.
 - A row whose note says `rescored` was scored again from the raw outputs of an
   earlier run with the current adapters (`--rescore`); its traversal columns
   are the earlier run's and its wall latency is `-`.

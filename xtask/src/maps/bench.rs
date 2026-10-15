@@ -22,6 +22,7 @@
 //! `--rescore <dir>` scores the raw outputs of an earlier run again (no
 //! traversal, no CLI) with the adapters as they are now.
 
+use super::fit_priors::file_salt;
 use super::trend::{self, NCOLS, TrendRow};
 use crate::gold::{self, Answer, Set};
 use anyhow::{Context, Result, bail};
@@ -124,6 +125,12 @@ pub struct BenchArgs {
     /// primary items). The row's note says `holdout-only`.
     #[arg(long, requires = "priors")]
     holdout_only: bool,
+    /// The split salt the prior table was fitted with (`maps fit-priors
+    /// --salt`). The hold-out list and the salt both come from the table; this
+    /// only checks that they match, and a mismatch is an error. The row's note
+    /// says `salt=<salt>` when the table has one.
+    #[arg(long, requires = "holdout_only")]
+    salt: Option<String>,
     /// A fitted tie-break file (`lci traverse --tie-break`) that orders results
     /// tied at the same rank. The row's note says `tie-break=<file stem>`.
     #[arg(long)]
@@ -184,11 +191,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
         .unwrap_or_else(|| repo_root().join(DEFAULT_TREND));
     let sets = args.set.sets();
     let holdout = match (&args.priors, args.holdout_only) {
-        (Some(path), true) => Some(
-            PriorTable::load(path)
-                .with_context(|| format!("read the prior table {}", path.display()))?
-                .holdout,
-        ),
+        (Some(path), true) => {
+            file_salt(path, args.salt.as_deref())?;
+            Some(
+                PriorTable::load(path)
+                    .with_context(|| format!("read the prior table {}", path.display()))?
+                    .holdout,
+            )
+        }
         _ => None,
     };
     let mut gold_items = Vec::new();
@@ -412,13 +422,20 @@ fn note_with_flags(
     parts.collect::<Vec<_>>().join("; ")
 }
 
-/// `priors=<file stem>` and `holdout-only`, for the row's note.
+/// `priors=<file stem>`, `holdout-only` and the table's split salt (when it
+/// has one), for the row's note.
 fn priors_note(args: &BenchArgs) -> Option<String> {
-    let stem = args.priors.as_ref()?.file_stem()?.to_string_lossy();
+    let path = args.priors.as_ref()?;
+    let stem = path.file_stem()?.to_string_lossy();
     let holdout = if args.holdout_only {
-        ", holdout-only"
+        let salt = file_salt(path, None).unwrap_or_default();
+        if salt.is_empty() {
+            ", holdout-only".to_owned()
+        } else {
+            format!(", holdout-only, salt={salt}")
+        }
     } else {
-        ""
+        String::new()
     };
     Some(format!("priors={stem}{holdout}"))
 }
@@ -440,7 +457,7 @@ fn policy_label(policy: &str) -> String {
         .to_string()
 }
 
-fn slug(text: &str) -> String {
+pub(super) fn slug(text: &str) -> String {
     let s: String = text
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -554,6 +571,9 @@ pub struct Totals {
     pub hops: u64,
     pub cross_map_hops: u64,
     pub stops: u64,
+    /// Pops of connective nodes that did not count toward `pops` (0 unless
+    /// `--pass-through` was on); total expansions = `pops + pass_through_pops`.
+    pub pass_through_pops: u64,
     pub elapsed_ms: f64,
     /// The reranker frontier's counts (0 when it was off).
     pub rerank_calls: u64,
@@ -638,6 +658,7 @@ impl Traversed {
                 hops: t["hops"].as_u64().unwrap_or(0),
                 cross_map_hops: t["cross_map_hops"].as_u64().unwrap_or(0),
                 stops: t["stops"].as_u64().unwrap_or(0),
+                pass_through_pops: t["pass_through_pops"].as_u64().unwrap_or(0),
                 elapsed_ms: t["elapsed_ms"].as_f64().unwrap_or(0.0),
                 rerank_calls: t["rerank_calls"].as_u64().unwrap_or(0),
                 rerank_docs: t["rerank_docs"].as_u64().unwrap_or(0),
@@ -651,6 +672,38 @@ impl Traversed {
             totals,
             wall_ms,
         }
+    }
+}
+
+/// What makes one item's result weak evidence: the walk was cut by the
+/// deadline (machine load, not the algorithm), or calls it depended on failed.
+/// Read from the raw traversal JSON; map failures need the checkpoint, which
+/// only a run that returns one has.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ItemFlags {
+    pub deadline: bool,
+    pub rerank_failures: u64,
+    pub map_failures: u64,
+}
+
+impl ItemFlags {
+    pub fn from_raw(raw: &Value) -> Self {
+        let map_failures = raw
+            .pointer("/checkpoint/maps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|stat| stat["failures"].as_u64())
+            .sum();
+        Self {
+            deadline: raw["stop_reason"].as_str() == Some("deadline"),
+            rerank_failures: raw["totals"]["rerank_failures"].as_u64().unwrap_or(0),
+            map_failures,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.deadline || self.rerank_failures > 0 || self.map_failures > 0
     }
 }
 
@@ -1241,6 +1294,31 @@ fn item_metrics(
         .unwrap_or_default())
 }
 
+/// Precision, F0.5 and the per-item record of `items.json` for one scored
+/// item: the scorer's metrics of the item alone plus `precision`, `f0.5` and,
+/// when known, `expansions`. `maps compare` rebuilds the record from `run.json`
+/// with this same function for runs that predate `items.json`.
+pub(super) fn item_record(
+    set: Set,
+    item: &Value,
+    answers: &[Value],
+    expansions: Option<u64>,
+) -> Result<(f64, f64, Map<String, Value>)> {
+    let metrics = item_metrics(set, item, answers)?;
+    let (p, r) = item_precision_recall(set, item, answers, &metrics);
+    let f05 = f_beta(p, r, 0.5);
+    let mut record: Map<String, Value> = metrics
+        .iter()
+        .map(|(name, value)| (name.clone(), json!(value)))
+        .collect();
+    record.insert("precision".into(), json!(p));
+    record.insert("f0.5".into(), json!(f05));
+    if let Some(n) = expansions {
+        record.insert("expansions".into(), json!(n));
+    }
+    Ok((p, f05, record))
+}
+
 /// The answer-set precision and recall of one item, from the scorer's own
 /// definitions (see the trend preface).
 pub fn item_precision_recall(
@@ -1401,6 +1479,11 @@ pub struct SetOutcome {
     pub row: TrendRow,
     /// Per attempted item: the raw traversal JSON, or the error text.
     pub raw: Vec<(String, Value)>,
+    /// `{"set": name, "items": {"<id>": {metric: value}}}`: the scorer's
+    /// metrics of every scored item alone, plus `precision`, `f0.5` and
+    /// `expansions` (pops + pass-through pops). `maps compare` pairs on it.
+    /// `Null` for a row that scored nothing.
+    pub items: Value,
 }
 
 /// Items that were not scored, by cause. Nothing is dropped without a count.
@@ -1443,6 +1526,10 @@ struct Sums {
     hops: u64,
     cross: u64,
     stops: u64,
+    pass_through_pops: u64,
+    /// Items that stopped on the deadline, had reranker failures or had map
+    /// call failures (an item can be in several).
+    flagged: [usize; 3],
     /// Reranker frontier calls, nodes rated and calls that failed.
     rerank: [u64; 3],
     answer_chars_tokens: u64,
@@ -1478,7 +1565,7 @@ fn ms_pair(sample: &[f64], under_load: bool) -> String {
 }
 
 /// The metrics a row shows for each set.
-fn headline(set: Set) -> &'static [&'static str] {
+pub(super) fn headline(set: Set) -> &'static [&'static str] {
     match set {
         Set::Impact => &["decl_recall", "decl_f1", "decl_ndcg@10", "file_f1"],
         Set::Flow => &["path_recall", "tau", "spurious"],
@@ -1566,6 +1653,7 @@ fn skipped_outcome(
         report: Value::Null,
         row: TrendRow { cells },
         raw: Vec::new(),
+        items: Value::Null,
     }
 }
 
@@ -1603,6 +1691,8 @@ pub fn bench_set(
     let mut sums = Sums::default();
     let mut skips = Skips::default();
     let mut scored: Vec<(Vec<Value>, &Value)> = Vec::new();
+    // Work per scored item (pops, pass-through pops), for `items.json`.
+    let mut work: Vec<[u64; 2]> = Vec::new();
     let started = Instant::now();
     for (index, item) in items.iter().enumerate() {
         let id = item["id"].as_str().context("gold item without an id")?;
@@ -1611,6 +1701,14 @@ pub fn bench_set(
             Ok((traversed, raw_json)) => {
                 if let Some(reason) = raw_json["stop_reason"].as_str() {
                     *sums.stop_reasons.entry(reason.to_owned()).or_default() += 1;
+                }
+                let flags = ItemFlags::from_raw(&raw_json);
+                for (count, hit) in sums.flagged.iter_mut().zip([
+                    flags.deadline,
+                    flags.rerank_failures > 0,
+                    flags.map_failures > 0,
+                ]) {
+                    *count += usize::from(hit);
                 }
                 raw.push((id.to_string(), raw_json));
                 let mut nodes: Vec<ResultNode> = Vec::new();
@@ -1643,6 +1741,7 @@ pub fn bench_set(
                     sums.hops += t.hops;
                     sums.cross += t.cross_map_hops;
                     sums.stops += t.stops;
+                    sums.pass_through_pops += t.pass_through_pops;
                     for (sum, n) in sums.rerank.iter_mut().zip([
                         t.rerank_calls,
                         t.rerank_docs,
@@ -1653,6 +1752,12 @@ pub fn bench_set(
                     sums.engine_ms.push(t.elapsed_ms);
                 }
                 run.insert(id.to_string(), Value::Array(answers.clone()));
+                work.push(
+                    traversed
+                        .totals
+                        .as_ref()
+                        .map_or([0, 0], |t| [t.pops, t.pass_through_pops]),
+                );
                 scored.push((answers, item));
             }
             Err(error) => {
@@ -1675,11 +1780,14 @@ pub fn bench_set(
         }
     }
 
-    for (answers, item) in &scored {
-        let metrics = item_metrics(set, item, answers)?;
-        let (p, r) = item_precision_recall(set, item, answers, &metrics);
+    let mut item_records = Map::new();
+    for ((answers, item), work) in scored.iter().zip(&work) {
+        let (p, f05, record) = item_record(set, item, answers, Some(work[0] + work[1]))?;
         sums.precision += p;
-        sums.f05 += f_beta(p, r, 0.5);
+        sums.f05 += f05;
+        if let Some(id) = item["id"].as_str() {
+            item_records.insert(id.to_owned(), Value::Object(record));
+        }
     }
     let n_scored = scored.len();
     let scored_items: Vec<Value> = scored.iter().map(|(_, item)| (*item).clone()).collect();
@@ -1712,8 +1820,19 @@ pub fn bench_set(
         cells[16] = ms_pair(&sums.wall_ms, config.under_load);
     }
     let mut notes: Vec<String> = Vec::new();
+    if let Some(marker) = unreliable_marker(sums.flagged) {
+        notes.push(marker);
+    }
     if !config.note.is_empty() {
         notes.push(config.note.clone());
+    }
+    if sums.pass_through_pops > 0 {
+        notes.push(format!(
+            "expansions={} (pops {} + pass-through pops {})",
+            sums.pops + sums.pass_through_pops,
+            sums.pops,
+            sums.pass_through_pops
+        ));
     }
     if sums.no_seeds > 0 {
         notes.push(format!("{} scored items found no seeds", sums.no_seeds));
@@ -1732,9 +1851,9 @@ pub fn bench_set(
             .collect();
         notes.push(format!("stops: {}", counts.join(" ")));
     }
-    if let Some(n) = sums.stop_reasons.get("deadline") {
+    if let Some(marker) = unreliable_marker(sums.flagged) {
         eprintln!(
-            "warning: {} stopped by the deadline for {n} item(s): machine load can cut walks",
+            "warning: {}: {marker}; machine load can cut walks and failed calls change answers",
             set_name(set)
         );
     }
@@ -1760,10 +1879,23 @@ pub fn bench_set(
         report,
         row: TrendRow { cells },
         raw,
+        items: json!({ "set": set_name(set), "items": item_records }),
     })
 }
 
-/// Writes `run.json`, `score.json`, `row.md` and `raw/<id>.json` under `dir`.
+/// The row-note marker for a run whose items include a deadline stop, reranker
+/// failures or map call failures (`flagged` counts the items of each kind);
+/// such a row is not a clean measurement and should not decide anything.
+fn unreliable_marker([deadline, rerank, map]: [usize; 3]) -> Option<String> {
+    (deadline + rerank + map > 0).then(|| {
+        format!(
+            "UNRELIABLE, not decision-grade (items with: deadline stop={deadline}, rerank failures={rerank}, map call failures={map})"
+        )
+    })
+}
+
+/// Writes `run.json`, `score.json`, `items.json`, `row.md` and `raw/<id>.json`
+/// under `dir`.
 pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
     let raw_dir = dir.join("raw");
     std::fs::create_dir_all(&raw_dir).with_context(|| format!("create {}", raw_dir.display()))?;
@@ -1773,6 +1905,9 @@ pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
         std::fs::write(dir.join("score.json"), pretty(&outcome.report)?)?;
     }
     std::fs::write(dir.join("row.md"), outcome.row.to_markdown() + "\n")?;
+    if !outcome.items.is_null() {
+        std::fs::write(dir.join("items.json"), pretty(&outcome.items)?)?;
+    }
     for (id, value) in &outcome.raw {
         std::fs::write(raw_dir.join(format!("{}.json", slug(id))), pretty(value)?)?;
     }
@@ -2195,6 +2330,18 @@ mod tests {
         assert!(cells[20].contains("1 scored items found no seeds"));
         assert!(cells[20].contains("rerank calls=3 docs=7 failed=1"));
         assert!(cells[20].contains("stops: bound=1 deadline=1 no_seeds=1"));
+        // The deadline stop and the reranker failure make the row unreliable.
+        assert!(
+            cells[20].starts_with(
+                "UNRELIABLE, not decision-grade (items with: deadline stop=1, rerank failures=1, map call failures=0)"
+            ),
+            "{}",
+            cells[20]
+        );
+        // The same item is in `items.json` with the per-item metrics.
+        assert_eq!(outcome.items["set"], "impact");
+        assert_eq!(outcome.items["items"]["i2"]["decl_recall"], 1.0);
+        assert_eq!(outcome.items["items"]["i2"]["expansions"], 4);
         assert!(cells[7].contains("decl_recall=0.667") && cells[7].contains("(over 3)"));
         assert_eq!(cells[18], "none");
 
@@ -2207,9 +2354,46 @@ mod tests {
         assert!(text.contains("| test-wave | impact | 3 | 3 | 3 | none | 2/3 |"));
         assert!(dir.join("out/run.json").exists() && dir.join("out/score.json").exists());
         assert!(dir.join("out/raw/i1.json").exists());
+        assert!(dir.join("out/items.json").exists());
         // Re-running the same wave and set is refused.
         assert!(trend::append(&trend_path, &outcome.row).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clean_run_has_no_marker_and_pass_through_pops_count_as_expansions() {
+        let items = vec![impact_item(
+            "i1",
+            "q one",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let mut one = traversal(&["x"], &[SEARCH_FN], 6);
+        one["totals"]["pass_through_pops"] = json!(5);
+        let answers = BTreeMap::from([("q one".to_owned(), one)]);
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(answers),
+            &config(&["graph.scip", "seeds.scip_names"]),
+        )
+        .unwrap();
+        let note = &outcome.row.cells[20];
+        assert!(!note.contains("UNRELIABLE"), "{note}");
+        assert!(
+            note.contains("expansions=11 (pops 6 + pass-through pops 5)"),
+            "{note}"
+        );
+        assert_eq!(outcome.items["items"]["i1"]["expansions"], 11);
+        // The map failures of a checkpoint are flags too.
+        let raw = json!({"checkpoint": {"maps": [
+            {"map": "graph.scip", "failures": 0}, {"map": "git.history", "failures": 3}]}});
+        let flags = ItemFlags::from_raw(&raw);
+        assert_eq!(
+            (flags.map_failures, flags.deadline, flags.any()),
+            (3, false, true)
+        );
+        assert!(!ItemFlags::from_raw(&json!({"stop_reason": "bound"})).any());
     }
 
     #[test]

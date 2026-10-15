@@ -4,6 +4,7 @@
 //! gold scorers and appends a row to the trend file (see `bench.rs`).
 
 pub mod bench;
+pub mod compare;
 pub mod fit_priors;
 pub mod fit_tiebreak;
 pub mod trend;
@@ -25,6 +26,12 @@ pub enum MapsCommand {
     /// tied at the same rank) from the raw outputs of a bench run of one set,
     /// leaving the hold-out items out of the fit.
     FitTiebreak(fit_tiebreak::FitTiebreakArgs),
+    /// Compare two bench runs of one set item by item: per metric the paired
+    /// means, the mean difference B - A with a 95% paired-bootstrap interval,
+    /// and the counts of items B is above, below or level on. Items either run
+    /// stopped on the deadline or had failures on are left out unless
+    /// --keep-failed.
+    Compare(compare::CompareArgs),
 }
 
 pub fn run(command: MapsCommand) -> Result<()> {
@@ -32,5 +39,6 @@ pub fn run(command: MapsCommand) -> Result<()> {
         MapsCommand::Bench(args) => bench::run(*args),
         MapsCommand::FitPriors(args) => fit_priors::run(args),
         MapsCommand::FitTiebreak(args) => fit_tiebreak::run(args),
+        MapsCommand::Compare(args) => compare::run(args),
     }
 }
