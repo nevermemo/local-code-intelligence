@@ -78,7 +78,36 @@ to the question, which scrambles the order along a call path (tau falls from
 .933 to .333, though tau is defined on 15 items instead of 30) and loses path recall, though precision rises. On where-to it
 also repairs the learned priors' loss. It costs 16 calls per item on average
 (about 90 documents per impact item, no failures) and 50 to 76% more pops.
-The history rows are pending.
+On history (with git.history) the reranker is the largest gain so far: over
+all 110 items mrr .128 to .230, hit@10 .191 to .382, precision .063 to .102,
+with 42% fewer pops (16734 to 9733); with learned priors on the held-out
+items, mrr .222 to .227 and hit@10 .379 to .517. It is also the most
+expensive arm: 80 reranker calls and about 670 rated documents per item, and
+50 of 8825 calls failed (timeouts while four sets shared one reranker).
+
+## Fitted tie-break (Q5)
+
+Pools of 40 results per item (bench-1021 Q5-pool, scored on the top 10) gave
+the fit its tied pairs; weights were fitted per set on the train ids only
+(pairwise logistic regression over results tied on ranked_potential). Share
+of held-out tied pairs with the gold result first: impact 58.4% by discovery
+order to 74.5% with the tie-break, where-to 78.4% to 80.6%, history 81.0% to
+86.3%, flow 75.3% to 68.6% (worse). Discovery order is already a fair
+tie-break.
+
+At k 10 on the held-out items (guessed priors, Q5-none against Q5-tb):
+
+| set | without | with the tie-break |
+| --- | --- | --- |
+| history (+ git.history) | mrr .086, hit@10 .138, precision .030 | .147, .241, .082 |
+| impact | decl_recall .046, decl_f1 .036 | .043, .033 |
+| where-to | reg_hit@3 .917, reg_mrr .722, set_f1 .300 | .833, .653, .348 |
+| flow | path_recall .403, tau 1.000 | .403, .600 |
+
+The pair gain on impact does not reach the top 10: at k 10 the bound ends the
+walk before most tied candidates are found, so the tie-break can only reorder
+the few that are. It stays opt-in; history is the only set where it helps, and
+that choice was made on the holdout.
 
 ## Fusion and pass-through (Q2, Q4)
 
