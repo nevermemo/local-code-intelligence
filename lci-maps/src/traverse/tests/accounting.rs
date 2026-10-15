@@ -317,14 +317,14 @@ async fn q4_a_connective_node_is_expanded_without_costing_a_pop() {
 }
 
 #[tokio::test]
-async fn q4_the_handle_keeps_pass_through_and_a_resume_equals_the_straight_run() {
+async fn q4_the_handle_keeps_its_flags_and_a_resume_equals_the_straight_run() {
     let reg = registry(vec![through_a_file()]);
     let first = walk(&reg, vec![seed("sym/s")], budget(1), |t| {
-        t.pass_through(true)
+        t.pass_through(true).score_bound(false)
     })
     .await;
     let snapshot = first.snapshot.expect("the pop cap left work");
-    assert!(snapshot.pass_through);
+    assert!(snapshot.pass_through && !snapshot.score_bound);
     assert_eq!(snapshot.totals.pass_through_pops, 1);
     let back = Snapshot::from_json(&snapshot.to_json()).unwrap();
     assert_eq!(back, snapshot);
@@ -332,8 +332,9 @@ async fn q4_the_handle_keeps_pass_through_and_a_resume_equals_the_straight_run()
     // The resume is not told to pass through: its handle is.
     let second = resume(&reg, back, budget(3), |t| t).await;
     assert_eq!(events_of(&second, "resume")[0]["pass_through"], true);
+    assert_eq!(events_of(&second, "resume")[0]["score_bound"], false);
     let straight = walk(&reg, vec![seed("sym/s")], budget(3), |t| {
-        t.pass_through(true)
+        t.pass_through(true).score_bound(false)
     })
     .await;
     assert_eq!(second.states, straight.states);

@@ -349,5 +349,10 @@ fusion = "boost"
 # make its children free, and the token budget is charged as usual. A resumed
 # traversal keeps the setting its handle was made with.
 pass_through = false
+# Whether the score bound may end a traversal early: once enough results exist and
+# nothing queued can lift a result above the k-th, the walk stops with the stop
+# reason `bound`. false: the walk runs to its budgets or a dry frontier. A resumed
+# traversal keeps the setting its handle was made with.
+score_bound = true
 # Hits of the hybrid search that become start nodes, 1 to 40.
 seed_k = 8

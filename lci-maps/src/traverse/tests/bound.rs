@@ -90,9 +90,13 @@ async fn q1_the_bound_holds_only_with_k_results_and_no_state_that_could_beat_the
     let reg = registry(vec![small()]);
     // Fewer than k results never hold it; a k of 0 switches it off; with two
     // expanding maps a queued state of potential 1 could rank 1.1, above the
-    // 2nd result at 1.0, so the walk goes on to the end.
-    for (k, maps) in [(100, 1), (0, 1), (2, 2)] {
-        let result = walk(&reg, vec![seed("s")], budget(100), |t| t.top_k(k, maps)).await;
+    // 2nd result at 1.0, so the walk goes on to the end. With the bound
+    // switched off the walk runs on though it would hold.
+    for (k, maps, on) in [(100, 1, true), (0, 1, true), (2, 2, true), (2, 1, false)] {
+        let result = walk(&reg, vec![seed("s")], budget(100), |t| {
+            t.top_k(k, maps).score_bound(on)
+        })
+        .await;
         assert_eq!(
             result.status,
             TraversalStatus::Complete,

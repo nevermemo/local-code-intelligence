@@ -574,6 +574,10 @@ pub struct TraverseConfig {
     /// and their tokens are charged as for any expansion. A resumed traversal keeps the
     /// setting its handle was made with.
     pub pass_through: bool,
+    /// Whether the score bound may end a traversal early (stop reason
+    /// `bound`). `false`: the walk runs to its budgets or a dry frontier. A
+    /// resumed traversal keeps the setting its handle was made with.
+    pub score_bound: bool,
     /// Hits of the hybrid search (the pipeline `search_code` runs, with the
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
@@ -663,6 +667,7 @@ impl Default for TraverseConfig {
             corroboration_boost: 0.1,
             fusion: TraverseFusion::Boost,
             pass_through: false,
+            score_bound: true,
             seed_k: 8,
         }
     }
@@ -2856,6 +2861,15 @@ fusion = \"rrf\"
         assert!(free.traverse.pass_through);
         let text = format!("{}[traverse]\npass_through = \"yes\"\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
+        // The score bound is on unless switched off.
+        assert_eq!(value["traverse"]["score_bound"], true);
+        let text = format!("{}[traverse]\nscore_bound = false\n", base_toml());
+        assert!(
+            !toml::from_str::<Config>(&text)
+                .unwrap()
+                .traverse
+                .score_bound
+        );
     }
 
     #[test]

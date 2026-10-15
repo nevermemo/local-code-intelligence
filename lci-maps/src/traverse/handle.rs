@@ -152,6 +152,8 @@ pub struct Snapshot {
     /// Whether the first call passed through connective nodes (their pops
     /// were free); a resume keeps it.
     pub pass_through: bool,
+    /// Whether the score bound could end the walk; a resume keeps it.
+    pub score_bound: bool,
 }
 
 impl Snapshot {
@@ -216,6 +218,7 @@ impl Snapshot {
             "identity": self.identity,
             "boost": self.boost,
             "pass_through": self.pass_through,
+            "score_bound": self.score_bound,
         })
     }
 
@@ -469,6 +472,9 @@ impl Snapshot {
             pass_through: get(obj, "pass_through")?
                 .as_bool()
                 .ok_or("pass_through is not a boolean")?,
+            score_bound: get(obj, "score_bound")?
+                .as_bool()
+                .ok_or("score_bound is not a boolean")?,
         })
     }
 }
@@ -714,6 +720,7 @@ impl Run<'_> {
             boost: self.t.boost,
             fusion: self.t.fusion,
             pass_through: self.t.pass_through,
+            score_bound: self.t.score_bound,
         }
     }
 
@@ -743,6 +750,7 @@ impl Run<'_> {
             boost,
             fusion,
             pass_through,
+            score_bound,
             ..
         } = snapshot;
         if self.t.identity.is_empty() {
@@ -751,6 +759,7 @@ impl Run<'_> {
         self.t.boost = boost;
         self.t.fusion = fusion;
         self.t.pass_through = pass_through;
+        self.t.score_bound = score_bound;
         self.state_of = states
             .iter()
             .enumerate()
@@ -818,6 +827,9 @@ impl Run<'_> {
         });
         if let (true, Some(object)) = (pass_through, resume.as_object_mut()) {
             object.insert("pass_through".into(), json!(true));
+        }
+        if let (false, Some(object)) = (score_bound, resume.as_object_mut()) {
+            object.insert("score_bound".into(), json!(false));
         }
         self.events.push(resume);
     }

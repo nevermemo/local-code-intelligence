@@ -375,6 +375,7 @@ pub struct Traversal<'s> {
     boost: f64,
     fusion: Fusion,
     pass_through: bool,
+    score_bound: bool,
     /// `(k, n_maps)` of the score bound; see [`Traversal::top_k`].
     bound: Option<(usize, usize)>,
     identity: String,
@@ -399,6 +400,7 @@ impl<'s> Traversal<'s> {
             boost: DEFAULT_CORROBORATION_BOOST,
             fusion: Fusion::Boost,
             pass_through: false,
+            score_bound: true,
             bound: None,
             identity: String::new(),
         }
@@ -453,6 +455,14 @@ impl<'s> Traversal<'s> {
     /// made with.
     pub fn pass_through(mut self, on: bool) -> Self {
         self.pass_through = on;
+        self
+    }
+
+    /// Whether the score bound may end the walk (default true; see
+    /// [`Traversal::top_k`]). A resumed traversal keeps the setting its handle
+    /// was made with.
+    pub fn score_bound(mut self, on: bool) -> Self {
+        self.score_bound = on;
         self
     }
 
@@ -673,6 +683,9 @@ impl<'s> Run<'s> {
             if let (true, Some(object)) = (self.t.pass_through, start.as_object_mut()) {
                 object.insert("pass_through".into(), json!(true));
             }
+            if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
+                object.insert("score_bound".into(), json!(false));
+            }
             if let (Some(plan), Some(object)) = (&self.t.plan, start.as_object_mut()) {
                 for (key, value) in plan.fields(stops_json(&self.t.stops)) {
                     object.insert(key.to_owned(), value);
@@ -880,7 +893,7 @@ impl<'s> Run<'s> {
         let (k, n_maps) = self.t.bound?;
         // A fused score depends on the ranks of all the other results, so no
         // frontier state has a bound on it.
-        if self.t.fusion == Fusion::Rrf || !self.t.targets.is_empty() {
+        if !self.t.score_bound || self.t.fusion == Fusion::Rrf || !self.t.targets.is_empty() {
             return None;
         }
         // The results: every state reached by an edge that is not pruned.

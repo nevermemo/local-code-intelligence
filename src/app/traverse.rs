@@ -1239,6 +1239,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .corroboration_boost(limits.corroboration_boost)
         .fusion(limits.fusion)
         .pass_through(limits.pass_through)
+        .score_bound(limits.score_bound)
         .top_k(call.top_k, expanding);
     let traversal = match handler {
         Some((ladder, stops, _)) => traversal.handler(ladder, stops),

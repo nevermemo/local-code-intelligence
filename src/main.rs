@@ -436,6 +436,11 @@ struct TraverseArgs {
     /// keeps the setting its handle started with.
     #[arg(long)]
     pass_through: bool,
+    /// Never end the walk on the score bound (the `[traverse] score_bound`
+    /// setting, on by default). A continuation keeps the setting its handle
+    /// started with.
+    #[arg(long)]
+    no_score_bound: bool,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -484,6 +489,7 @@ async fn run_traverse(
         config.traverse.fusion = fusion;
     }
     config.traverse.pass_through |= args.pass_through;
+    config.traverse.score_bound &= !args.no_score_bound;
     let mut steer = match &args.policy {
         None => SteerArgs::default(),
         Some(text) => match json_argument(text)? {

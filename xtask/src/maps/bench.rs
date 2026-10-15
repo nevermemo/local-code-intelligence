@@ -105,6 +105,10 @@ pub struct BenchArgs {
     /// note says when it is on.
     #[arg(long)]
     pass_through: bool,
+    /// Switch the score bound off (`lci traverse --no-score-bound`). The row's
+    /// note says `no-bound`.
+    #[arg(long)]
+    no_score_bound: bool,
     /// Run only the first N items of each set (impact: of the primary items).
     #[arg(long)]
     limit: Option<usize>,
@@ -182,6 +186,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         policy,
         fusion: fusion_arg(&args.fusion),
         pass_through: args.pass_through,
+        no_score_bound: args.no_score_bound,
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -212,7 +217,12 @@ pub fn run(args: BenchArgs) -> Result<()> {
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: note_with_flags(args.note.as_deref(), &args.fusion, args.pass_through),
+        note: note_with_flags(
+            args.note.as_deref(),
+            &args.fusion,
+            args.pass_through,
+            args.no_score_bound,
+        ),
         progress: true,
         rescored: false,
     };
@@ -253,7 +263,12 @@ fn rescore(
         policy_label: policy_label(&args.policy),
         under_load: args.under_load,
         include_seeds: args.include_seeds,
-        note: note_with_flags(args.note.as_deref(), &args.fusion, args.pass_through),
+        note: note_with_flags(
+            args.note.as_deref(),
+            &args.fusion,
+            args.pass_through,
+            args.no_score_bound,
+        ),
         progress: false,
         rescored: true,
     };
@@ -329,10 +344,16 @@ fn fusion_arg(fusion: &str) -> Option<String> {
 
 /// The note of the row, with the fusion when it is not the default and
 /// `pass-through` when it is on.
-fn note_with_flags(note: Option<&str>, fusion: &str, pass_through: bool) -> String {
+fn note_with_flags(
+    note: Option<&str>,
+    fusion: &str,
+    pass_through: bool,
+    no_score_bound: bool,
+) -> String {
     let flags = [
         fusion_arg(fusion).map(|fusion| format!("fusion {fusion}")),
         pass_through.then(|| "pass-through".to_owned()),
+        no_score_bound.then(|| "no-bound".to_owned()),
     ];
     let parts = note
         .filter(|note| !note.is_empty())
@@ -698,6 +719,8 @@ pub struct CliTraverser {
     pub fusion: Option<String>,
     /// `--pass-through` for the CLI.
     pub pass_through: bool,
+    /// `--no-score-bound` for the CLI.
+    pub no_score_bound: bool,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -747,6 +770,9 @@ impl CliTraverser {
         }
         if self.pass_through {
             command.arg("--pass-through");
+        }
+        if self.no_score_bound {
+            command.arg("--no-score-bound");
         }
         command
             .stdin(Stdio::null())
