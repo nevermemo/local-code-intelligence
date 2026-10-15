@@ -35,7 +35,11 @@ pub mod presets;
 
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow, bail};
-use lci_core::node::{NodeId, NodeKind};
+use lci_core::{
+    config::TraverseRerankScores,
+    models::HttpStatusError,
+    node::{NodeId, NodeKind},
+};
 use lci_maps::{
     Budget, Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse,
     MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
@@ -58,7 +62,7 @@ use lci_maps::{
         ladder::Ladder,
         lint::{LintContext, lint},
         priors::HopPriors,
-        rescore::FrontierRescorer,
+        rescore::{FrontierRescorer, RerankFailure, RescoreError},
         rules::RuleList,
         source::OnTheFly,
         steer::Steer,
@@ -75,7 +79,10 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -500,6 +507,13 @@ pub trait SeedSearch: Send + Sync {
     fn reranker(&self) -> Option<&Models> {
         None
     }
+
+    /// The reranker's model and endpoint as text a handle keeps, so a resume
+    /// can refuse another reranker; `None` when this search cannot say. The
+    /// text names no path and no secret.
+    fn reranker_identity(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The search `search_code` runs in its normal mode, over one workspace and
@@ -518,6 +532,17 @@ impl SeedSearch for AppSeeds<'_> {
 
     fn reranker(&self) -> Option<&Models> {
         Some(&self.app.models)
+    }
+
+    fn reranker_identity(&self) -> Option<String> {
+        let config = &self.app.config;
+        // The endpoint is kept as a hash: the URL may carry a host or a token
+        // that does not belong in a handle.
+        Some(format!(
+            "{} @ u{}",
+            config.reranker_model,
+            lci_maps::traverse::trace::hash16(config.reranker_url.as_bytes())
+        ))
     }
 
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
@@ -603,12 +628,26 @@ struct GraphRescorer<'a> {
     models: &'a Models,
     scip: Arc<ScipMap>,
     by_node: HashMap<NodeId, usize>,
+    /// What the reranker's scores mean (`[traverse] rerank_scores`).
+    scores: TraverseRerankScores,
+    /// The reranker's model and endpoint as text for a handle, without the
+    /// scores setting (see [`FrontierRescorer::identity`]).
+    reranker: String,
     /// The error of every call that failed, in order.
     errors: Mutex<Vec<String>>,
+    /// Scores that lay outside `[0, 1]` and were clamped (probability reading).
+    out_of_range: AtomicU32,
 }
 
 impl<'a> GraphRescorer<'a> {
-    fn new(models: &'a Models, scip: Arc<ScipMap>) -> Self {
+    /// `reranker` is [`SeedSearch::reranker_identity`] (none: the search does
+    /// not say, and the handle cannot tell one reranker from another).
+    fn new(
+        models: &'a Models,
+        scip: Arc<ScipMap>,
+        reranker: Option<String>,
+        scores: TraverseRerankScores,
+    ) -> Self {
         let by_node = (0..scip.graph().nodes.len())
             .map(|i| (scip.node_id(i).clone(), i))
             .collect();
@@ -616,8 +655,16 @@ impl<'a> GraphRescorer<'a> {
             models,
             scip,
             by_node,
+            scores,
+            reranker: reranker.unwrap_or_else(|| "reranker of unknown model".to_owned()),
             errors: Mutex::default(),
+            out_of_range: AtomicU32::new(0),
         }
+    }
+
+    /// How many scores were clamped into `[0, 1]` over this call.
+    fn clamped(&self) -> u32 {
+        self.out_of_range.load(Ordering::Relaxed)
     }
 
     fn text(&self, node: &NodeId) -> String {
@@ -644,29 +691,71 @@ impl<'a> GraphRescorer<'a> {
     }
 }
 
-/// The reranker's scores as relevance in `[0, 1]`. A server that returns
-/// probabilities (llama.cpp's `/rerank` does) is used as it is; if any score of
-/// the call lies outside `[0, 1]` (logits), the whole call goes through the
-/// logistic function `1 / (1 + e^-x)`, so one call is always on one scale.
-fn relevance(scores: &[f64]) -> Vec<f64> {
-    if scores.iter().all(|s| (0.0..=1.0).contains(s)) {
-        scores.to_vec()
+/// One reranker score as a relevance in `[0, 1]`, by what the score means and
+/// from that document's score alone: a probability is used as it is (clamped
+/// into the range), a logit goes through the logistic function
+/// `1 / (1 + e^-x)`. The second value is whether a probability lay outside
+/// `[0, 1]`. Whatever the other documents of the call scored, the same score
+/// gives the same relevance.
+fn relevance(score: f64, scores: TraverseRerankScores) -> (f64, bool) {
+    match scores {
+        TraverseRerankScores::Probability => (
+            score.clamp(0.0, 1.0),
+            score.is_finite() && !(0.0..=1.0).contains(&score),
+        ),
+        TraverseRerankScores::Logit => (1.0 / (1.0 + (-score).exp()), false),
+    }
+}
+
+/// Why a reranker call failed, from the error `Models::rerank` returned: an
+/// error status, a timeout, a service that cannot be reached (or is skipped
+/// as recently unreachable), an answer that cannot be read or holds the wrong
+/// number of scores, any other.
+fn classify(error: &anyhow::Error) -> RerankFailure {
+    if error.downcast_ref::<HttpStatusError>().is_some() {
+        return RerankFailure::Status;
+    }
+    let request = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>());
+    if let Some(request) = request {
+        if request.is_timeout() {
+            return RerankFailure::Timeout;
+        }
+        if request.is_connect() {
+            return RerankFailure::Unreachable;
+        }
+    }
+    let text = format!("{error:#}");
+    if text.contains("recently unreachable") {
+        RerankFailure::Unreachable
+    } else if text.contains("count mismatch") {
+        RerankFailure::CountMismatch
+    } else if text.contains("invalid reranker") || text.contains("byte limit") {
+        RerankFailure::Malformed
     } else {
-        scores.iter().map(|s| 1.0 / (1.0 + (-s).exp())).collect()
+        RerankFailure::Other
     }
 }
 
 #[lci_maps::async_trait]
 impl FrontierRescorer for &GraphRescorer<'_> {
-    async fn relevance(&self, question: &str, nodes: &[NodeId]) -> Result<Vec<f64>, String> {
+    fn identity(&self) -> String {
+        format!("{} scores={}", self.reranker, self.scores.as_str())
+    }
+
+    async fn relevance(&self, question: &str, nodes: &[NodeId]) -> Result<Vec<f64>, RescoreError> {
         let answer = if question.trim().is_empty() {
-            Err("the question is empty".to_owned())
+            Err(RescoreError::new(
+                RerankFailure::Other,
+                "the question is empty",
+            ))
         } else {
             let documents: Vec<String> = nodes.iter().map(|node| self.text(node)).collect();
             self.models
                 .rerank(question, &documents)
                 .await
-                .map_err(|error| format!("{error:#}"))
+                .map_err(|error| RescoreError::new(classify(&error), format!("{error:#}")))
         };
         let ranks = match answer {
             Ok(ranks) => ranks,
@@ -674,7 +763,7 @@ impl FrontierRescorer for &GraphRescorer<'_> {
                 self.errors
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push(error.clone());
+                    .push(error.to_string());
                 return Err(error);
             }
         };
@@ -682,7 +771,17 @@ impl FrontierRescorer for &GraphRescorer<'_> {
         for (index, score) in ranks {
             scores[index] = f64::from(score);
         }
-        Ok(relevance(&scores))
+        let mut clamped = 0;
+        let rated = scores
+            .iter()
+            .map(|&score| {
+                let (relevance, outside) = relevance(score, self.scores);
+                clamped += u32::from(outside);
+                relevance
+            })
+            .collect();
+        self.out_of_range.fetch_add(clamped, Ordering::Relaxed);
+        Ok(rated)
     }
 }
 
@@ -1163,6 +1262,20 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let loaded = load(call.scip_index, call.scip_root).await?;
     // A handle resumes on the workspace and index it was made for.
     let identity = identity_of(call, &loaded);
+    let rescorer = match (limits.rerank_frontier, call.seed_search) {
+        (false, _) => None,
+        (true, search) => match search.and_then(|search| search.reranker()) {
+            Some(models) => Some(GraphRescorer::new(
+                models,
+                loaded.scip.clone(),
+                search.and_then(|search| search.reranker_identity()),
+                limits.rerank_scores,
+            )),
+            None => bail!(
+                "[traverse] rerank_frontier needs the reranker: the call needs the application (give --root with a question or seeds)"
+            ),
+        },
+    };
     if let Some(snapshot) = &snapshot {
         snapshot
             .check_identity(&identity)
@@ -1171,19 +1284,22 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         snapshot
             .check_tie_break(tie_break.as_ref())
             .map_err(|e| anyhow!("{e}"))?;
+        let reranker = rescorer.as_ref().map(|rescorer| rescorer.identity());
         snapshot
-            .check_rerank(limits.rerank_frontier.then_some(limits.rerank_floor))
+            .check_rerank(
+                reranker
+                    .as_deref()
+                    .map(|identity| (limits.rerank_floor, identity)),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        // What a resume must repeat for the walk to be the same one.
+        snapshot
+            .check_boost(limits.corroboration_boost)
+            .map_err(|e| anyhow!("{e}"))?;
+        snapshot
+            .check_top_k(call.top_k)
             .map_err(|e| anyhow!("{e}"))?;
     }
-    let rescorer = match (limits.rerank_frontier, call.seed_search) {
-        (false, _) => None,
-        (true, search) => match search.and_then(|search| search.reranker()) {
-            Some(models) => Some(GraphRescorer::new(models, loaded.scip.clone())),
-            None => bail!(
-                "[traverse] rerank_frontier needs the reranker: the call needs the application (give --root with a question or seeds)"
-            ),
-        },
-    };
     let wants = |id: MapId| wanted.contains(&id);
 
     // The start nodes (not on a continuation, which resumes the old ones).
@@ -1399,11 +1515,16 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
 
     let policy = handler.as_ref().map(|(_, _, plan)| plan.clone());
+    // A continuation runs the weights and switches its handle replays.
+    let running_maps = match &snapshot {
+        Some(snapshot) => presets::restored(&plan_maps, &snapshot.weights, &snapshot.switches),
+        None => plan_maps.clone(),
+    };
     let (effective, plan_effective) = presets::effective(
         preset,
         &steer,
         handler.as_ref().map(|(_, stops, plan)| (stops, plan)),
-        &plan_maps,
+        &running_maps,
     );
     // The most a state can be corroborated by, which the score bound needs
     // (the seed maps only start the walk; maps over one graph count once).
@@ -1442,7 +1563,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .top_k(call.top_k, expanding)
         .expanders(registry.expanding_maps());
     let traversal = match &rescorer {
-        Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
+        Some(rescorer) => traversal
+            .rerank_frontier(rescorer, limits.rerank_floor)
+            .model_calls(limits.max_model_calls),
         None => traversal,
     };
     let traversal = match handler {
@@ -1488,12 +1611,21 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             ));
         }
     }
+    // The engine's warnings: reranker failures by reason, the model_calls cap,
+    // a boost or switches the handle did not take.
+    warnings.extend(result.warnings.iter().cloned());
     if let Some(rescorer) = &rescorer {
         let errors = rescorer.errors();
         if let Some(first) = errors.first() {
             notes.push(format!(
-                "rerank_frontier: {} reranker calls failed and left their hops at factor 1; the first: {first}",
-                errors.len()
+                "rerank_frontier: the first of the reranker calls that failed in this call: {first}"
+            ));
+        }
+        if rescorer.clamped() > 0 {
+            warnings.push(format!(
+                "rerank_frontier: {} reranker scores lay outside [0, 1] and were clamped; [traverse] rerank_scores is \"{}\"",
+                rescorer.clamped(),
+                limits.rerank_scores.as_str()
             ));
         }
     }
@@ -1892,6 +2024,12 @@ fn response_json(
             "hops": totals.hops,
             "cross_map_hops": totals.cross_map_hops,
             "tokens": totals.tokens,
+            // The allowance's account (a retried pop pays what its earlier run
+            // did not) and the work that ran: every map call and the external
+            // calls they made.
+            "external_calls": totals.external_calls,
+            "physical_map_calls": totals.physical_map_calls,
+            "physical_external_calls": totals.physical_external_calls,
             "stops": totals.stops,
             "steers": totals.steers,
             "per_map": per_map,
@@ -1934,6 +2072,18 @@ fn response_json(
                 "rerank_failures".into(),
                 json!(result.totals.rerank_failures),
             );
+            totals.insert(
+                "rerank_failure_reasons".into(),
+                Value::Object(
+                    result
+                        .totals
+                        .rerank_failure_reasons
+                        .iter()
+                        .map(|(reason, n)| (reason.as_str().to_owned(), json!(n)))
+                        .collect(),
+                ),
+            );
+            totals.insert("rerank_skipped".into(), json!(result.totals.rerank_skipped));
             totals.insert("rerank_ms".into(), json!(result.rerank_ms));
         }
         if let Some(checkpoint) = &result.checkpoint {
@@ -2446,25 +2596,128 @@ mod tests {
     }
 
     #[test]
-    fn reranker_scores_become_relevance_on_one_scale_per_call() {
-        // Probabilities pass through; one logit among them moves the whole call
-        // to the logistic scale.
-        assert_eq!(relevance(&[0.0, 0.2, 1.0]), [0.0, 0.2, 1.0]);
-        let logistic = relevance(&[-2.0, 0.0, 3.0]);
-        assert_eq!(logistic[1], 0.5);
-        assert!(logistic[0] < 0.5 && logistic[2] > 0.5 && logistic[2] < 1.0);
-        assert_eq!(relevance(&[0.5, 1.5])[0], 1.0 / (1.0 + (-0.5f64).exp()));
+    fn a_reranker_score_becomes_relevance_by_what_the_setting_says_and_by_itself() {
+        use TraverseRerankScores::{Logit, Probability};
+        // Probabilities pass through; one outside [0, 1] is clamped and counted.
+        assert_eq!(relevance(0.2, Probability), (0.2, false));
+        assert_eq!(relevance(1.0, Probability), (1.0, false));
+        assert_eq!(relevance(1.5, Probability), (1.0, true));
+        assert_eq!(relevance(-0.5, Probability), (0.0, true));
+        // Logits go through the logistic function.
+        assert_eq!(relevance(0.0, Logit), (0.5, false));
+        let (low, high) = (relevance(-2.0, Logit).0, relevance(3.0, Logit).0);
+        assert!(low < 0.5 && high > 0.5 && high < 1.0);
+        assert_eq!(relevance(0.5, Logit).0, 1.0 / (1.0 + (-0.5f64).exp()));
+        // A score means the same whatever the other documents of its call
+        // scored: a probability beside a stray logit is not rescaled.
+        assert_eq!(relevance(0.2, Probability).0, 0.2);
+        assert_eq!(relevance(0.75, Probability).0, 0.75);
+    }
+
+    #[test]
+    fn a_failed_rerank_call_is_classified_by_what_went_wrong() {
+        let status = anyhow::Error::new(HttpStatusError {
+            status: 503,
+            body: String::new(),
+        })
+        .context("reranker HTTP error");
+        let cases = [
+            (status, RerankFailure::Status),
+            (
+                anyhow!("reranker skipped as recently unreachable (next attempt in about 9s)"),
+                RerankFailure::Unreachable,
+            ),
+            (
+                anyhow!("reranker response count mismatch"),
+                RerankFailure::CountMismatch,
+            ),
+            (
+                anyhow!("invalid reranker index/score"),
+                RerankFailure::Malformed,
+            ),
+            (
+                anyhow!("reranker response body exceeds 1 byte limit"),
+                RerankFailure::Malformed,
+            ),
+            (
+                anyhow::Error::msg("expected value").context("invalid reranker response"),
+                RerankFailure::Malformed,
+            ),
+            (anyhow!("something else"), RerankFailure::Other),
+        ];
+        for (error, want) in cases {
+            assert_eq!(classify(&error), want, "{error:#}");
+        }
+    }
+
+    /// Answers each connection with one canned HTTP response (a stand-in
+    /// reranker on a loopback port) and returns its URL.
+    async fn canned_reranker(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/rerank", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the request: the head, then the body it announces.
+                while let Ok(n) = stream.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&seen).into_owned();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if seen.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        url
+    }
+
+    fn rescorer_at<'a>(
+        models: &'a Models,
+        loaded: &Loaded,
+        scores: TraverseRerankScores,
+    ) -> GraphRescorer<'a> {
+        GraphRescorer::new(
+            models,
+            loaded.scip.clone(),
+            Some("model @ uabc".into()),
+            scores,
+        )
+    }
+
+    fn models_at(url: String) -> Models {
+        Models::new(&lci_core::config::Config {
+            reranker_url: url,
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     #[tokio::test]
     async fn the_frontier_rates_nodes_by_what_the_graph_holds_and_records_a_failed_call() {
         let loaded = loaded();
-        let config = lci_core::config::Config {
-            reranker_url: "http://127.0.0.1:1/rerank".into(),
-            ..Default::default()
-        };
-        let models = Models::new(&config).unwrap();
-        let rescorer = GraphRescorer::new(&models, loaded.scip.clone());
+        let models = models_at("http://127.0.0.1:1/rerank".into());
+        let rescorer = rescorer_at(&models, &loaded, TraverseRerankScores::Probability);
         let symbol = loaded.scip.node_id(0).clone();
         let text = rescorer.text(&symbol);
         assert!(text.starts_with("src/search.rs\nfn "), "{text:?}");
@@ -2473,16 +2726,88 @@ mod tests {
         let long = NodeId::file(format!("src/{}.rs", "x".repeat(3000))).unwrap();
         assert_eq!(rescorer.text(&long).chars().count(), RERANK_TEXT_CHARS);
 
-        // The reranker is unreachable: the call fails, the error is kept, and
-        // an empty question is refused without asking.
+        // The reranker is unreachable: the call fails with that reason, the
+        // error is kept, and an empty question is refused without asking.
         let error = (&rescorer)
             .relevance("rank hits", &[symbol.clone(), file.clone()])
             .await
             .unwrap_err();
-        assert!(!error.is_empty());
+        assert_eq!(error.reason, RerankFailure::Unreachable, "{error}");
+        assert!(!error.message.is_empty());
         let empty = (&rescorer).relevance("  ", &[symbol]).await.unwrap_err();
-        assert_eq!(empty, "the question is empty");
+        assert_eq!(empty.message, "the question is empty");
         assert_eq!(rescorer.errors().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_rescorer_reports_a_reason_per_failure_and_scores_by_its_setting() {
+        let loaded = loaded();
+        let nodes = [
+            loaded.scip.node_id(0).clone(),
+            NodeId::file("src/new.rs").unwrap(),
+        ];
+
+        // An error status.
+        let url = canned_reranker("500 Internal Server Error", "{\"error\":\"x\"}").await;
+        let models = models_at(url);
+        let rescorer = rescorer_at(&models, &loaded, TraverseRerankScores::Probability);
+        let error = (&rescorer).relevance("q", &nodes).await.unwrap_err();
+        assert_eq!(error.reason, RerankFailure::Status, "{error}");
+        // An answer that is not JSON.
+        let models = models_at(canned_reranker("200 OK", "not json").await);
+        let rescorer = rescorer_at(&models, &loaded, TraverseRerankScores::Probability);
+        let error = (&rescorer).relevance("q", &nodes).await.unwrap_err();
+        assert_eq!(error.reason, RerankFailure::Malformed, "{error}");
+        // The wrong number of scores.
+        let one = "{\"results\":[{\"index\":0,\"relevance_score\":0.5}]}";
+        let models = models_at(canned_reranker("200 OK", one).await);
+        let rescorer = rescorer_at(&models, &loaded, TraverseRerankScores::Probability);
+        let error = (&rescorer).relevance("q", &nodes).await.unwrap_err();
+        assert_eq!(error.reason, RerankFailure::CountMismatch, "{error}");
+
+        // Two scores, one outside [0, 1]: each is read by itself.
+        let body = "{\"results\":[{\"index\":0,\"relevance_score\":0.25},{\"index\":1,\"relevance_score\":4.0}]}";
+        let models = models_at(canned_reranker("200 OK", body).await);
+        let probability = rescorer_at(&models, &loaded, TraverseRerankScores::Probability);
+        let got = (&probability).relevance("q", &nodes).await.unwrap();
+        assert_eq!(
+            got,
+            [0.25, 1.0],
+            "the 4.0 is clamped, the 0.25 is not rescaled"
+        );
+        assert_eq!(probability.clamped(), 1);
+        let models = models_at(canned_reranker("200 OK", body).await);
+        let logit = rescorer_at(&models, &loaded, TraverseRerankScores::Logit);
+        let got = (&logit).relevance("q", &nodes).await.unwrap();
+        assert_eq!(got[0], 1.0 / (1.0 + (-0.25f64).exp()));
+        assert_eq!(got[1], 1.0 / (1.0 + (-4.0f64).exp()));
+        assert_eq!(logit.clamped(), 0);
+    }
+
+    #[test]
+    fn the_rescorers_identity_names_the_reranker_and_how_its_scores_are_read() {
+        let loaded = loaded();
+        let models = Models::new(&lci_core::config::Config::default()).unwrap();
+        let identity = |reranker: Option<&str>, scores| {
+            let rescorer = GraphRescorer::new(
+                &models,
+                loaded.scip.clone(),
+                reranker.map(str::to_owned),
+                scores,
+            );
+            (&rescorer).identity()
+        };
+        let probability = identity(Some("m @ u1"), TraverseRerankScores::Probability);
+        assert_eq!(probability, "m @ u1 scores=probability");
+        assert_eq!(
+            identity(Some("m @ u1"), TraverseRerankScores::Logit),
+            "m @ u1 scores=logit"
+        );
+        assert_ne!(
+            identity(Some("m @ u2"), TraverseRerankScores::Probability),
+            probability
+        );
+        assert!(identity(None, TraverseRerankScores::Probability).contains("unknown"));
     }
 
     #[tokio::test]
@@ -2516,6 +2841,239 @@ mod tests {
         assert!(
             error.contains("rerank_frontier needs the reranker"),
             "{error}"
+        );
+    }
+
+    // ---- a resume repeats what its handle was made with (slice R1b) --------
+
+    /// A search that only offers the reranker (the seeds are given).
+    struct WithReranker {
+        models: Models,
+        identity: &'static str,
+    }
+
+    #[lci_maps::async_trait]
+    impl SeedSearch for WithReranker {
+        async fn search(&self, _question: &str, _k: usize) -> Result<Vec<SeedHit>> {
+            Err(anyhow!("not asked: the seeds are given"))
+        }
+
+        fn reranker(&self) -> Option<&Models> {
+            Some(&self.models)
+        }
+
+        fn reranker_identity(&self) -> Option<String> {
+            Some(self.identity.to_owned())
+        }
+    }
+
+    /// An empty index in a temporary tree, and three file nodes to start from:
+    /// with a cap of one pop the first call leaves a handle.
+    struct Tree {
+        dir: tempfile::TempDir,
+        index: PathBuf,
+        seeds: Vec<String>,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let index = dir.path().join("index.scip");
+            std::fs::write(&index, []).unwrap();
+            let seeds = ["src/a.rs", "src/b.rs", "src/c.rs"]
+                .map(|path| NodeId::file(path).unwrap().to_string())
+                .to_vec();
+            Self { dir, index, seeds }
+        }
+
+        async fn run(
+            &self,
+            limits: &TraverseConfig,
+            search: Option<&dyn SeedSearch>,
+            steer: &SteerArgs,
+            handle: Option<&str>,
+            top_k: usize,
+        ) -> Result<Value> {
+            let budget = BudgetArgs {
+                pops: Some(1),
+                ..BudgetArgs::default()
+            };
+            let call = Call {
+                scip_index: &self.index,
+                scip_root: Some(self.dir.path()),
+                question: "q",
+                seeds: &self.seeds,
+                seed_search: search,
+                top_k,
+                maps: None,
+                budget: &budget,
+                steer,
+                handle,
+                lsp: None,
+            };
+            Ok(run(limits, &Dirs::under(self.dir.path()), &call)
+                .await?
+                .response)
+        }
+    }
+
+    fn handle_of(response: &Value) -> String {
+        response["handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no handle in {response}"))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_resume_must_repeat_the_boost_and_the_top_k_of_its_handle() {
+        let tree = Tree::new();
+        let steer = SteerArgs::default();
+        let first = tree.run(&limits(), None, &steer, None, 8).await.unwrap();
+        let handle = handle_of(&first);
+        let totals = &first["totals"];
+        assert!(
+            totals["physical_map_calls"].as_u64().unwrap() >= 1,
+            "{totals}"
+        );
+        assert!(totals["physical_external_calls"].is_u64() && totals["external_calls"].is_u64());
+        assert!(
+            totals.get("rerank_failure_reasons").is_none(),
+            "no frontier, no rerank totals"
+        );
+
+        // The same settings resume.
+        tree.run(&limits(), None, &steer, Some(&handle), 8)
+            .await
+            .unwrap();
+        // Another boost or another k is refused, naming both.
+        let other = TraverseConfig {
+            corroboration_boost: 0.5,
+            ..limits()
+        };
+        let error = tree
+            .run(&other, None, &steer, Some(&handle), 8)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("boost") && error.contains("0.5") && error.contains("0.1"),
+            "{error}"
+        );
+        let error = tree
+            .run(&limits(), None, &steer, Some(&handle), 3)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("top_k") || error.contains("k of"), "{error}");
+        assert!(error.contains('8') && error.contains('3'), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_resume_must_repeat_the_reranker_its_handle_was_made_with() {
+        let tree = Tree::new();
+        let steer = SteerArgs::default();
+        let on = TraverseConfig {
+            rerank_frontier: true,
+            ..limits()
+        };
+        let models = || models_at("http://127.0.0.1:1/rerank".into());
+        let search = |identity| WithReranker {
+            models: models(),
+            identity,
+        };
+        let (a, b) = (search("model-a @ u1"), search("model-b @ u1"));
+
+        let first = tree.run(&on, Some(&a), &steer, None, 8).await.unwrap();
+        let handle = handle_of(&first);
+        // The totals say what ran: the physical map calls, and the reranker's
+        // failures by reason (none here) and skipped expansions.
+        let totals = &first["totals"];
+        assert!(
+            totals["physical_map_calls"].as_u64().unwrap() >= 1,
+            "{totals}"
+        );
+        assert_eq!(totals["rerank_failure_reasons"], json!({}));
+        assert_eq!(totals["rerank_skipped"], 0);
+        // The same model, endpoint and score reading resume.
+        tree.run(&on, Some(&a), &steer, Some(&handle), 8)
+            .await
+            .unwrap();
+        // Another model, another score reading, the frontier off, and a
+        // different floor are each refused.
+        async fn resume_refused(
+            tree: &Tree,
+            limits: &TraverseConfig,
+            search: Option<&dyn SeedSearch>,
+            handle: &str,
+        ) -> String {
+            tree.run(limits, search, &SteerArgs::default(), Some(handle), 8)
+                .await
+                .unwrap_err()
+                .to_string()
+        }
+        let error = resume_refused(&tree, &on, Some(&b), &handle).await;
+        assert!(
+            error.contains("model-a") && error.contains("model-b"),
+            "{error}"
+        );
+        let logit = TraverseConfig {
+            rerank_scores: TraverseRerankScores::Logit,
+            ..on.clone()
+        };
+        let error = resume_refused(&tree, &logit, Some(&a), &handle).await;
+        assert!(
+            error.contains("scores=probability") && error.contains("scores=logit"),
+            "{error}"
+        );
+        let error = resume_refused(&tree, &limits(), None, &handle).await;
+        assert!(error.contains("rerank"), "{error}");
+        let floor = TraverseConfig {
+            rerank_floor: 0.5,
+            ..on.clone()
+        };
+        let error = resume_refused(&tree, &floor, Some(&a), &handle).await;
+        assert!(error.contains("floor"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_continuations_effective_policy_shows_the_weights_and_switches_it_restored() {
+        let tree = Tree::new();
+        // The rules run at the stop after the first pop: weigh one map down and
+        // switch another off.
+        let steer = SteerArgs {
+            rules: Some(json!([
+                {"when": {"depth": {"ge": 0}}, "then": {"map_weight": {"id": "structure.contains", "weight": 0.5}}},
+                {"when": {"depth": {"ge": 0}}, "then": {"map_off": "graph.scip"}},
+            ])),
+            stop_every: Some(1),
+            ..SteerArgs::default()
+        };
+        let first = tree.run(&limits(), None, &steer, None, 8).await.unwrap();
+        let shown = |response: &Value, id: &str| -> (f64, bool) {
+            let map = response["effective_policy"]["maps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|map| map["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} in {response}"));
+            (
+                map["weight"].as_f64().unwrap(),
+                map["enabled"].as_bool().unwrap(),
+            )
+        };
+        // The first call shows the maps as registered.
+        assert_eq!(shown(&first, "structure.contains"), (1.0, true));
+        assert_eq!(shown(&first, "graph.scip"), (1.0, true));
+        let handle = handle_of(&first);
+        let second = tree
+            .run(&limits(), None, &SteerArgs::default(), Some(&handle), 8)
+            .await
+            .unwrap();
+        assert_eq!(shown(&second, "structure.contains"), (0.5, true));
+        assert_eq!(shown(&second, "graph.scip"), (1.0, false));
+        assert_ne!(
+            first["effective_policy"]["hash"],
+            second["effective_policy"]["hash"]
         );
     }
 

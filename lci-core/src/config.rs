@@ -526,6 +526,41 @@ impl std::str::FromStr for TraverseFusion {
     }
 }
 
+/// What the configured reranker's scores mean (`[traverse] rerank_scores`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraverseRerankScores {
+    /// A score is a relevance in `[0, 1]` (llama.cpp's `/rerank` returns
+    /// probabilities); one outside the range is clamped.
+    #[default]
+    Probability,
+    /// A score is a logit; its relevance is `1 / (1 + e^-score)`.
+    Logit,
+}
+
+impl TraverseRerankScores {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Probability => "probability",
+            Self::Logit => "logit",
+        }
+    }
+}
+
+impl std::str::FromStr for TraverseRerankScores {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "probability" => Ok(Self::Probability),
+            "logit" => Ok(Self::Logit),
+            other => Err(format!(
+                "rerank_scores must be \"probability\" or \"logit\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[traverse]`: the multimap traversal behind `search_code`'s
 /// `mode = "traverse"` (spine brief 1.7). The limits are also the caps of a
 /// request: a `budget` in the request may lower them, never raise them.
@@ -559,7 +594,7 @@ pub struct TraverseConfig {
     /// How much each independent map beyond the first that reached a node
     /// lifts the node's rank: `potential * (1 + boost * (maps - 1))`. A
     /// number from `0` (rank by potential alone) to `10`. A resumed
-    /// traversal keeps the boost its handle was made with.
+    /// traversal must be given the boost its handle was made with.
     pub corroboration_boost: f64,
     /// How the results of a traversal are ranked: `"boost"` (the default) ranks
     /// by the path potential lifted by `corroboration_boost`; `"rrf"` ranks by
@@ -585,6 +620,19 @@ pub struct TraverseConfig {
     /// The factor a hop gets when the reranker rates its destination 0; from
     /// `0` to `1` (`1` switches the effect off). Only with `rerank_frontier`.
     pub rerank_floor: f64,
+    /// What the reranker's scores are, fixed by configuration so that a
+    /// document's relevance never depends on the others of its call:
+    /// `"probability"` (the default; llama.cpp's `/rerank`) clamps each score
+    /// to `[0, 1]`; `"logit"` maps each through `1 / (1 + e^-score)`. Only with
+    /// `rerank_frontier`. A resumed traversal must be given the same setting
+    /// (its handle keeps it with the reranker's model and endpoint).
+    pub rerank_scores: TraverseRerankScores,
+    /// Most model calls (the reranker frontier's calls; later System One's) one
+    /// traversal may make, a continuation counting on from the calls before
+    /// it, `1..`. Once the cap is reached the frontier stops rating (the
+    /// hops keep factor 1) and the walk goes on. Absent: no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_calls: Option<u32>,
     /// Whether the score bound may end a traversal early (stop reason
     /// `bound`). `false`: the walk runs to its budgets or a dry frontier. A
     /// resumed traversal keeps the setting its handle was made with.
@@ -680,6 +728,10 @@ impl TraverseConfig {
             self.rerank_floor
         );
         ensure!(
+            self.max_model_calls.is_none_or(|n| n >= 1),
+            "traverse.max_model_calls must be at least 1 (leave it out for no cap)"
+        );
+        ensure!(
             (1..=Self::MAX_SEED_K_LIMIT).contains(&self.seed_k),
             "traverse.seed_k must be 1..={} (got {})",
             Self::MAX_SEED_K_LIMIT,
@@ -719,6 +771,8 @@ impl Default for TraverseConfig {
             pass_through: false,
             rerank_frontier: false,
             rerank_floor: 0.25,
+            rerank_scores: TraverseRerankScores::Probability,
+            max_model_calls: None,
             score_bound: true,
             priors: None,
             question_type: None,
@@ -2929,6 +2983,30 @@ fusion = \"rrf\"
         assert_eq!(reranked.traverse.rerank_floor, 0.5);
         let text = format!("{}[traverse]\nrerank_frontier = \"yes\"\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
+        // The reranker's scores are probabilities unless the file says logits,
+        // and no model-call cap is set unless it is given.
+        assert_eq!(value["traverse"]["rerank_scores"], "probability");
+        assert!(value["traverse"].get("max_model_calls").is_none());
+        let text = format!(
+            "{}[traverse]\nrerank_scores = \"logit\"\nmax_model_calls = 5\n",
+            base_toml()
+        );
+        let logits: Config = toml::from_str(&text).unwrap();
+        logits.validate().unwrap();
+        assert_eq!(logits.traverse.rerank_scores, TraverseRerankScores::Logit);
+        assert_eq!(logits.traverse.max_model_calls, Some(5));
+        let json = serde_json::to_value(&logits).unwrap();
+        assert_eq!(json["traverse"]["rerank_scores"], "logit");
+        assert_eq!(json["traverse"]["max_model_calls"], 5);
+        for bad in ["nope", "Logit", ""] {
+            let text = format!("{}[traverse]\nrerank_scores = \"{bad}\"\n", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad:?}");
+            assert!(bad.parse::<TraverseRerankScores>().is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            "probability".parse::<TraverseRerankScores>(),
+            Ok(TraverseRerankScores::Probability)
+        );
         // The score bound is on unless switched off.
         assert_eq!(value["traverse"]["score_bound"], true);
         let text = format!("{}[traverse]\nscore_bound = false\n", base_toml());
@@ -2956,7 +3034,7 @@ fusion = \"{fusion}\"
             assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
         }
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 22] = [
+        let bad: [(&str, Set); 23] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -2979,6 +3057,7 @@ fusion = \"{fusion}\"
             ("rerank_floor", |t| t.rerank_floor = -0.1),
             ("rerank_floor", |t| t.rerank_floor = 1.5),
             ("rerank_floor", |t| t.rerank_floor = f64::NAN),
+            ("max_model_calls", |t| t.max_model_calls = Some(0)),
             ("priors", |t| t.priors = Some("table.json".into())),
             ("question_type", |t| t.question_type = Some("flow".into())),
             ("priors", |t| {

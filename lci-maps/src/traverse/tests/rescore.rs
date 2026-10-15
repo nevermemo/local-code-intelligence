@@ -5,7 +5,7 @@
 use super::*;
 use crate::traverse::{
     handle::{HandleError, Snapshot},
-    rescore::{FrontierRescorer, factor},
+    rescore::{FrontierRescorer, RerankFailure, RescoreError, factor},
 };
 use std::{collections::HashMap, sync::Mutex};
 
@@ -16,6 +16,8 @@ enum Answer {
     TooFew,
     NotANumber,
     Hang,
+    /// An error the rescorer itself classifies.
+    Failing(RerankFailure),
 }
 
 /// Rates a node by name (1 when unlisted) and keeps the nodes of each call.
@@ -24,6 +26,7 @@ struct Mock {
     scores: HashMap<NodeId, f64>,
     answer: Answer,
     calls: Arc<Mutex<Vec<Vec<NodeId>>>>,
+    identity: &'static str,
 }
 
 impl Mock {
@@ -32,11 +35,17 @@ impl Mock {
             scores: scores.iter().map(|&(n, s)| (node(n), s)).collect(),
             answer: Answer::Scores,
             calls: Arc::default(),
+            identity: "mock-a",
         }
     }
 
     fn answering(mut self, answer: Answer) -> Self {
         self.answer = answer;
+        self
+    }
+
+    fn identified(mut self, identity: &'static str) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -47,7 +56,11 @@ impl Mock {
 
 #[crate::async_trait]
 impl FrontierRescorer for Mock {
-    async fn relevance(&self, question: &str, nodes: &[NodeId]) -> Result<Vec<f64>, String> {
+    fn identity(&self) -> String {
+        self.identity.to_owned()
+    }
+
+    async fn relevance(&self, question: &str, nodes: &[NodeId]) -> Result<Vec<f64>, RescoreError> {
         assert_eq!(question, "which file");
         self.calls.lock().unwrap().push(nodes.to_vec());
         let mut scores: Vec<f64> = nodes
@@ -57,6 +70,7 @@ impl FrontierRescorer for Mock {
         match self.answer {
             Answer::Scores => Ok(scores),
             Answer::Error => Err("the reranker is down".into()),
+            Answer::Failing(reason) => Err(RescoreError::new(reason, "the reranker failed")),
             Answer::TooFew => {
                 scores.pop();
                 Ok(scores)
@@ -217,7 +231,25 @@ async fn one_call_per_expansion_that_keeps_a_hop_counts_the_kept_nodes() {
 async fn a_failed_call_keeps_factor_one_is_counted_and_the_walk_completes() {
     let reg = two_branches();
     let plain = walk_with(&reg, 20, None).await;
-    for answer in [Answer::Error, Answer::TooFew, Answer::NotANumber] {
+    // Every failure keeps its reason: the rescorer's own, or the engine's for a
+    // wrong count or a score that is not a number.
+    for (answer, reason) in [
+        (Answer::Error, RerankFailure::Other),
+        (Answer::TooFew, RerankFailure::CountMismatch),
+        (Answer::NotANumber, RerankFailure::Malformed),
+        (
+            Answer::Failing(RerankFailure::Timeout),
+            RerankFailure::Timeout,
+        ),
+        (
+            Answer::Failing(RerankFailure::Status),
+            RerankFailure::Status,
+        ),
+        (
+            Answer::Failing(RerankFailure::Unreachable),
+            RerankFailure::Unreachable,
+        ),
+    ] {
         let mock = Mock::new(&[("a", 0.0)]).answering(answer);
         let result = walk_with(&reg, 20, Some((mock, 0.25))).await;
         assert_eq!(result.status, TraversalStatus::Complete);
@@ -227,9 +259,32 @@ async fn a_failed_call_keeps_factor_one_is_counted_and_the_walk_completes() {
             (result.totals.rerank_calls, result.totals.rerank_failures),
             (3, 3)
         );
+        assert_eq!(
+            result.totals.rerank_failure_reasons,
+            std::collections::BTreeMap::from([(reason, 3)]),
+            "{reason}"
+        );
         // `too few` for a one-node call is an empty answer: also a failure.
         assert_eq!(events_of(&result, "expand")[0]["rerank"]["failed"], true);
+        assert_eq!(
+            events_of(&result, "expand")[0]["rerank"]["reason"],
+            reason.as_str()
+        );
+        let end = &events_of(&result, "end")[0]["totals"];
+        assert_eq!(end["rerank_failure_reasons"][reason.as_str()], 3);
+        // A response warning, whatever the reason.
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("3 of 3 reranker calls failed")
+                && result.warnings[0].contains(&format!("{reason} 3")),
+            "{:?}",
+            result.warnings
+        );
     }
+    // No failure, no warning.
+    let fine = walk_with(&reg, 20, Some((Mock::new(&[]), 0.25))).await;
+    assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
+    assert!(fine.totals.rerank_failure_reasons.is_empty());
 
     // A rescorer that never answers is cut at the walk's deadline.
     let mut limits = budget(20);
@@ -240,6 +295,13 @@ async fn a_failed_call_keeps_factor_one_is_counted_and_the_walk_completes() {
     })
     .await;
     assert_eq!(hung.totals.rerank_failures, 1);
+    assert_eq!(
+        hung.totals
+            .rerank_failure_reasons
+            .get(&RerankFailure::Deadline),
+        Some(&1),
+        "the walk's deadline cut the call"
+    );
     assert!(
         hung.rerank_ms >= 50.0 && hung.rerank_ms < 5_000.0,
         "{}",
@@ -305,16 +367,32 @@ async fn a_handle_keeps_the_floor_refuses_another_and_resumes_as_the_straight_ru
     assert_eq!(snapshot.totals.rerank_calls, 2);
     assert_eq!(Snapshot::from_json(&snapshot.to_json()).unwrap(), snapshot);
 
-    snapshot.check_rerank(Some(0.25)).unwrap();
-    for (what, other) in [("off", None), ("another floor", Some(0.5))] {
+    assert_eq!(snapshot.rerank_identity.as_deref(), Some("mock-a"));
+    snapshot.check_rerank(Some((0.25, "mock-a"))).unwrap();
+    for (what, other) in [
+        ("off", None),
+        ("another floor", Some((0.5, "mock-a"))),
+        ("another reranker", Some((0.25, "mock-b"))),
+    ] {
         let error = snapshot.check_rerank(other).unwrap_err();
         assert!(matches!(error, HandleError::WrongRerank { .. }), "{what}");
     }
+    // The handle keeps the identity the rescorer reports, and refuses the
+    // reranker it was not made with.
+    let other = Mock::new(&[]).identified("mock-b");
+    let made_by_b = walk_with(&reg, 2, Some((other, 0.25)))
+        .await
+        .snapshot
+        .expect("work left");
+    assert_eq!(made_by_b.rerank_identity.as_deref(), Some("mock-b"));
+    made_by_b.check_rerank(Some((0.25, "mock-b"))).unwrap();
+    assert!(made_by_b.check_rerank(Some((0.25, "mock-a"))).is_err());
     // A handle made without the frontier refuses it, and the other way round.
     let off = walk_with(&reg, 2, None).await.snapshot.expect("work left");
     assert_eq!(off.rerank_floor, None);
+    assert_eq!(off.rerank_identity, None);
     off.check_rerank(None).unwrap();
-    assert!(off.check_rerank(Some(0.25)).is_err());
+    assert!(off.check_rerank(Some((0.25, "mock-a"))).is_err());
 
     let straight = walk_with(&reg, 20, Some((mock.clone(), 0.25))).await;
     let second = resume(&reg, snapshot, budget(20), |t| {
@@ -325,4 +403,128 @@ async fn a_handle_keeps_the_floor_refuses_another_and_resumes_as_the_straight_ru
     assert_eq!(second.popped, straight.popped);
     assert_eq!(totals_of(&second), totals_of(&straight));
     assert_eq!(events_of(&second, "resume")[0]["rerank_floor"], 0.25);
+}
+
+/// The `model_calls` cap stops the rating, not the walk.
+#[tokio::test]
+async fn the_model_calls_cap_stops_rating_but_not_the_walk() {
+    let reg = two_branches();
+    let plain = walk_with(&reg, 20, None).await;
+    let mock = Mock::new(&[("a", 0.0)]);
+    let capped = walk(&reg, vec![seed("s")], budget(20), |t| {
+        t.question("which file")
+            .rerank_frontier(mock.clone(), 0.25)
+            .model_calls(Some(2))
+    })
+    .await;
+    assert_eq!(capped.status, TraversalStatus::Complete);
+    // The walk reaches every state the plain walk does (the order differs:
+    // `a` was rated down before the cap was reached).
+    let sorted = |r: &TraversalResult| {
+        let mut p = r.popped.clone();
+        p.sort_unstable();
+        p
+    };
+    assert_eq!(sorted(&capped), sorted(&plain), "the walk goes on");
+    assert_eq!(mock.calls().len(), 2, "no call past the cap");
+    assert_eq!(
+        (
+            capped.totals.rerank_calls,
+            capped.totals.rerank_failures,
+            capped.totals.rerank_skipped
+        ),
+        (2, 0, 1)
+    );
+    let skipped = events_of(&capped, "expand")
+        .iter()
+        .filter(|e| e["rerank"]["skipped"] == "model_calls")
+        .count();
+    assert_eq!(skipped, 1);
+    assert_eq!(events_of(&capped, "end")[0]["totals"]["rerank_skipped"], 1);
+    assert_eq!(capped.warnings.len(), 1, "{:?}", capped.warnings);
+    assert!(
+        capped.warnings[0].contains("model_calls cap of 2")
+            && capped.warnings[0].contains("1 expansions were not rated"),
+        "{:?}",
+        capped.warnings
+    );
+
+    // No cap by default, and a cap that is never reached warns of nothing.
+    for cap in [None, Some(3), Some(100)] {
+        let mock = Mock::new(&[]);
+        let result = walk(&reg, vec![seed("s")], budget(20), |t| {
+            t.question("which file")
+                .rerank_frontier(mock.clone(), 0.25)
+                .model_calls(cap)
+        })
+        .await;
+        assert_eq!(
+            (result.totals.rerank_calls, result.totals.rerank_skipped),
+            (3, 0),
+            "{cap:?}"
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+}
+
+/// The cap counts calls over the whole traversal, a resume included.
+#[tokio::test]
+async fn the_model_calls_cap_is_absolute_across_a_resume() {
+    let reg = two_branches();
+    let mock = Mock::new(&[("a", 0.0)]);
+    let first = walk(&reg, vec![seed("s")], budget(2), |t| {
+        t.question("which file")
+            .rerank_frontier(mock.clone(), 0.25)
+            .model_calls(Some(2))
+    })
+    .await;
+    assert_eq!(first.totals.rerank_calls, 2, "s and a were rated");
+    assert!(first.warnings.is_empty(), "the cap was not hit yet");
+    let snapshot = first.snapshot.expect("the pop cap left work");
+    let second = resume(&reg, snapshot, budget(20), |t| {
+        t.rerank_frontier(mock.clone(), 0.25).model_calls(Some(2))
+    })
+    .await;
+    assert_eq!(second.status, TraversalStatus::Complete);
+    assert_eq!(
+        (second.totals.rerank_calls, second.totals.rerank_skipped),
+        (2, 1),
+        "the second walk starts at the first's two calls"
+    );
+    assert_eq!(mock.calls().len(), 2);
+    let straight = walk(&reg, vec![seed("s")], budget(20), |t| {
+        t.question("which file")
+            .rerank_frontier(Mock::new(&[("a", 0.0)]), 0.25)
+            .model_calls(Some(2))
+    })
+    .await;
+    assert_eq!(second.states, straight.states);
+    assert_eq!(totals_of(&second), totals_of(&straight));
+}
+
+/// The failure counts by reason persist in a handle and keep adding up.
+#[tokio::test]
+async fn failure_reasons_persist_in_a_handle() {
+    let reg = two_branches();
+    let mock = Mock::new(&[]).answering(Answer::Failing(RerankFailure::Unreachable));
+    let first = walk_with(&reg, 2, Some((mock.clone(), 0.25))).await;
+    let snapshot = first.snapshot.expect("work left");
+    assert_eq!(
+        snapshot.totals.rerank_failure_reasons,
+        std::collections::BTreeMap::from([(RerankFailure::Unreachable, 2)])
+    );
+    assert_eq!(Snapshot::from_json(&snapshot.to_json()).unwrap(), snapshot);
+    let second = resume(&reg, snapshot, budget(20), |t| {
+        t.rerank_frontier(mock.clone(), 0.25)
+    })
+    .await;
+    assert_eq!(
+        second.totals.rerank_failure_reasons,
+        std::collections::BTreeMap::from([(RerankFailure::Unreachable, 3)])
+    );
+    assert!(
+        second.warnings[0].contains("3 of 3 reranker calls failed"),
+        "{:?}",
+        second.warnings
+    );
 }

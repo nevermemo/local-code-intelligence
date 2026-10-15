@@ -19,11 +19,17 @@
 //! names others ([`Snapshot::check_identity`]).
 //!
 //! What a resume does not carry: the edge source, the scorer, the price, the
-//! handler and the reranker frontier's rescorer (its floor is kept, and
+//! handler and the reranker frontier's rescorer (its floor and its identity,
+//! the model, the endpoint and how its scores are read, are kept, and
 //! [`Snapshot::check_rerank`] refuses another). The caller passes them again,
-//! and may change them (a changed scorer is noted in the `resume` event). The budget is absolute for the
-//! whole traversal (`pops`, `est_tokens` and `external_calls` count from the
-//! first call), with a fresh deadline; what the outer agent raised stays with
+//! and may change them (a changed scorer is noted in the `resume` event). What
+//! the ranking and the early stop depend on is kept and checked: the
+//! corroboration boost ([`Snapshot::check_boost`]), the score bound's `k`
+//! ([`Snapshot::check_top_k`]), the hop priors, the tie-break file and the
+//! reranker; a caller refuses a handle whose setting it does not repeat. The
+//! budget is absolute for the whole traversal (`pops`, `est_tokens`,
+//! `external_calls` and the reranker calls count from the first call), with a
+//! fresh deadline; what the outer agent raised stays with
 //! the traversal and is added to the caps a call passes (see [`super::steer`]).
 //! The depth limit is the call's own: a resume with a lower limit does not
 //! expand what the first call queued below it, and one with a higher limit
@@ -31,10 +37,12 @@
 //! agent's [`Steer`](super::steer::Steer).
 
 use super::{
-    Fusion, Run, State, Totals, Traversal, TraversalBudget,
+    Fusion, Run, State, Totals, Traversal, TraversalBudget, failure_reasons_json,
     frontier::Frontier,
     priors::HopPriors,
     rank_json,
+    rescore::RerankFailure,
+    sane_boost,
     stop::{Disagreement, MapStat, Tally},
     stops_json,
     tiebreak::TieBreak,
@@ -50,7 +58,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const VERSION: u32 = 9;
+const VERSION: u32 = 10;
 /// The most distinct map ids a process interns while reading handles.
 const MAX_INTERNED: usize = 256;
 const MAX_MAP_ID: usize = 64;
@@ -80,9 +88,24 @@ pub enum HandleError {
         expected: String,
     },
     /// The handle was made with another reranker frontier setting than the
-    /// caller gives (see [`Snapshot::check_rerank`]); each side is the floor,
-    /// or `off`.
+    /// caller gives (see [`Snapshot::check_rerank`]); each side is the floor
+    /// and the reranker's identity, or `off`.
     WrongRerank {
+        handle: String,
+        found: String,
+        expected: String,
+    },
+    /// The handle ranked with another corroboration boost than the caller
+    /// gives (see [`Snapshot::check_boost`]).
+    WrongBoost {
+        handle: String,
+        found: f64,
+        expected: f64,
+    },
+    /// The handle was made with another `k` of the score bound than the
+    /// caller gives (see [`Snapshot::check_top_k`]); each side is `k`, or
+    /// `off`.
+    WrongTopK {
         handle: String,
         found: String,
         expected: String,
@@ -136,7 +159,26 @@ impl fmt::Display for HandleError {
             } => write!(
                 f,
                 "handle {handle} was made with the reranker frontier {found}, this call has \
-                 {expected}; give the same rerank_frontier and rerank_floor, or start a new traversal"
+                 {expected}; give the same rerank_frontier, rerank_floor, rerank_scores and \
+                 reranker, or start a new traversal"
+            ),
+            Self::WrongBoost {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} ranked with the corroboration boost {found}, this call has \
+                 {expected}; give the same corroboration_boost, or start a new traversal"
+            ),
+            Self::WrongTopK {
+                handle,
+                found,
+                expected,
+            } => write!(
+                f,
+                "handle {handle} was made with the score bound at top_k {found}, this call has \
+                 {expected}; give the same top_k, or start a new traversal"
             ),
             Self::WrongTieBreak {
                 handle,
@@ -207,10 +249,16 @@ pub struct Snapshot {
     pub pass_through: bool,
     /// The floor of the reranker frontier the first call ran with (none: it
     /// was off). The caller passes the rescorer again and checks the floor
-    /// with [`Snapshot::check_rerank`].
+    /// and the identity with [`Snapshot::check_rerank`].
     pub rerank_floor: Option<f64>,
+    /// The identity of the rescorer the first call ran with
+    /// ([`identity`](super::rescore::FrontierRescorer::identity)); some exactly when `rerank_floor` is.
+    pub rerank_identity: Option<String>,
     /// Whether the score bound could end the walk; a resume keeps it.
     pub score_bound: bool,
+    /// The `k` of the score bound the first call ran with (0: it had none).
+    /// The caller passes it again and checks it with [`Snapshot::check_top_k`].
+    pub top_k: usize,
     /// The question type and content hash of the fitted hop priors the first
     /// call priced with (none: the guess). Written to the handle only when
     /// there are some.
@@ -248,6 +296,9 @@ impl Snapshot {
             if let Some(hash) = &self.tie_break {
                 object.insert("tie_break".into(), json!(hash));
             }
+            if let Some(identity) = &self.rerank_identity {
+                object.insert("rerank_identity".into(), json!(identity));
+            }
         }
         value
     }
@@ -280,6 +331,11 @@ impl Snapshot {
                 "rerank_calls": self.totals.rerank_calls,
                 "rerank_docs": self.totals.rerank_docs,
                 "rerank_failures": self.totals.rerank_failures,
+                "rerank_failure_reasons":
+                    failure_reasons_json(&self.totals.rerank_failure_reasons),
+                "rerank_skipped": self.totals.rerank_skipped,
+                "physical_map_calls": self.totals.physical_map_calls,
+                "physical_external_calls": self.totals.physical_external_calls,
                 "stops": self.totals.stops,
                 "steers": self.totals.steers,
             },
@@ -296,6 +352,7 @@ impl Snapshot {
             "pass_through": self.pass_through,
             "rerank_floor": self.rerank_floor,
             "score_bound": self.score_bound,
+            "top_k": self.top_k,
         })
     }
 
@@ -356,18 +413,62 @@ impl Snapshot {
     }
 
     /// Refuses a snapshot made with another reranker frontier setting than
-    /// `floor`: the floor of the call (none: the frontier is off). The
-    /// rescorer is not in a handle, so the caller checks what it passes.
-    pub fn check_rerank(&self, floor: Option<f64>) -> Result<(), HandleError> {
-        if self.rerank_floor == floor {
+    /// `setting`: the floor and the rescorer's identity
+    /// ([`identity`](super::rescore::FrontierRescorer::identity)) of the call (none: the frontier is
+    /// off). The rescorer itself is not in a handle, so the caller checks what
+    /// it passes.
+    pub fn check_rerank(&self, setting: Option<(f64, &str)>) -> Result<(), HandleError> {
+        let found = self
+            .rerank_floor
+            .map(|floor| (floor, self.rerank_identity.as_deref().unwrap_or("")));
+        if found == setting {
             return Ok(());
         }
-        let show =
-            |floor: Option<f64>| floor.map_or("off".to_owned(), |f| format!("on at floor {f}"));
+        let show = |setting: Option<(f64, &str)>| {
+            setting.map_or("off".to_owned(), |(floor, identity)| {
+                format!("on at floor {floor} with {identity:?}")
+            })
+        };
         Err(HandleError::WrongRerank {
             handle: self.handle(),
-            found: show(self.rerank_floor),
-            expected: show(floor),
+            found: show(found),
+            expected: show(setting),
+        })
+    }
+
+    /// Refuses a snapshot that ranked with another corroboration boost than
+    /// `boost` (the caller's explicit one, sanitised as
+    /// [`Traversal::corroboration_boost`] does). A resume would otherwise rank
+    /// with the handle's boost, whatever the caller said.
+    pub fn check_boost(&self, boost: f64) -> Result<(), HandleError> {
+        let boost = sane_boost(boost);
+        if self.boost == boost {
+            return Ok(());
+        }
+        Err(HandleError::WrongBoost {
+            handle: self.handle(),
+            found: self.boost,
+            expected: boost,
+        })
+    }
+
+    /// Refuses a snapshot made with another `k` of the score bound than `k`
+    /// (0: no bound), since the bound decides where the walk ends.
+    pub fn check_top_k(&self, k: usize) -> Result<(), HandleError> {
+        if self.top_k == k {
+            return Ok(());
+        }
+        let show = |k: usize| {
+            if k == 0 {
+                "off".to_owned()
+            } else {
+                k.to_string()
+            }
+        };
+        Err(HandleError::WrongTopK {
+            handle: self.handle(),
+            found: show(self.top_k),
+            expected: show(k),
         })
     }
 
@@ -582,6 +683,15 @@ impl Snapshot {
                 rerank_calls: u32_of(get(totals, "rerank_calls")?)?,
                 rerank_docs: u32_of(get(totals, "rerank_docs")?)?,
                 rerank_failures: u32_of(get(totals, "rerank_failures")?)?,
+                rerank_failure_reasons: get(totals, "rerank_failure_reasons")?
+                    .as_object()
+                    .ok_or("rerank_failure_reasons is not an object")?
+                    .iter()
+                    .map(|(reason, n)| Ok((reason.parse::<RerankFailure>()?, u32_of(n)?)))
+                    .collect::<Result<_, String>>()?,
+                rerank_skipped: u32_of(get(totals, "rerank_skipped")?)?,
+                physical_map_calls: u32_of(get(totals, "physical_map_calls")?)?,
+                physical_external_calls: u32_of(get(totals, "physical_external_calls")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
                 steers: u32_of(get(totals, "steers")?)?,
                 elapsed_ms: 0.0,
@@ -608,9 +718,14 @@ impl Snapshot {
                 Value::Null => None,
                 v => Some(f64_of(v)?),
             },
+            rerank_identity: match obj.get("rerank_identity") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(string_of(v)?),
+            },
             score_bound: get(obj, "score_bound")?
                 .as_bool()
                 .ok_or("score_bound is not a boolean")?,
+            top_k: usize_of(get(obj, "top_k")?)?,
             priors: match obj.get("priors") {
                 None | Some(Value::Null) => None,
                 Some(v) => {
@@ -871,7 +986,13 @@ impl Run<'_> {
             fusion: self.t.fusion,
             pass_through: self.t.pass_through,
             rerank_floor: self.rerank_floor(),
+            rerank_identity: self
+                .t
+                .rerank
+                .as_ref()
+                .map(|(rescorer, _)| rescorer.identity()),
             score_bound: self.t.score_bound,
+            top_k: self.t.bound.map_or(0, |(k, _)| k),
             priors: self
                 .t
                 .priors
@@ -913,6 +1034,14 @@ impl Run<'_> {
         if self.t.identity.is_empty() {
             self.t.identity = identity;
         }
+        // A caller that repeats a different boost is refused by
+        // `Snapshot::check_boost`; one that did not check is told.
+        if self.t.boost_given && self.t.boost != boost {
+            self.warnings.push(format!(
+                "this call gave the corroboration boost {}; the handle {handle} ranked with {boost}, so this resume ranks with {boost}",
+                self.t.boost
+            ));
+        }
         self.t.boost = boost;
         self.t.fusion = fusion;
         self.t.pass_through = pass_through;
@@ -929,8 +1058,19 @@ impl Run<'_> {
         self.popped = popped;
         self.cleared = cleared.into_iter().collect();
         self.weights = weights.into_iter().collect();
+        // A switch the handle replays for a map this call has not registered
+        // has no effect; it stays in the handle and is named once here.
+        let mut unregistered: Vec<&str> = Vec::new();
         for (map, on) in &switches {
-            self.t.source.set_enabled(map, *on);
+            if !self.t.source.set_enabled(map, *on) && !unregistered.contains(&map.as_str()) {
+                unregistered.push(map);
+            }
+        }
+        if !unregistered.is_empty() {
+            self.warnings.push(format!(
+                "the handle {handle} switched the maps {} on or off, which this call has not registered; those switches have no effect",
+                unregistered.join(", ")
+            ));
         }
         self.switches = switches;
         self.totals = totals;

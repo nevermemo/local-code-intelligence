@@ -97,6 +97,31 @@ pub fn resolve(asked: &SteerArgs) -> Result<(SteerArgs, Option<String>)> {
     Ok((steer, Some(name.clone())))
 }
 
+/// The maps of a continuation as it runs them: the maps as registered, with the
+/// weights and on/off switches its handle replays (in order, the last one
+/// wins). A map the handle names that this call has not registered is left
+/// out, and a map the call registered off stays off whatever the handle says.
+pub fn restored(
+    maps: &[PlanMap],
+    weights: &[(String, f64)],
+    switches: &[(String, bool)],
+) -> Vec<PlanMap> {
+    let mut restored = maps.to_vec();
+    for (id, weight) in weights {
+        if let Some(map) = restored.iter_mut().find(|map| map.id == *id) {
+            map.weight = *weight;
+        }
+    }
+    for (id, on) in switches {
+        if let Some((map, registered)) =
+            restored.iter_mut().zip(maps).find(|(map, _)| map.id == *id)
+        {
+            map.enabled = *on && registered.enabled;
+        }
+    }
+    restored
+}
+
 /// The effective policy of a call: the response object and the part the
 /// `start` event records. `handler` is the stop policy and plan the call
 /// built, `None` for a call without a handler (no stops, no rules, no
@@ -155,6 +180,53 @@ mod tests {
         let names: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["explore", "impact", "flow", "where-to"]);
         assert!(is_preset("where-to") && !is_preset("default"));
+    }
+
+    #[test]
+    fn a_continuations_maps_carry_the_weights_and_switches_of_its_handle() {
+        let plan = |id: &str, weight: f64, enabled: bool| PlanMap {
+            id: id.to_owned(),
+            version: 1,
+            weight,
+            enabled,
+        };
+        let maps = [
+            plan("m1", 1.0, true),
+            plan("m2", 1.0, true),
+            plan("m3", 1.0, false),
+        ];
+        let weights = [
+            ("m1".to_owned(), 0.5),
+            ("gone".to_owned(), 2.0),
+            ("m1".to_owned(), 0.25),
+        ];
+        let switches = [
+            ("m2".to_owned(), false),
+            ("gone".to_owned(), false),
+            ("m3".to_owned(), true),
+            ("m2".to_owned(), true),
+            ("m2".to_owned(), false),
+        ];
+        let restored = restored(&maps, &weights, &switches);
+        assert_eq!(
+            restored,
+            [
+                plan("m1", 0.25, true),
+                plan("m2", 1.0, false),
+                // Switched on by the handle, but registered off by this call.
+                plan("m3", 1.0, false),
+            ]
+        );
+        // Nothing to replay: the maps as registered.
+        assert_eq!(super::restored(&maps, &[], &[]), maps);
+        // The policy shown for the two differs in its map block and its hash.
+        let steer = SteerArgs::default();
+        let (fresh, fresh_plan) = effective(None, &steer, None, &maps);
+        let (resumed, resumed_plan) = effective(None, &steer, None, &restored);
+        assert_eq!(resumed["maps"][0]["weight"], 0.25);
+        assert_eq!(resumed["maps"][1]["enabled"], false);
+        assert_eq!(fresh["maps"][1]["enabled"], true);
+        assert_ne!(fresh_plan.hash, resumed_plan.hash);
     }
 
     #[test]

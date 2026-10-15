@@ -330,7 +330,7 @@ tau = 0.8
 # rank: potential * (1 + boost * (maps - 1)). 0 ranks by potential alone; the
 # most is 10 (a larger value could overflow the ranks). Maps built on one graph
 # (structure.contains, graph.scip, scip.impact) count as one. A resumed
-# traversal keeps the boost its handle was made with.
+# traversal must be given the boost its handle was made with.
 corroboration_boost = 0.1
 # How results are ranked. "boost" (default): the path potential lifted by
 # corroboration_boost. "rrf": weighted reciprocal rank fusion, as Qdrant does:
@@ -352,12 +352,21 @@ pass_through = false
 # Reranker frontier: after the gate and the beam keep the edges of an expansion, one
 # batched reranker call scores the kept destinations against the question, and each
 # kept hop's value is multiplied by rerank_floor + (1 - rerank_floor) * s, s the
-# relevance in 0..1 (a score outside 0..1 is mapped with a logistic function). The
-# factor is at most 1, so the score bound stays sound. A failed call leaves the
-# factor at 1. Uses the configured reranker; a resumed traversal must be given the
-# same two settings. rerank_floor is the factor for relevance 0, 0 to 1 (1: no effect).
+# relevance in 0..1. The factor is at most 1, so the score bound stays sound. A
+# failed call leaves the factor at 1; the response warns when any failed and counts
+# the failures by reason. Uses the configured reranker; a resumed traversal must be
+# given the same settings, the same reranker model and endpoint, and the same
+# top_k. rerank_floor is the factor for relevance 0, 0 to 1 (1: no effect).
+# rerank_scores says what the reranker's scores are, for every document alike:
+# "probability" (default; llama.cpp's /rerank returns probabilities) clamps each
+# score to 0..1, "logit" maps each through 1 / (1 + e^-score).
 rerank_frontier = false
 rerank_floor = 0.25
+rerank_scores = "probability"
+# Most model calls (the reranker frontier's calls) one traversal may make, a
+# continuation counting on from the calls before it. Once reached, the frontier
+# stops rating (the hops keep factor 1) and the walk goes on. Absent: no cap.
+# max_model_calls = 200
 # Whether the score bound may end a traversal early: once enough results exist and
 # nothing queued can lift a result above the k-th, the walk stops with the stop
 # reason `bound`. false: the walk runs to its budgets or a dry frontier. A resumed

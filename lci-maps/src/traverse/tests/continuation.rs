@@ -374,6 +374,13 @@ async fn f1_a_cut_pop_is_requeued_and_its_retry_does_not_pay_its_calls_again() {
     let first = walk(&reg, vec![seed("a")], tight, |t| t).await;
     assert_eq!(first.status, TraversalStatus::BudgetExhausted);
     assert_eq!(first.totals.external_calls, 1);
+    assert_eq!(
+        (
+            first.totals.physical_map_calls,
+            first.totals.physical_external_calls
+        ),
+        (1, 1)
+    );
     let snapshot = first.snapshot.unwrap();
     // The handle says what the cut pop already paid: the seed (state 0), 10
     // tokens, 1 call; and it reads back.
@@ -398,6 +405,26 @@ async fn f1_a_cut_pop_is_requeued_and_its_retry_does_not_pay_its_calls_again() {
         second.totals.external_calls, 6,
         "a, b, c, d, e, h: one call each"
     );
+    // The physical work counts the retry: the seed's call ran twice.
+    assert_eq!(
+        (
+            straight.totals.physical_map_calls,
+            straight.totals.physical_external_calls
+        ),
+        (6, 6)
+    );
+    assert_eq!(
+        (
+            second.totals.physical_map_calls,
+            second.totals.physical_external_calls
+        ),
+        (7, 7),
+        "the first call's one plus the retry and the five other pops"
+    );
+    let end = &events_of(&second, "end")[0]["totals"];
+    assert_eq!(end["physical_map_calls"], 7);
+    assert_eq!(end["physical_external_calls"], 7);
+    assert_eq!(end["external_calls"], 6);
     assert_eq!(second.totals.tokens, straight.totals.tokens);
     assert_eq!(second.totals.hops, straight.totals.hops);
     // Six pops (a and its five children) cost one call each, plus five hops,
@@ -407,4 +434,145 @@ async fn f1_a_cut_pop_is_requeued_and_its_retry_does_not_pay_its_calls_again() {
         assert!(second.reached(&node(name)), "{name}");
     }
     assert!(second.snapshot.is_none());
+}
+
+// ---- R1b: what a resume must repeat -----------------------------------------------------
+
+#[tokio::test]
+async fn a_handle_refuses_another_corroboration_boost_and_warns_when_unchecked() {
+    use crate::traverse::handle::HandleError;
+    let (reg, snapshot) = cut_snapshot().await;
+    assert_eq!(snapshot.boost, DEFAULT_CORROBORATION_BOOST);
+    snapshot.check_boost(DEFAULT_CORROBORATION_BOOST).unwrap();
+    // A value that is sanitised to the handle's boost matches it.
+    let zero = walk(&reg, vec![seed("a")], budget(1), |t| {
+        t.corroboration_boost(0.0)
+    })
+    .await
+    .snapshot
+    .unwrap();
+    assert_eq!(zero.boost, 0.0);
+    zero.check_boost(-1.0).unwrap();
+    zero.check_boost(f64::NAN).unwrap();
+    let error = snapshot.check_boost(0.5).unwrap_err();
+    assert!(
+        matches!(error, HandleError::WrongBoost { found, expected, .. } if found == 0.1 && expected == 0.5),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("0.5") && text.contains("0.1"), "{text}");
+
+    // A resume that gave no boost, or the handle's, has nothing to say; one
+    // that gave another and was not checked ranks with the handle's, and says so.
+    for given in [None, Some(DEFAULT_CORROBORATION_BOOST)] {
+        let second = resume(&reg, snapshot.clone(), budget(100), |t| match given {
+            Some(boost) => t.corroboration_boost(boost),
+            None => t,
+        })
+        .await;
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    }
+    let second = resume(&reg, snapshot.clone(), budget(100), |t| {
+        t.corroboration_boost(0.5)
+    })
+    .await;
+    assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
+    assert!(
+        second.warnings[0].contains("0.5") && second.warnings[0].contains("0.1"),
+        "{:?}",
+        second.warnings
+    );
+}
+
+#[tokio::test]
+async fn a_handle_refuses_another_score_bound_k() {
+    use crate::traverse::handle::HandleError;
+    let reg = registry(vec![GraphMap::new("g", &[("a", "b"), ("a", "c")])]);
+    let bounded = walk(&reg, vec![seed("a")], budget(1), |t| t.top_k(3, 1))
+        .await
+        .snapshot
+        .unwrap();
+    assert_eq!(bounded.top_k, 3);
+    bounded.check_top_k(3).unwrap();
+    assert_eq!(Snapshot::from_json(&bounded.to_json()).unwrap(), bounded);
+    let error = bounded.check_top_k(5).unwrap_err();
+    assert!(matches!(error, HandleError::WrongTopK { .. }), "{error:?}");
+    let text = bounded.check_top_k(0).unwrap_err().to_string();
+    assert!(text.contains('3') && text.contains("off"), "{text}");
+    // The bound being off is a setting too.
+    let (_, unbounded) = cut_snapshot().await;
+    assert_eq!(unbounded.top_k, 0);
+    unbounded.check_top_k(0).unwrap();
+    assert!(unbounded.check_top_k(3).is_err());
+}
+
+#[tokio::test]
+async fn a_switch_for_a_map_the_resume_does_not_register_is_named() {
+    let both = registry(vec![
+        GraphMap::new("m1", &[("a", "b"), ("b", "c")]),
+        GraphMap::new("m2", &[("a", "x"), ("x", "y")]),
+    ]);
+    let first = walk(&both, vec![seed("a")], budget(10), |t| {
+        t.handler(
+            scripted(|cp| {
+                if cp.stop == 1 {
+                    vec![
+                        act(None, Action::MapOff("m2".into())),
+                        act(None, Action::Stop),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            }),
+            every(1),
+        )
+    })
+    .await;
+    let snapshot = first.snapshot.expect("a stop leaves a handle");
+    assert_eq!(snapshot.switches, [("m2".to_owned(), false)]);
+
+    // The same maps: nothing to say.
+    let same = resume(&both, snapshot.clone(), budget(10), |t| t).await;
+    assert!(same.warnings.is_empty(), "{:?}", same.warnings);
+    // A registry without m2: the switch has no effect, and the call says so.
+    let only_m1 = registry(vec![GraphMap::new("m1", &[("a", "b"), ("b", "c")])]);
+    let second = resume(&only_m1, snapshot.clone(), budget(10), |t| t).await;
+    assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
+    assert!(
+        second.warnings[0].contains("m2") && !second.warnings[0].contains("m1"),
+        "{:?}",
+        second.warnings
+    );
+}
+
+#[tokio::test]
+async fn a_version_10_handle_round_trips_its_new_fields() {
+    let reg = registry(vec![
+        GraphMap::new("g", &[("a", "b"), ("a", "c")]).cost(0, 1),
+    ]);
+    let first = walk(&reg, vec![seed("a")], budget(1), |t| t.top_k(3, 1)).await;
+    let snapshot = first.snapshot.unwrap();
+    let json = snapshot.to_json();
+    assert_eq!(json["version"], 10);
+    assert_eq!(json["top_k"], 3);
+    for key in [
+        "rerank_failure_reasons",
+        "rerank_skipped",
+        "physical_map_calls",
+        "physical_external_calls",
+    ] {
+        assert!(json["totals"].get(key).is_some(), "{key}");
+    }
+    assert_eq!(Snapshot::from_json(&json).unwrap(), snapshot);
+    // A handle of the version before is refused, not guessed at.
+    let mut old = json.clone();
+    old["version"] = json!(9);
+    assert!(Snapshot::from_json(&old).unwrap_err().contains("version"));
+    // The new totals are required.
+    let mut missing = json.clone();
+    missing["totals"]
+        .as_object_mut()
+        .unwrap()
+        .remove("physical_map_calls");
+    assert!(Snapshot::from_json(&missing).is_err());
 }
