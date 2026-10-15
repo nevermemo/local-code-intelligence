@@ -945,6 +945,36 @@ impl Manager {
         locations_for(value, workspace, adapter.provider())
     }
 
+    /// `textDocument/documentSymbol` for `file`: every symbol the server lists
+    /// (nested ones included, whichever of the two response shapes it uses),
+    /// as the location of its name.
+    pub async fn document_symbols(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+    ) -> Result<Vec<Location>> {
+        let uri = reqwest::Url::from_file_path(file)
+            .map_err(|_| anyhow!("cannot convert file path to URI"))?
+            .to_string();
+        let value = self
+            .position_request(
+                adapter,
+                workspace,
+                file,
+                relative,
+                "textDocument/documentSymbol",
+                json!({"textDocument":{"uri":uri}}),
+            )
+            .await?;
+        locations_for(
+            Value::Array(flatten_document_symbols(&value, &uri)),
+            workspace,
+            adapter.provider(),
+        )
+    }
+
     /// Whether a started, ready session exists for this provider and
     /// workspace. A session still starting (or warming up) is not running
     /// yet.
@@ -1131,6 +1161,31 @@ fn spawn_idle_sweeper(registry: Weak<Sessions>, idle: Duration) {
     });
 }
 
+/// The items of a `textDocument/documentSymbol` response as the flat
+/// `SymbolInformation` shape `locations_for` reads: a `DocumentSymbol` has no
+/// uri (it is the requested file's) and its name is its `selectionRange`;
+/// children follow their parent.
+fn flatten_document_symbols(value: &Value, uri: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for item in value.as_array().into_iter().flatten() {
+        if item.get("location").is_some() {
+            out.push(item.clone());
+            continue;
+        }
+        let range = item.get("selectionRange").or_else(|| item.get("range"));
+        if let Some(range) = range {
+            out.push(json!({
+                "name": item.get("name"), "kind": item.get("kind"),
+                "location": {"uri": uri, "range": range}
+            }));
+        }
+        if let Some(children) = item.get("children") {
+            out.extend(flatten_document_symbols(children, uri));
+        }
+    }
+    out
+}
+
 /// Normalizes an LSP `workspace/symbol`/`textDocument/definition`/
 /// `textDocument/references` response into this app's `Location` shape.
 /// Each location's `language` is derived from its own file (not fixed to one
@@ -1249,6 +1304,34 @@ mod tests {
         assert_eq!(result[0].language.as_deref(), Some("rust"));
         assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
+    }
+
+    #[test]
+    fn document_symbols_of_both_shapes_become_name_locations() {
+        let range = |line: u32| json!({"start":{"line":line,"character":3},"end":{"line":line,"character":7}});
+        let hierarchical = json!([{
+            "name":"outer","kind":23,"range":range(0),"selectionRange":range(1),
+            "children":[{"name":"inner","kind":12,"range":range(2),"selectionRange":range(3)}]
+        }]);
+        let flat =
+            json!([{"name":"item","kind":12,"location":{"uri":"file:///x.rs","range":range(4)}}]);
+        let names = |value: &Value| -> Vec<(String, u64)> {
+            flatten_document_symbols(value, "file:///x.rs")
+                .iter()
+                .map(|item| {
+                    (
+                        item["name"].as_str().unwrap().to_owned(),
+                        item["location"]["range"]["start"]["line"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&hierarchical),
+            [("outer".into(), 1), ("inner".into(), 3)]
+        );
+        assert_eq!(names(&flat), [("item".into(), 4)]);
+        assert!(names(&Value::Null).is_empty());
     }
 
     #[cfg(unix)]
