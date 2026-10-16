@@ -417,6 +417,51 @@ async fn go_java_c_and_cpp_source_is_indexed_and_searchable() {
             "greet",
             "std::string greet",
         ),
+        (
+            "c",
+            "c-header-service",
+            "include/greet.h",
+            "// Greet_header returns a friendly greeting for name.\nconst char *greet_header(const char *name);\n",
+            1,
+            "greet_header",
+            "const char *greet_header",
+        ),
+        (
+            "cpp",
+            "cc-service",
+            "greet.cc",
+            "// Greet_cc returns a friendly greeting for name.\nstd::string greet_cc(const std::string &name) {\n    return name;\n}\n",
+            1,
+            "greet_cc",
+            "std::string greet_cc",
+        ),
+        (
+            "cpp",
+            "cxx-service",
+            "greet.cxx",
+            "// Greet_cxx returns a friendly greeting for name.\nstd::string greet_cxx(const std::string &name) {\n    return name;\n}\n",
+            1,
+            "greet_cxx",
+            "std::string greet_cxx",
+        ),
+        (
+            "cpp",
+            "hh-service",
+            "include/greet.hh",
+            "// Greet_hh returns a friendly greeting for name.\nstd::string greet_hh(const std::string &name);\n",
+            1,
+            "greet_hh",
+            "std::string greet_hh",
+        ),
+        (
+            "cpp",
+            "hxx-service",
+            "include/greet.hxx",
+            "// Greet_hxx returns a friendly greeting for name.\nstd::string greet_hxx(const std::string &name);\n",
+            1,
+            "greet_hxx",
+            "std::string greet_hxx",
+        ),
     ];
     // Each case has its own fixture, so they run side by side.
     futures::future::join_all(cases.into_iter().map(
@@ -1663,6 +1708,174 @@ async fn mixed_languages_reuse_update_delete_and_preserve_the_previous_snapshot(
             .code
             .contains("UNCOMMITTED_SNAPSHOT_MARKER")
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn c_and_cpp_header_and_source_extensions_reuse_update_delete_and_keep_the_snapshot() {
+    use local_code_intelligence::filter::SourceRole;
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("c-family");
+    write(
+        &workspace,
+        "src/cache.h",
+        "// Evicts the least-recently-used entry once the cache exceeds its capacity.\nint evict_cached_entry(int *usage, int count, int capacity);\n",
+    );
+    write(
+        &workspace,
+        "src/throttle.cc",
+        "// Determines whether a new request should be admitted.\nbool admit_throttled_request(int recent, int limit) {\n    return recent < limit;\n}\n",
+    );
+    write(
+        &workspace,
+        "src/throttle_unittest.cc",
+        "// Search decoy: admit_throttled_request is mentioned only in a test.\nconst char *expected_throttle_description = \"admit requests under the limit\";\n",
+    );
+    write(
+        &workspace,
+        "src/window.cxx",
+        "// Counts requests inside a sliding window.\nint count_window_requests(int start, int end) {\n    return end - start;\n}\n",
+    );
+    write(
+        &workspace,
+        "include/window.hh",
+        "// Declares the sliding window counter.\nint count_window_requests(int start, int end);\n",
+    );
+    write(
+        &workspace,
+        "include/window.hxx",
+        "// Resets the sliding window counter.\nvoid reset_window_counter();\n",
+    );
+
+    let app = App::open(config.clone()).await.unwrap();
+    let first = app.index(&workspace).await.unwrap();
+    assert_eq!(first.files, 6);
+    assert_eq!(first.parsed_files, 6);
+    assert!(first.embedded_chunks > 0);
+
+    for (query, path, language) in [
+        ("evict_cached_entry", "src/cache.h", "c"),
+        ("admit_throttled_request", "src/throttle.cc", "cpp"),
+        ("count_window_requests", "src/window.cxx", "cpp"),
+        ("count_window_requests", "include/window.hh", "cpp"),
+        ("reset_window_counter", "include/window.hxx", "cpp"),
+    ] {
+        let report = app.search(&workspace, query, Some(8)).await.unwrap();
+        let hit = report
+            .results
+            .iter()
+            .find(|hit| hit.chunk.relative_file_path == path)
+            .unwrap_or_else(|| panic!("missing {path} for {query}: {:#?}", report.results));
+        assert_eq!(hit.chunk.language, language, "{path}");
+        assert_eq!(hit.source_role, SourceRole::Source, "{path}");
+        assert!(hit.chunk.start_line >= 1 && hit.chunk.end_line >= hit.chunk.start_line);
+    }
+    // A `*_unittest.cc` file is a test. (The fake model service does not rank
+    // by meaning, so only the metadata is asserted here; the live
+    // multilingual acceptance ranks the production file above its decoy.)
+    let throttle = app
+        .search(&workspace, "admit_throttled_request", Some(8))
+        .await
+        .unwrap();
+    assert!(throttle.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "src/throttle.cc" && hit.source_role == SourceRole::Source
+    }));
+    assert!(throttle.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "src/throttle_unittest.cc"
+            && hit.chunk.language == "cpp"
+            && hit.source_role == SourceRole::Test
+    }));
+    // Role filters see the new extensions, and a language filter groups `.h`
+    // with `c` and the other extensions with `cpp`.
+    let only_c = app
+        .search_with_filters(
+            &workspace,
+            "evict_cached_entry",
+            Some(8),
+            local_code_intelligence::filter::FilterRequest {
+                languages: Some(vec!["c".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!only_c.results.is_empty());
+    assert!(
+        only_c
+            .results
+            .iter()
+            .all(|hit| hit.chunk.language == "c" && hit.chunk.relative_file_path == "src/cache.h")
+    );
+
+    // Zero work on a repeat, in the same process and after a restart.
+    let unchanged = app.index(&workspace).await.unwrap();
+    assert_eq!(unchanged.parsed_files, 0);
+    assert_eq!(unchanged.embedded_chunks, 0);
+    drop(app);
+    let app = App::open(config).await.unwrap();
+    let restarted = app.index(&workspace).await.unwrap();
+    assert_eq!(restarted.parsed_files, 0);
+    assert_eq!(restarted.embedded_chunks, 0);
+    assert_eq!(restarted.unchanged_files, 6);
+
+    // A one-file update reparses that file and reuses every other vector.
+    write(
+        &workspace,
+        "include/window.hxx",
+        "// Resets the sliding window counter.\nvoid reset_window_counter();\n\n// Reports the window size.\nint window_size_limit();\n",
+    );
+    let changed = app.index(&workspace).await.unwrap();
+    assert_eq!(changed.parsed_files, 1);
+    assert_eq!(changed.unchanged_files, 5);
+    assert!(changed.reused_chunks > 0);
+    let updated = app
+        .search(&workspace, "window_size_limit", Some(8))
+        .await
+        .unwrap();
+    assert!(updated.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "include/window.hxx"
+            && hit.chunk.code.contains("window_size_limit")
+    }));
+
+    // Deleting the decoy removes its chunks from the next snapshot.
+    std::fs::remove_file(workspace.join("src/throttle_unittest.cc")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 5);
+    let after_delete = app
+        .search(&workspace, "expected_throttle_description", Some(8))
+        .await
+        .unwrap();
+    assert!(
+        after_delete
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path != "src/throttle_unittest.cc")
+    );
+
+    // A failed update keeps the previous snapshot searchable.
+    write(
+        &workspace,
+        "src/cache.h",
+        "// Evicts the least-recently-used entry.\nint evict_cached_entry(int *usage, int count, int capacity);\nint UNCOMMITTED_SNAPSHOT_MARKER(void);\n",
+    );
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    assert!(app.index(&workspace).await.is_err());
+    assert_eq!(app.status(&workspace).await.unwrap().chunks, deleted.chunks);
+    assert!(app.status(&workspace).await.unwrap().stale);
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let retained = app
+        .search(&workspace, "evict_cached_entry", Some(8))
+        .await
+        .unwrap();
+    let header = retained
+        .results
+        .iter()
+        .find(|hit| hit.chunk.relative_file_path == "src/cache.h")
+        .unwrap();
+    assert!(header.chunk.code.contains("evict_cached_entry"));
+    assert!(!header.chunk.code.contains("UNCOMMITTED_SNAPSHOT_MARKER"));
     task.abort();
 }
 

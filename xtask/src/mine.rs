@@ -47,7 +47,8 @@ use lci_core::evaluation::{EvaluationFile, validate_definition};
 /// of `ADAPTERS` in `lci-core/src/language.rs`. The
 /// `extensions_match_the_language_registry` test fails when the two drift apart.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "cs", "go", "java", "c", "cpp", "hpp",
+    "rs", "ts", "tsx", "js", "jsx", "py", "cs", "go", "java", "c", "h", "cpp", "hpp", "cc", "cxx",
+    "hh", "hxx",
 ];
 
 /// Commits touching more supported files than this are bulk changes (moves,
@@ -2180,7 +2181,18 @@ mod tests {
 
     #[test]
     fn extension_and_path_rules() {
-        for path in ["a.rs", "src/b.tsx", "x/y/z.hpp", "Program.cs", "a.b.c.py"] {
+        for path in [
+            "a.rs",
+            "src/b.tsx",
+            "x/y/z.hpp",
+            "Program.cs",
+            "a.b.c.py",
+            "src/a.h",
+            "src/b.cc",
+            "src/c.cxx",
+            "src/d.hh",
+            "src/e.hxx",
+        ] {
             assert!(is_eligible_path(path), "{path}");
         }
         for path in [
@@ -2190,7 +2202,7 @@ mod tests {
             ".rs",
             "src/a.RS",
             "src/a.rs.bak",
-            "src/a.h",
+            "src/a.inl",
             "src/Vendor/a.rs.orig",
             "vendor/a.rs",
             "a/node_modules/b/c.js",

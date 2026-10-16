@@ -142,6 +142,50 @@ const char *expected_rate_limiter_description = "admit requests under the config
 }
 "#;
 
+// The remaining C and C++ extensions: `.h` is indexed as `c`; `.cc`, `.cxx`,
+// `.hh`, and `.hxx` as `cpp`.
+const CACHE_H_V1: &str = r#"// Declares the eviction entry point of the least-recently-used cache.
+int evict_oldest_cached_entry(int *usage, int count, int capacity);
+"#;
+
+const THROTTLE_CC_V1: &str = r#"namespace throttling {
+
+// Decides whether a request is admitted while the throttle still has budget.
+bool admit_throttled_request(int recent_count, int budget) {
+    return recent_count < budget;
+}
+
+}
+"#;
+
+const THROTTLE_TEST_CC: &str = r#"namespace throttling {
+
+// Search decoy: admit_throttled_request is mentioned only in a test.
+const char *expected_throttle_description = "admit requests while budget remains";
+
+}
+"#;
+
+const WINDOW_CXX: &str = r#"// Counts the requests seen between two timestamps of the sliding window.
+int count_window_requests(int window_start, int window_end) {
+    return window_end - window_start;
+}
+"#;
+
+const WINDOW_HH: &str = r#"// Tracks how many requests fell inside the sliding window.
+class WindowCounter {
+public:
+    int total_in_window() const;
+};
+"#;
+
+const WINDOW_HXX: &str = r#"// Clears the sliding window counter after a rollover.
+inline int reset_window_counter_state(int *counter) {
+    *counter = 0;
+    return 0;
+}
+"#;
+
 const FIXTURE_CARGO_TOML: &str = r#"[package]
 name = "multilingual-acceptance-fixture"
 version = "0.1.0"
@@ -204,6 +248,12 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     fixture.write("tests/cache_test.c", CACHE_TEST_C)?;
     fixture.write("src/RateLimiter.cpp", RATE_LIMITER_CPP_V1)?;
     fixture.write("tests/RateLimiterTest.cpp", RATE_LIMITER_TEST_CPP)?;
+    fixture.write("include/cache.h", CACHE_H_V1)?;
+    fixture.write("src/Throttle.cc", THROTTLE_CC_V1)?;
+    fixture.write("tests/ThrottleTest.cc", THROTTLE_TEST_CC)?;
+    fixture.write("src/Window.cxx", WINDOW_CXX)?;
+    fixture.write("include/Window.hh", WINDOW_HH)?;
+    fixture.write("include/Window.hxx", WINDOW_HXX)?;
 
     evidence.stage("write-config")?;
     let config_path = fixture.write_config(&[
@@ -232,8 +282,8 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     let files = first["files"]
         .as_u64()
         .context("index report missing files count")?;
-    if files != 18 {
-        bail!("Initial index included {files} files instead of 18");
+    if files != 24 {
+        bail!("Initial index included {files} files instead of 24");
     }
     evidence.set("initial_files", files)?;
 
@@ -359,6 +409,61 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     )
     .await?;
 
+    let _c_header_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-c-header",
+        "evict_oldest_cached_entry",
+        "include/cache.h",
+        "c",
+        "int evict_oldest_cached_entry",
+    )
+    .await?;
+
+    let cc_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-cc",
+        "admit_throttled_request",
+        "src/Throttle.cc",
+        "cpp",
+        "bool admit_throttled_request",
+    )
+    .await?;
+
+    let _cxx_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-cxx",
+        "count_window_requests",
+        "src/Window.cxx",
+        "cpp",
+        "int count_window_requests",
+    )
+    .await?;
+
+    let _hh_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-hh",
+        "total_in_window",
+        "include/Window.hh",
+        "cpp",
+        "int total_in_window",
+    )
+    .await?;
+
+    let _hxx_search = assert_search(
+        &config_path,
+        &workspace,
+        "multilingual-search-hxx",
+        "reset_window_counter_state",
+        "include/Window.hxx",
+        "cpp",
+        "int reset_window_counter_state",
+    )
+    .await?;
+
     evidence.stage("ranking-and-decoys")?;
     let csharp_results = results_array(&csharp_search)?;
     let csharp_decoy_present = csharp_results.iter().any(|hit| {
@@ -438,6 +543,23 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         != Some("src/RateLimiter.cpp")
     {
         bail!("Production C++ implementation did not outrank the test decoy");
+    }
+
+    let cc_results = results_array(&cc_search)?;
+    let cc_decoy_present = cc_results.iter().any(|hit| {
+        hit["relative_file_path"].as_str() == Some("tests/ThrottleTest.cc")
+            && hit["language"].as_str() == Some("cpp")
+            && hit["source_role"].as_str() == Some("test")
+    });
+    if !cc_decoy_present {
+        bail!("Initial index did not include the .cc test decoy as cpp with test role");
+    }
+    if cc_results
+        .first()
+        .and_then(|hit| hit["relative_file_path"].as_str())
+        != Some("src/Throttle.cc")
+    {
+        bail!("Production .cc implementation did not outrank the test decoy");
     }
 
     let python_results = results_array(&python_search)?;
@@ -641,6 +763,43 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     }
     if cpp_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
         bail!("C++ update did not reuse other-language chunks");
+    }
+
+    evidence.stage("c-header-update")?;
+    let cache_h_v2 = format!("{CACHE_H_V1}\nint cache_header_revision(void);\n");
+    fixture.write("include/cache.h", &cache_h_v2)?;
+    let h_changed = run_report(
+        &config_path,
+        "multilingual-c-header-update",
+        &["index", &workspace],
+    )
+    .await?;
+    if h_changed["parsed_files"].as_u64() != Some(1) {
+        let parsed = h_changed["parsed_files"].as_u64().unwrap_or_default();
+        bail!(".h update parsed {parsed} files instead of exactly one");
+    }
+    if h_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
+        bail!(".h update did not reuse other-language chunks");
+    }
+
+    evidence.stage("cc-update")?;
+    let throttle_cc_v2 = THROTTLE_CC_V1.replace(
+        "return recent_count < budget;",
+        "return recent_count < budget && budget > 0;",
+    );
+    fixture.write("src/Throttle.cc", &throttle_cc_v2)?;
+    let cc_changed = run_report(
+        &config_path,
+        "multilingual-cc-update",
+        &["index", &workspace],
+    )
+    .await?;
+    if cc_changed["parsed_files"].as_u64() != Some(1) {
+        let parsed = cc_changed["parsed_files"].as_u64().unwrap_or_default();
+        bail!(".cc update parsed {parsed} files instead of exactly one");
+    }
+    if cc_changed["reused_chunks"].as_u64().unwrap_or(0) == 0 {
+        bail!(".cc update did not reuse other-language chunks");
     }
 
     evidence.stage("csharp-decoy-delete")?;
@@ -860,6 +1019,38 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
         bail!("Deleted C++ decoy chunks remain searchable");
     }
 
+    evidence.stage("cc-decoy-delete")?;
+    std::fs::remove_file(fixture.dir.join("tests/ThrottleTest.cc"))
+        .context("remove .cc decoy test file")?;
+    let cc_deleted = run_report(
+        &config_path,
+        "multilingual-cc-delete",
+        &["index", &workspace],
+    )
+    .await?;
+    if cc_deleted["removed_files"].as_u64() != Some(1) {
+        let removed = cc_deleted["removed_files"].as_u64().unwrap_or_default();
+        bail!(".cc decoy deletion removed {removed} cached files instead of one");
+    }
+    let cc_deleted_search = run_report(
+        &config_path,
+        "multilingual-search-after-cc-delete",
+        &[
+            "search",
+            &workspace,
+            "expected_throttle_description",
+            "--top-k",
+            "8",
+        ],
+    )
+    .await?;
+    if results_array(&cc_deleted_search)?
+        .iter()
+        .any(|hit| hit["relative_file_path"].as_str() == Some("tests/ThrottleTest.cc"))
+    {
+        bail!("Deleted .cc decoy chunks remain searchable");
+    }
+
     evidence.stage("failed-update-retention")?;
     let before_failure = run_report(
         &config_path,
@@ -889,6 +1080,10 @@ async fn execute(fixture: &Fixture, evidence: &mut Evidence) -> Result<()> {
     let rate_limiter_cpp_v3 =
         format!("{rate_limiter_cpp_v2}\n// failedUpdateMarker: not committed\n");
     fixture.write("src/RateLimiter.cpp", &rate_limiter_cpp_v3)?;
+    let cache_h_v3 = format!("{cache_h_v2}\n// failedUpdateMarker: not committed\n");
+    fixture.write("include/cache.h", &cache_h_v3)?;
+    let throttle_cc_v3 = format!("{throttle_cc_v2}\n// failedUpdateMarker: not committed\n");
+    fixture.write("src/Throttle.cc", &throttle_cc_v3)?;
 
     let failure_output = run_lci(&failure_config_path, &["index", &workspace]).await?;
     let failure_evidence = serde_json::json!({

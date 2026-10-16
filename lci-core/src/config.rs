@@ -1357,9 +1357,9 @@ impl JavaLspConfig {
 /// Optional C/C++ language-server (clangd) configuration.
 ///
 /// One configured clangd instance navigates both Tree-sitter-indexed
-/// languages `c` and `cpp` (`.c`, `.cpp`, `.hpp`), the same one-server-many-
-/// languages shape `TypeScriptLspConfig` uses for its four ECMAScript-family
-/// languages. C/C++ navigation is optional and fail-open: an absent or empty
+/// languages `c` and `cpp` (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`,
+/// `.hxx`), the same one-server-many-languages shape `TypeScriptLspConfig`
+/// uses for its four ECMAScript-family languages. C/C++ navigation is optional and fail-open: an absent or empty
 /// `[clangd]` section keeps the server disabled without affecting syntax
 /// retrieval. The shared `lsp_timeout_seconds` and `lsp_candidate_count`
 /// settings apply to this server as well.

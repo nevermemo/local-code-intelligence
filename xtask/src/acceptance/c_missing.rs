@@ -7,6 +7,10 @@ use anyhow::Result;
 
 const CALCULATOR_C: &str = "// Calculator performs basic arithmetic for acceptance testing.\ntypedef struct Calculator {\n    int placeholder;\n} Calculator;\n\n// add returns the sum of two integers.\nint add(Calculator c, int a, int b) {\n    return a + b;\n}\n";
 
+// A `.h` header: `find_definition` on it must reach the (missing) clangd and
+// fail with a tooling error naming it, not be rejected as an unrecognized file.
+const COUNTER_H: &str = "// Counter tracks how many items an acceptance run has seen.\ntypedef struct Counter {\n    int value;\n} Counter;\n\n// counter_next returns the value that follows current.\nint counter_next(int current);\n";
+
 const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
@@ -19,10 +23,14 @@ pub async fn run() -> Result<()> {
         display_name: "C",
         missing_path: "definitely-missing-clangd",
         extra_config_lines: vec![],
-        source_files: vec![("calculator.c", CALCULATOR_C), ("src/lib.rs", LIB_RS)],
+        source_files: vec![
+            ("calculator.c", CALCULATOR_C),
+            ("counter.h", COUNTER_H),
+            ("src/lib.rs", LIB_RS),
+        ],
         search_query: "Calculator add",
         search_languages: &["c"],
-        definition_file: "calculator.c",
+        definition_file: "counter.h",
         definition_line: 7,
         definition_character: 4,
         // `near_word` uses plain substring matching (see missing.rs's

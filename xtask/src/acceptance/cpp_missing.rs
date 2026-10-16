@@ -7,6 +7,10 @@ use anyhow::Result;
 
 const CALCULATOR_CPP: &str = "namespace acceptance {\n// Calculator performs basic arithmetic for acceptance testing.\nclass Calculator {\npublic:\n    // add returns the sum of two integers.\n    int add(int a, int b) { return a + b; }\n};\n}\n";
 
+// A `.hxx` header: `find_definition` on it must reach the (missing) clangd and
+// fail with a tooling error naming it, not be rejected as an unrecognized file.
+const TALLY_HXX: &str = "namespace acceptance {\n// Tally counts acceptance steps.\nclass Tally {\npublic:\n    // bump increments the tally.\n    int bump(int n) { return n + 1; }\n};\n}\n";
+
 const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
@@ -19,10 +23,14 @@ pub async fn run() -> Result<()> {
         display_name: "C++",
         missing_path: "definitely-missing-clangd",
         extra_config_lines: vec![],
-        source_files: vec![("calculator.cpp", CALCULATOR_CPP), ("src/lib.rs", LIB_RS)],
+        source_files: vec![
+            ("calculator.cpp", CALCULATOR_CPP),
+            ("tally.hxx", TALLY_HXX),
+            ("src/lib.rs", LIB_RS),
+        ],
         search_query: "Calculator add",
         search_languages: &["cpp"],
-        definition_file: "calculator.cpp",
+        definition_file: "tally.hxx",
         definition_line: 6,
         definition_character: 8,
         // See c_missing.rs for why this uses the real provider name rather

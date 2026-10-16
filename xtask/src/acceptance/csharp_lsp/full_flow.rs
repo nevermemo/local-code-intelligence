@@ -70,6 +70,7 @@ pub async fn run(csharp_ls: &Path) -> Result<()> {
             provider_name: "csharp-ls",
             generated_dirs: &["bin", "obj"],
             cross_file_references: true,
+            extra_probes: vec![],
         },
         Some(PathBuf::from(csharp_ls)),
     )

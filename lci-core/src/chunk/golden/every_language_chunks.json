@@ -24,6 +24,22 @@
     "content_hash": "c072bed2909d23bbf7b9cc5b80a5f11919f23c93e9023dae4daffdda1dbdc63d"
   },
   {
+    "relative_file_path": "native/math.h",
+    "language": "c",
+    "start_line": 1,
+    "end_line": 9,
+    "code": "#ifndef MATH_H\n#define MATH_H\n\n/* adds */\nint add(int a, int b);\n\nstruct pair { int a; int b; };\n\n#endif",
+    "content_hash": "2d4339df19b19344ab89118e2e599b4ceb8f35dbaef63c62833182d9b191a691"
+  },
+  {
+    "relative_file_path": "native/shape.cc",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 4,
+    "code": "namespace geo {\n// Perimeter of a square.\ndouble perimeter(double side) { return 4 * side; }\n}",
+    "content_hash": "d536f2fbb89b664f4ac81ce0ed1da27cf2013e1e0c0f18d6dfe479e501cec957"
+  },
+  {
     "relative_file_path": "native/shape.cpp",
     "language": "cpp",
     "start_line": 1,
@@ -64,6 +80,46 @@
     "content_hash": "c76f8a73d2ea0b20dc33b0c39bec76ebcfac7147ab8dd0650b1c6f4c9a571e74"
   },
   {
+    "relative_file_path": "native/shape.cxx",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "namespace geo {",
+    "content_hash": "ceaadce0c2c8bf15a1e572b650620495664582bed1e9ebb5776c52f26c474011"
+  },
+  {
+    "relative_file_path": "native/shape.cxx",
+    "language": "cpp",
+    "start_line": 2,
+    "end_line": 3,
+    "code": "class Circle {\npublic:",
+    "content_hash": "7d10b54c8c8bee1f36a5651c2d6b63b07a5b6a45e0e27a80a74c586ae95d667a"
+  },
+  {
+    "relative_file_path": "native/shape.cxx",
+    "language": "cpp",
+    "start_line": 4,
+    "end_line": 5,
+    "code": "double radius() const { return 1.0; }\n}",
+    "content_hash": "2e778439466031f3d358b01814c15991451bb363df3f48fc07b3074110f0daaf"
+  },
+  {
+    "relative_file_path": "native/shape.hh",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "#pragma once",
+    "content_hash": "6a221112d7fd41cf3950158643c579b4548c047d28be1bb8086a245b2607f49c"
+  },
+  {
+    "relative_file_path": "native/shape.hh",
+    "language": "cpp",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "double perimeter(double side);",
+    "content_hash": "8aac0ace881d1f9553cea2d4643a257d994e556707388b22afdd2c1bc6e97224"
+  },
+  {
     "relative_file_path": "native/shape.hpp",
     "language": "cpp",
     "start_line": 1,
@@ -78,6 +134,30 @@
     "end_line": 2,
     "code": "int area();",
     "content_hash": "b88bd55c8e82475135390c6138e0c59f929277713e4de7a94af3fc4da3cabca0"
+  },
+  {
+    "relative_file_path": "native/shape.hxx",
+    "language": "cpp",
+    "start_line": 1,
+    "end_line": 1,
+    "code": "#pragma once",
+    "content_hash": "6a221112d7fd41cf3950158643c579b4548c047d28be1bb8086a245b2607f49c"
+  },
+  {
+    "relative_file_path": "native/shape.hxx",
+    "language": "cpp",
+    "start_line": 2,
+    "end_line": 2,
+    "code": "namespace geo {",
+    "content_hash": "ceaadce0c2c8bf15a1e572b650620495664582bed1e9ebb5776c52f26c474011"
+  },
+  {
+    "relative_file_path": "native/shape.hxx",
+    "language": "cpp",
+    "start_line": 3,
+    "end_line": 3,
+    "code": "struct Square { double side; }",
+    "content_hash": "932a1feab85c279fe83f18945292fd80bf008be4e1afaef77a536d129683c51e"
   },
   {
     "relative_file_path": "src/lib.rs",

@@ -1,7 +1,8 @@
 //! Optional C/C++ language-server (clangd) adapter. One configured clangd
 //! instance navigates both Tree-sitter-indexed languages `c` and `cpp`
-//! (`.c`, `.cpp`, `.hpp`), the same one-server-many-languages shape
-//! `TypeScriptServer` uses for its four ECMAScript-family languages.
+//! (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`), the same
+//! one-server-many-languages shape `TypeScriptServer` uses for its four
+//! ECMAScript-family languages.
 //!
 //! Like gopls, clangd needs no forced leading transport flag: stdio is its
 //! default communication mode, with no `--stdio`-equivalent flag required
@@ -155,7 +156,16 @@ impl LspAdapter for ClangdServer {
 
 /// The LSP `languageId` clangd expects for a file, derived from its
 /// extension (matching the Tree-sitter language identifiers this adapter
-/// covers: `.c` files are `c`, `.cpp`/`.hpp` files are `cpp`).
+/// covers: `.c` files are `c`, `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx` files
+/// are `cpp`).
+///
+/// `.h` is the one deliberate exception to "same as the Tree-sitter
+/// identifier": LCI indexes `.h` as `c`, but the LSP `languageId` is `cpp`.
+/// The extension cannot say which language a header is written in, and clangd
+/// itself treats a bare `.h` as C++ because a C header is almost always valid
+/// C++ while a C++ header is never valid C. Opening it as C would turn every
+/// class or template in a C++ project's `.h` into parse errors for the server.
+/// Navigation results are still attributed to the indexed language `c`.
 fn language_id_for(relative: &str) -> &'static str {
     match Path::new(relative)
         .extension()
@@ -199,6 +209,12 @@ mod tests {
         assert_eq!(language_id_for("src/a.c"), "c");
         assert_eq!(language_id_for("src/a.cpp"), "cpp");
         assert_eq!(language_id_for("src/a.hpp"), "cpp");
+        for extension in ["cc", "cxx", "hh", "hxx"] {
+            assert_eq!(language_id_for(&format!("src/a.{extension}")), "cpp");
+        }
+        // `.h` is indexed as `c` but opened for the server as C++ (see the
+        // function's documentation).
+        assert_eq!(language_id_for("include/a.h"), "cpp");
         contract::assert_initialize_params_name_this_process(
             &usable,
             tempfile::tempdir().unwrap().path(),

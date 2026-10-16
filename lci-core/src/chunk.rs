@@ -1066,6 +1066,62 @@ export interface TelemetryLifecycle {
         );
     }
 
+    #[test]
+    fn scans_exactly_the_registered_c_and_cpp_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("include/vendor")).unwrap();
+        std::fs::create_dir_all(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::write(temp.path().join("include/.gitignore"), "vendor/\n").unwrap();
+        for (name, source) in [
+            ("src/a.c", "int a(void) { return 1; }\n"),
+            ("include/a.h", "int a(void);\n"),
+            ("include/.hidden.h", "int hidden(void);\n"),
+            ("src/b.cpp", "int b() { return 1; }\n"),
+            ("src/b.cc", "int bb() { return 1; }\n"),
+            ("src/b.cxx", "int bx() { return 1; }\n"),
+            ("include/b.hpp", "int b();\n"),
+            ("include/b.hh", "int bb();\n"),
+            ("include/b.hxx", "int bx();\n"),
+            // Unsupported or case-variant lookalikes are ignored.
+            ("src/upper.C", "int upper() { return 1; }\n"),
+            ("include/upper.H", "int upper();\n"),
+            ("src/upper.CC", "int upper() { return 1; }\n"),
+            ("include/upper.HPP", "int upper();\n"),
+            ("src/plus.c++", "int plus() { return 1; }\n"),
+            ("include/plus.h++", "int plus();\n"),
+            ("include/a.h.in", "int template_only();\n"),
+            ("include/a.inl", "int inl();\n"),
+            ("src/a.cu", "int cuda() { return 1; }\n"),
+            // Ignore files apply to the new extensions like any other.
+            ("out/gen.h", "int generated(void);\n"),
+            ("include/vendor/third.hh", "int third();\n"),
+        ] {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let chunks = scan(temp.path()).unwrap();
+        let mut languages: HashMap<&str, &str> = HashMap::new();
+        for chunk in &chunks {
+            languages.insert(chunk.relative_file_path.as_str(), chunk.language.as_str());
+        }
+        assert_eq!(
+            languages,
+            HashMap::from([
+                ("src/a.c", "c"),
+                ("include/a.h", "c"),
+                ("include/.hidden.h", "c"),
+                ("src/b.cpp", "cpp"),
+                ("src/b.cc", "cpp"),
+                ("src/b.cxx", "cpp"),
+                ("include/b.hpp", "cpp"),
+                ("include/b.hh", "cpp"),
+                ("include/b.hxx", "cpp"),
+            ])
+        );
+    }
+
     const QT_LINGUIST_CATALOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<context>\n    <name>SendCoinsDialog</name>\n    <message>\n        <source>Send coins</source>\n        <translation>Muenzen senden</translation>\n    </message>\n</context>\n</TS>\n";
 
     #[test]
@@ -1390,6 +1446,11 @@ export interface TelemetryLifecycle {
             ("small.c", "void small() {}\n", "//"),
             ("small.cpp", "void small() {}\n", "//"),
             ("small.hpp", "void small() {}\n", "//"),
+            ("small.h", "void small(void);\n", "//"),
+            ("small.cc", "void small() {}\n", "//"),
+            ("small.cxx", "void small() {}\n", "//"),
+            ("small.hh", "void small();\n", "//"),
+            ("small.hxx", "void small();\n", "//"),
         ] {
             let comment = format!("{marker} tail\n");
             let trailing = comment.repeat(2 * TARGET_BYTES / comment.len() + 1);
@@ -2090,5 +2151,94 @@ T add(T a, T b) {
                 .iter()
                 .any(|chunk| chunk.code.contains("class Widget"))
         );
+    }
+
+    #[test]
+    fn chunks_cc_cxx_hh_and_hxx_extensions_as_cpp() {
+        let source = "namespace geo {\n// Area of a unit square.\nclass Square {\npublic:\n    double area() const { return 1.0; }\n};\n}\n";
+        for path in ["a.cc", "a.cxx", "a.hh", "a.hxx", "inc/deep/dir/a.hxx"] {
+            let chunks = chunks_for_path(path, source).unwrap();
+            assert!(!chunks.is_empty(), "{path}");
+            for chunk in &chunks {
+                assert_eq!(chunk.language, "cpp", "{path}");
+                assert_eq!(chunk.relative_file_path, path);
+                assert!(source.contains(&chunk.code), "{path}");
+                assert_eq!(chunk.content_hash, hash(&chunk.code), "{path}");
+                assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+            }
+            // The leading comment stays attached to the class it describes.
+            let class = chunks
+                .iter()
+                .find(|chunk| chunk.code.contains("class Square"))
+                .unwrap_or_else(|| panic!("{path}: no class chunk: {chunks:#?}"));
+            assert!(class.code.contains("// Area of a unit square."), "{path}");
+            // The same text under `.cpp` gives identical chunks, so the
+            // extension changes only the file name, never the output.
+            let reference = chunks_for_path("a.cpp", source).unwrap();
+            let strip = |chunks: &[Chunk]| {
+                chunks
+                    .iter()
+                    .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(strip(&chunks), strip(&reference), "{path}");
+        }
+    }
+
+    #[test]
+    fn chunks_h_extension_as_c() {
+        let source = "#ifndef MATH_H\n#define MATH_H\n\n/* adds two ints */\nint add(int a, int b);\n\ntypedef struct pair {\n    int a;\n    int b;\n} pair;\n\n#endif\n";
+        let chunks = chunks_for_path("include/math.h", source).unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(chunk.language, "c");
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("/* adds two ints */")
+                    && chunk.code.contains("int add(int a, int b);"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("typedef struct pair"))
+        );
+        // Same text under `.c` gives the same chunks.
+        let reference = chunks_for_path("math.c", source).unwrap();
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.code).collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|chunk| &chunk.code)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cpp_header_named_dot_h_stays_searchable_as_c() {
+        // `.h` is registered as `c` whatever the header contains (a documented
+        // decision, not content sniffing). The C grammar recovers around the
+        // C++ constructs, so the file is still indexed, every chunk is exact
+        // source, and the declarations are still findable by text.
+        let source = "#pragma once\n#include <string>\n\nnamespace app {\n\n// A widget.\nclass Widget {\npublic:\n    int size() const { return 0; }\n    std::string name() const;\n};\n\ntemplate <typename T>\nT twice(T value) { return value + value; }\n\n}\n";
+        let chunks = chunks_for_path("include/widget.h", source).unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(chunk.language, "c");
+            assert!(source.contains(&chunk.code), "{chunk:#?}");
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+        }
+        for needle in ["class Widget", "int size() const", "T twice(T value)"] {
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(needle)),
+                "missing {needle}: {chunks:#?}"
+            );
+        }
+        assert_chunks_cover(&chunks, source);
     }
 }

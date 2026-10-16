@@ -237,8 +237,10 @@ fn is_test_file_name(file_name: &str) -> bool {
         }
     }
     // C/C++: `*_test`, `*_tests`, `*_unittest(s)` (googletest/Chromium), and
-    // `test_*` (Unity/CMocka) for the registered `.c`/`.cpp`/`.hpp` files.
-    if let Some(stem) = [".c", ".cpp", ".hpp"]
+    // `test_*` (Unity/CMocka) for every registered C/C++ extension: sources
+    // `.c`/`.cpp`/`.cc`/`.cxx` and headers `.h`/`.hpp`/`.hh`/`.hxx` (test
+    // helper headers follow the same names as the test sources).
+    if let Some(stem) = [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"]
         .iter()
         .find_map(|extension| file_name.strip_suffix(extension))
         && (["_test", "_tests", "_unittest", "_unittests"]

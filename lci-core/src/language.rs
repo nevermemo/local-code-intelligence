@@ -84,8 +84,13 @@ impl LanguageAdapter {
             "go" => "*.go",
             "java" => "*.java",
             "c" => "*.c",
+            "h" => "*.h",
             "cpp" => "*.cpp",
             "hpp" => "*.hpp",
+            "cc" => "*.cc",
+            "cxx" => "*.cxx",
+            "hh" => "*.hh",
+            "hxx" => "*.hxx",
             _ => unreachable!(),
         }
     }
@@ -581,6 +586,21 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         grammar: c,
         syntax: Syntax::C,
     },
+    // `.h` is registered as `c`, a documented decision and not a heuristic:
+    // the extension alone cannot tell a C header from a C++ one, and the
+    // registry never inspects content to choose a language. `.h` is the C
+    // header extension, so it follows `.c`. A C++ project's `.h` headers are
+    // therefore chunked with the C grammar (recovered, still searchable) and
+    // carry the language `c`; C++ projects that want the C++ grammar name
+    // their headers `.hpp`, `.hh`, or `.hxx`. clangd serves both families,
+    // so navigation on a `.h` file is unaffected.
+    LanguageAdapter {
+        extension: "h",
+        identifier: "c",
+        cache_version: "c-chunks-v4",
+        grammar: c,
+        syntax: Syntax::C,
+    },
     LanguageAdapter {
         extension: "cpp",
         identifier: "cpp",
@@ -590,6 +610,34 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
     },
     LanguageAdapter {
         extension: "hpp",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "cc",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "cxx",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "hh",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "hxx",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
         grammar: cpp,
@@ -649,8 +697,13 @@ mod tests {
             ("go", "go", "*.go", "go-chunks-v4"),
             ("java", "java", "*.java", "java-chunks-v4"),
             ("c", "c", "*.c", "c-chunks-v4"),
+            ("h", "c", "*.h", "c-chunks-v4"),
             ("cpp", "cpp", "*.cpp", "cpp-chunks-v4"),
             ("hpp", "cpp", "*.hpp", "cpp-chunks-v4"),
+            ("cc", "cpp", "*.cc", "cpp-chunks-v4"),
+            ("cxx", "cpp", "*.cxx", "cpp-chunks-v4"),
+            ("hh", "cpp", "*.hh", "cpp-chunks-v4"),
+            ("hxx", "cpp", "*.hxx", "cpp-chunks-v4"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
@@ -658,10 +711,37 @@ mod tests {
             assert_eq!(adapter.cache_version(), cache_version);
         }
         for extension in [
-            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "h",
-            "CPP", "HPP", "cc", "cxx", "hh", "hxx",
+            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "H",
+            "CPP", "HPP", "CC", "CXX", "HH", "HXX", "Cc", "Hxx", "c++", "h++", "hp", "ino", "inl",
+            "ipp", "tpp", "cu", "m", "mm",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
+        }
+    }
+
+    #[test]
+    fn the_c_and_cpp_header_and_source_extensions_map_to_one_family_each() {
+        // `.h` is `c` by decision (see the registry comment), never `cpp`, and
+        // never sniffed from content; the other header and source extensions
+        // are unambiguous C++.
+        for (path, identifier) in [
+            ("src/a.c", "c"),
+            ("include/a.h", "c"),
+            ("src/a.cpp", "cpp"),
+            ("src/a.cc", "cpp"),
+            ("src/a.cxx", "cpp"),
+            ("include/a.hpp", "cpp"),
+            ("include/a.hh", "cpp"),
+            ("include/a.hxx", "cpp"),
+            ("include/archive.tar.hh", "cpp"),
+        ] {
+            let adapter = for_path(Path::new(path)).unwrap();
+            assert_eq!(adapter.identifier(), identifier, "{path}");
+        }
+        // A `.h` file with unmistakable C++ in it is still `c`.
+        assert_eq!(for_path(Path::new("widget.h")).unwrap().identifier(), "c");
+        for path in ["README", "a.h.bak", "a.hh~", "Makefile.cc.in", ".h"] {
+            assert!(for_path(Path::new(path)).is_none(), "{path}");
         }
     }
 

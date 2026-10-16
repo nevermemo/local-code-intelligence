@@ -50,6 +50,7 @@ pub async fn run(gopls: Option<PathBuf>) -> Result<()> {
             provider_name: "gopls",
             generated_dirs: &[],
             cross_file_references: true,
+            extra_probes: vec![],
         },
         gopls,
     )

@@ -81,6 +81,27 @@ pub enum SearchAssertion {
     ContainsFile,
 }
 
+/// One more definition-then-references navigation probe, on files the main
+/// flow does not touch. A spec uses it to prove real-server navigation on every
+/// source extension its language registers (for example clangd on `.h`,
+/// `.hh`, `.hxx`, and `.cxx`) without duplicating the whole flow.
+pub struct ExtraProbe {
+    /// `find_definition` is requested at `call_site_needle` on this
+    /// one-based line of `call_site_file` and must resolve into
+    /// `declaration_file`.
+    pub call_site_file: &'static str,
+    pub call_site_source: &'static str,
+    pub call_site_line: usize,
+    pub call_site_needle: &'static str,
+    /// `find_references` (including the declaration) is requested at
+    /// `declaration_needle` on `declaration_line` of `declaration_file` and
+    /// must include that file.
+    pub declaration_file: &'static str,
+    pub declaration_source: &'static str,
+    pub declaration_line: usize,
+    pub declaration_needle: &'static str,
+}
+
 pub struct LspFullFlowSpec {
     pub language_key: &'static str,
     pub display_name: &'static str,
@@ -140,6 +161,10 @@ pub struct LspFullFlowSpec {
     /// this is a property of this acceptance harness's per-stage process
     /// model, not of LCI's actual navigation behavior for a real user.
     pub cross_file_references: bool,
+    /// Additional navigation probes (see [`ExtraProbe`]); empty for most
+    /// languages. Every location they return must carry
+    /// `language_identifier` and `provider_name` and stay inside the fixture.
+    pub extra_probes: Vec<ExtraProbe>,
 }
 
 pub async fn run(spec: LspFullFlowSpec, explicit: Option<PathBuf>) -> Result<()> {
@@ -570,6 +595,122 @@ async fn run_inner(
         evidence,
     )?;
 
+    run_extra_probes(spec, fixture, &config_path, &fixture_dir, evidence).await?;
+
+    Ok(())
+}
+
+async fn run_extra_probes(
+    spec: &LspFullFlowSpec,
+    fixture: &Fixture,
+    config_path: &Path,
+    fixture_dir: &str,
+    evidence: &mut Evidence,
+) -> Result<()> {
+    let mut recorded = Vec::new();
+    for (index, probe) in spec.extra_probes.iter().enumerate() {
+        let (def_line, def_char) = call_site_position(
+            probe.call_site_source,
+            probe.call_site_line,
+            probe.call_site_needle,
+        )?;
+        let (def_line_s, def_char_s) = (def_line.to_string(), def_char.to_string());
+        let definition = run_json_stage(
+            evidence,
+            &format!("extra-definition-{index}"),
+            config_path,
+            &[
+                "definition",
+                fixture_dir,
+                probe.call_site_file,
+                &def_line_s,
+                &def_char_s,
+            ],
+        )
+        .await?;
+        let (ref_line, ref_char) = call_site_position(
+            probe.declaration_source,
+            probe.declaration_line,
+            probe.declaration_needle,
+        )?;
+        let (ref_line_s, ref_char_s) = (ref_line.to_string(), ref_char.to_string());
+        let references = run_json_stage(
+            evidence,
+            &format!("extra-references-{index}"),
+            config_path,
+            &[
+                "references",
+                fixture_dir,
+                probe.declaration_file,
+                &ref_line_s,
+                &ref_char_s,
+                "--include-declaration",
+            ],
+        )
+        .await?;
+        let definition_results = results(&definition);
+        let reference_results = results(&references);
+        ensure!(
+            definition_results
+                .iter()
+                .any(|r| r.get("relative_file_path").and_then(Value::as_str)
+                    == Some(probe.declaration_file)),
+            "extra probe {index}: definition from {} did not resolve to {}",
+            probe.call_site_file,
+            probe.declaration_file
+        );
+        ensure!(
+            reference_results
+                .iter()
+                .any(|r| r.get("relative_file_path").and_then(Value::as_str)
+                    == Some(probe.declaration_file)),
+            "extra probe {index}: references did not include the declaration in {}",
+            probe.declaration_file
+        );
+        for location in definition_results.iter().chain(reference_results.iter()) {
+            let language = location
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ensure!(
+                language == spec.language_identifier,
+                "extra probe {index}: location has unexpected language: {language}"
+            );
+            let provider = location
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ensure!(
+                provider == spec.provider_name,
+                "extra probe {index}: location has unexpected provider: {provider}"
+            );
+            let relative_file_path = location
+                .get("relative_file_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ensure!(
+                fixture.dir.join(relative_file_path).is_file(),
+                "extra probe {index}: location points outside fixture sources: {relative_file_path}"
+            );
+            let start_line = location
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            ensure!(
+                start_line >= 1,
+                "extra probe {index}: location line is not one-based: {start_line}"
+            );
+        }
+        recorded.push(serde_json::json!({
+            "call_site_file": probe.call_site_file,
+            "declaration_file": probe.declaration_file,
+            "definition": definition_results,
+            "references": reference_results,
+        }));
+    }
+    if !recorded.is_empty() {
+        evidence.set("extra_probes", Value::Array(recorded))?;
+    }
     Ok(())
 }
 

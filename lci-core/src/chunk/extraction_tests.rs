@@ -58,6 +58,26 @@ fn write_multilanguage_tree(root: &Path) {
             "#include <string>\nnamespace geo {\nclass Shape {\npublic:\n  virtual double area() const = 0;\n};\ndouble twice(double x) { return 2 * x; }\n}\n",
         ),
         ("native/shape.hpp", "#pragma once\nint area();\n"),
+        (
+            "native/math.h",
+            "#ifndef MATH_H\n#define MATH_H\n\n/* adds */\nint add(int a, int b);\n\nstruct pair { int a; int b; };\n\n#endif\n",
+        ),
+        (
+            "native/shape.cc",
+            "namespace geo {\n// Perimeter of a square.\ndouble perimeter(double side) { return 4 * side; }\n}\n",
+        ),
+        (
+            "native/shape.cxx",
+            "namespace geo {\nclass Circle {\npublic:\n  double radius() const { return 1.0; }\n};\n}\n",
+        ),
+        (
+            "native/shape.hh",
+            "#pragma once\ndouble perimeter(double side);\n",
+        ),
+        (
+            "native/shape.hxx",
+            "#pragma once\nnamespace geo {\nstruct Square { double side; };\n}\n",
+        ),
     ];
     for (name, content) in files {
         let path = root.join(name);

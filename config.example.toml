@@ -179,8 +179,8 @@ lsp_stuck_seconds = 900
 # disabled = false
 
 # Optional C/C++ language server (clangd). One configured server navigates
-# both .c and .cpp/.hpp. Optional and fail-open, same as csharp above. Like
-# gopls, clangd needs no forced leading transport flag. No compile_commands.json
+# .c/.h and .cpp/.cc/.cxx/.hpp/.hh/.hxx. Optional and fail-open, same as csharp
+# above. Like gopls, clangd needs no forced leading transport flag. No compile_commands.json
 # is needed for simple per-file navigation; point clangd at a real one via
 # args (e.g. "--compile-commands-dir=...") for a workspace with a build system.
 # [clangd]

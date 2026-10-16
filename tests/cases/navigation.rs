@@ -168,8 +168,9 @@ fn fake_python_fixture(
     (config, workspace, state_path)
 }
 
-/// Builds a fake-clangd fixture for either `c` or `cpp` (`extension`: `"c"`
-/// or `"cpp"`), since one clangd instance/config navigates both.
+/// Builds a fake-clangd fixture for any registered C or C++ extension
+/// (`extension`: `"c"`, `"h"`, `"cpp"`, `"cc"`, ...), since one clangd
+/// instance/config navigates both languages.
 fn fake_clangd_fixture(
     temp: &tempfile::TempDir,
     mode: &str,
@@ -367,10 +368,11 @@ async fn fake_lsps_map_symbols_definitions_and_references() {
         fake_python_fixture,
         python_adapter,
     );
-    let clangd = |extension: &'static str| {
+    // (file extension, indexed language): `.h` is `c`, the others `cpp`.
+    let clangd = |extension: &'static str, language: &'static str| {
         assert_fake_lsp_maps_symbols_definitions_and_references(
             NavigationExpectation {
-                language: extension,
+                language,
                 provider: "clangd",
                 primary: format!("src/Calculator.{extension}"),
                 secondary: format!("src/CallSite.{extension}"),
@@ -378,11 +380,28 @@ async fn fake_lsps_map_symbols_definitions_and_references() {
                 references_at: (1, 4),
             },
             |temp, mode| fake_clangd_fixture(temp, mode, extension),
-            |manager| clangd_adapter(manager, extension),
+            |manager| clangd_adapter(manager, language),
         )
     };
     // The servers are separate processes, so the languages run side by side.
-    tokio::join!(csharp, typescript, python, clangd("c"), clangd("cpp"));
+    // The extra clangd extensions run as a second batch: eleven fake servers
+    // at once could outlast the fake servers' one-second inactivity timeout
+    // on a loaded machine.
+    tokio::join!(
+        csharp,
+        typescript,
+        python,
+        clangd("c", "c"),
+        clangd("cpp", "cpp"),
+    );
+    tokio::join!(
+        clangd("h", "c"),
+        clangd("cc", "cpp"),
+        clangd("cxx", "cpp"),
+        clangd("hpp", "cpp"),
+        clangd("hh", "cpp"),
+        clangd("hxx", "cpp"),
+    );
 }
 
 /// `JsonRpcClient::request` bounds its wait by inactivity, not total call
