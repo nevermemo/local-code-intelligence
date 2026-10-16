@@ -2259,7 +2259,13 @@ fn unreliable_marker([deadline, rerank, map]: [usize; 3]) -> Option<String> {
     })
 }
 
-/// Writes `run.json`, `score.json`, `items.json`, `row.md` and `raw/<id>.json`
+/// The set a scored outcome belongs to, read from its scorer report.
+fn outcome_set(outcome: &SetOutcome) -> Option<Set> {
+    <Set as ValueEnum>::from_str(outcome.report["set"].as_str()?, true).ok()
+}
+
+/// Writes `run.json`, `score.json`, `items.json`, `row.md`, `supplement.md`
+/// (extra tables and ceiling footers, see `supplement.rs`) and `raw/<id>.json`
 /// under `dir`.
 pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
     let raw_dir = dir.join("raw");
@@ -2272,6 +2278,11 @@ pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
     std::fs::write(dir.join("row.md"), outcome.row.to_markdown() + "\n")?;
     if !outcome.items.is_null() {
         std::fs::write(dir.join("items.json"), pretty(&outcome.items)?)?;
+    }
+    if let Some(set) = outcome_set(outcome)
+        && let Some(text) = super::supplement::render(set, &outcome.report, &outcome.items)
+    {
+        std::fs::write(dir.join("supplement.md"), text)?;
     }
     for (id, value) in &outcome.raw {
         std::fs::write(raw_dir.join(format!("{}.json", slug(id))), pretty(value)?)?;
@@ -2720,6 +2731,10 @@ mod tests {
         assert!(dir.join("out/run.json").exists() && dir.join("out/score.json").exists());
         assert!(dir.join("out/raw/i1.json").exists());
         assert!(dir.join("out/items.json").exists());
+        // The supplement is a new file; the frozen outputs above are unchanged.
+        let supplement = std::fs::read_to_string(dir.join("out/supplement.md")).unwrap();
+        assert!(supplement.contains("band | n | decl_recall | r2_decl_recall | tests_recall"));
+        assert!(supplement.contains("Ceiling: first-ring declaration recall"));
         // Re-running the same wave and set is refused.
         assert!(trend::append(&trend_path, &outcome.row).is_err());
         let _ = std::fs::remove_dir_all(&dir);

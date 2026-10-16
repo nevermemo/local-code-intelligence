@@ -668,3 +668,19 @@ the kill rule was a point estimate below .2.
 - Use: bench differences on flow and impact are evidence about answer quality for a card reader. A where-to
   difference, and any gain claimed on impact, still needs an agent arm before a default changes.
 - Cost: $25.41 of a $30 cap.
+
+## Reading rules for the tables above (2026-10-16, additive)
+
+Nothing in this file is rescored or edited; these are footers that apply to every table here and to later ones. The full
+list, with the new columns and the deferred items, is in `gold-scorers.md` ("Reporting rules"); `cargo xtask maps bench`
+now also writes a `supplement.md` per run with the secondary columns and the ceiling footers.
+
+- Ceiling metrics: impact first-ring declaration recall (a word-boundary grep plus the enclosing declaration reaches .995 on
+  unique names, .79 on some, .42 on common names), flow path recall (breadth-first expansion reaches 97 to 100% of the gold
+  paths at 200 pops), and the error set's message-to-site question (a fixed-string search gets .971). A walk, filter or
+  steering delta on one of these is not evidence of a gain. The impact rows to read are the `common` band, `r2_decl_recall`
+  and `tests_recall`.
+- Flow rows: read `path_recall` with answer precision and tau; recall alone rises with the answer count.
+- History: the H3a, H3b and H1 rows are not used for decisions (H3 floors near zero by construction; H1 is circular with the
+  exact pickaxe operator). No walk, bandit or filter decision above rests on them.
+- where-to on tantivy (30 items) is a loss guard only.

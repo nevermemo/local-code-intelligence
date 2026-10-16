@@ -152,3 +152,58 @@ summary of dropped items goes to stderr. The format is file-level, so:
 Queries run against the workspace key given with `--workspace` (default
 `self`); the evaluated tree must be the one the gold was built on for the
 structural sets to mean anything.
+
+## Reporting rules (2026-10-16, additive)
+
+These rules change how results are read and which columns sit beside the frozen
+ones. No gold file, item, split, stratum or metric definition changes, and no
+earlier number is rescored. A new column is computed from per-item outputs that
+already exist; anything that would need a bench rerun is listed under
+"Deferred" below.
+
+- **Bench supplement.** `cargo xtask maps bench` writes `supplement.md` beside
+  `row.md`, `score.json` and `items.json` of a run directory (new file; the
+  other outputs and the trend row are unchanged). It is computed from
+  `score.json` and `items.json` and shows, per set, the secondary metrics and
+  strata the one-line row leaves out, and a footer naming the ceilings below.
+  A `--rescore` run with `--out-dir` writes one too, under its own wave label.
+- **impact.** Read the `common` band (35 items), `r2_decl_recall` and
+  `tests_recall` first; `decl_recall` stays as a regression column. R1
+  declaration recall on unique names is saturated by a word-boundary grep plus
+  the enclosing declaration (stored baseline: unique .995, some .79, common
+  .42), so a walk or filter delta on a saturated band is not evidence. The
+  supplement table shows these three metrics for every `band` value.
+- **history.** The H3a, H3b and H1 rows are printed but marked "not used for
+  decisions": H3 floors near zero by construction and H1 is circular with
+  `exact.pickaxe`. No walk, bandit or filter question reads history.
+- **flow.** Report answer precision (the share of returned answers that are not
+  spurious; the `precision` column of the trend row and of `items.json`) and
+  `tau` beside `path_recall` in every table, with the breadth-first reference
+  line (BFS reaches 97 to 100% of the gold paths inside a 200-pop budget, M0.4)
+  beside it. The supplement prints the mean precision. The `flow_path` recipe
+  arm on the same 111 items needs a run, so it is deferred.
+- **where-to.** No new items. The tantivy items (30) are a loss guard only: a
+  delta there that is not a loss is not a gain claim.
+- **Ceilings.** Impact R1, flow path recall and the error set's message-to-site
+  question are near a ceiling. A table that shows one of them carries a footer
+  saying so, and no delta on that metric is read as evidence without the
+  baseline column beside it.
+
+### Sets beside the frozen five
+
+| set | state | numbers | rule |
+| --- | --- | --- | --- |
+| error (34 items) | kept as a regression check, not a discriminating set | first scored 2026-10-16 by a stand-alone scorer (not the `xtask gold` path, tolerance 3 lines for grep): hit@10 for the stored fixed-string fragment .971, for the whole quoted message .735, for `lci search` on the question .50 and on the quoted message .59 (reranker off) | Report the grep columns beside search always; the message-to-site question is saturated by a fixed-string search, and search sits below it (an exact-message routing gap). Primary scoring should add the entry-point chain. It needs its own id, seed, hash and prereg before any further scoring, and enters `xtask gold` only through a reviewed change. |
+| trait-dispatch | not built | 34 qualifying traits (at least 3 non-test impls and 3 non-test call sites) over three repositories, 33 of them in tantivy; bar 40 | Do not propose it again without a second repository that has traits. |
+| co-change | parked | prior co-change hit@10 .456 against .500 for same directory by recent modification | The baseline equals the premise, so a set would not discriminate. |
+| tests-for-code | frozen | - | Added beside the five; scored on its own. |
+| docs-for-code | being built | - | Added beside the five when frozen. |
+
+### Deferred (needs a run or a frozen-set edit, not done)
+
+- The `rg -w` plus enclosing-declaration baseline column on every impact table
+  (cited figures above are not re-measured here).
+- The `flow_path` recipe arm on the 111 flow items.
+- An entry-point chain scorer for the error set, and the error scorer in
+  `xtask gold`.
+- An independently audited error scorer and a rerun with the reranker on.

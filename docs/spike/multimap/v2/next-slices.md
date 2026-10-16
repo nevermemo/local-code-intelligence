@@ -222,3 +222,22 @@ not depend on N2. Not taken by default; the owner's order stands.
   tree), including whether the SCIP-based maps rebuild after an edit.
 - Learned components (N4 included) train on patterns, never on node identities, and are
   tested on a later commit than the one they were trained on.
+
+## Set portfolio (2026-10-16)
+
+A premise check of the candidate sets, run before any further set work. Nothing frozen changed; the numbers and the
+reporting rules are in `gold-scorers.md` ("Reporting rules", "Sets beside the frozen five").
+
+- **Error set (34 items): kept as a regression check.** Grep saturates it (hit@10 .971 with the stored fragment, .735 with
+  the whole quoted message) and `lci search` reaches .50 (.59 on the quoted message), which shows an exact-message routing
+  gap: search sits below a fixed-string search on this question type. Report the grep columns beside any search score; the
+  set discriminates only on wrapped prefixes, example values in the question, and the entry-point chain, which the first
+  scorer ignored.
+- **Trait-dispatch: not built.** 34 qualifying traits against a bar of 40, 33 of them in tantivy (the lci tree has one,
+  gust none). It would be a one-repository set; do not propose it again without a second repository that has traits.
+- **Co-change: parked.** Prior co-change hit@10 is .456 and the same-directory baseline is .500, so the baseline equals the
+  premise and a set would not discriminate.
+- **New sets: tests-for-code** (frozen) and **docs-for-code** (being built); both sit beside the five frozen sets and are
+  scored on their own.
+- **A second enumeration pass with model-built gold is under way**; its sets enter this portfolio only after their own
+  premise check and freeze.

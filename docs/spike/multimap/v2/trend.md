@@ -55,6 +55,12 @@ How to read a row:
 - A row whose note says `rescored` was scored again from the raw outputs of an
   earlier run with the current adapters (`--rescore`); its traversal columns
   are the earlier run's and its wall latency is `-`.
+- `cargo xtask maps bench` also writes `supplement.md` beside `row.md` in each run
+  directory (added 2026-10-16; no row changes): the secondary metrics per stratum
+  (impact: `common` band, `r2_decl_recall`, `tests_recall`; flow: answer precision
+  and tau; history: families marked when they are not used for decisions) and a
+  footer naming the metrics that sit near a ceiling. See `gold-scorers.md`,
+  "Reporting rules".
 
 | wave | set | n_gold | n_attempted | n_scored | skipped | non-empty | metrics (over n_scored) | precision | F0.5 | pops | hops | xhops | stops | ans tok | engine ms p50/p95 | wall ms p50/p95 | maps | maps unavailable | policy | note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

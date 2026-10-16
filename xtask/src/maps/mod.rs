@@ -9,6 +9,7 @@ pub mod compare;
 pub mod fit_priors;
 pub mod fit_tiebreak;
 pub mod oracle;
+pub mod supplement;
 pub mod trend;
 
 use anyhow::Result;
