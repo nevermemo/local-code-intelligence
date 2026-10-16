@@ -168,6 +168,9 @@ not depend on N2. Not taken by default; the owner's order stands.
 - Kill (agent A/B): against the control, the chained tool must cut agent round trips by at
   least 25% with task success no worse than 5 points below. If it does not, it stays
   internal. An uncued arm reports uptake separately.
+- Ran 2026-10-16: recipes SURVIVE the frozen kill rule (round trips 0.47x of the plain control and 0.63x of
+  the composer control, recall non-inferior). It is a floor test on recipe-shaped tasks, not a discovery.
+  Results and limits in `n3-results.md`.
 
 ## N4: a result filter trained on offline labels (parallel track)
 
