@@ -144,10 +144,11 @@ impl Settings {
         match self.signal {
             Signal::Topk => format!("topk;rate={rate}"),
             Signal::Rerank => format!(
-                "rerank;rate={rate};threshold={};every={};sample={};rescorer={}",
+                "rerank;rate={rate};threshold={};every={};sample={};seed={};rescorer={}",
                 o.threshold,
                 o.every,
                 o.sample,
+                o.seed,
                 rescorer.unwrap_or("none")
             ),
             Signal::Fixed => {
@@ -204,6 +205,43 @@ pub fn random_weight(seed: u64, kind: EdgeKind) -> f64 {
     z ^= z >> 31;
     let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
     WEIGHT_MIN + (WEIGHT_MAX - WEIGHT_MIN) * unit
+}
+
+/// The next number of the splitmix64 stream at `state`.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// The `rerank` signal's round sample: all of `items` when there are at most
+/// `sample`, else `sample` of them drawn uniformly without replacement, kept in
+/// their original order. The draw depends only on `seed` and `round`, so a run
+/// is repeatable; taking the first `sample` instead would rate the best-scored
+/// children of the first expansions, the nodes the priors already favour.
+pub fn draw_sample<T>(items: Vec<T>, sample: usize, seed: u64, round: u64) -> Vec<T> {
+    if items.len() <= sample {
+        return items;
+    }
+    let mut state = seed ^ round.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    // A partial Fisher-Yates shuffle of the indices; the first `sample` are kept.
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    for i in 0..sample {
+        let span = (order.len() - i) as u64;
+        let j = i + (splitmix64(&mut state) % span) as usize;
+        order.swap(i, j);
+    }
+    let mut keep = vec![false; items.len()];
+    for &i in &order[..sample] {
+        keep[i] = true;
+    }
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(item, kept)| kept.then_some(item))
+        .collect()
 }
 
 /// The top `k` ranks seen so far, best first.
@@ -629,7 +667,10 @@ mod tests {
         });
         random.observe(TESTS);
         assert_eq!(random.weight(TESTS), random_weight(5, TESTS));
-        assert_eq!(random.report().kinds[&TESTS].weight, random_weight(5, TESTS));
+        assert_eq!(
+            random.report().kinds[&TESTS].weight,
+            random_weight(5, TESTS)
+        );
     }
 
     #[test]
@@ -667,6 +708,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn draw_sample_keeps_all_when_few_and_a_seeded_uniform_subset_when_many() {
+        let items: Vec<u32> = (0..10).collect();
+        // At most `sample` items: all, in order.
+        assert_eq!(draw_sample(vec![1, 2], 4, 9, 1), vec![1, 2]);
+        assert_eq!(draw_sample(items.clone(), 10, 9, 1), items);
+        // More: `sample` distinct items in their original order, repeatable.
+        let a = draw_sample(items.clone(), 4, 7, 2);
+        assert_eq!(a.len(), 4);
+        assert!(a.windows(2).all(|w| w[0] < w[1]), "{a:?}");
+        assert_eq!(a, draw_sample(items.clone(), 4, 7, 2));
+        // The seed and the round change the draw.
+        let draws: std::collections::BTreeSet<Vec<u32>> = (0..20)
+            .map(|seed| draw_sample(items.clone(), 4, seed, 1))
+            .collect();
+        assert!(draws.len() > 10, "{draws:?}");
+        let rounds: std::collections::BTreeSet<Vec<u32>> = (0..20)
+            .map(|round| draw_sample(items.clone(), 4, 7, round))
+            .collect();
+        assert!(rounds.len() > 10, "{rounds:?}");
+        // Every item is drawn about equally often (uniform, not the first four).
+        let mut seen = [0u32; 10];
+        for seed in 0..2000 {
+            for i in draw_sample(items.clone(), 4, seed, 1) {
+                seen[i as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| (600..1000).contains(&n)), "{seen:?}");
+    }
     #[test]
     fn the_report_names_kinds_in_json() {
         let mut bandit = bandit(Signal::Topk);

@@ -6,8 +6,8 @@
 //! two means, the mean of `B - A` with a 95% paired-bootstrap percentile
 //! interval (fixed seed, 10000 resamples by default, the algorithm of
 //! `lci evaluate compare`), and how many pairs B is above, below or level on.
-//! Which side is better depends on the metric (`spurious` and `expansions` are
-//! better when lower), so the counts say `B>A` and `B<A`, not wins and losses.
+//! Which side is better depends on the metric (`spurious`, `expansions` and `model_calls`
+//! are better when lower), so the counts say `B>A` and `B<A`, not wins and losses.
 //!
 //! The per-item metrics are those `maps bench` scored and wrote to
 //! `items.json` ([`super::bench::item_record`]). A run from before that file
@@ -43,7 +43,7 @@ pub struct CompareArgs {
     /// Run dir B; deltas are `B - A`.
     run_b: PathBuf,
     /// Metrics to compare (default: the set's headline metrics, `precision`,
-    /// `f0.5` and `expansions`).
+    /// `f0.5`, `expansions` and `model_calls`).
     #[arg(long, num_args = 1..)]
     metric: Vec<String>,
     /// Keep items either side stopped on the deadline or had failures on
@@ -291,7 +291,7 @@ fn default_metrics(set: &str) -> Vec<String> {
     headline
         .iter()
         .copied()
-        .chain(["precision", "f0.5", "expansions"])
+        .chain(["precision", "f0.5", "expansions", "model_calls"])
         .map(str::to_owned)
         .collect()
 }
@@ -519,6 +519,11 @@ mod tests {
     fn default_metrics_are_the_headline_ones_plus_the_work() {
         let metrics = default_metrics("flow");
         assert_eq!(metrics[0], "path_recall");
-        assert!(metrics.ends_with(&["precision".into(), "f0.5".into(), "expansions".into()]));
+        assert!(metrics.ends_with(&[
+            "precision".into(),
+            "f0.5".into(),
+            "expansions".into(),
+            "model_calls".into()
+        ]));
     }
 }

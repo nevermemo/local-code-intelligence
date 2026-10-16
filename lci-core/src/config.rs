@@ -815,7 +815,8 @@ pub struct TraverseConfig {
     /// `bandit_signal = "rerank"`: rate at most this many new nodes per round,
     /// `1..=32`.
     pub bandit_sample: u32,
-    /// `bandit_signal = "random"`: the seed of the per-kind weights.
+    /// `bandit_signal = "random"`: the seed of the per-kind weights; `"rerank"`:
+    /// the seed of the draw of the nodes each round rates.
     pub bandit_seed: u64,
     /// `bandit_signal = "fixed"`: the weight of each edge kind (by name, as in
     /// the trace, e.g. `contains`), `0.5` to `2`; a kind not named has `1`.
@@ -3291,7 +3292,10 @@ fusion = \"rrf\"
         assert!(on.traverse.edge_bandit);
         assert_eq!(on.traverse.bandit_rate, 2.5);
         assert_eq!(on.traverse.bandit_signal, TraverseBanditSignal::Topk);
-        assert_eq!("topk".parse::<TraverseBanditSignal>(), Ok(TraverseBanditSignal::Topk));
+        assert_eq!(
+            "topk".parse::<TraverseBanditSignal>(),
+            Ok(TraverseBanditSignal::Topk)
+        );
         let text = format!("{}[traverse]\nbandit_signal = \"judge\"\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
         assert!("judge".parse::<TraverseBanditSignal>().is_err());
@@ -3357,7 +3361,10 @@ fusion = \"rrf\"
         );
         let config: Config = toml::from_str(&text).unwrap();
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("edge_bandit") && error.contains("rrf"), "{error}");
+        assert!(
+            error.contains("edge_bandit") && error.contains("rrf"),
+            "{error}"
+        );
         // Either alone is fine.
         for ok in ["edge_bandit = true", "fusion = \"rrf\""] {
             let text = format!("{}[traverse]\n{ok}\n", base_toml());

@@ -439,7 +439,8 @@ bandit_threshold = 0.5
 bandit_every = 3
 # rerank: rate at most this many new nodes per round (1 to 32).
 bandit_sample = 4
-# random: the seed of the per-kind weights.
+# random: the seed of the per-kind weights; rerank: the seed of the draw of the
+# (at most bandit_sample) nodes each round rates, uniform over the nodes found since.
 bandit_seed = 0
 # fixed: weight per kind of edge, each 0.5 to 2 (e.g. { contains = 1.5, tests = 0.8 }).
 # bandit_fixed = { contains = 1.5 }
