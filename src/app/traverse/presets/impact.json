@@ -1,4 +1,10 @@
 {
-  "description": "Question type: what a change to the start nodes affects. Untuned: it sets the same as explore, because no rule or number is justified by a measurement yet. To be tuned from traces.",
-  "steer": {}
+  "description": "Question type: what a change to the start nodes affects. Untuned steering: it sets the same steer as explore, because no rule or number is justified by a measurement yet. To be tuned from traces. Measured first stage (N0, N0b, multimap spike v2): the exact closure of the symbol the question names plus the start nodes answer alone, 20 cards; the walk lowers the second-ring recall at 20 answers (-.043), so it takes one pop and its cards are not returned (continue the handle to walk).",
+  "steer": {},
+  "traverse": {
+    "walk": false,
+    "extra_maps": ["exact.closure"],
+    "first_k": 20,
+    "seed_k": 20
+  }
 }

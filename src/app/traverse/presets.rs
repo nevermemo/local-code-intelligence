@@ -1,12 +1,14 @@
 //! Named steering policies and the effective policy of a call.
 //!
-//! A preset is a file under `presets/`: `{"description": .., "steer": {..}}`,
-//! where `steer` has the shape of the `steer` argument (rules, ladder,
-//! max_stops, tau, stop_every, on_disagreement, likely_complete). A call
-//! selects one with `steer.policy` (`--policy NAME` on the CLI). Fields given
-//! beside the name replace the preset's. A call that gives no policy field at
-//! all runs the first preset, `explore`, whose steer is empty: what the engine
-//! ran before presets existed.
+//! A preset is a file under `presets/`: `{"description": .., "steer": {..},
+//! "traverse": {..}}`. `steer` has the shape of the `steer` argument (rules,
+//! ladder, max_stops, tau, stop_every, on_disagreement, likely_complete);
+//! `traverse` holds the measured first-stage and walk settings of the question
+//! type ([`policy_for`]). A call selects one with `steer.policy` (`--policy
+//! NAME` on the CLI). Fields given beside the name replace the preset's. A
+//! call that gives no policy field at all runs the first preset, `explore`,
+//! whose steer is empty and whose traverse block is empty: what the engine ran
+//! before presets existed.
 //!
 //! [`effective`] describes what a call ran after the defaults: the stops,
 //! rules, ladder and initial map weights, with the preset name and a hash of
@@ -15,6 +17,7 @@
 
 use super::SteerArgs;
 use anyhow::{Result, anyhow};
+use lci_core::config::{TraverseConfig, TraversePolicy};
 use lci_maps::traverse::{
     handler::StopPolicy,
     trace::{PlanEffective, PlanMap, PlanPolicy, hash16},
@@ -29,14 +32,19 @@ struct PresetFile {
     #[allow(dead_code)]
     description: String,
     steer: SteerArgs,
+    /// The first-stage and walk settings of the question type (see
+    /// [`policy_for`]); none: the `[traverse]` keys alone.
+    #[serde(default)]
+    traverse: TraversePolicy,
 }
 
 /// The presets, the default first.
-pub(super) const FILES: [(&str, &str); 4] = [
+pub(super) const FILES: [(&str, &str); 5] = [
     ("explore", include_str!("presets/explore.json")),
     ("impact", include_str!("presets/impact.json")),
     ("flow", include_str!("presets/flow.json")),
     ("where-to", include_str!("presets/where-to.json")),
+    ("history", include_str!("presets/history.json")),
 ];
 
 /// Whether `name` is a preset.
@@ -95,6 +103,21 @@ pub fn resolve(asked: &SteerArgs) -> Result<(SteerArgs, Option<String>)> {
         actions: asked.actions.clone(),
     };
     Ok((steer, Some(name.clone())))
+}
+
+/// What the call's policy sets about the first stage and the walk: the
+/// `[traverse.policies.<name>]` keys over the preset file's `traverse` block
+/// (the measured defaults). A call without a named policy (`None`) sets
+/// nothing, so the `[traverse]` keys alone apply.
+pub fn policy_for(limits: &TraverseConfig, preset: Option<&str>) -> Result<TraversePolicy> {
+    let Some(name) = preset else {
+        return Ok(TraversePolicy::default());
+    };
+    let built_in = load(name)?.traverse;
+    Ok(match limits.policies.get(name) {
+        Some(own) => own.over(&built_in),
+        None => built_in,
+    })
 }
 
 /// The maps of a continuation as it runs them: the maps as registered, with the
@@ -178,8 +201,52 @@ mod tests {
             }
         }
         let names: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["explore", "impact", "flow", "where-to"]);
+        assert_eq!(names, ["explore", "impact", "flow", "where-to", "history"]);
+        assert_eq!(names, lci_core::config::TRAVERSE_POLICY_NAMES);
         assert!(is_preset("where-to") && !is_preset("default"));
+    }
+
+    #[test]
+    fn the_presets_carry_the_measured_first_stage_and_walk_defaults() {
+        let limits = TraverseConfig::default();
+        let of = |name: &str| policy_for(&limits, Some(name)).unwrap();
+        let maps = |names: &[&str]| Some(names.iter().map(|n| (*n).to_owned()).collect());
+        let impact = of("impact");
+        assert_eq!(impact.walk, Some(false));
+        assert_eq!(impact.extra_maps, maps(&["exact.closure"]));
+        assert_eq!((impact.first_k, impact.seed_k), (Some(20), Some(20)));
+        let history = of("history");
+        assert_eq!(history.walk, Some(false));
+        assert_eq!(history.extra_maps, maps(&["git.history", "exact.pickaxe"]));
+        assert_eq!((history.first_k, history.seed_k), (Some(20), Some(20)));
+        assert_eq!(of("flow").walk, Some(true));
+        assert_eq!(of("where-to").walk_min_answers, Some(20));
+        // Unset or explore: the [traverse] keys alone.
+        assert_eq!(of("explore"), TraversePolicy::default());
+        assert_eq!(
+            policy_for(&limits, None).unwrap(),
+            TraversePolicy::default()
+        );
+        assert!(policy_for(&limits, Some("nope")).is_err());
+        // The config table wins field by field.
+        let mut own = TraverseConfig::default();
+        own.policies.insert(
+            "impact".into(),
+            TraversePolicy {
+                walk: Some(true),
+                first_k: Some(12),
+                ..TraversePolicy::default()
+            },
+        );
+        let merged = policy_for(&own, Some("impact")).unwrap();
+        assert_eq!(merged.walk, Some(true));
+        assert_eq!(merged.first_k, Some(12));
+        assert_eq!(merged.seed_k, Some(20));
+        assert_eq!(merged.extra_maps, maps(&["exact.closure"]));
+        // Every built-in table passes the config's own checks.
+        for (name, _) in FILES {
+            of(name).validate(name).unwrap();
+        }
     }
 
     #[test]
@@ -269,7 +336,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("explore, impact, flow, where-to"),
+                .contains("explore, impact, flow, where-to, history"),
             "{error}"
         );
     }

@@ -425,8 +425,10 @@ struct TraverseArgs {
     /// runs with (default: the base configuration).
     #[arg(long)]
     search_profile: Option<String>,
-    /// The steering policy: a preset name (explore, impact, flow, where-to;
-    /// explore is what no policy runs), or a JSON file or inline JSON, either
+    /// The steering policy: a preset name (explore, impact, flow, where-to, history;
+    /// explore is what no policy runs; a preset also sets the measured first-stage
+    /// and walk defaults of its question type, see `[traverse.policies]`), or a JSON
+    /// file or inline JSON, either
     /// an array of rules or the object of `search_code`'s `steer` (rules,
     /// ladder, max_stops, tau, stop_every, on_disagreement, likely_complete).
     #[arg(long)]
@@ -684,6 +686,19 @@ async fn run_traverse(
     }
     if let Some(first_k) = args.first_k {
         config.traverse.first_k = first_k;
+        // An explicit --first-k also wins over the named policy's own value.
+        if let Some(name) = args
+            .policy
+            .as_deref()
+            .filter(|name| traverse::presets::is_preset(name))
+        {
+            config
+                .traverse
+                .policies
+                .entry(name.to_owned())
+                .or_default()
+                .first_k = Some(first_k);
+        }
     }
     if let Some(answer_seeds) = args.answer_seeds {
         config.traverse.answer_seeds = answer_seeds;

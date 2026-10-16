@@ -392,17 +392,55 @@ seed_k = 8
 # each abstains with a note when nothing the question names resolves), in the
 # order of the maps list, then, with answer_seeds, the start nodes. Cards say
 # where they came from (origin: exact, seed or walk) and a node is listed once,
-# at its first place. "off" (default): the results are the walk's alone and the
-# response is as without these keys. "append": the first stage (at most
-# first_k), then the walk's results. "interleave": first-stage and walk results
-# alternately, first stage first, cut to top_k in total. first_k caps the first
-# stage, 0 to 200 (0: no cap). A continuation (handle) returns the walk alone.
-first_stage = "off"
+# at its first place. "append" (default): the first stage (at most first_k),
+# then the walk's results. "interleave": first-stage and walk results
+# alternately, first stage first, cut to top_k in total. "off": the results are
+# the walk's alone and the response is as without these keys. first_k caps the
+# first stage, 0 to 200 (0: no cap). A continuation (handle) returns the walk
+# alone. The defaults here (append, answer_seeds, exact_seeds) are the measured
+# ones: the gains of the spike came from the first stage (N0, N0b in
+# docs/spike/multimap/v2/engine-results.md); see [traverse.policies] below for
+# the per-question-type walk.
+first_stage = "append"
 first_k = 10
-answer_seeds = false
+answer_seeds = true
 # Add the exact cards whose node the SCIP graph holds to the walk's start nodes,
-# after the others (independent of first_stage).
-exact_seeds = false
+# after the others (independent of first_stage). Measured as neutral (no score
+# change in N0; two more expansions per impact item); on because the cards are
+# exact answers.
+exact_seeds = true
+# Per steering policy (the question type: steer.policy, `lci traverse --policy`),
+# settings of the first stage and the walk. The built-in values below are the
+# measured defaults (N0, N0b of docs/spike/multimap/v2); a key given in a
+# [traverse.policies.<name>] table wins over the built-in value of that policy,
+# which wins over the [traverse] key of the same name. A call with no named
+# policy, or with `explore`, uses the [traverse] keys alone: first stage, then
+# the walk. The keys:
+#   walk = false            the first stage alone answers; the walk takes one pop,
+#                           its cards are not returned, and the handle lets a
+#                           caller continue it. Needs first_stage other than "off".
+#   walk_min_answers = N    the walk runs only when the call asks for N answers or
+#                           more (first_k + top_k); below that the first stage alone
+#                           answers. 0: no minimum.
+#   extra_maps = [...]      maps added to the default maps when the call names none
+#                           (they read the tree).
+#   first_k, seed_k         the policy's own first_k and seed_k.
+# Built-in values:
+#   impact   walk = false, extra_maps = ["exact.closure"], first_k = 20, seed_k = 20
+#            (the first stage alone at 20 cards beat the walk on second-ring recall,
+#            -.043 with the walk; N0b)
+#   history  walk = false, extra_maps = ["git.history", "exact.pickaxe"],
+#            first_k = 20, seed_k = 20 (the walk adds nothing the data can separate
+#            at 153 pops per question; N0b)
+#   flow     walk = true (the walk adds path recall at 10 and at 20 answers)
+#   where-to walk_min_answers = 20 (the walk wins at 20 answers, +.069 set F1, and
+#            not significantly at 10)
+#   explore  nothing
+# Over MCP the default top_k is 8, so first_k 10 + top_k 8 = 18 answers. That point
+# was not measured; the threshold sits at the measured point (20), so where-to
+# does not walk over MCP with the default top_k and gets its walk from top_k 10.
+# [traverse.policies.impact]
+# walk = true
 # Edges of one expansion the walk follows once it offers more than 8: the best
 # `beam` by the hop score are adopted, the rest are dropped. A search heuristic,
 # not a limit of the maps (config.key offers up to 256 edges per node,
@@ -418,6 +456,7 @@ beam = 16
 # settings and a continuation must use the same ones. The trace's end event and the
 # response's totals report tries, hits and weight per edge kind as `bandit`. Not
 # combinable with fusion = "rrf".
+# measured off (N2/N0b), see docs/spike/multimap/v2
 edge_bandit = false
 # The exponent of the weight, 0 to 4: 0 has no effect, larger shifts the queue harder.
 bandit_rate = 1.0
@@ -455,6 +494,7 @@ bandit_seed = 0
 # note.
 [recipes]
 enabled = false
+# measured off (N2/N0b), see docs/spike/multimap/v2
 flow_judge = false
 
 # lci_compose: up to 6 operator steps in one call, with $sN.field references to

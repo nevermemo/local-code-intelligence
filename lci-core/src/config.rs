@@ -579,9 +579,9 @@ impl std::str::FromStr for TraverseRerankScores {
 #[serde(rename_all = "lowercase")]
 pub enum TraverseFirstStage {
     /// The results are the walk's alone, as without the setting.
-    #[default]
     Off,
     /// The first-stage list (at most `first_k`), then the walk's results.
+    #[default]
     Append,
     /// First-stage and walk results alternately, first stage first, cut to
     /// `top_k` in total.
@@ -664,6 +664,95 @@ impl std::str::FromStr for TraverseBanditSignal {
                 "bandit_signal must be \"topk\", \"rerank\", \"fixed\" or \"random\" (got {other:?})"
             )),
         }
+    }
+}
+
+/// The names a `[traverse.policies]` table may use: the steering presets
+/// (`steer.policy`, `--policy`). A test in the application crate keeps this
+/// list equal to the presets.
+pub const TRAVERSE_POLICY_NAMES: [&str; 5] = ["explore", "impact", "flow", "where-to", "history"];
+
+/// What a steering policy (a question type) sets about the first stage and
+/// the walk, `[traverse.policies.<name>]`. Every field is optional; a field
+/// left out falls through to the policy's built-in value (the preset file of
+/// the application) and then to the `[traverse]` key of the same name. The
+/// built-in values are the measured defaults (N0, N0b of the multimap spike
+/// v2): see `config.example.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TraversePolicy {
+    /// `false`: the first stage alone answers. The walk takes one pop (so the
+    /// response still carries a handle a caller may continue) and its cards
+    /// are not returned. `true`: the walk runs and its cards follow the
+    /// first stage's. Only with a first stage (`first_stage` other than
+    /// `"off"`); a first-stage-less call always returns the walk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk: Option<bool>,
+    /// The walk runs only when the call asks for at least this many answers,
+    /// `first_k + top_k`; below it the first stage alone answers (`walk =
+    /// false`). `0`: no minimum. Needs the walk to be on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk_min_answers: Option<u32>,
+    /// Maps added to the default maps when the call names none (for example
+    /// `exact.closure` for impact questions). A call that names its maps uses
+    /// exactly those. Maps that read the tree are skipped when the call has
+    /// no tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_maps: Option<Vec<String>>,
+    /// `first_k` for calls with this policy, `0..=200`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_k: Option<u32>,
+    /// `seed_k` for calls with this policy, `1..=40`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_k: Option<u32>,
+}
+
+impl TraversePolicy {
+    /// Most answers a call may ask for with `first_k + top_k`.
+    pub const MAX_WALK_MIN_ANSWERS: u32 = 240;
+
+    /// `self` with every field it leaves out taken from `base`.
+    #[must_use]
+    pub fn over(&self, base: &Self) -> Self {
+        Self {
+            walk: self.walk.or(base.walk),
+            walk_min_answers: self.walk_min_answers.or(base.walk_min_answers),
+            extra_maps: self.extra_maps.clone().or_else(|| base.extra_maps.clone()),
+            first_k: self.first_k.or(base.first_k),
+            seed_k: self.seed_k.or(base.seed_k),
+        }
+    }
+
+    /// Checks the values; `at` names the table in the message.
+    pub fn validate(&self, at: &str) -> Result<()> {
+        if let Some(k) = self.first_k {
+            ensure!(
+                k <= TraverseConfig::MAX_FIRST_K_LIMIT,
+                "{at}.first_k must be 0..={} (got {k})",
+                TraverseConfig::MAX_FIRST_K_LIMIT
+            );
+        }
+        if let Some(k) = self.seed_k {
+            ensure!(
+                (1..=TraverseConfig::MAX_SEED_K_LIMIT).contains(&k),
+                "{at}.seed_k must be 1..={} (got {k})",
+                TraverseConfig::MAX_SEED_K_LIMIT
+            );
+        }
+        if let Some(n) = self.walk_min_answers {
+            ensure!(
+                n <= Self::MAX_WALK_MIN_ANSWERS,
+                "{at}.walk_min_answers must be 0..={} (got {n})",
+                Self::MAX_WALK_MIN_ANSWERS
+            );
+        }
+        for map in self.extra_maps.iter().flatten() {
+            ensure!(
+                !map.trim().is_empty(),
+                "{at}.extra_maps must not hold an empty name"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -767,21 +856,33 @@ pub struct TraverseConfig {
     /// profile of the request) that become start nodes when a request gives
     /// a question and no seeds, `1..=40`.
     pub seed_k: u32,
-    /// How the first-stage answers join the walk's results: `"off"` (default;
-    /// the results are the walk's alone), `"append"` or `"interleave"`. The
-    /// first stage is the cards of the exact operators the call selected
-    /// (`exact.closure`, `exact.pickaxe`), in the order of the maps list, then,
-    /// with `answer_seeds`, the start nodes. A node is listed once, at its
-    /// first place. A continuation (`handle`) returns the walk alone.
+    /// How the first-stage answers join the walk's results: `"append"`
+    /// (default; the first stage, then the walk's results), `"interleave"` or
+    /// `"off"` (the results are the walk's alone). The first stage is the
+    /// cards of the exact operators the call selected (`exact.closure`,
+    /// `exact.pickaxe`), in the order of the maps list, then, with
+    /// `answer_seeds`, the start nodes. A node is listed once, at its first
+    /// place. A continuation (`handle`) returns the walk alone. Measured: N0,
+    /// N0b of the multimap spike v2.
     pub first_stage: TraverseFirstStage,
-    /// Most first-stage answers returned; `0` is no cap, `0..=200`.
+    /// Most first-stage answers returned; `0` is no cap, `0..=200`. A
+    /// steering policy may set its own (`policies`).
     pub first_k: u32,
     /// Also answer with the start nodes (cards with `origin: "seed"`) after
-    /// the exact cards. Only with `first_stage` other than `"off"`.
+    /// the exact cards (default on). Only with `first_stage` other than
+    /// `"off"`.
     pub answer_seeds: bool,
     /// Add the exact cards whose node the SCIP graph holds to the walk's start
-    /// nodes, after the others.
+    /// nodes, after the others (default on; measured as neutral).
     pub exact_seeds: bool,
+    /// Per steering policy (`steer.policy`, `--policy`) settings of the first
+    /// stage and the walk, `[traverse.policies.<name>]` with the names
+    /// `explore`, `impact`, `flow`, `where-to`, `history`. Keys given here win
+    /// over the policy's built-in values (the measured defaults, see
+    /// `config.example.toml`), which win over the `[traverse]` keys of the same
+    /// name. Empty: the built-in values apply.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub policies: BTreeMap<String, TraversePolicy>,
     /// Most edges of one expansion the walk follows once the expansion offers
     /// more than 8: the best `beam` by the hop score are adopted and the rest
     /// are dropped (a search heuristic, not a limit of the maps). `16` is
@@ -914,6 +1015,14 @@ impl TraverseConfig {
             Self::MAX_FIRST_K_LIMIT,
             self.first_k
         );
+        for (name, policy) in &self.policies {
+            ensure!(
+                TRAVERSE_POLICY_NAMES.contains(&name.as_str()),
+                "traverse.policies.{name}: unknown policy; the policies are {}",
+                TRAVERSE_POLICY_NAMES.join(", ")
+            );
+            policy.validate(&format!("traverse.policies.{name}"))?;
+        }
         ensure!(
             (0.0..=Self::MAX_BANDIT_RATE).contains(&self.bandit_rate),
             "traverse.bandit_rate must be a number from 0 to {} (got {})",
@@ -988,10 +1097,11 @@ impl Default for TraverseConfig {
             question_type: None,
             tie_break: None,
             seed_k: 8,
-            first_stage: TraverseFirstStage::Off,
+            first_stage: TraverseFirstStage::Append,
             first_k: 10,
-            answer_seeds: false,
-            exact_seeds: false,
+            answer_seeds: true,
+            exact_seeds: true,
+            policies: BTreeMap::new(),
             beam: 16,
             edge_bandit: false,
             bandit_rate: 1.0,
@@ -3373,11 +3483,12 @@ fusion = \"rrf\"
     }
 
     #[test]
-    fn the_first_stage_keys_default_to_off_and_parse() {
+    fn the_first_stage_keys_default_to_the_measured_values_and_parse() {
         let defaults = TraverseConfig::default();
-        assert_eq!(defaults.first_stage, TraverseFirstStage::Off);
+        assert_eq!(defaults.first_stage, TraverseFirstStage::Append);
         assert_eq!(defaults.first_k, 10);
-        assert!(!defaults.answer_seeds && !defaults.exact_seeds);
+        assert!(defaults.answer_seeds && defaults.exact_seeds);
+        assert!(defaults.policies.is_empty());
         let on: Config = toml::from_str(&format!(
             "{}[traverse]
 first_stage = \"interleave\"
@@ -3426,6 +3537,78 @@ first_stage = \"{bad}\"
         config.traverse.first_k = TraverseConfig::MAX_FIRST_K_LIMIT + 1;
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("first_k"), "{error}");
+    }
+
+    #[test]
+    fn the_policy_tables_parse_layer_over_each_other_and_are_checked() {
+        let on: Config = toml::from_str(&format!(
+            "{}[traverse]
+[traverse.policies.impact]
+walk = true
+first_k = 12
+extra_maps = [\"exact.closure\"]
+
+[traverse.policies.where-to]
+walk_min_answers = 14
+",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        let impact = &on.traverse.policies["impact"];
+        assert_eq!(impact.walk, Some(true));
+        assert_eq!(impact.first_k, Some(12));
+        assert_eq!(impact.seed_k, None);
+        assert_eq!(on.traverse.policies["where-to"].walk_min_answers, Some(14));
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["traverse"]["policies"]["impact"]["first_k"], 12);
+        assert!(
+            json["traverse"]["policies"]["impact"]
+                .get("seed_k")
+                .is_none()
+        );
+
+        let built_in = TraversePolicy {
+            walk: Some(false),
+            first_k: Some(20),
+            seed_k: Some(20),
+            ..TraversePolicy::default()
+        };
+        let merged = impact.over(&built_in);
+        assert_eq!(merged.walk, Some(true));
+        assert_eq!(merged.first_k, Some(12));
+        assert_eq!(merged.seed_k, Some(20));
+        assert_eq!(
+            merged.extra_maps.as_deref(),
+            Some(&["exact.closure".to_owned()][..])
+        );
+
+        for (text, key) in [
+            ("[traverse.policies.nope]\nwalk = true\n", "unknown policy"),
+            (
+                "[traverse.policies.flow]\nfirst_k = 201\n",
+                "policies.flow.first_k",
+            ),
+            (
+                "[traverse.policies.flow]\nseed_k = 0\n",
+                "policies.flow.seed_k",
+            ),
+            (
+                "[traverse.policies.flow]\nwalk_min_answers = 241\n",
+                "policies.flow.walk_min_answers",
+            ),
+            (
+                "[traverse.policies.flow]\nextra_maps = [\" \"]\n",
+                "extra_maps",
+            ),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("{}[traverse]\n{text}", base_toml())).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(key), "{text}: {error}");
+        }
+        let unknown_key = format!("{}[traverse.policies.flow]\nwalking = true\n", base_toml());
+        assert!(toml::from_str::<Config>(&unknown_key).is_err());
     }
 
     #[test]

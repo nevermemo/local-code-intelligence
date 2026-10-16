@@ -98,7 +98,7 @@
           ]
         },
         "policy": {
-          "description": "A named policy: `explore` (what a call with no policy runs), `impact`,\n`flow` or `where-to`. Its settings apply; the fields given beside it\nreplace the preset's. The response's `effective_policy` shows what ran.",
+          "description": "A named policy, the question type: `explore` (what a call with no\npolicy runs), `impact`, `flow`, `where-to` or `history`. Its settings\napply: its steering, and the measured first-stage and walk defaults of\nthe question type (`impact` and `history` answer from the first stage\nalone; `where-to` adds the walk from 20 answers); the fields given\nbeside it replace the preset's. The response's `effective_policy` shows\nwhat ran.",
           "type": [
             "string",
             "null"

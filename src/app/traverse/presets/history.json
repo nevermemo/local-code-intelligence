@@ -1,0 +1,10 @@
+{
+  "description": "Question type: when and why something changed. Untuned steering: it sets the same steer as explore, because no rule or number is justified by a measurement yet. To be tuned from traces. Measured first stage (N0, N0b, multimap spike v2): the commits the pickaxe (git log -G/-S/--grep) finds plus the start nodes answer alone, 20 cards; the walk adds nothing the data can separate (+.018 hit@10, Holm .27) at 153 pops per question, so it takes one pop and its cards are not returned (continue the handle to walk).",
+  "steer": {},
+  "traverse": {
+    "walk": false,
+    "extra_maps": ["git.history", "exact.pickaxe"],
+    "first_k": 20,
+    "seed_k": 20
+  }
+}

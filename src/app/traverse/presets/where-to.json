@@ -1,4 +1,7 @@
 {
-  "description": "Question type: where to add, register or follow the convention for something. Untuned: it sets the same as explore, because no rule or number is justified by a measurement yet. To be tuned from traces.",
-  "steer": {}
+  "description": "Question type: where to add, register or follow the convention for something. Untuned steering: it sets the same steer as explore, because no rule or number is justified by a measurement yet. To be tuned from traces. Measured first stage (N0, N0b, multimap spike v2): the start nodes (at most first_k 10, from seed_k 8 hits plus any exact cards) followed by the walk's results when the call asks for at least 20 answers (first_k 10 + top_k 10: +.069 set F1); below that the walk is not significant (+.012 at 10), so the start nodes answer alone.",
+  "steer": {},
+  "traverse": {
+    "walk_min_answers": 20
+  }
 }

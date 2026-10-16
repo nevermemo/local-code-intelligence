@@ -67,8 +67,8 @@ use lci_maps::{
     },
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
-        frontier::HopPrice,
         bandit::{Options as BanditOptions, Settings as BanditSettings, Signal as BanditSignal},
+        frontier::HopPrice,
         handle::HandleStore,
         handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
         ladder::Ladder,
@@ -176,9 +176,13 @@ pub struct BudgetArgs {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SteerArgs {
-    /// A named policy: `explore` (what a call with no policy runs), `impact`,
-    /// `flow` or `where-to`. Its settings apply; the fields given beside it
-    /// replace the preset's. The response's `effective_policy` shows what ran.
+    /// A named policy, the question type: `explore` (what a call with no
+    /// policy runs), `impact`, `flow`, `where-to` or `history`. Its settings
+    /// apply: its steering, and the measured first-stage and walk defaults of
+    /// the question type (`impact` and `history` answer from the first stage
+    /// alone; `where-to` adds the walk from 20 answers); the fields given
+    /// beside it replace the preset's. The response's `effective_policy` shows
+    /// what ran.
     pub policy: Option<String>,
     /// Rung 1 of the ladder: an array of `{"when": predicate, "then": action}`
     /// rules (at most 64). Predicates: `kind`, `path_glob`, `witness`, `map`,
@@ -1291,24 +1295,59 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     if call.top_k == 0 || call.top_k > MAX_TOP_K {
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
-    let wanted: Vec<MapId> = match call.maps {
-        None => MAPS.to_vec(),
-        Some(ids) => ids
-            .iter()
-            .map(|id| {
-                MAPS.iter()
-                    .chain(&OPT_IN_MAPS)
-                    .copied()
-                    .find(|known| known == id)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "unknown map {id:?}; the maps are {}, and, only when named, {}",
-                            MAPS.join(", "),
-                            OPT_IN_MAPS.join(", ")
-                        )
-                    })
+    let known_map = |id: &str| {
+        MAPS.iter()
+            .chain(&OPT_IN_MAPS)
+            .copied()
+            .find(|known| *known == id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown map {id:?}; the maps are {}, and, only when named, {}",
+                    MAPS.join(", "),
+                    OPT_IN_MAPS.join(", ")
+                )
             })
-            .collect::<Result<_>>()?,
+    };
+    // The call's question type (its steering policy) sets the measured
+    // first-stage and walk defaults; a call without a named policy sets none.
+    let (steer, preset) = presets::resolve(call.steer)?;
+    let policy = presets::policy_for(limits, preset.as_deref())?;
+    // Extra maps named by the policy that this call cannot run (no tree).
+    let mut skipped_maps: Vec<String> = Vec::new();
+    let wanted: Vec<MapId> = match call.maps {
+        None => {
+            let mut ids = MAPS.to_vec();
+            // The policy's extra maps read the tree.
+            if call.scip_root.is_some() {
+                for name in policy.extra_maps.iter().flatten() {
+                    let id = known_map(name).map_err(|e| {
+                        anyhow!(
+                            "policy {}: extra_maps: {e}",
+                            preset.as_deref().unwrap_or_default()
+                        )
+                    })?;
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            } else {
+                skipped_maps = policy.extra_maps.iter().flatten().cloned().collect();
+            }
+            ids
+        }
+        Some(ids) => ids.iter().map(|id| known_map(id)).collect::<Result<_>>()?,
+    };
+    // The policy's first_k and seed_k take the place of the [traverse] keys.
+    let tuned;
+    let limits = if policy.first_k.is_some() || policy.seed_k.is_some() {
+        tuned = TraverseConfig {
+            first_k: policy.first_k.unwrap_or(limits.first_k),
+            seed_k: policy.seed_k.unwrap_or(limits.seed_k),
+            ..limits.clone()
+        };
+        &tuned
+    } else {
+        limits
     };
     if wanted.iter().any(|id| OPT_IN_MAPS.contains(id)) && call.scip_root.is_none() {
         bail!("the maps named beyond the defaults read the tree: give its root");
@@ -1322,9 +1361,42 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     let tie_break = (limits.tie_break.as_deref())
         .map(|path| TieBreak::open(path).map_err(|e| anyhow!("[traverse] tie_break {path}: {e}")))
         .transpose()?;
-    let (steer, preset) = presets::resolve(call.steer)?;
     let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
     let mut notes = Vec::new();
+    if !skipped_maps.is_empty() {
+        notes.push(format!(
+            "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
+            preset.as_deref().unwrap_or_default(),
+            skipped_maps.join(", ")
+        ));
+    }
+    // First stage alone: the policy says so, or the call asks for fewer
+    // answers (first stage plus walk) than the policy's walk is worth. Only
+    // a first call with a first stage: a continuation is the walk, and
+    // without a first stage nothing else would answer.
+    let walk_off = call.handle.is_none()
+        && {
+            let asked = match limits.first_k {
+                0 => usize::MAX,
+                k => (k as usize).saturating_add(call.top_k),
+            };
+            let wanted_off = policy.walk == Some(false)
+                || (asked as u64) < u64::from(policy.walk_min_answers.unwrap_or(0));
+            if wanted_off && limits.first_stage == TraverseFirstStage::Off {
+                notes.push(format!(
+                "policy {}: the first stage alone would answer, but [traverse] first_stage is off: the walk runs",
+                preset.as_deref().unwrap_or_default()
+            ));
+            }
+            wanted_off && limits.first_stage != TraverseFirstStage::Off
+        };
+    if walk_off {
+        budget.pops = 1;
+        notes.push(format!(
+            "policy {}: the first stage alone answers (measured: the walk does not pay here at this many answers); the walk took one pop and its cards are not returned, continue the handle to walk on",
+            preset.as_deref().unwrap_or_default()
+        ));
+    }
     let handler = build_ladder(limits, &steer, budget.pops, &mut warnings)?;
     let actions = match (&steer.actions, call.handle) {
         (Some(_), None) => {
@@ -1685,6 +1757,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         }
         if limits.first_stage != TraverseFirstStage::Off {
             stage.mode = limits.first_stage;
+            stage.walk_off = walk_off;
             stage.first_k = limits.first_k as usize;
             stage.cards = exact.iter().map(|card| card.card.clone()).collect();
             if limits.answer_seeds {
@@ -2272,7 +2345,16 @@ fn response_json(
             card
         })
         .collect();
-    let results = if stage.active() {
+    let results = if stage.active() && stage.walk_off {
+        // The first stage alone answers: no walk card, whatever the mode.
+        merge(
+            TraverseFirstStage::Append,
+            &stage.cards,
+            &[],
+            stage.first_k,
+            call.top_k,
+        )
+    } else if stage.active() {
         merge(
             stage.mode,
             &stage.cards,
@@ -2599,18 +2681,24 @@ pub async fn search(
 }
 
 /// Text for the server instructions when the mode is on.
-pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the reached nodes with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode needs an index.scip in the workspace, and the search that finds the start nodes uses the same index and model services as the normal mode.";
+pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode needs an index.scip in the workspace, and the search that finds the start nodes uses the same index and model services as the normal mode.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lci_core::config::TraversePolicy;
     use lci_maps::EdgeKind;
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// The walk alone: the tests of the walk do not want the first stage that
+    /// the defaults now put ahead of it.
     fn limits() -> TraverseConfig {
         TraverseConfig {
             enabled: true,
+            first_stage: TraverseFirstStage::Off,
+            answer_seeds: false,
+            exact_seeds: false,
             ..TraverseConfig::default()
         }
     }
@@ -3976,7 +4064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_stage_is_off_by_default_and_leaves_the_output_as_it_was() {
+    async fn with_the_first_stage_off_the_output_is_the_walks_alone() {
         let tree = Tree::new();
         let response = first_stage_run(&tree, &limits(), None).await;
         let results = response["results"].as_array().expect("results");
@@ -4057,6 +4145,257 @@ mod tests {
         nodes.sort_unstable();
         nodes.dedup();
         assert_eq!(nodes.len(), listed, "{response}");
+    }
+
+    /// One call over the three-file tree under the named policy.
+    async fn policy_run(
+        tree: &Tree,
+        limits: &TraverseConfig,
+        policy: &str,
+        top_k: usize,
+        maps: Option<&[&str]>,
+    ) -> Value {
+        let maps: Option<Vec<String>> =
+            maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+        let (budget, steer) = (
+            BudgetArgs::default(),
+            SteerArgs {
+                policy: Some(policy.to_owned()),
+                ..SteerArgs::default()
+            },
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: Some(tree.dir.path()),
+            question: "q",
+            seeds: &tree.seeds,
+            seed_search: None,
+            top_k,
+            maps: maps.as_deref(),
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        run(limits, &Dirs::under(tree.dir.path()), &call)
+            .await
+            .unwrap()
+            .response
+    }
+
+    fn notes_of(response: &Value) -> String {
+        response["notes"].to_string()
+    }
+
+    #[tokio::test]
+    async fn the_default_configuration_has_the_measured_first_stage() {
+        let defaults = TraverseConfig {
+            enabled: true,
+            ..TraverseConfig::default()
+        };
+        let tree = Tree::new();
+        let response = first_stage_run(&tree, &defaults, None).await;
+        let origins: Vec<&str> = response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|card| card["origin"].as_str().expect("origin"))
+            .collect();
+        // The start nodes answer (answer_seeds), ahead of the walk's cards.
+        assert!(origins.contains(&"seed"), "{response}");
+        assert!(response["totals"]["first_stage"].is_object(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn impact_and_history_answer_from_the_first_stage_alone() {
+        let tree = Tree::new();
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        let maps = ["graph.scip", "structure.contains"];
+        for policy in ["impact", "history"] {
+            let response = policy_run(&tree, &limits, policy, 8, Some(&maps)).await;
+            let results = response["results"].as_array().expect("results");
+            assert!(!results.is_empty(), "{policy}: {response}");
+            assert!(
+                results.iter().all(|card| card["origin"] != "walk"),
+                "{policy}: {response}"
+            );
+            assert_eq!(
+                response["totals"]["first_stage"]["walk"], 0,
+                "{policy}: {response}"
+            );
+            assert!(
+                notes_of(&response).contains("first stage alone answers"),
+                "{policy}: {response}"
+            );
+            assert!(
+                response["totals"]["pops"].as_u64().unwrap() <= 1,
+                "{response}"
+            );
+        }
+        // The same call under flow (or no policy) keeps the walk: no such note.
+        for policy in ["flow", "explore"] {
+            let response = policy_run(&tree, &limits, policy, 8, Some(&maps)).await;
+            assert!(
+                !notes_of(&response).contains("first stage alone"),
+                "{policy}: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn where_to_walks_only_when_the_call_asks_for_twenty_answers() {
+        let tree = Tree::new();
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        let maps = ["graph.scip", "structure.contains"];
+        // first_k 10 + top_k 8 = 18: the first stage alone.
+        let below = policy_run(&tree, &limits, "where-to", 8, Some(&maps)).await;
+        assert!(
+            notes_of(&below).contains("first stage alone answers"),
+            "{below}"
+        );
+        // first_k 10 + top_k 10 = 20: the walk runs.
+        let at = policy_run(&tree, &limits, "where-to", 10, Some(&maps)).await;
+        assert!(!notes_of(&at).contains("first stage alone"), "{at}");
+        // A config key moves the threshold, and first_k counts.
+        let mut own = limits.clone();
+        own.policies.insert(
+            "where-to".into(),
+            TraversePolicy {
+                walk_min_answers: Some(15),
+                ..TraversePolicy::default()
+            },
+        );
+        let lowered = policy_run(&tree, &own, "where-to", 8, Some(&maps)).await;
+        assert!(
+            !notes_of(&lowered).contains("first stage alone"),
+            "{lowered}"
+        );
+        // An uncapped first stage (first_k 0) always meets the minimum.
+        let uncapped = TraverseConfig {
+            first_k: 0,
+            ..limits.clone()
+        };
+        let all = policy_run(&tree, &uncapped, "where-to", 1, Some(&maps)).await;
+        assert!(!notes_of(&all).contains("first stage alone"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn a_policy_cannot_remove_the_only_answers_a_call_has() {
+        // With the first stage off the walk is the only answer: the walk
+        // switch is ignored, and the call says so.
+        let tree = Tree::new();
+        let maps = ["graph.scip", "structure.contains"];
+        let response = policy_run(&tree, &limits(), "impact", 8, Some(&maps)).await;
+        let notes = notes_of(&response);
+        assert!(
+            notes.contains("[traverse] first_stage is off: the walk runs"),
+            "{notes}"
+        );
+        assert!(!notes.contains("the walk took one pop"), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn a_policy_map_that_needs_the_tree_is_reported_when_there_is_no_tree() {
+        let tree = Tree::new();
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        let (budget, steer) = (
+            BudgetArgs::default(),
+            SteerArgs {
+                policy: Some("impact".to_owned()),
+                ..SteerArgs::default()
+            },
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: None,
+            question: "q",
+            seeds: &tree.seeds,
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        let response = run(&limits, &Dirs::under(tree.dir.path()), &call)
+            .await
+            .expect("run")
+            .response;
+        let notes = notes_of(&response);
+        assert!(
+            notes.contains("exact.closure") && notes.contains("left out"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_adds_its_maps_only_when_the_call_names_none() {
+        let tree = Tree::new();
+        let limits = TraverseConfig {
+            first_stage: TraverseFirstStage::Append,
+            answer_seeds: true,
+            ..limits()
+        };
+        // impact reads the exact closure: the exact report shows the operator ran.
+        let response = policy_run(&tree, &limits, "impact", 8, None).await;
+        assert_eq!(response["exact"][0]["map"], EXACT_CLOSURE_ID, "{response}");
+        // A named maps list is used as given.
+        let named = policy_run(&tree, &limits, "impact", 8, Some(&["graph.scip"])).await;
+        assert!(named.get("exact").is_none(), "{named}");
+        // flow and the others add none.
+        let flow = policy_run(&tree, &limits, "flow", 8, None).await;
+        assert!(flow.get("exact").is_none(), "{flow}");
+        // A wrong map in a policy table is an error that names the policy.
+        let mut bad = limits.clone();
+        bad.policies.insert(
+            "flow".into(),
+            TraversePolicy {
+                extra_maps: Some(vec!["nope.map".into()]),
+                ..TraversePolicy::default()
+            },
+        );
+        let (budget, steer) = (
+            BudgetArgs::default(),
+            SteerArgs {
+                policy: Some("flow".into()),
+                ..SteerArgs::default()
+            },
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: Some(tree.dir.path()),
+            question: "q",
+            seeds: &tree.seeds,
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        let error = run(&bad, &Dirs::under(tree.dir.path()), &call)
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("policy flow") && error.contains("nope.map"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

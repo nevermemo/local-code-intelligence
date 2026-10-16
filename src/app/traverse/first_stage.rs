@@ -304,6 +304,9 @@ pub struct FirstStage {
     /// Git calls the exact operators made, to add to the physical external
     /// calls of the totals.
     pub git_calls: u32,
+    /// The policy asks for the first stage alone: the walk's cards are not
+    /// returned (the walk took one pop; a handle continues it).
+    pub walk_off: bool,
 }
 
 impl FirstStage {
@@ -314,6 +317,7 @@ impl FirstStage {
             first_k: 0,
             cards: Vec::new(),
             git_calls: 0,
+            walk_off: false,
         }
     }
 

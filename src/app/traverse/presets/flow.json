@@ -1,4 +1,7 @@
 {
-  "description": "Question type: how control or data gets from one place to another. Untuned: it sets the same as explore, because no rule or number is justified by a measurement yet. To be tuned from traces.",
-  "steer": {}
+  "description": "Question type: how control or data gets from one place to another. Untuned steering: it sets the same steer as explore, because no rule or number is justified by a measurement yet. To be tuned from traces. Measured first stage (N0, N0b, multimap spike v2): the start nodes (at most first_k 10, from seed_k 8 hits plus any exact cards) followed by the walk's results; the walk adds path recall at 10 and at 20 answers (+.29 at 20, +.06 to +.13 at 10), so it always runs.",
+  "steer": {},
+  "traverse": {
+    "walk": true
+  }
 }

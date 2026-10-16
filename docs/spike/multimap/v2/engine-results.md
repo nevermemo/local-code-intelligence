@@ -616,6 +616,38 @@ where the walk's tie order is the problem (flow at 10), and there the local
 pick's test gain is +.03 (+.02 for the cheaper tie-only judge), below what the
 tests can separate from noise.
 
+## Shipped defaults (S1)
+
+The N0 and N0b decisions are the engine's defaults now (code defaults in `lci-core/src/config.rs`, the per-question-type
+values in the preset files `src/app/traverse/presets/*.json`, both restated in `config.example.toml`):
+
+| setting | default | source |
+| --- | --- | --- |
+| `[traverse] first_stage` | `"append"` (was `"off"`) | N0: the gains come from the first stage |
+| `[traverse] answer_seeds` | `true` (was `false`) | the start nodes are the first-stage answers on where-to and flow; the winning arms all had it |
+| `[traverse] exact_seeds` | `true` (was `false`) | neutral in bench-1023 (no score change); the exact cards are exact answers |
+| policy `impact` | walk off, `exact.closure` added to the maps, `first_k` 20, `seed_k` 20 | N0 @20: first stage alone better (-.043 with the walk) |
+| policy `history` (new preset) | walk off, `git.history` and `exact.pickaxe` added, `first_k` 20, `seed_k` 20 | N0: walk +.018, Holm .27 |
+| policy `flow` | walk on | N0, N0b: +.294 at 20, +.131 at 10 |
+| policy `where-to` | walk when `first_k + top_k >= 20` | N0: +.069 at 20, +.012 (n.s.) at 10 |
+| no policy, or `explore` | `[traverse]` keys alone: first stage, then the walk | unchanged walk |
+| `edge_bandit`, `[recipes] flow_judge`, `[recipes] enabled`, `[compose] enabled` | off | N2, N0b measured off; the recipe and compose verdict is N3b's |
+
+"Walk off" means the first stage alone answers: the call takes one pop (so the response still has a handle a caller may
+continue) and the walk's cards are not returned; the bench arm F-first20 ran the same way (`max_pops = 1`, walk cards dropped).
+"Answers" for the where-to rule is the number of cards a call asks for, `first_k + top_k` (N0's 20 is 10 + 10); over MCP the
+default `top_k` is 8 (18 answers), a point nobody measured: the threshold sits at the measured point (20 answers), so a where-to call over MCP with the default `top_k` does not walk, and gets its walk from `top_k` 10. Whether the default `top_k` or the threshold should move is open. A `[traverse.policies.<name>]` table overrides any of the
+built-in values; `lci traverse --first-k` wins over the policy's own value. The recipes pin the first stage off, so
+`flow_from` still reads the walk's own cards.
+
+Verification (S1): the bench was re-run on the frozen tree with these defaults and no arm flags (only `--policy <set>`
+for the question type) and compared item by item with the winning arms of the earlier run, at 20 and at 10 answers.
+where-to (59 items) and flow (111) against F-append, impact (141) against F-first20: every primary metric is identical
+(set F1 .2966 at 20 and .3069 at 10, reg hit@3 .920, path recall .5466 at 20 and .3600 at 10, tau .3785, impact second
+ring .5043 at 20 and .4462 at 10, decl F1 .6924 and .8152); the only differences are precision +.0017 on one where-to
+item at 10 and -.0002 on one flow item. history (110 items) is identical to F-first20 (hit@10 .6455, mrr .4988 at 20 and .4918 at 10, hit@3 .5091, precision .2809 at 20); against F-append it is -.0182 on hit@10 (interval -.0455 to 0, two items), -.0023 on mrr and -.0091 on hit@3, inside the .02 allowed, at 1 expansion per item against 153.
+
+
 ## Do bench metric differences predict answer quality? (proxy validity, pv2)
 
 Pre-registered check, run 2026-10-16. For one arm pair (first stage with walk cards dropped against first stage plus

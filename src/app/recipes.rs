@@ -60,7 +60,7 @@ use crate::{
         App,
         traverse::{self, BudgetArgs, Call, Dirs, OpenedIndex, SteerArgs},
     },
-    config::TraverseConfig,
+    config::{TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use lci_core::node::{ConfigNamespace, NodeId};
@@ -1273,8 +1273,12 @@ async fn flow_from(
         ));
     }
     let seed = sources.node_string(def);
+    // The recipe reads the walk's own cards: no first stage ahead of them.
     let limits = TraverseConfig {
         beam: ctx.limits.beam.max(RECIPE_BEAM),
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
         ..ctx.limits.clone()
     };
     let maps = ["graph.scip".to_owned(), "structure.contains".to_owned()];
@@ -1298,7 +1302,7 @@ async fn flow_from(
         lsp: None,
     };
     let at = Instant::now();
-    let report = traverse::run(&limits, ctx.dirs, &call).await?;
+    let report = Box::pin(traverse::run(&limits, ctx.dirs, &call)).await?;
     let response = report.response;
     let expands: u64 = response["totals"]["per_map"]
         .as_object()

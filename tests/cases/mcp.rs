@@ -2184,7 +2184,9 @@ async fn a_traverse_call_echoes_the_policy_it_ran_and_lints_the_steer() {
     // is the same call as no policy.
     let explore = answer(call(Some(json!({"policy": "explore"}))).await);
     assert_eq!(explore["trace"]["hash"], plain["trace"]["hash"]);
-    for name in ["impact", "flow", "where-to"] {
+    // `flow` walks and `where-to` walks at twenty answers (10 first-stage plus
+    // top_k 20 here), so both run the call `explore` does.
+    for name in ["flow", "where-to"] {
         let named = answer(call(Some(json!({"policy": name}))).await);
         assert_eq!(named["effective_policy"]["preset"], name);
         assert_eq!(named["effective_policy"]["hash"], effective["hash"]);
@@ -2192,6 +2194,51 @@ async fn a_traverse_call_echoes_the_policy_it_ran_and_lints_the_steer() {
         assert_eq!(named["totals"]["pops"], plain["totals"]["pops"], "{name}");
         assert!(named.get("warnings").is_none(), "{named}");
     }
+
+    // `impact` adds the closure map and answers from the first stage alone: the
+    // walk takes its one pop and returns no cards.
+    let impact = answer(call(Some(json!({"policy": "impact"}))).await);
+    assert_eq!(impact["effective_policy"]["preset"], "impact");
+    assert_ne!(impact["effective_policy"]["hash"], effective["hash"]);
+    let impact_maps: Vec<&str> = impact["effective_policy"]["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|map| map["id"].as_str().unwrap())
+        .collect();
+    assert!(impact_maps.contains(&"exact.closure"), "{impact_maps:?}");
+    assert!(impact["totals"]["pops"].as_u64().unwrap() <= 1, "{impact}");
+    let impact_results = impact["results"].as_array().unwrap();
+    assert!(!impact_results.is_empty(), "{impact}");
+    assert!(
+        impact_results.iter().all(|card| card["origin"] != "walk"),
+        "{impact}"
+    );
+    assert!(
+        impact["handle"].is_string(),
+        "the walk can be continued: {impact}"
+    );
+
+    // Without top_k the MCP default (8) asks for 18 answers, below where-to's
+    // measured 20: the first stage answers alone.
+    let default_k = answer(
+        mcp_search_call(
+            &client,
+            &base,
+            &session,
+            json!({
+                "workspace_path": workspace, "query": "how does search rank hits",
+                "mode": "traverse", "steer": {"policy": "where-to"},
+            }),
+        )
+        .await,
+    );
+    assert!(
+        default_k["notes"]
+            .to_string()
+            .contains("first stage alone answers"),
+        "{default_k}"
+    );
 
     // Fields beside the name replace the preset's, and the response shows
     // the stops, rules and ladder after the defaults.
@@ -2270,7 +2317,10 @@ async fn a_traverse_call_echoes_the_policy_it_ran_and_lints_the_steer() {
     let unknown = call(Some(json!({"policy": "nope"}))).await;
     assert_eq!(unknown["isError"], true, "{unknown}");
     let text = unknown["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("explore, impact, flow, where-to"), "{text}");
+    assert!(
+        text.contains("explore, impact, flow, where-to, history"),
+        "{text}"
+    );
 
     token.cancel();
     server.abort();
@@ -2316,6 +2366,10 @@ fn start_event(data_dir: &Path, response: &Value) -> lci_maps::traverse::trace::
 async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     config.traverse.enabled = true;
+    // This test reads the walk's own cards; the first stage is covered by the unit tests of the traverse module.
+    config.traverse.first_stage = lci_core::config::TraverseFirstStage::Off;
+    config.traverse.answer_seeds = false;
+    config.traverse.exact_seeds = false;
     let workspace = temp.path().join("scip-hybrid");
     write_hybrid_workspace(&workspace);
     let data_dir = config.data_dir.clone();
