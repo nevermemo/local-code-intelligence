@@ -352,11 +352,11 @@ impl McpServer {
 
 /// The recipe tools: listed and callable only with `[recipes] enabled`. Their
 /// descriptions state inputs, outputs and limits. All of them read the SCIP
-/// index (`[traverse] scip_index`) in the workspace; none calls a model.
+/// index (`[traverse] scip_index`); none calls a model.
 #[tool_router(router = recipe_router)]
 impl McpServer {
     #[tool(
-        description = "Lists the declarations that read or set a key of config.example.toml (map config.key, exact SCIP witnesses only; text-only matches are not listed) and, with include_tests (default true), the test declarations that reference those readers. Input: key as `section.key`, a top-level `key`, a key name only one section has, or `cfg:toml:<id>`. Output: anchor, steps, results (node, name, path, line, role prod|test, group readers|tests), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next) and counts (operator_calls). Limits: 40 readers and 60 tests listed; needs index.scip in the workspace and rg on PATH."
+        description = "Lists the declarations that read or set a key of config.example.toml (map config.key, exact SCIP witnesses only; text-only matches are not listed) and, with include_tests (default true), the test declarations that reference those readers. Input: key as `section.key`, a top-level `key`, a key name only one section has, or `cfg:toml:<id>`. Output: anchor, steps, results (node, name, path, line, role prod|test, group readers|tests), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next) and counts (operator_calls). Limits: 40 readers and 60 tests listed; needs the server's SCIP index and rg on PATH."
     )]
     async fn config_readers(
         &self,
@@ -365,7 +365,7 @@ impl McpServer {
         self.recipe(recipes::Request::ConfigReaders(args)).await
     }
     #[tool(
-        description = "Lists the declarations that reference a symbol (ring 1, the exact one-hop reverse closure of the SCIP index) and, with rings = 2, the declarations that reference a ring-1 declaration (ring 2). Input: symbol as a name (`Type::member`, `module::name`) of a function, method, struct, enum, trait, type alias, constant, static, field or enum variant, or the node id of a candidate; rings 1 or 2 (default 2). Output: anchor (candidates when the name matches several declarations), steps, results (node, name, path, line, role prod|test, group ring_1|ring_2, ring), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next) and counts (operator_calls). Limits: 60 ring-1 and 80 ring-2 declarations listed, ring 2 is not computed from a cut ring 1; role comes from the path (tests/ directory, tests.rs, *_test.rs); needs index.scip in the workspace."
+        description = "Lists the declarations that reference a symbol (ring 1, the exact one-hop reverse closure of the SCIP index) and, with rings = 2, the declarations that reference a ring-1 declaration (ring 2). Input: symbol as a name (`Type::member`, `module::name`) of a function, method, struct, enum, trait, type alias, constant, static, field or enum variant, or the node id of a candidate; rings 1 or 2 (default 2). Output: anchor (candidates when the name matches several declarations), steps, results (node, name, path, line, role prod|test, group ring_1|ring_2, ring), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next) and counts (operator_calls). Limits: 60 ring-1 and 80 ring-2 declarations listed, ring 2 is not computed from a cut ring 1; role is test when the path has a tests or test directory or is tests.rs, *_test.rs or *_tests.rs, or when the symbol sits in a module named tests or test, otherwise prod; needs the server's SCIP index."
     )]
     async fn impact_rings(
         &self,
@@ -374,7 +374,7 @@ impl McpServer {
         self.recipe(recipes::Request::ImpactRings(args)).await
     }
     #[tool(
-        description = "Lists the functions and methods on the shortest call paths from one function to another in the SCIP call graph, in call order. Input: from and to as names or node ids; max_depth 1 through 8 (default 4). Output: anchor (candidates when a name matches several declarations), steps, path_length, results (node, name, path, line, role, group path, depth from `from`), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored with both frontier sizes; next with a deeper max_depth) and counts (operator_calls). Limits: 40 path nodes listed; edges are calls and references between functions and methods, they end at a trait method and implementations are not enumerated; needs index.scip in the workspace."
+        description = "Lists the functions and methods on the shortest call paths from one function to another in the SCIP call graph, in call order. Input: from and to as names or node ids; max_depth 1 through 8 (default 4). Output: anchor ({from, to}, each with candidates when its name matches several declarations), steps, path_length, results (node, name, path, line, role, group path, depth from `from`), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored with both frontier sizes; next with a deeper max_depth) and counts (operator_calls). Limits: 40 path nodes listed; edges are calls and references between functions and methods, they end at a trait method and implementations are not enumerated; needs the server's SCIP index."
     )]
     async fn flow_path(
         &self,
@@ -383,7 +383,7 @@ impl McpServer {
         self.recipe(recipes::Request::FlowPath(args)).await
     }
     #[tool(
-        description = "Walks the SCIP call graph from a function with the traversal engine's flow policy (beam 64, maps graph.scip and structure.contains) and returns the k best nodes reached. Input: entry as a name or node id of a function or method; k 1 through 40 (default 10). Output: anchor, steps, results (node, name, path, line, role, group walk, depth, witness), walk (stop_reason, status, trace file), stop (reason complete, ambiguous_anchor, empty or over_budget; partial) and counts (operator_calls = the walk's map expansions). Limits: the traversal budget of the server's [traverse] caps; needs index.scip in the workspace."
+        description = "Walks the SCIP call graph from a function with the traversal engine's flow policy (beam = the larger of [traverse] beam and 64, maps graph.scip and structure.contains) and returns the k best nodes reached. Input: entry as a name or node id of a function or method; k 1 through 40 (default 10). Output: anchor, steps, results (node, name, path, line, role, group walk, or file for a file node, depth, witness), walk (stop_reason, status, trace file), stop (reason complete, ambiguous_anchor, empty or over_budget; partial) and counts (operator_calls = the walk's map expansions). Limits: the traversal budget of the server's [traverse] caps; needs the server's SCIP index."
     )]
     async fn flow_from(
         &self,
@@ -392,7 +392,7 @@ impl McpServer {
         self.recipe(recipes::Request::FlowFrom(args)).await
     }
     #[tool(
-        description = "For a declaration: the keys of config.example.toml it reads or sets (group keys), the other declarations that read or set those keys (group other_readers, with the keys in note) and the declarations that reference it (group callers). Input: symbol as a name or node id. Output: anchor (candidates when the name matches several declarations), steps, results (node, name, path, line, role, group), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next impact_rings when the declaration touches no key) and counts (operator_calls). Limits: 20 keys, 80 other readers and 60 callers listed; exact SCIP witnesses only; needs index.scip in the workspace and rg on PATH."
+        description = "For a declaration: the keys of config.example.toml it reads or sets (group keys), the other declarations that read or set those keys (group other_readers, with the keys in note) and the declarations that reference it (group callers). Input: symbol as a name or node id. Output: anchor (candidates when the name matches several declarations), steps, results (node, name, path, line, role, group), stop (reason complete, ambiguous_anchor, empty or fanout_cap; partial; unexplored; next impact_rings when the declaration touches no key) and counts (operator_calls). Limits: 20 keys, 80 other readers and 60 callers listed; exact SCIP witnesses only; needs the server's SCIP index and rg on PATH."
     )]
     async fn config_neighbours(
         &self,
@@ -406,7 +406,7 @@ impl McpServer {
 #[tool_router(router = compose_router)]
 impl McpServer {
     #[tool(
-        description = "Runs 1 to 6 operator steps in order, with `$sN.symbols` / `$sN.keys` (or bare `$sN`) references to earlier steps and no model call between them. Ops: seeds.scip_names (names -> symbols), exact.closure (symbols -> declarations that reference them, one hop), scip.impact (symbols, depth 1-3 -> declarations that reach them, nearest first), graph.scip (symbols, depth 1-4 -> functions they call, nearest first), config.key (keys -> reader symbols, or symbols -> keys), set.union / set.intersect / set.minus (of: references), pick (from, role prod|test, path_glob, name_glob, top). Input: steps as [{id, op, in}]. Output: resolved (every step's size and first 40 nodes), results (the last step's nodes), stop (reason complete, ambiguous_anchor, empty or fanout_cap), counts (operator_calls). Limits: 2000 nodes per step, 40 listed; a name that matches several declarations stops the call with candidates; needs index.scip in the workspace and, for config.key, rg on PATH."
+        description = "Runs 1 to 6 operator steps in order, with `$sN.symbols` / `$sN.keys` (or bare `$sN`) references to earlier steps and no model call between them. Ops: seeds.scip_names (names -> symbols), exact.closure (symbols -> declarations that reference them, one hop), scip.impact (symbols, depth 1-3 -> declarations that reach them, nearest first), graph.scip (symbols, depth 1-4 -> functions they call, nearest first), config.key (keys -> reader symbols, or symbols -> keys), set.union / set.intersect / set.minus (of: references), pick (from, role prod|test, path_glob, name_glob, top). Input: steps as [{id, op, in}]. Output: resolved (every step's size and first 40 nodes), results (the last step's nodes), stop (reason complete, ambiguous_anchor, empty or fanout_cap), counts (operator_calls). Limits: 2000 nodes per step, 40 listed; a name that matches several declarations stops the call with candidates; needs the server's SCIP index and, for config.key, rg on PATH."
     )]
     async fn lci_compose(
         &self,

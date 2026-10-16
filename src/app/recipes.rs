@@ -34,14 +34,22 @@
 //!
 //! The closures read the index directly and are not capped by the 40-card
 //! limit of a traversal; each recipe has its own caps, and a cut result says
-//! so (`fanout_cap`, `partial`). Roles are classified from the path (`tests/`
-//! directory, `tests.rs`, `*_test.rs`); a `#[cfg(test)]` module inside a
-//! source file counts as production.
+//! so (`fanout_cap`, `partial`); every cut a recipe makes is listed in
+//! `stop.unexplored`, and `stop.at` names the first. A declaration is a test
+//! when its path has a `tests` or `test` directory or is `tests.rs`,
+//! `*_test.rs` or `*_tests.rs`, or when its SCIP module path holds a `tests`
+//! or `test` module (an inline `#[cfg(test)] mod tests`); no file is read.
 //!
-//! `counts.operator_calls` counts one per `exact.closure` or `scip.impact`
-//! expansion, one per `config.key` expansion, one per breadth-first search
-//! direction of `flow_path`, and, for `flow_from`, the expansions the
-//! traversal reports per map. It is also logged per request (`operator_calls`).
+//! # Operator calls
+//!
+//! `counts.operator_calls` has one rule: one call per node an operator
+//! expands. `exact.closure` and `scip.impact` count one per declaration whose
+//! referrers they read; `config.key` one per key or declaration it expands;
+//! `graph.scip` and the two search directions of `flow_path` one per
+//! breadth-first pop below the depth limit, per direction (the expansions a
+//! walk would make); `flow_from` the expansions the traversal reports per
+//! map. `seeds.scip_names` counts one per call, and the set operators and
+//! `pick` count none. It is also logged per request (`operator_calls`).
 
 mod compose;
 #[cfg(test)]
@@ -60,7 +68,7 @@ use lci_maps::{
     Budget, Map, SnapshotRef, SnapshotView,
     config_key::ConfigKeyMap,
     edge::Edge,
-    impact::{ImpactIndex, code_names},
+    impact::{Chain, ImpactIndex, code_names},
     reads_key,
     scip_graph::ScipMap,
     scip_impact::ImpactMap,
@@ -414,6 +422,17 @@ impl Stop {
         self
     }
 
+    /// A cut at `step`: every cut is listed in `unexplored`; `at` stays the
+    /// step of the first.
+    pub fn cap(&mut self, step: &str, item: Value) {
+        if self.reason == "complete" {
+            self.at = step.into();
+            self.reason = "fanout_cap";
+            self.partial = true;
+        }
+        self.unexplored.push(item);
+    }
+
     pub fn next(mut self, recipe: &str, args: Value) -> Self {
         self.next = Some(json!({"recipe": recipe, "args": args}));
         self
@@ -507,13 +526,24 @@ pub(crate) fn role_of(path: &str) -> &'static str {
     }
 }
 
+/// The role of a declaration: [`role_of`] its path, and `test` also when a
+/// module of its SCIP symbol (every name before the last) is `tests` or
+/// `test`, which is how an inline `#[cfg(test)] mod tests` shows. No I/O.
+pub(crate) fn role_of_decl(path: &str, chain: Option<&Chain>) -> &'static str {
+    let inline = chain.is_some_and(|chain| {
+        let modules = &chain.names[..chain.names.len().saturating_sub(1)];
+        modules.iter().any(|name| name == "tests" || name == "test")
+    });
+    if inline { "test" } else { role_of(path) }
+}
+
 // --------------------------------------------------------------- resolution
 
 /// What a name resolved to.
 pub(crate) enum Resolution {
     One(usize, &'static str),
     Many(Vec<usize>),
-    Missing(&'static str),
+    Missing(String),
 }
 
 /// A recipe that could not start or go on: the anchor as far as it got and
@@ -545,12 +575,17 @@ impl Sources {
         }
     }
 
+    /// The role of a definition: its path and its module path.
+    pub fn role(&self, def: usize) -> &'static str {
+        role_of_decl(&self.ix().defs[def].path, self.ix().chains[def].as_ref())
+    }
+
     /// A row for a definition.
     pub fn row(&self, def: usize, group: &str, via: &[&str]) -> Row {
         let decl = self.ix().decl(def);
         Row {
             node: self.node_string(def),
-            role: role_of(&decl.path),
+            role: self.role(def),
             name: decl.name,
             path: decl.path,
             line: decl.line,
@@ -568,29 +603,49 @@ impl Sources {
     pub fn resolve(&self, given: &str) -> Resolution {
         let given = given.trim();
         if given.is_empty() {
-            return Resolution::Missing("empty name");
+            return Resolution::Missing("empty name".into());
         }
         if given.starts_with("sym:") {
             return match NodeId::from_str(given) {
                 Ok(node) => match self.impact.def_of(&node) {
                     Some(def) => Resolution::One(def, "id"),
-                    None => Resolution::Missing("no declaration has that node id"),
+                    None => Resolution::Missing("no declaration has that node id".into()),
                 },
-                Err(_) => Resolution::Missing("not a name or a node id"),
+                Err(_) => Resolution::Missing("not a name or a node id".into()),
             };
+        }
+        let ix = self.ix();
+        // The raw SCIP symbol of a declaration that has no node id (a field,
+        // an enum variant) is the `node` a candidate lists; it resolves back.
+        if let Some(def) = ix.def_index(given) {
+            return Resolution::One(def, "id");
         }
         let (names, _) = code_names(&format!("`{given}`"));
         if names.is_empty() {
-            return Resolution::Missing("not a name: use identifiers joined by `::`");
+            return Resolution::Missing("not a name: use identifiers joined by `::`".into());
         }
-        let ix = self.ix();
-        let found: Vec<usize> = ix
-            .anchor_candidates(&names)
-            .into_iter()
+        let matched = ix.anchor_candidates(&names);
+        let found: Vec<usize> = matched
+            .iter()
+            .copied()
             .filter(|&def| ix.anchorable(def))
             .collect();
         match found.len() {
-            0 => Resolution::Missing("no declaration of the index has that name"),
+            0 if !matched.is_empty() => {
+                let unkinded = matched
+                    .iter()
+                    .filter(|&&def| ix.kinds[def].is_none())
+                    .count();
+                Resolution::Missing(if unkinded == matched.len() {
+                    format!("found {unkinded} declarations without a kind; not anchorable")
+                } else {
+                    format!(
+                        "found {} declarations that are not anchorable ({unkinded} without a kind)",
+                        matched.len()
+                    )
+                })
+            }
+            0 => Resolution::Missing("no declaration of the index has that name".into()),
             1 => Resolution::One(found[0], "exact"),
             _ => Resolution::Many(found),
         }
@@ -861,8 +916,10 @@ async fn config_readers(
     }
     let mut stop = Stop::complete();
     if readers.len() > CAP_READERS {
-        stop = Stop::at("s1", "fanout_cap", true)
-            .unexplored(json!({"readers_not_listed": readers.len() - CAP_READERS}));
+        stop.cap(
+            "s1",
+            json!({"readers_not_listed": readers.len() - CAP_READERS}),
+        );
         readers.truncate(CAP_READERS);
     }
 
@@ -876,7 +933,7 @@ async fn config_readers(
             expanded += 1;
             for user in ix.closure(&ix.defs[def].symbol) {
                 let d = &ix.defs[user];
-                if user == def || role_of(&d.path) != "test" {
+                if user == def || sources.role(user) != "test" {
                     continue;
                 }
                 covers
@@ -893,15 +950,14 @@ async fn config_readers(
             .collect();
         run.step(
             "s2",
-            "scip.impact",
+            "exact.closure",
             json!({"depth": 1, "role": "test"}),
             expanded,
             tests.len(),
             at,
         );
-        if tests.len() > CAP_TESTS && stop.reason == "complete" {
-            stop = Stop::at("s2", "fanout_cap", true)
-                .unexplored(json!({"tests_not_listed": tests.len() - CAP_TESTS}));
+        if tests.len() > CAP_TESTS {
+            stop.cap("s2", json!({"tests_not_listed": tests.len() - CAP_TESTS}));
         }
         let listed: Vec<Row> = tests
             .into_iter()
@@ -969,9 +1025,11 @@ fn impact_rings(sources: &Sources, args: &ImpactRingsArgs, started: Instant) -> 
     let mut stop = Stop::complete();
     let mut listed1 = ring1.clone();
     if listed1.len() > CAP_RING1 {
-        stop = Stop::at("s2", "fanout_cap", true)
-            .unexplored(json!({"ring_1_not_listed": listed1.len() - CAP_RING1}))
-            .unexplored(json!({"ring_2": "not computed from a cut ring 1"}));
+        stop.cap(
+            "s2",
+            json!({"ring_1_not_listed": listed1.len() - CAP_RING1}),
+        );
+        stop.cap("s2", json!({"ring_2": "not computed from a cut ring 1"}));
         listed1.truncate(CAP_RING1);
     }
     for &user in &listed1 {
@@ -999,7 +1057,7 @@ fn impact_rings(sources: &Sources, args: &ImpactRingsArgs, started: Instant) -> 
         run.seen += ring2.len() as u64;
         run.step(
             "s3",
-            "scip.impact",
+            "exact.closure",
             json!({"depth": 1, "from": "ring_1"}),
             ring1.len(),
             ring2.len(),
@@ -1013,8 +1071,7 @@ fn impact_rings(sources: &Sources, args: &ImpactRingsArgs, started: Instant) -> 
             run.rows.push(row);
         }
         if total > CAP_RING2 {
-            stop = Stop::at("s3", "fanout_cap", true)
-                .unexplored(json!({"ring_2_not_listed": total - CAP_RING2}));
+            stop.cap("s3", json!({"ring_2_not_listed": total - CAP_RING2}));
         }
     }
     Ok(finish(recipe, anchor, run, stop, started, None))
@@ -1022,19 +1079,22 @@ fn impact_rings(sources: &Sources, args: &ImpactRingsArgs, started: Instant) -> 
 
 // ----------------------------------------------------------------- flow_path
 
-/// Distances from `start` along `adjacent`, at most `max` hops.
+/// Distances from `start` along `adjacent`, at most `max` hops, and the
+/// number of nodes expanded: the breadth-first pops below `max`.
 fn distances(
     start: usize,
     max: u32,
     adjacent: &dyn Fn(usize) -> Vec<usize>,
-) -> HashMap<usize, u32> {
+) -> (HashMap<usize, u32>, u64) {
     let mut dist = HashMap::from([(start, 0u32)]);
     let mut queue = VecDeque::from([start]);
+    let mut pops = 0;
     while let Some(node) = queue.pop_front() {
         let here = dist[&node];
         if here == max {
             continue;
         }
+        pops += 1;
         for next in adjacent(node) {
             dist.entry(next).or_insert_with(|| {
                 queue.push_back(next);
@@ -1042,7 +1102,7 @@ fn distances(
             });
         }
     }
-    dist
+    (dist, pops)
 }
 
 fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result<Value> {
@@ -1052,44 +1112,53 @@ fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result
         bail!("max_depth must be 1 through {MAX_PATH_DEPTH}");
     }
     let mut run = Run::default();
-    let mut ends = Vec::new();
+    // Both ends are resolved before the recipe stops, so the anchor always
+    // has the `{from, to}` shape and shows what each end came to.
+    let mut anchors = Vec::new();
+    let mut nodes = Vec::new();
+    let mut halted: Option<Stop> = None;
     for (given, step) in [(&args.from, "s1"), (&args.to, "s2")] {
-        let (def, anchor) = match sources.anchor(given, step) {
-            Ok(found) => found,
-            Err(halted) => return Ok(halt(recipe, *halted, run, started)),
-        };
-        let Some(node) = sources.graph_node(def) else {
-            let anchor = json!({"given": given, "resolved": sources.node_string(def),
-                "why": "not a function or method: the call graph has no node for it"});
-            return Ok(finish(
-                recipe,
-                anchor,
-                run,
-                Stop::at(step, "empty", false),
-                started,
-                None,
-            ));
-        };
-        run.step(
-            step,
-            "resolve",
-            json!({"name": given}),
-            1,
-            1,
-            Instant::now(),
-        );
-        ends.push((node, anchor));
+        match sources.anchor(given, step) {
+            Err(halt) => {
+                let halt = *halt;
+                anchors.push(halt.anchor);
+                halted.get_or_insert(halt.stop);
+            }
+            Ok((def, anchor)) => {
+                let Some(node) = sources.graph_node(def) else {
+                    anchors.push(json!({"given": given, "resolved": sources.node_string(def),
+                        "kind": sources.ix().kind_name(def),
+                        "why": "not a function or method: the call graph has no node for it"}));
+                    halted.get_or_insert(Stop::at(step, "empty", false));
+                    continue;
+                };
+                run.step(
+                    step,
+                    "resolve",
+                    json!({"name": given}),
+                    1,
+                    1,
+                    Instant::now(),
+                );
+                anchors.push(anchor);
+                nodes.push(node);
+            }
+        }
     }
-    let (from, from_anchor) = ends.remove(0);
-    let (to, to_anchor) = ends.remove(0);
+    let to_anchor = anchors.pop().unwrap_or(Value::Null);
+    let from_anchor = anchors.pop().unwrap_or(Value::Null);
     let anchor = json!({"from": from_anchor, "to": to_anchor});
+    if let Some(stop) = halted {
+        return Ok(finish(recipe, anchor, run, stop, started, None));
+    }
+    let (from, to) = (nodes[0], nodes[1]);
     let graph = sources.scip.graph();
 
     let at = Instant::now();
-    let forward = distances(from, max_depth, &|n| {
+    let (forward, pops) = distances(from, max_depth, &|n| {
         graph.out[n].iter().map(|e| e.to).collect()
     });
-    run.calls += 1;
+    run.calls += pops;
     run.step(
         "s3",
         "graph.scip",
@@ -1106,8 +1175,8 @@ fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result
             reverse_edges[edge.to].push(caller);
         }
     }
-    let backward = distances(to, max_depth, &|n| reverse_edges[n].clone());
-    run.calls += 1;
+    let (backward, pops) = distances(to, max_depth, &|n| reverse_edges[n].clone());
+    run.calls += pops;
     run.step(
         "s4",
         "graph.scip",
@@ -1145,8 +1214,7 @@ fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result
     let total = on_path.len();
     let mut stop = Stop::complete();
     if total > CAP_PATH {
-        stop = Stop::at("s4", "fanout_cap", true)
-            .unexplored(json!({"path_nodes_not_listed": total - CAP_PATH}));
+        stop.cap("s4", json!({"path_nodes_not_listed": total - CAP_PATH}));
     }
     for (depth, _, node) in on_path.into_iter().take(CAP_PATH) {
         let Some(def) = sources.def_of_graph(node) else {
@@ -1265,7 +1333,12 @@ async fn flow_from(
                 path: card["site"]["path"].as_str().unwrap_or_default().to_owned(),
                 line: card["site"]["line"].as_u64().unwrap_or(0) as u32,
                 role: role_of(card["site"]["path"].as_str().unwrap_or_default()),
-                group: "walk".into(),
+                group: if node_text.starts_with("file:") {
+                    "file"
+                } else {
+                    "walk"
+                }
+                .into(),
                 ring: None,
                 depth: None,
                 via: vec!["s2".into()],
@@ -1348,8 +1421,7 @@ async fn config_neighbours(
     }
     let mut stop = Stop::complete();
     if keys.len() > CAP_KEYS {
-        stop = Stop::at("s2", "fanout_cap", true)
-            .unexplored(json!({"keys_not_listed": keys.len() - CAP_KEYS}));
+        stop.cap("s2", json!({"keys_not_listed": keys.len() - CAP_KEYS}));
         keys.truncate(CAP_KEYS);
     }
     for key in &keys {
@@ -1383,9 +1455,11 @@ async fn config_neighbours(
         at,
     );
     let total = others.len();
-    if total > CAP_OTHER_READERS && stop.reason == "complete" {
-        stop = Stop::at("s3", "fanout_cap", true)
-            .unexplored(json!({"other_readers_not_listed": total - CAP_OTHER_READERS}));
+    if total > CAP_OTHER_READERS {
+        stop.cap(
+            "s3",
+            json!({"other_readers_not_listed": total - CAP_OTHER_READERS}),
+        );
     }
     for id in order.into_iter().take(CAP_OTHER_READERS) {
         if let Some((mut row, via_keys)) = others.remove(&id) {
@@ -1413,9 +1487,11 @@ async fn config_neighbours(
         callers.len(),
         at,
     );
-    if callers.len() > CAP_RING1 && stop.reason == "complete" {
-        stop = Stop::at("s4", "fanout_cap", true)
-            .unexplored(json!({"callers_not_listed": callers.len() - CAP_RING1}));
+    if callers.len() > CAP_RING1 {
+        stop.cap(
+            "s4",
+            json!({"callers_not_listed": callers.len() - CAP_RING1}),
+        );
     }
     for user in callers.into_iter().take(CAP_RING1) {
         run.rows.push(sources.row(user, "callers", &["s4"]));

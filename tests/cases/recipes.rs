@@ -104,11 +104,8 @@ fn the_recipe_command_prints_the_answer_without_a_server() {
     let (ok, stdout, stderr) = run("flow_from", r#"{"entry":"beta","k":5}"#);
     assert!(ok, "{stderr}");
     let walk: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        result_names(&walk, "walk"),
-        ["alpha", "file:a.rs"],
-        "{walk}"
-    );
+    assert_eq!(result_names(&walk, "walk"), ["alpha"], "{walk}");
+    assert_eq!(result_names(&walk, "file"), ["file:a.rs"], "{walk}");
 
     // An unknown recipe and a stray argument are refused by name.
     let (ok, _, stderr) = run("no_such_recipe", "{}");
@@ -169,6 +166,64 @@ async fn with_the_flags_off_no_recipe_tool_or_route_exists() {
     models_task.abort();
 }
 
+/// What a client sees of a server's surface: the instructions sent at
+/// `initialize`, the tools listed on `/mcp` (by name) and the OpenAPI
+/// document, as one value.
+async fn surface_of(app: Arc<App>) -> Value {
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, initialized) = mcp_initialize(&client, &base, "/mcp").await;
+    let listed = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    let mut tools = listed["tools"].as_array().unwrap().clone();
+    tools.sort_by_key(|tool| tool["name"].as_str().unwrap().to_owned());
+    let openapi = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    token.cancel();
+    server.abort();
+    json!({"instructions": initialized["instructions"], "tools": tools, "openapi": openapi})
+}
+
+/// With both flags off the server's surface is the surface of the commit
+/// before the recipes (b46786e): the same instructions, the same tools with
+/// the same descriptions and schemas, the same OpenAPI document.
+///
+/// A server built without the recipe and compose code paths cannot be
+/// constructed from this tree: the code is compiled in and the flags only
+/// decide whether the routers are merged. So the comparison is against a
+/// golden file taken from the binary of b46786e, produced by `surface_of`
+/// with the default configuration (`tests/golden/surface_flags_off.json`).
+/// Do not re-bless it from this tree; it is the reference, not an output.
+#[tokio::test]
+async fn with_the_flags_off_the_surface_is_that_of_the_commit_before_the_recipes() {
+    let (_temp, config, _fake, models_task) = fixture().await;
+    assert!(!config.recipes.enabled && !config.compose.enabled);
+    let app = Arc::new(App::open(config).await.unwrap());
+    let actual = surface_of(app).await;
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/surface_flags_off.json");
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(&golden)
+            .unwrap_or_else(|error| panic!("{}: {error}", golden.display())),
+    )
+    .unwrap();
+    // Compare the parts one by one so a failure names the part that moved.
+    assert_eq!(
+        actual["instructions"], expected["instructions"],
+        "server instructions changed"
+    );
+    assert_eq!(actual["tools"], expected["tools"], "tools/list changed");
+    assert_eq!(
+        actual["openapi"], expected["openapi"],
+        "openapi.json changed"
+    );
+    models_task.abort();
+}
+
 #[tokio::test]
 async fn with_the_flags_on_the_recipes_answer_over_mcp_and_rest() {
     let (temp, mut config, _fake, models_task) = fixture().await;
@@ -195,6 +250,18 @@ async fn with_the_flags_on_the_recipes_answer_over_mcp_and_rest() {
     }
     // The existing tools stay.
     assert!(listed.iter().any(|tool| tool["name"] == "search_code"));
+
+    // The six descriptions say the same thing about the index: it is the
+    // server's, not a file the caller has to find in the workspace.
+    for name in RECIPE_TOOLS {
+        let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("needs the server's SCIP index"),
+            "{name}: {description}"
+        );
+        assert!(!description.contains("index.scip"), "{name}: {description}");
+    }
 
     // One call over MCP.
     let called = mcp_result(

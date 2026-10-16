@@ -4,7 +4,7 @@
 use super::*;
 use lci_maps::{
     config_key::ConfigKeyOptions,
-    impact::Decl,
+    impact::{Decl, chain_of},
     scip_graph::{RawDocument, RawOccurrence, ScipGraph},
     scip_impact::ImpactOptions,
 };
@@ -335,7 +335,9 @@ fn a_path_lists_the_functions_between_the_ends_in_call_order() {
         .map(|row| row["depth"].as_u64().unwrap())
         .collect();
     assert_eq!(depths, [0, 1, 2, 3]);
-    assert_eq!(answer["counts"]["operator_calls"], 2);
+    // Breadth-first pops below the depth limit, per direction: top, deep,
+    // use_foo, Foo::run forward; Foo::run, use_foo, test_run, deep, top back.
+    assert_eq!(answer["counts"]["operator_calls"], 4 + 5);
 }
 
 #[test]
@@ -361,14 +363,36 @@ fn no_path_within_the_depth_asks_for_a_deeper_search_and_reports_the_frontiers()
     let typed = flow_path(&sources, &path_args("Foo", "top", None), started()).unwrap();
     assert_eq!(typed["stop"]["reason"], "empty");
     assert!(
-        typed["anchor"]["why"]
+        typed["anchor"]["from"]["why"]
             .as_str()
             .unwrap()
             .contains("call graph")
     );
 
+    // The anchor has the {from, to} shape whichever end stops the recipe.
     let ambiguous = flow_path(&sources, &path_args("run", "top", None), started()).unwrap();
     assert_eq!(ambiguous["stop"]["reason"], "ambiguous_anchor");
+    assert_eq!(ambiguous["stop"]["at"], "s1");
+    assert_eq!(
+        ambiguous["anchor"]["from"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(ambiguous["anchor"]["to"]["resolved"].is_string());
+    let ambiguous_to = flow_path(&sources, &path_args("top", "run", None), started()).unwrap();
+    assert_eq!(ambiguous_to["stop"]["reason"], "ambiguous_anchor");
+    assert_eq!(ambiguous_to["stop"]["at"], "s2");
+    assert!(ambiguous_to["anchor"]["from"]["resolved"].is_string());
+    assert_eq!(
+        ambiguous_to["anchor"]["to"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(ambiguous_to["anchor"].get("candidates").is_none());
     assert!(flow_path(&sources, &path_args("top", "run", Some(9)), started()).is_err());
 }
 
@@ -515,6 +539,8 @@ async fn compose_walks_impact_and_callees_with_their_depths_and_joins_keys() {
     ]));
     let answer = compose::run(&sources, &callees, started()).await.unwrap();
     assert_eq!(names(&answer, "a"), ["deep", "use_foo", "Foo::run"]);
+    // Breadth-first pops below depth 3: top, deep, use_foo.
+    assert_eq!(answer["counts"]["operator_calls"], 3);
 
     let keys = compose_of(json!([
         {"id": "k", "op": "config.key", "in": {"keys": ["server.port"]}},
@@ -617,6 +643,229 @@ fn roles_follow_the_path_and_globs_match_names() {
     assert!(compose::glob_match("*", ""));
 }
 
+/// A function definition and its enclosing range on one line.
+fn fn_def(line: u32, symbol: &str) -> RawOccurrence {
+    occ((line, 3, line, 12), symbol, 1, Some((line, 0, line, 60)))
+}
+
+/// A reference on a line, to a symbol.
+fn reference(line: u32, symbol: &str) -> RawOccurrence {
+    occ((line, 20, line, 28), symbol, 0, None)
+}
+
+fn all_functions(symbols: &[&str]) -> HashMap<String, Kind> {
+    symbols
+        .iter()
+        .map(|symbol| (sym(symbol), Kind::Function))
+        .collect()
+}
+
+#[test]
+fn a_declaration_in_a_tests_module_is_a_test_whatever_its_path() {
+    // The SCIP symbol of `lci-core/src/config.rs:1045`, a test of the frozen
+    // tree that sits in an inline `#[cfg(test)] mod tests`.
+    let inline =
+        "rust-analyzer cargo lci-core 0.1.0 config/tests/grep_only_arm_is_a_valid_configuration().";
+    assert_eq!(
+        role_of_decl("lci-core/src/config.rs", chain_of(inline).as_ref()),
+        "test"
+    );
+    assert_eq!(role_of("lci-core/src/config.rs"), "prod");
+    // A `test` module counts the same; a type or function of that name does not.
+    let module = chain_of(&sym("a/test/helper().")).unwrap();
+    assert_eq!(role_of_decl("src/a.rs", Some(&module)), "test");
+    let named = chain_of(&sym("a/test().")).unwrap();
+    assert_eq!(role_of_decl("src/a.rs", Some(&named)), "prod");
+    let production = chain_of(&sym("a/reader().")).unwrap();
+    assert_eq!(role_of_decl("src/a.rs", Some(&production)), "prod");
+    // The path still decides when the symbol says nothing.
+    assert_eq!(role_of_decl("tests/t.rs", Some(&production)), "test");
+    assert_eq!(role_of_decl("tests/t.rs", None), "test");
+}
+
+#[tokio::test]
+async fn an_inline_test_module_shows_as_a_test_in_every_recipe_that_lists_roles() {
+    let (reader, user, covers) = (
+        sym("a/reader()."),
+        sym("a/prod_user()."),
+        sym("a/tests/covers_reader()."),
+    );
+    let docs = vec![RawDocument {
+        path: "src/a.rs".into(),
+        occurrences: vec![
+            fn_def(0, &reader),
+            fn_def(1, &user),
+            reference(1, &reader),
+            fn_def(2, &covers),
+            reference(2, &reader),
+        ],
+    }];
+    let kinds = all_functions(&["a/reader().", "a/prod_user().", "a/tests/covers_reader()."]);
+    let edges = [key_edge(
+        "server.port",
+        decl("reader", 1, "a/reader().", "src/a.rs"),
+    )];
+    let sources = sources_of(docs, &kinds, &edges);
+
+    // config_readers keeps only tests in its test step: the inline one stays.
+    let answer = config_readers(&sources, &readers("server.port", true), started())
+        .await
+        .unwrap();
+    assert_eq!(names(&answer, "tests"), ["covers_reader"], "{answer}");
+    let row = answer["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["group"] == "tests")
+        .unwrap();
+    assert_eq!(row["role"], "test");
+    assert_eq!(row["path"], "src/a.rs");
+
+    // The rings label it, and tell it from the production user.
+    let ringed = impact_rings(&sources, &rings("reader", Some(1)), started()).unwrap();
+    let mut roles: Vec<(&str, &str)> = ringed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| (row["name"].as_str().unwrap(), row["role"].as_str().unwrap()))
+        .collect();
+    roles.sort();
+    assert_eq!(roles, [("covers_reader", "test"), ("prod_user", "prod")]);
+
+    // So does `pick`.
+    let picked = compose_of(json!([
+        {"id": "s1", "op": "seeds.scip_names", "in": {"names": ["reader"]}},
+        {"id": "s2", "op": "exact.closure", "in": {"symbols": "$s1.symbols"}},
+        {"id": "s3", "op": "pick", "in": {"from": "$s2", "role": "test"}},
+    ]));
+    let answer = compose::run(&sources, &picked, started()).await.unwrap();
+    assert_eq!(names(&answer, "s3"), ["covers_reader"], "{answer}");
+}
+
+/// Two fields called `reranker` and one function using each.
+fn field_sources() -> Sources {
+    let (one, two) = (sym("a/Config#reranker."), sym("a/Other#reranker."));
+    let (use_one, use_two) = (sym("a/use_one()."), sym("a/use_two()."));
+    let docs = vec![RawDocument {
+        path: "src/a.rs".into(),
+        occurrences: vec![
+            occ((0, 2, 0, 10), &one, 1, Some((0, 2, 0, 20))),
+            occ((1, 2, 1, 10), &two, 1, Some((1, 2, 1, 20))),
+            fn_def(2, &use_one),
+            reference(2, &one),
+            fn_def(3, &use_two),
+            reference(3, &two),
+        ],
+    }];
+    let mut kinds = all_functions(&["a/use_one().", "a/use_two()."]);
+    kinds.insert(one, Kind::Field);
+    kinds.insert(two, Kind::Field);
+    sources_of(docs, &kinds, &[])
+}
+
+#[tokio::test]
+async fn every_candidate_node_of_an_ambiguous_name_is_accepted_back() {
+    let sources = field_sources();
+    let ambiguous = impact_rings(&sources, &rings("reranker", Some(1)), started()).unwrap();
+    assert_eq!(ambiguous["stop"]["reason"], "ambiguous_anchor");
+    let candidates = ambiguous["anchor"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{ambiguous}");
+    let mut users = Vec::new();
+    for candidate in candidates {
+        assert_eq!(candidate["kind"], "field");
+        let node = candidate["node"].as_str().unwrap();
+        let back = impact_rings(&sources, &rings(node, Some(1)), started()).unwrap();
+        assert_eq!(back["stop"]["reason"], "complete", "{node}: {back}");
+        assert_eq!(back["anchor"]["how"], "id");
+        assert_eq!(back["anchor"]["resolved"], node);
+        users.extend(names(&back, "ring_1"));
+
+        // The same node goes into the other recipes and into a composition.
+        let composed = compose_of(json!([
+            {"id": "s1", "op": "seeds.scip_names", "in": {"names": [node]}},
+            {"id": "s2", "op": "exact.closure", "in": {"symbols": "$s1.symbols"}},
+        ]));
+        let answer = compose::run(&sources, &composed, started()).await.unwrap();
+        assert_eq!(answer["stop"]["reason"], "complete", "{node}: {answer}");
+        assert_eq!(names(&answer, "s2").len(), 1, "{answer}");
+    }
+    users.sort();
+    assert_eq!(users, ["use_one", "use_two"]);
+}
+
+#[test]
+fn a_name_whose_declarations_have_no_kind_says_so() {
+    let docs = vec![RawDocument {
+        path: "src/a.rs".into(),
+        occurrences: vec![
+            fn_def(0, &sym("a/orphan().")),
+            fn_def(1, &sym("b/orphan().")),
+        ],
+    }];
+    let sources = sources_of(docs, &HashMap::new(), &[]);
+    let answer = impact_rings(&sources, &rings("orphan", None), started()).unwrap();
+    assert_eq!(answer["stop"]["reason"], "empty");
+    assert_eq!(
+        answer["anchor"]["why"],
+        "found 2 declarations without a kind; not anchorable"
+    );
+    let unknown = impact_rings(&sources, &rings("nothing_here", None), started()).unwrap();
+    assert!(
+        unknown["anchor"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("no declaration of the index")
+    );
+}
+
+#[tokio::test]
+async fn every_cut_is_listed_as_unexplored_and_the_stop_names_the_first() {
+    let readers_cut = 3;
+    let tests_cut = 4;
+    let mut occurrences = Vec::new();
+    let mut kinds = HashMap::new();
+    let mut edges = Vec::new();
+    for i in 0..(CAP_READERS + readers_cut) {
+        let name = format!("a/reader{i}().");
+        occurrences.push(fn_def(i as u32, &sym(&name)));
+        kinds.insert(sym(&name), Kind::Function);
+        edges.push(key_edge(
+            "server.port",
+            decl(&format!("reader{i}"), i as u32 + 1, &name, "src/a.rs"),
+        ));
+    }
+    let mut test_occurrences = Vec::new();
+    for j in 0..(CAP_TESTS + tests_cut) {
+        let name = format!("t/test{j}().");
+        test_occurrences.push(fn_def(j as u32, &sym(&name)));
+        test_occurrences.push(reference(j as u32, &sym("a/reader0().")));
+        kinds.insert(sym(&name), Kind::Function);
+    }
+    let docs = vec![
+        RawDocument {
+            path: "src/a.rs".into(),
+            occurrences,
+        },
+        RawDocument {
+            path: "tests/t.rs".into(),
+            occurrences: test_occurrences,
+        },
+    ];
+    let sources = sources_of(docs, &kinds, &edges);
+    let answer = config_readers(&sources, &readers("server.port", true), started())
+        .await
+        .unwrap();
+    assert_eq!(answer["stop"]["reason"], "fanout_cap");
+    assert_eq!(answer["stop"]["at"], "s1");
+    assert_eq!(answer["stop"]["partial"], true);
+    assert_eq!(
+        answer["stop"]["unexplored"],
+        json!([{"readers_not_listed": readers_cut}, {"tests_not_listed": tests_cut}])
+    );
+    assert_eq!(names(&answer, "readers").len(), CAP_READERS);
+    assert_eq!(names(&answer, "tests").len(), CAP_TESTS);
+}
+
 /// A tree with an `index.scip` written to disk (kinds included): `alpha`
 /// references `Foo`, `beta` calls `alpha`.
 struct Tree {
@@ -706,7 +955,9 @@ async fn recipes_run_over_an_index_file_and_the_walk_goes_through_the_traversal(
     let walk = tree
         .ask(json!({"flow_from": {"entry": "beta", "k": 5}}), false)
         .await;
-    assert_eq!(names(&walk, "walk"), ["alpha", "file:a.rs"], "{walk}");
+    // The file node the walk passes through is kept, in its own group.
+    assert_eq!(names(&walk, "walk"), ["alpha"], "{walk}");
+    assert_eq!(names(&walk, "file"), ["file:a.rs"], "{walk}");
     assert_eq!(walk["stop"]["reason"], "complete", "{walk}");
     assert!(
         walk["counts"]["operator_calls"].as_u64().unwrap() >= 1,
@@ -724,6 +975,7 @@ async fn recipes_run_over_an_index_file_and_the_walk_goes_through_the_traversal(
         .ask(json!({"flow_from": {"entry": "beta"}}), true)
         .await;
     assert_eq!(names(&judged, "walk"), names(&walk, "walk"));
+    assert_eq!(names(&judged, "file"), names(&walk, "file"));
     assert!(
         judged["stop"]["unexplored"][0]["flow_judge"]
             .as_str()

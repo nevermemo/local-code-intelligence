@@ -17,7 +17,8 @@
 //!
 //! A reference is `$sN.symbols`, `$sN.keys` or a bare `$sN` (the step's main
 //! output). A name that matches several declarations stops the call with
-//! `ambiguous_anchor` and its candidates.
+//! `ambiguous_anchor` and its candidates. `counts.operator_calls` follows the
+//! rule in the header of the parent module (one per node an operator expands).
 
 use super::*;
 
@@ -305,8 +306,9 @@ fn impact_reach(
     Ok(out)
 }
 
-/// Functions called within `depth` hops of `start`, nearest first.
-fn callee_reach(sources: &Sources, start: &[usize], depth: u32) -> Out {
+/// Functions called within `depth` hops of `start`, nearest first, and the
+/// number of nodes expanded (the breadth-first pops below `depth`).
+fn callee_reach(sources: &Sources, start: &[usize], depth: u32) -> (Out, u64) {
     let graph = sources.scip.graph();
     let roots: Vec<usize> = start
         .iter()
@@ -314,11 +316,13 @@ fn callee_reach(sources: &Sources, start: &[usize], depth: u32) -> Out {
         .collect();
     let mut dist: HashMap<usize, u32> = roots.iter().map(|&n| (n, 0)).collect();
     let mut queue: VecDeque<usize> = roots.iter().copied().collect();
+    let mut pops = 0;
     while let Some(node) = queue.pop_front() {
         let here = dist[&node];
         if here == depth {
             continue;
         }
+        pops += 1;
         for edge in &graph.out[node] {
             dist.entry(edge.to).or_insert_with(|| {
                 queue.push_back(edge.to);
@@ -339,7 +343,7 @@ fn callee_reach(sources: &Sources, start: &[usize], depth: u32) -> Out {
             out.depths.push(d);
         }
     }
-    out
+    (out, pops)
 }
 
 async fn execute(env: &Env<'_>, step: &StepArgs, calls: &mut u64) -> R<(Out, usize)> {
@@ -401,8 +405,8 @@ async fn execute(env: &Env<'_>, step: &StepArgs, calls: &mut u64) -> R<(Out, usi
             };
             let start = env.symbols(id, value)?;
             let depth = depth_of(step, 1, 4)?;
-            *calls += 1;
-            let out = callee_reach(sources, &start, depth);
+            let (out, pops) = callee_reach(sources, &start, depth);
+            *calls += pops;
             if out.symbols.len() > MAX_SET {
                 return Err(capped(id, "graph.scip", out.symbols.len()));
             }
@@ -541,7 +545,7 @@ async fn execute(env: &Env<'_>, step: &StepArgs, calls: &mut u64) -> R<(Out, usi
                 .into_iter()
                 .filter(|&def| {
                     let decl = ix.decl(def);
-                    role.is_none_or(|r| role_of(&decl.path) == r)
+                    role.is_none_or(|r| sources.role(def) == r)
                         && path_glob.is_none_or(|g| glob_match(g, &decl.path))
                         && name_glob.is_none_or(|g| glob_match(g, &decl.name))
                 })
@@ -701,11 +705,10 @@ pub(super) async fn run(
             (id.clone(), json!({"n": out.size(), "listed": listed}))
         })
         .collect();
-    if let Some((id, last)) = env.done.last().filter(|_| stop.reason == "complete")
+    if let Some((id, last)) = env.done.last()
         && last.size() > SHOWN
     {
-        stop = Stop::at(id, "fanout_cap", true)
-            .unexplored(json!({"results_not_listed": last.size() - SHOWN}));
+        stop.cap(id, json!({"results_not_listed": last.size() - SHOWN}));
     }
     if let Some((id, last)) = env.done.last() {
         run.rows = rows_of(sources, id, last, SHOWN);
