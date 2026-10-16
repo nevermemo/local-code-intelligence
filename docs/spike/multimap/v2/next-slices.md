@@ -120,6 +120,9 @@ not depend on N2. Not taken by default; the owner's order stands.
 - Also recorded, not gates: the plan's step count against the tool calls the same agent
   makes without the schema, and an uncued arm (native tools plus today's LCI tool
   descriptions, no cue) that records whether agents pick LCI tools at all.
+- Ran 2026-10-16: KILLED, 12 of 54 units (22%) executable and on target; agents write plans that run (85%)
+  but miss the answer. Uncued, agents used lci tools in 4 of 54 runs. Results in `n1-results.md`. N3 builds
+  recipes only.
 - Operator gaps found while designing the tasks are listed per task (no implements edge,
   no doc-section nodes, no path operator, `config.key` misses string-literal TOML).
 
