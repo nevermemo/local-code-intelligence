@@ -615,3 +615,24 @@ where-to at 10 (default at 20, as in N0), impact and history. A judge pays only
 where the walk's tie order is the problem (flow at 10), and there the local
 pick's test gain is +.03 (+.02 for the cheaper tie-only judge), below what the
 tests can separate from noise.
+
+## Do bench metric differences predict answer quality? (proxy validity, pv2)
+
+Pre-registered check, run 2026-10-16. For one arm pair (first stage with walk cards dropped against first stage plus
+walk, both cut at 20 cards), a reader model answered each bench question from each arm's cards only, three
+repetitions, and two blind judges (a third on disagreement) graded the answers against gold. The statistic is the
+pooled Spearman correlation between the per-item metric difference and the per-item graded answer difference;
+the kill rule was a point estimate below .2.
+
+- Not killed: Spearman +0.699 (95% interval +0.596 to +0.784, 181 items over where-to, flow and impact). Per set:
+  flow +0.50 (78 items), impact +0.59 (77), where-to +0.155 (26, interval -0.29 to +0.55, undetermined).
+- Signs agree on 98 of 112 items where both differences are nonzero. Mean graded difference is +0.184 when the
+  metric rises, +0.037 when it is unchanged and -0.118 when it falls.
+- Reliability of the graded outcome over three repetitions is about .90, so +0.70 is close to the ceiling.
+- Limits: pooling across sets adds between-set structure (flow differences are all positive, impact mostly
+  negative); the metric detects losses better than gains (rises on impact and where-to showed about zero graded
+  gain); the reader sees cards only, so validity for a live agent with tools is probably lower; one arm pair
+  only. History had too few nonzero differences to test.
+- Use: bench differences on flow and impact are evidence about answer quality for a card reader. A where-to
+  difference, and any gain claimed on impact, still needs an agent arm before a default changes.
+- Cost: $25.41 of a $30 cap.
