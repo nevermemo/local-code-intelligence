@@ -613,6 +613,60 @@ impl std::str::FromStr for TraverseFirstStage {
     }
 }
 
+/// What counts as a hit for the edge bandit (`[traverse] bandit_signal`). The
+/// bandit's weight update does not depend on which one is used: a signal only
+/// says, for each newly found node, whether the edge kind that found it paid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraverseBanditSignal {
+    /// Diagnostic only. The node would place in the walk's current top `k` by
+    /// the walk's own score (once the top `k` list is full). No model, but that
+    /// score is built from the same kind priors the bandit reweights, so it
+    /// reinforces itself: it shows what the walk already believes, it does not
+    /// measure whether an edge kind pays.
+    #[default]
+    Topk,
+    /// A reranker rates a sample of the new nodes (`bandit_every`,
+    /// `bandit_sample`, independent of `rerank_frontier`); a score at or above
+    /// `bandit_threshold` is a hit. Costs model calls, counted in
+    /// `totals.bandit_calls` and capped with `rerank_frontier`'s by
+    /// `model_calls`.
+    Rerank,
+    /// Fixed per-kind weights from `bandit_fixed`; no stats. A cost-free
+    /// baseline arm.
+    Fixed,
+    /// Per-kind weights in `0.5..=2` drawn from `bandit_seed` (and the kind);
+    /// no stats. A cost-free baseline arm.
+    Random,
+}
+
+impl TraverseBanditSignal {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Topk => "topk",
+            Self::Rerank => "rerank",
+            Self::Fixed => "fixed",
+            Self::Random => "random",
+        }
+    }
+}
+
+impl std::str::FromStr for TraverseBanditSignal {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "topk" => Ok(Self::Topk),
+            "rerank" => Ok(Self::Rerank),
+            "fixed" => Ok(Self::Fixed),
+            "random" => Ok(Self::Random),
+            other => Err(format!(
+                "bandit_signal must be \"topk\", \"rerank\", \"fixed\" or \"random\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[traverse]`: the multimap traversal behind `search_code`'s
 /// `mode = "traverse"` (spine brief 1.7). The limits are also the caps of a
 /// request: a `budget` in the request may lower them, never raise them.
@@ -735,6 +789,37 @@ pub struct TraverseConfig {
     /// many readers or callers is not cut. A resumed traversal runs with the
     /// beam of the call that resumes it. Allowed: `1..=256`.
     pub beam: usize,
+    /// In-request edge bandit: within one request, a newly found node that
+    /// would place in the top `k` counts as a hit for the kind of edge that
+    /// found it, and the frontier priority of each new node is multiplied by a
+    /// weight (0.5 to 2) from its kind's smoothed hit rate. Only the queue order
+    /// changes; the scores answers rank by do not. Nothing carries over between
+    /// requests or into a handle. Off: the walk is unchanged.
+    pub edge_bandit: bool,
+    /// The exponent of the bandit's weight (`(rate / mean rate) ^ bandit_rate`):
+    /// `0` to `4`; `0` switches the effect off, larger values shift the queue
+    /// harder. Only with `edge_bandit`.
+    pub bandit_rate: f64,
+    /// What counts as a hit for the bandit: `"topk"` (the default, diagnostic: the
+    /// node would place in the walk's current top `k` by its own score, which
+    /// the same kind priors shape, so it reinforces itself), `"rerank"` (a
+    /// reranker rates a sample of new nodes), or the cost-free baselines `"fixed"`
+    /// (the weights of `bandit_fixed`) and `"random"` (weights drawn from
+    /// `bandit_seed`). Only with `edge_bandit`.
+    pub bandit_signal: TraverseBanditSignal,
+    /// `bandit_signal = "rerank"`: a rated node is a hit when its score is at
+    /// least this, `0` to `1`.
+    pub bandit_threshold: f64,
+    /// `bandit_signal = "rerank"`: rate after every this many pops, `1..=64`.
+    pub bandit_every: u32,
+    /// `bandit_signal = "rerank"`: rate at most this many new nodes per round,
+    /// `1..=32`.
+    pub bandit_sample: u32,
+    /// `bandit_signal = "random"`: the seed of the per-kind weights.
+    pub bandit_seed: u64,
+    /// `bandit_signal = "fixed"`: the weight of each edge kind (by name, as in
+    /// the trace, e.g. `contains`), `0.5` to `2`; a kind not named has `1`.
+    pub bandit_fixed: BTreeMap<String, f64>,
 }
 
 impl TraverseConfig {
@@ -747,6 +832,9 @@ impl TraverseConfig {
     pub const MAX_DEADLINE_MS_LIMIT: u64 = 60_000;
     pub const MAX_STOPS_LIMIT: u32 = 32;
     pub const MAX_CORROBORATION_BOOST: f64 = 10.0;
+    pub const MAX_BANDIT_RATE: f64 = 4.0;
+    pub const MAX_BANDIT_EVERY: u32 = 64;
+    pub const MAX_BANDIT_SAMPLE: u32 = 32;
 
     fn is_default(&self) -> bool {
         *self == Self::default()
@@ -826,6 +914,39 @@ impl TraverseConfig {
             self.first_k
         );
         ensure!(
+            (0.0..=Self::MAX_BANDIT_RATE).contains(&self.bandit_rate),
+            "traverse.bandit_rate must be a number from 0 to {} (got {})",
+            Self::MAX_BANDIT_RATE,
+            self.bandit_rate
+        );
+        ensure!(
+            (0.0..=1.0).contains(&self.bandit_threshold),
+            "traverse.bandit_threshold must be a number from 0 to 1 (got {})",
+            self.bandit_threshold
+        );
+        ensure!(
+            (1..=Self::MAX_BANDIT_EVERY).contains(&self.bandit_every),
+            "traverse.bandit_every must be 1..={} (got {})",
+            Self::MAX_BANDIT_EVERY,
+            self.bandit_every
+        );
+        ensure!(
+            (1..=Self::MAX_BANDIT_SAMPLE).contains(&self.bandit_sample),
+            "traverse.bandit_sample must be 1..={} (got {})",
+            Self::MAX_BANDIT_SAMPLE,
+            self.bandit_sample
+        );
+        for (kind, weight) in &self.bandit_fixed {
+            ensure!(
+                (0.5..=2.0).contains(weight),
+                "traverse.bandit_fixed.{kind} must be a number from 0.5 to 2 (got {weight})"
+            );
+        }
+        ensure!(
+            !(self.edge_bandit && self.fusion == TraverseFusion::Rrf),
+            "traverse.edge_bandit does not work with fusion = \"rrf\": rrf ranks results by a fused score, not the potential the bandit's hit test reads; use fusion = \"boost\""
+        );
+        ensure!(
             self.priors.is_some() == self.question_type.is_some(),
             "traverse.priors and traverse.question_type go together: a table is read for one question type"
         );
@@ -871,6 +992,14 @@ impl Default for TraverseConfig {
             answer_seeds: false,
             exact_seeds: false,
             beam: 16,
+            edge_bandit: false,
+            bandit_rate: 1.0,
+            bandit_signal: TraverseBanditSignal::Topk,
+            bandit_threshold: 0.5,
+            bandit_every: 3,
+            bandit_sample: 4,
+            bandit_seed: 0,
+            bandit_fixed: BTreeMap::new(),
         }
     }
 }
@@ -3146,6 +3275,94 @@ fusion = \"rrf\"
                 .traverse
                 .score_bound
         );
+    }
+
+    #[test]
+    fn the_edge_bandit_is_off_by_default_and_its_rate_is_checked() {
+        let defaults = TraverseConfig::default();
+        assert!(!defaults.edge_bandit);
+        assert_eq!(defaults.bandit_rate, 1.0);
+        let on: Config = toml::from_str(&format!(
+            "{}[traverse]\nedge_bandit = true\nbandit_rate = 2.5\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.traverse.edge_bandit);
+        assert_eq!(on.traverse.bandit_rate, 2.5);
+        assert_eq!(on.traverse.bandit_signal, TraverseBanditSignal::Topk);
+        assert_eq!("topk".parse::<TraverseBanditSignal>(), Ok(TraverseBanditSignal::Topk));
+        let text = format!("{}[traverse]\nbandit_signal = \"judge\"\n", base_toml());
+        assert!(toml::from_str::<Config>(&text).is_err());
+        assert!("judge".parse::<TraverseBanditSignal>().is_err());
+        for bad in ["-0.5", "4.5", "nan"] {
+            let text = format!("{}[traverse]\nbandit_rate = {bad}\n", base_toml());
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(config.validate().is_err(), "{bad:?}");
+        }
+        let text = format!("{}[traverse]\nedge_bandit = \"yes\"\n", base_toml());
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn the_edge_bandit_signals_and_their_keys_are_checked() {
+        let defaults = TraverseConfig::default();
+        assert_eq!(defaults.bandit_threshold, 0.5);
+        assert_eq!(defaults.bandit_every, 3);
+        assert_eq!(defaults.bandit_sample, 4);
+        assert_eq!(defaults.bandit_seed, 0);
+        assert!(defaults.bandit_fixed.is_empty());
+        for (name, signal) in [
+            ("topk", TraverseBanditSignal::Topk),
+            ("rerank", TraverseBanditSignal::Rerank),
+            ("fixed", TraverseBanditSignal::Fixed),
+            ("random", TraverseBanditSignal::Random),
+        ] {
+            assert_eq!(name.parse::<TraverseBanditSignal>(), Ok(signal));
+            assert_eq!(signal.as_str(), name);
+            let text = format!(
+                "{}[traverse]\nedge_bandit = true\nbandit_signal = \"{name}\"\nbandit_threshold = 0.7\nbandit_every = 5\nbandit_sample = 2\nbandit_seed = 9\n\n[traverse.bandit_fixed]\ncontains = 1.5\n",
+                base_toml()
+            );
+            let config: Config = toml::from_str(&text).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.traverse.bandit_signal, signal);
+            assert_eq!(config.traverse.bandit_threshold, 0.7);
+            assert_eq!(config.traverse.bandit_every, 5);
+            assert_eq!(config.traverse.bandit_sample, 2);
+            assert_eq!(config.traverse.bandit_seed, 9);
+            assert_eq!(config.traverse.bandit_fixed["contains"], 1.5);
+        }
+        for bad in [
+            "bandit_threshold = 1.5",
+            "bandit_threshold = -0.1",
+            "bandit_every = 0",
+            "bandit_every = 65",
+            "bandit_sample = 0",
+            "bandit_sample = 33",
+            "bandit_fixed = { contains = 2.5 }",
+            "bandit_fixed = { contains = 0.1 }",
+        ] {
+            let text = format!("{}[traverse]\n{bad}\n", base_toml());
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(config.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_edge_bandit_is_refused_with_rrf_fusion() {
+        let text = format!(
+            "{}[traverse]\nedge_bandit = true\nfusion = \"rrf\"\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("edge_bandit") && error.contains("rrf"), "{error}");
+        // Either alone is fine.
+        for ok in ["edge_bandit = true", "fusion = \"rrf\""] {
+            let text = format!("{}[traverse]\n{ok}\n", base_toml());
+            toml::from_str::<Config>(&text).unwrap().validate().unwrap();
+        }
     }
 
     #[test]

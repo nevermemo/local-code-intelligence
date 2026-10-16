@@ -128,6 +128,17 @@
 //! external calls it made. Reranker calls draw on no allowance of the budget;
 //! [`Traversal::model_calls`] caps them (default: no cap).
 //!
+//! Edge bandit (`[traverse] edge_bandit`, off by default): see [`bandit`]. Within one
+//! request, a kind of edge that finds answers is learned and the frontier priority of a child
+//! is its potential times a weight in `[0.5, 2]` for the kind that found it. The hit signal is
+//! `topk` (diagnostic: the node would place in the top `k`), `rerank` (a sample of new nodes
+//! rated by the bandit's own rescorer, [`Traversal::bandit_rescorer`]; counted in
+//! [`Totals::bandit_calls`] and [`Totals::bandit_docs`]) or the stat-free baselines `fixed`
+//! and `random`. Only the queue order changes: potentials, ranks and the score bound are the
+//! same. The stats are the call's (a handle keeps the settings, not the stats, and refuses
+//! other settings: [`handle::Snapshot::check_bandit`]) and are reported in the `end` event's
+//! `totals.bandit` and [`TraversalResult::bandit`].
+//!
 //! The score bound ([`Traversal::top_k`]) ends a walk early, with the stop
 //! reason `bound`, once `k` results exist and neither a queued state nor a
 //! result below the top `k` can reach a rank above the `k`-th; it fixes the
@@ -139,6 +150,7 @@
 //! The run is recorded as JSON events ([`TraversalResult::events`]), written as
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
 
+pub mod bandit;
 pub mod frontier;
 pub mod fusion;
 pub mod handle;
@@ -158,7 +170,8 @@ pub mod trace;
 #[cfg(test)]
 mod tests;
 
-use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
+use crate::{Budget, EdgeKind, MapId, edge::MapCard, edge::WitnessClass};
+use bandit::{Bandit, BanditReport, Pending, TopK};
 use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop};
 use handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
@@ -327,6 +340,10 @@ pub struct Totals {
     /// Expansions whose rerank was skipped because the `model_calls` cap was
     /// reached (no call was made, the hops kept factor 1; not a failure).
     pub rerank_skipped: u32,
+    /// Edge bandit with the `rerank` signal: rating calls made (one per round),
+    /// the nodes they rated. They count against `model_calls` with `rerank_calls`.
+    pub bandit_calls: u32,
+    pub bandit_docs: u32,
     /// Map calls that ran, retries of a cut pop included. `external_calls`
     /// and `tokens` charge a retry only what the earlier run did not pay (the
     /// logical work); these count every call and the external calls it made
@@ -390,6 +407,9 @@ pub struct TraversalResult {
     /// failed over the traversal, expansions the `model_calls` cap left
     /// unrated. Empty when there is nothing to say.
     pub warnings: Vec<String>,
+    /// The edge bandit's tries, hits and weights per edge kind in this call
+    /// (none when it was off).
+    pub bandit: Option<BanditReport>,
 }
 
 impl TraversalResult {
@@ -482,6 +502,14 @@ pub struct Traversal<'s> {
     boost_given: bool,
     /// The most model calls (rerank calls) the traversal may make in all.
     model_calls: Option<u32>,
+    /// The edge bandit's rate (`bandit_rate`); none: it is off.
+    bandit: Option<f64>,
+    /// What counts as a hit for the bandit.
+    bandit_signal: bandit::Signal,
+    /// The settings of the signals other than `topk`.
+    bandit_options: bandit::Options,
+    /// The rescorer of the `rerank` signal; independent of `rerank`.
+    bandit_rescorer: Option<Box<dyn FrontierRescorer + 's>>,
 }
 
 impl<'s> Traversal<'s> {
@@ -512,16 +540,85 @@ impl<'s> Traversal<'s> {
             identity: String::new(),
             boost_given: false,
             model_calls: None,
+            bandit: None,
+            bandit_signal: bandit::Signal::default(),
+            bandit_options: bandit::Options::default(),
+            bandit_rescorer: None,
         }
     }
 
+    /// The in-request edge bandit (default off; see [`bandit`]): `Some(rate)`
+    /// weights the frontier priority of each new node by how well its kind of
+    /// edge has found top-`k` results in this call. `rate` is the exponent of
+    /// the weight (0 to 4; anything else is 1). Not kept in a handle: a resumed
+    /// call starts with no stats, and the caller passes the setting again.
+    pub fn edge_bandit(mut self, rate: Option<f64>) -> Self {
+        self.bandit = rate.map(bandit::sane_rate);
+        self
+    }
+
+    /// What counts as a hit for the edge bandit (default `topk`; see
+    /// [`bandit`]). Only with [`Traversal::edge_bandit`].
+    pub fn bandit_signal(mut self, signal: bandit::Signal) -> Self {
+        self.bandit_signal = signal;
+        self
+    }
+
+    /// The edge bandit as one object (none: it is off): the rate, the signal
+    /// and the options. Same as [`Traversal::edge_bandit`],
+    /// [`Traversal::bandit_signal`] and [`Traversal::bandit_options`] together.
+    pub fn edge_bandit_with(self, settings: Option<bandit::Settings>) -> Self {
+        match settings {
+            Some(settings) => self
+                .edge_bandit(Some(settings.rate))
+                .bandit_signal(settings.signal)
+                .bandit_options(settings.options),
+            None => self.edge_bandit(None),
+        }
+    }
+
+    /// The settings of the edge bandit's other signals: the `rerank`
+    /// threshold, round length and sample, the `random` seed and the `fixed`
+    /// table (see [`bandit::Options`]). Only with [`Traversal::edge_bandit`].
+    pub fn bandit_options(mut self, options: bandit::Options) -> Self {
+        self.bandit_options = options.sane();
+        self
+    }
+
+    /// The rescorer of the edge bandit's `rerank` signal: independent of
+    /// [`Traversal::rerank_frontier`] (either may be on without the other).
+    /// Its calls count in [`Totals::bandit_calls`] and against
+    /// [`Traversal::model_calls`]. Not kept in a handle; its identity is part
+    /// of [`Traversal::bandit_fingerprint`].
+    pub fn bandit_rescorer(mut self, rescorer: impl FrontierRescorer + 's) -> Self {
+        self.bandit_rescorer = Some(Box::new(rescorer));
+        self
+    }
+
+    /// The edge bandit's settings (none: it is off).
+    fn bandit_settings(&self) -> Option<bandit::Settings> {
+        self.bandit.map(|rate| bandit::Settings {
+            rate,
+            signal: self.bandit_signal,
+            options: self.bandit_options.clone(),
+        })
+    }
+
+    /// Text that names the edge bandit's settings, for a handle to keep and
+    /// [`handle::Snapshot::check_bandit`] to compare (none: it is off). Names
+    /// no path and no secret.
+    pub fn bandit_fingerprint(&self) -> Option<String> {
+        let identity = self.bandit_rescorer.as_ref().map(|r| r.identity());
+        Some(self.bandit_settings()?.fingerprint(identity.as_deref()))
+    }
+
     /// The most model calls the whole traversal may make (default: no cap).
-    /// Today a model call is a reranker frontier call. Like the other caps it
+    /// A model call is a reranker frontier call or an edge bandit rating call. Like the other caps it
     /// is absolute: the totals persist in a handle, so a continuation counts
     /// on from the calls before it, and the caller passes the cap again. Once
     /// the calls made reach it, the frontier rates nothing more (the hops keep
-    /// factor 1, counted in [`Totals::rerank_skipped`], no failure) and the
-    /// walk goes on.
+    /// factor 1, counted in [`Totals::rerank_skipped`], no failure; the bandit's
+    /// rounds are skipped, reported in its `skipped`) and the walk goes on.
     pub fn model_calls(mut self, cap: Option<u32>) -> Self {
         self.model_calls = cap;
         self
@@ -731,11 +828,31 @@ struct Run<'s> {
     rerank_ms: f64,
     /// See [`TraversalResult::warnings`]; the ones the run itself finds.
     warnings: Vec<String>,
+    /// The edge bandit, when on.
+    bandit: Option<Bandit>,
+    /// The nodes adopted since the last rating round (the `rerank` signal).
+    bandit_pending: Pending,
+    /// Expansions since the call began, for the `rerank` rounds.
+    bandit_expansions: u32,
+    /// The kind of edge that found each state in this call (bandit on), so a
+    /// state queued later gets its kind's weight.
+    via_kind: HashMap<usize, EdgeKind>,
 }
 
 impl<'s> Run<'s> {
     fn new(t: Traversal<'s>) -> Self {
         let query = crate::walk::question_tokens(&t.question);
+        let bandit = t.bandit_settings().map(|settings| Bandit::new(&settings));
+        let mut warnings = Vec::new();
+        if bandit.is_some()
+            && t.bandit_signal == bandit::Signal::Rerank
+            && t.bandit_rescorer.is_none()
+        {
+            warnings.push(
+                "edge_bandit: bandit_signal rerank has no rescorer; nothing is rated and every weight is 1"
+                    .to_owned(),
+            );
+        }
         Self {
             t,
             query,
@@ -762,7 +879,11 @@ impl<'s> Run<'s> {
             paid: BTreeMap::new(),
             map_ms: BTreeMap::new(),
             rerank_ms: 0.0,
-            warnings: Vec::new(),
+            warnings,
+            bandit,
+            bandit_pending: Vec::new(),
+            bandit_expansions: 0,
+            via_kind: HashMap::new(),
         }
     }
 
@@ -1016,6 +1137,13 @@ impl<'s> Run<'s> {
             if self.t.pass_through {
                 object["totals"]["pass_through_pops"] = json!(self.totals.pass_through_pops);
             }
+            if let Some(bandit) = &self.bandit {
+                object["totals"]["bandit"] = bandit.report().to_json();
+                if bandit.signal() == bandit::Signal::Rerank {
+                    object["totals"]["bandit_calls"] = json!(self.totals.bandit_calls);
+                    object["totals"]["bandit_docs"] = json!(self.totals.bandit_docs);
+                }
+            }
             if self.t.rerank.is_some() {
                 object["totals"]["rerank_calls"] = json!(self.totals.rerank_calls);
                 object["totals"]["rerank_docs"] = json!(self.totals.rerank_docs);
@@ -1064,6 +1192,7 @@ impl<'s> Run<'s> {
             tie_break: self.t.tie_break,
             query: self.query,
             warnings: self.warnings,
+            bandit: self.bandit.as_ref().map(Bandit::report),
         }
     }
 
@@ -1084,6 +1213,20 @@ impl<'s> Run<'s> {
                 self.totals.rerank_calls,
                 reasons.join(", ")
             ));
+        }
+        if let Some(report) = self.bandit.as_ref().map(Bandit::report) {
+            if report.failures > 0 {
+                self.warnings.push(format!(
+                    "edge_bandit: {} rating calls failed in this call ({} made over the traversal); their nodes were not counted",
+                    report.failures, self.totals.bandit_calls
+                ));
+            }
+            if let (Some(cap), true) = (self.t.model_calls, report.skipped > 0) {
+                self.warnings.push(format!(
+                    "edge_bandit: the model_calls cap of {cap} was reached; {} rating rounds were skipped",
+                    report.skipped
+                ));
+            }
         }
         if let (Some(cap), true) = (self.t.model_calls, self.totals.rerank_skipped > 0) {
             self.warnings.push(format!(
@@ -1369,6 +1512,13 @@ impl<'s> Run<'s> {
         let mut chosen = vec![false; kept.len()];
         let mut adopted = 0usize;
         let mut truncated = false;
+        // Edge bandit: the weights this expansion uses are those of the stats
+        // at its start; the top-k tracks the results as they are adopted.
+        let frozen = self.bandit.clone();
+        let mut top = frozen
+            .as_ref()
+            .filter(|b| b.wants_top())
+            .map(|_| self.answer_top());
         for (i, value) in steps {
             chosen[i] = true;
             let edge = &kept[i];
@@ -1407,14 +1557,39 @@ impl<'s> Run<'s> {
             self.state_of.insert(dst.clone(), child);
             self.totals.hops += 1;
             self.totals.cross_map_hops += u32::from(cross);
-            self.events.push(json!({
+            // The queue priority of a child is its potential, times the
+            // bandit's weight for the kind of edge when the bandit is on.
+            let mut priority = potential;
+            if let (Some(frozen), Some(bandit)) = (&frozen, self.bandit.as_mut()) {
+                let kind = edge.best.kind;
+                let rank = self.states[child].ranked_potential(self.t.boost);
+                // `topk` records a hit or a miss at once (once the list is
+                // full); `rerank` queues the node for its next rating round.
+                if let Some(hit) = bandit.hit(top.as_ref(), rank) {
+                    bandit.record(kind, hit);
+                }
+                if bandit.signal() == bandit::Signal::Rerank {
+                    self.bandit_pending.push((dst.clone(), kind));
+                }
+                bandit.observe(kind);
+                if let Some(top) = top.as_mut() {
+                    top.insert(rank);
+                }
+                self.via_kind.insert(child, kind);
+                priority = potential * frozen.weight(kind);
+            }
+            let mut hop_event = json!({
                 "ev": "hop", "src": node.to_string(), "dst": dst.to_string(),
                 "kind": edge.best.kind.as_str(), "map": map, "maps": edge.maps,
                 "witness": edge.best.witness.as_str(), "conf": edge.conf,
                 "potential": potential, "cross_map": cross,
-            }));
+            });
+            if let (true, Some(object)) = (frozen.is_some(), hop_event.as_object_mut()) {
+                object.insert("priority".into(), json!(priority));
+            }
+            self.events.push(hop_event);
             if depth + 1 < self.t.budget.max_depth {
-                self.frontier.push(child, potential);
+                self.frontier.push(child, priority);
             } else {
                 self.deferred.insert(child);
             }
@@ -1489,6 +1664,7 @@ impl<'s> Run<'s> {
             }
         }
         self.events.insert(at, event);
+        self.bandit_round().await;
         cut.then_some(adopted > 0 || timed_out)
     }
 
@@ -1513,7 +1689,7 @@ impl<'s> Run<'s> {
         if self
             .t
             .model_calls
-            .is_some_and(|cap| self.totals.rerank_calls >= cap)
+            .is_some_and(|cap| self.model_calls_made() >= cap)
         {
             self.totals.rerank_skipped = self.totals.rerank_skipped.saturating_add(1);
             return (steps, Some(json!({"skipped": "model_calls"})));
@@ -1559,6 +1735,118 @@ impl<'s> Run<'s> {
             Err(_) => steps,
         };
         (steps, Some(event))
+    }
+
+    /// The calls made so far that the `model_calls` cap counts: the reranker
+    /// frontier's and the edge bandit's.
+    fn model_calls_made(&self) -> u32 {
+        self.totals
+            .rerank_calls
+            .saturating_add(self.totals.bandit_calls)
+    }
+
+    /// The queue priority of `state` with `potential`: the potential times the
+    /// edge bandit's weight for the kind of edge that found the state in this
+    /// call. A state this call did not find (a resumed one) has no kind, and
+    /// with the bandit off the priority is the potential.
+    fn queue_priority(&self, state: usize, potential: f64) -> f64 {
+        match (&self.bandit, self.via_kind.get(&state)) {
+            (Some(bandit), Some(&kind)) => potential * bandit.weight(kind),
+            _ => potential,
+        }
+    }
+
+    /// The edge bandit's `rerank` signal (see [`bandit`]): after every
+    /// `every`-th expansion, the bandit's rescorer rates the first `sample` of
+    /// the nodes adopted since (the rest are dropped) and a score at or above
+    /// the threshold is a hit for the kind of edge that found the node. The
+    /// call is bounded by the deadline and counts against `model_calls` like a
+    /// frontier rerank; a failed call (an error, the deadline, a wrong count or
+    /// a score that is not a number) records nothing.
+    async fn bandit_round(&mut self) {
+        let Some(bandit) = &self.bandit else {
+            return;
+        };
+        if bandit.signal() != bandit::Signal::Rerank {
+            return;
+        }
+        let (every, sample) = (bandit.options().every, bandit.options().sample as usize);
+        self.bandit_expansions = self.bandit_expansions.saturating_add(1);
+        let mut pending = std::mem::take(&mut self.bandit_pending);
+        if self.bandit_expansions % every != 0 {
+            self.bandit_pending = pending;
+            return;
+        }
+        pending.truncate(sample);
+        if pending.is_empty() {
+            return;
+        }
+        let Some(rescorer) = &self.t.bandit_rescorer else {
+            return;
+        };
+        if self
+            .t
+            .model_calls
+            .is_some_and(|cap| self.model_calls_made() >= cap)
+        {
+            if let Some(bandit) = self.bandit.as_mut() {
+                bandit.note_skipped();
+            }
+            self.events
+                .push(json!({"ev": "bandit", "skipped": "model_calls"}));
+            return;
+        }
+        let nodes: Vec<NodeId> = pending.iter().map(|(node, _)| node.clone()).collect();
+        let started = Instant::now();
+        let left = self.t.budget.deadline.saturating_duration_since(started);
+        let answer = tokio::time::timeout(left, rescorer.relevance(&self.t.question, &nodes)).await;
+        self.rerank_ms += started.elapsed().as_secs_f64() * 1000.0;
+        let scores: Result<Vec<f64>, RerankFailure> = match answer {
+            Err(_elapsed) => Err(RerankFailure::Deadline),
+            Ok(Err(error)) => Err(error.reason),
+            Ok(Ok(scores)) if scores.len() != nodes.len() => Err(RerankFailure::CountMismatch),
+            Ok(Ok(scores)) if scores.iter().any(|s| !s.is_finite()) => {
+                Err(RerankFailure::Malformed)
+            }
+            Ok(Ok(scores)) => Ok(scores),
+        };
+        let docs = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+        self.totals.bandit_calls = self.totals.bandit_calls.saturating_add(1);
+        self.totals.bandit_docs = self.totals.bandit_docs.saturating_add(docs);
+        let mut event = json!({"ev": "bandit", "docs": docs, "failed": scores.is_err()});
+        match (scores, self.bandit.as_mut()) {
+            (Ok(scores), Some(bandit)) => {
+                let mut hits = 0u32;
+                for ((_, kind), score) in pending.iter().zip(scores) {
+                    let hit = bandit.score_hit(score);
+                    hits += u32::from(hit);
+                    bandit.record(*kind, hit);
+                }
+                event["hits"] = json!(hits);
+            }
+            (Err(reason), bandit) => {
+                if let Some(bandit) = bandit {
+                    bandit.note_failure();
+                }
+                event["reason"] = json!(reason.as_str());
+            }
+            (Ok(_), None) => {}
+        }
+        self.events.push(event);
+    }
+
+    /// The ranks of the current top results, for the edge bandit's hit test:
+    /// the answer cutoff is the score bound's `k`, else [`ANSWER_K`]. Results
+    /// are the states reached by an edge that are not pruned.
+    fn answer_top(&self) -> TopK {
+        let k = self.t.bound.map_or(ANSWER_K, |(k, _)| k);
+        TopK::new(
+            k,
+            self.states
+                .iter()
+                .filter(|s| s.parent.is_some() && !self.cleared.contains(&s.node))
+                .map(|s| s.ranked_potential(self.t.boost)),
+        )
     }
 
     /// Whether `target` is `from` or one of its ancestors.
@@ -1675,7 +1963,11 @@ impl<'s> Run<'s> {
         });
         if unblock {
             self.deferred.remove(&reached);
-            self.frontier.push(reached, potential);
+            if self.bandit.is_some() {
+                self.via_kind.insert(reached, edge.best.kind);
+            }
+            let priority = self.queue_priority(reached, potential);
+            self.frontier.push(reached, priority);
         } else if queued {
             match self.frontier.priority_of(reached) {
                 // A handler's boost or reorder stays: scale by the ratio.
@@ -1742,7 +2034,8 @@ impl<'s> Run<'s> {
                     } else if self.frontier.contains(child) {
                         self.frontier.scale(child, ratio);
                     } else if self.deferred.remove(&child) {
-                        self.frontier.push(child, potential);
+                        let priority = self.queue_priority(child, potential);
+                        self.frontier.push(child, priority);
                     }
                 }
                 work.push(child);
@@ -2171,7 +2464,8 @@ impl<'s> Run<'s> {
                 Some(state) => {
                     let potential = self.states[state].potential;
                     self.deferred.remove(&state);
-                    self.frontier.push(state, potential);
+                    let priority = self.queue_priority(state, potential);
+                    self.frontier.push(state, priority);
                 }
                 None => self.add_seed(&Seed::from(node.clone()), fanout),
             }

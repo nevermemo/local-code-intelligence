@@ -270,6 +270,29 @@ impl EdgeKind {
             Self::DefinedIn => "defined_in",
         }
     }
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::QueryMatch,
+        Self::Prior,
+        Self::CallsOrRefs,
+        Self::Contains,
+        Self::Imports,
+        Self::Implements,
+        Self::Tests,
+        Self::ReadsKey,
+        Self::Mentions,
+        Self::Touched,
+        Self::Cochange,
+        Self::CompileErrorAt,
+        Self::Near,
+        Self::DefinedIn,
+    ];
+
+    /// The kind whose [`EdgeKind::as_str`] is `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
