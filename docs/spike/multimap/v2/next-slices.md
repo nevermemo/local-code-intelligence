@@ -154,6 +154,10 @@ not depend on N2. Not taken by default; the owner's order stands.
   there; the trend row is reported with the result.
 - A yield-based stop is tried only as a by-product, under the stopper rule already used
   (at least 20% extra saved at matched recall, and better than a fixed step count).
+- Ran 2026-10-16: no formal verdict (+.03 not detectable at the available n), then STOPPED by the coordinator:
+  every interval of the bandit minus F-append has an upper bound far below +.03 (flow@20 -0.025, upper +0.001),
+  and the rating signal was weak (hit rates 6% and 13%), so the weights followed try counts and tie order. The
+  bandit stays off (`edge_bandit`, default false). N2b is not triggered. Results and caveats in `n2-results.md`.
 
 ## N3: chained executor with breakpoints
 
