@@ -725,6 +725,13 @@ pub struct Totals {
     pub bandit_signal: Option<String>,
 }
 
+impl Totals {
+    /// Model calls of the traversal: the reranker frontier's plus the bandit's.
+    pub fn model_calls(&self) -> u64 {
+        self.rerank_calls.saturating_add(self.bandit_calls)
+    }
+}
+
 /// The edge-bandit flags passed to `lci traverse` (all unset: the
 /// configuration's settings apply).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -2088,11 +2095,7 @@ pub fn bench_set(
                 }
                 run.insert(id.to_string(), Value::Array(answers.clone()));
                 work.push(traversed.totals.as_ref().map_or([0, 0, 0], |t| {
-                    [
-                        t.pops,
-                        t.pass_through_pops,
-                        t.rerank_calls.saturating_add(t.bandit_calls),
-                    ]
+                    [t.pops, t.pass_through_pops, t.model_calls()]
                 }));
                 scored.push((answers, item));
             }
@@ -2245,13 +2248,13 @@ pub fn bench_set(
     })
 }
 
-/// The row-note marker for a run whose items include a deadline stop, reranker
-/// failures or map call failures (`flagged` counts the items of each kind);
+/// The row-note marker for a run whose items include a deadline stop, model
+/// call failures (reranker or bandit) or map call failures (`flagged` counts the items of each kind);
 /// such a row is not a clean measurement and should not decide anything.
 fn unreliable_marker([deadline, rerank, map]: [usize; 3]) -> Option<String> {
     (deadline + rerank + map > 0).then(|| {
         format!(
-            "UNRELIABLE, not decision-grade (items with: deadline stop={deadline}, rerank failures={rerank}, map call failures={map})"
+            "UNRELIABLE, not decision-grade (items with: deadline stop={deadline}, model-call failures={rerank}, map call failures={map})"
         )
     })
 }
@@ -2695,7 +2698,7 @@ mod tests {
         // The deadline stop and the reranker failure make the row unreliable.
         assert!(
             cells[20].starts_with(
-                "UNRELIABLE, not decision-grade (items with: deadline stop=1, rerank failures=1, map call failures=0)"
+                "UNRELIABLE, not decision-grade (items with: deadline stop=1, model-call failures=1, map call failures=0)"
             ),
             "{}",
             cells[20]

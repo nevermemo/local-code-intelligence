@@ -23,7 +23,7 @@
 //! it is kept exactly when `src/lib.rs`-style root files are in the regions.
 
 use super::baseline::write_arm_run;
-use super::bench::{ResultNode, Traversed, adapt, select_items, set_name, slug};
+use super::bench::{ResultNode, Totals, Traversed, adapt, select_items, set_name, slug};
 use crate::gold::{self, Set};
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -332,6 +332,7 @@ pub fn run_filter(args: OracleFilterArgs) -> Result<()> {
     let (mut missing, mut no_region, mut short) = (0usize, 0usize, 0usize);
     let mut scored: Vec<(&Value, Vec<Value>)> = Vec::new();
     let mut expansions: Vec<u64> = Vec::new();
+    let mut model_calls: Vec<u64> = Vec::new();
     for item in &items {
         let id = item["id"].as_str().context("gold item without an id")?;
         let file = format!("{}.json", slug(id));
@@ -377,6 +378,8 @@ pub fn run_filter(args: OracleFilterArgs) -> Result<()> {
                 .as_ref()
                 .map_or(0, |t| t.pops + t.pass_through_pops),
         );
+        // The filter is free, but the walk it filters paid for these calls.
+        model_calls.push(traversed.totals.as_ref().map_or(0, Totals::model_calls));
         std::fs::copy(raw_dir.join(&file), dir.join("raw").join(&file))
             .with_context(|| format!("copy the raw output of {id}"))?;
     }
@@ -390,9 +393,9 @@ pub fn run_filter(args: OracleFilterArgs) -> Result<()> {
         "items_without_raw_output": missing,
         "items_without_region": no_region,
         "items_with_fewer_than_k_after_filter": short,
-        "note": "the plain walk's results restricted to the gold regions, then cut to k; compare with the oracle-policy arm to split steering from filtering; expansions are the plain walk's",
+        "note": "the plain walk's results restricted to the gold regions, then cut to k; compare with the oracle-policy arm to split steering from filtering; expansions and model calls are the source walk's",
     });
-    let summary = write_arm_run(&dir, set, &scored, &expansions, &meta)?;
+    let summary = write_arm_run(&dir, set, &scored, &expansions, &model_calls, &meta)?;
     eprintln!(
         "oracle-filter: BENCH-ONLY, GOLD-AWARE. {} items scored, {missing} without a raw output, {no_region} without a region, {short} left with fewer than {} results\nprecision {:.3}, f0.5 {:.3}; {}\nrun dir: {}",
         summary.n,
@@ -585,7 +588,10 @@ mod tests {
                 {"node": outside, "text": "outside", "site": {"path": "z.rs", "line": 5}},
                 {"node": inside, "text": "inside", "site": {"path": "a.rs", "line": 2}},
             ],
-            "totals": {"pops": 7, "hops": 9, "elapsed_ms": 1.0}
+            "totals": {
+                "pops": 7, "hops": 9, "elapsed_ms": 1.0,
+                "rerank_calls": 2, "bandit_calls": 3
+            }
         });
         let run_dir = root.join("run");
         std::fs::create_dir_all(run_dir.join("raw")).unwrap();
@@ -608,6 +614,11 @@ mod tests {
         let data = super::super::compare::load_run(&dir, None).unwrap();
         assert_eq!(data.items["impact-t1"]["decl_recall"], Some(1.0));
         assert_eq!(data.items["impact-t1"]["expansions"], Some(7.0));
+        // The arm carries its source's model calls (rerank 2 + bandit 3), the
+        // same sum the bench stamps on the source run's own items.
+        let source = Traversed::from_json(&raw, None).totals.unwrap();
+        assert_eq!(source.model_calls(), 5);
+        assert_eq!(data.items["impact-t1"]["model_calls"], Some(5.0));
         // The raw output travelled with it, so compare can read its flags.
         assert!(dir.join("raw").join("impact-t1.json").is_file());
         assert!(data.flags["impact-t1"].is_some());

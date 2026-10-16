@@ -61,23 +61,25 @@ pub(super) struct ArmSummary {
 }
 
 /// Writes `run.json`, `items.json`, `score.json` and `meta.json` under `dir`
-/// for the scored `(item, answers)` pairs, with `expansions` per pair.
+/// for the scored `(item, answers)` pairs, with `expansions` and `model_calls`
+/// per pair (0 for the arms that make no model calls; the oracle filter carries
+/// its source run's).
 pub(super) fn write_arm_run(
     dir: &Path,
     set: Set,
     scored: &[(&Value, Vec<Value>)],
     expansions: &[u64],
+    model_calls: &[u64],
     meta: &Value,
 ) -> Result<ArmSummary> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let mut run = Map::new();
     let mut records = Map::new();
     let (mut precision, mut f05) = (0.0, 0.0);
-    for ((item, answers), work) in scored.iter().zip(expansions) {
+    for (((item, answers), work), calls) in scored.iter().zip(expansions).zip(model_calls) {
         let id = item["id"].as_str().context("gold item without an id")?;
         let (p, f, mut record) = item_record(set, item, answers, Some(*work))?;
-        // The arms of a baseline make no model calls.
-        record.insert("model_calls".into(), json!(0));
+        record.insert("model_calls".into(), json!(*calls));
         precision += p;
         f05 += f;
         run.insert(id.to_owned(), Value::Array(answers.clone()));
@@ -230,8 +232,8 @@ fn run_impact(args: ImpactArgs) -> Result<()> {
         "items_with_empty_answer": empty,
         "note": "the anchor reads the backticked names of the question; the engine's hybrid seeds do not parse backticks; the closure comes from the same SCIP index as the gold's R1",
     });
-    let expansions = vec![0u64; scored.len()];
-    let summary = write_arm_run(&dir, Set::Impact, &scored, &expansions, &meta)?;
+    let zeros = vec![0u64; scored.len()];
+    let summary = write_arm_run(&dir, Set::Impact, &scored, &zeros, &zeros, &meta)?;
     say("baseline impact (arm N)", &dir, &summary);
     eprintln!("without names {no_names}, without anchor {no_anchor}, empty {empty}");
     Ok(())
@@ -309,8 +311,8 @@ fn run_history(args: HistoryArgs) -> Result<()> {
         "first_git_failure": tally.first_failure,
         "note": "the engine's git.history reads the tree HEAD only; this arm honours the sha in an H2 question, a small edge on those items",
     });
-    let expansions = vec![0u64; scored.len()];
-    let summary = write_arm_run(&dir, Set::History, &scored, &expansions, &meta)?;
+    let zeros = vec![0u64; scored.len()];
+    let summary = write_arm_run(&dir, Set::History, &scored, &zeros, &zeros, &meta)?;
     say("baseline history (git log)", &dir, &summary);
     if tally.failures > 0 {
         eprintln!(
@@ -438,8 +440,15 @@ mod tests {
         let pick = pick_impact(&ix, item["question"].as_str().unwrap(), 10);
         let dir = temp_dir("arm-n");
         let scored = vec![(&item, pick.answers)];
-        let summary =
-            write_arm_run(&dir, Set::Impact, &scored, &[0], &json!({"arm": "test"})).unwrap();
+        let summary = write_arm_run(
+            &dir,
+            Set::Impact,
+            &scored,
+            &[0],
+            &[0],
+            &json!({"arm": "test"}),
+        )
+        .unwrap();
         assert_eq!(summary.n, 1);
         for file in ["run.json", "items.json", "score.json", "meta.json"] {
             assert!(dir.join(file).is_file(), "{file}");
