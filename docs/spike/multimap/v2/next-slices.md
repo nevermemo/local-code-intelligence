@@ -175,6 +175,9 @@ not depend on N2. Not taken by default; the owner's order stands.
 - Ran 2026-10-16: recipes SURVIVE the frozen kill rule (round trips 0.47x of the plain control and 0.63x of
   the composer control, recall non-inferior). It is a floor test on recipe-shaped tasks, not a discovery.
   Results and limits in `n3-results.md`.
+- Off-shape (N3b, 2026-10-16): NULL, with 0 recipe calls in 80 runs and LCI at 2.7% of all tool calls in both
+  arms. Recipes stay opt-in. The anchor-resolver follow-up is dropped because its premise needs recipe calls.
+  Details are in `n3-results.md` ("Off-shape tasks: N3b").
 
 ## N4: a result filter trained on offline labels (parallel track)
 
@@ -237,7 +240,17 @@ reporting rules are in `gold-scorers.md` ("Reporting rules", "Sets beside the fr
   gust none). It would be a one-repository set; do not propose it again without a second repository that has traits.
 - **Co-change: parked.** Prior co-change hit@10 is .456 and the same-directory baseline is .500, so the baseline equals the
   premise and a set would not discriminate.
-- **New sets: tests-for-code** (frozen) and **docs-for-code** (being built); both sit beside the five frozen sets and are
-  scored on their own.
-- **A second enumeration pass with model-built gold is under way**; its sets enter this portfolio only after their own
-  premise check and freeze.
+- **New sets: tests-for-code** and **docs-for-code**, both frozen. Both sit beside the five frozen sets and are scored on
+  their own. Docs-for-code has 548 items; its seed-only baselines reach recall@10 .386 and BM25 on the commit message
+  .730.
+- Model-built sets enter this portfolio only after their own premise check and freeze.
+- **Exact-message routing: parked** (2026-10-16, pre-registered). With the reranker on, search on the quoted message
+  reached .647 against grep on it at .735, inside the .10 kill band. Questions given whole score .53 to .56. Agents
+  grep a quoted message first, and grep plus search together already cover what routing would add.
+- **Second enumeration pass (models allowed).** It ranked docs-for-code > co-change for a diff > issue-to-fix > masked
+  region questions > masked docs-to-code. The sanity review checked the whole plan against public benchmarks:
+  - RepoQA's needle-function task has the masked-region design but was not adopted: 29.3% of its descriptions are
+    leak-clean, against a 40% bar.
+  - Issue-to-fix overlaps the SWE-bench family but is built in-house: the trees are already pinned and public sets
+    are likely in training data. It borrows a post-cutoff stratum and file-level metrics.
+  - The issue-to-fix pilot and the masked-region build are running.

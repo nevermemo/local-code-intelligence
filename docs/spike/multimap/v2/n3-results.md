@@ -176,3 +176,44 @@ unrestricted shell is untested.
 
 Neither follow-up changes the scope above: the tasks are still recipe-shaped. Follow-up 1 (off-shape tasks) is the
 next test.
+
+## Off-shape tasks: N3b (2026-10-16, pre-registered)
+
+T (recipes on the surface) against C0B on 40 off-shape tasks from the same pool (20 config-reader, 20
+tests-for-code; lci and gust trees), 2 reps each, 160 runs, 0 lost. Verdict by the frozen rule: NULL.
+
+| measure | value |
+| --- | --- |
+| round trips T / C0B | 1.044 (one-sided 95% bounds on the log ratio -0.020, +0.108) |
+| recall T - C0B | -0.015 (lower -0.040, upper 0.000) |
+| recipe calls in T | 0 of 80 runs |
+| input tokens per run, C0B / T | 85.0k / 94.9k (+11.6%) |
+
+The NULL measures the token cost of tools nobody called, not whether recipes help when used:
+
+- LCI tools were 33 of 1,245 tool calls (2.7%) across both arms, all `search_code`; the navigation tools were
+  called in 0 of 160 runs. 30 of the 33 calls were a run's opening call and 30 were followed immediately by Grep.
+  Runs that opened with `search_code` were not cheaper (7.74 vs 8.00 calls in C0B, 7.92 vs 7.57 in T).
+- In the tests-for-code stratum no run used LCI (0 of 60).
+- Recall was at the ceiling and identical across arms on 38 of 40 tasks, so no tool could have moved it on this
+  pool.
+- `traverse` was on neither surface (frozen N3 binary), so its agent uptake is unmeasured.
+
+This matches N1 (4 of 54) and N3 C0 (21 of 80): with Grep, Glob and Bash available, a facts-only tool description
+and no cue about the task's shape, Sonnet 5.5 uses LCI at most as an orienting first query. Public reports say
+the same (agents default to grep even with LSP available), so uptake is a known baseline, not something to
+re-measure.
+
+Consequences:
+
+- Recipes stay opt-in (`[recipes] enabled = false`) with facts-only descriptions. N3's claim stays "recipe-shaped
+  tasks only", and N3b adds "no unprompted uptake off-shape".
+- Follow-up 6 (one-line descriptions) is cancelled: it is moot at zero uptake.
+- `impact_rings` and `flow_path` are candidates to merge into `traverse --policy` once traverse is on the agent
+  surface. S1's impact preset already does most of what `impact_rings` does.
+- No further arm-against-C0B agent run on this pool: it has no recall headroom. The next agent-level question
+  needs a pool with headroom (tests-for-code stage 2: 65% of gold tests are reached by no heuristic) and a setup
+  where LCI sits in the search slot. One candidate is Grep denied by a deployable settings rule, with an LCI tool
+  answering grep-shaped calls. That is a setup change, and it would be reported as such.
+
+Cost $10.78 of an $18 cap. One unit never warmed and is flagged; its task has recall 1.0 in both arms.
