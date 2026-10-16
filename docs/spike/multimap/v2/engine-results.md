@@ -361,6 +361,16 @@ Reading:
   .874), decl_f1 (.692 against .462) and precision (.592 against .342); at 10
   the two arms are nearly the same answers. History: no difference the data can
   separate at 20 (2 items better, none worse) and none at 10. Both are opt-in.
+- Tie sensitivity (added after the run, from the rebuilt walk pools): many
+  walk candidates tie on potential, and the product breaks ties in discovery
+  order. Under random tie-breaking the expected flow gain at 10 answers is
+  +.056 [+.040, +.072] (Holm .0008), not +.131: quote flow at 10 as +.06 to
+  +.13, with more than half of the observed gain coming from the order in
+  which the walk discovers its ties (first-found ties neighbour the best
+  seeds). The 20-answer numbers are robust (flow +.273 expected against +.294
+  observed; where-to unchanged), and every per-set decision above survives.
+  Tie order alone moves flow by about ±.02, so later judge or filter gains
+  smaller than that are not counted as wins.
 - Secondaries at 20 (descriptive, unadjusted): where-to precision .166 to .287,
   flow precision .184 to .216, history mrr .499 to .501, history precision .281
   to .170; reg_hit@3 and reg_mrr on where-to are identical at both cuts (25
@@ -403,3 +413,205 @@ where-to at 20 answers (opt-in at 10, so where-to is budget-dependent); it is
 opt-in on impact, where the first stage alone is better at 20, and on history.
 This compares the walk with no result filter; whether a local judge changes it
 is N0b.
+
+## N0b: a local judge as a result filter
+
+Question: does a local judge, used as a result filter, change the N0 decisions
+(first stage alone against first stage plus walk)? Pre-registered before any
+judged test result; confirmatory on the S8j test split only. Five arms, all
+offline reorderings or filters of the same raw engine outputs (the engine and
+its cost are unchanged by the judge):
+
+- A1 first stage alone (20 cards), A2 first stage plus judge, A3 first stage
+  plus walk (append, 10 plus the walk's top 10), A4 append plus judge, A5
+  append plus a judge that reorders only the tie group at the K=10 cut (flow
+  only).
+- Judge: cygnet:12b, Q8_0 GGUF, Apache-2.0 (a Gemma 4 12B derivative), rank
+  mode, one candidate per request, card text only (the gold is never sent),
+  exact-origin answers never reordered. It was picked by a rule fixed before
+  the numbers were used: among the licence-eligible local models, the highest
+  mean gain over the no-judge null on the dev items at K=10, where a set loss
+  worse than -.02 disqualifies. The gate modes (keep or drop) all lost on dev
+  and were disqualified; cygnet:12b in rank mode won with a mean dev gain of
+  +.071 (flow path_recall +.143, where-to set_f1 -.002).
+- Test split, n per set (items with the primary defined): where-to 20 (of 34),
+  flow 50, impact 73 (of 82), history 52. Where-to is at the edge of the
+  n >= 20 floor, so a where-to result there is "no evidence", not "no effect".
+- K = 10 is the primary view; K = 20 is the robustness view. Same primaries and
+  Holm correction (over the four sets, inside each comparison) as N0; 95%
+  paired bootstrap, 10000 resamples. Comparisons: C1 A2 minus A1 (filter on the
+  first stage), C2 A4 minus A3 (filter on the append), C3 A4 minus A2 (walk
+  under the filter), C4 A3 minus A1 (walk without a filter, the N0 question).
+- Decision chain per set: the walk stays only if C3 is positive and
+  Holm-significant; the filter becomes the default only if it is positive,
+  Holm-significant and (on flow at 10) above the tie band below; a significant
+  harm is reported.
+
+### Primaries at K=10, test split
+
+| arm | where-to set_f1 (20) | flow path_recall (50) | impact r2_decl_recall (73) | history hit@10 (52) |
+| --- | --- | --- | --- | --- |
+| A1 first stage | .349 | .197 | .460 | .615 |
+| A2 first stage + judge | .377 | .169 | .457 | .615 |
+| A3 append | .363 | .324 (E .254) | .461 | .615 |
+| A4 append + judge | .315 | .355 | .460 | .615 |
+| oracle filter, first stage (ceiling) | .430 | .215 | .466 | .615 |
+| oracle filter, append (ceiling) | .386 | .492 | .473 | .615 |
+
+E is the expected score under random tie order (no-judge append only; the first
+stage has no ties). The oracle rows reorder by the gold labels and are ceilings,
+not arms.
+
+### Verdict per set at K=10 (delta [95% CI], Holm p)
+
+| set (n) | C1 filter on first stage | C2 filter on append | C3 walk under the filter | C4 walk, no filter | default after the chain |
+| --- | --- | --- | --- | --- | --- |
+| where-to (20) | +.028 [-.024, +.077], .83 | -.048 [-.095, -.006], .10 | -.063 [-.120, -.013], .023 | +.014 [+.005, +.024], .0008 | A1; walk opt-in, filter off |
+| flow (50) | -.027 [-.063, .000], .23 | +.031 [-.025, +.086], .78 | +.186 [+.120, +.257], .0008 | +.127 [+.077, +.179], .0008 | A3; walk stays, filter off |
+| impact (73) | -.003 [-.019, +.008], 1.0 | -.002 [-.005, .000], 1.0 | +.003 [-.008, +.019], 1.0 | +.002 [.000, +.005], 1.0 | A1; walk opt-in, filter off |
+| history (52) | .000 [.000, .000], 1.0 | .000 [.000, .000], 1.0 | .000 [.000, .000], 1.0 | .000 [.000, .000], 1.0 | A1; walk opt-in, filter off |
+
+Reading:
+
+- No set adopts the filter. The pick's dev gain on flow (+.143, on the screen's
+  pools) did not carry over: on test, A4 minus A3 is +.031, numerically above
+  the .02 tie band but not significant. The screen is a weak predictor here.
+- Where-to: with the filter on, the walk pool is significantly worse than the
+  filtered first stage (C3 -.063), so the walk is opt-in at 10 as in N0. The
+  filter on the append (C2 -.048, unadjusted p .026, Holm .10) is not a
+  significant harm after Holm; 9 of the 12 changed items lose.
+- Flow: the walk stays under the filter (C3 +.186, 22 items up, 1 down).
+- Impact and history: the judge moves nothing. Every impact difference is under
+  .003, and history has no judged change at K=10 (at K=20 its cards change in 10
+  of 52 items for A4, which cannot change the score). A judge gain above .01 on
+  either set would have been checked as a bug; none occurred.
+- What the judge did: at K=10 it reordered the card list in nearly every item
+  (where-to 34 of 34, flow 47 to 50 of 50, impact 53 to 55 of 73), changed the
+  card set in 32 to 54 items, and moved the primary in only 1 to 15 items per
+  set (where-to 12 of 20, mostly down for A4: 3 up, 9 down).
+- The oracle ceilings reproduce the N0 harness exactly. Headroom is real only
+  on flow with the walk (append .324 to .492); a filter reaching it would need
+  a much better ranking than this judge gives.
+
+K = 20: in rank mode the judge reorders and drops nothing from the 20 cards, so
+it cannot change the scored set. A2 equals A1 and A4 equals A3 exactly on all
+four sets (checked, not tested). The walk effects repeat N0: where-to +.069
+[+.028, +.114] and flow +.277 [+.185, +.374] significant (Holm .0008), impact
+-.034 [-.060, -.009] significant (Holm .012, the walk lowers recall), history
++.019 [.000, +.058] not significant.
+
+### Ties
+
+Tie order is part of the K=10 flow score, as the N0 tie note says. Test split,
+flow at 10: A3 scores .324 as observed against .254 expected under random tie
+order. The no-judge walk gain (C4) is +.127 observed and +.057 against that
+expectation, so more than half of the K=10 flow gain is tie order. At K=20 the
+walk gains are robust to ties (flow +.277 observed, +.260 against the expected
+score; where-to +.069 either way; impact -.034 and -.037).
+
+Tie band rule, fixed before the judged results: a judge gain counts as a win
+only if it also exceeds the tie band of its cell (flow at 10 about .02, flow at
+20 about .016, other cells about .002) as well as passing the registered test.
+Judge arms cannot be redrawn under random ties without new verdicts, so they are
+reported as observed only. C2 on flow is +.031, above the band but with Holm .78,
+so it is not a win under either criterion.
+
+### A5: a tie-only judge (flow, K=10)
+
+Offline, on dev, the tie group at the cut (about 11 candidates per item) was
+the only place where a judge could matter on flow at 10: the oracle order
+inside the ties reaches .55 against .36 observed (all items), and the dev
+tie-break with cygnet:12b gained +.103 [+.039, +.166]. A5 applies that on test,
+reusing the A4 verdicts (no extra model calls).
+
+| judge | A3 | A4 | A5 | A5 minus A3 [95% CI], Holm | A5 minus A4 [95% CI], Holm | judge calls per item, A5 against A4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| cygnet:12b | .324 | .355 | .342 | +.018 [-.027, +.064], .82 | -.013 [-.057, +.030], .82 | 9.1 against 14.1 |
+
+- The dev promise (+.103) shrank to +.018 on test, not significant and below the
+  band: not a win. A5 is indistinguishable from the full-pool judge (A4) at
+  about two thirds of the calls.
+- The dev numbers were selected on dev (the screen models were chosen there), so
+  shrinkage was expected, and it was large.
+
+### Hosted reference, not a candidate
+
+A hosted model (jev-latest) ran the same arms A2, A4 and A5 as a descriptive
+reference for what a good judge can do. It is never shipped, is not eligible
+for the pick, and sits outside the decision chain and every Holm family (its
+Holm column is inside this reference set only). It does not change any verdict.
+
+| comparison, K=10 | where-to (20) | flow (50) | impact (73) |
+| --- | --- | --- | --- |
+| ref A2 first stage + judge | .418 | .181 | .462 |
+| ref A4 append + judge | .368 | .395 | .458 |
+| ref C1 A2 minus A1 | +.070 [+.025, +.117] | -.016 [-.042, +.003] | +.003 [-.002, +.009] |
+| ref C2 A4 minus A3 | +.005 [-.037, +.050] | +.071 [+.021, +.124] | -.003 [-.007, .000] |
+| ref C3 A4 minus A2 | -.050 [-.095, -.008] | +.214 [+.141, +.290] | -.004 [-.010, .000] |
+| gap, cygnet minus ref, A2 | -.041 [-.091, +.001] | -.012 [-.040, +.010] | -.006 [-.021, +.004] |
+| gap, cygnet minus ref, A4 | -.054 [-.114, +.004] | -.040 [-.086, +.001] | +.001 [.000, +.004] |
+
+- The reference helps where a filter should: on the first stage for where-to
+  (+.070) and on the append for flow (+.071, above the band). A5 with the
+  reference is +.046 [+.002, +.092] over A3 (unadjusted p .040, Holm .081), also
+  not a win.
+- The local pick trails the reference by .04 to .05 on where-to and flow
+  (intervals touch zero, n = 20 and 50) and matches it on impact. History is
+  identical for both (no judged change).
+
+### Physical cost
+
+- cygnet:12b: 3246 live requests, none failed or lost, 2.9 M server input
+  tokens, no output tokens, about 0.13 to 0.14 s p50 per request, 576 s for the
+  whole local run (concurrency 1, no throttle). The harness's character-based
+  token estimate undercounts the server's count by about 1.9 times for this
+  model.
+- Reference (hosted): 3256 requests, none failed, 2.1 M input and 114 k output
+  tokens, 0.26 s p50, 507 s at 2 workers.
+- Engine cost per item is the same with and without a judge: the walk costs
+  about 10 to 11 pops and 16 to 18 map calls on where-to, flow and impact
+  against 0 pops and 1.4 to 1.8 map calls for the first stage alone. History:
+  153 pops, 385 map calls and 90 external calls against 2.6 map calls and 7.4
+  external calls.
+- The pick produced no significant gain, so it has no cost per point. For the
+  reference, A4 on flow costs about 8.8 k judge input tokens per item for +.071
+  (an estimate from request counts).
+- A5: 9.1 judge calls per item (9.4 per tied item) against 14.1 for the
+  full-pool judge, with no extra model calls.
+
+### Deviations and caveats
+
+- A5 is not a strict subset of the A4 pool: 45 of the 508 tie-group members
+  (9%) were found by the walk but never returned, so they have no verdict and
+  cannot be placed. A5 reorders only the returned, judged members (453 of 463
+  returned members had a verdict). It is a conservative, cache-only version of
+  the dev tie-break, which also scored members the walk had not returned.
+- RAM guard breach: free memory fell to 2.6 to 2.8 GB for a few minutes while
+  the judge model was resident, against the run's 6 GB rule, and recovered to
+  6.5 GB or more within minutes. The run was not paused, because the model has
+  to stay resident; nothing was paging (checked). The VRAM guard (hard-coded 2.0
+  GB free in the harness) was lowered to 1.0 GB to match the run's rule; free
+  VRAM stayed at about 1.3 GB.
+- Process: the pick comparisons were run minutes before the rule text was
+  written into the pick record. The rule was not changed after the numbers were
+  seen.
+- Report-only additions made after results existed: the table of items whose
+  cards changed against items whose primary changed, and the per-item card lists
+  kept for a later agent-proxy measurement. They change no rule, test, Holm
+  family or number. They arrived mid-run, not before results, and the
+  registration says so.
+- The GPU throttle was off for this run (the registration text still reads 0.6).
+  The call cap (3256, the registered estimate) was exactly enough.
+- Screen against live: the dev screen sent batches of 40 candidates on larger
+  pools; the live run sends one candidate per request on the real arm pools.
+  Per-request latency in the screen was queue time; live latency is 0.14 s.
+- Not run: the all-items descriptive judge run, K=20 gate comparisons (the pick
+  is a rank mode), and the decima:agent candidate (its screen entry was
+  incomplete). History has no judge-sensitive cards at K=10.
+
+Decision from this run: no local judge filter becomes a default on any set. The
+N0 defaults stand under the filter: the walk stays on flow, is opt-in on
+where-to at 10 (default at 20, as in N0), impact and history. A judge pays only
+where the walk's tie order is the problem (flow at 10), and there the local
+pick's test gain is +.03 (+.02 for the cheaper tie-only judge), below what the
+tests can separate from noise.

@@ -104,6 +104,14 @@ not depend on N2. Not taken by default; the owner's order stands.
   default; the walk stays only where walk-plus-filter beats first-stage-plus-filter with an
   interval that excludes zero. Physical cost (expansions, model calls, input tokens) is
   reported for every arm.
+- Ran 2026-10-16: no filter adopted. Judge cygnet:12b (picked on dev by a fixed rule). On the test
+  split at K=10 the filter is not significantly positive on any set (flow append +.031, Holm .78); on where-to the walk pool under the filter is worse than
+  the filtered first stage (-.063, Holm .023). The N0 defaults stand: walk on flow, opt-in on
+  where-to at 10, impact and history. The dev tie-break promise (+.103) shrank to +.018 (n.s.) as
+  a tie-only judge. A hosted reference judge helps more (flow +.071) but is not a candidate.
+  Results in `engine-results.md`, section N0b.
+- N2b (a bandit driven by the judge's verdicts) is not triggered: the judge gave no gain to
+  build on, and the walk's flow gain at 10 is partly tie order.
 
 ## N1: will agents write good query plans? (Wizard of Oz)
 
