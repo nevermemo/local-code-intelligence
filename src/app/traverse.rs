@@ -67,6 +67,7 @@ use lci_maps::{
     },
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
+        frontier::HopPrice,
         handle::HandleStore,
         handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
         ladder::Ladder,
@@ -433,6 +434,32 @@ async fn impact_map(index: &Path, root: &Path, loaded: &Loaded) -> Result<Arc<Im
     .await
     .context("build scip.impact")??;
     Ok(cache.put(index, root, loaded.stamp, map))
+}
+
+/// What a recipe reads of a SCIP index and its tree: the call graph
+/// (`graph.scip`) and the impact map (`scip.impact`, whose index serves
+/// `exact.closure`). Both are cached by the stamp of the index, as `run` uses
+/// them, so a recipe and a traversal over the same index share one load.
+pub(crate) struct OpenedIndex {
+    pub scip: Arc<ScipMap>,
+    pub impact: Arc<ImpactMap>,
+}
+
+/// Opens (or takes from the cache) the maps of `index` over `root`.
+pub(crate) async fn open_index(index: &Path, root: &Path) -> Result<OpenedIndex> {
+    let loaded = load(index, Some(root)).await?;
+    let impact = impact_map(index, root, &loaded).await?;
+    Ok(OpenedIndex {
+        scip: loaded.scip.clone(),
+        impact,
+    })
+}
+
+/// The `config.key` map of `index` over `root` (built once per index stamp; it
+/// runs the key extractor, which needs `rg` on `PATH`).
+pub(crate) async fn open_config_key(index: &Path, root: &Path) -> Result<Arc<ConfigKeyMap>> {
+    let loaded = load(index, Some(root)).await?;
+    config_key_map(index, root, &loaded).await
 }
 
 /// Matches the question's words against symbol names: the stand-in for the
@@ -1719,6 +1746,10 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .priors(priors)
         .tie_break(tie_break)
         .top_k(call.top_k, expanding)
+        .price(HopPrice {
+            beam: limits.beam,
+            ..HopPrice::default()
+        })
         .expanders(registry.expanding_maps());
     let traversal = match &rescorer {
         Some(rescorer) => traversal
@@ -4358,5 +4389,106 @@ mod tests {
             error.contains("tie_break no-such-tie-break.json"),
             "{error}"
         );
+    }
+
+    /// A tree whose `a.rs` has `target` and `users` functions that each hold
+    /// one reference to it, with a SCIP index over it.
+    #[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+    fn crowded_tree(users: u32) -> (tempfile::TempDir, PathBuf) {
+        use scip::types::{Document, Index, Occurrence};
+        let dir = tempfile::tempdir().unwrap();
+        let source: String = (0..=users).map(|_| "fn f() { f(); }\n").collect();
+        std::fs::write(dir.path().join("a.rs"), source).unwrap();
+        let sym = |name: &str| format!("rust-analyzer cargo demo 0.1.0 a/{name}().");
+        let occurrence = |range: &[i32], symbol: &str, roles: i32, enclosing: &[i32]| {
+            let mut o = Occurrence::default();
+            o.range = range.to_vec();
+            o.symbol = symbol.to_owned();
+            o.symbol_roles = roles;
+            o.enclosing_range = enclosing.to_vec();
+            o
+        };
+        let mut document = Document::default();
+        document.relative_path = "a.rs".to_owned();
+        document.occurrences = vec![occurrence(&[0, 3, 9], &sym("target"), 1, &[0, 0, 0, 15])];
+        for i in 1..=users as i32 {
+            document.occurrences.push(occurrence(
+                &[i, 3, 8],
+                &sym(&format!("user{i}")),
+                1,
+                &[i, 0, i, 15],
+            ));
+            document
+                .occurrences
+                .push(occurrence(&[i, 9, 15], &sym("target"), 0, &[]));
+        }
+        // The impact map anchors at declarations, which need a kind.
+        document.symbols = std::iter::once("target".to_owned())
+            .chain((1..=users).map(|i| format!("user{i}")))
+            .map(|name| {
+                let mut info = scip::types::SymbolInformation::default();
+                info.symbol = sym(&name);
+                info.kind = scip::types::symbol_information::Kind::Function.into();
+                info
+            })
+            .collect();
+        let mut message = Index::default();
+        message.documents = vec![document];
+        let index = dir.path().join("index.scip");
+        scip::write_message_to_file(&index, message).unwrap();
+        (dir, index)
+    }
+
+    #[tokio::test]
+    async fn the_beam_decides_how_many_of_a_nodes_edges_the_walk_follows() {
+        let (dir, index) = crowded_tree(21);
+        let loaded = load(&index, Some(dir.path())).await.unwrap();
+        let target = loaded
+            .scip
+            .node_id(
+                loaded
+                    .scip
+                    .graph()
+                    .node_index("rust-analyzer cargo demo 0.1.0 a/target().")
+                    .expect("target is a graph node"),
+            )
+            .to_string();
+        let maps = [SCIP_IMPACT_ID.to_owned()];
+        let (budget, steer) = (
+            BudgetArgs {
+                max_depth: Some(1),
+                ..BudgetArgs::default()
+            },
+            SteerArgs::default(),
+        );
+        let hops = |beam: usize| {
+            let (target, maps, budget, steer, index, dir) =
+                (&target, &maps, &budget, &steer, &index, &dir);
+            async move {
+                let call = Call {
+                    scip_index: index,
+                    scip_root: Some(dir.path()),
+                    question: "q",
+                    seeds: std::slice::from_ref(target),
+                    seed_search: None,
+                    top_k: 40,
+                    maps: Some(maps),
+                    budget,
+                    steer,
+                    handle: None,
+                    lsp: None,
+                };
+                let limits = TraverseConfig { beam, ..limits() };
+                let response = run(&limits, &Dirs::under(dir.path()), &call)
+                    .await
+                    .unwrap()
+                    .response;
+                response["totals"]["hops"].as_u64().unwrap()
+            }
+        };
+        // 21 users offered: the default beam of 16 drops five, 64 keeps all.
+        assert_eq!(TraverseConfig::default().beam, 16);
+        assert_eq!(hops(TraverseConfig::default().beam).await, 16);
+        assert_eq!(hops(64).await, 21);
     }
 }

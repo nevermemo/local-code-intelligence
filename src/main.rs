@@ -350,6 +350,15 @@ enum Command {
     /// ran out, the `handle` and `checkpoint`; continue with `--handle` (and
     /// `--steer`).
     Traverse(TraverseArgs),
+    /// Run one recipe over a SCIP index and print its JSON answer: the nodes,
+    /// the steps run, why it stopped and what it cost. The recipes are
+    /// config_readers, impact_rings, flow_path, flow_from, config_neighbours
+    /// and lci_compose (arguments as the matching MCP tool takes them, minus
+    /// `workspace_path`, which is `--root`). `[recipes] enabled` and `[compose]
+    /// enabled` only gate the MCP and REST tools; this command always runs.
+    /// config_readers, config_neighbours and an lci_compose config.key step
+    /// need `rg` on PATH.
+    Recipe(RecipeArgs),
     Symbols {
         workspace: PathBuf,
         query: String,
@@ -499,6 +508,81 @@ struct TraverseArgs {
     /// data directory.
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct RecipeArgs {
+    /// The recipe: config_readers, impact_rings, flow_path, flow_from,
+    /// config_neighbours or lci_compose.
+    name: String,
+    /// The tree the index describes (also holds `config.example.toml`).
+    #[arg(long)]
+    root: PathBuf,
+    /// The SCIP index (default: `[traverse] scip_index` under --root).
+    #[arg(long)]
+    scip: Option<PathBuf>,
+    /// The recipe's arguments, inline JSON or the path of a JSON file
+    /// (default `{}`).
+    #[arg(long)]
+    args: Option<String>,
+    /// Write `traces/` and `handles/` of flow_from under this directory
+    /// instead of the data directory.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+/// `recipe`: one recipe over a SCIP index, printed as JSON. Runs without
+/// opening the application.
+async fn run_recipe(
+    config_path: Option<PathBuf>,
+    no_local_config: bool,
+    args: RecipeArgs,
+) -> Result<()> {
+    use local_code_intelligence::app::{
+        recipes::{self, Ctx, Request},
+        traverse::Dirs,
+    };
+    let spec = ResolveSpec::from_process(
+        config_path,
+        Flags {
+            port: None,
+            no_local_config,
+        },
+    )?;
+    let config = layers::resolve(&spec)?.config;
+    let root = dunce::canonicalize(&args.root)
+        .with_context(|| format!("the tree {}", args.root.display()))?;
+    let mut recipe_args = match &args.args {
+        Some(text) => json_argument(text)?,
+        None => json!({}),
+    };
+    let object = recipe_args
+        .as_object_mut()
+        .context("--args must be a JSON object")?;
+    object
+        .entry("workspace_path")
+        .or_insert_with(|| json!(root.to_string_lossy()));
+    let request = Request::parse(&args.name, &recipe_args)?;
+    let scip = args
+        .scip
+        .unwrap_or_else(|| root.join(&config.traverse.scip_index));
+    let dirs = match &args.out {
+        Some(out) => Dirs {
+            traces: out.join("traces"),
+            handles: out.join("handles"),
+        },
+        None => Dirs::under(&config.data_dir),
+    };
+    let ctx = Ctx {
+        limits: &config.traverse,
+        dirs: &dirs,
+        scip_index: &scip,
+        root: &root,
+        flow_judge: config.recipes.flow_judge,
+    };
+    let answer = recipes::run(&ctx, &request).await?;
+    println!("{}", serde_json::to_string_pretty(&answer)?);
+    Ok(())
 }
 
 /// JSON given inline or as the path of a file.
@@ -1096,6 +1180,9 @@ async fn run() -> Result<()> {
     if let Command::Traverse(args) = command {
         return run_traverse(cli.config, cli.no_local_config, args).await;
     }
+    if let Command::Recipe(args) = command {
+        return run_recipe(cli.config, cli.no_local_config, args).await;
+    }
     if let Command::Config { json } = command {
         return run_config(cli.config, cli.no_local_config, json);
     }
@@ -1220,6 +1307,7 @@ async fn run() -> Result<()> {
         Command::Compare { .. } => unreachable!("compare returns before the application opens"),
         Command::Replay { .. } => unreachable!("replay returns before the application opens"),
         Command::Traverse(_) => unreachable!("traverse returns before the application opens"),
+        Command::Recipe(_) => unreachable!("recipe returns before the application opens"),
         Command::Symbols { workspace, query } => serde_json::to_value(
             until_shutdown_signal(&app, app.symbols(&workspace, &query)).await?,
         )?,

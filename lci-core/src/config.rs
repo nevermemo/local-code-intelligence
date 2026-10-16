@@ -485,6 +485,17 @@ pub struct Config {
     /// reports stay as they were.
     #[serde(skip_serializing_if = "TraverseConfig::is_default")]
     pub traverse: TraverseConfig,
+    /// `[recipes]`: the named recipe tools (`config_readers`, `impact_rings`,
+    /// `flow_path`, `flow_from`, `config_neighbours`). Off by default; while
+    /// off the tool list, schemas, REST routes and server instructions are
+    /// those of a server without them. Left out of the serialized
+    /// configuration while it equals the default.
+    #[serde(skip_serializing_if = "RecipesConfig::is_default")]
+    pub recipes: RecipesConfig,
+    /// `[compose]`: the `lci_compose` tool (operator steps in one call). Off
+    /// by default, with the same guarantees as `[recipes]`.
+    #[serde(skip_serializing_if = "ComposeConfig::is_default")]
+    pub compose: ComposeConfig,
     /// `[system_one]`: the small model that steers a traversal (a local
     /// server, a hosted provider or another machine). Off when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,9 +728,17 @@ pub struct TraverseConfig {
     /// Add the exact cards whose node the SCIP graph holds to the walk's start
     /// nodes, after the others.
     pub exact_seeds: bool,
+    /// Most edges of one expansion the walk follows once the expansion offers
+    /// more than 8: the best `beam` by the hop score are adopted and the rest
+    /// are dropped (a search heuristic, not a limit of the maps). `16` is
+    /// what the walk always used; the recipes raise it so that a node with
+    /// many readers or callers is not cut. A resumed traversal runs with the
+    /// beam of the call that resumes it. Allowed: `1..=256`.
+    pub beam: usize,
 }
 
 impl TraverseConfig {
+    pub const MAX_BEAM_LIMIT: usize = 256;
     pub const MAX_FIRST_K_LIMIT: u32 = 200;
     pub const MAX_POPS_LIMIT: u32 = 2000;
     pub const MAX_SEED_K_LIMIT: u32 = 40;
@@ -795,6 +814,12 @@ impl TraverseConfig {
             self.seed_k
         );
         ensure!(
+            (1..=Self::MAX_BEAM_LIMIT).contains(&self.beam),
+            "traverse.beam must be 1..={} (got {})",
+            Self::MAX_BEAM_LIMIT,
+            self.beam
+        );
+        ensure!(
             self.first_k <= Self::MAX_FIRST_K_LIMIT,
             "traverse.first_k must be 0..={} (got {})",
             Self::MAX_FIRST_K_LIMIT,
@@ -845,7 +870,43 @@ impl Default for TraverseConfig {
             first_k: 10,
             answer_seeds: false,
             exact_seeds: false,
+            beam: 16,
         }
+    }
+}
+
+/// `[recipes]`: the named server-side recipes. They read the SCIP index of
+/// `[traverse] scip_index` and, for the config recipes, the tree's
+/// `config.example.toml`; `[traverse] enabled` is not needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecipesConfig {
+    /// Serve the recipe tools over MCP and REST. `false`: no recipe tool is
+    /// listed or routed, and the other tools are unchanged.
+    pub enabled: bool,
+    /// Let a judge drop the walk results of `flow_from` that do not answer
+    /// the question. No judge is wired in this build: `true` only adds a note
+    /// to the answer and leaves the walk order as it is.
+    pub flow_judge: bool,
+}
+
+impl RecipesConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[compose]`: the `lci_compose` tool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComposeConfig {
+    /// Serve `lci_compose` over MCP and REST. `false`: not listed or routed.
+    pub enabled: bool,
+}
+
+impl ComposeConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1148,6 +1209,8 @@ impl Default for Config {
             fusion: FusionConfig::default(),
             search_profiles: BTreeMap::new(),
             traverse: TraverseConfig::default(),
+            recipes: RecipesConfig::default(),
+            compose: ComposeConfig::default(),
             system_one: None,
         }
     }
@@ -3142,6 +3205,66 @@ first_stage = \"{bad}\"
     }
 
     #[test]
+    fn the_recipe_and_compose_sections_are_off_by_default_and_parse() {
+        let plain: Config = toml::from_str(&base_toml()).unwrap();
+        assert_eq!(plain.recipes, RecipesConfig::default());
+        assert!(!plain.recipes.enabled && !plain.recipes.flow_judge && !plain.compose.enabled);
+        // Left out of the serialized configuration while default.
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("recipes").is_none() && json.get("compose").is_none());
+        let on: Config = toml::from_str(&format!(
+            "{}[recipes]
+enabled = true
+[compose]
+enabled = true
+",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.recipes.enabled && on.compose.enabled && !on.recipes.flow_judge);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["recipes"]["enabled"], true);
+        assert_eq!(json["compose"]["enabled"], true);
+        for bad in [
+            "[recipes]
+nope = 1
+",
+            "[compose]
+nope = 1
+",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("{}{bad}", base_toml())).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_beam_defaults_to_what_the_walk_always_used_and_parses() {
+        assert_eq!(TraverseConfig::default().beam, 16);
+        // The default beam leaves the serialized traverse section alone.
+        let plain: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("traverse")
+                .is_none()
+        );
+        let wide: Config = toml::from_str(&format!(
+            "{}[traverse]
+beam = 64
+",
+            base_toml()
+        ))
+        .unwrap();
+        wide.validate().unwrap();
+        assert_eq!(wide.traverse.beam, 64);
+        assert_eq!(serde_json::to_value(&wide).unwrap()["traverse"]["beam"], 64);
+    }
+
+    #[test]
     fn traverse_rejects_unknown_keys_and_out_of_range_limits() {
         let text = format!("{}[traverse]\nnope = 1\n", base_toml());
         assert!(toml::from_str::<Config>(&text).is_err());
@@ -3157,7 +3280,7 @@ fusion = \"{fusion}\"
             assert!(fusion.parse::<TraverseFusion>().is_err(), "{fusion:?}");
         }
         type Set = fn(&mut TraverseConfig);
-        let bad: [(&str, Set); 23] = [
+        let bad: [(&str, Set); 25] = [
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
@@ -3192,6 +3315,8 @@ fusion = \"{fusion}\"
             ("seed_k", |t| {
                 t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1
             }),
+            ("beam", |t| t.beam = 0),
+            ("beam", |t| t.beam = TraverseConfig::MAX_BEAM_LIMIT + 1),
         ];
         for (key, set) in bad {
             let mut config = Config {

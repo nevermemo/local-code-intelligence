@@ -403,3 +403,26 @@ answer_seeds = false
 # Add the exact cards whose node the SCIP graph holds to the walk's start nodes,
 # after the others (independent of first_stage).
 exact_seeds = false
+# Edges of one expansion the walk follows once it offers more than 8: the best
+# `beam` by the hop score are adopted, the rest are dropped. A search heuristic,
+# not a limit of the maps (config.key offers up to 256 edges per node,
+# scip.impact 64). 16 is what the walk always used; 1 to 256.
+beam = 16
+
+# Named server-side recipes (config_readers, impact_rings, flow_path, flow_from,
+# config_neighbours): fixed chains of the operators above, each answering with
+# its steps, a witness per result and a stop reason. Off by default; while
+# enabled is false the tool list, the schemas and the REST routes are exactly
+# those of a server without them. Needs [traverse] scip_index. The same recipes
+# run as `lci recipe`, which ignores enabled. flow_judge asks a judge to drop
+# walk results of flow_from; no judge is wired in this build, so it only adds a
+# note.
+[recipes]
+enabled = false
+flow_judge = false
+
+# lci_compose: up to 6 operator steps in one call, with $sN.field references to
+# earlier steps and no model between them. Off by default; same rules as
+# [recipes]. Needs [traverse] scip_index.
+[compose]
+enabled = false

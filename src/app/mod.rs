@@ -7,6 +7,7 @@ mod compact;
 mod indexing;
 mod navigation;
 pub(crate) mod readiness;
+pub mod recipes;
 mod search;
 pub mod traverse;
 
