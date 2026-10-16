@@ -194,6 +194,23 @@ not depend on N2. Not taken by default; the owner's order stands.
   metric of two or more sets with Holm-adjusted intervals that exclude zero, loses no set
   by more than .02, and costs no more model calls per question. Otherwise the untrained
   judge stays.
+- Ran 2026-10-16, two forms, both KILLED:
+  - Cheap head (gradient-boosted trees on card features, CPU). Trained and tested within the
+    same sets it wins flow (append, +.15) and loses where-to. Trained with one set left out
+    (the transfer case) it loses both. No form met the rule.
+  - LoRA fine-tune of the 4B reranker on the other sets' gold, scored on the left-out set:
+    where-to set_f1@10 .222 tuned against .244 untuned and .307 for the first-stage order
+    (tuned minus first stage -.085, interval -.125 to -.048, Holm p .001); first20 also
+    lost. The flow fold was not run once where-to could no longer win. A read-only review
+    found no defect (prompt parity with the served model 1.0, correct yes/no tokens and
+    score direction, no fold overlap). Mechanism: pointwise relevance labels do not
+    translate into set_f1 over files on where-to; even the label oracle is not
+    significantly better than the first-stage order there.
+  - Consequence: no reranking stage on map card lists; the first-stage order stays the
+    default (with the N0 walk rules). Offline-gold fine-tuning across question types made
+    ordering worse, so any later fine-tune needs in-distribution labels from agent use and
+    its own gate. The search pipeline's chunk reranker is a different use and is not
+    affected by this result.
 
 ## Later: freshness (F1, F2)
 
