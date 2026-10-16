@@ -218,6 +218,17 @@ impl ImpactMap {
         self.ids.get(self.ix.def_index(symbol)?)?.as_ref()
     }
 
+    /// The definition (an index into [`ImpactIndex::defs`]) a node id stands
+    /// for, the reverse of [`ImpactMap::node_of`].
+    pub fn def_of(&self, node: &NodeId) -> Option<usize> {
+        self.by_node.get(node).copied()
+    }
+
+    /// The node id of the definition at `def`, if the map has one.
+    pub fn node_of_def(&self, def: usize) -> Option<&NodeId> {
+        self.ids.get(def)?.as_ref()
+    }
+
     /// Where the map's node is defined: the path and the 0-based line and
     /// column of the name. For a unit the SCIP graph does not hold (a type, a
     /// constant) this is the only place that knows.

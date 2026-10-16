@@ -438,6 +438,60 @@ impl ImpactIndex {
         })
     }
 
+    /// Every definition the `names` match (the test [`ImpactIndex::anchor_n`]
+    /// uses), in the order `anchor_n` ranks them: most non-definition
+    /// occurrences, then most name segments, earliest line, symbol order. The
+    /// first is the anchor `anchor_n` picks; more than one means the name is
+    /// ambiguous, which `anchor_n` does not say.
+    pub fn anchor_candidates(&self, names: &[Vec<String>]) -> Vec<usize> {
+        let mut found: Vec<(NKey<'_>, usize)> = Vec::new();
+        for def in 0..self.defs.len() {
+            let segs = names
+                .iter()
+                .filter(|n| self.matches(def, n))
+                .map(Vec::len)
+                .max();
+            let Some(segs) = segs else { continue };
+            let d = &self.defs[def];
+            found.push((
+                (
+                    std::cmp::Reverse(self.ref_count(def)),
+                    std::cmp::Reverse(segs),
+                    d.name_range.0,
+                    d.symbol.as_str(),
+                ),
+                def,
+            ));
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found.into_iter().map(|(_, def)| def).collect()
+    }
+
+    /// Whether a question can be anchored on the definition: a unit (see the
+    /// module header) or a field or enum variant, which are not units but are
+    /// symbols whose references the closure counts.
+    pub fn anchorable(&self, def: usize) -> bool {
+        self.unit[def] || matches!(self.kinds[def], Some(Kind::Field | Kind::EnumMember))
+    }
+
+    /// The definition's kind in words (`function`, `struct`, `field`, ...);
+    /// `symbol` when the index gave none.
+    pub fn kind_name(&self, def: usize) -> &'static str {
+        match self.kinds[def] {
+            Some(Kind::Function) => "function",
+            Some(Kind::Method | Kind::TraitMethod | Kind::StaticMethod) => "method",
+            Some(Kind::Struct | Kind::Class) => "struct",
+            Some(Kind::Enum) => "enum",
+            Some(Kind::Trait | Kind::Interface) => "trait",
+            Some(Kind::TypeAlias) => "type_alias",
+            Some(Kind::Constant) => "const",
+            Some(Kind::StaticVariable | Kind::StaticProperty) => "static",
+            Some(Kind::Field) => "field",
+            Some(Kind::EnumMember) => "enum_variant",
+            _ => "symbol",
+        }
+    }
+
     /// Arm N for one question: the code names of the question, the anchor
     /// ([`ImpactIndex::anchor_n`]) and its one-hop reverse closure, ordered by
     /// the anchor's occurrences each declaration holds (most first), then path,
@@ -880,6 +934,72 @@ mod tests {
             ix.defs[ix.anchor_n(&names).unwrap().def].symbol,
             sym("a/Foo#")
         );
+    }
+
+    /// Two structs named `Foo` (`a.rs` with two references, `b.rs` with one)
+    /// and a method `Foo::new` in `b.rs`.
+    fn twin_demo() -> ImpactIndex {
+        let (a_foo, b_foo, new, user) = (
+            sym("a/Foo#"),
+            sym("b/Foo#"),
+            sym("b/impl#[Foo]new()."),
+            sym("a/user()."),
+        );
+        let docs = vec![
+            RawDocument {
+                path: "a.rs".into(),
+                occurrences: vec![
+                    occ((0, 7, 0, 10), &a_foo, 1, Some((0, 0, 0, 14))),
+                    occ((1, 3, 1, 7), &user, 1, Some((1, 0, 1, 40))),
+                    occ((1, 12, 1, 15), &a_foo, 0, None),
+                    occ((1, 20, 1, 23), &a_foo, 0, None),
+                    occ((1, 25, 1, 28), &b_foo, 0, None),
+                ],
+            },
+            RawDocument {
+                path: "b.rs".into(),
+                occurrences: vec![
+                    occ((0, 7, 0, 10), &b_foo, 1, Some((0, 0, 0, 14))),
+                    occ((1, 14, 1, 17), &new, 1, Some((1, 11, 1, 30))),
+                ],
+            },
+        ];
+        let kinds: HashMap<String, Kind> = [
+            (a_foo, Kind::Struct),
+            (b_foo, Kind::Struct),
+            (new, Kind::Method),
+            (user, Kind::Function),
+        ]
+        .into_iter()
+        .collect();
+        ImpactIndex::build(docs, &kinds, None)
+    }
+
+    #[test]
+    fn anchor_candidates_list_every_match_in_the_order_anchor_n_picks() {
+        let ix = twin_demo();
+        let symbols = |names: &[Vec<String>]| -> Vec<String> {
+            ix.anchor_candidates(names)
+                .into_iter()
+                .map(|def| ix.defs[def].symbol.clone())
+                .collect()
+        };
+        // A bare name matches both structs, the more referenced one first.
+        let (bare, _) = code_names("`Foo`");
+        assert_eq!(symbols(&bare), vec![sym("a/Foo#"), sym("b/Foo#")]);
+        assert_eq!(
+            ix.defs[ix.anchor_n(&bare).unwrap().def].symbol,
+            sym("a/Foo#")
+        );
+        // A module qualifier narrows to one; an owner qualifier finds the method.
+        let (qualified, _) = code_names("`b::Foo`");
+        assert_eq!(symbols(&qualified), vec![sym("b/Foo#")]);
+        let (method, _) = code_names("`Foo::new`");
+        assert_eq!(symbols(&method), vec![sym("b/impl#[Foo]new().")]);
+        // No match, no candidate.
+        let (none, _) = code_names("`Nowhere`");
+        assert!(ix.anchor_candidates(&none).is_empty());
+        assert!(ix.anchor_candidates(&[]).is_empty());
     }
 
     #[test]

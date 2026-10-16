@@ -173,6 +173,18 @@ fn every_node_of_the_map_has_the_site_of_its_definition() {
     assert_eq!(map.site_of(&function("nowhere")), None);
 }
 
+#[test]
+fn a_node_id_and_its_definition_map_both_ways() {
+    let map = map();
+    let node = function("use_foo");
+    let def = map.def_of(&node).expect("use_foo has a definition");
+    assert_eq!(map.index().defs[def].symbol, sym("a/use_foo()."));
+    assert_eq!(map.node_of_def(def), Some(&node));
+    assert_eq!(map.node_of(&sym("a/use_foo().")), Some(&node));
+    assert_eq!(map.def_of(&function("nowhere")), None);
+    assert_eq!(map.node_of_def(usize::MAX), None);
+}
+
 #[tokio::test]
 async fn a_chain_of_callers_is_one_hop_at_a_time() {
     let map = map();
