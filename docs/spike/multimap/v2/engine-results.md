@@ -20,6 +20,9 @@ sets at once.
 - The held-out sets are small (where-to has 12 registration items there).
   Choosing a prior per set from these rows would select on the holdout; any
   such choice needs a fresh split before it counts.
+- Tau is reported as the aggregate mean over the items where an arm defines it,
+  with the item count in parentheses, so two arms in one row can rest on
+  different items. A paired tau (items defined in both arms) is labelled paired.
 
 ## Score bound (Q1, B1)
 
@@ -76,11 +79,10 @@ Held-out items, learned priors with and without the reranker:
 | --- | --- | --- |
 | where-to | reg_hit@3 .750, reg_mrr .644, precision .342 | .833, .799, .482 |
 | impact | decl_recall .051, decl_f1 .046 | .069, .055 |
-| flow | path_recall .403, tau 1.000 | .364, .667 (tau over 6 items) |
+| flow | path_recall .403, tau 1.000 | .364, .667 (aggregate tau over 6 items) |
 
 The reranker helps where-to and impact and hurts flow: it ranks by relevance
-to the question, which scrambles the order along a call path (tau falls from
-.933 to .333, though tau is defined on 15 items instead of 30) and loses path recall, though precision rises. On where-to it
+to the question, which scrambles the order along a call path (aggregate tau falls from .933 over 30 items to .333 over 15; the two means rest on different items and are not a paired change) and loses path recall, though precision rises. On where-to it
 also repairs the learned priors' loss. It costs 16 calls per item on average
 (about 90 documents per impact item, no failures) and 50 to 76% more pops.
 On history (with git.history) the reranker is the largest gain so far: over
@@ -165,16 +167,16 @@ closure, so N reproduces it nearly by construction (`m1.4-results.md`): a
 typed impact query should route to the closure, and the walk's value on
 impact is for questions that name no symbol.
 
-## Seeds, one hop and the steering ceiling (bench-1022)
+## Seeds, one hop and a gold-aware steering probe (bench-1022)
 
 Release build of `40e495f`, all items, guessed priors, two sets at once, no
 deadline stops or call failures in any row (waves `W-*` in `trend.md`).
 Paired deltas are `maps compare` with a 95% bootstrap interval.
 
-| set | walk (W-plain) | search only (W-search) | one hop + seeds (W-onehop) | oracle steer (W-oracle) |
+| set | walk (W-plain) | search only (W-search) | one hop + seeds (W-onehop) | gold-aware steer (W-oracle) |
 | --- | --- | --- | --- | --- |
 | where-to | reg_mrr .687, set_f1 .242, precision .333 | .837, .314, .343 | .837, .306, .310 | .900, .356, .661 |
-| flow | path_recall .328, tau .933 (30), precision .138 | .219, -.273 (11), .220 | .467, .167 (44), .230 | .402, .855 (46), .186 |
+| flow | path_recall .328, tau .933 (30), precision .138 | .219, -.273 (11), .366 | .467, .167 (44), .230 | .402, .855 (46), .186 |
 
 - The walk does not return its own seeds (the hybrid search hits), and on
   where-to those are its best answers: search alone beats the walk (reg_mrr
@@ -185,15 +187,17 @@ Paired deltas are `maps compare` with a 95% bootstrap interval.
 - Merging run files offline (no new engine run): seeds interleaved with the
   walk's answers, cut to 10, give flow path_recall .444 and tau .615 at the
   walk's own answer count (about 10 per item), and where-to reg_mrr .847,
-  reg_hit@3 .960. Appended in full, flow reaches path_recall .547.
-- The oracle steer (`maps oracle-policy`: per-item prune rules built from the
-  gold, bench only) bounds what steering can add with these maps: where-to
-  precision +.328 [+.239, +.417] and set_f1 +.114, flow path_recall +.074
+  reg_hit@3 .960. Appended in full, flow reaches path_recall .547 (about 20 answers per item
+  instead of 10, so part of that is answer budget; see the N0 section).
+- The gold-aware steer (`maps oracle-policy`: per-item prune rules built from
+  the gold, bench only) is a probe, not an optimal-policy ceiling: it prunes
+  outside the gold files and so may remove useful intermediate routes. With
+  these maps it gains: where-to precision +.328 [+.239, +.417] and set_f1 +.114, flow path_recall +.074
   [+.037, +.115]. A gold-aware filter of the plain walk's 40-result pool
   (`maps oracle-filter`, no steering) reaches about the same: where-to
   precision .660, reg_mrr .840; flow path_recall .418, tau .842. Most of the
-  ceiling is choosing among results the walk already finds (4 of 59 oracle
-  where-to walks returned nothing), so a result
+  probe's gain is choosing among results the walk already finds (4 of 59
+  gold-aware where-to walks returned nothing), so a result
   filter can be tried before steering the walk itself.
 - A larger pool (top 40, scored on 10) changes little (where-to reg_mrr .680, flow path_recall .324).
 
@@ -210,8 +214,9 @@ The exact operators of BR3 against the walk's run files, merged per item
   (.482 to .534): exact first, the walk after it.
 - History: interleaving the git pickaxe baseline with the reranked walk
   (RR-git), cut to 10, raises hit@10 .645 to .727 and mrr .492 to .521. The
-  walk rows stopped on the deadline on 52 of 110 items, so the gain is a lower
-  bound for that arm.
+  walk rows stopped on the deadline on 52 of 110 items, so this is a
+  deadline-limited observation, not a lower bound: further exploration could
+  also displace good answers.
 
 On every set a first stage (search hits or an exact operator) gives the best
 early answers and the walk adds answers the first stage does not reach. BR4
@@ -228,14 +233,14 @@ exact answers. Impact selects `exact.closure`, history `git.history` and
 `exact.pickaxe`. Deltas are against F-off, 95% paired bootstrap, no item
 stopped on the deadline.
 
-| set | metric | F-off | F-append | F-interleave | F-exactseed |
+| set | metric | F-off (about 10 answers) | F-append (about 20) | F-interleave (about 10) | F-exactseed (about 20) |
 | --- | --- | --- | --- | --- | --- |
 | where-to (59) | reg_mrr (25) | .687 | .837 [+.027, +.293] | .847 [+.040, +.300] | - |
 | | set_f1 (34) | .242 | .297 [+.023, +.091] | .260 (n.s.) | - |
 | | precision | .333 | .287 [-.088, -.009] | .358 (n.s.) | - |
 | flow (111) | path_recall | .328 | .547 [+.168, +.272] | .398 [+.008, +.134] | - |
 | | precision | .138 | .216 [+.060, +.098] | .300 [+.136, +.191] | - |
-| | tau (30 / 16) | .933 | .756 [-.356, -.044] | .792 (n.s.) | - |
+| | tau (paired: 30 / 16 items) | .933 (.875 on the 16) | .756 [-.356, -.044] | .792 (n.s.) | - |
 | impact (141) | decl_recall | .067 | .874 | .711 | .869 |
 | | r2_decl_recall | .046 | .461 | .364 | .464 |
 | | tests_recall (100) | .006 | .387 | .291 | .387 |
@@ -243,13 +248,21 @@ stopped on the deadline.
 | history (110) | mrr | .128 | .501 [+.281, +.465] | .483 | .501 |
 | | hit@10 | .191 | .664 [+.373, +.573] | .582 | .664 |
 
-Every impact and history interval excludes zero by a wide margin. Findings:
+Every impact and history interval excludes zero by a wide margin.
 
-- A plain repeat of F-off (arm R-off) gives the same score on every item of
-  every set: the engine's run-to-run noise is zero at this deadline, so any
-  nonzero delta here is a real change in the answers. This is the engine's
-  noise floor only; the noise of agent runs is still to be measured.
-- Append is the default to beat: it is best or tied on recall everywhere
+Answer budget: F-append (and F-exactseed) return the first stage's cards (up to
+`first_k = 10`) plus the walk's top 10, about 20 answers per item, against about
+10 for F-off and F-interleave, and the bench scores every returned answer. Part
+of the F-append gain over those arms, above all on the recall metrics (flow
+path_recall, impact second ring, history hit@10), is answer budget and not
+walk. The matched rerun is the N0 section below. Findings:
+
+- A plain repeat of F-off (arm R-off) gave the same score on every item of
+  every set: this repeat showed no metric differences at this deadline. That
+  shows repeatable scores on one repeat, not identical ranked evidence, and it
+  says nothing about the noise of agent runs, which is still to be measured.
+- Append is the default to beat (at about twice the answers of F-off and
+  F-interleave; see N0 below): it is best or tied on recall everywhere
   (flow path_recall +.219, impact second-ring +.415, history hit@10 +.473)
   and loses only flow order (tau) and where-to precision. Interleave buys
   precision (flow .300, impact .428) for recall.
@@ -261,3 +274,132 @@ Every impact and history interval excludes zero by a wide margin. Findings:
   impact second ring (.461 vs .572) and history hit@10 (.664 vs .727); those
   merges used the reranked walk and wider maps, these arms the default maps
   without the reranker frontier.
+
+## N0: first stage alone against first stage plus walk (bench-1024, bench-1024b)
+
+Question: once the first stage has answered, does the walk add anything? Two
+runs, the second pre-registered to remove a confound of the first. Same frozen
+eval tree and release build (`b5462ad`) as bench-1023; paired by item, 95%
+paired bootstrap (10000 resamples over items).
+
+### First run, unmatched (bench-1024)
+
+F-first is the first stage alone with its natural answer count (8.0 cards per
+item on where-to and flow, 9.8 on impact, 9.7 on history); it was compared
+with bench-1023's F-append (18 to 20 cards). F-append scored higher on the
+recall metrics (flow path_recall .219 to .547, +.328 [+.269, +.388]; impact
+second ring +.015 [+.009, +.022]; history hit@10 +.018 [.000, +.046]) and
+lower on precision (flow -.150, impact decl_f1 -.361), and on where-to set_f1
+it scored lower (.314 to .297, -.017 [-.029, -.007]). This mixes "walk against
+no walk" with "about 10 against about 20 answers", and the bench scores every
+returned answer, so a reviewer rated it confounded. It is kept only as the
+reference for the matched run.
+
+### Matched rerun (bench-1024b), pre-registered
+
+The arms, the primaries (one per set: where-to set_f1, flow path_recall, impact
+r2_decl_recall, history hit@10) and the decision rule were written before any
+bench-1024b arm was scored (`prereg.md` of that run).
+
+- F-append: bench-1023's arm as it is (first stage capped at `first_k = 10`,
+  then the walk's top 10), reused and not re-run. The matched comparison is
+  therefore against a 10-card first stage plus the walk; a walk appended to a
+  20-card first stage was not run.
+- F-first20: the first stage alone at 20 cards. A live run of the same binary
+  with `first_stage = "append"`, `first_k = 20`, `answer_seeds = true`,
+  `seed_k = 20` and `max_pops = 1`; every walk-origin card is then dropped, so
+  the answers are the exact operators' cards (impact, history) followed by the
+  search seeds. `seed_k = 20` is needed because the seeds are the walk's start
+  nodes; with 8 seeds where-to and flow could not reach 20 first-stage cards.
+- Both arms are scored twice: on at most 20 answers (headline) and cut at 10
+  (robustness view). Delta is F-append minus F-first20.
+- Rule: the walk stays in the default path for a set only when delta is
+  positive, the primary is Holm-significant over the four primaries (alpha .05)
+  and its unadjusted 95% interval excludes zero; otherwise the walk is opt-in.
+  Bootstrap p is floored at 2/10001, so the smallest Holm p here is .0008.
+  Secondaries are descriptive, with no verdicts.
+
+Prefix check (after the run): the first cards of F-first20 equal bench-1024's
+F-first cards on all 141 impact, 110 history and 59 where-to items, and on 108
+of 111 flow items (3 differ). So lengthening the first stage kept the earlier
+answers in place except on 3 flow items.
+
+Invalid first where-to run: its preflight call for `seeds.hybrid` timed out
+after 60 s (attributed to GPU contention), so the run used stand-in seeds
+(3 first-stage cards per item, first cards equal to F-first on 0 of 59 items,
+reg_hit@3 .24). It was moved aside as invalid and rerun; the rerun gave 20
+cards per item and the 59 of 59 prefix match above. Nothing from the invalid
+run is scored in the tables.
+
+View at 20 answers (both arms scored on at most 20; delta = F-append minus
+F-first20):
+
+| set | primary (n) | F-first20 | F-append | delta [95% CI] | Holm p | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| where-to | set_f1 (34) | .227 | .297 | +.069 [+.031, +.108] | .0008 | walk stays default |
+| flow | path_recall (111) | .253 | .547 | +.294 [+.236, +.355] | .0008 | walk stays default |
+| impact | r2_decl_recall (141) | .504 | .461 | -.043 [-.061, -.025] | .0008 | walk opt-in |
+| history | hit@10 (110) | .645 | .664 | +.018 [.000, +.046] | .268 | walk opt-in |
+
+View cut at 10 answers:
+
+| set | primary (n) | F-first20 | F-append | delta [95% CI] | Holm p | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| where-to | set_f1 (34) | .295 | .307 | +.012 [.000, +.022] | .130 | walk opt-in |
+| flow | path_recall (111) | .229 | .360 | +.131 [+.097, +.168] | .0008 | walk stays default |
+| impact | r2_decl_recall (141) | .446 | .447 | +.001 [.000, +.002] | 1.0 | walk opt-in |
+| history | hit@10 (110) | .645 | .645 | .000 (all ties) | 1.0 | walk opt-in |
+
+Reading:
+
+- Flow: the walk adds path recall in both views (61 items better, none worse
+  at 20), so it stays default. Where-to: the walk wins at 20 but only just at
+  10 (the interval barely clears zero and Holm does not), so where-to is
+  budget-dependent: default when 20 answers are returned, opt-in at 10.
+- Impact: with 20 first-stage cards the first stage alone is better on the
+  primary (-.043; 47 items worse, 13 better), and on decl_recall (.964 against
+  .874), decl_f1 (.692 against .462) and precision (.592 against .342); at 10
+  the two arms are nearly the same answers. History: no difference the data can
+  separate at 20 (2 items better, none worse) and none at 10. Both are opt-in.
+- Secondaries at 20 (descriptive, unadjusted): where-to precision .166 to .287,
+  flow precision .184 to .216, history mrr .499 to .501, history precision .281
+  to .170; reg_hit@3 and reg_mrr on where-to are identical at both cuts (25
+  items, all ties).
+- Flow tau, aggregate and paired. Aggregate: F-first20 -.389 over 12 items;
+  F-append .379 over 59 (bench-1023 row). Paired over the 12 items where
+  F-first20 defines it: -.389 to -.333 at 20 (+.056 [-.167, +.278]); at 10,
+  paired over 11 items, -.273 to -.515 (-.242 [-.545, .000]). Tau rests on
+  a few items and decides nothing here.
+
+Caveats:
+
+- Answer counts: F-first20 returns 20.0 cards per item on every set (minimum
+  19, on one flow item). F-append returns 18.0 on where-to and flow, 19.8 on
+  impact and 19.7 on history. On where-to and flow F-first20 therefore has two
+  more scored slots, so the F-append wins there are conservative. On impact the
+  counts are nearly equal, so the first stage's win is not an answer-count
+  effect.
+- Scored list: history hit@10 reads commits (accepted commits among the
+  distinct commits returned), so it is effectively a comparison of commit
+  lists. F-first20 returns 12.2 commits per item and F-append 7.4; the rest of
+  F-append's cards are symbols, chunks and files that this metric does not
+  score. A walk contribution outside commits is invisible to it.
+- Cost, per item (cost proxies, not wall time). F-append: pops 11.4, 9.7, 11.3
+  and 153.4, physical map calls 18.1, 16.2, 17.9 and 386.9, for where-to, flow,
+  impact and history; external calls are 0 on the first three sets and 88.9 on
+  history. F-first20 (live, walk capped at one pop): physical map calls 1.3,
+  1.8, 1.3 and 2.6, history git calls 7.2 and none elsewhere.
+
+Agreement check: dropped on where-to and flow (no exact operator, so the
+overlap between exact answers and seeds is undefined). Kept on impact and
+history, with the label now measured against F-first20. On impact the walk adds
+a gold item on 0 of 141 items, so the AUC is undefined (first run: .584, with
+8 positives). On history it adds one on 5 of 110 items and the file-overlap AUC
+is .472 [.181, .748], again below the .65 rule: killed as a skip-the-walk
+signal, as in the first run.
+
+Decision from this run: the walk is default on flow (both views) and on
+where-to at 20 answers (opt-in at 10, so where-to is budget-dependent); it is
+opt-in on impact, where the first stage alone is better at 20, and on history.
+This compares the walk with no result filter; whether a local judge changes it
+is N0b.

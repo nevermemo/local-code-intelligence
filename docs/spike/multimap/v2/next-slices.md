@@ -91,7 +91,9 @@ not depend on N2. Not taken by default; the owner's order stands.
   kind of question.
 - Agreement check (offline): does overlap between the exact answers and the search seeds
   predict whether the walk adds a gold item? Killed on the first, unmatched run (AUC .584
-  on impact, .472 on history, both below .65); not repeated.
+  on impact, .472 on history, both below .65). N0 ran 2026-10-16 (bench-1024, then the
+  matched, pre-registered bench-1024b); results in `engine-results.md`, section N0, where the
+  agreement check was repeated and stayed killed.
 
 ## N0b: does a result filter make the walk worth it?
 

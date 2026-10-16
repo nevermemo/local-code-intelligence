@@ -34,7 +34,7 @@ rules written down before the runs.
 | router | a classical (TF-IDF) router reaches 90% accuracy, unless the model wins by 5 points |
 
 - **Reference arms.** Local reranker and local models (clef, jevk5, decider:4b), the plain walk,
-  and gold-aware oracle arms as ceilings (bench only, never used for scoring).
+  and gold-aware oracle arms as probes (bench only, never used for scoring).
 
 ## Results
 
@@ -103,27 +103,27 @@ routing is solved on free-form questions.
 
 The judge scores the distinct files of the first-stage hits before the walk, and the scores
 become per-item steering policy (keep the top 3, 5 or 10 files; keep the model's own picks, at
-most 3; or boost them by 2x instead of pruning). Oracle-pool is the gold-aware ceiling: the
+most 3; or boost them by 2x instead of pruning). Oracle-pool is a gold-aware probe (not an optimal-policy ceiling): the
 gold regions intersected with the same seed-file pool, plus anchor files. Paired dev items: where-to
 25, flow 61, impact 68. First stage off (the walk alone), headline metric per set:
 
 | set (metric) | oracle-pool gain over plain | best judge arm | recovery of oracle-pool | vs post-walk judge filter |
 | --- | --- | --- | --- | --- |
 | where-to (reg_mrr, n 11 with registrations) | +.318 | own picks: +.227 (top 3: +.182) | .71 (top 3: .57) | -.182 (top 3: -.227) |
-| flow (path_recall) | -.084 | top 3 boost: -.003 (prune arms -.08 to -.10) | not defined (ceiling negative) | -.30 to -.40 |
+| flow (path_recall) | -.084 | top 3 boost: -.003 (prune arms -.08 to -.10) | not defined (probe negative) | -.30 to -.40 |
 | impact (decl_recall) | +.033 | top 10: +.011 | .35 | not applicable |
 
 - Where-to: the prefilter recovers more than half of the oracle-pool gain, but the plain walk
   followed by the judge filter reaches reg_mrr .909 (+.409 over the plain walk), far above
   either, so the second kill clause (under 0.03 over the post-walk filter) is hit. Boost-only
   arms gain nothing (top 3 boost -.015, own boost -.045).
-- Flow: every arm is negative, and so is the oracle-pool ceiling (-.084; the oracle over full
+- Flow: every arm is negative, and so is the oracle-pool probe (-.084; the oracle over full
   regions is +.089). Restricting the walk to first-stage files removes the files the walk
   would have reached.
-- Impact: effects near zero, even for the ceiling (+.033).
+- Impact: effects near zero, even for the probe (+.033).
 - First stage append (exact answers and seeds merged with the walk): no gain on where-to or
-  impact (oracle ceiling also 0.0); flow negative for every arm including the ceiling (-.109).
-- Caveat: the pool is small (distinct files of the seed hits), so the ceiling is low by
+  impact (oracle probe also 0.0); flow negative for every arm including the probe (-.109).
+- Caveat: the pool is small (distinct files of the seed hits), so the probe is low by
   construction, and where-to has only 11 registration items on dev. Neither changes the
   verdict, since the post-walk judge filter beats every prefilter arm using the same scores.
 
