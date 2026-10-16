@@ -330,11 +330,11 @@ impl Snapshot {
             }
             // Left out when there are none, so a handle of a walk without the
             // bandit is what it was.
-            if let Some(totals) = object.get_mut("totals").and_then(Value::as_object_mut) {
-                if self.totals.bandit_calls > 0 || self.totals.bandit_docs > 0 {
-                    totals.insert("bandit_calls".into(), json!(self.totals.bandit_calls));
-                    totals.insert("bandit_docs".into(), json!(self.totals.bandit_docs));
-                }
+            if let Some(totals) = object.get_mut("totals").and_then(Value::as_object_mut)
+                && (self.totals.bandit_calls > 0 || self.totals.bandit_docs > 0)
+            {
+                totals.insert("bandit_calls".into(), json!(self.totals.bandit_calls));
+                totals.insert("bandit_docs".into(), json!(self.totals.bandit_docs));
             }
         }
         value

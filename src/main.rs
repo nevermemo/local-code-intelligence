@@ -349,7 +349,7 @@ enum Command {
     /// decisions and, when the ladder could not decide a stop or the budget
     /// ran out, the `handle` and `checkpoint`; continue with `--handle` (and
     /// `--steer`).
-    Traverse(TraverseArgs),
+    Traverse(Box<TraverseArgs>),
     Symbols {
         workspace: PathBuf,
         query: String,
@@ -516,7 +516,7 @@ struct TraverseArgs {
     /// bandit_sample` setting).
     #[arg(long)]
     bandit_sample: Option<u32>,
-    /// `random`: the seed of the per-kind weights (the `[traverse]
+    /// `random`: the seed of the per-kind weights; `rerank`: of the sample draw (the `[traverse]
     /// bandit_seed` setting).
     #[arg(long)]
     bandit_seed: Option<u64>,
@@ -1173,7 +1173,9 @@ async fn run() -> Result<()> {
         );
     }
     if let Command::Traverse(args) = command {
-        return run_traverse(cli.config, cli.no_local_config, args).await;
+        // Boxed: the traversal future is large, and `run` shares the main
+        // thread's stack (1 MiB on Windows) with it in a debug build.
+        return Box::pin(run_traverse(cli.config, cli.no_local_config, *args)).await;
     }
     if let Command::Config { json } = command {
         return run_config(cli.config, cli.no_local_config, json);
@@ -1456,5 +1458,23 @@ mod tests {
                 "lci_core::lsp"
             ]
         );
+    }
+
+    #[test]
+    fn bandit_fixed_is_parsed_as_kind_weight_pairs() {
+        let table = super::parse_bandit_fixed("contains=1.5, calls_or_refs = 0.8,").unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table["contains"], 1.5);
+        assert_eq!(table["calls_or_refs"], 0.8);
+        assert!(super::parse_bandit_fixed("").unwrap().is_empty());
+        // A part without `=` or with a weight that is not a number is named.
+        let error = super::parse_bandit_fixed("contains")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected kind=weight"), "{error}");
+        let error = super::parse_bandit_fixed("contains=heavy")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a number"), "{error}");
     }
 }

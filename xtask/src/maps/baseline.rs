@@ -75,7 +75,9 @@ pub(super) fn write_arm_run(
     let (mut precision, mut f05) = (0.0, 0.0);
     for ((item, answers), work) in scored.iter().zip(expansions) {
         let id = item["id"].as_str().context("gold item without an id")?;
-        let (p, f, record) = item_record(set, item, answers, Some(*work))?;
+        let (p, f, mut record) = item_record(set, item, answers, Some(*work))?;
+        // The arms of a baseline make no model calls.
+        record.insert("model_calls".into(), json!(0));
         precision += p;
         f05 += f;
         run.insert(id.to_owned(), Value::Array(answers.clone()));
@@ -447,6 +449,7 @@ mod tests {
         let record = &data.items["impact-t1"];
         assert_eq!(record["decl_recall"], Some(1.0));
         assert_eq!(record["expansions"], Some(0.0));
+        assert_eq!(record["model_calls"], Some(0.0));
         assert!(record["f0.5"].is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

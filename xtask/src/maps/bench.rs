@@ -719,6 +719,8 @@ pub struct Totals {
     /// Tries and hits summed over the kinds of edge.
     pub bandit_tries: u64,
     pub bandit_hits: u64,
+    /// The bandit's failed rating calls.
+    pub bandit_failures: u64,
     /// The bandit's signal, when the traversal ran one.
     pub bandit_signal: Option<String>,
 }
@@ -906,6 +908,7 @@ impl Traversed {
                 bandit_docs: t["bandit_docs"].as_u64().unwrap_or(0),
                 bandit_tries: bandit_sum(&t["bandit"], "tries"),
                 bandit_hits: bandit_sum(&t["bandit"], "hits"),
+                bandit_failures: t["bandit"]["failures"].as_u64().unwrap_or(0),
                 bandit_signal: t["bandit"]["signal"].as_str().map(str::to_owned),
             });
         Traversed {
@@ -941,7 +944,12 @@ impl ItemFlags {
             .sum();
         Self {
             deadline: raw["stop_reason"].as_str() == Some("deadline"),
-            rerank_failures: raw["totals"]["rerank_failures"].as_u64().unwrap_or(0),
+            // The reranker frontier's failed calls and the edge bandit's failed
+            // rating calls both make a row unreliable.
+            rerank_failures: raw["totals"]["rerank_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(raw["totals"]["bandit"]["failures"].as_u64().unwrap_or(0)),
             map_failures,
         }
     }
@@ -1843,7 +1851,7 @@ struct Sums {
     /// Reranker frontier calls, nodes rated and calls that failed.
     rerank: [u64; 3],
     /// The bandit's model calls, rated nodes, tries and hits, and its signal.
-    bandit: [u64; 4],
+    bandit: [u64; 5],
     bandit_signal: Option<String>,
     answer_chars_tokens: u64,
     engine_ms: Vec<f64>,
@@ -2005,7 +2013,9 @@ pub fn bench_set(
     let mut skips = Skips::default();
     let mut scored: Vec<(Vec<Value>, &Value)> = Vec::new();
     // Work per scored item (pops, pass-through pops), for `items.json`.
-    let mut work: Vec<[u64; 2]> = Vec::new();
+    // Per scored item: pops, pass-through pops and model calls (frontier rerank
+    // calls + the edge bandit's rating calls).
+    let mut work: Vec<[u64; 3]> = Vec::new();
     let started = Instant::now();
     for (index, item) in items.iter().enumerate() {
         let id = item["id"].as_str().context("gold item without an id")?;
@@ -2067,6 +2077,7 @@ pub fn bench_set(
                         t.bandit_docs,
                         t.bandit_tries,
                         t.bandit_hits,
+                        t.bandit_failures,
                     ]) {
                         *sum += n;
                     }
@@ -2076,12 +2087,13 @@ pub fn bench_set(
                     sums.engine_ms.push(t.elapsed_ms);
                 }
                 run.insert(id.to_string(), Value::Array(answers.clone()));
-                work.push(
-                    traversed
-                        .totals
-                        .as_ref()
-                        .map_or([0, 0], |t| [t.pops, t.pass_through_pops]),
-                );
+                work.push(traversed.totals.as_ref().map_or([0, 0, 0], |t| {
+                    [
+                        t.pops,
+                        t.pass_through_pops,
+                        t.rerank_calls.saturating_add(t.bandit_calls),
+                    ]
+                }));
                 scored.push((answers, item));
             }
             Err(error) => {
@@ -2106,7 +2118,9 @@ pub fn bench_set(
 
     let mut item_records = Map::new();
     for ((answers, item), work) in scored.iter().zip(&work) {
-        let (p, f05, record) = item_record(set, item, answers, Some(work[0] + work[1]))?;
+        let (p, f05, mut record) = item_record(set, item, answers, Some(work[0] + work[1]))?;
+        // The model calls, so `maps compare` can pair on them next to `expansions`.
+        record.insert("model_calls".into(), json!(work[2]));
         sums.precision += p;
         sums.f05 += f05;
         if let Some(id) = item["id"].as_str() {
@@ -2174,12 +2188,21 @@ pub fn bench_set(
         ));
     }
     if let Some(signal) = &sums.bandit_signal {
-        let [bandit_calls, bandit_docs, tries, hits] = sums.bandit;
+        let [bandit_calls, bandit_docs, tries, hits, failed] = sums.bandit;
         notes.push(format!(
-            "bandit {signal}: tries={tries} hits={hits} bandit calls={bandit_calls} docs={bandit_docs}; physical cost: expansions={} hops={} model calls={} (rerank {calls} + bandit {bandit_calls})",
+            "bandit {signal}: tries={tries} hits={hits} bandit calls={bandit_calls} docs={bandit_docs} failed={failed}"
+        ));
+    }
+    if sums.bandit_signal.is_some() || calls + sums.bandit[0] > 0 {
+        // Two components, never combined: no weight of a model call against an
+        // expansion is assumed. Judge each against the F-append arm's own total
+        // (1.5x rule per component); `items.json` carries both per item.
+        notes.push(format!(
+            "cost: expansions={} (hops {}) model calls={} (rerank {calls} + bandit {}); each component is judged apart against the F-append arm, 1.5x rule per component",
             sums.pops + sums.pass_through_pops,
             sums.hops,
-            calls + bandit_calls
+            calls + sums.bandit[0],
+            sums.bandit[0]
         ));
     }
     if !sums.stop_reasons.is_empty() {
@@ -2733,6 +2756,12 @@ mod tests {
             (3, false, true)
         );
         assert!(!ItemFlags::from_raw(&json!({"stop_reason": "bound"})).any());
+        // A failed bandit rating call makes the item unreliable, as a failed
+        // frontier rerank call does.
+        let bandit = ItemFlags::from_raw(&json!({"totals": {"bandit": {"failures": 2}}}));
+        assert_eq!((bandit.rerank_failures, bandit.any()), (2, true));
+        let clean = ItemFlags::from_raw(&json!({"totals": {"bandit": {"failures": 0}}}));
+        assert!(!clean.any());
     }
 
     #[test]
@@ -2750,6 +2779,7 @@ mod tests {
         one["totals"]["bandit"] = json!({
             "rate": 1.0,
             "signal": "rerank",
+            "failures": 2,
             "kinds": {
                 "contains": {"tries": 4, "hits": 1, "weight": 0.8},
                 "calls": {"tries": 5, "hits": 3, "weight": 1.2}
@@ -2763,13 +2793,18 @@ mod tests {
             &config(&["graph.scip", "seeds.scip_names"]),
         )
         .unwrap();
+        // The per-item record carries the model calls next to the expansions.
+        assert_eq!(outcome.items["items"]["i1"]["model_calls"], 5);
+        assert_eq!(outcome.items["items"]["i1"]["expansions"], 6);
         let note = &outcome.row.cells[20];
         assert!(
-            note.contains("bandit rerank: tries=9 hits=4 bandit calls=3 docs=9"),
+            note.contains("bandit rerank: tries=9 hits=4 bandit calls=3 docs=9 failed=2"),
             "{note}"
         );
         assert!(
-            note.contains("expansions=6 hops=") && note.contains("model calls=5 (rerank 2 + bandit 3)"),
+            note.contains("cost: expansions=6 (hops ")
+                && note.contains("model calls=5 (rerank 2 + bandit 3)")
+                && note.contains("1.5x rule per component"),
             "{note}"
         );
         // A run without a bandit says nothing of one.
@@ -2837,7 +2872,10 @@ mod tests {
             bandit_note(&given).as_deref(),
             Some("edge-bandit random seed=3")
         );
-        assert_eq!(BanditFlags::from_args(&given).signal.as_deref(), Some("random"));
+        assert_eq!(
+            BanditFlags::from_args(&given).signal.as_deref(),
+            Some("random")
+        );
     }
 
     #[test]

@@ -51,8 +51,8 @@ use lci_core::{
     node::{NodeId, NodeKind},
 };
 use lci_maps::{
-    Budget, Contribution, EdgeKind, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse,
-    MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    Budget, Contribution, EdgeKind, FreshnessModel, Map, MapDescriptor, MapId, MapRequest,
+    MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
@@ -1834,12 +1834,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     // The engine's warnings: reranker failures by reason, the model_calls cap,
     // a boost or switches the handle did not take.
     warnings.extend(result.warnings.iter().cloned());
-    if let Some(rescorer) = &bandit_rescorer {
-        if let Some(first) = rescorer.errors().first() {
-            notes.push(format!(
-                "edge_bandit: the first of the reranker calls that failed in this call: {first}"
-            ));
-        }
+    if let Some(rescorer) = &bandit_rescorer
+        && let Some(first) = rescorer.errors().first()
+    {
+        notes.push(format!(
+            "edge_bandit: the first of the reranker calls that failed in this call: {first}"
+        ));
     }
     if let Some(rescorer) = &rescorer {
         let errors = rescorer.errors();
@@ -4436,6 +4436,24 @@ mod tests {
         assert!(
             error.contains("tie_break no-such-tie-break.json"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn bandit_settings_are_none_when_off_and_name_an_unknown_fixed_kind() {
+        assert!(bandit_settings(&limits()).unwrap().is_none());
+        let mut on = limits();
+        on.edge_bandit = true;
+        on.bandit_fixed.insert("contains".into(), 1.5);
+        let settings = bandit_settings(&on).unwrap().expect("on");
+        assert_eq!(settings.options.fixed[&EdgeKind::Contains], 1.5);
+        on.bandit_fixed.insert("no_such_kind".into(), 1.2);
+        let error = bandit_settings(&on).expect_err("an error").to_string();
+        assert!(error.contains("\"no_such_kind\""), "{error}");
+        assert!(error.contains("not an edge kind"), "{error}");
+        assert!(
+            error.contains("contains"),
+            "the valid kinds are listed: {error}"
         );
     }
 }

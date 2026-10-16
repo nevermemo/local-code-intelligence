@@ -1757,8 +1757,9 @@ impl<'s> Run<'s> {
     }
 
     /// The edge bandit's `rerank` signal (see [`bandit`]): after every
-    /// `every`-th expansion, the bandit's rescorer rates the first `sample` of
-    /// the nodes adopted since (the rest are dropped) and a score at or above
+    /// `every`-th expansion, the bandit's rescorer rates `sample` of the
+    /// nodes adopted since, drawn uniformly with the seed `bandit_seed` and the
+    /// round number (the rest are dropped) and a score at or above
     /// the threshold is a hit for the kind of edge that found the node. The
     /// call is bounded by the deadline and counts against `model_calls` like a
     /// frontier rerank; a failed call (an error, the deadline, a wrong count or
@@ -1772,12 +1773,16 @@ impl<'s> Run<'s> {
         }
         let (every, sample) = (bandit.options().every, bandit.options().sample as usize);
         self.bandit_expansions = self.bandit_expansions.saturating_add(1);
-        let mut pending = std::mem::take(&mut self.bandit_pending);
-        if self.bandit_expansions % every != 0 {
+        let pending = std::mem::take(&mut self.bandit_pending);
+        if !self.bandit_expansions.is_multiple_of(every) {
             self.bandit_pending = pending;
             return;
         }
-        pending.truncate(sample);
+        // The sample is a seeded uniform draw, not the first nodes adopted: those
+        // are the best-scored children of the first expansions.
+        let round = u64::from(self.bandit_expansions / every);
+        let seed = bandit.options().seed;
+        let pending = bandit::draw_sample(pending, sample, seed, round);
         if pending.is_empty() {
             return;
         }

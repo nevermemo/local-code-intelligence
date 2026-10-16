@@ -8,7 +8,7 @@ use super::*;
 use crate::traverse::{
     bandit::{Options, Signal, WEIGHT_MAX, WEIGHT_MIN, random_weight},
     handle::{HandleError, Snapshot},
-    rescore::{FrontierRescorer, RescoreError, RerankFailure},
+    rescore::{FrontierRescorer, RerankFailure, RescoreError},
     stop::StopReason,
 };
 use std::{collections::HashMap, sync::Mutex};
@@ -135,7 +135,10 @@ async fn off_the_walk_and_its_trace_are_as_before() {
 #[tokio::test]
 async fn a_bandit_of_rate_zero_orders_the_walk_as_off_and_still_reports() {
     let reg = registry(vec![lattice_map("g", 12)]);
-    let off = walk(&reg, vec![seed("n0")], budget(30), |t| t.top_k(4, 1).score_bound(false)).await;
+    let off = walk(&reg, vec![seed("n0")], budget(30), |t| {
+        t.top_k(4, 1).score_bound(false)
+    })
+    .await;
     let flat = walk(&reg, vec![seed("n0")], budget(30), |t| {
         t.top_k(4, 1).score_bound(false).edge_bandit(Some(0.0))
     })
@@ -252,8 +255,16 @@ async fn the_queue_moves_toward_the_kind_the_rater_likes() {
             .bandit_rescorer(rater.clone())
     })
     .await;
-    assert!(pop_index(&off, "y") < pop_index(&off, "x"), "{:?}", popped_names(&off));
-    assert!(pop_index(&on, "x") < pop_index(&on, "y"), "{:?}", popped_names(&on));
+    assert!(
+        pop_index(&off, "y") < pop_index(&off, "x"),
+        "{:?}",
+        popped_names(&off)
+    );
+    assert!(
+        pop_index(&on, "x") < pop_index(&on, "y"),
+        "{:?}",
+        popped_names(&on)
+    );
 
     // The rater rated a, b after `s` (2 docs) and x, y after `b`.
     let report = on.bandit.as_ref().unwrap();
@@ -313,7 +324,11 @@ async fn a_relaxed_node_keeps_the_weight_of_the_first_route() {
     // Off, x ties c at .5 and c was queued first.
     assert!(pop_index(&off, "c") < pop_index(&off, "x"));
     // On, x keeps the containment weight (above 1) and pops first.
-    assert!(pop_index(&on, "x") < pop_index(&on, "c"), "{:?}", popped_names(&on));
+    assert!(
+        pop_index(&on, "x") < pop_index(&on, "c"),
+        "{:?}",
+        popped_names(&on)
+    );
 }
 
 /// Two trees, one of containments and one of calls.
@@ -430,7 +445,11 @@ async fn fixed_weights_move_the_queue_and_keep_no_stats() {
     assert_eq!(popped_names(&off).len(), popped_names(&on).len());
     // Off: s a b a1 b1. On: a (1.0) and a1 (.5) come before b (.25).
     assert!(pop_index(&off, "b") < pop_index(&off, "a1"));
-    assert!(pop_index(&on, "a1") < pop_index(&on, "b"), "{:?}", popped_names(&on));
+    assert!(
+        pop_index(&on, "a1") < pop_index(&on, "b"),
+        "{:?}",
+        popped_names(&on)
+    );
     assert_eq!(hop_to(&on, "a")["priority"], 1.0);
     assert_eq!(hop_to(&on, "b")["priority"], 0.25);
     assert_eq!(hop_to(&on, "a1")["priority"], 0.5);
@@ -511,7 +530,10 @@ async fn the_rerank_signal_counts_its_calls_and_docs() {
     .await;
     let calls = rater.calls();
     assert!(!calls.is_empty());
-    assert!(calls.iter().all(|c| !c.is_empty() && c.len() <= 2), "{calls:?}");
+    assert!(
+        calls.iter().all(|c| !c.is_empty() && c.len() <= 2),
+        "{calls:?}"
+    );
     assert_eq!(r.totals.bandit_calls as usize, calls.len());
     assert_eq!(
         r.totals.bandit_docs as usize,
@@ -614,7 +636,9 @@ async fn a_failed_rating_call_records_nothing_and_is_counted() {
     assert_eq!(report.failures, on.totals.bandit_calls);
     assert!(on.totals.bandit_calls > 0);
     assert!(
-        on.warnings.iter().any(|w| w.contains("rating calls failed")),
+        on.warnings
+            .iter()
+            .any(|w| w.contains("rating calls failed")),
         "{:?}",
         on.warnings
     );
@@ -682,7 +706,10 @@ async fn a_handle_keeps_the_bandit_settings_and_refuses_others() {
     .expect("work left");
     let text = rerank.bandit.clone().unwrap();
     assert!(text.starts_with("rerank;"), "{text}");
-    assert!(text.contains("every=2") && text.contains("sample=3"), "{text}");
+    assert!(
+        text.contains("every=2") && text.contains("sample=3"),
+        "{text}"
+    );
     assert!(text.contains("rescorer=rater-a"), "{text}");
 
     // The bandit calls persist, so a resume counts on from them.
@@ -692,10 +719,7 @@ async fn a_handle_keeps_the_bandit_settings_and_refuses_others() {
     assert_eq!(back.totals.bandit_docs, rerank.totals.bandit_docs);
 
     // A matching resume carries on with a new bandit (no stats).
-    let second = resume(&reg, snapshot, budget(30), |t| {
-        t.edge_bandit(Some(1.0))
-    })
-    .await;
+    let second = resume(&reg, snapshot, budget(30), |t| t.edge_bandit(Some(1.0))).await;
     assert!(second.totals.pops > 3);
     assert!(second.bandit.is_some());
 }
@@ -744,6 +768,59 @@ async fn a_state_queued_later_gets_the_weight_of_the_kind_that_found_it() {
             .any(|e| e["dst"].as_str().unwrap().ends_with("x.rs") && e["unblocked"] == true);
         assert!(unblocked, "x is unblocked: {:?}", popped_names(r));
     }
-    assert!(pop_index(&off, "e") < pop_index(&off, "x"), "{:?}", popped_names(&off));
-    assert!(pop_index(&on, "x") < pop_index(&on, "e"), "{:?}", popped_names(&on));
+    assert!(
+        pop_index(&off, "e") < pop_index(&off, "x"),
+        "{:?}",
+        popped_names(&off)
+    );
+    assert!(
+        pop_index(&on, "x") < pop_index(&on, "e"),
+        "{:?}",
+        popped_names(&on)
+    );
+}
+
+/// The nodes the first rating call of a walk over a star of eight children
+/// rated, for `seed`, with a sample of three.
+async fn first_sample(seed_of_draw: u64) -> Vec<NodeId> {
+    let edges: Vec<(String, String)> = (0..8).map(|i| ("s".to_owned(), format!("c{i}"))).collect();
+    let edges: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let reg = registry(vec![GraphMap::new("star", &edges).kind(EdgeKind::Contains)]);
+    let rater = Rater::new(&[]);
+    walk(&reg, vec![seed("s")], budget(30), |t| {
+        t.question("q")
+            .edge_bandit(Some(1.0))
+            .bandit_signal(Signal::Rerank)
+            .bandit_options(Options {
+                seed: seed_of_draw,
+                ..rerank_options(1, 3)
+            })
+            .bandit_rescorer(rater.clone())
+    })
+    .await;
+    rater.calls().remove(0)
+}
+
+#[tokio::test]
+async fn a_round_samples_a_seeded_draw_not_the_first_nodes_adopted() {
+    let first_adopted: Vec<NodeId> = ["c0", "c1", "c2"].iter().map(|n| node(n)).collect();
+    let mut draws = Vec::new();
+    for seed in 0..12 {
+        let sample = first_sample(seed).await;
+        assert_eq!(sample.len(), 3, "seed {seed}: {sample:?}");
+        // The same seed draws the same nodes.
+        assert_eq!(sample, first_sample(seed).await, "seed {seed}");
+        draws.push(sample);
+    }
+    assert!(
+        draws.iter().any(|d| *d != first_adopted),
+        "every seed rated the first three adopted: {draws:?}"
+    );
+    assert!(
+        draws.iter().any(|d| *d != draws[0]),
+        "the seed changes nothing: {draws:?}"
+    );
 }
