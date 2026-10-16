@@ -143,11 +143,36 @@ can flip the round-trip primary:
 
 1. Off-shape tasks with gold not derived from SCIP operators (where-to and history families, tests-for-code, commit
    replay), scored with the same rule. A null or negative result there is the real scope statement.
-2. C0 plus Bash (rg, git), 40 tasks x 2 repetitions. **Running now; result will be appended here.**
+2. C0 plus Bash (rg, git), 40 tasks x 2 repetitions. **Done:** see "Follow-up results" below.
 3. Re-judge the 352 existing sheets with neutral items shown, the "one of" group collapsed, and "file:line without
-   a name counts as named"; report both verdicts. **Running now; result will be appended here.**
+   a name counts as named"; report both verdicts. **Done:** see "Follow-up results" below.
 4. A second repository with a fresh SCIP index and gold written by someone who has not seen the recipes.
 5. Another agent family on the same 40 tasks.
 6. Uptake with one-line recipe descriptions (the facts-only rule stands; the question is how much of 72/72 is
    description length).
 7. Per-family rows and wall time in the write-up.
+
+## Follow-up results (2026-10-16, pre-registered before any model call)
+
+Re-judge of all 352 sheets (neutral items shown as neutral, the "one of" group as one item, a test counts when named
+or cited by file and line within 3 lines of the gold line, arm-identifying words masked before judging). The frozen
+rule gives the same verdict, with every gate unchanged:
+
+| contrast | original | re-judged |
+| --- | --- | --- |
+| round trips T / C0 | 0.469 (upper 0.526) | 0.469 (upper 0.526) |
+| round trips T / C1 | 0.633 (upper 0.707) | 0.633 (upper 0.707) |
+| recall T - C0 | +0.097 (lower +0.054) | +0.124 (lower +0.078) |
+| recall T - C1 | +0.028 (lower +0.003) | +0.069 (lower +0.027) |
+
+The line tolerance is stricter than the original judges were, so it moved 16 runs from pass to fail (9 of them C0)
+and 8 from fail to pass; a looser reading would land between the two columns.
+
+C0B = C0 plus a read-only Bash allowlist (rg, git and similar; 40 tasks x 2), judged with the re-judge sheets.
+Against it, T needs 0.444 times the round trips (upper 0.499) and recalls +0.136 more (lower +0.083); this is
+descriptive, not a third gate. Bash did not help the control: round trips 1.06 times C0, tokens 1.25 times, recall
+-0.013, and the agents used Bash in 27 of 80 runs. Limit: the shell refused 21 calls (mostly awk and loops), so an
+unrestricted shell is untested.
+
+Neither follow-up changes the scope above: the tasks are still recipe-shaped. Follow-up 1 (off-shape tasks) is the
+next test.
