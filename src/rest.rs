@@ -8,7 +8,8 @@
 //! below can never drift from what a request actually accepts.
 
 use crate::{
-    app::App,
+    app::{App, recipes},
+    config::Config,
     server::{PositionArgs, ReferencesArgs, SearchArgs, SymbolArgs, WorkspaceArgs},
 };
 use axum::{
@@ -168,7 +169,8 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 ///
 /// `servers` names the loopback port the service is configured to listen on
 /// (`Config::port`), so the document is right for any port, not only 8768.
-fn openapi_document(port: u16) -> Value {
+fn openapi_document(config: &Config) -> Value {
+    let port = config.port;
     let request_schema = |schema| {
         let mut schema = serde_json::to_value(schema).unwrap();
         schema.as_object_mut().unwrap().remove("$schema");
@@ -245,7 +247,50 @@ fn openapi_document(port: u16) -> Value {
         "schema": {"type": "string"}
     }]);
 
-    json!({
+    let mut paths = serde_json::Map::new();
+    if config.recipes.enabled {
+        for (path, summary, schema) in [
+            (
+                "config_readers",
+                "Declarations that read or set a config key, and the tests that reference them",
+                request_schema(schema_for!(recipes::ConfigReadersArgs)),
+            ),
+            (
+                "impact_rings",
+                "Declarations that reference a symbol (ring 1) and those that reference them (ring 2)",
+                request_schema(schema_for!(recipes::ImpactRingsArgs)),
+            ),
+            (
+                "flow_path",
+                "Functions on the shortest call paths between two functions",
+                request_schema(schema_for!(recipes::FlowPathArgs)),
+            ),
+            (
+                "flow_from",
+                "The traversal engine's flow walk from a function",
+                request_schema(schema_for!(recipes::FlowFromArgs)),
+            ),
+            (
+                "config_neighbours",
+                "Keys a declaration touches, their other readers, and its callers",
+                request_schema(schema_for!(recipes::ConfigNeighboursArgs)),
+            ),
+        ] {
+            paths.insert(format!("/v1/{path}"), post_operation(summary, path, schema));
+        }
+    }
+    if config.compose.enabled {
+        paths.insert(
+            "/v1/lci_compose".into(),
+            post_operation(
+                "Up to six operator steps with references between them",
+                "lci_compose",
+                request_schema(schema_for!(recipes::ComposeArgs)),
+            ),
+        );
+    }
+
+    let mut document = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "local-code-intelligence",
@@ -281,7 +326,11 @@ fn openapi_document(port: u16) -> Value {
                 }
             }
         }
-    })
+    });
+    if let Some(existing) = document["paths"].as_object_mut() {
+        existing.extend(paths);
+    }
+    document
 }
 
 pub fn routes() -> Router<Arc<App>> {
@@ -299,6 +348,71 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/v1/service_status", get(service_status))
         .route(
             "/openapi.json",
-            get(|State(app): State<Arc<App>>| async move { Json(openapi_document(app.config.port)) }),
+            get(|State(app): State<Arc<App>>| async move { Json(openapi_document(&app.config)) }),
         )
+}
+
+async fn recipe(app: Arc<App>, request: recipes::Request) -> (StatusCode, Json<Value>) {
+    respond(recipes::serve(&app, &request).await)
+}
+
+async fn config_readers(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::ConfigReadersArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::ConfigReaders(args)).await
+}
+
+async fn impact_rings(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::ImpactRingsArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::ImpactRings(args)).await
+}
+
+async fn flow_path(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::FlowPathArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::FlowPath(args)).await
+}
+
+async fn flow_from(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::FlowFromArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::FlowFrom(args)).await
+}
+
+async fn config_neighbours(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::ConfigNeighboursArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::ConfigNeighbours(args)).await
+}
+
+async fn lci_compose(
+    State(app): State<Arc<App>>,
+    Json(args): Json<recipes::ComposeArgs>,
+) -> (StatusCode, Json<Value>) {
+    recipe(app, recipes::Request::Compose(args)).await
+}
+
+/// The recipe routes, present only for the flags that are on: `[recipes]
+/// enabled` adds the five recipes, `[compose] enabled` adds `lci_compose`.
+/// With both off this is an empty router and the service is what it was.
+pub fn recipe_routes(config: &Config) -> Router<Arc<App>> {
+    let mut router = Router::new();
+    if config.recipes.enabled {
+        router = router
+            .route("/v1/config_readers", post(config_readers))
+            .route("/v1/impact_rings", post(impact_rings))
+            .route("/v1/flow_path", post(flow_path))
+            .route("/v1/flow_from", post(flow_from))
+            .route("/v1/config_neighbours", post(config_neighbours));
+    }
+    if config.compose.enabled {
+        router = router.route("/v1/lci_compose", post(lci_compose));
+    }
+    router
 }

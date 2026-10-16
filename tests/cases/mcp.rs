@@ -496,7 +496,7 @@ fn write_profile_workspace(root: &Path) {
 
 /// Serves `app` on an ephemeral loopback port: the base URL, the token that
 /// stops the MCP sessions, and the server task.
-async fn serve_on_loopback(
+pub(super) async fn serve_on_loopback(
     app: Arc<App>,
 ) -> (
     String,
@@ -548,7 +548,11 @@ fn rpc_response(body: &str) -> Value {
 }
 
 /// Opens an MCP session on `path`: its id and the `initialize` result.
-async fn mcp_initialize(client: &reqwest::Client, base: &str, path: &str) -> (String, Value) {
+pub(super) async fn mcp_initialize(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> (String, Value) {
     let url = format!("{base}{path}");
     let response = mcp_post(client, &url, None, &initialize_message()).await;
     assert!(
@@ -576,7 +580,7 @@ async fn mcp_initialize(client: &reqwest::Client, base: &str, path: &str) -> (St
 }
 
 /// The `result` of one request in an open session.
-async fn mcp_result(
+pub(super) async fn mcp_result(
     client: &reqwest::Client,
     base: &str,
     path: &str,
