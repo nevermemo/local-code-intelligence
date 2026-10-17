@@ -5,7 +5,7 @@
       "description": "`budget` of a traversal request. Each value may lower the `[traverse]`\ncap of the same name, never raise it.",
       "properties": {
         "deadline_ms": {
-          "description": "Longest the call may run, in milliseconds.",
+          "description": "Longest the walk may run, in milliseconds. The hybrid search for the\nstart nodes does not count against it.",
           "format": "uint64",
           "minimum": 0,
           "type": [

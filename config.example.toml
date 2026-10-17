@@ -321,6 +321,9 @@ scip_index = "index.scip"
 max_pops = 200
 max_depth = 6
 max_est_tokens = 20000
+# Longest the walk may run. The hybrid search for the start nodes does not
+# count against it (embedding_timeout_seconds and reranker_timeout_seconds
+# bound that search). Loading the index does count against it.
 deadline_ms = 5000
 max_stops = 4
 tau = 0.8

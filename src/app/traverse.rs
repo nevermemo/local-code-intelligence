@@ -166,7 +166,8 @@ pub struct BudgetArgs {
     pub max_depth: Option<u32>,
     /// Most estimated tokens the expansions may cost.
     pub est_tokens: Option<u64>,
-    /// Longest the call may run, in milliseconds.
+    /// Longest the walk may run, in milliseconds. The hybrid search for the
+    /// start nodes does not count against it.
     pub deadline_ms: Option<u64>,
 }
 
@@ -1498,6 +1499,11 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     if snapshot.is_none() {
         found = find_seeds(limits, call, &loaded, &wanted).await?;
         notes.append(&mut found.notes);
+        // The deadline is the walk's own: a slow hybrid search (a loaded
+        // embedder) must not spend it before the first pop. The search is
+        // bounded by the embedding and reranker timeouts instead, and the
+        // first stage's git calls below see the moved deadline.
+        budget.deadline += found.search_time;
     }
 
     let mut registry = Registry::new(60.0);
@@ -2127,6 +2133,10 @@ struct Seeds {
     /// Why the stand-in replaced the hybrid search, if it did.
     fallback: Option<String>,
     notes: Vec<String>,
+    /// How long the hybrid search ran (zero when it did not). The walk's
+    /// deadline does not run while it does: the search is bounded by the
+    /// embedding and reranker timeouts, not by `deadline_ms`.
+    search_time: Duration,
 }
 
 /// Finds the start nodes: the caller's, else the hybrid search's, else (when
@@ -2162,22 +2172,26 @@ async fn find_seeds(
             Some(_) if call.question.trim().is_empty() => {
                 reason = Some("the question is empty".to_owned());
             }
-            Some(search) => match search.search(call.question, limits.seed_k as usize).await {
-                Err(error) => reason = Some(format!("the hybrid search failed: {error:#}")),
-                Ok(hits) if hits.is_empty() => {
-                    reason = Some("the hybrid search returned no hits".to_owned());
-                }
-                Ok(hits) => {
-                    let mapped = map_hits(loaded, call.question, &hits);
-                    let kinds = |kind: &str| {
-                        mapped
-                            .iter()
-                            .filter(|seed| seed.info["kind"] == kind)
-                            .count()
-                    };
-                    let chunks = kinds("chunk") + kinds("file");
-                    if chunks > 0 {
-                        found.notes.push(if wanted.contains(&CONTAINS_MAP_ID) {
+            Some(search) => {
+                let started = Instant::now();
+                let hits = search.search(call.question, limits.seed_k as usize).await;
+                found.search_time = started.elapsed();
+                match hits {
+                    Err(error) => reason = Some(format!("the hybrid search failed: {error:#}")),
+                    Ok(hits) if hits.is_empty() => {
+                        reason = Some("the hybrid search returned no hits".to_owned());
+                    }
+                    Ok(hits) => {
+                        let mapped = map_hits(loaded, call.question, &hits);
+                        let kinds = |kind: &str| {
+                            mapped
+                                .iter()
+                                .filter(|seed| seed.info["kind"] == kind)
+                                .count()
+                        };
+                        let chunks = kinds("chunk") + kinds("file");
+                        if chunks > 0 {
+                            found.notes.push(if wanted.contains(&CONTAINS_MAP_ID) {
                             format!(
                                 "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; {CONTAINS_MAP_ID} expands them to the symbols they contain",
                                 mapped.len()
@@ -2188,18 +2202,19 @@ async fn find_seeds(
                                 mapped.len()
                             )
                         });
+                        }
+                        found.source = "hybrid";
+                        for seed in mapped {
+                            found.nodes.push(Seed {
+                                node: seed.node,
+                                map: Some(SEEDS_HYBRID),
+                            });
+                            found.details.push(seed.info);
+                        }
+                        return Ok(found);
                     }
-                    found.source = "hybrid";
-                    for seed in mapped {
-                        found.nodes.push(Seed {
-                            node: seed.node,
-                            map: Some(SEEDS_HYBRID),
-                        });
-                        found.details.push(seed.info);
-                    }
-                    return Ok(found);
                 }
-            },
+            }
         }
     }
     if wanted.contains(&SEEDS_MAP) {
@@ -4748,6 +4763,83 @@ mod tests {
             notes.contains("stopped: the first stage's time ran out"),
             "{notes}"
         );
+    }
+
+    /// A hybrid search that answers after a delay, as one over a loaded
+    /// embedder does: the hit is the lines of `alpha` in `a.rs`.
+    struct SlowSearch(Duration);
+
+    #[lci_maps::async_trait]
+    impl SeedSearch for SlowSearch {
+        async fn search(&self, _question: &str, _k: usize) -> Result<Vec<SeedHit>> {
+            tokio::time::sleep(self.0).await;
+            Ok(vec![SeedHit {
+                path: "a.rs".into(),
+                start_line: 2,
+                end_line: 2,
+                content_hash: "abc123".into(),
+                ordinal: None,
+                rank: 1,
+                retrievers: vec!["semantic".into()],
+                semantic_rank: Some(1),
+                lexical_rank: None,
+                lsp_rank: None,
+                fusion_score: 0.25,
+                reranker_score: None,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_search_slower_than_the_deadline_does_not_starve_the_walk() {
+        let tree = ScipTree::new();
+        // The search takes longer than the whole deadline; the walk's own
+        // deadline starts when the search returns.
+        let search = SlowSearch(Duration::from_millis(600));
+        let (budget, steer) = (
+            BudgetArgs {
+                pops: Some(3),
+                deadline_ms: Some(400),
+                ..BudgetArgs::default()
+            },
+            SteerArgs::default(),
+        );
+        let call = Call {
+            scip_index: &tree.index,
+            scip_root: Some(tree.dir.path()),
+            question: "What breaks if `Foo` changes?",
+            seeds: &[],
+            seed_search: Some(&search),
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp: None,
+        };
+        let response = run(&limits(), &Dirs::under(tree.dir.path()), &call)
+            .await
+            .unwrap()
+            .response;
+        assert_eq!(response["seed_source"], "hybrid", "{response}");
+        assert!(
+            response["totals"]["pops"].as_u64().unwrap() >= 1,
+            "the walk popped nothing: {response}"
+        );
+        assert_ne!(response["stop_reason"], "deadline", "{response}");
+    }
+
+    #[tokio::test]
+    async fn the_time_of_the_hybrid_search_is_kept_apart_for_the_deadline() {
+        let search = SlowSearch(Duration::from_millis(50));
+        let found = seeds_for(Some(&search), "alpha", &[], &MAPS).await;
+        assert!(found.search_time >= Duration::from_millis(50));
+        // Given seeds and the stand-in alone run no search.
+        let id = "sym:rust:search::search/fn";
+        let given = seeds_for(Some(&search), "q", &[id.to_owned()], &MAPS).await;
+        assert_eq!(given.search_time, Duration::ZERO);
+        let names = seeds_for(Some(&search), "rank hits", &[], &[SEEDS_MAP]).await;
+        assert_eq!(names.search_time, Duration::ZERO);
     }
 
     #[tokio::test]

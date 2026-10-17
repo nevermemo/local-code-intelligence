@@ -779,7 +779,11 @@ pub struct TraverseConfig {
     /// Most estimated tokens the expansions of one traversal may cost,
     /// `1..=1000000`.
     pub max_est_tokens: u64,
-    /// Longest one call may run, in milliseconds, `1..=60000`.
+    /// Longest the walk of one call may run, in milliseconds, `1..=60000`.
+    /// The hybrid search that finds the start nodes does not count against
+    /// it: that search is bounded by `embedding_timeout_seconds` and
+    /// `reranker_timeout_seconds`, so a call takes at most those plus this
+    /// (and the time to load the index, which does count).
     pub deadline_ms: u64,
     /// Most stops (handler consultations) of one traversal, `0..=32`.
     pub max_stops: u32,
