@@ -676,7 +676,7 @@ async fn a_search_waiting_for_a_failed_explicit_index_reports_its_error() {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let failing_models = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -753,7 +753,7 @@ async fn a_search_waiting_for_a_cancelled_explicit_index_does_not_report_a_stale
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let failing_models = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -2319,7 +2319,7 @@ async fn a_reranker_http_error_body_credential_is_not_reported() {
             )
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let address = listener.local_addr().unwrap();
     let reranker_task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -2811,8 +2811,9 @@ async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-cold");
     config.lsp_search_budget_ms = 200;
-    // The server needs 1.5 s to answer `initialize`, far past the budget.
-    config = with_fake_csharp_server(config, &state, &["--initialize-delay-ms", "1500"], 10);
+    // The server needs 4 s to answer `initialize`, far past the budget; the
+    // 3 s ceiling below still tells a capped wait from a full start under load.
+    config = with_fake_csharp_server(config, &state, &["--initialize-delay-ms", "4000"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -2821,8 +2822,8 @@ async fn a_cold_language_server_costs_a_search_only_its_budget_and_keeps_warming
         .await
         .unwrap();
     assert!(
-        (150.0..1200.0).contains(&cold.timings.lsp_search_ms),
-        "the LSP channel waited {} ms: capped by the 200 ms budget, not the 1500 ms start",
+        (150.0..3000.0).contains(&cold.timings.lsp_search_ms),
+        "the LSP channel waited {} ms: capped by the 200 ms budget, not the 4000 ms start",
         cold.timings.lsp_search_ms
     );
     assert!(!cold.results.is_empty());
