@@ -15,7 +15,7 @@ mod readiness;
 #[path = "cases/recipes.rs"]
 mod recipes;
 // Calls `App::record_through_maps`, which exists only with this feature.
-#[cfg(feature = "spike-maps")]
+#[cfg(feature = "map-equivalence")]
 #[path = "cases/run_records.rs"]
 mod run_records;
 #[path = "cases/watching.rs"]

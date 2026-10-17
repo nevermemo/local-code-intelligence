@@ -1,5 +1,6 @@
-//! The typed edge of the multimap spine (slice S1): what [`crate::Map::expand`]
-//! returns, with the evidence class of its witness.
+//! The typed edge that the traversal engine follows: what [`crate::Map::expand`]
+//! returns, with the evidence class of its witness (History: multimap spine
+//! slice S1).
 //!
 //! Rows are sorted by confidence (high first), then destination [`NodeId`]
 //! ([`sort_edges`]). A prefix of a sorted list is a cap, not a rank (design

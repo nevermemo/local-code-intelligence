@@ -1,5 +1,6 @@
-//! A typed graph over function and method symbols, loaded from a SCIP index
-//! (slice M0.4 of the multimap spike v2; pre-registration in
+//! A typed graph over function and method symbols, loaded from a SCIP index;
+//! the `graph.scip` map and the traversal engine read it (History: slice M0.4
+//! of the multimap spike v2; pre-registration in
 //! `docs/spike/multimap/v2/m0.4-prereg.md`).
 //!
 //! Nodes are the symbols whose SCIP descriptor ends in `().` (functions and

@@ -1,5 +1,7 @@
-//! A scored walk over a [`ScipGraph`] (slice M0.4 of the multimap spike v2;
-//! pre-registration in `docs/spike/multimap/v2/m0.4-prereg.md`).
+//! The scoring primitives for walks over a [`ScipGraph`]: the question
+//! tokenizer and name index, the hop values and a reference best-first walk
+//! (History: slice M0.4 of the multimap spike v2; pre-registration in
+//! `docs/spike/multimap/v2/m0.4-prereg.md`).
 //!
 //! [`hop`] is the single step. A node with at most `gate` distinct callees
 //! is followed whole: every callee gets the value 1 and no scorer runs. Above

@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::{
-    app::search::legacy_maps::{
+    app::search::channel_maps::{
         Channel, LexicalMap, RecordedChannel, SourceRolePrior, legacy_registry, lexical_descriptor,
         source_role_descriptor,
     },
@@ -414,7 +414,7 @@ async fn the_live_lexical_map_passes_c1_and_c6_and_fails_open_without_ripgrep() 
 /// failed keeps its hits (as `search_once` fuses them), with the warning.
 #[test]
 fn an_lsp_answer_with_hits_is_partial_even_when_every_provider_failed() {
-    use crate::app::search::legacy_maps::lsp_status;
+    use crate::app::search::channel_maps::lsp_status;
     use lci_maps::MapStatus;
     let warning = || Some("Optional LSP provider unavailable: x".to_owned());
     assert_eq!(lsp_status(None, None, false, false), MapStatus::Ok);

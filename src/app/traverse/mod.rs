@@ -1,5 +1,6 @@
 //! Graph traversal for `search_code` `mode = "traverse"` and for the
-//! `lci traverse` command (multimap spine slices S6 and S6b; spine brief 1.7).
+//! `lci traverse` command (History: multimap spine slices S6 and S6b; spine
+//! brief 1.7).
 //!
 //! One function, [`run`], serves both. It loads the SCIP index (map
 //! `graph.scip`, cached by file stamp), finds the start nodes, builds the

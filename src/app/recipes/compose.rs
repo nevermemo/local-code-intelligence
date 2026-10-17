@@ -1,7 +1,7 @@
-//! `lci_compose`: the thin baseline arm of the N3 A/B. Up to six operator
-//! steps in one call, `$sN.field` references between them, no model call and
-//! no recipe. It exists so a recipe cannot win only by wrapping several calls
-//! in one.
+//! `lci_compose`: up to six operator steps in one call, `$sN.field`
+//! references between them, no model call and no recipe. It is the thin
+//! baseline a recipe is measured against, so a recipe cannot win only by
+//! wrapping several calls in one. (History: the baseline arm of the N3 A/B.)
 //!
 //! Operators (each reads the SCIP index or the config-key map, nothing else):
 //!

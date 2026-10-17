@@ -1,6 +1,7 @@
-//! The three legacy retrieval channels and the source-role prior wrapped as
-//! [`Map`]s (spike slice S2; spec `docs/spike/multimap/specs/map-trait.md`,
-//! 3.5). Each map calls the code the production search calls
+//! The three retrieval channels (vector, lexical, LSP symbols) and the
+//! source-role prior wrapped as [`Map`]s, for the T0 bit-for-bit check
+//! against [`App::fuse_hits`] (History: spike slice S2; spec
+//! `docs/spike/multimap/specs/map-trait.md`, 3.5). Each map calls the code the production search calls
 //! (`Models::query` and `Store::search`, `lexical::search` and
 //! [`App::map_lexical_matches`], [`App::provider_symbols`] and
 //! [`App::map_lsp_locations`], `Hit::source_role_prior`) and reports with

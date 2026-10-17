@@ -4338,7 +4338,7 @@ async fn search_code_json_matches_the_golden_file() {
 /// same chunks in the same fused order with every `fusion_score` equal by
 /// `to_bits()`. The production search does not use the registry; this
 /// shows the wrapped maps reproduce it.
-#[cfg(feature = "spike-maps")]
+#[cfg(feature = "map-equivalence")]
 #[tokio::test]
 async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
     let (temp, mut config, _fake, task) = fixture().await;
@@ -4411,7 +4411,7 @@ async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
 /// while the fake C# server answers, the map registry fuses the traced
 /// search's pool bit for bit and raises the same warnings: each map warning
 /// is one of the parts the production search joins with "; ".
-#[cfg(feature = "spike-maps")]
+#[cfg(feature = "map-equivalence")]
 #[tokio::test]
 async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
     let (temp, mut config, fake, task) = fixture().await;

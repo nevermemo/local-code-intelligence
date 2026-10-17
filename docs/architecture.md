@@ -12,7 +12,7 @@ The Cargo workspace has four members: the root package `local-code-intelligence`
 
 | Crate | Path | Holds | Depends on |
 | --- | --- | --- | --- |
-| `local-code-intelligence` (root) | `src/` | `app`, `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server` (MCP), `rest`, `init` (`lci init`), `main` (CLI). Re-exports the `lci-core` modules from `src/lib.rs` so `crate::chunk`-style paths resolve. Cargo feature `spike-maps` compiles test-only entry points (`App::fuse_through_maps`, `App::record_through_maps`) and the wrapped legacy maps. | `lci-core`, `lci-maps` |
+| `local-code-intelligence` (root) | `src/` | `app`, `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server` (MCP), `rest`, `init` (`lci init`), `main` (CLI). Re-exports the `lci-core` modules from `src/lib.rs` so `crate::chunk`-style paths resolve. Cargo feature `map-equivalence` compiles test-only entry points (`App::fuse_through_maps`, `App::record_through_maps`) and the wrapped legacy maps. | `lci-core`, `lci-maps` |
 | `lci-core` | `lci-core/src/` | Pure logic: `bundle`, `chunk`, `config` (with `config::layers`), `endpoint`, `evaluation` (portable evaluation definitions and validation), `filter`, `language`, `lexical`, `lsp`, `manifest`, `models`, `node` (stable `NodeId`), `path`, `provider` (completion providers for System One), `workspace`, plus the Tree-sitter grammars | none of LanceDB, Arrow, axum, rmcp |
 | `lci-maps` | `lci-maps/src/` | The map layer of the multimap spike: the `Map` trait, `Registry` (fail-open, fusion in today's arithmetic and order), the traversal engine (`traverse`, `walk`), the maps (SCIP graph and impact, config key, git history, live grep, LSP, search, symbol definitions, probe), the contract kit, the RunRecord writer | `lci-core` |
 | `xtask` | `xtask/src/` | `cargo xtask` subcommands setup, build, test, acceptance, live-acceptance, env, lint-machine-paths, docs, gold, maps, mine-queries | `lci-core`, `lci-maps` |
@@ -20,7 +20,7 @@ The Cargo workspace has four members: the root package `local-code-intelligence`
 The split exists for build time (commit `0729d9a`): the LanceDB/Arrow tree takes minutes to compile, so a change that stays inside
 `lci-core` is checked in seconds with `cargo check -p lci-core` and `cargo test -p lci-core --lib <module>::` (see
 [testing.md](development/testing.md)). A generic map can live in `lci-core` or `lci-maps`; anything stored in LanceDB
-is implemented in the root crate (the legacy channels wrapped as maps are in `src/app/search/legacy_maps`).
+is implemented in the root crate (the retrieval channels wrapped as maps are in `src/app/search/channel_maps`).
 
 ## Runtime boundaries
 

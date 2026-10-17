@@ -85,10 +85,10 @@ fn invoke_focused(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The root crate's feature that compiles the multimap spike's test-only
-/// entry points; the suites that run their tests enable it, so they do not
+/// The root crate's feature that compiles the test-only map entry points
+/// (the T0 bit-for-bit map check and the `RunRecord` paths); the suites that run their tests enable it, so they do not
 /// vanish from the gate (merge condition M3).
-const SPIKE_MAPS: &str = "local-code-intelligence/spike-maps";
+const MAP_EQUIVALENCE: &str = "local-code-intelligence/map-equivalence";
 
 /// The cargo calls of [`Suite::Full`] after the path lint and the docs check, in order. The ones
 /// that resolve dependencies run `--locked`, so a pull request that edits a
@@ -98,14 +98,20 @@ const SPIKE_MAPS: &str = "local-code-intelligence/spike-maps";
 /// in the middle of an edit.
 const FULL_STEPS: [&[&str]; 3] = [
     &["fmt", "--all", "--", "--check"],
-    &["test", "--workspace", "--locked", "--features", SPIKE_MAPS],
+    &[
+        "test",
+        "--workspace",
+        "--locked",
+        "--features",
+        MAP_EQUIVALENCE,
+    ],
     &[
         "clippy",
         "--workspace",
         "--all-targets",
         "--locked",
         "--features",
-        SPIKE_MAPS,
+        MAP_EQUIVALENCE,
         "--",
         "-D",
         "warnings",
@@ -131,7 +137,7 @@ pub fn run(suite: Suite) -> Result<()> {
             "--test",
             "integration",
             "--features",
-            SPIKE_MAPS,
+            MAP_EQUIVALENCE,
             "indexing::",
         ]),
         Suite::Readiness => invoke_focused(&["test", "--test", "integration", "readiness::"]),
@@ -156,7 +162,7 @@ pub fn run(suite: Suite) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FULL_STEPS, SPIKE_MAPS, executed_in_summary};
+    use super::{FULL_STEPS, MAP_EQUIVALENCE, executed_in_summary};
 
     #[test]
     fn the_full_suite_locks_every_step_that_resolves_dependencies() {
@@ -175,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn the_full_suite_tests_and_lints_with_the_spike_maps_feature() {
-        // Without it the tests of the spike's test-only entry points would
+    fn the_full_suite_tests_and_lints_with_the_map_equivalence_feature() {
+        // Without it the tests of the test-only map entry points would
         // compile out of the gate.
         for step in FULL_STEPS.iter().filter(|step| step[0] != "fmt") {
             let cargo_arguments: Vec<_> = step
@@ -186,8 +192,8 @@ mod tests {
             assert!(
                 cargo_arguments
                     .windows(2)
-                    .any(|pair| *pair[0] == "--features" && *pair[1] == SPIKE_MAPS),
-                "{step:?} does not enable {SPIKE_MAPS}"
+                    .any(|pair| *pair[0] == "--features" && *pair[1] == MAP_EQUIVALENCE),
+                "{step:?} does not enable {MAP_EQUIVALENCE}"
             );
         }
     }

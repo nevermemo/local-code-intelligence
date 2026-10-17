@@ -1,13 +1,17 @@
-//! The map layer of the multimap spike (slice S2; spec
-//! `docs/spike/multimap/specs/map-trait.md`).
+//! The maps, the registry and the traversal engine behind
+//! `search_code mode="traverse"`, `lci traverse` and the recipes.
 //!
 //! A [`Map`] answers one request (a query text and/or seed nodes) with
 //! ranked [`NodeId`]s and evidence. The [`Registry`] calls every enabled map,
 //! turns any failure into a status instead of an error (contract C1), fuses
-//! the answers with today's weighted RRF arithmetic in today's order, and
-//! sorts with today's tie rule. Nothing on the production search path uses
-//! this crate yet: the legacy channels are wrapped as maps in the root crate
-//! and checked against `fuse_hits` bit for bit (test T0).
+//! the answers with the weighted RRF arithmetic of the production search in
+//! its order, and sorts with its tie rule. The [`traverse`] engine walks the
+//! typed edges the maps expose. The default `search_code` ranking does not
+//! call the registry: the retrieval channels are wrapped as maps in the root
+//! crate and checked against `fuse_hits` bit for bit (test T0).
+//!
+//! History: slice S2 of the multimap spike; spec
+//! `docs/spike/multimap/specs/map-trait.md`.
 
 pub mod audit;
 pub mod config_key;
@@ -56,7 +60,7 @@ pub type MapId = &'static str;
 
 /// The three legacy channels, fused first and in this order, so the f32
 /// sums are those of `fuse_hits` (lesson L14, decision M-3).
-pub const LEGACY_ORDER: [MapId; 3] = ["vec.chunk.code", "lexical", "lsp.symbols"];
+pub const CHANNEL_ORDER: [MapId; 3] = ["vec.chunk.code", "lexical", "lsp.symbols"];
 
 /// How fusion uses a map's output (map-trait.md 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,7 +544,7 @@ impl std::error::Error for RegisterError {}
 /// Fusion position of a map: the legacy three in their order, then other
 /// rank lists and expansions by id, then priors by id (decision M-3).
 fn slot(descriptor: &MapDescriptor) -> (u8, usize, MapId) {
-    let legacy = LEGACY_ORDER.iter().position(|id| *id == descriptor.id);
+    let legacy = CHANNEL_ORDER.iter().position(|id| *id == descriptor.id);
     match (descriptor.contribution, legacy) {
         (Contribution::Prior, _) => (2, 0, descriptor.id),
         (_, Some(position)) => (0, position, descriptor.id),

@@ -1,7 +1,7 @@
-//! Named multi-step queries over the SCIP index and the config-key map
-//! (spike v2, slice N3). A recipe runs the steps that a chain of single
-//! lookups would, server side, and answers once with the nodes, the steps it
-//! ran, why it stopped and what it cost.
+//! Named multi-step queries over the SCIP index and the config-key map. A
+//! recipe runs the steps that a chain of single lookups would, server side,
+//! and answers once with the nodes, the steps it ran, why it stopped and what
+//! it cost. (History: spike v2, slice N3.)
 //!
 //! Off by default: the MCP and REST tools exist only with `[recipes] enabled`
 //! (and `[compose] enabled` for `lci_compose`), and `lci recipe` runs them

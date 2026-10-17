@@ -1,5 +1,5 @@
-//! RunRecord writing (spike slice S3; spec
-//! `docs/spike/multimap/specs/run-record.md`, schema
+//! RunRecord writing: the JSON Lines record of one registry run (History:
+//! spike slice S3; spec `docs/spike/multimap/specs/run-record.md`, schema
 //! `docs/spike/multimap/specs/runrecord-0.schema.json`).
 //!
 //! A RunRecord is JSON Lines: one `run` line, one `step` line per engine

@@ -1,6 +1,7 @@
-//! The traversal engine of the multimap spine (slice S2; spine brief 1.3 to
-//! 1.5): best-first search over path states, where one pop expands one state
-//! through an [`EdgeSource`].
+//! The traversal engine: best-first search over path states, where one pop
+//! expands one state through an [`EdgeSource`]. It runs behind
+//! `search_code mode="traverse"`, `lci traverse` and the `flow_from` recipe
+//! (History: multimap spine slice S2; spine brief 1.3 to 1.5).
 //!
 //! A state's priority is the product of the hop values along its path (the
 //! `walk.rs` rule); ties pop in discovery order. A node becomes a state once

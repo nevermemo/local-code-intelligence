@@ -1,5 +1,6 @@
-//! The map contract kit, skeleton (contract-kit.md; slice S2 implements
-//! contracts C1 and C6). One generic harness checks any [`Map`] against a
+//! The map contract kit (contract-kit.md; this module holds contracts C1 and
+//! C6, the others live in `kit_c3`, `audit` and `labels`; History: slice S2).
+//! One generic harness checks any [`Map`] against a
 //! fixture: a snapshot view, a query text and a control map that returns
 //! candidates (the C1 carve-out: the comparison with the map removed is only
 //! meaningful while another map answers).

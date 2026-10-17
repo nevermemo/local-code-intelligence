@@ -4,10 +4,10 @@
 //! named `[search_profiles.<name>]` can override those switches and the
 //! rerank window per search (see [`App::search_in_profile`]).
 
-// The wrapped legacy maps of the multimap spike: unit tests (T0) and the
-// `spike-maps` feature only, so the default build adds no public path.
-#[cfg(any(test, feature = "spike-maps"))]
-mod legacy_maps;
+// The retrieval channels wrapped as maps (the T0 bit-for-bit check): unit tests (T0) and the
+// `map-equivalence` feature only, so the default build adds no public path.
+#[cfg(any(test, feature = "map-equivalence"))]
+mod channel_maps;
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{

@@ -1,7 +1,7 @@
-//! The `reads_key` translation kind of slice M1.2 of the multimap spike v2
-//! (pre-registration in `docs/spike/multimap/v2/m1.2-prereg.md`): a config key
-//! (a TOML path) joined to the declarations that read or set it, with two
-//! witnesses per edge, and the key anchors of the "+ translation" arms.
+//! The `reads_key` translation kind: a config key (a TOML path) joined to the
+//! declarations that read or set it, with two witnesses per edge, and the key
+//! anchors of the "+ translation" arms (History: slice M1.2 of the multimap
+//! spike v2; pre-registration in `docs/spike/multimap/v2/m1.2-prereg.md`).
 //!
 //! The key table is built from the example TOML and the `serde` structs of
 //! the tree by lines (no parser). Witness W1 is the SCIP closure of the field

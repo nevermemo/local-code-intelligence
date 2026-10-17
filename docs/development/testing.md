@@ -58,7 +58,7 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
 | Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |
 | Documentation link check (`xtask/src/docs.rs`) | `cargo test -p xtask docs::` (its repository case needs `git` on `PATH`); `cargo xtask docs check` runs the check itself and is the second step of `--suite Full` |
-| Index lifecycle or persistence | `cargo xtask test --suite Indexing` (runs with the `spike-maps` feature) |
+| Index lifecycle or persistence | `cargo xtask test --suite Indexing` (runs with the `map-equivalence` feature) |
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
 | Watched refresh | `cargo xtask test --suite Watching` |
@@ -72,9 +72,9 @@ suite counts the tests it executed and fails when its filter matched none, so
 a renamed or moved module can't make a suite pass vacuously.
 
 `cargo xtask test --suite Full` runs, in order: the machine-value lint, the documentation link check, `cargo fmt --all -- --check`, `cargo test
---workspace --locked --features local-code-intelligence/spike-maps`, and Clippy with the same `--locked` and feature
+--workspace --locked --features local-code-intelligence/map-equivalence`, and Clippy with the same `--locked` and feature
 flags. `--locked` makes a pull request that edits `Cargo.toml` without its lockfile fail here instead of in a locked
-build later; the focused suites stay unlocked. The `spike-maps` feature compiles the test-only map entry points.
+build later; the focused suites stay unlocked. The `map-equivalence` feature compiles the test-only map entry points (the T0 bit-for-bit map check and the `RunRecord` paths); it was named `spike-maps` before decision d366, with no alias, so external CI scripts must use the new name.
 Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
 it depends on locally running services. Generated reports belong under
 `test-results` and are never committed.
@@ -87,7 +87,7 @@ and link cost of many separate integration binaries.
 
 `.config/nextest.toml` defines a `ci` profile for
 [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`):
-`cargo nextest run --workspace --locked --features local-code-intelligence/spike-maps --profile ci`
+`cargo nextest run --workspace --locked --features local-code-intelligence/map-equivalence --profile ci`
 retries a failed test once and reports it as flaky, ends a test that runs past
 5 minutes, and runs the language-server, model-client and process tests at
 most two at a time. `cargo xtask test` does not use it.

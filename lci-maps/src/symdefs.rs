@@ -1,7 +1,7 @@
-//! `sym.defs`, the first stored map (slice S3): the declarations of the
-//! snapshot, fed from the path-free declaration bundles
-//! (`lci_core::bundle`). A query names identifiers; the map returns the
-//! chunks that define declarations with those names.
+//! `sym.defs`, a stored map: the declarations of the snapshot, fed from the
+//! path-free declaration bundles (`lci_core::bundle`). A query names
+//! identifiers; the map returns the chunks that define declarations with
+//! those names (History: the first stored map, slice S3).
 //!
 //! Hits are projected to chunks before fusion (decision M-4): a symbol's
 //! hit is the chunk holding the first line of its declaration ("head
