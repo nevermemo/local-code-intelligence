@@ -1,7 +1,8 @@
 //! Optional C/C++ language-server (clangd) adapter. One configured clangd
 //! instance navigates both Tree-sitter-indexed languages `c` and `cpp`
-//! (`.c`, `.cpp`, `.hpp`), the same one-server-many-languages shape
-//! `TypeScriptServer` uses for its four ECMAScript-family languages.
+//! (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`), the same
+//! one-server-many-languages shape `TypeScriptServer` uses for its four
+//! ECMAScript-family languages.
 //!
 //! Like gopls, clangd needs no forced leading transport flag: stdio is its
 //! default communication mode, with no `--stdio`-equivalent flag required
@@ -16,9 +17,9 @@
 //! (`--compile-commands-dir=...`); this adapter does not generate one.
 
 use crate::config::ClangdLspConfig;
-use crate::lsp::adapter::LspAdapter;
+use crate::lsp::adapter::{LspAdapter, read_for_did_open};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -125,9 +126,9 @@ impl LspAdapter for ClangdServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .with_context(|| format!("read {relative} to open in clangd"))?;
+        let Some(content) = read_for_did_open(file, relative, "clangd").await? else {
+            return Ok(());
+        };
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();
@@ -155,7 +156,16 @@ impl LspAdapter for ClangdServer {
 
 /// The LSP `languageId` clangd expects for a file, derived from its
 /// extension (matching the Tree-sitter language identifiers this adapter
-/// covers: `.c` files are `c`, `.cpp`/`.hpp` files are `cpp`).
+/// covers: `.c` files are `c`, `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx` files
+/// are `cpp`).
+///
+/// `.h` is the one deliberate exception to "same as the Tree-sitter
+/// identifier": LCI indexes `.h` as `c`, but the LSP `languageId` is `cpp`.
+/// The extension cannot say which language a header is written in, and clangd
+/// itself treats a bare `.h` as C++ because a C header is almost always valid
+/// C++ while a C++ header is never valid C. Opening it as C would turn every
+/// class or template in a C++ project's `.h` into parse errors for the server.
+/// Navigation results are still attributed to the indexed language `c`.
 fn language_id_for(relative: &str) -> &'static str {
     match Path::new(relative)
         .extension()
@@ -169,77 +179,45 @@ fn language_id_for(relative: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::adapter::contract;
 
-    #[test]
-    fn adapter_reports_c_and_cpp() {
+    fn server(path: Option<&str>, args: &[&str], disabled: bool) -> ClangdServer {
         let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: false,
+            path: path.map(str::to_owned),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            disabled,
         };
-        let server = ClangdServer::new(&config, Duration::from_secs(60));
-        assert_eq!(server.languages(), &["c", "cpp"]);
-        assert!(server.enabled());
+        ClangdServer::new(&config, Duration::from_secs(60))
     }
 
     #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        let missing = ClangdLspConfig::default();
-        assert!(!ClangdServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            ClangdServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
+    fn the_clangd_adapter_follows_the_adapter_contract() {
+        let usable = server(Some("clangd"), &[], false);
+        assert_eq!(usable.languages(), &["c", "cpp"]);
+        contract::assert_enabled_only_with_a_usable_path(
+            |path, disabled| server(path, &[], disabled),
+            "clangd",
         );
-
-        let empty = ClangdLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        };
-        assert!(!ClangdServer::new(&empty, Duration::from_secs(60)).enabled());
-
-        let disabled = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: true,
-        };
-        assert!(!ClangdServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
-
-    #[test]
-    fn transport_has_no_forced_leading_flag() {
         // Unlike pyright/typescript-language-server, clangd needs no
         // --stdio-equivalent flag forced before configured args: its
         // default communication mode already is stdio.
-        let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec!["--log=verbose".into()],
-            disabled: false,
-        };
-        let server = ClangdServer::new(&config, Duration::from_secs(30));
-        let transport = server.transport_config(Path::new("/tmp")).unwrap();
+        let transport = server(Some("clangd"), &["--log=verbose"], false)
+            .transport_config(Path::new("/tmp"))
+            .unwrap();
         assert_eq!(transport.args, vec!["--log=verbose".to_string()]);
-    }
 
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let config = ClangdLspConfig {
-            path: Some("clangd".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = ClangdServer::new(&config, Duration::from_secs(30));
-        let temp = tempfile::tempdir().unwrap();
-        let params = server.initialize_params(temp.path()).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
-    }
-
-    #[test]
-    fn language_id_matches_extension() {
         assert_eq!(language_id_for("src/a.c"), "c");
         assert_eq!(language_id_for("src/a.cpp"), "cpp");
         assert_eq!(language_id_for("src/a.hpp"), "cpp");
+        for extension in ["cc", "cxx", "hh", "hxx"] {
+            assert_eq!(language_id_for(&format!("src/a.{extension}")), "cpp");
+        }
+        // `.h` is indexed as `c` but opened for the server as C++ (see the
+        // function's documentation).
+        assert_eq!(language_id_for("include/a.h"), "cpp");
+        contract::assert_initialize_params_name_this_process(
+            &usable,
+            tempfile::tempdir().unwrap().path(),
+        );
     }
 }

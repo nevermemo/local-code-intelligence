@@ -452,7 +452,6 @@ async fn force_kill(child: &mut tokio::process::Child) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn drive_protocol(
     reader: &mut BufReader<ChildStdout>,
     stdin: &mut ChildStdin,

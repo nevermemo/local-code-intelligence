@@ -17,10 +17,10 @@ use std::path::PathBuf;
 
 const INIT_PY: &str = "";
 
-const CALCULATOR_PY: &str = r#"class Calculator:
+const CALCULATOR_PY: &str = r"class Calculator:
     def add(self, a, b):
         return a + b
-"#;
+";
 
 const CALL_SITE_PY: &str = "from .calculator import Calculator\n\n\ndef run(value: Calculator) -> int:\n    return value.add(1, 2)\n";
 
@@ -68,6 +68,7 @@ pub async fn run(pyright: Option<PathBuf>) -> Result<()> {
             provider_name: "pyright",
             generated_dirs: &["bin", "obj"],
             cross_file_references: true,
+            extra_probes: vec![],
         },
         pyright,
     )

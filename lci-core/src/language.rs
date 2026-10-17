@@ -13,6 +13,28 @@ pub(crate) enum Syntax {
     Cpp,
 }
 
+/// A data format that shares a registered source extension and is therefore
+/// not source code in the language the extension names.
+///
+/// This is never used to choose a language: the extension still does that.
+/// It only lets a scan leave out a file whose content cannot be that
+/// language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonSource {
+    /// A Qt Linguist translation catalog (XML) saved with the `.ts`
+    /// extension, which TypeScript also uses.
+    QtLinguist,
+}
+
+impl NonSource {
+    /// Stable name for logs and reports.
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::QtLinguist => "qt-linguist",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LanguageAdapter {
     extension: &'static str,
@@ -25,6 +47,21 @@ pub struct LanguageAdapter {
 impl LanguageAdapter {
     pub const fn identifier(&self) -> &'static str {
         self.identifier
+    }
+
+    /// Reports whether the content of a file with this adapter's extension is
+    /// a known non-source data format, so the file must not be parsed or
+    /// indexed as this language. Only extensions with a known clash are
+    /// checked; every other adapter returns `None` without reading `content`.
+    ///
+    /// A false positive would drop real source from the index, so each check
+    /// requires something the language cannot start with. For `ts` that is a
+    /// Qt Linguist XML start in UTF-8 or byte-order-marked UTF-16.
+    pub fn non_source(&self, content: &[u8]) -> Option<NonSource> {
+        match self.extension {
+            "ts" => qt_linguist(content),
+            _ => None,
+        }
     }
 
     pub const fn cache_version(&self) -> &'static str {
@@ -47,8 +84,13 @@ impl LanguageAdapter {
             "go" => "*.go",
             "java" => "*.java",
             "c" => "*.c",
+            "h" => "*.h",
             "cpp" => "*.cpp",
             "hpp" => "*.hpp",
+            "cc" => "*.cc",
+            "cxx" => "*.cxx",
+            "hh" => "*.hh",
+            "hxx" => "*.hxx",
             _ => unreachable!(),
         }
     }
@@ -359,88 +401,245 @@ fn cpp() -> Language {
     tree_sitter_cpp::LANGUAGE.into()
 }
 
+/// Code units of a UTF-16 file decoded when looking for a Qt Linguist
+/// catalog. An XML declaration or a `<TS` start tag with its first attribute
+/// is far shorter, so the rest of the file is never decoded; a UTF-16 catalog
+/// whose leading comments run past this limit is not recognized.
+const UTF16_PREFIX_UNITS: usize = 512;
+
+/// Detects a Qt Linguist catalog from the start of a `.ts` file, in UTF-8
+/// (with or without a byte-order mark) or in UTF-16 with a byte-order mark
+/// (little or big endian; a UTF-16 file without a mark is not guessed).
+///
+/// After the mark and whitespace, leading XML comments and a DOCTYPE are
+/// skipped before checking for an XML declaration (`<?xml`, which no
+/// TypeScript statement or expression can start with) or a `<TS` root element
+/// that carries an attribute (`<TS version="2.1" ...>`). Both encodings share
+/// that one rule ([`is_catalog_start`]): a UTF-16 file is decoded to
+/// ASCII-compatible bytes first, and only as far as the rule needs, never the
+/// whole file.
+fn qt_linguist(content: &[u8]) -> Option<NonSource> {
+    let catalog = if let Some(units) = content.strip_prefix(b"\xFF\xFE") {
+        is_catalog_start(&utf16_ascii_prefix(units, u16::from_le_bytes))
+    } else if let Some(units) = content.strip_prefix(b"\xFE\xFF") {
+        is_catalog_start(&utf16_ascii_prefix(units, u16::from_be_bytes))
+    } else {
+        is_catalog_start(content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content))
+    };
+    catalog.then_some(NonSource::QtLinguist)
+}
+
+/// The leading text of UTF-16 `units` (two bytes each, byte order given by
+/// `decode`) as ASCII-compatible bytes: whitespace is skipped without limit,
+/// then at most [`UTF16_PREFIX_UNITS`] units are kept. A unit outside ASCII
+/// becomes `0x80`, which neither the whitespace nor the name checks accept; a
+/// trailing odd byte is ignored.
+fn utf16_ascii_prefix(units: &[u8], decode: fn([u8; 2]) -> u16) -> Vec<u8> {
+    units
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| decode(pair))
+        .skip_while(|&unit| u8::try_from(unit).is_ok_and(|byte| byte.is_ascii_whitespace()))
+        .take(UTF16_PREFIX_UNITS)
+        .map(|unit| u8::try_from(unit).ok().filter(u8::is_ascii).unwrap_or(0x80))
+        .collect()
+}
+
+/// The shared catalog rule over ASCII-compatible text (see [`qt_linguist`]).
+///
+/// A bare `<TS>` or `<TS extends Base>(...) => ...` is not enough: both are
+/// valid TypeScript (a type assertion and a generic arrow function), so the
+/// element must be followed by `name=`.
+fn is_catalog_start(text: &[u8]) -> bool {
+    let mut text = text.trim_ascii_start();
+    loop {
+        if let Some(after_comment) = text.strip_prefix(b"<!--") {
+            let Some(comment_end) = after_comment.windows(3).position(|window| window == b"-->")
+            else {
+                return false;
+            };
+            text = &after_comment[comment_end + 3..];
+        } else if text.starts_with(b"<!DOCTYPE") {
+            let Some(after_doctype) = skip_doctype(text) else {
+                return false;
+            };
+            text = after_doctype;
+        } else {
+            break;
+        }
+        text = text.trim_ascii_start();
+    }
+    if text.starts_with(b"<?xml") {
+        return true;
+    }
+    let Some(after_tag) = text.strip_prefix(b"<TS") else {
+        return false;
+    };
+    let attributes = after_tag.trim_ascii_start();
+    if attributes.len() == after_tag.len() {
+        return false;
+    }
+    let name_len = attributes
+        .iter()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+        })
+        .count();
+    name_len > 0 && attributes[name_len..].trim_ascii_start().first() == Some(&b'=')
+}
+
+fn skip_doctype(text: &[u8]) -> Option<&[u8]> {
+    let after_keyword = text.strip_prefix(b"<!DOCTYPE")?;
+    if !after_keyword.first().is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut subset_depth = 0_usize;
+    for (index, &byte) in after_keyword.iter().enumerate() {
+        if let Some(quote_byte) = quote {
+            if byte == quote_byte {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => subset_depth += 1,
+            b']' => subset_depth = subset_depth.saturating_sub(1),
+            b'>' if subset_depth == 0 => return Some(&after_keyword[index + 1..]),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub const ADAPTERS: &[LanguageAdapter] = &[
     LanguageAdapter {
         extension: "rs",
         identifier: "rust",
-        cache_version: "rust-chunks-v1",
+        cache_version: "rust-chunks-v4",
         grammar: rust,
         syntax: Syntax::Rust,
     },
     LanguageAdapter {
         extension: "ts",
         identifier: "typescript",
-        cache_version: "typescript-chunks-v1",
+        cache_version: "typescript-chunks-v4",
         grammar: typescript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "tsx",
         identifier: "tsx",
-        cache_version: "tsx-chunks-v1",
+        cache_version: "tsx-chunks-v4",
         grammar: tsx,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "js",
         identifier: "javascript",
-        cache_version: "javascript-chunks-v1",
+        cache_version: "javascript-chunks-v4",
         grammar: javascript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "jsx",
         identifier: "jsx",
-        cache_version: "jsx-chunks-v1",
+        cache_version: "jsx-chunks-v4",
         grammar: javascript,
         syntax: Syntax::EcmaScript,
     },
     LanguageAdapter {
         extension: "py",
         identifier: "python",
-        cache_version: "python-chunks-v1",
+        cache_version: "python-chunks-v4",
         grammar: python,
         syntax: Syntax::Python,
     },
     LanguageAdapter {
         extension: "cs",
         identifier: "csharp",
-        cache_version: "csharp-chunks-v1",
+        cache_version: "csharp-chunks-v4",
         grammar: csharp,
         syntax: Syntax::CSharp,
     },
     LanguageAdapter {
         extension: "go",
         identifier: "go",
-        cache_version: "go-chunks-v1",
+        cache_version: "go-chunks-v4",
         grammar: go,
         syntax: Syntax::Go,
     },
     LanguageAdapter {
         extension: "java",
         identifier: "java",
-        cache_version: "java-chunks-v1",
+        cache_version: "java-chunks-v4",
         grammar: java,
         syntax: Syntax::Java,
     },
     LanguageAdapter {
         extension: "c",
         identifier: "c",
-        cache_version: "c-chunks-v1",
+        cache_version: "c-chunks-v4",
+        grammar: c,
+        syntax: Syntax::C,
+    },
+    // `.h` is registered as `c`, a documented decision and not a heuristic:
+    // the extension alone cannot tell a C header from a C++ one, and the
+    // registry never inspects content to choose a language. `.h` is the C
+    // header extension, so it follows `.c`. A C++ project's `.h` headers are
+    // therefore chunked with the C grammar (recovered, still searchable) and
+    // carry the language `c`; C++ projects that want the C++ grammar name
+    // their headers `.hpp`, `.hh`, or `.hxx`. clangd serves both families,
+    // so navigation on a `.h` file is unaffected.
+    LanguageAdapter {
+        extension: "h",
+        identifier: "c",
+        cache_version: "c-chunks-v4",
         grammar: c,
         syntax: Syntax::C,
     },
     LanguageAdapter {
         extension: "cpp",
         identifier: "cpp",
-        cache_version: "cpp-chunks-v1",
+        cache_version: "cpp-chunks-v4",
         grammar: cpp,
         syntax: Syntax::Cpp,
     },
     LanguageAdapter {
         extension: "hpp",
         identifier: "cpp",
-        cache_version: "cpp-chunks-v1",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "cc",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "cxx",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "hh",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
+        grammar: cpp,
+        syntax: Syntax::Cpp,
+    },
+    LanguageAdapter {
+        extension: "hxx",
+        identifier: "cpp",
+        cache_version: "cpp-chunks-v4",
         grammar: cpp,
         syntax: Syntax::Cpp,
     },
@@ -458,9 +657,18 @@ pub fn for_path(path: &Path) -> Option<&'static LanguageAdapter> {
         .and_then(for_extension)
 }
 
-/// Iterate over the registered language identifiers.
+/// Iterate over the registered language identifiers, each once, in the order
+/// of their first adapter (`cpp` belongs to two extensions).
 pub fn identifiers() -> impl Iterator<Item = &'static str> {
-    ADAPTERS.iter().map(|adapter| adapter.identifier)
+    ADAPTERS
+        .iter()
+        .enumerate()
+        .filter(|(index, adapter)| {
+            !ADAPTERS[..*index]
+                .iter()
+                .any(|earlier| earlier.identifier == adapter.identifier)
+        })
+        .map(|(_, adapter)| adapter.identifier)
 }
 
 /// Report whether `identifier` is a registered language identifier.
@@ -478,30 +686,283 @@ mod tests {
 
     #[test]
     fn recognizes_only_requested_lowercase_extensions() {
-        for (extension, identifier, glob) in [
-            ("rs", "rust", "*.rs"),
-            ("ts", "typescript", "*.ts"),
-            ("tsx", "tsx", "*.tsx"),
-            ("js", "javascript", "*.js"),
-            ("jsx", "jsx", "*.jsx"),
-            ("py", "python", "*.py"),
-            ("cs", "csharp", "*.cs"),
-            ("go", "go", "*.go"),
-            ("java", "java", "*.java"),
-            ("c", "c", "*.c"),
-            ("cpp", "cpp", "*.cpp"),
-            ("hpp", "cpp", "*.hpp"),
+        for (extension, identifier, glob, cache_version) in [
+            ("rs", "rust", "*.rs", "rust-chunks-v4"),
+            ("ts", "typescript", "*.ts", "typescript-chunks-v4"),
+            ("tsx", "tsx", "*.tsx", "tsx-chunks-v4"),
+            ("js", "javascript", "*.js", "javascript-chunks-v4"),
+            ("jsx", "jsx", "*.jsx", "jsx-chunks-v4"),
+            ("py", "python", "*.py", "python-chunks-v4"),
+            ("cs", "csharp", "*.cs", "csharp-chunks-v4"),
+            ("go", "go", "*.go", "go-chunks-v4"),
+            ("java", "java", "*.java", "java-chunks-v4"),
+            ("c", "c", "*.c", "c-chunks-v4"),
+            ("h", "c", "*.h", "c-chunks-v4"),
+            ("cpp", "cpp", "*.cpp", "cpp-chunks-v4"),
+            ("hpp", "cpp", "*.hpp", "cpp-chunks-v4"),
+            ("cc", "cpp", "*.cc", "cpp-chunks-v4"),
+            ("cxx", "cpp", "*.cxx", "cpp-chunks-v4"),
+            ("hh", "cpp", "*.hh", "cpp-chunks-v4"),
+            ("hxx", "cpp", "*.hxx", "cpp-chunks-v4"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
             assert_eq!(adapter.glob(), glob);
-            assert!(!adapter.cache_version().is_empty());
+            assert_eq!(adapter.cache_version(), cache_version);
         }
         for extension in [
-            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "h",
-            "CPP", "HPP", "cc", "cxx", "hh", "hxx",
+            "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "H",
+            "CPP", "HPP", "CC", "CXX", "HH", "HXX", "Cc", "Hxx", "c++", "h++", "hp", "ino", "inl",
+            "ipp", "tpp", "cu", "m", "mm",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
+        }
+    }
+
+    #[test]
+    fn the_c_and_cpp_header_and_source_extensions_map_to_one_family_each() {
+        // `.h` is `c` by decision (see the registry comment), never `cpp`, and
+        // never sniffed from content; the other header and source extensions
+        // are unambiguous C++.
+        for (path, identifier) in [
+            ("src/a.c", "c"),
+            ("include/a.h", "c"),
+            ("src/a.cpp", "cpp"),
+            ("src/a.cc", "cpp"),
+            ("src/a.cxx", "cpp"),
+            ("include/a.hpp", "cpp"),
+            ("include/a.hh", "cpp"),
+            ("include/a.hxx", "cpp"),
+            ("include/archive.tar.hh", "cpp"),
+        ] {
+            let adapter = for_path(Path::new(path)).unwrap();
+            assert_eq!(adapter.identifier(), identifier, "{path}");
+        }
+        // A `.h` file with unmistakable C++ in it is still `c`.
+        assert_eq!(for_path(Path::new("widget.h")).unwrap().identifier(), "c");
+        for path in ["README", "a.h.bak", "a.hh~", "Makefile.cc.in", ".h"] {
+            assert!(for_path(Path::new(path)).is_none(), "{path}");
+        }
+    }
+
+    fn ts_non_source(content: &[u8]) -> Option<NonSource> {
+        for_extension("ts").unwrap().non_source(content)
+    }
+
+    #[test]
+    fn qt_linguist_catalogs_are_recognized_by_their_xml_start() {
+        for content in [
+            &b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n</TS>\n"[..],
+            b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TS version=\"2.1\">",
+            b"\n  \r\n\t<?xml version=\"1.0\"?>",
+            b"\xEF\xBB\xBF \n<?xml?>",
+            b"<!-- hand-edited catalog -->\n<TS version=\"2.1\">",
+            b"<!-- before declaration -->\n<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<?xml version=\"1.0\"?>\n<!-- after declaration -->\n<TS version=\"2.1\">",
+            b"<!DOCTYPE TS>\n<TS version=\"2.1\">",
+            b"<!-- catalog -->\n<!DOCTYPE TS>\n<TS version=\"2.1\">",
+            b"<TS version=\"2.1\" language=\"de\">\n</TS>",
+            b"  <TS\n  version = \"2.1\">",
+            b"<TS language=\"de\" version=\"2.1\">",
+        ] {
+            assert_eq!(
+                ts_non_source(content),
+                Some(NonSource::QtLinguist),
+                "{}",
+                String::from_utf8_lossy(content)
+            );
+        }
+        assert_eq!(NonSource::QtLinguist.identifier(), "qt-linguist");
+    }
+
+    #[test]
+    fn typescript_is_never_mistaken_for_a_qt_linguist_catalog() {
+        for content in [
+            &b""[..],
+            b"   \n",
+            b"\xEF\xBB\xBF",
+            b"export const value = 1;\n",
+            b"// <?xml version=\"1.0\"?>\nexport const value = 1;\n",
+            b"// <TS version=\"2.1\">\nexport const value = 1;\n",
+            b"/* <?xml */\nexport const value = 1;\n",
+            b"\xEF\xBB\xBF// bom then a comment\nexport const value = 1;\n",
+            b"const xml = '<?xml version=\"1.0\"?>';\n",
+            b"const template = `<!-- not an XML prolog -->`;\nexport const value = 1;\n",
+            // A leading `<!--` or `<!DOCTYPE` is skipped, but what follows must
+            // still be an XML declaration or a `<TS` root with an attribute.
+            b"<!-- an html-style comment line -->\nexport const value = 1;\n",
+            b"<!-- unterminated\nexport const value = 1;\n",
+            b"<!DOCTYPE html>\nexport const value = 1;\n",
+            // Valid TypeScript that starts with `<TS`: a type assertion and
+            // generic arrow functions.
+            b"<TS>value;\n",
+            b"<TS extends Base>(item: TS) => item;\n",
+            b"<TS = string>(item: TS) => item;\n",
+            b"<TS\n  extends Base>(item: TS) => item;\n",
+            b"<TS>\nvalue;\n",
+            b"<TSX version=\"1\">",
+            b"<T version=\"1\">",
+            b"<ts version=\"2.1\">",
+            b"<TS",
+            b"<TS ",
+            b"<TS version",
+            b"<?xm",
+            b"< ?xml",
+        ] {
+            assert_eq!(
+                ts_non_source(content),
+                None,
+                "{}",
+                String::from_utf8_lossy(content)
+            );
+        }
+    }
+
+    /// `text` as UTF-16, with a byte-order mark when `bom` is set.
+    fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in bom
+            .then_some(0xFEFF_u16)
+            .into_iter()
+            .chain(text.encode_utf16())
+        {
+            bytes.extend(if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn each_identifier_is_listed_once_in_registration_order() {
+        assert_eq!(
+            identifiers().collect::<Vec<_>>(),
+            [
+                "rust",
+                "typescript",
+                "tsx",
+                "javascript",
+                "jsx",
+                "python",
+                "csharp",
+                "go",
+                "java",
+                "c",
+                "cpp"
+            ]
+        );
+    }
+
+    #[test]
+    fn utf16_qt_linguist_catalogs_with_a_byte_order_mark_are_recognized() {
+        let declared = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<translation>M\u{fc}nzen senden \u{1F4B0}</translation>\n</TS>\n";
+        let root_only = "<TS version=\"2.1\" language=\"de\">\n</TS>\n";
+        let spaced = " \r\n\t<TS\n  version = \"2.1\">";
+        let commented = "<!-- hand-edited catalog -->\n<TS version=\"2.1\">";
+        for text in [declared, root_only, spaced, commented, "<?xml?>"] {
+            for big_endian in [false, true] {
+                let content = utf16(text, big_endian, true);
+                assert_eq!(
+                    ts_non_source(&content),
+                    Some(NonSource::QtLinguist),
+                    "big_endian={big_endian}: {text}"
+                );
+            }
+        }
+        // Only a bounded prefix is decoded: a large body changes nothing,
+        // and neither does whitespace before the root element.
+        for big_endian in [false, true] {
+            let text = format!("{}<TS version=\"2.1\">", " ".repeat(5000));
+            let mut content = utf16(&text, big_endian, true);
+            content.extend(std::iter::repeat_n(0xD8, 200_000));
+            assert_eq!(ts_non_source(&content), Some(NonSource::QtLinguist));
+        }
+    }
+
+    #[test]
+    fn utf16_typescript_and_look_alikes_are_not_qt_linguist_catalogs() {
+        let texts = [
+            "export const a = 1;\n",
+            "<TS>value;\n",
+            "<TS extends Base>(item: TS) => item;\n",
+            "// <?xml version=\"1.0\"?>\nexport const a = 1;\n",
+            "// <TS version=\"2.1\">\nexport const a = 1;\n",
+            "\u{e9}<?xml?>",
+            "<?xm",
+            "<TS version",
+            "",
+            "  \n",
+        ];
+        for text in texts {
+            for big_endian in [false, true] {
+                let content = utf16(text, big_endian, true);
+                assert_eq!(
+                    ts_non_source(&content),
+                    None,
+                    "big_endian={big_endian}: {text:?}"
+                );
+            }
+        }
+        // A lone byte-order mark.
+        assert_eq!(ts_non_source(b"\xFF\xFE"), None);
+        assert_eq!(ts_non_source(b"\xFE\xFF"), None);
+        // UTF-16 without a byte-order mark is not guessed, even for a catalog.
+        for big_endian in [false, true] {
+            let text = "<?xml version=\"1.0\"?>\n<TS version=\"2.1\">";
+            let catalog = utf16(text, big_endian, false);
+            assert_eq!(ts_non_source(&catalog), None, "big_endian={big_endian}");
+        }
+        // A UTF-32 little-endian mark starts with the UTF-16 one but is not
+        // decoded as UTF-16 text.
+        assert_eq!(
+            ts_non_source(b"\xFF\xFE\x00\x00<\x00\x00\x00?\x00\x00\x00"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_truncated_utf16_stream_is_handled_without_panicking() {
+        for big_endian in [false, true] {
+            let complete = utf16("<?xml?>", big_endian, true);
+            // An odd trailing byte after complete units is ignored.
+            let mut odd = complete.clone();
+            odd.push(0x3C);
+            assert_eq!(ts_non_source(&odd), Some(NonSource::QtLinguist));
+            // Every truncation is either a catalog (the `<?xml` units are
+            // complete) or not, and none panics.
+            let needed = 2 + 2 * "<?xml".len();
+            for length in 0..=complete.len() {
+                let expected = (length >= needed).then_some(NonSource::QtLinguist);
+                assert_eq!(
+                    ts_non_source(&complete[..length]),
+                    expected,
+                    "big_endian={big_endian} length={length}"
+                );
+            }
+            // A cut before the attribute's `=` never matches, odd or even.
+            let root = utf16("<TS version=\"2.1\">", big_endian, true);
+            let cut = 2 + 2 * "<TS version".len();
+            assert_eq!(ts_non_source(&root[..cut]), None);
+            assert_eq!(ts_non_source(&root[..=cut]), None);
+            assert_eq!(ts_non_source(&root[..cut + 2]), Some(NonSource::QtLinguist));
+        }
+        assert_eq!(ts_non_source(b"\xFF\xFE<"), None);
+        assert_eq!(ts_non_source(b"\xFE\xFF\x00"), None);
+    }
+
+    #[test]
+    fn only_the_ts_extension_checks_for_a_clash() {
+        let utf16_catalog = utf16("<?xml?>", false, true);
+        for catalog in [
+            &b"<?xml version=\"1.0\"?>\n<TS version=\"2.1\">"[..],
+            &utf16_catalog,
+        ] {
+            for adapter in ADAPTERS {
+                let expected = (adapter.glob() == "*.ts").then_some(NonSource::QtLinguist);
+                assert_eq!(adapter.non_source(catalog), expected, "{}", adapter.glob());
+            }
         }
     }
 }

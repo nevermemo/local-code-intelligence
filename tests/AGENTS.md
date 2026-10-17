@@ -1,6 +1,8 @@
 # Test guidance
 
-Keep shared fake services and fixtures in `tests/support`. Put behavioral cases
-in `tests/cases` and register them from the single `tests/integration.rs` binary.
-Run the focused suite while iterating and the full deterministic suite once at
-the end. Automated tests must not require live services on ports 8765-8767.
+- Shared fakes and fixtures live in `tests/support`: the fake model HTTP service (`mod.rs`) and the fake LSP (`fake_lsp.rs`, built as the `fake-lsp-server` binary from `fake_lsp_bin.rs`). Behavioral cases live in `tests/cases/*.rs`, registered as modules of the single `tests/integration.rs` binary (`config`, `evaluation`, `indexing`, `mcp`, `navigation`, `readiness`, `recipes`, `run_records`, `watching`). `cargo xtask test --suite <name>` filters on those module names; `recipes` and `run_records` have no focused suite (use `cargo test --test integration recipes::`, or the `Full` gate).
+- Two fake model servers exist by design: `FakeModelServer` in `lci-core` covers raw TCP connection faults, while `FakeModels` in `tests/support` covers application behavior. The C# fake-LSP config builder is `with_fake_csharp_server` in `tests/support/mod.rs` (the request timeout is a parameter); a few tests in `tests/cases/navigation.rs` still build their own `CSharpLspConfig` inline.
+- Ports, the fakes and temporary data directories: `AGENTS.md` "Hard rules". Build and test commands, the focused suites and the `Full` gate: `AGENTS.md` "Working method" and `docs/development/testing.md`.
+- Test observable contracts and recovery: parse and embedding request counts for incremental work, preserved snapshots after a failed update, fail-open paths, filtered-empty results. Do not test implementation details or documentation wording.
+- A failing gate is fixed, or the change is reverted. Never weaken, delete, or `#[ignore]` a test to make a gate pass.
+- Live acceptance (`cargo xtask acceptance <name>`, `cargo xtask live-acceptance`) is separate evidence. Its reports go to `test-results/` and are never committed.

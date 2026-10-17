@@ -15,10 +15,10 @@ use anyhow::Result;
 
 const CALCULATOR_JAVA: &str = "package acceptance;\n\npublic class Calculator {\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

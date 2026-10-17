@@ -91,12 +91,12 @@ const SELF_PROFILE: LspProfile = LspProfile {
     expect_symbol_name: "openapi_document",
     declaration_file: "src/rest.rs",
     declaration: Anchor::Located {
-        line_needle: "fn openapi_document() -> Value {",
+        line_needle: "fn openapi_document(port: u16) -> Value {",
         symbol: "openapi_document",
     },
     call_site_file: "src/rest.rs",
     call_site: Anchor::Located {
-        line_needle: "\"/openapi.json\"",
+        line_needle: "Json(openapi_document(",
         symbol: "openapi_document",
     },
     // The declaration plus the one router wiring that calls it.
@@ -196,7 +196,6 @@ pub async fn run(profile: AcceptanceProfile, workspace: Option<PathBuf>) -> Resu
     final_result.map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     spec: &LspProfile,
     workspace_path: &Path,
@@ -220,7 +219,13 @@ async fn run_inner(
     evidence.set("lci_pid", lci_pid)?;
 
     evidence.stage("wait-health")?;
-    let healthy = wait_http_ok(&format!("{BASE}/health"), 30, Duration::from_millis(500)).await;
+    let healthy = wait_http_ok(
+        &format!("{BASE}/health"),
+        30,
+        Duration::from_millis(500),
+        || server.as_mut().is_none_or(ManagedServer::has_exited),
+    )
+    .await;
     if !healthy {
         bail!("/health did not report ok within the bounded wait");
     }

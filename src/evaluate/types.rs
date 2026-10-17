@@ -2,78 +2,20 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::filter::{EffectiveFilterReport, FilterRequest};
+use crate::app::{CandidateTrace, RerankOutcome};
+use crate::config::{ChannelsConfig, Config, FusionConfig};
+use crate::filter::EffectiveFilterReport;
 
 use super::metrics::query_metrics;
-/// A portable evaluation file: the workspaces it references plus the
-/// queries to run against them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvaluationFile {
-    /// Workspaces referenced by key.
-    #[serde(default)]
-    pub workspaces: Vec<EvalWorkspace>,
-    /// Queries to evaluate.
-    #[serde(default)]
-    pub queries: Vec<EvalQuery>,
-}
-
-/// A workspace referenced by an evaluation file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvalWorkspace {
-    /// Stable key used by [`EvalQuery::workspace`].
-    pub key: String,
-    /// Required workspaces must be present; when an optional workspace is
-    /// missing, its queries are skipped rather than failing the run.
-    /// Defaults to `true` when omitted in a definition file.
-    #[serde(default = "default_required")]
-    pub required: bool,
-}
-
-const fn default_required() -> bool {
-    true
-}
-
-/// A single evaluation query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvalQuery {
-    /// Query text sent to search.
-    pub query: String,
-    /// Key of the workspace this query runs against.
-    pub workspace: String,
-    /// Result window size; `None` uses the service default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<usize>,
-    /// Optional retrieval filters, shared with the service filter request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<FilterRequest>,
-    /// Repository-relative path patterns that count as a hit. When several
-    /// patterns match the same result, the result still counts as one hit.
-    #[serde(default)]
-    pub expected_paths: Vec<String>,
-    /// Path patterns that should appear in the results; each matching
-    /// result counts once toward [`QueryMetrics::preferred_count`]
-    /// regardless of how many patterns match it.
-    #[serde(default)]
-    pub preferred_paths: Vec<String>,
-    /// Path patterns that should not appear before the first expected hit.
-    #[serde(default)]
-    pub disfavored_paths: Vec<String>,
-    /// Source-role names (lowercase wire names) expected on the first
-    /// expected hit. Empty means no role expectation.
-    #[serde(default)]
-    pub expected_roles: Vec<String>,
-    /// A snippet that must appear in the first expected hit's bounded
-    /// snippet; `None` means no snippet expectation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_snippet: Option<String>,
-}
+pub use lci_core::evaluation::{EvalQuery, EvalWorkspace, EvaluationFile};
 
 // ---------------------------------------------------------------------------
 // Bounded result evidence
 // ---------------------------------------------------------------------------
 
-/// Maximum characters retained in a bounded evidence snippet.
-pub const SNIPPET_BUDGET: usize = 400;
+// The snippet bound lives in `store`, beside the retrieval pipeline that
+// records it in a candidate dump; evaluation re-exports it.
+pub use crate::store::{SNIPPET_BUDGET, bounded_snippet};
 
 /// Bounded evidence for one returned result: just enough to evaluate a
 /// query without persisting full chunk text.
@@ -98,21 +40,6 @@ pub struct ResultEvidence {
     pub reranker_score: Option<f32>,
 }
 
-/// Truncate code to the bounded snippet budget, marking truncation with a
-/// trailing ellipsis. Short input is returned unchanged.
-pub fn bounded_snippet(code: &str) -> String {
-    if code.len() <= SNIPPET_BUDGET {
-        return code.to_owned();
-    }
-    let mut end = SNIPPET_BUDGET;
-    while !code.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out: String = code[..end].to_owned();
-    out.push('…');
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Reported search state
 // ---------------------------------------------------------------------------
@@ -129,6 +56,134 @@ pub enum RerankerState {
     Reranked,
     /// The report was reranked but some evidence rows lack scores.
     PartiallyScored,
+}
+
+// ---------------------------------------------------------------------------
+// Candidate dump
+// ---------------------------------------------------------------------------
+
+/// How the reranker's output is used to order the results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankMode {
+    /// The reranker's order replaces the fusion order (production behaviour
+    /// whenever `[channels].reranker` is on).
+    Replace,
+    /// No reranker: the results are the head of the fusion order
+    /// (`[channels].reranker = false`).
+    Off,
+    /// The reranker's order enters as a vote: each shortlisted candidate is
+    /// re-scored `fusion_score + vote_weight / (rrf_k + rerank_rank)` and the
+    /// shortlist is re-sorted. Replay-only: production has no such mode, so
+    /// no dump carries it, but `replay --rerank-mode vote` applies it.
+    Vote,
+}
+
+impl RerankMode {
+    /// The lowercase wire/CLI name of the mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Off => "off",
+            Self::Vote => "vote",
+        }
+    }
+}
+
+/// Why `replay` could not score a dumped query under the replayed arm. A
+/// refused query is never approximated: it is reported as skipped (so
+/// `compare` leaves it out of every pair), counted, and listed under the
+/// report's `replay` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayRefusal {
+    /// The query carries no candidate dump (the report was not made with
+    /// `evaluate --dump-candidates`, or the query was dumped by nothing).
+    NotDumped,
+    /// Fusion recomputed at the dumped arm does not reproduce a row's
+    /// `fusion_score` bit for bit, or the dump is not in `fused_rank` order.
+    FusionMismatch,
+    /// The per-file cap recomputed at the dumped arm does not reproduce a
+    /// row's `capped_rank` or `shortlisted`.
+    ShortlistMismatch,
+    /// The replayed arm uses the reranker but the dumped search has no
+    /// reranker scores (its outcome was not `scored`).
+    RerankNotScored,
+    /// The replayed rerank window holds a candidate the dumped search never
+    /// sent to the reranker, so it has no score.
+    UnscoredWindow,
+}
+
+impl ReplayRefusal {
+    /// The snake_case name used in the report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDumped => "not_dumped",
+            Self::FusionMismatch => "fusion_mismatch",
+            Self::ShortlistMismatch => "shortlist_mismatch",
+            Self::RerankNotScored => "rerank_not_scored",
+            Self::UnscoredWindow => "unscored_window",
+        }
+    }
+}
+
+/// The retrieval configuration one candidate dump was taken under: what a
+/// replay must hold equal (or may only narrow) to reproduce the dumped
+/// search exactly. Recorded on every dumped query so a report stays
+/// self-describing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateArm {
+    /// Reciprocal Rank Fusion constant of the dumped fusion.
+    pub rrf_k: f32,
+    /// Channel weights and the per-file cap (`max_chunks_per_file`; `0` is
+    /// unlimited) of the dumped fusion.
+    pub fusion: FusionConfig,
+    /// Size of the reranker shortlist (the cut after the cap).
+    pub rerank_candidate_count: usize,
+    /// Bytes of code each shortlisted document carried to the reranker.
+    pub rerank_document_max_bytes: usize,
+    /// Depth of the semantic channel's candidate list.
+    pub semantic_candidate_count: usize,
+    /// Depth of the lexical channel's candidate list.
+    pub lexical_candidate_count: usize,
+    /// Depth of the language-server channel's candidate list.
+    pub lsp_candidate_count: usize,
+    /// Which channels and whether the reranker were switched on.
+    pub channels: ChannelsConfig,
+    /// The result window the query asked for: `top_k`, or the configured
+    /// default when the query has none.
+    pub k: usize,
+    /// Embedding endpoint, model, and document format the index was built
+    /// with (`Config::embedding_identity`).
+    pub embedding_identity: String,
+    /// Reranker model name sent with every request.
+    pub reranker_model: String,
+    /// How the reranker's output ordered the dumped results.
+    pub rerank_mode: RerankMode,
+}
+
+impl CandidateArm {
+    /// The arm `config` produces for a query whose result window is `k`.
+    pub fn new(config: &Config, k: usize) -> Self {
+        Self {
+            rrf_k: config.rrf_k,
+            fusion: config.fusion,
+            rerank_candidate_count: config.rerank_candidate_count,
+            rerank_document_max_bytes: config.rerank_document_max_bytes,
+            semantic_candidate_count: config.semantic_candidate_count,
+            lexical_candidate_count: config.lexical_candidate_count,
+            lsp_candidate_count: config.lsp_candidate_count,
+            channels: config.channels,
+            k,
+            embedding_identity: config.embedding_identity(),
+            reranker_model: config.reranker_model.clone(),
+            rerank_mode: if config.channels.reranker {
+                RerankMode::Replace
+            } else {
+                RerankMode::Off
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -198,6 +253,43 @@ pub struct QueryMetrics {
     /// Whether any returned chunk contains the required snippet. A missing
     /// expectation is satisfied vacuously.
     pub required_snippet_found: Option<bool>,
+    /// Graded nDCG over the first ten results: a result matching an
+    /// expected pattern has gain 2, one matching only a preferred pattern
+    /// has gain 1, anything else 0, with a `log2(rank + 1)` discount. The
+    /// ideal ranking holds one gain-2 slot per distinct expected pattern
+    /// followed by one gain-1 slot per distinct preferred pattern that no
+    /// expected pattern already covers. Each gold pattern earns its gain at
+    /// most once, at the first result that matches it (a repeated chunk of
+    /// the same file earns nothing; when several unsatisfied patterns match,
+    /// the most specific one is credited), so the value stays in `[0, 1]`.
+    /// `0.0` when there is no gold or no gold result in the window.
+    ///
+    /// Bounded by the returned result window: the report holds at most
+    /// `top_k` results (the checked-in definitions use 8), so with
+    /// `top_k < 10` this is effectively nDCG@`top_k`. Set `top_k >= 10` to
+    /// compare with published @10 numbers.
+    #[serde(default)]
+    pub ndcg_at_10: f64,
+    /// Fraction of distinct expected patterns matched by at least one of the
+    /// first three results; `0.0` when there are no expected patterns.
+    #[serde(default)]
+    pub recall_at_3: f64,
+    /// Fraction of distinct expected patterns matched by at least one of the
+    /// first eight results (fewer when the window, `top_k`, is smaller);
+    /// `0.0` when there are no expected patterns.
+    #[serde(default)]
+    pub recall_at_8: f64,
+    /// `1.0` when an expected pattern matches one of the first five
+    /// distinct files (repeated chunks of a file collapse to that file's
+    /// best rank), else `0.0`.
+    #[serde(default)]
+    pub file_acc_at_5: f64,
+    /// `1.0` when an expected pattern matches one of the first ten
+    /// distinct files, else `0.0`. Bounded by the returned result window
+    /// like [`Self::ndcg_at_10`]: with `top_k = 8` it is effectively
+    /// accuracy over the first eight results.
+    #[serde(default)]
+    pub file_acc_at_10: f64,
 }
 
 /// Per-query evaluation report: bounded evidence, reported search state,
@@ -238,6 +330,33 @@ pub struct QueryReport {
     pub index_wait_ms: Option<f64>,
     /// Computed metrics.
     pub metrics: QueryMetrics,
+    /// The whole fused candidate pool of the search, in fused order, with
+    /// everything a replay needs (see [`CandidateTrace`]). Only
+    /// `evaluate --dump-candidates` fills it; it is empty, and absent from the
+    /// JSON, otherwise and for skipped or failed queries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<CandidateTrace>,
+    /// The retrieval configuration `candidates` was dumped under. Present
+    /// exactly when the query was dumped, even if its pool is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm: Option<CandidateArm>,
+    /// What the reranker did for a dumped query: scored, failed, off, or not
+    /// run. Present exactly when [`Self::arm`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_outcome: Option<RerankOutcome>,
+    /// The search report's informational notes, for example "LSP still
+    /// starting or slow" when the language-server channel hit its budget and
+    /// contributed nothing or less than usual. A replay can use them to
+    /// exclude or stratify such queries. Never a fallback. Only
+    /// `evaluate --dump-candidates` fills it, together with `arm`; it is
+    /// empty, and absent from the JSON, otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// Set by `replay` on a query it refused to score (see
+    /// [`ReplayRefusal`]); such a query is also `skipped`, with the detail
+    /// in `reason`. Absent from every other report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_refusal: Option<ReplayRefusal>,
 }
 
 impl QueryReport {
@@ -272,6 +391,11 @@ impl QueryReport {
             index_action,
             index_wait_ms,
             metrics,
+            candidates: Vec::new(),
+            arm: None,
+            rerank_outcome: None,
+            notes: Vec::new(),
+            replay_refusal: None,
         }
     }
 
@@ -307,7 +431,17 @@ impl QueryReport {
                 reranker: RerankerState::NoResults,
                 expected_roles_satisfied: None,
                 required_snippet_found: None,
+                ndcg_at_10: 0.0,
+                recall_at_3: 0.0,
+                recall_at_8: 0.0,
+                file_acc_at_5: 0.0,
+                file_acc_at_10: 0.0,
             },
+            candidates: Vec::new(),
+            arm: None,
+            rerank_outcome: None,
+            notes: Vec::new(),
+            replay_refusal: None,
         }
     }
 
@@ -324,6 +458,55 @@ impl QueryReport {
 // ---------------------------------------------------------------------------
 // Aggregate report
 // ---------------------------------------------------------------------------
+
+/// Median, nearest-rank 95th percentile, maximum and sample count of one
+/// latency series, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LatencyPercentiles {
+    /// Median (mean of the two middle values for even sample counts).
+    pub p50: f64,
+    /// Nearest-rank 95th percentile. Below 20 samples this is the maximum
+    /// itself and for 20 to 39 it is the second-highest value, so a single
+    /// outlier can hide; read `max` for the worst query.
+    pub p95: f64,
+    /// Largest sample. Reports written before this field existed load as 0.
+    #[serde(default)]
+    pub max: f64,
+    /// Number of samples (queries with timings). Reports written before this
+    /// field existed load as 0.
+    #[serde(default)]
+    pub n: usize,
+}
+
+/// [`LatencyPercentiles`] for every [`EvalTimings`] field; each key mirrors
+/// the timing field it summarizes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StageLatency {
+    pub query_embedding_ms: LatencyPercentiles,
+    pub lancedb_search_ms: LatencyPercentiles,
+    pub lexical_search_ms: LatencyPercentiles,
+    pub lsp_search_ms: LatencyPercentiles,
+    pub fusion_ms: LatencyPercentiles,
+    pub reranking_ms: LatencyPercentiles,
+    pub total_ms: LatencyPercentiles,
+}
+
+/// Headline metrics for the executed queries that carry one tag (see
+/// [`EvalQuery::tags`]). A query with several tags counts once in each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagAggregate {
+    /// Executed (non-skipped) queries carrying the tag; always at least one.
+    pub executed_count: usize,
+    /// hit@1 rate over those queries.
+    pub hit_at_1_rate: f64,
+    /// hit@3 rate over those queries.
+    pub hit_at_3_rate: f64,
+    /// Mean reciprocal rank over those queries.
+    pub mrr: f64,
+    /// Mean [`QueryMetrics::ndcg_at_10`] over those queries (bounded by each
+    /// query's result window, see there).
+    pub mean_ndcg_at_10: f64,
+}
 
 /// Aggregate metrics across all query reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,12 +534,34 @@ pub struct AggregateReport {
     /// Mean reciprocal rank over evaluated queries; `None` when none were
     /// evaluated.
     pub mrr: Option<f64>,
+    /// Mean [`QueryMetrics::ndcg_at_10`] over evaluated queries (bounded by
+    /// each query's result window, see there); `None` when none were
+    /// evaluated.
+    #[serde(default)]
+    pub mean_ndcg_at_10: Option<f64>,
+    /// Mean [`QueryMetrics::recall_at_3`] over evaluated queries.
+    #[serde(default)]
+    pub mean_recall_at_3: Option<f64>,
+    /// Mean [`QueryMetrics::recall_at_8`] over evaluated queries.
+    #[serde(default)]
+    pub mean_recall_at_8: Option<f64>,
+    /// Mean [`QueryMetrics::file_acc_at_5`] over evaluated queries.
+    #[serde(default)]
+    pub mean_file_acc_at_5: Option<f64>,
+    /// Mean [`QueryMetrics::file_acc_at_10`] over evaluated queries.
+    #[serde(default)]
+    pub mean_file_acc_at_10: Option<f64>,
     /// Median total latency in milliseconds over evaluated queries with
     /// timings; `None` when there are no samples.
     pub median_latency_ms: Option<f64>,
     /// 95th percentile (nearest-rank) total latency in milliseconds;
     /// `None` when there are no samples.
     pub p95_latency_ms: Option<f64>,
+    /// Per-stage p50/p95/max latency and sample count over evaluated queries
+    /// with timings, using the same median and nearest-rank percentile as
+    /// the total-latency fields; `None` when there are no samples.
+    #[serde(default)]
+    pub stage_latency: Option<StageLatency>,
     /// Evaluated queries whose report carried a warning (degraded
     /// channel), i.e. fell back.
     pub fallback_queries: usize,
@@ -369,9 +574,17 @@ pub struct AggregateReport {
     pub index_reused: usize,
     /// Evaluated queries that waited for an existing index job.
     pub index_waited: usize,
+    /// Evaluated queries whose stale index was refreshed incrementally.
+    #[serde(default)]
+    pub index_refreshed: usize,
     /// Combined source-role distribution over all evaluated evidence.
     #[serde(default)]
     pub role_distribution: BTreeMap<String, usize>,
+    /// Per-tag aggregates over executed queries, keyed by tag. Empty (and
+    /// omitted from JSON) when no executed query carries a tag; a tag that
+    /// only appears on skipped queries has no entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_tag: BTreeMap<String, TagAggregate>,
     /// The per-query reports.
     #[serde(default)]
     pub queries: Vec<QueryReport>,

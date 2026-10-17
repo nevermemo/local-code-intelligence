@@ -1,14 +1,68 @@
+# This file describes behaviour. Machine-specific values -- data_dir, port, the
+# model URLs and names, ripgrep_path, rust_analyzer_path and the language-server
+# sections below -- can also be set per machine, outside this file, so it can
+# be shared unchanged: in a local overlay file beside it (config.local.toml for
+# config.toml; the same keys, nothing else) or in LCI_* environment variables
+# (LCI_DATA_DIR, LCI_PORT, ...). Both win over this file; the environment wins
+# over the overlay. `lci config` prints every resolved value with the layer it
+# came from, and `lci init` writes the overlay for this machine (the data
+# directory, the absolute path of each tool on PATH) with comments on the
+# model services and the port; it never edits this file. Details: the
+# Configuration section of the README.
 embedding_url = "http://localhost:8766/v1"
 embedding_model = "qwen3-embedding-4b"
 reranker_url = "http://localhost:8767/rerank"
 reranker_model = "qwen3-reranker-4b"
+# Each model service (the embedder and reranker above, System One below) is a
+# URL, a model name and, optionally, the NAME of an environment variable that
+# holds an API key (sent as a bearer token). The key itself never belongs in a
+# configuration file; the name is upper-case letters, digits and '_'. Each
+# service can be a local server, a server on another machine, or a hosted
+# provider; the defaults point at local servers.
+# embedding_api_key_env = "EMBEDDING_API_KEY"
+# reranker_api_key_env = "RERANKER_API_KEY"
+#
+# The optional [system_one] section (a small model planned to steer a traversal)
+# is a table, so its commented example is at the end of this file.
 default_top_k = 8
 # Defaults to the OS-native local data directory joined with
 # "local-code-intelligence": %LOCALAPPDATA% on Windows, ~/Library/Application
-# Support on macOS, $XDG_DATA_HOME or ~/.local/share on Linux.
-# Must be outside every workspace you index.
-# data_dir = 'C:\Users\you\AppData\Local\local-code-intelligence'
+# Support on macOS, $XDG_DATA_HOME or ~/.local/share on Linux, which is
+# usually right. Must be absolute and outside every workspace you index. To
+# place it for this machine only, set data_dir in the local overlay or
+# LCI_DATA_DIR instead of here.
+# data_dir = '/absolute/path/outside/every/indexed/workspace'
+# Loopback port `serve` binds (127.0.0.1). 8765, 8766 and 8767 belong to other
+# services and are rejected. `serve --port` overrides it.
+port = 8768
 embedding_batch_size = 8
+# Prompt formats for the embedding model. Models differ in what they expect (an
+# instruction prefix, a task label), so the text embedded for a query and for an
+# indexed chunk are both templates. The defaults below are the formats LCI used
+# before they were configurable (Qwen3-Embedding's query instruction, the bare
+# code for documents).
+#
+# embedding_query_template is the text embedded for a search query. {query} is
+# required. It shapes the query only, so changing it never re-embeds an index.
+embedding_query_template = "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}"
+# embedding_document_template is the text embedded for each indexed chunk.
+# {code} (the chunk's source) is required; {path} (its repository-relative file
+# path) is optional. Changing it changes the index's embedding identity, so
+# every chunk is re-embedded: the next index_workspace does it, and so does a
+# search under the default on-search freshness (under manual or watch a search
+# fails until you re-index). Without {path}, identical code is embedded once
+# and reused wherever it appears; with {path} the vector depends on the file
+# too, so identical code in different files, or a file moved to a new path, is
+# embedded per path.
+# Placeholders are filled in one pass: code that contains the text {path} is
+# embedded literally, and any other {text} in a template is kept as it is.
+embedding_document_template = "{code}"
+# EmbeddingGemma 2 (set both):
+# embedding_query_template = "task: code retrieval | query: {query}"
+# embedding_document_template = "title: {path} | text: {code}"
+# bge-code-v1 (set both; the document format is the bare code):
+# embedding_query_template = "<instruct>Given a question in text, retrieve relevant code that answers it.\n<query>{query}"
+# embedding_document_template = "{code}"
 embedding_timeout_seconds = 120
 reranker_timeout_seconds = 120
 # Bounded timeout for /ready and service_status dependency probes (1-30 seconds).
@@ -16,14 +70,52 @@ readiness_timeout_seconds = 5
 ripgrep_path = "rg"
 semantic_candidate_count = 40
 lexical_candidate_count = 40
+# Candidates kept after fusion: the reranker's window, and the most results a
+# search returns even when top_k asks for more (a top_k passed above it adds
+# a note to the response). A search profile may set its own (1-200).
 rerank_candidate_count = 24
+# Most bytes of code sent to the reranker per candidate (256-1048576).
+rerank_document_max_bytes = 4096
 rrf_k = 60.0
 # Used only after watch_workspace is called for a workspace.
 watch_poll_milliseconds = 2000
 watch_debounce_milliseconds = 750
 rust_analyzer_path = "rust-analyzer"
+# Restore rust-analyzer's execution/network defaults only for trusted
+# repositories and dependencies. Applies to every workspace this process uses.
+rust_analyzer_trusted = false
+# Seconds a request to a language server may go without any sign of life from
+# it (1-86400).
 lsp_timeout_seconds = 60
 lsp_candidate_count = 40
+# Most milliseconds one search waits for the language-server channel
+# (100-60000). A server that is still starting (rust-analyzer takes about 10 s
+# to index a workspace; an estimate) or slow to answer costs a search at most this long: the
+# search returns without symbol candidates, notes that in its "notes" field
+# (not "warning": nothing failed), and the server keeps starting in the
+# background so a later search uses it. Raise it to wait longer for a cold
+# server; lsp_timeout_seconds separately bounds one request to a hung server.
+lsp_search_budget_ms = 1500
+# Seconds a language server may go unused before LCI shuts it down (through
+# the protocol's shutdown request and exit notification: up to 2 seconds for
+# the answer and 2 more for the process to end, then it is killed) to free its
+# memory; 0 keeps every server until the service stops. Any search or
+# navigation call for the workspace counts as use, and a server that is still
+# building its symbol index or serving a call is never released. The next call
+# after a release starts a fresh server, which pays the cold start and priming
+# again, so a search right after a release can hit lsp_search_budget_ms and
+# note it. Allowed: 0-86400; values below 60 are meant for tests.
+lsp_idle_timeout_seconds = 1800
+
+# Seconds a language server may answer nothing but transient "ask again"
+# errors (ContentModified, ServerCancelled, RequestFailed, a loading server's
+# own errors) before its session is replaced; the span runs from its first such
+# answer, and any result, any other error, or a progress notification from the
+# server ends it. A server that is still loading answers them for minutes and a
+# restarted one starts the load over, so keep this above the longest load you
+# expect. 0 never replaces a session for this.
+# Allowed: 0-86400; values below 60 are meant for tests.
+lsp_stuck_seconds = 900
 
 # Optional C# language server (csharp-ls). C# tooling is optional and
 # fail-open: omitting this section (or leaving path empty) keeps it disabled
@@ -68,19 +160,115 @@ lsp_candidate_count = 40
 # and platform config dir under that directory itself. Optional and
 # fail-open, same as csharp above.
 # [java]
-# path = "C:/tools/jdtls"
+# path = "/path/to/jdtls"
 # args = []
 # disabled = false
 
 # Optional C/C++ language server (clangd). One configured server navigates
-# both .c and .cpp/.hpp. Optional and fail-open, same as csharp above. Like
-# gopls, clangd needs no forced leading transport flag. No compile_commands.json
+# .c/.h and .cpp/.cc/.cxx/.hpp/.hh/.hxx. Optional and fail-open, same as csharp
+# above. Like gopls, clangd needs no forced leading transport flag. No compile_commands.json
 # is needed for simple per-file navigation; point clangd at a real one via
 # args (e.g. "--compile-commands-dir=...") for a workspace with a build system.
 # [clangd]
 # path = "clangd"
 # args = []
 # disabled = false
+
+# Query-time switches for the retrieval channels and the reranker; all default
+# to true, and a file without this section behaves exactly as before. A
+# disabled channel is skipped outright: no candidates, no work (semantic =
+# false never embeds the query; lsp = false never starts a language server), a
+# zero timing, and no "unavailable" warning, because turning it off is a
+# choice, not a failure. A disabled reranker returns the fusion order with
+# reranked = false, sends no request, and adds no warning. At least one of
+# semantic, lexical, and lsp must stay enabled, or the configuration is
+# rejected at startup.
+# The switches affect searches only. Indexing always embeds and stores every
+# chunk, so flipping one never needs a reindex, and /ready and service_status
+# keep probing the embedding service even with semantic = false, because
+# indexing still needs it.
+# Grep-only baseline for an evaluation arm (ripgrep matches mapped onto
+# chunks, nothing else): semantic = false, lsp = false, reranker = false.
+[channels]
+semantic = true
+lexical = true
+lsp = true
+reranker = true
+
+# Named query-time profiles, [search_profiles.<name>]: none are configured by
+# default, and a search that names none behaves exactly as it does without this
+# section. A profile overrides only semantic, lexical, lsp, reranker (the same
+# switches as [channels]) and rerank_candidate_count (1..=200); a key it leaves
+# out keeps the top-level value above. Nothing that changes the index, the
+# embedding identity, fusion, the candidate depths, the per-file cap, or
+# rerank_document_max_bytes can be set here (an unknown key is an error), so
+# every profile searches the same index. Each profile must keep at least one of
+# semantic, lexical, and lsp enabled. A name is 1 to 32 letters, digits, "_" or
+# "-" starting with a letter or digit, and "default" is reserved. Choose one
+# with `search --search-profile <name>` on the command line; an unknown name is
+# an error that lists the configured ones, never a silent fall back to the
+# defaults. The response and the candidate dump then carry search_profile.
+# Fusion order only, no rerank request:
+# [search_profiles.fast]
+# reranker = false
+# Rerank a wider shortlist and leave the language servers out:
+# [search_profiles.deep]
+# lsp = false
+# rerank_candidate_count = 48
+#
+# Four more profile keys change only how the MCP endpoint /mcp/<name> shows
+# itself to an agent and never what a search retrieves; REST and the command
+# line always return the full result:
+#   tools = "full" (default) or "search": "search" lists and serves only
+#     search_code, search_symbols, find_definition and find_references, not the
+#     six maintenance tools (about a third of the tool list).
+#   response = "full" (default) or "compact": "compact" makes search_code return
+#     per hit only relative_file_path, start_line, end_line, language,
+#     source_role and code, and a short envelope. The same hits in the same
+#     order.
+#   compact_max_hit_lines = 40 (1..=1000): a longer hit's code is cut after this
+#     many lines and marked (code_truncated, excerpt_end_line, and a last line
+#     naming the lines to read from the file).
+#   compact_max_response_chars = 16000 (1000..=1000000): a ceiling on the whole
+#     serialized result; code is shortened across hits (response_truncated), and
+#     if even the locators do not fit the call fails and asks for a lower top_k.
+# The two compact_* keys are an error without response = "compact". A search-only
+# agent endpoint with the compact result (served at /mcp/agent):
+# [search_profiles.agent]
+# tools = "search"
+# response = "compact"
+# compact_max_hit_lines = 40
+# compact_max_response_chars = 16000
+
+# Per-channel weights for Reciprocal Rank Fusion. A channel adds
+# weight / (rrf_k + rank) for each chunk it returns, and a chunk several
+# channels return sums those terms; the source-role prior is added afterwards
+# and is never scaled. All three weights default to 1.0, which is plain
+# unweighted RRF (a semantic_weight of 2.0 had no significant effect in an exact
+# offline replay; see docs/decisions.md). A file without this section uses the defaults. Set max_chunks_per_file to 0
+# for plain RRF with no file cap, for example for an evaluation arm that must
+# match earlier reports. Each weight must be finite and greater than zero: a
+# zero weight is rejected at startup, because turning a channel off is what
+# [channels] is for. The weights show up only in fusion_score; channel ranks and
+# scores, and the reranker's input, are unchanged. rrf_k stays a top-level key.
+#
+# max_chunks_per_file (0..=100, default 2; 0 = unlimited, which leaves the
+# fused order exactly as plain fusion gives it) caps how many chunks of one file
+# keep their place in the fused order. A file's chunks beyond the cap are
+# demoted, never dropped: they move behind every other chunk, both groups
+# keeping their fused order, before the list is cut to rerank_candidate_count.
+# The reranker's shortlist (and, with the reranker off or failing, the results)
+# therefore fill with distinct files first, and top_k is still filled from the
+# demoted chunks when there are too few files. fusion_score is not rescaled, so
+# a demoted chunk can appear after a chunk with a lower fusion_score. The
+# reranker's own output order is not capped again. The default of 2 was
+# measured on the mined evaluation set and core; the numbers are in
+# docs/decisions.md.
+[fusion]
+semantic_weight = 1.0
+lexical_weight = 1.0
+lsp_weight = 1.0
+max_chunks_per_file = 2
 
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
@@ -93,3 +281,193 @@ stale_check_interval_seconds = 10
 # How long a search waits for a concurrently running refresh job before
 # falling back to the previous snapshot.
 wait_for_existing_job_seconds = 120
+
+# The graph-traversal mode of search_code (mode = "traverse"), off by default.
+# While enabled is false, search_code, its schema and the server instructions
+# are exactly those of a server without the mode, and a request that asks for
+# the mode is an error. Enabled, a request with mode = "traverse" walks the
+# workspace's SCIP index (map graph.scip, written by `rust-analyzer scip`;
+# the start nodes are the top seed_k hits of the hybrid search search_code runs
+# in its normal mode, mapped to symbols of the index) under the budget, the rule
+# list and the stop settings of its steer object, and returns the reached
+# nodes with the trace totals; a handle and a checkpoint come back only when
+# the steering ladder could not decide a stop or the budget ran out. The
+# limits below are caps: a request may lower them, never raise them. The same
+# walk runs as `lci traverse`, which ignores enabled and, given --root, seeds
+# from the hybrid search of that tree (the model services it configures). A
+# stand-in that matches the question's words against symbol names replaces the
+# hybrid search only when it is unavailable or finds nothing, and the response
+# and the trace say so (seed_source). Traces and handles are written under
+# data_dir. Engine reference: docs/spike/multimap/engine.md.
+[traverse]
+enabled = false
+# A relative path is taken from the workspace directory.
+scip_index = "index.scip"
+max_pops = 200
+max_depth = 6
+max_est_tokens = 20000
+# Longest the walk may run. The hybrid search for the start nodes does not
+# count against it (embedding_timeout_seconds and reranker_timeout_seconds
+# bound that search). Loading the index does count against it.
+deadline_ms = 5000
+max_stops = 4
+tau = 0.8
+# How much each independent map beyond the first that reaches a node lifts its
+# rank: potential * (1 + boost * (maps - 1)). 0 ranks by potential alone; the
+# most is 10 (a larger value could overflow the ranks). Maps built on one graph
+# (structure.contains, graph.scip, scip.impact) count as one. A resumed
+# traversal must be given the boost its handle was made with.
+corroboration_boost = 0.1
+# How results are ranked. "boost" (default): the path potential lifted by
+# corroboration_boost. "rrf": weighted reciprocal rank fusion, as Qdrant does:
+# each evidence source (one independent map; the maps built on one graph
+# together; a seed's own map) ranks the nodes it delivered by the best
+# potential with which it delivered them, and a node scores the sum over
+# sources of weight / (rank + 2), rank from 0, weight the map weight a steering
+# policy sets (1 by default). Ties go by node id. Under "rrf" the score bound
+# (the early stop `bound`) is off, because a fused score depends on the ranks of
+# all the other results, and corroboration_boost does not rank. A resumed
+# traversal keeps the fusion its handle was made with.
+fusion = "boost"
+# Connective nodes (files, commits, config keys) are passed through: expanding one
+# does not cost a pop, so they do not eat the budget that answer nodes need. The
+# traversal ends when the free pops reach max_pops, a pass-through pop does not
+# make its children free, and the token budget is charged as usual. A resumed
+# traversal keeps the setting its handle was made with.
+pass_through = false
+# Reranker frontier: after the gate and the beam keep the edges of an expansion, one
+# batched reranker call scores the kept destinations against the question, and each
+# kept hop's value is multiplied by rerank_floor + (1 - rerank_floor) * s, s the
+# relevance in 0..1. The factor is at most 1, so the score bound stays sound. A
+# failed call leaves the factor at 1; the response warns when any failed and counts
+# the failures by reason. Uses the configured reranker; a resumed traversal must be
+# given the same settings, the same reranker model and endpoint, and the same
+# top_k. rerank_floor is the factor for relevance 0, 0 to 1 (1: no effect).
+# rerank_scores says what the reranker's scores are, for every document alike:
+# "probability" (default; llama.cpp's /rerank returns probabilities) clamps each
+# score to 0..1, "logit" maps each through 1 / (1 + e^-score).
+rerank_frontier = false
+rerank_floor = 0.25
+rerank_scores = "probability"
+# Most model calls (the reranker frontier's calls) one traversal may make, a
+# continuation counting on from the calls before it. Once reached, the frontier
+# stops rating (the hops keep factor 1) and the walk goes on. Absent: no cap.
+# max_model_calls = 200
+# Whether the score bound may end a traversal early: once enough results exist and
+# nothing queued can lift a result above the k-th, the walk stops with the stop
+# reason `bound`. false: the walk runs to its budgets or a dry frontier. A resumed
+# traversal keeps the setting its handle was made with.
+score_bound = true
+# A table of fitted hop priors (written by `cargo xtask maps fit-priors`) and the
+# question type whose priors price the hops; both or neither. Per question type
+# the priors are divided by the largest, and a pair the table lacks keeps the
+# guessed prior. A continuation handle keeps the table's content hash and is
+# refused when the file changed.
+# priors = "hop-priors.json"
+# question_type = "flow"
+# A fitted tie-break (written by `cargo xtask maps fit-tiebreak`): a weighted sum of
+# result features that orders results tied at the same rank, which otherwise keep
+# discovery order. It never lifts a result over a higher rank. A continuation
+# handle keeps the file's content hash and is refused when the file changed.
+# tie_break = "tie-break.json"
+# Hits of the hybrid search that become start nodes, 1 to 40.
+seed_k = 8
+# First stage: answers that join the walk's results ahead of or among them. The
+# first stage is the cards of the exact operators the call selects (the maps
+# exact.closure and exact.pickaxe, named in the maps list and needing the tree;
+# each abstains with a note when nothing the question names resolves), in the
+# order of the maps list, then, with answer_seeds, the start nodes. Cards say
+# where they came from (origin: exact, seed or walk) and a node is listed once,
+# at its first place. "append" (default): the first stage (at most first_k),
+# then the walk's results. "interleave": first-stage and walk results
+# alternately, first stage first, cut to top_k in total. "off": the results are
+# the walk's alone and the response is as without these keys. first_k caps the
+# first stage, 0 to 200 (0: no cap). A continuation (handle) returns the walk
+# alone. The defaults here (append, answer_seeds, exact_seeds) are the measured
+# ones: the gains came from the first stage (N0, N0b; 2026-10-15,
+# docs/spike/multimap/v2/engine-results.md); see [traverse.policies] below for
+# the per-question-type walk.
+first_stage = "append"
+first_k = 10
+answer_seeds = true
+# Add the exact cards whose node the SCIP graph holds to the walk's start nodes,
+# after the others (independent of first_stage). Measured as neutral (no score
+# change in N0; two more expansions per impact item); on because the cards are
+# exact answers.
+exact_seeds = true
+# Per steering policy (the question type: steer.policy, `lci traverse --policy`),
+# settings of the first stage and the walk. The built-in values below are the
+# measured defaults (N0, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md); a key given in a
+# [traverse.policies.<name>] table wins over the built-in value of that policy,
+# which wins over the [traverse] key of the same name. A call with no named
+# policy, or with `explore`, uses the [traverse] keys alone: first stage, then
+# the walk. The keys:
+#   walk = false            the first stage alone answers; the walk takes one pop,
+#                           its cards are not returned, and the handle lets a
+#                           caller continue it. Needs first_stage other than "off".
+#   walk_min_answers = N    the walk runs only when the call asks for N answers or
+#                           more (first_k + top_k); below that the first stage alone
+#                           answers. 0: no minimum.
+#   extra_maps = [...]      maps added to the default maps when the call names none
+#                           (they read the tree).
+#   first_k, seed_k         the policy's own first_k and seed_k.
+# Built-in values:
+#   impact   walk = false, extra_maps = ["exact.closure"], first_k = 20, seed_k = 20
+#            (the first stage alone at 20 cards beat the walk on second-ring recall,
+#            -.043 with the walk; N0b)
+#   history  walk = false, extra_maps = ["git.history", "exact.pickaxe"],
+#            first_k = 20, seed_k = 20 (the walk adds nothing the data can separate
+#            at 153 pops per question; N0b)
+#   flow     walk = true (the walk adds path recall at 10 and at 20 answers)
+#   where-to walk_min_answers = 20 (the walk wins at 20 answers, +.069 set F1, and
+#            not significantly at 10)
+#   explore  nothing
+# Over MCP the default top_k is 8, so first_k 10 + top_k 8 = 18 answers. That point
+# was not measured; the threshold sits at the measured point (20), so where-to
+# does not walk over MCP with the default top_k and gets its walk from top_k 10.
+# Edges of one expansion the walk follows once it offers more than 8: the best
+# `beam` by the hop score are adopted, the rest are dropped. A search heuristic,
+# not a limit of the maps (config.key offers up to 256 edges per node,
+# scip.impact 64). 16 is what the walk always used; 1 to 256.
+beam = 16
+# A per-policy table must come after every [traverse] key above; a key placed
+# below its header would belong to the policy, not to [traverse]. Example:
+# [traverse.policies.impact]
+# walk = true
+
+# Named server-side recipes (config_readers, impact_rings, flow_path, flow_from,
+# config_neighbours): fixed chains of the operators above, each answering with
+# its steps, a witness per result and a stop reason. Off by default; while
+# enabled is false the tool list, the schemas and the REST routes are exactly
+# those of a server without them. Needs [traverse] scip_index. The same recipes
+# run as `lci recipe`, which ignores enabled. flow_judge asks a judge to drop
+# walk results of flow_from; no judge is wired in this build, so it only adds a
+# note.
+[recipes]
+enabled = false
+# measured off (N2, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md)
+flow_judge = false
+
+# lci_compose: up to 6 operator steps in one call, with $sN.field references to
+# earlier steps and no model between them. Off by default; same rules as
+# [recipes]. Needs [traverse] scip_index.
+[compose]
+enabled = false
+
+# [system_one] is the slot for a small model planned to steer a traversal (the
+# configuration and provider client exist; no traversal rung calls it yet). Off
+# when the section is absent. Uncomment the whole block, header included; it is
+# last in this file because a table header ends the table before it.
+# [system_one]
+# provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)
+# url = "http://127.0.0.1:8080/v1"   # base URL; /chat/completions or /completions is appended
+# model = "your-model-name"
+# api = "chat"                 # "chat" or "completion"
+# timeout_ms = 30000           # 100 to 600000; one attempt, no retry
+# api_key_env = "SYSTEM_ONE_API_KEY"
+# allow_remote = false         # a non-loopback host in url is refused unless true
+# replay_file = "pairs.json"   # provider = "mock" only
+# [system_one.capabilities]
+# constraint = "json_schema"   # "gbnf" (llama.cpp grammar), "json_schema" or "none"
+# logprobs = false             # the server returns top log-probabilities
+# batch = false

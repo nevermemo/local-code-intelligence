@@ -55,6 +55,36 @@ pub fn lci_binary() -> PathBuf {
     ))
 }
 
+/// Removes every `LCI_*` variable of this process from the environment
+/// `command` will start with. The acceptance harness always hands the service
+/// its own `--config` and port, so a developer's exported `LCI_DATA_DIR`,
+/// `LCI_EMBEDDING_URL`, `LCI_LOCAL_CONFIG` or `LCI_PORT` (any variable the
+/// service reads now or later) must not redirect a live run to their data, a
+/// different model service or a different overlay. Names are compared
+/// case-insensitively because Windows treats them so. The harness's own
+/// `LCI_ACCEPTANCE_*` variables are read by this process, never by the
+/// service, so they are stripped along with the rest.
+pub fn strip_lci_env(command: &mut Command) -> &mut Command {
+    strip_lci_env_named(command, std::env::vars_os().map(|(name, _)| name))
+}
+
+/// [`strip_lci_env`] over an explicit list of variable names.
+fn strip_lci_env_named(
+    command: &mut Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> &mut Command {
+    for name in names {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("LCI_")
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 pub fn test_results_dir() -> Result<PathBuf> {
     let dir = workspace_root().join("test-results");
     std::fs::create_dir_all(&dir)?;
@@ -218,6 +248,20 @@ impl Fixture {
 /// actually failing to bind, producing confusing false failures.
 pub const PORT: u16 = 8769;
 
+/// Refuses a port something already listens on. The probe binds instead of
+/// connecting: on Windows a connection to a closed loopback port is retried for
+/// about a second before it fails, so a short connect timeout reports "timed
+/// out" for a free port.
+fn ensure_port_free(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("acceptance server port {port} is already in use")
+        }
+        Err(error) => Err(error).with_context(|| format!("check acceptance server port {port}")),
+    }
+}
+
 /// A `local-code-intelligence serve` process this acceptance run owns, plus
 /// cross-platform helpers to inspect and kill its child language-server
 /// processes.
@@ -228,10 +272,13 @@ pub struct ManagedServer {
 
 impl ManagedServer {
     pub async fn spawn(config_path: &Path, working_dir: &Path, log_dir: &Path) -> Result<Self> {
+        ensure_port_free(PORT)?;
         std::fs::create_dir_all(log_dir)?;
         let stdout = std::fs::File::create(log_dir.join("serve.stdout.log"))?;
         let stderr = std::fs::File::create(log_dir.join("serve.stderr.log"))?;
-        let child = Command::new(lci_binary())
+        let mut command = Command::new(lci_binary());
+        strip_lci_env(&mut command);
+        let child = command
             .arg("--config")
             .arg(config_path)
             .arg("serve")
@@ -348,11 +395,24 @@ impl ManagedServer {
     }
 }
 
-/// Polls `GET url` until it returns a 2xx status or `attempts` is exhausted.
-pub async fn wait_http_ok(url: &str, attempts: u32, delay: Duration) -> bool {
+/// Polls `GET url` until it returns a 2xx status, the owned child exits, or
+/// `attempts` is exhausted.
+pub async fn wait_http_ok(
+    url: &str,
+    attempts: u32,
+    delay: Duration,
+    mut exited: impl FnMut() -> bool,
+) -> bool {
     let client = reqwest::Client::new();
     for _ in 0..attempts {
-        if let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await
+        if exited() {
+            return false;
+        }
+        let response = client.get(url).timeout(Duration::from_secs(2)).send().await;
+        if exited() {
+            return false;
+        }
+        if let Ok(response) = response
             && response.status().is_success()
         {
             return true;
@@ -563,7 +623,9 @@ pub async fn run_npm(dir: &Path, args: &[&str]) -> Result<()> {
 /// Runs the compiled `local-code-intelligence` CLI (not the MCP server) with
 /// the given config and arguments.
 pub async fn run_lci(config_path: &Path, args: &[&str]) -> Result<LciOutput> {
-    let output = Command::new(lci_binary())
+    let mut command = Command::new(lci_binary());
+    strip_lci_env(&mut command);
+    let output = command
         .arg("--config")
         .arg(config_path)
         .args(args)
@@ -575,4 +637,164 @@ pub async fn run_lci(config_path: &Path, args: &[&str]) -> Result<LciOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn free_port_check_rejects_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = ensure_port_free(port).expect_err("an occupied loopback port must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!("acceptance server port {port} is already in use")
+        );
+    }
+
+    #[test]
+    fn free_port_check_accepts_unoccupied_port() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            // Another test may claim the released port, so retry with a fresh one.
+            match ensure_port_free(port) {
+                Ok(()) => return,
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no unoccupied loopback port passed the check within 500 ms: {error}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_stops_without_polling_when_child_exited() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = requests.clone();
+        let fake_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_http_ok(
+                &format!("http://{address}/health"),
+                30,
+                Duration::from_secs(1),
+                || true,
+            ),
+        )
+        .await;
+        fake_server.abort();
+        assert!(
+            !result.expect("an exited child must end the wait immediately"),
+            "readiness must fail when the owned child has exited"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_accepts_success_only_while_child_is_alive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for exits_during_request in [false, true] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let fake_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            let mut checks = 0;
+            let ready = wait_http_ok(
+                &format!("http://{address}/health"),
+                1,
+                Duration::ZERO,
+                || {
+                    checks += 1;
+                    exits_during_request && checks > 1
+                },
+            )
+            .await;
+            fake_server.await.unwrap();
+            assert_eq!(ready, !exits_during_request);
+        }
+    }
+
+    fn removed(command: &Command) -> Vec<String> {
+        let mut removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                assert!(value.is_none(), "{name:?} is set, not removed");
+                name.to_string_lossy().into_owned()
+            })
+            .collect();
+        removed.sort();
+        removed
+    }
+
+    #[test]
+    fn the_service_never_inherits_an_lci_variable() {
+        let mut command = Command::new("not-run");
+        strip_lci_env_named(
+            &mut command,
+            [
+                "LCI_DATA_DIR",
+                "lci_local_config",
+                "LCI_EMBEDDING_URL",
+                "LCI_ACCEPTANCE_JDTLS",
+                "LCI_SOMETHING_NEW",
+                "PATH",
+                "LCIX",
+                "HOME",
+            ]
+            .map(OsString::from),
+        );
+        assert_eq!(
+            removed(&command),
+            [
+                "LCI_ACCEPTANCE_JDTLS",
+                "LCI_DATA_DIR",
+                "LCI_EMBEDDING_URL",
+                "LCI_SOMETHING_NEW",
+                "lci_local_config"
+            ]
+        );
+
+        // Applied to the real environment it covers whatever the shell exports.
+        let mut command = Command::new("not-run");
+        strip_lci_env(&mut command);
+        let removed = removed(&command);
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            if name.to_ascii_uppercase().starts_with("LCI_") {
+                assert!(removed.contains(&name), "{name} would reach the service");
+            }
+        }
+    }
 }

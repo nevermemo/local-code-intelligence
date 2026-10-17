@@ -9,6 +9,9 @@ use tree_sitter::{Node, Parser};
 
 const TARGET_BYTES: usize = 6000;
 const MAX_DECLARATION_BYTES: usize = 24000;
+/// Recursion frames of `ranges`, not syntactic levels: a nested Rust `mod`
+/// costs two (`mod_item`, `declaration_list`), so about 64 nested modules.
+const MAX_RANGE_DEPTH: usize = 128;
 pub const DOCUMENT_FORMAT_VERSION: &str = "rust-chunks-v1";
 
 #[derive(Debug)]
@@ -19,6 +22,24 @@ pub struct Scan {
     pub parsed_files: usize,
     pub unchanged_files: usize,
     pub removed_files: usize,
+    /// Repository-relative paths of files that were not valid UTF-8 and were
+    /// indexed from a lossy decoding (invalid bytes become U+FFFD).
+    pub lossy_files: Vec<String>,
+    /// Files with a registered source extension that were left out because
+    /// their content is a known non-source format (for example a Qt Linguist
+    /// catalog saved as `.ts`). They are neither parsed, chunked, hashed nor
+    /// recorded in the manifest, so a file that stops being source disappears
+    /// from the next snapshot like a deleted one, and the staleness
+    /// fingerprint ignores them.
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+/// A file with a source extension that is not indexed as source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    /// Repository-relative path with `/` separators.
+    pub relative_path: String,
+    pub reason: language::NonSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +54,19 @@ pub struct Chunk {
 
 // Recurse through oversized declarations to syntax boundaries (including match arms).
 // A large leaf remains whole: no arbitrary text windows or broken UTF-8.
-fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(usize, usize)>) {
+fn ranges(
+    adapter: &language::LanguageAdapter,
+    node: Node<'_>,
+    out: &mut Vec<(usize, usize)>,
+    depth: usize,
+) {
+    // Keep pathological nesting whole rather than exhausting a blocking worker's
+    // stack; such a range can exceed MAX_DECLARATION_BYTES, which the embedder
+    // already handles by halving rejected inputs.
+    if depth >= MAX_RANGE_DEPTH {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
     let container = adapter.is_container(node.kind());
     let boundary = adapter.is_boundary(node.kind());
     let declaration = adapter.is_declaration(node.kind());
@@ -55,11 +88,27 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
         out.push((node.start_byte(), node.end_byte()));
         return;
     }
+    // Prefix children (comments, attributes) attach to the declaration after
+    // them. A run after the last declaration has none to attach to; when it is
+    // longer than the target its children are packed like any other child
+    // instead of staying whole in the chunk before it.
+    let trailing_prefix_start = children
+        .iter()
+        .rposition(|child| !adapter.is_prefix(child.kind()))
+        .map_or(0, |index| index + 1);
+    let split_trailing_prefix = children
+        .get(trailing_prefix_start)
+        .zip(children.last())
+        .is_some_and(|(first, last)| last.end_byte() - first.start_byte() > TARGET_BYTES);
     let mut start = node.start_byte();
     let mut end = start;
     let mut pending_prefix = None;
-    for child in children {
-        if container && adapter.is_prefix(child.kind()) {
+    let mut last_split_range = None;
+    for (index, child) in children.into_iter().enumerate() {
+        if container
+            && adapter.is_prefix(child.kind())
+            && (!split_trailing_prefix || index < trailing_prefix_start)
+        {
             pending_prefix.get_or_insert(child.start_byte());
             continue;
         }
@@ -78,19 +127,30 @@ fn ranges(adapter: &language::LanguageAdapter, node: Node<'_>, out: &mut Vec<(us
                 out.push((start, child_start));
             }
             let first = out.len();
-            ranges(adapter, child, out);
+            ranges(adapter, child, out, depth + 1);
             if let Some(range) = out.get_mut(first) {
                 range.0 = if attach_header { start } else { child_start };
             }
+            last_split_range = out.len().checked_sub(1).filter(|&index| index >= first);
             start = child.end_byte();
             end = start;
         } else if container || child.end_byte() - start > TARGET_BYTES {
+            // The chunk reaches the next child's start, so the bytes between two
+            // children (an operator, a comma) stay in a chunk: after a pending
+            // run, in it; right after a split child, in that child's last chunk.
             if end > start {
-                out.push((start, end));
+                out.push((start, child_start));
+            } else if let Some(index) = last_split_range.take()
+                && let Some((_, previous_end)) = out.get_mut(index)
+                && *previous_end == start
+            {
+                *previous_end = child_start;
             }
+            last_split_range = None;
             start = child_start;
             end = child.end_byte();
         } else {
+            last_split_range = None;
             end = child.end_byte();
         }
     }
@@ -116,15 +176,56 @@ fn chunks_with_adapter(
     source: &str,
     adapter: &language::LanguageAdapter,
 ) -> Result<Vec<Chunk>> {
+    Ok(extract(path, source, adapter, false)?.chunks)
+}
+
+/// What one parse of a file yields (the extraction hook of the multimap
+/// spike, slice S3): the file's chunks, exactly as [`chunks_for_path`] gives
+/// them, and its declarations where the language has an extractor (Rust
+/// only so far; `None` for every other language).
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub chunks: Vec<Chunk>,
+    pub declarations: Option<Vec<crate::node::Declaration>>,
+}
+
+/// [`chunks_for_path`] plus the declarations, from one parse.
+pub fn extract_for_path(path: &str, source: &str) -> Result<Extraction> {
+    let Some(adapter) = language::for_path(Path::new(path)) else {
+        bail!("unsupported source extension: {path}");
+    };
+    extract_with_adapter(path, source, adapter)
+}
+
+/// [`chunks_with_adapter`] plus the declarations, from one parse (the
+/// extraction hook).
+pub fn extract_with_adapter(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+) -> Result<Extraction> {
+    extract(path, source, adapter, true)
+}
+
+/// The one chunker: parses `source`, cuts the tree into chunks, and walks
+/// the declarations only when `with_declarations` asks for them (and the
+/// language has an extractor), so a caller that wants chunks alone pays
+/// for no declaration walk.
+fn extract(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+    with_declarations: bool,
+) -> Result<Extraction> {
     let mut parser = Parser::new();
     parser.set_language(&adapter.grammar())?;
     let tree = parser
         .parse(source, None)
         .context("Tree-sitter parse cancelled")?;
     let mut spans = Vec::new();
-    ranges(adapter, tree.root_node(), &mut spans);
+    ranges(adapter, tree.root_node(), &mut spans, 0);
     let mut chunks = Vec::new();
-    for (start, end) in spans {
+    for &(start, end) in &spans {
         let raw = &source[start..end];
         let code = raw.trim();
         if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
@@ -141,7 +242,14 @@ fn chunks_with_adapter(
             content_hash: hash(code),
         });
     }
-    Ok(chunks)
+    #[cfg(test)]
+    tests::assert_uncovered_bytes_are_expected(adapter, source, &spans);
+    let declarations = (with_declarations && adapter.identifier() == "rust")
+        .then(|| crate::node::rust_declarations_in(tree.root_node(), source));
+    Ok(Extraction {
+        chunks,
+        declarations,
+    })
 }
 
 struct SourceFile {
@@ -149,10 +257,42 @@ struct SourceFile {
     source: String,
     content_hash: String,
     adapter: &'static language::LanguageAdapter,
+    lossy: bool,
 }
 
-fn sources(root: &Path) -> Result<Vec<SourceFile>> {
+/// Decodes source bytes as UTF-8, falling back to a lossy decoding (invalid
+/// sequences become U+FFFD) rather than failing. Legacy-encoded files --
+/// e.g. Windows-1252 C sources -- are common in real repositories, and one
+/// of them must not make the whole workspace unindexable or unsearchable.
+/// Line structure is preserved, so line ranges stay valid. One leading byte
+/// order mark (U+FEFF) is dropped: it is not text, `trim()` keeps it, and it
+/// would otherwise sit in the first chunk's code and in the file's hash.
+pub fn decode_source(bytes: Vec<u8>) -> (String, bool) {
+    let (mut source, lossy) = match String::from_utf8(bytes) {
+        Ok(source) => (source, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+    };
+    if source.starts_with('\u{feff}') {
+        source.drain(..'\u{feff}'.len_utf8());
+    }
+    (source, lossy)
+}
+
+struct Sources {
+    files: Vec<SourceFile>,
+    skipped: Vec<SkippedFile>,
+}
+
+fn sources(root: &Path) -> Result<Sources> {
+    sources_with_read(root, |path| std::fs::read(path))
+}
+
+fn sources_with_read(
+    root: &Path,
+    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Sources> {
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(false)
@@ -168,24 +308,47 @@ fn sources(root: &Path) -> Result<Vec<SourceFile>> {
         let Some(adapter) = language::for_path(entry.path()) else {
             continue;
         };
-        let relative = entry
-            .path()
-            .strip_prefix(root)?
-            .to_str()
-            .context("non-UTF-8 file path")?
-            .replace('\\', "/");
-        let source =
-            std::fs::read_to_string(entry.path()).with_context(|| format!("read {relative}"))?;
+        let path = entry.path().strip_prefix(root)?;
+        let relative = path
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>();
+        let Some(relative) = relative else {
+            tracing::warn!(path = ?path, "skipping source file: non-UTF-8 file path");
+            continue;
+        };
+        let relative = relative.join("/");
+        let bytes = match read(entry.path()) {
+            Ok(bytes) => bytes,
+            // Removed between the walk and the read (a branch switch during a
+            // run): not an error. Any other failure aborts the pass, so the
+            // previous index is kept rather than silently losing the file.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %relative, %error, "skipping source file removed during the scan");
+                continue;
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {relative}")),
+        };
+        if let Some(reason) = adapter.non_source(&bytes) {
+            skipped.push(SkippedFile {
+                relative_path: relative,
+                reason,
+            });
+            continue;
+        }
+        let (source, lossy) = decode_source(bytes);
         let source_hash = hash(&source);
         files.push(SourceFile {
             relative_path: relative,
             source,
             content_hash: source_hash,
             adapter,
+            lossy,
         });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(files)
+    skipped.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(Sources { files, skipped })
 }
 
 fn fingerprint_material(file: &SourceFile) -> String {
@@ -200,6 +363,7 @@ fn fingerprint_material(file: &SourceFile) -> String {
 
 pub fn fingerprint(root: &Path) -> Result<String> {
     let material = sources(root)?
+        .files
         .iter()
         .map(fingerprint_material)
         .collect::<String>();
@@ -214,7 +378,10 @@ pub fn scan_incremental(
     let mut files = HashMap::new();
     let mut parsed_files = 0;
     let mut unchanged_files = 0;
-    let source_files = sources(root)?;
+    let Sources {
+        files: source_files,
+        skipped: skipped_files,
+    } = sources(root)?;
     let present: HashSet<_> = source_files
         .iter()
         .map(|file| file.relative_path.as_str())
@@ -227,6 +394,11 @@ pub fn scan_incremental(
         .iter()
         .map(fingerprint_material)
         .collect::<String>();
+    let lossy_files = source_files
+        .iter()
+        .filter(|file| file.lossy)
+        .map(|file| file.relative_path.clone())
+        .collect();
     for file in source_files {
         let file_chunks = match previous.get(&file.relative_path) {
             Some(cached)
@@ -263,6 +435,8 @@ pub fn scan_incremental(
         parsed_files,
         unchanged_files,
         removed_files,
+        lossy_files,
+        skipped_files,
     })
 }
 
@@ -271,19 +445,275 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
 }
 
 #[cfg(test)]
+mod extraction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn chunks_have_exact_source_lines_and_stable_hashes() {
-        let source =
-            "// café\nfn first() { println!(\"hello\"); }\n\nimpl A {\nfn second() {}\n}\n";
-        let chunks = rust_chunks("lib.rs", source).unwrap();
-        assert!(chunks.iter().any(|c| c.code.contains("fn second")));
-        for c in chunks {
-            assert!(source.contains(&c.code));
-            assert_eq!(c.content_hash, hash(&c.code));
-            assert!(c.end_line >= c.start_line);
+
+    /// Test-only check that runs on every chunking call of this crate's unit
+    /// tests: a byte that is in no chunk must be whitespace, a separator the
+    /// chunker drops on purpose (`{`, `}`, `;`), a leading byte order mark, or a
+    /// comment that no chunk carries as a prefix.
+    pub(super) fn assert_uncovered_bytes_are_expected(
+        adapter: &language::LanguageAdapter,
+        source: &str,
+        spans: &[(usize, usize)],
+    ) {
+        let mut covered = vec![false; source.len()];
+        for &(start, end) in spans {
+            let raw = &source[start..end];
+            let code = raw.trim();
+            if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                continue;
+            }
+            let begin = start + raw.len() - raw.trim_start().len();
+            covered[begin..begin + code.len()].fill(true);
         }
+
+        let mut parser = Parser::new();
+        parser.set_language(&adapter.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        let mut comments = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "line_comment" | "block_comment" | "comment") {
+                comments.push((node.kind(), node.start_byte(), node.end_byte()));
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        for (kind, comment_start, comment_end) in comments {
+            let attached = spans.iter().any(|&(start, end)| {
+                let raw = &source[start..end];
+                let code = raw.trim();
+                if code.is_empty() || code.chars().all(|c| c.is_whitespace() || "{};".contains(c)) {
+                    return false;
+                }
+                let begin = start + raw.len() - raw.trim_start().len();
+                adapter.is_prefix(kind)
+                    && begin >= comment_end
+                    && source[comment_end..begin].chars().all(char::is_whitespace)
+            });
+            if attached {
+                covered[comment_start..comment_end].fill(true);
+            }
+        }
+
+        for (offset, character) in source.char_indices() {
+            let end = offset + character.len_utf8();
+            if covered[offset..end].iter().all(|&byte| byte)
+                || character.is_whitespace()
+                || "{};".contains(character)
+                || (offset == 0 && character == '\u{feff}')
+            {
+                continue;
+            }
+            panic!(
+                "unexpected uncovered byte at {offset} ({character:?}) in {} source bytes",
+                source.len()
+            );
+        }
+    }
+
+    fn compact(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    fn assert_chunks_cover(chunks: &[Chunk], expected: &str) {
+        let packed: String = chunks.iter().map(|chunk| compact(&chunk.code)).collect();
+        let expected = compact(expected);
+        assert!(
+            packed.contains(&expected),
+            "chunks do not cover {expected:?}:\n{chunks:#?}"
+        );
+    }
+
+    fn assert_non_whitespace_coverage(source: &str, expected: &str) {
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        assert_chunks_cover(&chunks, expected);
+    }
+
+    #[test]
+    fn ordinary_nested_modules_keep_exact_chunks() {
+        let depth = 32;
+        let source = format!(
+            "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+            "mod m {\n".repeat(depth),
+            "}\n".repeat(depth)
+        );
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        let mut expected: Vec<_> = (1..=depth as u32)
+            .map(|line| (line, line, "mod m"))
+            .collect();
+        expected.push((32, 34, "{\nfn leaf() {}\n}"));
+        expected.push((66, 66, "fn sibling() {}"));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.as_str()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for chunk in chunks {
+            assert_eq!(chunk.relative_file_path, "lib.rs");
+            assert_eq!(chunk.language, "rust");
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+        }
+    }
+
+    #[test]
+    fn deeply_nested_modules_on_default_blocking_stack() {
+        const CHILD_DEPTH: &str = "LCI_TEST_NESTING_DEPTH";
+        if let Ok(depth) = std::env::var(CHILD_DEPTH) {
+            let depth: usize = depth.parse().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let source = format!(
+                        "{}fn leaf() {{}}\n{}fn sibling() {{}}\n",
+                        "mod m {\n".repeat(depth),
+                        "}\n".repeat(depth)
+                    );
+                    let chunks = rust_chunks("deep.rs", &source).unwrap();
+                    assert_chunks_cover(&chunks, "fn leaf() {}");
+                    assert_chunks_cover(&chunks, "fn sibling() {}");
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.code.matches("mod m").count())
+                            .sum::<usize>(),
+                        depth
+                    );
+                    for chunk in chunks {
+                        assert_eq!(chunk.content_hash, hash(&chunk.code));
+                        assert!(source.contains(&chunk.code));
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            return;
+        }
+
+        // Isolate stack overflow in a child so the regression cannot abort
+        // the rest of the test suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "chunk::tests::deeply_nested_modules_on_default_blocking_stack",
+                "--nocapture",
+            ])
+            .env(CHILD_DEPTH, "32768")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "default-stack chunking failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn leading_bom_does_not_change_rust_typescript_or_csharp_chunks() {
+        let fixtures = [
+            ("lib.rs", "fn rust_value() { let _ = 1; }\n"),
+            ("types.ts", "export const typescriptValue = 1;\n"),
+            ("Service.cs", "public sealed class CsharpService {}\n"),
+        ];
+        let without_bom = tempfile::tempdir().unwrap();
+        let with_bom = tempfile::tempdir().unwrap();
+        for (path, source) in fixtures {
+            std::fs::write(without_bom.path().join(path), source).unwrap();
+            std::fs::write(with_bom.path().join(path), format!("\u{feff}{source}")).unwrap();
+        }
+
+        let without_bom = scan_incremental(without_bom.path(), &HashMap::new()).unwrap();
+        let with_bom = scan_incremental(with_bom.path(), &HashMap::new()).unwrap();
+        let details = |chunks: &[Chunk]| {
+            chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.relative_file_path.clone(),
+                        chunk.language.clone(),
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.code.clone(),
+                        chunk.content_hash.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            details(&with_bom.chunks),
+            details(&without_bom.chunks),
+            "chunks with BOM: {:#?}\nchunks without BOM: {:#?}",
+            with_bom.chunks,
+            without_bom.chunks
+        );
+        assert!(with_bom.chunks.iter().all(|chunk| chunk.code != "\u{feff}"));
+        let differing_source_hashes: Vec<_> = fixtures
+            .iter()
+            .filter_map(|(path, _)| {
+                let with_bom_hash = &with_bom.files[*path].content_hash;
+                let without_bom_hash = &without_bom.files[*path].content_hash;
+                (with_bom_hash != without_bom_hash).then_some((
+                    *path,
+                    with_bom_hash,
+                    without_bom_hash,
+                ))
+            })
+            .collect();
+        assert!(
+            differing_source_hashes.is_empty(),
+            "decoded source hashes differ by language: {differing_source_hashes:#?}"
+        );
+    }
+
+    #[test]
+    fn decode_source_drops_one_leading_byte_order_mark_and_keeps_the_lossy_flag() {
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBFfn a() {}\n".to_vec()),
+            ("fn a() {}\n".to_owned(), false)
+        );
+        assert_eq!(
+            decode_source(b"fn a() {}\n".to_vec()),
+            ("fn a() {}\n".to_owned(), false)
+        );
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBF".to_vec()),
+            (String::new(), false)
+        );
+        // Only the first mark is the byte order mark; a second one is content.
+        assert_eq!(
+            decode_source("\u{feff}\u{feff}x".as_bytes().to_vec()),
+            ("\u{feff}x".to_owned(), false)
+        );
+        // A mark in the middle is content too.
+        assert_eq!(
+            decode_source("a\u{feff}b".as_bytes().to_vec()),
+            ("a\u{feff}b".to_owned(), false)
+        );
+        // Invalid UTF-8 after the mark: the file is lossy, and the mark still goes.
+        assert_eq!(
+            decode_source(b"\xEF\xBB\xBFlet a = \xFF;\n".to_vec()),
+            ("let a = \u{fffd};\n".to_owned(), true)
+        );
     }
 
     #[test]
@@ -304,6 +734,10 @@ mod tests {
                 (4, 6, "{\nfn second() {}\n}"),
             ]
         );
+        for chunk in chunks {
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+        }
     }
 
     #[test]
@@ -363,7 +797,7 @@ startTelemetry();
 
     #[test]
     fn chunks_class_methods_and_interface_signatures_at_member_boundaries() {
-        let source = r#"/** Coordinates telemetry. */
+        let source = r"/** Coordinates telemetry. */
 export class TelemetryCoordinator {
   // Starts collection.
   start(): void {}
@@ -376,7 +810,7 @@ export interface TelemetryLifecycle {
   start(): void;
   stop(): void;
 }
-"#;
+";
         let chunks = chunks_for_path("lifecycle.ts", source).unwrap();
         let start_method = chunks
             .iter()
@@ -483,6 +917,102 @@ export interface TelemetryLifecycle {
         assert_eq!(chunks[0].relative_file_path, "lib.rs");
     }
 
+    // Linux only: APFS refuses to create a file whose name is not valid UTF-8.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scan_skips_non_utf8_paths_and_indexes_other_files() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let invalid = std::ffi::OsStr::from_bytes(b"invalid-\xff.rs");
+        std::fs::write(temp.path().join(invalid), "fn invisible() {}\n").unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+
+        let result = scan_incremental(temp.path(), &HashMap::new());
+        assert!(
+            result.is_ok(),
+            "one non-UTF-8 path failed the scan: {result:?}"
+        );
+        let scan = result.unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.chunks.len(), 1);
+        assert_eq!(scan.chunks[0].relative_file_path, "lib.rs");
+        assert!(scan.chunks[0].code.contains("visible"));
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
+        let repeated = scan_incremental(temp.path(), &scan.files).unwrap();
+        assert_eq!(repeated.unchanged_files, 1);
+        assert_eq!(repeated.parsed_files, 0);
+    }
+
+    #[test]
+    fn scan_skips_a_file_removed_between_discovery_and_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("vanishing.rs");
+        std::fs::write(&victim, "fn vanishing() {}\n").unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+        let previous = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let mut removed = false;
+
+        let result = sources_with_read(temp.path(), |path| {
+            if path == victim {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::read(path)
+        });
+        assert!(removed, "the walker must discover the file before removal");
+        assert!(result.is_ok(), "one disappearing file failed the scan");
+        let sources = result.unwrap();
+        assert_eq!(sources.files.len(), 1);
+        assert_eq!(sources.files[0].relative_path, "lib.rs");
+        assert!(sources.files[0].source.contains("visible"));
+        let scan = scan_incremental(temp.path(), &previous.files).unwrap();
+        assert_eq!(scan.removed_files, 1);
+        assert_eq!(scan.unchanged_files, 1);
+        assert_eq!(scan.chunks.len(), 1);
+        assert!(scan.chunks[0].code.contains("visible"));
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
+    }
+
+    #[test]
+    fn scan_fails_on_a_read_error_other_than_a_removed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+
+        let result = sources_with_read(temp.path(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+
+        let Err(error) = result else {
+            panic!("an unreadable file must abort the scan, not be skipped");
+        };
+        assert!(format!("{error:#}").contains("read lib.rs"), "{error:#}");
+    }
+
+    #[test]
+    fn non_utf8_files_are_indexed_lossily_instead_of_failing_the_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        // Windows-1252 "café" (0xE9 is not valid UTF-8 on its own).
+        std::fs::write(
+            temp.path().join("legacy.c"),
+            b"/* caf\xe9 */\nint legacy_value(void) { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert_eq!(scan.lossy_files, vec!["legacy.c".to_owned()]);
+        let legacy = scan
+            .chunks
+            .iter()
+            .find(|chunk| chunk.relative_file_path == "legacy.c")
+            .expect("the legacy file is still indexed");
+        assert!(legacy.code.contains("caf\u{FFFD}"), "{}", legacy.code);
+        assert!(legacy.code.contains("legacy_value"));
+        // The staleness fingerprint no longer fails on the same file.
+        assert_eq!(fingerprint(temp.path()).unwrap(), scan.fingerprint);
+    }
+
     #[test]
     fn respects_project_local_lciignore() {
         let temp = tempfile::tempdir().unwrap();
@@ -537,6 +1067,282 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
+    fn scans_exactly_the_registered_c_and_cpp_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("include/vendor")).unwrap();
+        std::fs::create_dir_all(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::write(temp.path().join("include/.gitignore"), "vendor/\n").unwrap();
+        for (name, source) in [
+            ("src/a.c", "int a(void) { return 1; }\n"),
+            ("include/a.h", "int a(void);\n"),
+            ("include/.hidden.h", "int hidden(void);\n"),
+            ("src/b.cpp", "int b() { return 1; }\n"),
+            ("src/b.cc", "int bb() { return 1; }\n"),
+            ("src/b.cxx", "int bx() { return 1; }\n"),
+            ("include/b.hpp", "int b();\n"),
+            ("include/b.hh", "int bb();\n"),
+            ("include/b.hxx", "int bx();\n"),
+            // Unsupported or case-variant lookalikes are ignored.
+            ("src/upper.C", "int upper() { return 1; }\n"),
+            ("include/upper.H", "int upper();\n"),
+            ("src/upper.CC", "int upper() { return 1; }\n"),
+            ("include/upper.HPP", "int upper();\n"),
+            ("src/plus.c++", "int plus() { return 1; }\n"),
+            ("include/plus.h++", "int plus();\n"),
+            ("include/a.h.in", "int template_only();\n"),
+            ("include/a.inl", "int inl();\n"),
+            ("src/a.cu", "int cuda() { return 1; }\n"),
+            // Ignore files apply to the new extensions like any other.
+            ("out/gen.h", "int generated(void);\n"),
+            ("include/vendor/third.hh", "int third();\n"),
+        ] {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let chunks = scan(temp.path()).unwrap();
+        let mut languages: HashMap<&str, &str> = HashMap::new();
+        for chunk in &chunks {
+            languages.insert(chunk.relative_file_path.as_str(), chunk.language.as_str());
+        }
+        assert_eq!(
+            languages,
+            HashMap::from([
+                ("src/a.c", "c"),
+                ("include/a.h", "c"),
+                ("include/.hidden.h", "c"),
+                ("src/b.cpp", "cpp"),
+                ("src/b.cc", "cpp"),
+                ("src/b.cxx", "cpp"),
+                ("include/b.hpp", "cpp"),
+                ("include/b.hh", "cpp"),
+                ("include/b.hxx", "cpp"),
+            ])
+        );
+    }
+
+    const QT_LINGUIST_CATALOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n<context>\n    <name>SendCoinsDialog</name>\n    <message>\n        <source>Send coins</source>\n        <translation>Muenzen senden</translation>\n    </message>\n</context>\n</TS>\n";
+
+    #[test]
+    fn qt_linguist_files_are_skipped_while_typescript_is_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("locale")).unwrap();
+        std::fs::write(
+            temp.path().join("send.ts"),
+            "export function sendCoins() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("locale/app_de.ts"), QT_LINGUIST_CATALOG).unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert_eq!(
+            scan.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["send.ts"]
+        );
+        assert_eq!(scan.files["send.ts"].language, "typescript");
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| chunk.language == "typescript"
+                    && chunk.relative_file_path == "send.ts"
+                    && !chunk.code.contains("Muenzen"))
+        );
+        assert_eq!(scan.parsed_files, 1);
+        assert_eq!(
+            scan.skipped_files,
+            vec![SkippedFile {
+                relative_path: "locale/app_de.ts".into(),
+                reason: language::NonSource::QtLinguist,
+            }]
+        );
+        assert!(scan.lossy_files.is_empty());
+    }
+
+    #[test]
+    fn skipped_files_do_not_change_the_staleness_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("send.ts"), "export const a = 1;\n").unwrap();
+        let without = fingerprint(temp.path()).unwrap();
+        std::fs::write(temp.path().join("app_de.ts"), QT_LINGUIST_CATALOG).unwrap();
+        assert_eq!(fingerprint(temp.path()).unwrap(), without);
+        std::fs::write(
+            temp.path().join("app_de.ts"),
+            QT_LINGUIST_CATALOG.replace("Muenzen", "Coins"),
+        )
+        .unwrap();
+        assert_eq!(fingerprint(temp.path()).unwrap(), without);
+        // Once the file turns out to be TypeScript the fingerprint moves.
+        std::fs::write(temp.path().join("app_de.ts"), "export const b = 2;\n").unwrap();
+        assert_ne!(fingerprint(temp.path()).unwrap(), without);
+    }
+
+    #[test]
+    fn a_file_reclassified_as_qt_linguist_drops_its_cached_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("send.ts"), "export const send = 1;\n").unwrap();
+        std::fs::write(
+            temp.path().join("catalog.ts"),
+            "export function translatorOnly() { return 1; }\n",
+        )
+        .unwrap();
+        let first = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        assert!(first.skipped_files.is_empty());
+        assert!(
+            first
+                .chunks
+                .iter()
+                .any(|chunk| chunk.relative_file_path == "catalog.ts")
+        );
+
+        std::fs::write(temp.path().join("catalog.ts"), QT_LINGUIST_CATALOG).unwrap();
+        let second = scan_incremental(temp.path(), &first.files).unwrap();
+        assert_eq!(second.removed_files, 1);
+        assert_eq!(second.unchanged_files, 1);
+        assert_eq!(second.parsed_files, 0);
+        assert!(!second.files.contains_key("catalog.ts"));
+        assert!(
+            second
+                .chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "send.ts")
+        );
+        assert_eq!(second.skipped_files.len(), 1);
+        assert_ne!(second.fingerprint, first.fingerprint);
+
+        // And back: the same path is parsed again as TypeScript.
+        std::fs::write(
+            temp.path().join("catalog.ts"),
+            "export function translatorOnly() { return 1; }\n",
+        )
+        .unwrap();
+        let third = scan_incremental(temp.path(), &second.files).unwrap();
+        assert_eq!(third.parsed_files, 1);
+        assert!(third.skipped_files.is_empty());
+        assert_eq!(third.files["catalog.ts"].language, "typescript");
+    }
+
+    #[test]
+    fn qt_linguist_edge_cases_keep_real_typescript_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        let bom_catalog = format!("\u{feff}{QT_LINGUIST_CATALOG}");
+        let blank_then_catalog = format!("\n\n  \t{QT_LINGUIST_CATALOG}");
+        for (name, content) in [
+            ("bom.ts", bom_catalog.as_str()),
+            ("blank_then_catalog.ts", blank_then_catalog.as_str()),
+            (
+                "root_only.ts",
+                "<TS version=\"2.1\" language=\"fr\">\n</TS>\n",
+            ),
+            (
+                "comment.ts",
+                "// <TS version=\"2.1\"> is the Qt Linguist root element\nexport const note = 1;\n",
+            ),
+            (
+                "jsdoc.ts",
+                "/** Reads <?xml prologs. */\nexport function readProlog() {}\n",
+            ),
+            ("assertion.ts", "<TS>value;\n"),
+            (
+                "generic_arrow.ts",
+                "<TS extends object>(item: TS) => item;\n",
+            ),
+            ("bom_typescript.ts", "\u{feff}export const bomValue = 1;\n"),
+            ("empty.ts", ""),
+            ("blank.ts", "\n  \n"),
+        ] {
+            std::fs::write(temp.path().join(name), content).unwrap();
+        }
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let skipped: Vec<_> = scan
+            .skipped_files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(skipped, ["blank_then_catalog.ts", "bom.ts", "root_only.ts"]);
+        let mut indexed: Vec<_> = scan.files.keys().map(String::as_str).collect();
+        indexed.sort_unstable();
+        assert_eq!(
+            indexed,
+            [
+                "assertion.ts",
+                "blank.ts",
+                "bom_typescript.ts",
+                "comment.ts",
+                "empty.ts",
+                "generic_arrow.ts",
+                "jsdoc.ts"
+            ]
+        );
+        // Empty and blank files are indexed (as zero chunks), not skipped.
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| !matches!(chunk.relative_file_path.as_str(), "empty.ts" | "blank.ts"))
+        );
+        assert!(
+            scan.chunks
+                .iter()
+                .any(|chunk| chunk.relative_file_path == "comment.ts"
+                    && chunk.code.contains("export const note"))
+        );
+    }
+
+    #[test]
+    fn utf16_qt_linguist_catalogs_are_skipped_instead_of_decoded_lossily() {
+        fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+            std::iter::once(0xFEFF_u16)
+                .chain(text.encode_utf16())
+                .flat_map(|unit| {
+                    if big_endian {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                })
+                .collect()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("app_de_le.ts"),
+            utf16(QT_LINGUIST_CATALOG, false),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app_de_be.ts"),
+            utf16(QT_LINGUIST_CATALOG, true),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("send.ts"),
+            "export function sendCoins() { return 1; }\n",
+        )
+        .unwrap();
+
+        let scan = scan_incremental(temp.path(), &HashMap::new()).unwrap();
+        let skipped: Vec<_> = scan
+            .skipped_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.reason))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("app_de_be.ts", language::NonSource::QtLinguist),
+                ("app_de_le.ts", language::NonSource::QtLinguist)
+            ]
+        );
+        // Skipped before decoding: neither catalog is reported as lossy.
+        assert!(scan.lossy_files.is_empty());
+        assert_eq!(scan.files.keys().collect::<Vec<_>>(), ["send.ts"]);
+        assert!(
+            scan.chunks
+                .iter()
+                .all(|chunk| chunk.relative_file_path == "send.ts")
+        );
+    }
+
+    #[test]
     fn reparses_only_the_language_with_incompatible_cache_metadata() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "fn stable() {}\n").unwrap();
@@ -571,24 +1377,189 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
-    fn oversized_function_splits_at_syntax_without_losing_statements() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("    let value_{i} = {i};\n"))
-            .collect();
-        let source = format!("fn large() {{\n{}}}\n", statements.concat());
-        let chunks = rust_chunks("lib.rs", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            assert!(chunks.iter().any(|c| c.code.contains(statement.trim())));
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
+    fn oversized_trailing_comment_run_splits_at_syntax_boundaries() {
+        let body = "    let value = 42;\n".repeat(2000);
+        assert!(body.len() > MAX_DECLARATION_BYTES);
+        let comment = format!("// {}\n", "x".repeat(56));
+        assert_eq!(comment.len(), 60);
+        let trailing = comment.repeat(2 * TARGET_BYTES / comment.len());
+        assert_eq!(trailing.len(), 2 * TARGET_BYTES);
+        for declaration in [
+            format!("fn large() {{\n{body}}}\n"),
+            "fn small() {}\n".into(),
+            String::new(),
+        ] {
+            let source = format!("impl Example {{\n{declaration}{trailing}}}\n");
+            let chunks = rust_chunks("lib.rs", &source).unwrap();
             assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
+                chunks.iter().all(|chunk| chunk.code.len() <= TARGET_BYTES),
+                "chunk lengths exceed target {TARGET_BYTES}: {:?}",
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.code.len())
+                    .collect::<Vec<_>>()
             );
+            assert_chunks_cover(&chunks, &trailing);
+            assert_chunks_cover(&chunks, &declaration);
+            for chunk in chunks {
+                assert!(source.contains(&chunk.code));
+                assert_eq!(chunk.content_hash, hash(&chunk.code));
+                let lines: Vec<_> = source.lines().collect();
+                assert!(
+                    lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                        .join("\n")
+                        .contains(&chunk.code)
+                );
+            }
         }
+    }
+
+    #[test]
+    fn short_trailing_comments_keep_existing_boundaries() {
+        let source = "impl Example {\nfn small() {}\n// tail\n}\n";
+        let chunks = rust_chunks("lib.rs", source).unwrap();
+        let boundaries: Vec<_> = chunks
+            .iter()
+            .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.as_str()))
+            .collect();
+        assert_eq!(
+            boundaries,
+            [
+                (1, 1, "impl Example"),
+                (1, 4, "{\nfn small() {}\n// tail\n}")
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_trailing_comments_split_for_every_adapter() {
+        for (path, declaration, marker) in [
+            ("lib.rs", "fn small() {}\n", "//"),
+            ("small.ts", "function small() {}\n", "//"),
+            ("small.tsx", "function small() {}\n", "//"),
+            ("small.js", "function small() {}\n", "//"),
+            ("small.jsx", "function small() {}\n", "//"),
+            ("small.py", "def small():\n    pass\n", "#"),
+            ("Small.cs", "class Small {}\n", "//"),
+            ("small.go", "package small\nfunc small() {}\n", "//"),
+            ("Small.java", "class Small {}\n", "//"),
+            ("small.c", "void small() {}\n", "//"),
+            ("small.cpp", "void small() {}\n", "//"),
+            ("small.hpp", "void small() {}\n", "//"),
+            ("small.h", "void small(void);\n", "//"),
+            ("small.cc", "void small() {}\n", "//"),
+            ("small.cxx", "void small() {}\n", "//"),
+            ("small.hh", "void small();\n", "//"),
+            ("small.hxx", "void small();\n", "//"),
+        ] {
+            let comment = format!("{marker} tail\n");
+            let trailing = comment.repeat(2 * TARGET_BYTES / comment.len() + 1);
+            let source = format!("{declaration}{trailing}");
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(
+                chunks.iter().all(|chunk| chunk.code.len() <= TARGET_BYTES),
+                "{path} has an oversized trailing chunk"
+            );
+            assert_chunks_cover(&chunks, &trailing);
+        }
+    }
+
+    #[test]
+    fn indivisible_trailing_comment_remains_whole() {
+        let comment = format!("/* {} */", "é".repeat(TARGET_BYTES));
+        let source = format!("impl Example {{\nfn small() {{}}\n{comment}\n}}\n");
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        assert!(chunks.iter().any(|chunk| chunk.code.contains(&comment)));
+    }
+
+    #[test]
+    fn leading_comments_stay_attached_when_a_long_trailing_run_splits() {
+        let comment = format!("// {}\n", "x".repeat(56));
+        let trailing = comment.repeat(2 * TARGET_BYTES / comment.len());
+        let source = format!(
+            "impl Example {{\n    /// Documented.\n    fn documented() {{}}\n{trailing}}}\n"
+        );
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        assert!(
+            chunks.iter().any(|chunk| {
+                chunk.code.contains("/// Documented.") && chunk.code.contains("fn documented")
+            }),
+            "the doc comment left its function: {:?}",
+            chunks
+                .iter()
+                .map(|chunk| &chunk.code[..chunk.code.len().min(40)])
+                .collect::<Vec<_>>()
+        );
+        assert!(chunks.iter().all(|chunk| chunk.code.len() <= TARGET_BYTES));
+        assert_chunks_cover(&chunks, &trailing);
+    }
+
+    #[test]
+    fn trailing_comment_run_at_the_target_is_not_split_by_the_closing_brace() {
+        let comment = format!("// {}\n", "x".repeat(TARGET_BYTES / 2 - 4));
+        assert_eq!(2 * comment.len(), TARGET_BYTES);
+        let source = format!("impl Example {{\nfn small() {{}}\n{comment}{comment}}}\n");
+        let chunks = rust_chunks("lib.rs", &source).unwrap();
+        assert!(
+            chunks.iter().any(|chunk| chunk
+                .code
+                .contains(&format!("{comment}{}", comment.trim_end()))),
+            "a run of exactly the target was split: {:?}",
+            chunks
+                .iter()
+                .map(|chunk| chunk.code.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Includes the traced example of N22: an oversized call whose two arguments
+    /// are joined by `+`. The operator lies between the two split children and
+    /// used to be in no chunk.
+    #[test]
+    fn oversized_containers_cover_non_whitespace_bytes_across_inputs() {
+        let left = "a".repeat(3500);
+        let middle = "b".repeat(3500);
+        let right = "c".repeat(3500);
+        let expressions = [
+            format!("emit(\"{left}\" + \"{middle}\")"),
+            format!("emit([\"{left}\", \"{middle}\"])"),
+            format!("emit((\"{left}\", \"{middle}\"))"),
+            format!("emit(\"{left}\" + \"{middle}\" + \"{right}\")"),
+        ];
+
+        for expression in expressions {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
+        }
+    }
+
+    #[test]
+    fn split_children_keep_separators_before_following_small_siblings() {
+        let large = "a".repeat(6500);
+        for expression in [
+            format!("consume(\"{large}\", short_name)"),
+            format!("[\"{large}\", short_name]"),
+            format!("(\"{large}\", short_name)"),
+        ] {
+            let statements = format!("    {expression};\n").repeat(4);
+            let source = format!("fn main() {{\n{statements}}}\n");
+            assert_non_whitespace_coverage(&source, &expression);
+        }
+
+        let mut properties: String = (0..1200)
+            .map(|index| format!("  field_{index}: string,\n"))
+            .collect();
+        properties.push_str(&format!("  oversized: \"{large}\",\n  short: string,\n"));
+        let source = format!("type Fields = {{\n{properties}}};\n");
+        let chunks = chunks_for_path("fields.ts", &source).unwrap();
+        assert_chunks_cover(&chunks, &format!("\"{large}\", short: string"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk.code.trim(), "," | ";")),
+            "a chunk contains only separators:\n{chunks:#?}"
+        );
     }
 
     #[test]
@@ -683,8 +1654,7 @@ if TOP:
                 lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
                     .join("\n")
                     .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
+                "invalid range for {chunk:#?}"
             );
         }
     }
@@ -725,8 +1695,302 @@ if TOP:
     }
 
     #[test]
-    fn chunks_csharp_namespaces_types_members_attributes_and_top_level_statements() {
-        let source = r#"using System;
+    fn parser_recovery_keeps_following_declarations_searchable() {
+        for (path, source, healthy) in [
+            (
+                "Recovered.cs",
+                "public class Broken { void Run( { }\npublic record HealthyRecord(int Value);\n",
+                "HealthyRecord",
+            ),
+            (
+                "Recovered.java",
+                "public class Broken { void run( { }\npublic record HealthyRecord(int value) {}\n",
+                "HealthyRecord",
+            ),
+            (
+                "recovered.c",
+                "int broken( {\nint healthy_value(void) { return 42; }\n",
+                "healthy_value",
+            ),
+            (
+                "recovered.cpp",
+                "class Broken { void run( { }\nint healthy_value() { return 42; }\n",
+                "healthy_value",
+            ),
+        ] {
+            let chunks = chunks_for_path(path, source).unwrap();
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(healthy)),
+                "{path}: valid declaration after syntax damage was lost: {chunks:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_member_splits_at_statements_and_keeps_its_header() {
+        let statements = (0..1200)
+            .map(|i| format!("        total += {i};\n"))
+            .collect::<String>();
+        // (path, source, the member's header line, a header attribute)
+        let cases = [
+            (
+                "LargeCalculator.cs",
+                format!(
+                    "public class LargeCalculator\n{{\n    [Obsolete]\n    public int Calculate()\n    {{\n        var total = 0;\n{statements}        return total;\n    }}\n}}\n"
+                ),
+                "public int Calculate",
+                "[Obsolete]",
+            ),
+            (
+                "LargeCalculator.java",
+                format!(
+                    "public class LargeCalculator {{\n    @Deprecated\n    public int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}}\n"
+                ),
+                "public int calculate",
+                "@Deprecated",
+            ),
+            (
+                "LargeCalculator.cpp",
+                format!(
+                    "class LargeCalculator {{\npublic:\n    int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}};\n"
+                ),
+                "int calculate",
+                "int calculate",
+            ),
+        ];
+        for (path, source, header_line, attribute) in cases {
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(
+                chunks.len() > 2,
+                "{path}: oversized member was not split: {chunks:#?}"
+            );
+            let header = chunks
+                .iter()
+                .find(|chunk| chunk.code.contains(header_line))
+                .unwrap();
+            assert!(header.code.contains(attribute), "{path}");
+            assert!(
+                chunks
+                    .iter()
+                    .any(|chunk| chunk.code.contains("return total;")),
+                "{path}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| source.contains(&chunk.code)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_function_splits_at_statements_without_losing_them() {
+        let rust: Vec<_> = (0..2000)
+            .map(|i| format!("    let value_{i} = {i};\n"))
+            .collect();
+        let go: Vec<_> = (0..2000)
+            .map(|i| format!("\tvalue{i} := {i}\n\t_ = value{i}\n"))
+            .collect();
+        let c: Vec<_> = (0..2000)
+            .map(|i| format!("\tint value{i} = {i};\n\t(void)value{i};\n"))
+            .collect();
+        let cases = [
+            (
+                "lib.rs",
+                format!("fn large() {{\n{}}}\n", rust.concat()),
+                rust,
+            ),
+            (
+                "large.go",
+                format!("package example\n\nfunc large() {{\n{}}}\n", go.concat()),
+                go,
+            ),
+            (
+                "large.c",
+                format!("int large(void) {{\n{}\treturn 0;\n}}\n", c.concat()),
+                c,
+            ),
+        ];
+        for (path, source, statements) in cases {
+            let chunks = chunks_for_path(path, &source).unwrap();
+            assert!(chunks.len() > 1, "{path}");
+            for statement in statements {
+                for line in statement.lines().filter(|line| !line.trim().is_empty()) {
+                    assert!(
+                        chunks.iter().any(|c| c.code.contains(line.trim())),
+                        "{path}: missing statement: {line}"
+                    );
+                }
+            }
+            let lines: Vec<_> = source.lines().collect();
+            for c in chunks {
+                assert!(
+                    lines[(c.start_line - 1) as usize..c.end_line as usize]
+                        .join("\n")
+                        .contains(&c.code),
+                    "{path}: invalid range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_go_and_c_declarations_with_leading_comments_attached() {
+        let go = r"package example
+
+// Add returns the sum of two numbers.
+func Add(a, b int) int {
+	return a + b
+}
+
+// Counter tracks a running total.
+type Counter struct {
+	Total int
+}
+
+// Increment adds n to the counter's total.
+func (c *Counter) Increment(n int) {
+	c.Total += n
+}
+
+const MaxRetries = 3
+
+var DefaultTimeout = 30
+";
+        let c = r"#include <stdio.h>
+
+// Add returns the sum of two numbers.
+int add(int a, int b) {
+    return a + b;
+}
+
+// Counter tracks a running total.
+struct Counter {
+    int total;
+};
+
+// increment adds n to the counter's total.
+void increment(struct Counter *c, int n) {
+    c->total += n;
+}
+
+#define MAX_RETRIES 3
+
+int default_timeout = 30;
+";
+        // (path, language, source, [(declaration, the chunk starts with)], other
+        // chunk fragments, a declaration that appears in exactly one chunk)
+        let cases = [
+            (
+                "service.go",
+                "go",
+                go,
+                [
+                    (
+                        "func Add",
+                        "// Add returns the sum of two numbers.\nfunc Add",
+                    ),
+                    (
+                        "type Counter struct",
+                        "// Counter tracks a running total.\ntype Counter",
+                    ),
+                    (
+                        "func (c *Counter) Increment",
+                        "// Increment adds n to the counter's total.\nfunc (c *Counter) Increment",
+                    ),
+                ],
+                ["const MaxRetries = 3", "var DefaultTimeout = 30"],
+                "func Add",
+            ),
+            (
+                "service.c",
+                "c",
+                c,
+                [
+                    ("int add", "// Add returns the sum of two numbers.\nint add"),
+                    (
+                        "struct Counter",
+                        "// Counter tracks a running total.\nstruct Counter",
+                    ),
+                    (
+                        "void increment",
+                        "// increment adds n to the counter's total.\nvoid increment",
+                    ),
+                ],
+                ["#define MAX_RETRIES 3", "int default_timeout = 30;"],
+                "int add",
+            ),
+        ];
+        for (path, language, source, attached, others, unique) in cases {
+            let chunks = chunks_for_path(path, source).unwrap();
+
+            assert!(!chunks.is_empty(), "{path}");
+            assert!(chunks.iter().all(|chunk| chunk.language == language));
+            assert!(chunks.iter().all(|chunk| chunk.relative_file_path == path));
+            for (declaration, prefix) in attached {
+                let chunk = chunks
+                    .iter()
+                    .find(|chunk| chunk.code.contains(declaration))
+                    .unwrap_or_else(|| panic!("{path}: no chunk for {declaration}"));
+                assert!(
+                    chunk.code.starts_with(prefix),
+                    "{path}: {declaration} lost its comment"
+                );
+            }
+            for fragment in others {
+                assert!(
+                    chunks.iter().any(|chunk| chunk.code.contains(fragment)),
+                    "{path}: missing {fragment}"
+                );
+            }
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| chunk.code.contains(unique))
+                    .count(),
+                1,
+                "{path}"
+            );
+
+            let lines: Vec<_> = source.lines().collect();
+            for chunk in chunks {
+                assert!(
+                    lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
+                        .join("\n")
+                        .contains(&chunk.code),
+                    "{path}: invalid range for {chunk:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_java_csharp_and_cpp_declarations_keep_their_attachments() {
+        let java = r#"package com.example.telemetry;
+
+import java.util.List;
+
+/**
+ * Processes production telemetry.
+ */
+@Deprecated
+public class TelemetryProcessor {
+    private String name = "production";
+
+    public TelemetryProcessor(String name) {
+        this.name = name;
+    }
+
+    public String normalize(String value) {
+        String trimmed = value.trim();
+        return trimmed.toLowerCase();
+    }
+}
+
+interface TelemetrySink {
+    void write(String value);
+}
+"#;
+        let csharp = r#"using System;
 
 Console.WriteLine("startup");
 
@@ -753,429 +2017,7 @@ public interface ITelemetrySink
     void Write(string value);
 }
 "#;
-        let chunks = chunks_for_path("TelemetryProcessor.cs", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "csharp"));
-        for expected in [
-            "using System",
-            "Console.WriteLine",
-            "class TelemetryProcessor",
-            "event EventHandler",
-            "string Name",
-            "TelemetryProcessor(string name)",
-            "string Normalize",
-            "string Trimmed()",
-            "interface ITelemetrySink",
-            "void Write",
-        ] {
-            assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
-            );
-        }
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
-            .unwrap();
-        assert!(class.code.contains("/// <summary>"));
-        assert!(class.code.contains("[Obsolete]"));
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_csharp_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "public class LargeCalculator\n{{\n    [Obsolete]\n    public int Calculate()\n    {{\n        var total = 0;\n{statements}        return total;\n    }}\n}}\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.cs", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("public int Calculate"))
-            .unwrap();
-        assert!(header.code.contains("[Obsolete]"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn csharp_parser_recovery_keeps_following_declarations_searchable() {
-        let source =
-            "public class Broken { void Run( { }\npublic record HealthyRecord(int Value);\n";
-        let chunks = chunks_for_path("Recovered.cs", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("HealthyRecord")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_go_declarations_with_leading_comments_attached() {
-        let source = r#"package example
-
-// Add returns the sum of two numbers.
-func Add(a, b int) int {
-	return a + b
-}
-
-// Counter tracks a running total.
-type Counter struct {
-	Total int
-}
-
-// Increment adds n to the counter's total.
-func (c *Counter) Increment(n int) {
-	c.Total += n
-}
-
-const MaxRetries = 3
-
-var DefaultTimeout = 30
-"#;
-        let chunks = chunks_for_path("service.go", source).unwrap();
-
-        assert!(!chunks.is_empty());
-        assert!(chunks.iter().all(|chunk| chunk.language == "go"));
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.relative_file_path == "service.go")
-        );
-
-        let add = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("func Add"))
-            .unwrap();
-        assert!(
-            add.code
-                .starts_with("// Add returns the sum of two numbers.\nfunc Add")
-        );
-
-        let counter = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("type Counter struct"))
-            .unwrap();
-        assert!(
-            counter
-                .code
-                .starts_with("// Counter tracks a running total.\ntype Counter")
-        );
-
-        let increment = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("func (c *Counter) Increment"))
-            .unwrap();
-        assert!(increment.code.starts_with(
-            "// Increment adds n to the counter's total.\nfunc (c *Counter) Increment"
-        ));
-
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("const MaxRetries = 3"))
-        );
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("var DefaultTimeout = 30"))
-        );
-        assert_eq!(
-            chunks
-                .iter()
-                .filter(|chunk| chunk.code.contains("func Add"))
-                .count(),
-            1
-        );
-
-        let lines: Vec<_> = source.lines().collect();
-        for chunk in chunks {
-            assert!(
-                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
-                    .join("\n")
-                    .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_go_function_splits_at_statements_without_losing_them() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("\tvalue{i} := {i}\n\t_ = value{i}\n"))
-            .collect();
-        let source = format!(
-            "package example\n\nfunc large() {{\n{}}}\n",
-            statements.concat()
-        );
-        let chunks = chunks_for_path("large.go", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
-                assert!(
-                    chunks.iter().any(|c| c.code.contains(line.trim())),
-                    "missing statement: {line}"
-                );
-            }
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
-            assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
-            );
-        }
-    }
-
-    #[test]
-    fn chunks_java_packages_types_members_annotations_and_javadoc() {
-        let source = r#"package com.example.telemetry;
-
-import java.util.List;
-
-/**
- * Processes production telemetry.
- */
-@Deprecated
-public class TelemetryProcessor {
-    private String name = "production";
-
-    public TelemetryProcessor(String name) {
-        this.name = name;
-    }
-
-    public String normalize(String value) {
-        String trimmed = value.trim();
-        return trimmed.toLowerCase();
-    }
-}
-
-interface TelemetrySink {
-    void write(String value);
-}
-"#;
-        let chunks = chunks_for_path("TelemetryProcessor.java", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "java"));
-        for expected in [
-            "import java.util.List",
-            "class TelemetryProcessor",
-            "private String name",
-            "TelemetryProcessor(String name)",
-            "String normalize",
-            "interface TelemetrySink",
-            "void write",
-        ] {
-            assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
-            );
-        }
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class TelemetryProcessor"))
-            .unwrap();
-        assert!(class.code.contains("/**"));
-        assert!(class.code.contains("@Deprecated"));
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_java_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "public class LargeCalculator {{\n    @Deprecated\n    public int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}}\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.java", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("public int calculate"))
-            .unwrap();
-        assert!(header.code.contains("@Deprecated"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn java_parser_recovery_keeps_following_declarations_searchable() {
-        let source =
-            "public class Broken { void run( { }\npublic record HealthyRecord(int value) {}\n";
-        let chunks = chunks_for_path("Recovered.java", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("HealthyRecord")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_c_declarations_with_leading_comments_attached() {
-        let source = r#"#include <stdio.h>
-
-// Add returns the sum of two numbers.
-int add(int a, int b) {
-    return a + b;
-}
-
-// Counter tracks a running total.
-struct Counter {
-    int total;
-};
-
-// increment adds n to the counter's total.
-void increment(struct Counter *c, int n) {
-    c->total += n;
-}
-
-#define MAX_RETRIES 3
-
-int default_timeout = 30;
-"#;
-        let chunks = chunks_for_path("service.c", source).unwrap();
-
-        assert!(!chunks.is_empty());
-        assert!(chunks.iter().all(|chunk| chunk.language == "c"));
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.relative_file_path == "service.c")
-        );
-
-        let add = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("int add"))
-            .unwrap();
-        assert!(
-            add.code
-                .starts_with("// Add returns the sum of two numbers.\nint add")
-        );
-
-        let counter = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("struct Counter"))
-            .unwrap();
-        assert!(
-            counter
-                .code
-                .starts_with("// Counter tracks a running total.\nstruct Counter")
-        );
-
-        let increment = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("void increment"))
-            .unwrap();
-        assert!(
-            increment
-                .code
-                .starts_with("// increment adds n to the counter's total.\nvoid increment")
-        );
-
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("#define MAX_RETRIES 3"))
-        );
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("int default_timeout = 30;"))
-        );
-        assert_eq!(
-            chunks
-                .iter()
-                .filter(|chunk| chunk.code.contains("int add"))
-                .count(),
-            1
-        );
-
-        let lines: Vec<_> = source.lines().collect();
-        for chunk in chunks {
-            assert!(
-                lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
-                    .join("\n")
-                    .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_c_function_splits_at_statements_without_losing_them() {
-        let statements: Vec<_> = (0..2000)
-            .map(|i| format!("\tint value{i} = {i};\n\t(void)value{i};\n"))
-            .collect();
-        let source = format!(
-            "int large(void) {{\n{}\treturn 0;\n}}\n",
-            statements.concat()
-        );
-        let chunks = chunks_for_path("large.c", &source).unwrap();
-        assert!(chunks.len() > 1);
-        for statement in statements {
-            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
-                assert!(
-                    chunks.iter().any(|c| c.code.contains(line.trim())),
-                    "missing statement: {line}"
-                );
-            }
-        }
-        for c in chunks {
-            let lines: Vec<_> = source.lines().collect();
-            assert!(
-                lines[(c.start_line - 1) as usize..c.end_line as usize]
-                    .join("\n")
-                    .contains(&c.code)
-            );
-        }
-    }
-
-    #[test]
-    fn c_parser_recovery_keeps_following_declarations_searchable() {
-        let source = "int broken( {\nint healthy_value(void) { return 42; }\n";
-        let chunks = chunks_for_path("recovered.c", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("healthy_value")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
-    }
-
-    #[test]
-    fn chunks_cpp_namespaces_classes_members_templates_and_leading_comments() {
-        let source = r#"namespace telemetry {
+        let cpp = r"namespace telemetry {
 
 // Processes production telemetry events.
 class Processor {
@@ -1196,86 +2038,106 @@ T add(T a, T b) {
 }
 
 }
-"#;
-        let chunks = chunks_for_path("processor.cpp", source).unwrap();
-        assert!(chunks.iter().all(|chunk| chunk.language == "cpp"));
-        for expected in [
-            "class Processor",
-            "std::string normalize",
-            "int count_;",
-            "T add(T a, T b)",
-        ] {
+";
+        // (path, language, source, fragments some chunk must contain,
+        // [(a chunk's identifying text, fragments that chunk must also contain)])
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+            &'a [(&'a str, &'a [&'a str])],
+        );
+        let cases: [Case; 3] = [
+            (
+                "TelemetryProcessor.java",
+                "java",
+                java,
+                &[
+                    "import java.util.List",
+                    "class TelemetryProcessor",
+                    "private String name",
+                    "TelemetryProcessor(String name)",
+                    "String normalize",
+                    "interface TelemetrySink",
+                    "void write",
+                ],
+                &[("class TelemetryProcessor", &["/**", "@Deprecated"])],
+            ),
+            (
+                "TelemetryProcessor.cs",
+                "csharp",
+                csharp,
+                &[
+                    "using System",
+                    "Console.WriteLine",
+                    "class TelemetryProcessor",
+                    "event EventHandler",
+                    "string Name",
+                    "TelemetryProcessor(string name)",
+                    "string Normalize",
+                    "string Trimmed()",
+                    "interface ITelemetrySink",
+                    "void Write",
+                ],
+                &[("class TelemetryProcessor", &["/// <summary>", "[Obsolete]"])],
+            ),
+            (
+                "processor.cpp",
+                "cpp",
+                cpp,
+                &[
+                    "class Processor",
+                    "std::string normalize",
+                    "int count_;",
+                    "T add(T a, T b)",
+                ],
+                &[
+                    (
+                        "class Processor",
+                        &["// Processes production telemetry events."],
+                    ),
+                    (
+                        "T add(T a, T b)",
+                        &[
+                            "template<typename T>",
+                            "// add returns the sum of two values of any numeric type.",
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        for (path, language, source, expected, attachments) in cases {
+            let chunks = chunks_for_path(path, source).unwrap();
             assert!(
-                chunks.iter().any(|chunk| chunk.code.contains(expected)),
-                "missing {expected}: {chunks:#?}"
+                chunks.iter().all(|chunk| chunk.language == language),
+                "{path}"
             );
+            for fragment in expected {
+                assert!(
+                    chunks.iter().any(|chunk| chunk.code.contains(fragment)),
+                    "{path}: missing {fragment}: {chunks:#?}"
+                );
+            }
+            for (identity, fragments) in attachments {
+                let chunk = chunks
+                    .iter()
+                    .find(|chunk| chunk.code.contains(identity))
+                    .unwrap();
+                for fragment in *fragments {
+                    assert!(
+                        chunk.code.contains(fragment),
+                        "{path}: {identity} lost {fragment}"
+                    );
+                }
+            }
+            for chunk in &chunks {
+                assert!(source.contains(&chunk.code), "{path}");
+                assert_eq!(chunk.content_hash, hash(&chunk.code), "{path}");
+                assert!(chunk.start_line >= 1, "{path}");
+                assert!(chunk.end_line >= chunk.start_line, "{path}");
+            }
         }
-
-        let class = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("class Processor"))
-            .unwrap();
-        assert!(
-            class
-                .code
-                .contains("// Processes production telemetry events.")
-        );
-
-        let template_fn = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("T add(T a, T b)"))
-            .unwrap();
-        assert!(template_fn.code.contains("template<typename T>"));
-        assert!(
-            template_fn
-                .code
-                .contains("// add returns the sum of two values of any numeric type.")
-        );
-
-        for chunk in &chunks {
-            assert!(source.contains(&chunk.code));
-            assert_eq!(chunk.content_hash, hash(&chunk.code));
-            assert!(chunk.start_line >= 1);
-            assert!(chunk.end_line >= chunk.start_line);
-        }
-    }
-
-    #[test]
-    fn oversized_cpp_method_splits_at_statements_and_keeps_its_header() {
-        let statements = (0..1200)
-            .map(|i| format!("        total += {i};\n"))
-            .collect::<String>();
-        let source = format!(
-            "class LargeCalculator {{\npublic:\n    int calculate() {{\n        int total = 0;\n{statements}        return total;\n    }}\n}};\n"
-        );
-        let chunks = chunks_for_path("LargeCalculator.cpp", &source).unwrap();
-        assert!(
-            chunks.len() > 2,
-            "oversized member was not split: {chunks:#?}"
-        );
-        let header = chunks
-            .iter()
-            .find(|chunk| chunk.code.contains("int calculate"))
-            .unwrap();
-        assert!(header.code.contains("int calculate"));
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("return total;"))
-        );
-        assert!(chunks.iter().all(|chunk| source.contains(&chunk.code)));
-    }
-
-    #[test]
-    fn cpp_parser_recovery_keeps_following_declarations_searchable() {
-        let source = "class Broken { void run( { }\nint healthy_value() { return 42; }\n";
-        let chunks = chunks_for_path("recovered.cpp", source).unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.code.contains("healthy_value")),
-            "valid declaration after syntax damage was lost: {chunks:#?}"
-        );
     }
 
     #[test]
@@ -1288,5 +2150,94 @@ T add(T a, T b) {
                 .iter()
                 .any(|chunk| chunk.code.contains("class Widget"))
         );
+    }
+
+    #[test]
+    fn chunks_cc_cxx_hh_and_hxx_extensions_as_cpp() {
+        let source = "namespace geo {\n// Area of a unit square.\nclass Square {\npublic:\n    double area() const { return 1.0; }\n};\n}\n";
+        for path in ["a.cc", "a.cxx", "a.hh", "a.hxx", "inc/deep/dir/a.hxx"] {
+            let chunks = chunks_for_path(path, source).unwrap();
+            assert!(!chunks.is_empty(), "{path}");
+            for chunk in &chunks {
+                assert_eq!(chunk.language, "cpp", "{path}");
+                assert_eq!(chunk.relative_file_path, path);
+                assert!(source.contains(&chunk.code), "{path}");
+                assert_eq!(chunk.content_hash, hash(&chunk.code), "{path}");
+                assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+            }
+            // The leading comment stays attached to the class it describes.
+            let class = chunks
+                .iter()
+                .find(|chunk| chunk.code.contains("class Square"))
+                .unwrap_or_else(|| panic!("{path}: no class chunk: {chunks:#?}"));
+            assert!(class.code.contains("// Area of a unit square."), "{path}");
+            // The same text under `.cpp` gives identical chunks, so the
+            // extension changes only the file name, never the output.
+            let reference = chunks_for_path("a.cpp", source).unwrap();
+            let strip = |chunks: &[Chunk]| {
+                chunks
+                    .iter()
+                    .map(|chunk| (chunk.start_line, chunk.end_line, chunk.code.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(strip(&chunks), strip(&reference), "{path}");
+        }
+    }
+
+    #[test]
+    fn chunks_h_extension_as_c() {
+        let source = "#ifndef MATH_H\n#define MATH_H\n\n/* adds two ints */\nint add(int a, int b);\n\ntypedef struct pair {\n    int a;\n    int b;\n} pair;\n\n#endif\n";
+        let chunks = chunks_for_path("include/math.h", source).unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(chunk.language, "c");
+            assert!(source.contains(&chunk.code));
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("/* adds two ints */")
+                    && chunk.code.contains("int add(int a, int b);"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.code.contains("typedef struct pair"))
+        );
+        // Same text under `.c` gives the same chunks.
+        let reference = chunks_for_path("math.c", source).unwrap();
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.code).collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|chunk| &chunk.code)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cpp_header_named_dot_h_stays_searchable_as_c() {
+        // `.h` is registered as `c` whatever the header contains (a documented
+        // decision, not content sniffing). The C grammar recovers around the
+        // C++ constructs, so the file is still indexed, every chunk is exact
+        // source, and the declarations are still findable by text.
+        let source = "#pragma once\n#include <string>\n\nnamespace app {\n\n// A widget.\nclass Widget {\npublic:\n    int size() const { return 0; }\n    std::string name() const;\n};\n\ntemplate <typename T>\nT twice(T value) { return value + value; }\n\n}\n";
+        let chunks = chunks_for_path("include/widget.h", source).unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(chunk.language, "c");
+            assert!(source.contains(&chunk.code), "{chunk:#?}");
+            assert_eq!(chunk.content_hash, hash(&chunk.code));
+            assert!(chunk.start_line >= 1 && chunk.end_line >= chunk.start_line);
+        }
+        for needle in ["class Widget", "int size() const", "T twice(T value)"] {
+            assert!(
+                chunks.iter().any(|chunk| chunk.code.contains(needle)),
+                "missing {needle}: {chunks:#?}"
+            );
+        }
+        assert_chunks_cover(&chunks, source);
     }
 }

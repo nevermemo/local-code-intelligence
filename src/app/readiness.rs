@@ -2,8 +2,8 @@
 //! dependency, shared by `/ready` and the `service_status` MCP tool.
 
 use super::App;
-use crate::lexical;
-use anyhow::{Context, Result, anyhow, ensure};
+use crate::{lexical, lsp::adapter::probe_subprocess_version};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::{path::Path, sync::Arc};
 
@@ -32,8 +32,17 @@ pub struct ServiceStatus {
 /// Outcome of a model-listing probe. `NotExposed` (HTTP 404/405) is neutral for
 /// an optional component but a failure for a required one.
 #[derive(Debug, Clone)]
-enum ModelListing {
+pub(crate) enum ModelListing {
     Listed,
+    NotExposed,
+    Failed(String),
+}
+
+/// What a model-listing endpoint answered: the model ids it lists,
+/// `NotExposed` for HTTP 404/405, or why it could not be read.
+#[derive(Debug, Clone)]
+pub(crate) enum ModelIds {
+    Listed(Vec<String>),
     NotExposed,
     Failed(String),
 }
@@ -42,6 +51,44 @@ enum ModelListing {
 /// the PID and a wall-clock timestamp, concurrent probes stay unique.
 static READINESS_PROBE_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Longest `data_dir` (in characters) that leaves room on Windows for the
+/// path LanceDB binds to MAX_PATH below it.
+///
+/// That path is Lance's data file, `data\<50-character name>.lance`, which is
+/// 96 characters below `data_dir` (counting `\lancedb\ws_<16 hex>.lance\`).
+/// lance-io's `LocalWriter` persists it at shutdown by moving a tempfile with
+/// a raw `MoveFileExW` call (no `\\?\` prefix), so MAX_PATH applies: the
+/// ceiling is 259 - 96 = 163 characters (about 110 with the old 64-hex table
+/// name). The longer staging manifest under `_versions\` goes through
+/// `object_store`'s `std` rename, which `std` makes verbatim-aware, so it is
+/// not bound, and LCI creates no indices. 150 leaves 13 characters of slack.
+///
+/// Measured on a Windows machine: the old binary failed at a 139-character
+/// `data_dir`; the new one worked at 139 and still failed at 199.
+const WINDOWS_DATA_DIR_LENGTH_LIMIT: usize = 150;
+
+/// Optional readiness component that flags a `data_dir` too long for Windows'
+/// 260-character path limit, which LanceDB hits as `os error 3` once its
+/// internal paths are appended. Never required, so it degrades the report
+/// without changing `ready`. `windows` and `limit` are parameters so the rule
+/// is testable on any platform.
+fn data_dir_length_component(data_dir: &Path, windows: bool, limit: usize) -> ReadinessComponent {
+    let length = data_dir.to_string_lossy().chars().count();
+    let too_long = windows && length > limit;
+    ReadinessComponent {
+        name: "data_dir_path_length",
+        ready: !too_long,
+        required: false,
+        detail: Some(if too_long {
+            format!(
+                "data_dir is {length} characters; above {limit}, LanceDB's internal paths can exceed Windows' 260-character limit (os error 3); use a shorter data_dir"
+            )
+        } else {
+            format!("data_dir is {length} characters")
+        }),
+    }
+}
 
 impl App {
     /// Builds the shared, serializable readiness report. Each named component
@@ -65,10 +112,8 @@ impl App {
                 async move {
                     let probe: Result<()> = if !adapter.enabled() {
                         Ok(())
-                    } else if let Some(command) = adapter.configured_command() {
-                        Self::probe_subprocess_version(Path::new(&command), timeout).await
                     } else {
-                        Ok(())
+                        adapter.probe_readiness(timeout).await
                     };
                     (adapter, probe)
                 }
@@ -86,23 +131,23 @@ impl App {
         ) = tokio::join!(
             Self::probe_data_dir(&data_dir),
             self.store.accessibility_probe(&lancedb_path),
-            Self::probe_endpoint_reach(client, &embedding_url, "embedding endpoint", timeout),
-            Self::probe_model_listing(
+            probe_endpoint_reach(client, &embedding_url, "embedding endpoint", timeout),
+            probe_model_listing(
                 client,
                 &embedding_url,
                 &embedding_model,
                 "embedding model listing",
                 timeout
             ),
-            Self::probe_endpoint_reach(client, &reranker_url, "reranker endpoint", timeout),
-            Self::probe_model_listing(
+            probe_endpoint_reach(client, &reranker_url, "reranker endpoint", timeout),
+            probe_model_listing(
                 client,
                 &reranker_url,
                 &reranker_model,
                 "reranker model listing",
                 timeout
             ),
-            Self::probe_subprocess_version(&ripgrep_resolved, timeout),
+            probe_subprocess_version(&ripgrep_resolved, timeout),
             lsp_probes_future,
         );
 
@@ -145,6 +190,7 @@ impl App {
                 required: true,
                 detail: lancedb_probe.err().map(|e| format!("{e:#}")),
             },
+            data_dir_length_component(&data_dir, cfg!(windows), WINDOWS_DATA_DIR_LENGTH_LIMIT),
             ReadinessComponent {
                 name: "embedding_endpoint_reachable",
                 ready: embedding_reach_ready,
@@ -258,120 +304,158 @@ impl App {
         })
         .await?
     }
+}
 
-    /// Classifies a reqwest transport error by class only. reqwest's `Display`
-    /// embeds the request URL, which may contain credentials or query secrets,
-    /// so readiness reports must never echo the raw error text.
-    fn reqwest_error_class(error: &reqwest::Error) -> &'static str {
-        if error.is_timeout() {
-            "timeout"
-        } else if error.is_connect() {
-            "connection failure"
-        } else {
-            "request failure"
-        }
+/// Classifies a reqwest transport error by class only. reqwest's `Display`
+/// embeds the request URL, which may contain credentials or query secrets,
+/// so readiness reports must never echo the raw error text.
+pub(crate) fn reqwest_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection failure"
+    } else {
+        "request failure"
     }
+}
 
-    /// Contacts the configured base URL. Any HTTP response (including 404/405)
-    /// proves the endpoint is reachable; only a connection failure or timeout
-    /// marks it unreachable. Errors identify the dependency generically via
-    /// `label` because configured URLs may contain credentials or query
-    /// secrets that must not be echoed into readiness reports.
-    async fn probe_endpoint_reach(
-        client: &reqwest::Client,
-        url: &str,
-        label: &str,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        let target = url.trim_end_matches('/');
-        client
-            .get(target)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow!("connect to {label}: {}", Self::reqwest_error_class(&error))
-            })?;
-        Ok(())
+/// Contacts the configured base URL. Any HTTP response (including 404/405)
+/// proves the endpoint is reachable; only a connection failure or timeout
+/// marks it unreachable. Errors identify the dependency generically via
+/// `label` because configured URLs may contain credentials or query
+/// secrets that must not be echoed into readiness reports.
+pub(crate) async fn probe_endpoint_reach(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let target = url.trim_end_matches('/');
+    client
+        .get(target)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| anyhow!("connect to {label}: {}", reqwest_error_class(&error)))?;
+    Ok(())
+}
+
+/// Reads the model ids the OpenAI-compatible listing endpoint derived from
+/// the configured URL's origin (`/v1/models`) reports. A 404/405 means the
+/// listing is not exposed. Errors identify the dependency generically via
+/// `label` (with HTTP status where relevant) because configured URLs may
+/// contain credentials or query secrets that must not be echoed into
+/// readiness reports.
+pub(crate) async fn fetch_model_ids(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+    timeout: std::time::Duration,
+) -> ModelIds {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => return ModelIds::Failed(format!("invalid {label} URL: {e}")),
+    };
+    let mut models_url = parsed;
+    models_url.set_path("/v1/models");
+    models_url.set_query(None);
+    models_url.set_fragment(None);
+    let response = match client.get(models_url).timeout(timeout).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ModelIds::Failed(format!("connect to {label}: {}", reqwest_error_class(&e)));
+        }
+    };
+    let status = response.status();
+    if status.as_u16() == 404 || status.as_u16() == 405 {
+        return ModelIds::NotExposed;
     }
+    if !status.is_success() {
+        return ModelIds::Failed(format!("{label} HTTP error: {status}"));
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(e) => return ModelIds::Failed(format!("invalid {label} response: {e:#}")),
+    };
+    let ids = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ModelIds::Listed(ids)
+}
 
-    /// Derives the likely OpenAI-compatible model listing endpoint from the
-    /// configured URL origin and checks that the configured model is present.
-    /// A 404/405 means the listing is not exposed. Errors identify the
-    /// dependency generically via `label` (with HTTP status where relevant)
-    /// because configured URLs may contain credentials or query secrets that
-    /// must not be echoed into readiness reports.
-    async fn probe_model_listing(
-        client: &reqwest::Client,
-        url: &str,
-        model: &str,
-        label: &str,
-        timeout: std::time::Duration,
-    ) -> ModelListing {
-        let parsed = match reqwest::Url::parse(url) {
-            Ok(u) => u,
-            Err(e) => return ModelListing::Failed(format!("invalid {label} URL: {e}")),
-        };
-        let mut models_url = parsed;
-        models_url.set_path("/v1/models");
-        models_url.set_query(None);
-        models_url.set_fragment(None);
-        let response = match client.get(models_url).timeout(timeout).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ModelListing::Failed(format!(
-                    "connect to {label}: {}",
-                    Self::reqwest_error_class(&e)
-                ));
-            }
-        };
-        let status = response.status();
-        if status.as_u16() == 404 || status.as_u16() == 405 {
-            return ModelListing::NotExposed;
-        }
-        if !status.is_success() {
-            return ModelListing::Failed(format!("{label} HTTP error: {status}"));
-        }
-        let body: serde_json::Value = match response.json().await {
-            Ok(b) => b,
-            Err(e) => return ModelListing::Failed(format!("invalid {label} response: {e:#}")),
-        };
-        let ids = body
-            .get("data")
-            .and_then(|d| d.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if ids.iter().any(|id| id == model) {
-            ModelListing::Listed
-        } else {
+/// Derives the likely OpenAI-compatible model listing endpoint from the
+/// configured URL origin and checks that the configured model is present
+/// (see [`fetch_model_ids`]).
+pub(crate) async fn probe_model_listing(
+    client: &reqwest::Client,
+    url: &str,
+    model: &str,
+    label: &str,
+    timeout: std::time::Duration,
+) -> ModelListing {
+    match fetch_model_ids(client, url, label, timeout).await {
+        ModelIds::NotExposed => ModelListing::NotExposed,
+        ModelIds::Failed(reason) => ModelListing::Failed(reason),
+        ModelIds::Listed(ids) if ids.iter().any(|id| id == model) => ModelListing::Listed,
+        ModelIds::Listed(_) => {
             ModelListing::Failed(format!("configured model {model} not present in {label}"))
         }
     }
+}
 
-    async fn probe_subprocess_version(
-        resolved: &std::path::Path,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        let mut command = tokio::process::Command::new(resolved);
-        command.arg("--version");
-        command
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .with_context(|| format!("timed out running {} --version", resolved.display()))?
-            .with_context(|| format!("start {}", resolved.display()))?;
-        ensure!(
-            output.status.success(),
-            "subprocess {} --version failed",
-            resolved.display()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_of(characters: usize) -> std::path::PathBuf {
+        "d".repeat(characters).into()
+    }
+
+    #[test]
+    fn data_dir_length_warns_only_on_windows_above_the_limit() {
+        let at_limit = data_dir_length_component(&dir_of(150), true, 150);
+        assert_eq!(at_limit.name, "data_dir_path_length");
+        assert!(at_limit.ready);
+        assert!(!at_limit.required);
+        assert_eq!(
+            at_limit.detail.as_deref(),
+            Some("data_dir is 150 characters")
         );
-        Ok(())
+
+        let above = data_dir_length_component(&dir_of(151), true, 150);
+        assert!(!above.ready);
+        assert!(!above.required);
+        let detail = above.detail.unwrap();
+        assert!(detail.contains("151 characters"), "{detail}");
+        assert!(detail.contains("260"), "{detail}");
+        assert!(detail.contains("shorter data_dir"), "{detail}");
+
+        // Other platforms have no such limit, however long the path.
+        let elsewhere = data_dir_length_component(&dir_of(300), false, 150);
+        assert!(elsewhere.ready);
+        assert!(!elsewhere.required);
+        assert_eq!(
+            elsewhere.detail.as_deref(),
+            Some("data_dir is 300 characters")
+        );
+    }
+
+    #[test]
+    fn data_dir_length_counts_characters_not_bytes() {
+        // 100 two-byte characters are 200 bytes but 100 characters.
+        let multibyte: std::path::PathBuf = "é".repeat(100).into();
+        let component = data_dir_length_component(&multibyte, true, 150);
+        assert!(component.ready);
+        assert_eq!(
+            component.detail.as_deref(),
+            Some("data_dir is 100 characters")
+        );
     }
 }

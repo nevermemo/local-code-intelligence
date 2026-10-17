@@ -5,7 +5,7 @@
 use super::missing::{MissingServerSpec, ProcessCheck};
 use anyhow::Result;
 
-const PRODUCTION_CS: &str = r#"namespace Acceptance;
+const PRODUCTION_CS: &str = r"namespace Acceptance;
 
 public interface ICalculator { int Add(int left, int right); }
 
@@ -13,12 +13,12 @@ public sealed class Calculator : ICalculator
 {
     public int Add(int left, int right) => left + right;
 }
-"#;
+";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

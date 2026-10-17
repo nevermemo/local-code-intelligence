@@ -13,7 +13,7 @@
 use super::missing::{MissingServerSpec, ProcessCheck};
 use anyhow::Result;
 
-const PRODUCTION_TS: &str = r#"export interface ICalculator {
+const PRODUCTION_TS: &str = r"export interface ICalculator {
   add(left: number, right: number): number;
 }
 
@@ -22,12 +22,12 @@ export class Calculator implements ICalculator {
     return left + right;
   }
 }
-"#;
+";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

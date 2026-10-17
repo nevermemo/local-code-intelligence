@@ -3,14 +3,16 @@
 use super::{App, WorkspaceCoordination, ms};
 use crate::{
     chunk,
+    config::fill_template,
     manifest::{self, Manifest},
-    store::Store,
+    models::{self, Models},
+    store::{Store, vector_key},
     workspace::Workspace,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::Instant,
@@ -27,7 +29,86 @@ pub struct IndexReport {
     pub parsed_files: usize,
     pub unchanged_files: usize,
     pub removed_files: usize,
+    /// Files with a source extension left out of the index because their
+    /// content is another format (a Qt Linguist `.ts` catalog is XML, not
+    /// TypeScript). They are not counted in `files` and have no chunks.
+    pub skipped_non_source_files: usize,
+    /// Files that were not valid UTF-8 and were indexed from a lossy decoding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lossy_decoded_files: Vec<String>,
+    /// Chunks (`path:start_line`) the embedding service rejected as too long,
+    /// whose vectors were computed from a shortened prefix instead. The full
+    /// chunk is still stored, returned, and lexically searchable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_for_embedding: Vec<String>,
     pub total_ms: f64,
+}
+
+/// Shortest prefix (in bytes) an oversized input is cut down to before
+/// giving up: below this, a rejection can't plausibly be about length.
+const MIN_EMBED_PREFIX_BYTES: usize = 512;
+
+/// The text embedded for `chunk`: `template` (`embedding_document_template`)
+/// with `{code}` replaced by the chunk's source and `{path}` by its
+/// repository-relative file path. The default template `{code}` yields the
+/// source unchanged. The oversized-input fallback below shortens this
+/// formatted text from its end, so a prefix from the template survives.
+pub(super) fn document_text(template: &str, chunk: &chunk::Chunk) -> String {
+    fill_template(
+        template,
+        &[
+            ("code", chunk.code.as_str()),
+            ("path", chunk.relative_file_path.as_str()),
+        ],
+    )
+}
+
+/// Embeds one batch of document texts. When the service rejects the batch's
+/// input itself (HTTP 400/413/422 -- typically one chunk longer than the
+/// model's context, e.g. a large generated literal the chunker cannot
+/// split), the batch is retried one input at a time, and each rejected
+/// input is embedded from a progressively halved prefix. One oversized
+/// chunk therefore costs a few extra requests instead of failing the whole
+/// indexing pass. Returns the vectors plus the batch positions that had to
+/// be shortened. Any other error -- or a rejection that persists down to
+/// [`MIN_EMBED_PREFIX_BYTES`] -- is returned unchanged.
+async fn embed_isolating_oversized(
+    models: &Models,
+    texts: &[String],
+) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
+    match models.embed(texts).await {
+        Ok(vectors) => return Ok((vectors, Vec::new())),
+        Err(error) if !models::is_input_rejected(&error) => return Err(error),
+        Err(_) => {}
+    }
+    let mut vectors = Vec::with_capacity(texts.len());
+    let mut shortened = Vec::new();
+    for (position, text) in texts.iter().enumerate() {
+        let mut input = text.as_str();
+        loop {
+            match models.embed(&[input.to_owned()]).await {
+                Ok(mut vector) => {
+                    vectors.push(vector.remove(0));
+                    if input.len() < text.len() {
+                        shortened.push(position);
+                    }
+                    break;
+                }
+                Err(error)
+                    if models::is_input_rejected(&error)
+                        && input.len() / 2 >= MIN_EMBED_PREFIX_BYTES =>
+                {
+                    let mut end = input.len() / 2;
+                    while !input.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    input = &input[..end];
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok((vectors, shortened))
 }
 
 #[derive(Debug, Serialize)]
@@ -39,14 +120,33 @@ pub struct Status {
     pub embedding_dimension: Option<usize>,
     pub compatible: bool,
     pub stale: bool,
+    /// Why staleness could not be determined (e.g. an unreadable file);
+    /// `stale` is then reported as `true` for an indexed workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_check_error: Option<String>,
     pub watched: bool,
+    /// Deprecated, kept for one release: `analyzers_running["rust-analyzer"]`.
     pub analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["csharp-ls"]`.
     pub csharp_analyzer_running: bool,
+    /// Deprecated, kept for one release:
+    /// `analyzers_running["typescript-language-server"]`.
     pub typescript_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["pyright"]`.
     pub python_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["gopls"]`.
     pub go_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["jdtls"]`.
     pub java_analyzer_running: bool,
+    /// Deprecated, kept for one release: `analyzers_running["clangd"]`.
     pub clangd_analyzer_running: bool,
+    /// Whether a started, ready language server is running for this
+    /// workspace, keyed by provider name (`rust-analyzer`, `csharp-ls`,
+    /// `typescript-language-server`, `pyright`, `gopls`, `jdtls`, `clangd`).
+    /// Derived from the language-server registry, so it has one entry for
+    /// every registered server, `false` for one that is not running, disabled
+    /// or unconfigured.
+    pub analyzers_running: BTreeMap<String, bool>,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -82,11 +182,106 @@ pub enum IndexAction {
 }
 
 impl App {
+    /// Embeds every chunk whose vector key `cache` lacks (each key once) and
+    /// adds the vectors to `cache`; returns how many it embedded. Chunks the
+    /// service accepted only as a shortened prefix are recorded in
+    /// `truncated_for_embedding`.
+    async fn embed_missing(
+        &self,
+        workspace: &Workspace,
+        chunks: &[chunk::Chunk],
+        key_of: &impl Fn(&chunk::Chunk) -> String,
+        cache: &mut HashMap<String, Vec<f32>>,
+        truncated_for_embedding: &mut Vec<String>,
+    ) -> Result<usize> {
+        let template = &self.config.embedding_document_template;
+        let mut seen = HashSet::new();
+        let missing: Vec<_> = chunks
+            .iter()
+            .filter(|&c| {
+                let key = key_of(c);
+                !cache.contains_key(&key) && seen.insert(key)
+            })
+            .collect();
+        for (i, batch) in missing.chunks(self.config.embedding_batch_size).enumerate() {
+            let texts: Vec<_> = batch.iter().map(|c| document_text(template, c)).collect();
+            let (vectors, shortened) = embed_isolating_oversized(&self.models, &texts)
+                .await
+                .with_context(|| {
+                    let first = batch[0];
+                    format!(
+                        "embedding a batch starting at {}:{}",
+                        first.relative_file_path, first.start_line
+                    )
+                })?;
+            for position in shortened {
+                let chunk = batch[position];
+                let location = format!("{}:{}", chunk.relative_file_path, chunk.start_line);
+                tracing::warn!(workspace_id = %workspace.id, chunk = %location, bytes = texts[position].len(), "embedding service rejected the full chunk as too long; embedded a shortened prefix");
+                truncated_for_embedding.push(location);
+            }
+            for (&c, vector) in batch.iter().zip(vectors) {
+                cache.insert(key_of(c), vector);
+            }
+            tracing::info!(workspace_id = %workspace.id, completed = ((i+1)*self.config.embedding_batch_size).min(missing.len()), total = missing.len(), "embedding chunks");
+        }
+        Ok(missing.len())
+    }
+
+    /// The vector width the embedding service returns now, from embedding a
+    /// prefix of the first chunk (at most `MIN_EMBED_PREFIX_BYTES`, which the
+    /// service accepts whenever it accepts any chunk) with one attempt. `None`
+    /// when there is no chunk or the request fails: a failed probe only warns,
+    /// and the run keeps the cached vectors as it would without the probe
+    /// (fail-open), without paying index-time retries or backoff.
+    async fn probe_dimension(
+        &self,
+        workspace: &Workspace,
+        chunks: &[chunk::Chunk],
+    ) -> Option<usize> {
+        let text = document_text(&self.config.embedding_document_template, chunks.first()?);
+        let mut end = text.len().min(MIN_EMBED_PREFIX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        match self.models.embed_once(&[text[..end].to_owned()]).await {
+            Ok(vectors) => vectors.first().map(Vec::len),
+            Err(error) => {
+                tracing::warn!(workspace_id = %workspace.id, error = %format!("{error:#}"), "could not check the embedding width; reusing the cached vectors");
+                None
+            }
+        }
+    }
+
     pub async fn index(&self, path: &Path) -> Result<IndexReport> {
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let coordination = self.lock(&workspace.id).await;
         let _write = coordination.lock.write().await;
-        self.index_locked(workspace).await
+        *coordination.flight_error.lock().await = None;
+        let result = self.index_locked(workspace).await;
+        if let Err(error) = &result {
+            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    async fn index_if_stale(&self, workspace: &Workspace) -> Result<()> {
+        let coordination = self.lock(&workspace.id).await;
+        let _write = coordination.lock.write().await;
+        // A job ahead of the watcher may already have committed the change.
+        // Scan again under the lock: the pre-debounce fingerprint can be old.
+        let root = workspace.path.clone();
+        let current = tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??;
+        let persisted = manifest::try_load(&self.config.data_dir, workspace)?;
+        if persisted.fingerprint == current {
+            return Ok(());
+        }
+        *coordination.flight_error.lock().await = None;
+        let result = self.index_locked(workspace.clone()).await;
+        if let Err(error) = &result {
+            *coordination.flight_error.lock().await = Some(format!("{error:#}"));
+        }
+        result.map(|_| ())
     }
 
     /// Runs the indexing pipeline for `workspace`, assuming the caller already
@@ -96,7 +291,8 @@ impl App {
     pub(super) async fn index_locked(&self, workspace: Workspace) -> Result<IndexReport> {
         let start = Instant::now();
         let _index = self.index_lock.lock().await;
-        let prior_manifest = manifest::load(&self.config.data_dir, &workspace);
+        let _data_dir_lock = super::lock_data_dir_for_indexing(&self.config.data_dir).await?;
+        let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let root = workspace.path.clone();
         let prior_files = prior_manifest.files;
         let scan =
@@ -105,41 +301,83 @@ impl App {
         let chunks = scan.chunks;
         let previous = self.store.snapshot(&workspace).await?;
         let identity = self.config.embedding_identity();
+        let template = &self.config.embedding_document_template;
+        // A template that embeds the file path makes a vector depend on the
+        // file as well as the code, so the vector cache is keyed by both.
+        let uses_path = template.contains("{path}");
+        let key_of =
+            |c: &chunk::Chunk| vector_key(uses_path, &c.content_hash, &c.relative_file_path);
         let mut cache = match &previous {
-            Some(s) if s.identity == identity => Store::cached_vectors(s).await?,
+            Some(s) if s.identity == identity => Store::cached_vectors(s, uses_path).await?,
             _ => HashMap::new(),
         };
+        let mut cached_keys: HashSet<String> = cache.keys().cloned().collect();
+        let mut truncated_for_embedding = Vec::new();
+        let mut embedded_chunks = self
+            .embed_missing(
+                &workspace,
+                &chunks,
+                &key_of,
+                &mut cache,
+                &mut truncated_for_embedding,
+            )
+            .await?;
+        // The identity names the URL and model, not the width: a service can
+        // start returning another width under both. Cached vectors of another
+        // width than the service returns now are embedded again; mixing widths
+        // would fail the commit, and an index of the old width fails every
+        // search. The width comes from this process's latest embedding
+        // response; a probe is sent only when there was none and the cache is
+        // not empty (a first index never probes), so an unchanged run in a
+        // process that has embedded before still sends no request.
+        // Known gap: a width change seen by no request since this process's
+        // last one (no search, no changed chunk) is found by the next search,
+        // which warns, and the index run after it repairs.
+        if !cached_keys.is_empty() {
+            let current = match self.models.observed_dimension() {
+                Some(dimension) => Some(dimension),
+                None => self.probe_dimension(&workspace, &chunks).await,
+            };
+            if let Some(current) = current
+                && cache.values().any(|vector| vector.len() != current)
+            {
+                tracing::warn!(workspace_id = %workspace.id, dimension = current, "the embedding service returns another vector width than the cached vectors; embedding them again");
+                cache.retain(|_, vector| vector.len() == current);
+                cached_keys.retain(|key| cache.contains_key(key));
+                embedded_chunks += self
+                    .embed_missing(
+                        &workspace,
+                        &chunks,
+                        &key_of,
+                        &mut cache,
+                        &mut truncated_for_embedding,
+                    )
+                    .await?;
+            }
+        }
         let reused_chunks = chunks
             .iter()
-            .filter(|c| cache.contains_key(&c.content_hash))
+            .filter(|&c| cached_keys.contains(&key_of(c)))
             .count();
-        let mut seen = HashSet::new();
-        let missing: Vec<_> = chunks
-            .iter()
-            .filter(|c| !cache.contains_key(&c.content_hash) && seen.insert(c.content_hash.clone()))
-            .collect();
-        let embedded_chunks = missing.len();
-        for (i, batch) in missing.chunks(self.config.embedding_batch_size).enumerate() {
-            let texts: Vec<_> = batch.iter().map(|c| c.code.clone()).collect();
-            let vectors = self.models.embed(&texts).await?;
-            for (c, vector) in batch.iter().zip(vectors) {
-                cache.insert(c.content_hash.clone(), vector);
-            }
-            tracing::info!(workspace_id = %workspace.id, completed = ((i+1)*self.config.embedding_batch_size).min(missing.len()), total = missing.len(), "embedding chunks");
-        }
-        let vectors: Vec<_> = chunks
-            .iter()
-            .map(|c| cache[&c.content_hash].clone())
-            .collect();
+        let vectors: Vec<_> = chunks.iter().map(|c| cache[&key_of(c)].clone()).collect();
         let dimension = vectors
             .first()
             .map(Vec::len)
             .or_else(|| previous.as_ref().map(|s| s.dimension))
             .unwrap_or(1);
+        drop(previous);
         self.store
             .replace(&workspace, &chunks, &vectors, &identity, dimension)
             .await?;
         let files = scan.files.len();
+        for path in &scan.lossy_files {
+            tracing::warn!(workspace_id = %workspace.id, file = %path, "file is not valid UTF-8; indexed from a lossy decoding");
+        }
+        let lossy_decoded_files = scan.lossy_files;
+        let skipped_non_source_files = scan.skipped_files.len();
+        if let Some(first) = scan.skipped_files.first() {
+            tracing::info!(workspace_id = %workspace.id, skipped = skipped_non_source_files, first = %first.relative_path, reason = first.reason.identifier(), "skipped files whose content is not source for their extension");
+        }
         let next_manifest = Manifest {
             version: manifest::VERSION,
             workspace_id: workspace.id.clone(),
@@ -157,6 +395,9 @@ impl App {
             parsed_files: scan.parsed_files,
             unchanged_files: scan.unchanged_files,
             removed_files: scan.removed_files,
+            skipped_non_source_files,
+            lossy_decoded_files,
+            truncated_for_embedding,
             total_ms: ms(start),
         })
     }
@@ -185,7 +426,21 @@ impl App {
         };
         let current_fingerprint = if due {
             let root = workspace.path.clone();
-            Some(tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??)
+            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+                Ok(fingerprint) => Some(fingerprint),
+                // A file that can't be read (permissions, a file vanishing
+                // mid-walk) must not turn ordinary search into a hard
+                // failure while a compatible snapshot exists.
+                Err(error) if !identity_changed => {
+                    return Ok((
+                        IndexAction::Reused,
+                        Some(format!(
+                            "staleness check unavailable; reusing previous snapshot: {error:#}"
+                        )),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -277,24 +532,54 @@ impl App {
             Some(s) => s.table.count_rows(None).await?,
             None => 0,
         };
-        let stored_manifest = manifest::load(&self.config.data_dir, &workspace);
+        // A manifest that cannot be read makes staleness unknown too: the
+        // snapshot is reported stale and the status says why.
+        let (stored_manifest, manifest_error) =
+            match manifest::try_load(&self.config.data_dir, &workspace) {
+                Ok(stored) => (stored, None),
+                Err(error) => (
+                    manifest::Manifest::empty(&workspace),
+                    Some(format!("{error:#}")),
+                ),
+            };
         let root = workspace.path.clone();
-        let current_fingerprint =
-            tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??;
-        let stale = snapshot.is_some()
-            && (stored_manifest.fingerprint.is_empty()
-                || stored_manifest.fingerprint != current_fingerprint);
+        // An unreadable file makes staleness unknown, not the status call a
+        // failure: report the snapshot as stale and say why.
+        let (stale, stale_check_error) =
+            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+                Ok(current_fingerprint) => (
+                    snapshot.is_some()
+                        && (stored_manifest.fingerprint.is_empty()
+                            || stored_manifest.fingerprint != current_fingerprint),
+                    manifest_error,
+                ),
+                Err(error) => (
+                    snapshot.is_some(),
+                    Some(match manifest_error {
+                        Some(manifest_error) => format!("{manifest_error}; {error:#}"),
+                        None => format!("{error:#}"),
+                    }),
+                ),
+            };
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
-        let analyzer_running = self.analyzer.running("rust-analyzer", &workspace.id).await;
-        let csharp_analyzer_running = self.analyzer.running("csharp-ls", &workspace.id).await;
-        let typescript_analyzer_running = self
-            .analyzer
-            .running("typescript-language-server", &workspace.id)
-            .await;
-        let python_analyzer_running = self.analyzer.running("pyright", &workspace.id).await;
-        let go_analyzer_running = self.analyzer.running("gopls", &workspace.id).await;
-        let java_analyzer_running = self.analyzer.running("jdtls", &workspace.id).await;
-        let clangd_analyzer_running = self.analyzer.running("clangd", &workspace.id).await;
+        let mut analyzers_running = BTreeMap::new();
+        for adapter in self.analyzer.adapters() {
+            let provider = adapter.provider();
+            analyzers_running.insert(
+                provider.to_owned(),
+                self.analyzer.running(provider, &workspace.id).await,
+            );
+        }
+        // The deprecated per-server booleans read the same map, so they can
+        // never disagree with it.
+        let running = |provider: &str| analyzers_running.get(provider).copied().unwrap_or(false);
+        let analyzer_running = running("rust-analyzer");
+        let csharp_analyzer_running = running("csharp-ls");
+        let typescript_analyzer_running = running("typescript-language-server");
+        let python_analyzer_running = running("pyright");
+        let go_analyzer_running = running("gopls");
+        let java_analyzer_running = running("jdtls");
+        let clangd_analyzer_running = running("clangd");
         Ok(Status {
             workspace,
             indexed: snapshot.is_some(),
@@ -308,6 +593,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.identity == self.config.embedding_identity()),
             stale,
+            stale_check_error,
             watched,
             analyzer_running,
             csharp_analyzer_running,
@@ -316,6 +602,7 @@ impl App {
             go_analyzer_running,
             java_analyzer_running,
             clangd_analyzer_running,
+            analyzers_running,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }
@@ -331,7 +618,7 @@ impl App {
             self.store.snapshot(&workspace).await?.is_some(),
             "workspace is not indexed; call index_workspace first"
         );
-        let manifest = manifest::load(&self.config.data_dir, &workspace);
+        let manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let mut files: Vec<IndexedFile> = manifest
             .files
             .into_iter()
@@ -360,7 +647,10 @@ impl App {
             });
         }
         let cancellation = CancellationToken::new();
-        watchers.insert(workspace.id.clone(), cancellation.clone());
+        watchers.insert(
+            workspace.id.clone(),
+            (workspace.clone(), cancellation.clone()),
+        );
         drop(watchers);
 
         let app = Arc::clone(self);
@@ -377,10 +667,19 @@ impl App {
                     _ = interval.tick() => {}
                 }
                 let root = watched_workspace.path.clone();
-                let current = match tokio::task::spawn_blocking(move || chunk::fingerprint(&root))
-                    .await
+                let current = match tokio::task::spawn_blocking(move || {
+                    if !root.try_exists()? {
+                        return Ok(None);
+                    }
+                    chunk::fingerprint(&root).map(Some)
+                })
+                .await
                 {
-                    Ok(Ok(value)) => value,
+                    Ok(Ok(Some(value))) => value,
+                    Ok(Ok(None)) => {
+                        tracing::warn!(workspace_id = %watched_workspace.id, "watched workspace disappeared; stopping watcher");
+                        break;
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(workspace_id = %watched_workspace.id, error = %error, "watch scan failed");
                         continue;
@@ -398,9 +697,15 @@ impl App {
                     _ = cancellation.cancelled() => break,
                     _ = tokio::time::sleep(debounce) => {}
                 }
-                if let Err(error) = app.index(&watched_workspace.path).await {
+                if let Err(error) = app.index_if_stale(&watched_workspace).await {
                     tracing::warn!(workspace_id = %watched_workspace.id, error = %format!("{error:#}"), "automatic reindex failed; previous index retained");
                 }
+            }
+            let mut watchers = app.watchers.lock().await;
+            // Unwatch cancels under this lock; an old task must not remove a replacement.
+            if !cancellation.is_cancelled() {
+                watchers.remove(&watched_workspace.id);
+                cancellation.cancel();
             }
         });
         Ok(WatchReport {
@@ -411,10 +716,21 @@ impl App {
     }
 
     pub async fn unwatch(&self, path: &Path) -> Result<WatchReport> {
-        let workspace = Workspace::resolve(path, &self.config.data_dir)?;
-        let cancellation = self.watchers.lock().await.remove(&workspace.id);
+        let mut watchers = self.watchers.lock().await;
+        let workspace = match Workspace::resolve(path, &self.config.data_dir) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                let absolute = std::path::absolute(path)?;
+                watchers
+                    .values()
+                    .find(|(workspace, _)| workspace.path == absolute)
+                    .map(|(workspace, _)| workspace.clone())
+                    .ok_or(error)?
+            }
+        };
+        let cancellation = watchers.remove(&workspace.id);
         let already_in_requested_state = cancellation.is_none();
-        if let Some(token) = cancellation {
+        if let Some((_, token)) = cancellation {
             token.cancel();
         }
         Ok(WatchReport {
@@ -422,5 +738,45 @@ impl App {
             watched: false,
             already_in_requested_state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(path: &str, code: &str) -> chunk::Chunk {
+        chunk::Chunk {
+            relative_file_path: path.to_owned(),
+            language: "rust".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            code: code.to_owned(),
+            content_hash: "hash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_default_document_template_embeds_the_code_unchanged() {
+        let template = &crate::config::Config::default().embedding_document_template;
+        let source = "fn a() {}\n// {path} stays literal\n";
+        let text = document_text(template, &sample("src/a.rs", source));
+        assert_eq!(text, source);
+    }
+
+    #[test]
+    fn a_document_template_can_carry_the_file_path() {
+        let plain = sample("src/a.rs", "fn a() {}");
+        assert_eq!(
+            document_text("title: {path} | text: {code}", &plain),
+            "title: src/a.rs | text: fn a() {}"
+        );
+        // Code that mentions a placeholder is never expanded, and the
+        // template's own prefix is still in front of it.
+        let tricky = sample("src/a.rs", "let p = \"{path}\";");
+        assert_eq!(
+            document_text("{path}\n{code}", &tricky),
+            "src/a.rs\nlet p = \"{path}\";"
+        );
     }
 }

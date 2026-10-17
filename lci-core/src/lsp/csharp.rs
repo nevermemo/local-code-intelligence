@@ -297,120 +297,126 @@ mod tests {
     }
 
     #[test]
-    fn adapter_reports_csharp_and_cs() {
-        let config = CSharpLspConfig {
-            path: Some("csharp-ls".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = CSharpServer::new(&config, Duration::from_secs(60));
-        assert_eq!(server.language_identifier(), "csharp");
-        assert_eq!(server.extension(), "cs");
-        assert!(server.enabled());
+    fn the_csharp_adapter_follows_the_adapter_contract() {
+        // it reports csharp and cs
+        {
+            let config = CSharpLspConfig {
+                path: Some("csharp-ls".into()),
+                args: vec![],
+                disabled: false,
+            };
+            let server = CSharpServer::new(&config, Duration::from_secs(60));
+            assert_eq!(server.language_identifier(), "csharp");
+            assert_eq!(server.extension(), "cs");
+            assert!(server.enabled());
+        }
+
+        // it is enabled only with a usable path
+        {
+            // Missing path.
+            let missing = CSharpLspConfig::default();
+            assert!(!CSharpServer::new(&missing, Duration::from_secs(60)).enabled());
+            assert!(
+                CSharpServer::new(&missing, Duration::from_secs(60))
+                    .transport_config(Path::new("/tmp"))
+                    .is_none()
+            );
+
+            // Empty path is not silently enabled.
+            let empty = CSharpLspConfig {
+                path: Some("   ".into()),
+                args: vec![],
+                disabled: false,
+            };
+            assert!(!CSharpServer::new(&empty, Duration::from_secs(60)).enabled());
+            assert!(
+                CSharpServer::new(&empty, Duration::from_secs(60))
+                    .transport_config(Path::new("/tmp"))
+                    .is_none()
+            );
+
+            // Explicitly disabled even with a path.
+            let disabled = CSharpLspConfig {
+                path: Some("csharp-ls".into()),
+                args: vec![],
+                disabled: true,
+            };
+            assert!(!CSharpServer::new(&disabled, Duration::from_secs(60)).enabled());
+        }
+
+        // it can be represented without a process
+        {
+            let config = CSharpLspConfig {
+                path: Some("csharp-ls".into()),
+                args: vec!["--stdio".into()],
+                disabled: false,
+            };
+            let server = CSharpServer::new(&config, Duration::from_secs(30));
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let transport = server.transport_config(root).unwrap();
+            assert_eq!(transport.executable, "csharp-ls");
+            assert_eq!(transport.label, "csharp-ls");
+            assert_eq!(server.args(), &["--stdio".to_string()]);
+
+            let params = server.initialize_params(root).unwrap();
+            assert_eq!(params["processId"], std::process::id());
+            assert!(params["rootUri"].as_str().is_some());
+        }
     }
 
     #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        // Missing path.
-        let missing = CSharpLspConfig::default();
-        assert!(!CSharpServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            CSharpServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
-        );
+    fn project_discovery() {
+        // a solution beats a project
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(&root.join("App.csproj"), "<Project/>");
+            write(&root.join("Solution.sln"), "");
+            let project = discover_project(root);
+            assert_eq!(project.kind, ProjectKind::Solution);
+            assert_eq!(project.path, root.join("Solution.sln"));
+        }
 
-        // Empty path is not silently enabled.
-        let empty = CSharpLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        };
-        assert!(!CSharpServer::new(&empty, Duration::from_secs(60)).enabled());
-        assert!(
-            CSharpServer::new(&empty, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
-        );
+        // a project, then the root
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(&root.join("App.csproj"), "<Project/>");
+            let project = discover_project(root);
+            assert_eq!(project.kind, ProjectKind::Project);
+            assert_eq!(project.path, root.join("App.csproj"));
 
-        // Explicitly disabled even with a path.
-        let disabled = CSharpLspConfig {
-            path: Some("csharp-ls".into()),
-            args: vec![],
-            disabled: true,
-        };
-        assert!(!CSharpServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
+            let empty = tempfile::tempdir().unwrap();
+            let rootless = discover_project(empty.path());
+            assert_eq!(rootless.kind, ProjectKind::Root);
+            assert_eq!(rootless.path, empty.path().to_path_buf());
+        }
 
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let config = CSharpLspConfig {
-            path: Some("csharp-ls".into()),
-            args: vec!["--stdio".into()],
-            disabled: false,
-        };
-        let server = CSharpServer::new(&config, Duration::from_secs(30));
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let transport = server.transport_config(root).unwrap();
-        assert_eq!(transport.executable, "csharp-ls");
-        assert_eq!(transport.label, "csharp-ls");
-        assert_eq!(server.args(), &["--stdio".to_string()]);
+        // shallowest first, then lexicographic
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            // Two projects at the same depth: lexicographic tie-break.
+            write(&root.join("b.csproj"), "<Project/>");
+            write(&root.join("a.csproj"), "<Project/>");
+            // A deeper project should lose to the shallower one.
+            write(&root.join("deep").join("z.csproj"), "<Project/>");
+            let project = discover_project(root);
+            assert_eq!(project.kind, ProjectKind::Project);
+            assert_eq!(project.path, root.join("a.csproj"));
+        }
 
-        let params = server.initialize_params(root).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
-    }
-
-    #[test]
-    fn discovery_prefers_solution_over_project() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        write(&root.join("App.csproj"), "<Project/>");
-        write(&root.join("Solution.sln"), "");
-        let project = discover_project(root);
-        assert_eq!(project.kind, ProjectKind::Solution);
-        assert_eq!(project.path, root.join("Solution.sln"));
-    }
-
-    #[test]
-    fn discovery_falls_back_to_project_then_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        write(&root.join("App.csproj"), "<Project/>");
-        let project = discover_project(root);
-        assert_eq!(project.kind, ProjectKind::Project);
-        assert_eq!(project.path, root.join("App.csproj"));
-
-        let empty = tempfile::tempdir().unwrap();
-        let rootless = discover_project(empty.path());
-        assert_eq!(rootless.kind, ProjectKind::Root);
-        assert_eq!(rootless.path, empty.path().to_path_buf());
-    }
-
-    #[test]
-    fn discovery_is_deterministic_shallowest_then_lexicographic() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        // Two projects at the same depth: lexicographic tie-break.
-        write(&root.join("b.csproj"), "<Project/>");
-        write(&root.join("a.csproj"), "<Project/>");
-        // A deeper project should lose to the shallower one.
-        write(&root.join("deep").join("z.csproj"), "<Project/>");
-        let project = discover_project(root);
-        assert_eq!(project.kind, ProjectKind::Project);
-        assert_eq!(project.path, root.join("a.csproj"));
-    }
-
-    #[test]
-    fn discovery_skips_build_and_hidden_directories() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        write(&root.join("obj").join("gen.csproj"), "<Project/>");
-        write(&root.join(".git").join("hidden.csproj"), "<Project/>");
-        write(&root.join("real.csproj"), "<Project/>");
-        let project = discover_project(root);
-        assert_eq!(project.kind, ProjectKind::Project);
-        assert_eq!(project.path, root.join("real.csproj"));
+        // build and hidden directories are skipped
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(&root.join("obj").join("gen.csproj"), "<Project/>");
+            write(&root.join(".git").join("hidden.csproj"), "<Project/>");
+            write(&root.join("real.csproj"), "<Project/>");
+            let project = discover_project(root);
+            assert_eq!(project.kind, ProjectKind::Project);
+            assert_eq!(project.path, root.join("real.csproj"));
+        }
     }
 }

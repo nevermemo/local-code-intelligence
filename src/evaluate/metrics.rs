@@ -1,28 +1,17 @@
-use std::collections::BTreeMap;
-
-use anyhow::Result;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filter::GlobPattern;
 
 use super::types::{
-    AggregateReport, EvalQuery, IndexLifecycleAction, QueryMetrics, QueryReport, RerankerState,
-    ResultEvidence,
+    AggregateReport, EvalQuery, EvalTimings, IndexLifecycleAction, LatencyPercentiles,
+    QueryMetrics, QueryReport, RerankerState, ResultEvidence, StageLatency, TagAggregate,
 };
 // ---------------------------------------------------------------------------
 // Pure metrics
 // ---------------------------------------------------------------------------
 
-/// Validate a repository-relative path pattern.
-///
-/// Patterns must be non-empty, use `/` separators, and stay inside the
-/// repository: no backslashes, no absolute or drive/UNC paths, no `.` or
-/// `..` components, and no leading `/`. Glob metacharacters `*`, `?`, and
-/// `[...]` are allowed.
-pub fn validate_pattern(pattern: &str) -> Result<()> {
-    GlobPattern::compile(pattern)
-        .map(|_| ())
-        .map_err(Into::into)
-}
+pub use lci_core::evaluation::validate_pattern;
 
 /// Whether a repository-relative glob pattern matches a result path.
 ///
@@ -60,6 +49,8 @@ pub fn query_metrics(
                 .any(|pattern| pattern_matches(pattern, &row.relative_file_path))
         })
         .map(|index| index + 1);
+
+    let gold = GoldPatterns::new(query);
 
     let hit = first_expected_rank.is_some();
     let hit_at_1 = first_expected_rank == Some(1);
@@ -168,7 +159,218 @@ pub fn query_metrics(
         reranker: reranker_state(reranked, evidence),
         expected_roles_satisfied,
         required_snippet_found,
+        ndcg_at_10: ndcg_at_10(&gold, evidence),
+        recall_at_3: recall_at_k(&gold, evidence, 3),
+        recall_at_8: recall_at_k(&gold, evidence, 8),
+        file_acc_at_5: file_acc_at_k(&gold, evidence, 5),
+        file_acc_at_10: file_acc_at_k(&gold, evidence, 10),
     }
+}
+
+/// Number of leading results that count toward nDCG.
+const NDCG_CUTOFF: usize = 10;
+/// Gain of a result that matches an expected path pattern.
+const EXPECTED_GAIN: f64 = 2.0;
+/// Gain of a result that matches only a preferred path pattern.
+const PREFERRED_GAIN: f64 = 1.0;
+
+/// Specificity of a path pattern; smaller sorts first. Literal paths (no
+/// wildcard component) come first, then patterns with fewer wildcard
+/// components, then fewer `**` components, then more literal characters.
+fn specificity(pattern: &str) -> (usize, usize, Reverse<usize>) {
+    let mut wildcard_components = 0;
+    let mut recursive_components = 0;
+    for component in pattern.split('/') {
+        if component == "**" {
+            wildcard_components += 1;
+            recursive_components += 1;
+        } else if component.contains(['*', '?', '[']) {
+            wildcard_components += 1;
+        }
+    }
+    let literal_chars = pattern
+        .chars()
+        .filter(|ch| !matches!(ch, '*' | '?' | '[' | ']'))
+        .count();
+    (
+        wildcard_components,
+        recursive_components,
+        Reverse(literal_chars),
+    )
+}
+
+/// Distinct patterns, most specific first. The order depends only on the
+/// pattern set, never on how the definition happened to list them.
+fn distinct_by_specificity(patterns: &[String]) -> Vec<&str> {
+    let mut distinct: Vec<&str> = patterns
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    distinct.sort_by(|a, b| specificity(a).cmp(&specificity(b)).then_with(|| a.cmp(b)));
+    distinct
+}
+
+/// The distinct gold patterns of one query, prepared once and shared by the
+/// rank-aware metrics.
+struct GoldPatterns<'a> {
+    /// Distinct expected patterns, most specific first.
+    expected: Vec<&'a str>,
+    /// Distinct preferred patterns, most specific first, without any pattern
+    /// that an expected pattern already covers: one that equals an expected
+    /// pattern or that an expected pattern matches as a path (preferred
+    /// `src/slang/mod.rs` under expected `src/slang/**`). Such a result is
+    /// always an expected hit, so its preferred slot could never be earned.
+    preferred: Vec<&'a str>,
+}
+
+impl<'a> GoldPatterns<'a> {
+    fn new(query: &'a EvalQuery) -> Self {
+        let expected = distinct_by_specificity(&query.expected_paths);
+        let preferred = distinct_by_specificity(&query.preferred_paths)
+            .into_iter()
+            .filter(|preferred| {
+                !expected
+                    .iter()
+                    .any(|expected| expected == preferred || pattern_matches(expected, preferred))
+            })
+            .collect();
+        Self {
+            expected,
+            preferred,
+        }
+    }
+}
+
+/// Discounted gain of `gain` at a one-based `rank`.
+fn discounted(gain: f64, rank: usize) -> f64 {
+    gain / (rank as f64 + 1.0).log2()
+}
+
+/// Outcome of matching one result path against a set of gold patterns.
+enum Claim {
+    /// No pattern matches the path.
+    Unmatched,
+    /// The path matched a pattern that no earlier result had satisfied.
+    Claimed,
+    /// Every pattern that matches was already satisfied by an earlier result.
+    Duplicate,
+}
+
+/// Match `path` against `patterns` (most specific first), marking the first
+/// still-unclaimed matching pattern, hence the most specific one, as
+/// satisfied.
+fn claim_pattern(patterns: &[&str], claimed: &mut [bool], path: &str) -> Claim {
+    let mut matched = false;
+    for (index, pattern) in patterns.iter().enumerate() {
+        if pattern_matches(pattern, path) {
+            matched = true;
+            if !claimed[index] {
+                claimed[index] = true;
+                return Claim::Claimed;
+            }
+        }
+    }
+    if matched {
+        Claim::Duplicate
+    } else {
+        Claim::Unmatched
+    }
+}
+
+/// Graded nDCG@10 (see [`QueryMetrics::ndcg_at_10`]).
+///
+/// Each distinct expected pattern is one ideal gain-2 slot and each distinct
+/// preferred pattern not covered by an expected pattern (see
+/// [`GoldPatterns`]) one ideal gain-1 slot. A result earns the gain of the
+/// most specific unsatisfied gold pattern it matches; a result that only
+/// re-matches already satisfied patterns, such as a second chunk of the same
+/// file, earns nothing, which keeps the value at or below 1.
+fn ndcg_at_10(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence]) -> f64 {
+    let GoldPatterns {
+        expected,
+        preferred,
+    } = gold;
+
+    // Expected slots come first, so the ideal gains are already descending.
+    let ideal: f64 = std::iter::repeat_n(EXPECTED_GAIN, expected.len())
+        .chain(std::iter::repeat_n(PREFERRED_GAIN, preferred.len()))
+        .take(NDCG_CUTOFF)
+        .enumerate()
+        .map(|(index, gain)| discounted(gain, index + 1))
+        .sum();
+    if ideal <= 0.0 {
+        return 0.0;
+    }
+
+    let mut expected_claimed = vec![false; expected.len()];
+    let mut expected_files_claimed = BTreeSet::new();
+    let mut preferred_claimed = vec![false; preferred.len()];
+    let dcg: f64 = evidence
+        .iter()
+        .take(NDCG_CUTOFF)
+        .enumerate()
+        .map(|(index, row)| {
+            let path = row.relative_file_path.as_str();
+            let gain = if expected_files_claimed.contains(path) {
+                0.0
+            } else {
+                match claim_pattern(expected, &mut expected_claimed, path) {
+                    Claim::Claimed => {
+                        expected_files_claimed.insert(path.to_owned());
+                        EXPECTED_GAIN
+                    }
+                    Claim::Duplicate => 0.0,
+                    Claim::Unmatched => {
+                        match claim_pattern(preferred, &mut preferred_claimed, path) {
+                            Claim::Claimed => PREFERRED_GAIN,
+                            Claim::Unmatched | Claim::Duplicate => 0.0,
+                        }
+                    }
+                }
+            };
+            discounted(gain, index + 1)
+        })
+        .sum();
+    dcg / ideal
+}
+
+/// Fraction of distinct expected patterns matched by at least one of the
+/// first `k` results; `0.0` when there are no expected patterns.
+fn recall_at_k(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence], k: usize) -> f64 {
+    let expected = &gold.expected;
+    if expected.is_empty() {
+        return 0.0;
+    }
+    let found = expected
+        .iter()
+        .filter(|pattern| {
+            evidence
+                .iter()
+                .take(k)
+                .any(|row| pattern_matches(pattern, &row.relative_file_path))
+        })
+        .count();
+    found as f64 / expected.len() as f64
+}
+
+/// `1.0` when an expected pattern matches one of the first `k` distinct
+/// files, else `0.0`. A file's rank is the rank of its best-ranked chunk, so
+/// repeated chunks of one file occupy a single position.
+fn file_acc_at_k(gold: &GoldPatterns<'_>, evidence: &[ResultEvidence], k: usize) -> f64 {
+    let mut seen = BTreeSet::new();
+    let hit = evidence
+        .iter()
+        .map(|row| row.relative_file_path.as_str())
+        .filter(|path| seen.insert(*path))
+        .take(k)
+        .any(|path| {
+            gold.expected
+                .iter()
+                .any(|pattern| pattern_matches(pattern, path))
+        });
+    f64::from(hit)
 }
 
 /// Derive the reranker state from the reranked flag and evidence scores.
@@ -219,32 +421,16 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
         .filter(|report| report.warning.is_some())
         .count();
 
-    let mrr = if executed_count == 0 {
-        None
-    } else {
-        Some(
-            executed
-                .iter()
-                .map(|report| report.metrics.reciprocal_rank)
-                .sum::<f64>()
-                / executed_count as f64,
-        )
-    };
+    let mrr = mean_metric(&executed, |metrics| metrics.reciprocal_rank);
 
-    let latencies: Vec<f64> = executed
+    let timings: Vec<EvalTimings> = executed
         .iter()
-        .filter_map(|report| report.timings.map(|timings| timings.total_ms))
+        .filter_map(|report| report.timings)
         .collect();
-    let median_latency_ms = if latencies.is_empty() {
-        None
-    } else {
-        Some(median(&latencies))
-    };
-    let p95_latency_ms = if latencies.is_empty() {
-        None
-    } else {
-        Some(percentile(&latencies, 0.95))
-    };
+    // The total-latency fields are the `total_ms` stage, computed once.
+    let stages = stage_latency(&timings);
+    let median_latency_ms = stages.map(|stages| stages.total_ms.p50);
+    let p95_latency_ms = stages.map(|stages| stages.total_ms.p95);
 
     let mut role_distribution = BTreeMap::new();
     for report in &executed {
@@ -265,8 +451,14 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
         hit_at_3_rate: rate(hit_at_3, executed_count),
         hit_at_8_or_window_rate: rate(hit_at_8_or_window, executed_count),
         mrr,
+        mean_ndcg_at_10: mean_metric(&executed, |metrics| metrics.ndcg_at_10),
+        mean_recall_at_3: mean_metric(&executed, |metrics| metrics.recall_at_3),
+        mean_recall_at_8: mean_metric(&executed, |metrics| metrics.recall_at_8),
+        mean_file_acc_at_5: mean_metric(&executed, |metrics| metrics.file_acc_at_5),
+        mean_file_acc_at_10: mean_metric(&executed, |metrics| metrics.file_acc_at_10),
         median_latency_ms,
         p95_latency_ms,
+        stage_latency: stages,
         fallback_queries,
         fallback_rate: rate(fallback_queries, executed_count),
         index_created: executed
@@ -286,9 +478,96 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
                 )
             })
             .count(),
+        index_refreshed: executed
+            .iter()
+            .filter(|report| {
+                matches!(
+                    report.index_action,
+                    Some(IndexLifecycleAction::RefreshedIncrementally)
+                )
+            })
+            .count(),
         role_distribution,
+        by_tag: tag_aggregates(&executed),
         queries: reports.to_vec(),
     }
+}
+
+/// Group the executed reports by query tag and summarize each group. A
+/// query repeating a tag counts once for it, and a query with several tags
+/// counts once in each group.
+fn tag_aggregates(executed: &[&QueryReport]) -> BTreeMap<String, TagAggregate> {
+    let mut groups: BTreeMap<&str, Vec<&QueryReport>> = BTreeMap::new();
+    for report in executed {
+        let distinct: BTreeSet<&str> = report.query.tags.iter().map(String::as_str).collect();
+        for tag in distinct {
+            groups.entry(tag).or_default().push(report);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(tag, reports)| {
+            let count = reports.len() as f64;
+            let share = |hit: fn(&QueryMetrics) -> bool| {
+                reports.iter().filter(|report| hit(&report.metrics)).count() as f64 / count
+            };
+            let mean = |value: fn(&QueryMetrics) -> f64| {
+                reports
+                    .iter()
+                    .map(|report| value(&report.metrics))
+                    .sum::<f64>()
+                    / count
+            };
+            let aggregate = TagAggregate {
+                executed_count: reports.len(),
+                hit_at_1_rate: share(|metrics| metrics.hit_at_1),
+                hit_at_3_rate: share(|metrics| metrics.hit_at_3),
+                mrr: mean(|metrics| metrics.reciprocal_rank),
+                mean_ndcg_at_10: mean(|metrics| metrics.ndcg_at_10),
+            };
+            (tag.to_owned(), aggregate)
+        })
+        .collect()
+}
+
+/// Mean of a per-query metric over the executed reports; `None` when there
+/// are none.
+fn mean_metric(executed: &[&QueryReport], value: impl Fn(&QueryMetrics) -> f64) -> Option<f64> {
+    (!executed.is_empty()).then(|| {
+        executed
+            .iter()
+            .map(|report| value(&report.metrics))
+            .sum::<f64>()
+            / executed.len() as f64
+    })
+}
+
+/// Median, nearest-rank p95, maximum and sample count of a non-empty series.
+fn latency_percentiles(values: impl Iterator<Item = f64>) -> LatencyPercentiles {
+    let values: Vec<f64> = values.collect();
+    LatencyPercentiles {
+        p50: median(&values),
+        p95: percentile(&values, 0.95),
+        max: values.iter().copied().fold(f64::MIN, f64::max),
+        n: values.len(),
+    }
+}
+
+/// Per-stage latency percentiles over the given timings; `None` when empty.
+fn stage_latency(timings: &[EvalTimings]) -> Option<StageLatency> {
+    if timings.is_empty() {
+        return None;
+    }
+    let stage = |select: fn(&EvalTimings) -> f64| latency_percentiles(timings.iter().map(select));
+    Some(StageLatency {
+        query_embedding_ms: stage(|timings| timings.query_embedding_ms),
+        lancedb_search_ms: stage(|timings| timings.lancedb_search_ms),
+        lexical_search_ms: stage(|timings| timings.lexical_search_ms),
+        lsp_search_ms: stage(|timings| timings.lsp_search_ms),
+        fusion_ms: stage(|timings| timings.fusion_ms),
+        reranking_ms: stage(|timings| timings.reranking_ms),
+        total_ms: stage(|timings| timings.total_ms),
+    })
 }
 
 /// `numerator / denominator` as a rate in `[0, 1]`; `None` when the

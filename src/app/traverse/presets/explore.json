@@ -1,0 +1,4 @@
+{
+  "description": "The default policy, and what a call with no policy runs: no rules, no stop triggers, no map weights, the default ladder (rules, then agent). The walk ends at its budget or on the score bound. Its first stage and walk are those of the [traverse] keys: the first stage (exact cards, then the start nodes) ahead of the walk's results.",
+  "steer": {}
+}

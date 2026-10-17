@@ -121,16 +121,33 @@ pub fn classify_source_role(relative_path: &str) -> SourceRole {
     if is_benchmark(&dir_components, file_name) {
         return SourceRole::Benchmark;
     }
-    if is_example(&dir_components, file_name) {
+    // Example/documentation/configuration are repository-layout
+    // conventions. Directories below a JVM source root are package names
+    // (`com/example`, `org/acme/config`), not layout, so they don't count.
+    let layout_dirs = layout_components(&dir_components);
+    if is_example(layout_dirs, file_name) {
         return SourceRole::Example;
     }
-    if is_documentation(&dir_components) {
+    if is_documentation(layout_dirs) {
         return SourceRole::Documentation;
     }
-    if is_configuration(&dir_components) {
+    if is_configuration(layout_dirs, file_name) {
         return SourceRole::Configuration;
     }
     SourceRole::Source
+}
+
+/// Directory components that describe repository layout: all of them,
+/// except that in a Maven/Gradle tree (`src/<sourceSet>/<java|kotlin|scala|
+/// groovy>/...`) the components after the language root are package names.
+fn layout_components<'a>(dirs: &'a [&'a str]) -> &'a [&'a str] {
+    let jvm_root = dirs.windows(3).position(|window| {
+        window[0] == "src" && matches!(window[2], "java" | "kotlin" | "scala" | "groovy")
+    });
+    match jvm_root {
+        Some(start) => &dirs[..start + 3],
+        None => dirs,
+    }
 }
 
 fn is_generated(dirs: &[&str], file_name: &str) -> bool {
@@ -161,10 +178,14 @@ fn is_supported_source_file_name(file_name: &str) -> bool {
 }
 
 fn is_test(dirs: &[&str], file_name: &str) -> bool {
-    if dirs
-        .iter()
-        .any(|c| matches!(*c, "test" | "tests" | "__tests__"))
-    {
+    // `androidTest`, `integrationTest`, and `testFixtures` are Gradle/Android
+    // test source sets (`app/src/androidTest/java/...`).
+    if dirs.iter().any(|c| {
+        matches!(
+            *c,
+            "test" | "tests" | "__tests__" | "androidTest" | "integrationTest" | "testFixtures"
+        )
+    }) {
         return true;
     }
     is_test_file_name(file_name)
@@ -193,6 +214,62 @@ fn is_test_file_name(file_name: &str) -> bool {
         if file_name.ends_with(suffix) {
             return true;
         }
+    }
+    // Go: `*_test.go` is the only test file convention, and such files sit
+    // next to the production code they test.
+    if file_name.ends_with("_test.go") {
+        return true;
+    }
+    // Java: JUnit/TestNG `*Test`, `*Tests`, `*TestCase`, and Failsafe
+    // integration tests `*IT` (case-sensitive, so `Latest.java` or
+    // `Kit.java` stay source; an all-caps `GIT.java` is not `*IT`).
+    if let Some(stem) = file_name.strip_suffix(".java") {
+        if stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("TestCase") {
+            return true;
+        }
+        if let Some(prefix) = stem.strip_suffix("IT")
+            && prefix
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // C/C++: `*_test`, `*_tests`, `*_unittest(s)` (googletest/Chromium), and
+    // `test_*` (Unity/CMocka) for every registered C/C++ extension: sources
+    // `.c`/`.cpp`/`.cc`/`.cxx` and headers `.h`/`.hpp`/`.hh`/`.hxx` (test
+    // helper headers follow the same names as the test sources).
+    if let Some(stem) = [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"]
+        .iter()
+        .find_map(|extension| file_name.strip_suffix(extension))
+        && (["_test", "_tests", "_unittest", "_unittests"]
+            .iter()
+            .any(|suffix| stem.ends_with(suffix))
+            || stem.starts_with("test_"))
+    {
+        return true;
+    }
+    // Rust: `tests.rs` (the out-of-line `#[cfg(test)] mod tests;`),
+    // `test_*.rs`, `*_test.rs`, `*_tests.rs`. Integration tests under any
+    // `tests/` directory are already caught by the directory rule, and
+    // `benches/` / `examples/` map to the benchmark / example roles.
+    //
+    // A bare `test.rs` deliberately stays `source`: unlike `tests.rs` it has
+    // no test-module convention, and it is a legitimate production module
+    // name (this repository's `xtask/src/test.rs` implements the
+    // `cargo xtask test` command). A `test.rs` inside a `test/` or `tests/`
+    // directory is still a test through the directory rule. Test code in an
+    // inline `#[cfg(test)] mod tests { .. }` block inside a source file
+    // cannot be classified from the path; that is chunk-level information,
+    // not a file role.
+    if file_name.strip_suffix(".rs").is_some_and(|stem| {
+        stem == "tests"
+            || stem.starts_with("test_")
+            || stem.ends_with("_test")
+            || stem.ends_with("_tests")
+    }) {
+        return true;
     }
     if file_name.strip_suffix(".cs").is_some_and(|stripped| {
         stripped.ends_with("Tests") || stripped.ends_with("Test") || stripped.ends_with(".Tests")
@@ -244,13 +321,21 @@ fn is_documentation(dirs: &[&str]) -> bool {
         .any(|c| matches!(*c, "doc" | "docs" | "documentation"))
 }
 
-fn is_configuration(dirs: &[&str]) -> bool {
-    dirs.iter().any(|c| {
-        matches!(
-            *c,
-            "config" | "configs" | "configuration" | "scripts" | "tools" | "build"
-        )
-    })
+fn is_configuration(dirs: &[&str], file_name: &str) -> bool {
+    // Tooling directories hold build/maintenance code, whatever its language.
+    if dirs
+        .iter()
+        .any(|c| matches!(*c, "scripts" | "tools" | "build"))
+    {
+        return true;
+    }
+    // A `config/` directory marks configuration *data*. Source code there --
+    // `internal/config/loader.go`, `src/config/index.ts` -- is ordinary
+    // production code that loads configuration, so it stays `source`.
+    !is_supported_source_file_name(file_name)
+        && dirs
+            .iter()
+            .any(|c| matches!(*c, "config" | "configs" | "configuration"))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,26 +344,13 @@ fn is_configuration(dirs: &[&str]) -> bool {
 
 /// Normalize a repository-relative path to use `/` separators.
 ///
-/// Backslashes are converted to forward slashes. Leading and trailing
-/// separators are trimmed. Repeated separators are collapsed.
+/// Backslashes are separators on Windows and ordinary filename characters on
+/// Unix. Leading and trailing separators and `.` components are removed.
+/// Repeated separators are collapsed.
 pub(super) fn normalize_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut prev_sep = false;
-    for ch in path.chars() {
-        let is_sep = ch == '/' || ch == '\\';
-        if is_sep {
-            if !prev_sep && !out.is_empty() {
-                out.push('/');
-            }
-            prev_sep = true;
-        } else {
-            out.push(ch);
-            prev_sep = false;
-        }
-    }
-    // Trim trailing separator.
-    while out.ends_with('/') {
-        out.pop();
-    }
-    out
+    crate::path::normalize_path_separators(path)
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }

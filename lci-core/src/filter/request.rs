@@ -36,13 +36,13 @@ impl GlobPattern {
         if trimmed.is_empty() {
             return Err(FilterError::EmptyPattern);
         }
-        if trimmed.contains('\\') {
-            return Err(FilterError::BackslashInPattern {
+        if is_absolute_pattern(trimmed) {
+            return Err(FilterError::AbsolutePath {
                 pattern: pattern.to_owned(),
             });
         }
-        if is_absolute_pattern(trimmed) {
-            return Err(FilterError::AbsolutePath {
+        if trimmed.contains('\\') {
+            return Err(FilterError::BackslashInPattern {
                 pattern: pattern.to_owned(),
             });
         }
@@ -53,7 +53,15 @@ impl GlobPattern {
                 });
             }
         }
-        let matcher = GlobBuilder::new(trimmed)
+        let normalized = trimmed
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        if normalized.is_empty() {
+            return Err(FilterError::EmptyPattern);
+        }
+        let matcher = GlobBuilder::new(&normalized)
             .literal_separator(true)
             .case_insensitive(false)
             .build()
@@ -85,10 +93,12 @@ fn is_absolute_pattern(pattern: &str) -> bool {
     if pattern.starts_with('/') {
         return true;
     }
-    // Windows drive-letter absolute, e.g. `C:\...` or `C:/...`.
-    if pattern.len() >= 3
-        && pattern.as_bytes()[0].is_ascii_alphabetic()
-        && pattern.as_bytes()[1] == b':'
+    // Windows drive prefix, e.g. `C:`, `C:\...`, or `C:/...`.
+    let bytes = pattern.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
     {
         return true;
     }

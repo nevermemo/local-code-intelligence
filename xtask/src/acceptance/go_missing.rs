@@ -6,10 +6,10 @@ use anyhow::Result;
 
 const CALCULATOR_GO: &str = "package acceptance\n\n// Calculator performs basic arithmetic for acceptance testing.\ntype Calculator struct{}\n\n// Add returns the sum of two integers.\nfunc (c Calculator) Add(a, b int) int {\n\treturn a + b\n}\n";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

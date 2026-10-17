@@ -1,9 +1,15 @@
+pub mod bundle;
 pub mod chunk;
 pub mod config;
+pub mod endpoint;
+pub mod evaluation;
 pub mod filter;
 pub mod language;
 pub mod lexical;
 pub mod lsp;
 pub mod manifest;
 pub mod models;
+pub mod node;
+pub mod path;
+pub mod provider;
 pub mod workspace;

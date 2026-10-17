@@ -25,10 +25,10 @@ use super::recovery::{FixtureScaffold, NavigationProbe, ProcessCheck, RecoverySp
 use anyhow::Result;
 use std::path::PathBuf;
 
-const CALCULATOR_PY: &str = r#"class Calculator:
+const CALCULATOR_PY: &str = r"class Calculator:
     def add(self, a, b):
         return a + b
-"#;
+";
 
 const CALL_SITE_PY: &str = "from .calculator import Calculator\n\n\ndef run(value: Calculator) -> int:\n    return value.add(1, 2)\n";
 

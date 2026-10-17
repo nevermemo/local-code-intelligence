@@ -1,6 +1,12 @@
 mod acceptance;
 mod build;
+mod docs;
+mod env;
+mod gold;
+mod lint;
 mod live_acceptance;
+mod maps;
+mod mine;
 mod setup;
 mod test;
 
@@ -49,7 +55,69 @@ enum Command {
         /// Skip the initial `cargo build --workspace` step.
         #[arg(long)]
         skip_build: bool,
+        /// Fail if any selected step is skipped because a prerequisite is unavailable.
+        #[arg(long)]
+        require_all: bool,
     },
+    /// Resolve the development-tooling paths (work area, plans, frozen
+    /// binaries, checkpoint, ...) by role instead of hard-coding them:
+    /// defaults < .local/machine.toml < LCI_DEV_<KEY>. See
+    /// docs/development/machine-values.md.
+    Env(env::EnvArgs),
+    /// Fail when a tracked text file names a machine-specific location (a
+    /// user profile path, an AppData folder, a client session folder, or a
+    /// literal from the gitignored .local/lint-machine-paths.txt). Prints
+    /// file:line for each hit. Also part of `test --suite Full`. See
+    /// docs/development/machine-values.md, "Lint".
+    LintMachinePaths,
+    /// Documentation checks. See docs/development/documentation.md, rule 9.
+    Docs {
+        #[command(subcommand)]
+        which: DocsCommand,
+    },
+    /// Score, baseline and convert the local gold sets (impact, flow,
+    /// where-to, history, instructions). The gold files live outside the
+    /// repository and are passed with --gold. See
+    /// docs/spike/multimap/v2/gold-scorers.md.
+    Gold {
+        #[command(subcommand)]
+        which: gold::GoldCommand,
+    },
+    /// Multimap spine tooling: `bench` runs `lci traverse` over a gold set,
+    /// scores it and appends a trend row. See docs/spike/multimap/v2/trend.md.
+    Maps {
+        #[command(subcommand)]
+        which: maps::MapsCommand,
+    },
+    /// Mine an evaluation definition from a repository's git history: each
+    /// qualifying commit message becomes a query and the supported source
+    /// files it touched that still exist at HEAD become its expected paths.
+    /// Reads git history only. See README "Retrieval evaluation".
+    MineQueries {
+        /// Root of the git repository to mine.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Workspace key written into the definition; the same key is passed
+        /// to `evaluate --workspace <key>=<path>`.
+        #[arg(long)]
+        key: String,
+        /// Evaluation definition to write, e.g. evaluations/mined/<key>.toml.
+        #[arg(long)]
+        out: PathBuf,
+        /// Keep at most this many queries (the most recent qualifying ones).
+        #[arg(long, default_value_t = 300)]
+        max: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    /// Fail when a relative Markdown link or anchor in a tracked *.md file does
+    /// not resolve (external links are skipped). Excludes the vendored
+    /// .agents/skills/rust-skills; broken links in the frozen records under
+    /// docs/spike/multimap/v2 (*-prereg*.md, *-results.md) are reported but
+    /// never fail. Prints path:line: target (reason).
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -213,6 +281,42 @@ async fn main() -> Result<()> {
                 acceptance::cpp_recovery::run(clangd).await
             }
         },
-        Command::LiveAcceptance { only, skip_build } => live_acceptance::run(only, skip_build),
+        Command::LiveAcceptance {
+            only,
+            skip_build,
+            require_all,
+        } => live_acceptance::run(only, skip_build, require_all),
+        Command::Env(args) => env::run(args),
+        Command::LintMachinePaths => lint::run(),
+        Command::Docs { which } => match which {
+            DocsCommand::Check => docs::run(),
+        },
+        Command::Gold { which } => gold::run(which),
+        Command::Maps { which } => maps::run(which),
+        Command::MineQueries {
+            repo,
+            key,
+            out,
+            max,
+        } => mine::run(repo, key, out, max),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_acceptance_require_all_is_opt_in() {
+        for (args, expected) in [
+            (vec!["xtask", "live-acceptance"], false),
+            (vec!["xtask", "live-acceptance", "--require-all"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::LiveAcceptance { require_all, .. } = cli.command else {
+                panic!("expected live-acceptance command");
+            };
+            assert_eq!(require_all, expected);
+        }
     }
 }

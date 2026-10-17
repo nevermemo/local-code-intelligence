@@ -1,24 +1,41 @@
 # Claude Code entry point
 
-Before doing any non-trivial work in this repository, read `AGENTS.md` at the
-repository root. It defines the product boundaries, working method, and the
-project skills under `.agents/skills/` (`lci-language-adapter`,
-`lci-lsp-adapter`, `lci-retrieval-evaluation`, `lci-release-validation`).
+Read `AGENTS.md` first. It holds the hard rules, approval rules, live-service rules, and working method, and it is client-neutral. This file adds only what is specific to Claude Code.
 
-Load the skill matching the task before starting it -- in particular,
-`.agents/skills/lci-language-adapter/references/acceptance.md` defines the
-full acceptance bar a language must pass before it can be called supported
-(parser/chunk, incremental reuse, deletion reconciliation, restart reuse,
-retrieval, decoy-ranking, and documentation updates). Do not add or claim
-language support without checking that file first.
+## Skills
 
-For the fast `lci-core`-scoped build/test loop, see
-`docs/development/testing.md`.
+Load the matching project skill (under `.agents/skills/`) before starting. The list of skills and when each applies is in `AGENTS.md` "Project skills"; the language-support bar is in `AGENTS.md` "Working method" ("Language support"). For `lci-autonomous-improvement`, the role mapping is below. Fast build/test loop: `docs/development/testing.md`.
 
-This repository dogfoods itself: when the `lci` MCP tools are connected in
-this session, prefer them (`search_code`, `find_definition`,
-`find_references`, `search_symbols`) over ad hoc `grep`/file-by-file reads
-for exploring this codebase. If they are not connected, do not just quietly
-fall back to manual search -- see AGENTS.md's "Working method" section for
-how to check whether the service is running, build/start it if not, and get
-the connection reconnected.
+## Dogfooding with the `lci` MCP server
+
+- Follow `AGENTS.md` "Working method" for `lci` MCP dogfooding and connection recovery.
+- Claude Code cannot re-dial a failed MCP connection; ask the human to reconnect it. Say once that you are using Grep/Read meanwhile.
+- Subagents launched with the Agent tool inherit the same rule; tell them whether `lci` is connected so they do not rediscover it.
+
+## Role mapping for `lci-autonomous-improvement`
+
+| Role | Claude Code mapping |
+| --- | --- |
+| coordinator | The main session. Owns the roadmap, git, gates, usage checks, and every approval request. |
+| planner, reviewer | Agent tool with `model: "fable"`. The reviewer must not be the subagent that wrote the diff. |
+| implementer | Agent tool with `model: "sonnet"`. One bounded edit, an allowed-file list, no commits, no test runs unless the slice says so. |
+| explorer | Occasional Agent tool with `model: "sonnet"` and `run_in_background: true`. Hunts for optimisations or researches an option with no time pressure; "found nothing" is a valid report. |
+
+## Usage check
+
+After each slice, load `mcp__ccd_session_mgmt__get_usage` (ToolSearch `select:mcp__ccd_session_mgmt__get_usage`) and call it. What to do with the numbers is the skill's rule: `lci-autonomous-improvement` "Stopping at the usage limit".
+
+## Commits and approval
+
+- Commit attribution: Claude Code supplies the `Co-Authored-By` trailer through the session's attribution reminder. Do not hand-write a different one, and do not strip it.
+- Approval: `AGENTS.md` "Approval rules" (from the human in chat only).
+
+# Compact instructions
+
+Durable state already lives in `docs/development/roadmap.md`, `docs/decisions.md`, git history, `test-results/`, AGENTS.md, the skills, and the agent's memory files, so a summary only needs what those do not hold:
+
+- Keep: the user's standing mandate and stop rule, approvals granted in this session (verbatim scope), unanswered questions to the user, the branch and last pushed commit, the in-progress roadmap item and its uncommitted files, running background tasks and agents (purpose, what to do when they finish), frozen-binary and scratch config/data paths in use, service state (which models run where, anything temporarily swapped that must be restored), and decisions made but not yet written to the roadmap.
+- Drop: tool output, file contents, diffs, evaluation tables already recorded in the roadmap or commit messages, and finished discussions.
+- After compacting, re-read the roadmap's "Now and next" section and `git status` before acting.
+
+Mechanics for long runs (see the skill's "Compaction strategy"): the owner may set `autoCompactWindow` (e.g. 300000) plus hooks in the gitignored `.claude/settings.local.json` -- a `SessionStart` hook with matcher `compact` that prints the run checkpoint, the roadmap's "Now and next" section and git state, and a `PostToolUse` hook (`if: "Bash(git push*)"`) reminding the agent to refresh the checkpoint after every push. The agent cannot trigger compaction itself; it keeps the checkpoint current so any compaction is cheap. Keep the checkpoint outside the repository, at the checkpoint path (`cargo xtask env checkpoint`; its durable location is recorded in the agent's memory), never in the repo.

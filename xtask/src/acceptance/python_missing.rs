@@ -11,15 +11,15 @@
 use super::missing::{MissingServerSpec, ProcessCheck};
 use anyhow::Result;
 
-const CALCULATOR_PY: &str = r#"class Calculator:
+const CALCULATOR_PY: &str = r"class Calculator:
     def add(self, a, b):
         return a + b
-"#;
+";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

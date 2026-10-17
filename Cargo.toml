@@ -1,11 +1,11 @@
 [workspace]
-members = ["xtask", "lci-core"]
+members = ["xtask", "lci-core", "lci-maps"]
 
 [package]
 name = "local-code-intelligence"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 
 [dependencies]
 anyhow = "1"
@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 dunce = "1"
 futures = "0.3"
 lci-core = { path = "lci-core" }
+lci-maps = { path = "lci-maps" }
 # 0.38.0's job module references Error::Http without a feature guard.
 # Enable remote to compile upstream; the application opens only local paths.
 lancedb = { version = "=0.38.0", default-features = false, features = ["remote"] }
@@ -30,8 +31,17 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# The test-only map entry points (`App::fuse_through_maps`,
+# `App::record_through_maps`) and the wrapped channel maps they use.
+# Renamed from `spike-maps` (decision d366; recorded break, no alias).
+# `cargo xtask test --suite Full` and `--suite Indexing` enable it; the
+# default build has neither (merge condition M3).
+map-equivalence = []
+
 [dev-dependencies]
 tempfile = "3"
+scip = "0.10.0"
 
 [[bin]]
 name = "fake-lsp-server"

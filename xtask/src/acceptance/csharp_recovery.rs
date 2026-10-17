@@ -16,7 +16,7 @@ const CSPROJ: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
 </Project>
 "#;
 
-const PRODUCTION_CS: &str = r#"namespace Acceptance;
+const PRODUCTION_CS: &str = r"namespace Acceptance;
 
 public interface ICalculator { int Add(int left, int right); }
 
@@ -25,7 +25,7 @@ public sealed class Calculator : ICalculator
     public int Add(int left, int right) => left + right;
     public int Use() => Add(2, 3);
 }
-"#;
+";
 
 pub async fn run(csharp_ls: Option<PathBuf>) -> Result<()> {
     super::recovery::run(

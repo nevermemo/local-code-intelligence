@@ -11,9 +11,9 @@
 //! blocks further work until that reply arrives).
 
 use crate::config::PythonLspConfig;
-use crate::lsp::adapter::LspAdapter;
+use crate::lsp::adapter::{LspAdapter, read_for_did_open};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -128,9 +128,9 @@ impl LspAdapter for PythonServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .with_context(|| format!("read {relative} to open in pyright"))?;
+        let Some(content) = read_for_did_open(file, relative, "pyright").await? else {
+            return Ok(());
+        };
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();
@@ -159,67 +159,33 @@ impl LspAdapter for PythonServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::adapter::contract;
 
-    #[test]
-    fn adapter_reports_python() {
+    fn server(path: Option<&str>, args: &[&str], disabled: bool) -> PythonServer {
         let config = PythonLspConfig {
-            path: Some("pyright-langserver".into()),
-            args: vec![],
-            disabled: false,
+            path: path.map(str::to_owned),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            disabled,
         };
-        let server = PythonServer::new(&config, Duration::from_secs(60));
-        assert_eq!(server.languages(), &["python"]);
-        assert!(server.enabled());
+        PythonServer::new(&config, Duration::from_secs(60))
     }
 
     #[test]
-    fn empty_or_missing_path_is_not_enabled() {
-        let missing = PythonLspConfig::default();
-        assert!(!PythonServer::new(&missing, Duration::from_secs(60)).enabled());
-        assert!(
-            PythonServer::new(&missing, Duration::from_secs(60))
-                .transport_config(Path::new("/tmp"))
-                .is_none()
+    fn the_python_adapter_follows_the_adapter_contract() {
+        let usable = server(Some("pyright-langserver"), &[], false);
+        assert_eq!(usable.languages(), &["python"]);
+        contract::assert_enabled_only_with_a_usable_path(
+            |path, disabled| server(path, &[], disabled),
+            "pyright-langserver",
         );
-
-        let empty = PythonLspConfig {
-            path: Some("   ".into()),
-            args: vec![],
-            disabled: false,
-        };
-        assert!(!PythonServer::new(&empty, Duration::from_secs(60)).enabled());
-
-        let disabled = PythonLspConfig {
-            path: Some("pyright-langserver".into()),
-            args: vec![],
-            disabled: true,
-        };
-        assert!(!PythonServer::new(&disabled, Duration::from_secs(60)).enabled());
-    }
-
-    #[test]
-    fn transport_always_includes_stdio_before_configured_args() {
-        let config = PythonLspConfig {
-            path: Some("pyright-langserver".into()),
-            args: vec!["--verbose".into()],
-            disabled: false,
-        };
-        let server = PythonServer::new(&config, Duration::from_secs(30));
-        let transport = server.transport_config(Path::new("/tmp")).unwrap();
+        // --stdio always comes before the configured args.
+        let transport = server(Some("pyright-langserver"), &["--verbose"], false)
+            .transport_config(Path::new("/tmp"))
+            .unwrap();
         assert_eq!(transport.args, vec!["--stdio", "--verbose"]);
-    }
-
-    #[test]
-    fn server_can_be_represented_without_a_process() {
-        let config = PythonLspConfig {
-            path: Some("pyright-langserver".into()),
-            args: vec![],
-            disabled: false,
-        };
-        let server = PythonServer::new(&config, Duration::from_secs(30));
-        let temp = tempfile::tempdir().unwrap();
-        let params = server.initialize_params(temp.path()).unwrap();
-        assert_eq!(params["processId"], std::process::id());
-        assert!(params["rootUri"].as_str().is_some());
+        contract::assert_initialize_params_name_this_process(
+            &usable,
+            tempfile::tempdir().unwrap().path(),
+        );
     }
 }

@@ -102,6 +102,7 @@ pub async fn run(java_dir: Option<PathBuf>) -> Result<()> {
             provider_name: "jdtls",
             generated_dirs: &["bin"],
             cross_file_references: true,
+            extra_probes: vec![],
         },
         java_dir,
     )

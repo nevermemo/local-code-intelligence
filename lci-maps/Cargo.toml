@@ -1,0 +1,26 @@
+[package]
+name = "lci-maps"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# The multimap spike's map layer (slice S2): the `Map` trait, the registry
+# with fail-open, the fusion loop and the contract kit. Depends on `lci-core`
+# only; maps that touch LanceDB live in the root crate. Every dependency is
+# already in Cargo.lock except `scip` (Apache-2.0) and `protobuf` (MIT) for the
+# scored-walk harness of the v2 spike (slice M0.4); `scip` needs no `protoc`.
+# `ignore` (already a dependency of `lci-core`) walks the tree for `grep.live`.
+[dependencies]
+async-trait = "0.1.92"
+futures = "0.3"
+ignore = "0.4"
+lci-core = { path = "../lci-core" }
+protobuf = "=3.7.2"
+scip = "0.10.0"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["time", "macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

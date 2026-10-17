@@ -10,9 +10,8 @@
 //! platform-specific shell script.
 
 use crate::acceptance::{lci_binary, test_results_dir, workspace_root};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::fs::File;
-use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
@@ -28,6 +27,7 @@ struct StepSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Passed,
+    Skipped,
     Failed,
     TimedOut,
 }
@@ -36,6 +36,7 @@ impl Status {
     fn label(self) -> &'static str {
         match self {
             Status::Passed => "PASSED",
+            Status::Skipped => "SKIPPED",
             Status::Failed => "FAILED",
             Status::TimedOut => "TIMED OUT",
         }
@@ -46,6 +47,50 @@ struct StepResult {
     name: String,
     status: Status,
     duration: Duration,
+}
+
+fn completed_status(success: bool, stdout: &str) -> Status {
+    if !success {
+        Status::Failed
+    } else if stdout
+        .lines()
+        .any(|line| line.starts_with("PREREQUISITE_UNAVAILABLE:"))
+    {
+        Status::Skipped
+    } else {
+        Status::Passed
+    }
+}
+
+fn write_summary(
+    results: &[StepResult],
+    require_all: bool,
+    writer: &mut impl std::io::Write,
+) -> Result<&'static str> {
+    for result in results {
+        writeln!(
+            writer,
+            "{}\t{}\t{}s",
+            result.name,
+            result.status.label(),
+            result.duration.as_secs()
+        )?;
+    }
+    let failed = results
+        .iter()
+        .filter(|r| {
+            matches!(r.status, Status::Failed | Status::TimedOut)
+                || (require_all && r.status == Status::Skipped)
+        })
+        .count();
+    if failed != 0 {
+        bail!("{failed} step(s) did not pass.");
+    }
+    if results.iter().any(|r| r.status == Status::Skipped) {
+        Ok("Completed with skipped steps.")
+    } else {
+        Ok("All steps passed.")
+    }
 }
 
 /// The already-built `xtask` binary, mirroring `acceptance::lci_binary()`.
@@ -177,10 +222,13 @@ fn run_step(spec: &StepSpec, log_dir: &std::path::Path) -> Result<StepResult> {
     let mut last_log = started;
     let status = loop {
         if let Some(exit_status) = child.try_wait()? {
-            break if exit_status.success() {
-                Status::Passed
-            } else {
+            break if !exit_status.success() {
                 Status::Failed
+            } else {
+                completed_status(
+                    true,
+                    &String::from_utf8_lossy(&std::fs::read(&stdout_path)?),
+                )
             };
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -261,7 +309,14 @@ fn should_run(only: &[String], name: &str, cmd: &str) -> bool {
     })
 }
 
-pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
+fn select_steps<'a>(steps: &'a [StepSpec], only: &[String]) -> Vec<&'a StepSpec> {
+    steps
+        .iter()
+        .filter(|spec| spec.name == "Build" || should_run(only, spec.name, spec.cmd))
+        .collect()
+}
+
+pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()> {
     let root = workspace_root();
     std::env::set_current_dir(&root)?;
 
@@ -369,6 +424,20 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
     }
 
     if should_run(&only, "Evaluate", "evaluate") {
+        // The evaluation below inherits this process's environment and passes
+        // no --config, so it honours the user-level local overlay and any
+        // LCI_* variable (the self-hosted runner may rely on its machine
+        // overlay). Neither is stripped. Instead, resolve the same
+        // configuration with the same binary and environment first, so this
+        // run's logs show which layers and values the evaluation used (the
+        // step's stdout log is `lci config --json`).
+        steps.push(binary_step(
+            "Evaluate provenance - lci config --json",
+            "evaluate-config",
+            lci_binary(),
+            vec!["config".to_string(), "--json".to_string()],
+            1,
+        ));
         let workspace_arg = format!("self={}", root.display());
         let output_arg = test_results_dir()?.join("evaluation.json");
         steps.push(binary_step(
@@ -387,10 +456,7 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
         ));
     }
 
-    let selected: Vec<&StepSpec> = steps
-        .iter()
-        .filter(|spec| should_run(&only, spec.name, spec.cmd))
-        .collect();
+    let selected = select_steps(&steps, &only);
     if selected.is_empty() {
         println!(
             "No steps matched -only '{}' -- nothing ran.",
@@ -435,25 +501,182 @@ pub fn run(only: Vec<String>, skip_build: bool) -> Result<()> {
 
     let summary_path = log_dir.join("summary.txt");
     let mut summary_file = File::create(&summary_path)?;
-    for result in &results {
-        writeln!(
-            summary_file,
-            "{}\t{}\t{}s",
-            result.name,
-            result.status.label(),
-            result.duration.as_secs()
-        )?;
-    }
     println!("Full logs: {}", log_dir.display());
-
-    let failed: Vec<&StepResult> = results
-        .iter()
-        .filter(|r| r.status != Status::Passed)
-        .collect();
-    if !failed.is_empty() {
-        println!("{} step(s) did not pass.", failed.len());
-        std::process::exit(1);
-    }
-    println!("All steps passed.");
+    println!(
+        "{}",
+        write_summary(&results, require_all, &mut summary_file)?
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selection_test_steps(include_build: bool) -> Vec<StepSpec> {
+        let mut steps = Vec::new();
+        if include_build {
+            steps.push(cargo_step("Build", "build", &["build"], 20));
+        }
+        steps.push(binary_step(
+            "Acceptance - core indexing",
+            "core",
+            "xtask".into(),
+            vec![],
+            20,
+        ));
+        steps.push(binary_step(
+            "Acceptance - core search",
+            "core",
+            "xtask".into(),
+            vec![],
+            20,
+        ));
+        steps.push(binary_step(
+            "Acceptance - multilingual",
+            "multilingual",
+            "xtask".into(),
+            vec![],
+            15,
+        ));
+        steps
+    }
+
+    #[test]
+    fn only_core_keeps_build_and_core_steps() {
+        let steps = selection_test_steps(true);
+        let selected = select_steps(&steps, &["core".to_string()]);
+
+        assert_eq!(
+            selected.iter().map(|step| step.name).collect::<Vec<_>>(),
+            [
+                "Build",
+                "Acceptance - core indexing",
+                "Acceptance - core search"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_core_with_skip_build_keeps_core_steps() {
+        let steps = selection_test_steps(false);
+        let selected = select_steps(&steps, &["core".to_string()]);
+
+        assert_eq!(
+            selected.iter().map(|step| step.name).collect::<Vec<_>>(),
+            ["Acceptance - core indexing", "Acceptance - core search"]
+        );
+    }
+
+    #[test]
+    fn no_only_filter_keeps_every_step() {
+        let steps = selection_test_steps(true);
+        let selected = select_steps(&steps, &[]);
+
+        assert_eq!(selected.len(), steps.len());
+    }
+
+    #[test]
+    fn prerequisite_unavailable_child() {
+        println!("PREREQUISITE_UNAVAILABLE: fake language server not installed");
+    }
+
+    #[test]
+    fn prerequisite_unavailable_is_not_passed() {
+        let log_dir = std::env::temp_dir().join(format!(
+            "xtask-skip-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&log_dir).unwrap();
+        let spec = binary_step(
+            "Fake LSP acceptance",
+            "fake-lsp",
+            std::env::current_exe().unwrap(),
+            vec![
+                "--exact".to_string(),
+                "live_acceptance::tests::prerequisite_unavailable_child".to_string(),
+                "--nocapture".to_string(),
+            ],
+            1,
+        );
+        let result = run_step(&spec, &log_dir).unwrap();
+        std::fs::remove_dir_all(&log_dir).unwrap();
+
+        assert_eq!(result.status.label(), "SKIPPED");
+    }
+
+    #[test]
+    fn skipped_step_is_listed_and_requires_all_to_fail() {
+        let results = [
+            StepResult {
+                name: "Available LSP".to_string(),
+                status: Status::Passed,
+                duration: Duration::from_secs(1),
+            },
+            StepResult {
+                name: "Missing LSP".to_string(),
+                status: completed_status(true, "PREREQUISITE_UNAVAILABLE: fake server"),
+                duration: Duration::ZERO,
+            },
+        ];
+        for require_all in [false, true] {
+            let mut output = Vec::new();
+            let outcome = write_summary(&results, require_all, &mut output);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                "Available LSP\tPASSED\t1s\nMissing LSP\tSKIPPED\t0s\n"
+            );
+            if require_all {
+                assert_eq!(outcome.unwrap_err().to_string(), "1 step(s) did not pass.");
+            } else {
+                assert_eq!(outcome.unwrap(), "Completed with skipped steps.");
+            }
+        }
+    }
+
+    #[test]
+    fn all_passed_summary_succeeds_in_both_modes() {
+        let results = [StepResult {
+            name: "Available LSP".to_string(),
+            status: Status::Passed,
+            duration: Duration::ZERO,
+        }];
+        for require_all in [false, true] {
+            assert_eq!(
+                write_summary(&results, require_all, &mut Vec::new()).unwrap(),
+                "All steps passed."
+            );
+        }
+    }
+
+    #[test]
+    fn failures_and_timeouts_fail_in_both_modes() {
+        for status in [Status::Failed, Status::TimedOut] {
+            let results = [StepResult {
+                name: "Unsuccessful LSP".to_string(),
+                status,
+                duration: Duration::ZERO,
+            }];
+            for require_all in [false, true] {
+                assert!(write_summary(&results, require_all, &mut Vec::new()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn prerequisite_marker_does_not_hide_failure_or_match_incidental_text() {
+        assert_eq!(
+            completed_status(false, "PREREQUISITE_UNAVAILABLE: fake server"),
+            Status::Failed
+        );
+        assert_eq!(completed_status(true, "PASS: fake server"), Status::Passed);
+        assert_eq!(
+            completed_status(true, "diagnostic mentions PREREQUISITE_UNAVAILABLE"),
+            Status::Passed
+        );
+    }
 }
