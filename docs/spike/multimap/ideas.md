@@ -1,20 +1,37 @@
 # Multimap traversal: idea catalogue
 
-Status: a catalogue of candidates, not a plan. An idea is built only after a measurement shows its premise holds
-(the owner's working principle in `docs/development/roadmap.md`, "Strategy checkpoint": measure a premise before
-designing on it, prefer small falsification tests to idea volume). The agent A/B (I-10) decides first whether any of
-it is pursued; on CONTINUE, each map or interface is measured against native tools plus git and a language server,
-and only the winners are built (the roadmap's "Long-range map", branch 2).
+Status: CATALOGUE of candidates, not a plan; nothing here is scheduled. An idea is built only after a measurement shows
+its premise holds (the owner's working principle in [../../development/roadmap.md](../../development/roadmap.md):
+measure a premise before designing on it, prefer small falsification tests to idea volume). Direction since 2026-10-17:
+multimap traversal is the focus ([../../decisions.md](../../decisions.md)); each map or interface is measured against
+native tools plus git and a language server, and only the winners are built. Results of the ideas that were tested:
+[results.md](results.md). Idea ids here (G1, N1, S1, U1 ...) are unrelated to the slice ids N0 to N4 of the results.
 
 Sources:
 - the owner's design;
 - the coordinating agent's proposals;
 - a six-lane idea swarm, each lane forced into a different field, then a synthesis and an independent refutation
   pass by another model family;
-- earlier internal research (not in the repository).
+- earlier internal research (not in the repository; see [lessons.md](lessons.md)).
 
 "Prior" means the earlier internal research already had the idea, "partial" means it had a related one, and "new"
 means a keyword search found nothing. External citations are from memory and must be checked before they are quoted.
+
+## Where the catalogue stands (checked 2026-10-17)
+- Built: pause-and-steer checkpoints as the `steer` object and resumable handle of `search_code` with
+  `mode = traverse` (`lci-maps/src/traverse`: `ladder`, `steer`, `handle`, `stop`); budgets with a time deadline
+  (`budget`, anytime behaviour of G5); a `MapCard` type in `lci-maps`; five recipes and `lci_compose` (up to six
+  operator steps, both off unless `[recipes]` and `[compose]` are enabled), the nearest built form of N1.
+  Details: [engine.md](engine.md).
+- Killed or stopped by measurement: the chained-query schema (slice N1), the in-request edge bandit (slice N2), the
+  trained result filter (slices N4 and N4b). The co-change question ("which files usually change together") was
+  dropped by the 2026-10-17 direction. Each is a DROPPED or FINDING entry in [../../decisions.md](../../decisions.md)
+  and a row in [results.md](results.md).
+- Designed in a spec but not built: separate `traverse_start`, `traverse_continue` and `traverse_steer` tools (there is
+  no such tool in `src/server.rs`; steering rides on `search_code`), the full op catalogue of
+  [specs/steering-ops.md](specs/steering-ops.md), and benchmark-updated map cards
+  ([specs/map-card.md](specs/map-card.md)).
+- Not started: everything else below, unless a row says otherwise.
 
 ## Core (owner)
 - **Many maps over one node-identity space.** The nodes are file, chunk, symbol, commit, test, config key, doc section
@@ -105,27 +122,24 @@ Dropped or folded:
   a raise and a test. The agent gate should add value only when role typing leaves two or more candidates.
 - **C. Merge crossover (S8 + S5 + S9).** Pairs used repeatedly, high fan-out hubs and edit-heavy workloads. Below
   about 5k chunks, on-the-fly joins should always win (the negative control).
+- **D. Map and merge variants (from the earlier research).** Portals through shared keys; other maps (docs, commits,
+  rules) as entry points into the code map; a vector gate on edge choice; two beams meeting for paths; typed next
+  moves with token estimates. Merge forms: one typed adjacency with provenance and witness-agreement confidence
+  (pre-merged), on-demand vector neighbours (on the fly), incrementally maintained views, and a workload-driven advisor
+  that picks views by benefit per unit of RAM and maintenance (materialised on demand).
 
 ## Live agent map (owner): ownership and borrowing for parallel agents
 - **The idea.** A live map over the same node ids records which agent reads or writes which file or symbol, with
-  Rust-like semantics:
-  - shared read borrows with a reader count;
-  - an exclusive write borrow;
-  - weak watches;
-  - leases released on exit or by TTL;
-  - task-scoped lifetimes;
-  - pinned nodes.
+  Rust-like semantics: shared read borrows with a reader count; an exclusive write borrow; weak watches; leases
+  released on exit or by TTL; task-scoped lifetimes; pinned nodes.
 - **Borrow regions are semantic.** Coupled nodes (caller and callee, trait and impl, config key and reader, test and
   code) conflict even without a textual merge conflict.
 - **Enforcement.** Agent tool hooks: an edit asks for a write borrow, a read records a read borrow. Cloud agents get
   launch-time forecasting and landing-time validation.
 - **Rollout.** Advisory first, then enforced where the measurements justify it. New.
-- **Supporting ideas:**
-  - A1, a conflict forecaster and wave scheduler for parallel tasks;
-  - A2, stale-read signals to weak readers (partial);
-  - A3, an optimistic copy-on-write mode with semantic validation at merge;
-  - A4, a living documentation layer (below);
-  - A5, declared lifetimes and scope guards from each task's allowed-file list.
+- **Supporting ideas.** A1, a conflict forecaster and wave scheduler for parallel tasks; A2, stale-read signals to weak
+  readers (partial); A3, an optimistic copy-on-write mode with semantic validation at merge; A4, a living
+  documentation layer (below); A5, declared lifetimes and scope guards from each task's allowed-file list.
 
 ## Living documentation layer (owner): notes, AI files and human docs with a drift watch
 - **Three text maps over the same code nodes.** Human docs, AI instruction files and agent notes. Each is sections with
@@ -133,12 +147,8 @@ Dropped or folded:
 - **Notes.** Anchored to a node and a content hash, with a TTL and confirmations. A stable, confirmed note that no
   document covers becomes a proposed documentation edit for a human to approve.
 - **Translation rules.** Declared in the repository. Each has a source, a traversal, a target, an overlap metric, a
-  threshold and a severity. The rules:
-  - mentions resolve;
-  - code entity sets match the documentation tables both ways;
-  - AI and human sections on the same footprint agree;
-  - each rule has a single owner;
-  - notes expire or retire.
+  threshold and a severity. The rules: mentions resolve; code entity sets match the documentation tables both ways;
+  AI and human sections on the same footprint agree; each rule has a single owner; notes expire or retire.
 - **Overlap scores.** Jaccard and directional coverage between the node footprints that sections reach, plus claim
   agreement. Thresholds are calibrated on the current tree, and alerts fire on drops.
 - **Regular checks.** Incremental on the index change feed, with a watchpoint, a digest, an MCP tool and a CI check.

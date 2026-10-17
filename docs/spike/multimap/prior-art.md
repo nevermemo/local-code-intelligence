@@ -1,7 +1,10 @@
 # Multimap traversal: prior-art survey
 
-Generated: 2026-10-12T04:08Z
-Revised: 2026-10-12T06:51Z (constraint wording: one LCI service, not one OS process)
+Status: REFERENCE (a survey, not a plan). Surveyed 2026-10-12 (generated 04:08Z; constraint wording revised 06:51Z:
+one LCI service, not one OS process). Entries are not re-checked since; the "Implementation status" block
+under the reuse set records what the tree contains as of 2026-10-17. Sections: Recommended reuse set, Unverified
+items, Summary table, then the 43 entries in groups 1 to 8. Evidence for how the spike used these ideas:
+[results.md](results.md), [lessons.md](lessons.md), [ideas.md](ideas.md).
 
 Scope: prior art for the "modular multimap traversal" spike. The idea is to keep
 many indexes ("maps") over the same code units and let a step-wise traversal
@@ -35,12 +38,134 @@ Verdicts:
 How things were checked:
 
 - Licenses were read from each project's LICENSE file on its default branch, or
-  from crates.io metadata for crates, on the date above.
-- Crate versions are the latest crates.io releases on that date.
+  from crates.io metadata for crates, on 2026-10-12 (the survey date).
+- Crate versions are the latest crates.io releases on 2026-10-12.
 - arXiv IDs were checked against each project's README or arXiv search results.
 - Anything not checked this way is marked **unverified**.
 
----
+## Recommended reuse set for the spike
+
+1. **Execution model.** An in-process traversal engine:
+   - a beam or best-first frontier with per-item map provenance (5.10, 5.5);
+   - exposed as stateful MCP tools through the existing `rmcp` (5.9);
+   - a bounded, summarised frontier at each checkpoint (5.1);
+   - an Agentless-style coarse-to-fine default recipe for unattended use (5.2).
+2. **Fusion and expansion.**
+   - Parallel step: keep RRF over the enabled maps.
+   - Sequence step: Personalized PageRank seeded from the current frontier
+     (2.3, 1.5) and k-hop ego expansion over typed edges (1.2, 1.4).
+   - Both are hand-rolled or use `petgraph` (MIT OR Apache-2.0).
+3. **Structural maps without a language server.**
+   - Use `tree-sitter-tags` 0.25.x (MIT) with per-language tag queries for
+     def/ref, import and call approximations (1.5).
+   - Edge rules live in declarative query files, borrowing the tree-sitter-graph
+     idea (4.4).
+4. **Precise maps when available.** Optional `scip` (Apache-2.0) import of
+   `index.scip` from rust-analyzer or the scip-* indexers (4.1), next to the
+   existing LSP navigation. Never required.
+5. **History maps.** `gix` (MIT OR Apache-2.0) to build co-change, with ROSE
+   support and confidence, code-maat thresholds and recency decay (6.1, 6.2,
+   6.4).
+6. **Vector maps.**
+   - Multiple LanceDB tables or columns per embedder x granularity x purpose,
+     on the existing `lancedb`.
+   - Coarse-to-fine through file-level then chunk-level maps (3.6).
+   - Late interaction (3.1, 3.4, 3.5) is deferred until a permissively licensed
+     multi-vector model and Rust multivector query support are confirmed.
+7. **Map selection.**
+   - A deterministic repository profile produces the map plan, with an optional
+     agent-advice hook (7.4).
+   - Query-time routing is heuristic first (7.1, 7.2), with RRF as the fallback.
+8. **Do not use:**
+   - CodeQL (proprietary CLI), Neo4j (separate server, GPL-3.0), Universal Ctags
+     and code-maat (GPL), AutoCodeRover code (source-available), Jina ColBERT v2
+     weights (non-commercial);
+   - `stack-graphs` and `tree-sitter-graph` as dependencies (unmaintained, and
+     they pin `tree-sitter` ^0.24);
+   - any second vector or full-text store (`tantivy`, `hnsw_rs`, `arroy`,
+     `usearch`).
+
+Implementation status (checked 2026-10-17 against `Cargo.toml`, `src/server.rs`, `src/app/recipes.rs` and
+`lci-maps/src/git_history.rs` in the tree this file ships in):
+
+- Step 1, MCP tools (5.9): the traversal is not exposed as `traverse_start`, `traverse_step` and `traverse_result`
+  tools. It is `search_code` with `mode = traverse` (arguments `budget` and `steer`, server key `[traverse] enabled`),
+  plus the recipe tools `impact_rings`, `flow_path`, `flow_from`, `config_neighbours`, `config_readers` and
+  `lci_compose`. `rmcp` =3.2.0 is the transport.
+- Step 4, SCIP import (4.1): the `scip` crate (0.10.0) is a dependency of `lci-maps`; its manifest comment names
+  the scored-walk harness of slice M0.4 as the use.
+- Step 5, history maps (6.4): the git history map shells out to the `git` executable; `gix` and `git2` are not
+  dependencies.
+- Steps 2 and 3: `petgraph` and `tree-sitter-tags` are not dependencies of any workspace crate.
+- Step 8, do-not-use list: none of the listed crates or products is a dependency.
+
+## Unverified items
+
+- CodeRAG / GraphCodeAgent code license.
+- Which ModelScope-Agent subdirectory holds the CodexGraph code.
+- Kythe maintenance level.
+- Archive status of src-d/hercules.
+- Jina ColBERT v2 license: confirmed from Jina's model page and mirrors, not
+  from the Hugging Face card itself.
+- Whether the LanceDB Rust SDK at 0.38.0 supports multivector queries.
+- Windows support of each scip-* indexer.
+- LSIF types in `lsp-types`.
+- Matryoshka support in specific local embedding models.
+- `gix` blame support level.
+- libgit2's own license wording.
+- Glean's storage engine.
+- arXiv IDs for OpenHands (2407.16741), ReAct (2210.03629) and Matryoshka
+  (2205.13147): from general knowledge, not checked against a README this pass.
+- Claude Code and Cursor retrieval descriptions (no primary source retrieved).
+- The citation for sparse versus dense selection (7.3).
+
+## Summary table
+
+| # | Entry | Verdict | Crate | License |
+| --- | --- | --- | --- | --- |
+| 1.1 | CodexGraph | adapt | none | Apache-2.0 (ModelScope-Agent; subdir unverified) |
+| 1.2 | RepoGraph | adapt | none | Apache-2.0 |
+| 1.3 | CodeRAG / GraphCodeAgent | adapt | none | unverified |
+| 1.4 | LocAgent | adapt | none | Apache-2.0 |
+| 1.5 | Aider repo map (PPR) | adapt | `tree-sitter-tags` 0.25.x | Apache-2.0 (aider), MIT (crate) |
+| 1.6 | Sourcegraph / Cody context | adapt (evidence) | none | Apache-2.0 (cody snapshot, zoekt); main repo **proprietary** |
+| 1.7 | Continue @codebase | skip | none | Apache-2.0 |
+| 1.8 | Kythe | skip (borrow vocabulary) | none | Apache-2.0 |
+| 2.1 | Microsoft GraphRAG | skip (adapt module summaries) | `graphrs` | MIT |
+| 2.2 | LightRAG | adapt (edge embeddings) | none | MIT |
+| 2.3 | HippoRAG / HippoRAG 2 | adapt (PPR from seeds) | hand-rolled / `petgraph` | MIT |
+| 2.4 | Neo4j hybrid | skip DB, adapt pattern | none | **GPL-3.0** / commercial (server); Apache-2.0 (python lib) |
+| 3.1 | ColBERT / v2 / PLAID | adapt later | `lancedb` multivector | MIT |
+| 3.2 | ColPali | skip | none | MIT (code) |
+| 3.3 | Jina ColBERT v2 | skip | none | **CC-BY-NC-4.0** (partially verified) |
+| 3.4 | LanceDB multivector | reuse if needed | `lancedb` | Apache-2.0 (Rust API at 0.38 unverified) |
+| 3.5 | PyLate / pylate-rs / FastPlaid | adapt later | `pylate-rs` | MIT |
+| 3.6 | Multi-granularity / Matryoshka | adapt | none | not applicable |
+| 4.1 | SCIP + indexers | reuse (optional import) | `scip` | Apache-2.0 (scip-python MIT) |
+| 4.2 | LSIF | skip | `lsp-types` | MIT |
+| 4.3 | Stack graphs | skip (study design) | `stack-graphs`, `tree-sitter-stack-graphs` | MIT OR Apache-2.0; **unsupported by GitHub** |
+| 4.4 | tree-sitter-graph | adapt idea | `tree-sitter-graph` | MIT OR Apache-2.0 |
+| 4.5 | CodeQL databases | skip | none | **proprietary CLI** (queries MIT) |
+| 4.6 | Glean | skip (adapt fact model) | none | BSD-3-Clause |
+| 4.7 | Universal Ctags | skip | `tree-sitter-tags` instead | **GPL-2.0** |
+| 5.1 | SWE-agent ACI | adapt | none | MIT |
+| 5.2 | Agentless | adapt (default recipe) | none | MIT |
+| 5.3 | AutoCodeRover | adapt idea only | none | **Sonar Source-Available v1.0** |
+| 5.4 | OpenHands | skip | none | MIT |
+| 5.5 | Moatless / SWE-Search MCTS | adapt (beam frontier) | none | MIT / Apache-2.0 |
+| 5.6 | Self-RAG / IRCoT / FLARE | adapt (control pattern) | none | MIT / Apache-2.0 / MIT |
+| 5.7 | ReAct | adapt (framing) | none | not applicable |
+| 5.8 | Claude Code / Cursor observations | adapt (eval baseline) | none | proprietary; **unverified** |
+| 5.9 | MCP tool design | reuse | `rmcp` | MIT and Apache-2.0 (spec) |
+| 5.10 | Beam / frontier search, agent-in-loop | adapt (core model) | std | not applicable |
+| 6.1 | Logical coupling / ROSE | adapt | `gix` | not applicable |
+| 6.2 | code-maat | adapt metrics | none | **GPL-3.0** |
+| 6.3 | hercules (Go) | skip | none | Apache-2.0 |
+| 6.4 | gix / git2 | reuse `gix` | `gix`, `git2` | MIT OR Apache-2.0 |
+| 7.1 | Adaptive-RAG | adapt (heuristic router) | none | Apache-2.0 |
+| 7.2 | RouteLLM | adapt framing | none | Apache-2.0 |
+| 7.3 | Sparse vs dense selection | adapt | none | not applicable (**unverified** citation) |
+| 7.4 | Index advisor / repo profiling | adapt | `ignore`, `globset` | not applicable |
 
 ## 1. Code graph retrieval
 
@@ -158,8 +283,6 @@ How things were checked:
 - **License:** Apache-2.0. Current maintenance level is unverified.
 - **URLs:** https://kythe.io , https://github.com/kythe/kythe
 
----
-
 ## 2. GraphRAG-style graph plus vector retrieval
 
 ### 2.1 Microsoft GraphRAG
@@ -215,8 +338,6 @@ How things were checked:
   - `neo4j-graphrag-python`: Apache-2.0.
   - Neo4j server: **GPL-3.0** (Community) or commercial.
 - **URLs:** https://github.com/neo4j/neo4j-graphrag-python , https://github.com/neo4j/neo4j
-
----
 
 ## 3. Multi-vector and late interaction
 
@@ -293,8 +414,6 @@ How things were checked:
 - **Crate:** none needed. Store it as extra LanceDB vector columns or tables.
 - **License:** not applicable (technique).
 - **URL:** https://arxiv.org/abs/2205.13147 (unverified this pass)
-
----
 
 ## 4. Code knowledge graphs and formats
 
@@ -406,8 +525,6 @@ How things were checked:
 - **Crate:** `tree-sitter-tags` (MIT) is the in-process replacement.
 - **License:** **GPL-2.0**.
 - **URL:** https://github.com/universal-ctags/ctags
-
----
 
 ## 5. Agentic retrieval, pause and steer, tool-in-the-loop
 
@@ -551,8 +668,6 @@ How things were checked:
 - **License:** not applicable.
 - **URL:** none (textbook technique).
 
----
-
 ## 6. Git co-change mining
 
 ### 6.1 Logical coupling and ROSE
@@ -613,8 +728,6 @@ How things were checked:
   linking exception (from general knowledge, unverified this pass).
 - **URLs:** https://github.com/GitoxideLabs/gitoxide , https://github.com/rust-lang/git2-rs
 
----
-
 ## 7. Adaptive index selection and query routing
 
 ### 7.1 Adaptive-RAG
@@ -669,8 +782,6 @@ How things were checked:
 - **License:** not applicable.
 - **URL:** none (technique).
 
----
-
 ## 8. Rust building blocks
 
 | Crate | Version (crates.io, 2026-10-12) | License | Use in spike | Verdict |
@@ -698,115 +809,3 @@ Note on graph storage. Edge maps (calls, imports, co-change, test-to-code and so
 on) can be stored as LanceDB tables (`src_unit, dst_unit, kind, weight,
 provenance`) and loaded into memory for traversal. That keeps "one LCI service, no new
 database". A side file per map in LCI's data directory is the alternative.
-
----
-
-## Summary table
-
-| # | Entry | Verdict | Crate | License |
-| --- | --- | --- | --- | --- |
-| 1.1 | CodexGraph | adapt | none | Apache-2.0 (ModelScope-Agent; subdir unverified) |
-| 1.2 | RepoGraph | adapt | none | Apache-2.0 |
-| 1.3 | CodeRAG / GraphCodeAgent | adapt | none | unverified |
-| 1.4 | LocAgent | adapt | none | Apache-2.0 |
-| 1.5 | Aider repo map (PPR) | adapt | `tree-sitter-tags` 0.25.x | Apache-2.0 (aider), MIT (crate) |
-| 1.6 | Sourcegraph / Cody context | adapt (evidence) | none | Apache-2.0 (cody snapshot, zoekt); main repo **proprietary** |
-| 1.7 | Continue @codebase | skip | none | Apache-2.0 |
-| 1.8 | Kythe | skip (borrow vocabulary) | none | Apache-2.0 |
-| 2.1 | Microsoft GraphRAG | skip (adapt module summaries) | `graphrs` | MIT |
-| 2.2 | LightRAG | adapt (edge embeddings) | none | MIT |
-| 2.3 | HippoRAG / HippoRAG 2 | adapt (PPR from seeds) | hand-rolled / `petgraph` | MIT |
-| 2.4 | Neo4j hybrid | skip DB, adapt pattern | none | **GPL-3.0** / commercial (server); Apache-2.0 (python lib) |
-| 3.1 | ColBERT / v2 / PLAID | adapt later | `lancedb` multivector | MIT |
-| 3.2 | ColPali | skip | none | MIT (code) |
-| 3.3 | Jina ColBERT v2 | skip | none | **CC-BY-NC-4.0** (partially verified) |
-| 3.4 | LanceDB multivector | reuse if needed | `lancedb` | Apache-2.0 (Rust API at 0.38 unverified) |
-| 3.5 | PyLate / pylate-rs / FastPlaid | adapt later | `pylate-rs` | MIT |
-| 3.6 | Multi-granularity / Matryoshka | adapt | none | not applicable |
-| 4.1 | SCIP + indexers | reuse (optional import) | `scip` | Apache-2.0 (scip-python MIT) |
-| 4.2 | LSIF | skip | `lsp-types` | MIT |
-| 4.3 | Stack graphs | skip (study design) | `stack-graphs`, `tree-sitter-stack-graphs` | MIT OR Apache-2.0; **unsupported by GitHub** |
-| 4.4 | tree-sitter-graph | adapt idea | `tree-sitter-graph` | MIT OR Apache-2.0 |
-| 4.5 | CodeQL databases | skip | none | **proprietary CLI** (queries MIT) |
-| 4.6 | Glean | skip (adapt fact model) | none | BSD-3-Clause |
-| 4.7 | Universal Ctags | skip | `tree-sitter-tags` instead | **GPL-2.0** |
-| 5.1 | SWE-agent ACI | adapt | none | MIT |
-| 5.2 | Agentless | adapt (default recipe) | none | MIT |
-| 5.3 | AutoCodeRover | adapt idea only | none | **Sonar Source-Available v1.0** |
-| 5.4 | OpenHands | skip | none | MIT |
-| 5.5 | Moatless / SWE-Search MCTS | adapt (beam frontier) | none | MIT / Apache-2.0 |
-| 5.6 | Self-RAG / IRCoT / FLARE | adapt (control pattern) | none | MIT / Apache-2.0 / MIT |
-| 5.7 | ReAct | adapt (framing) | none | not applicable |
-| 5.8 | Claude Code / Cursor observations | adapt (eval baseline) | none | proprietary; **unverified** |
-| 5.9 | MCP tool design | reuse | `rmcp` | MIT and Apache-2.0 (spec) |
-| 5.10 | Beam / frontier search, agent-in-loop | adapt (core model) | std | not applicable |
-| 6.1 | Logical coupling / ROSE | adapt | `gix` | not applicable |
-| 6.2 | code-maat | adapt metrics | none | **GPL-3.0** |
-| 6.3 | hercules (Go) | skip | none | Apache-2.0 |
-| 6.4 | gix / git2 | reuse `gix` | `gix`, `git2` | MIT OR Apache-2.0 |
-| 7.1 | Adaptive-RAG | adapt (heuristic router) | none | Apache-2.0 |
-| 7.2 | RouteLLM | adapt framing | none | Apache-2.0 |
-| 7.3 | Sparse vs dense selection | adapt | none | not applicable (**unverified** citation) |
-| 7.4 | Index advisor / repo profiling | adapt | `ignore`, `globset` | not applicable |
-
-## Recommended reuse set for the spike
-
-1. **Execution model.** An in-process traversal engine:
-   - a beam or best-first frontier with per-item map provenance (5.10, 5.5);
-   - exposed as stateful MCP tools through the existing `rmcp` (5.9);
-   - a bounded, summarised frontier at each checkpoint (5.1);
-   - an Agentless-style coarse-to-fine default recipe for unattended use (5.2).
-2. **Fusion and expansion.**
-   - Parallel step: keep RRF over the enabled maps.
-   - Sequence step: Personalized PageRank seeded from the current frontier
-     (2.3, 1.5) and k-hop ego expansion over typed edges (1.2, 1.4).
-   - Both are hand-rolled or use `petgraph` (MIT OR Apache-2.0).
-3. **Structural maps without a language server.**
-   - Use `tree-sitter-tags` 0.25.x (MIT) with per-language tag queries for
-     def/ref, import and call approximations (1.5).
-   - Edge rules live in declarative query files, borrowing the tree-sitter-graph
-     idea (4.4).
-4. **Precise maps when available.** Optional `scip` (Apache-2.0) import of
-   `index.scip` from rust-analyzer or the scip-* indexers (4.1), next to the
-   existing LSP navigation. Never required.
-5. **History maps.** `gix` (MIT OR Apache-2.0) to build co-change, with ROSE
-   support and confidence, code-maat thresholds and recency decay (6.1, 6.2,
-   6.4).
-6. **Vector maps.**
-   - Multiple LanceDB tables or columns per embedder x granularity x purpose,
-     on the existing `lancedb`.
-   - Coarse-to-fine through file-level then chunk-level maps (3.6).
-   - Late interaction (3.1, 3.4, 3.5) is deferred until a permissively licensed
-     multi-vector model and Rust multivector query support are confirmed.
-7. **Map selection.**
-   - A deterministic repository profile produces the map plan, with an optional
-     agent-advice hook (7.4).
-   - Query-time routing is heuristic first (7.1, 7.2), with RRF as the fallback.
-8. **Do not use:**
-   - CodeQL (proprietary CLI), Neo4j (separate server, GPL-3.0), Universal Ctags
-     and code-maat (GPL), AutoCodeRover code (source-available), Jina ColBERT v2
-     weights (non-commercial);
-   - `stack-graphs` and `tree-sitter-graph` as dependencies (unmaintained, and
-     they pin `tree-sitter` ^0.24);
-   - any second vector or full-text store (`tantivy`, `hnsw_rs`, `arroy`,
-     `usearch`).
-
-## Unverified items
-
-- CodeRAG / GraphCodeAgent code license.
-- Which ModelScope-Agent subdirectory holds the CodexGraph code.
-- Kythe maintenance level.
-- Archive status of src-d/hercules.
-- Jina ColBERT v2 license: confirmed from Jina's model page and mirrors, not
-  from the Hugging Face card itself.
-- Whether the LanceDB Rust SDK at 0.38.0 supports multivector queries.
-- Windows support of each scip-* indexer.
-- LSIF types in `lsp-types`.
-- Matryoshka support in specific local embedding models.
-- `gix` blame support level.
-- libgit2's own license wording.
-- Glean's storage engine.
-- arXiv IDs for OpenHands (2407.16741), ReAct (2210.03629) and Matryoshka
-  (2205.13147): from general knowledge, not checked against a README this pass.
-- Claude Code and Cursor retrieval descriptions (no primary source retrieved).
-- The citation for sparse versus dense selection (7.3).
