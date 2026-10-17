@@ -168,7 +168,7 @@ Defaults work with the services described under Ports and URLs. Copy `config.exa
 | `[search_profiles.<name>].response` | `"full"` (the whole search report); `"compact"` returns locators and code only (MCP only) |
 | `[search_profiles.<name>].compact_max_hit_lines` | `40` with `response = "compact"` (allowed: 1-1000; an error without it) |
 | `[search_profiles.<name>].compact_max_response_chars` | `16000` with `response = "compact"` (allowed: 1000-1000000; an error without it) |
-| `[traverse]` | `enabled = false`; `scip_index = "index.scip"`; `max_pops = 200`; `max_depth = 6`; `max_est_tokens = 20000`; `deadline_ms = 5000`; `max_stops = 4`; `tau = 0.8`; `first_stage = "append"`; `answer_seeds = true`; `exact_seeds = true`; the remaining keys and their comments are in `config.example.toml` |
+| `[traverse]` | `enabled = false`; `scip_index = "index.scip"`; `max_pops = 200`; `max_depth = 6`; `max_est_tokens = 20000`; `deadline_ms = 5000`; `max_stops = 4`; `tau = 0.8`; `first_stage = "append"`; `answer_seeds = true`; `exact_seeds = true`; the remaining keys and their comments are in `config.example.toml`. The edge-bandit keys (`edge_bandit`, `bandit_*`) and the matching `lci traverse` flags (`--edge-bandit`, `--bandit-*`) no longer exist: a config that sets one fails to load naming the key, and a stored handle made with the bandit on is refused (d365) |
 | `[recipes]`, `[compose]` | `enabled = false` each (`[recipes] flow_judge = false`) |
 
 ### Channels

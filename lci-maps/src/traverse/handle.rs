@@ -479,7 +479,8 @@ impl Snapshot {
         if get(obj, "version")?.as_u64() != Some(u64::from(VERSION)) {
             return Err("unsupported snapshot version".into());
         }
-        // Only a walk with the removed edge bandit on wrote this key, and its
+        // Only a walk with the removed edge bandit on wrote this key (with it
+        // off the old writer omitted it, so such handles load unchanged), and its
         // queue priorities are weighted by a bandit this build no longer has.
         if obj.get("bandit").is_some_and(|v| !v.is_null()) {
             return Err(
