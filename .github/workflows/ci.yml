@@ -23,6 +23,10 @@ on:
 # canary means: bump RUST_PIN on purpose and record the bump as a roadmap
 # row. There is no rust-toolchain file on purpose: it would also change the
 # toolchain of every contributor's local builds.
+# The jobs only check out and run cargo: a read-only token is enough.
+permissions:
+  contents: read
+
 env:
   RUST_PIN: 1.99.0
 
