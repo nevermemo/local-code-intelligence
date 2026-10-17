@@ -58,8 +58,6 @@ Ordered; the first item with all dependencies met is next. Every item gets its k
 | 8 | Tier-2 calibration | blocked(7) | Confidence calibration and a small judged subset with a cheap model at milestones (d327). Tier 3, real agent A/B runs, stays rare and validates the proxies (pv2 rho .699, d261). |
 | 9 | S1b: where-to MCP default | ready | The MCP default `top_k` of 8 returns about 18 answers on where-to and has not been measured (d244, d259). Measure it at matched answer budgets before changing it. |
 | 10 | N14 re-evaluate | paused until search work resumes | Tag `keep/n14-lexical-suffix`, commit e0f7c10 (d115, d302). The before/after run needs the 4B pass. |
-| 11 | Reject unknown MCP argument keys (PR #55 idea) | ready | Re-implement in cleanup phase 5 with golden tests and a recorded break if an agent-facing behavior changes (d303, d323). |
-| 12 | The 7 pre-existing CI failures on main | ready | Failing since 2026-09-19, noted on PR #77 (d310). List them, classify product versus test versus environment, fix or pin each as its own slice. |
 
 ## Open items by tier
 
@@ -93,7 +91,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
 | N89 | An API key is sent as a bearer header over plain http to a non-loopback embedder, reranker or System One host (allowed today; CodeQL on PR 78); decide reject vs warn without breaking an http LAN setup (d371) | ready | S | - |
 | N90 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
-| N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 11) (roadmap@bbd3292 N14) | paused | S | - |
+| N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.
 
