@@ -166,6 +166,20 @@ async fn with_the_flags_off_no_recipe_tool_or_route_exists() {
     models_task.abort();
 }
 
+/// Removes every `"additionalProperties": false` member, at any depth.
+fn strip_additional_properties_false(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.get("additionalProperties") == Some(&Value::Bool(false)) {
+                map.remove("additionalProperties");
+            }
+            map.values_mut().for_each(strip_additional_properties_false);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_additional_properties_false),
+        _ => {}
+    }
+}
+
 /// What a client sees of a server's surface: the instructions sent at
 /// `initialize`, the tools listed on `/mcp` (by name) and the OpenAPI
 /// document, as one value.
@@ -216,11 +230,15 @@ async fn with_the_flags_off_the_surface_is_that_of_the_commit_before_the_recipes
         actual["instructions"], expected["instructions"],
         "server instructions changed"
     );
-    assert_eq!(actual["tools"], expected["tools"], "tools/list changed");
-    assert_eq!(
-        actual["openapi"], expected["openapi"],
-        "openapi.json changed"
-    );
+    // The one recorded change since b46786e (d363): tool input schemas
+    // and REST bodies deny unknown keys. Strip exactly that marker before
+    // comparing.
+    let mut tools = actual["tools"].clone();
+    strip_additional_properties_false(&mut tools);
+    let mut openapi = actual["openapi"].clone();
+    strip_additional_properties_false(&mut openapi);
+    assert_eq!(tools, expected["tools"], "tools/list changed");
+    assert_eq!(openapi, expected["openapi"], "openapi.json changed");
     models_task.abort();
 }
 
