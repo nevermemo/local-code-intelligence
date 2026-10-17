@@ -75,10 +75,48 @@ pub struct EvalQuery {
     /// Free-form labels that stratify the aggregate: the report carries one
     /// `TagAggregate` per distinct tag. Generated query sets use
     /// `keyword` or `keyword-agnostic`, optionally followed by `gold-drift`
-    /// and one of `short-query` / `long-query`. Tags never affect search or
-    /// the per-query metrics.
+    /// and one of `short-query` / `long-query`. Tags never affect search. The
+    /// only tags the evaluation reads are the two lane tags
+    /// ([`EvalLane::DOCS_TAG`], [`EvalLane::UNION_TAG`]), which choose the
+    /// result list the query is scored on (see [`EvalQuery::lane`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+/// Which list of a search report an evaluation query is scored on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvalLane {
+    /// The code `results` (the default).
+    #[default]
+    Code,
+    /// The separate `docs` list.
+    Docs,
+    /// The code `results` followed by the `docs` list.
+    Union,
+}
+
+impl EvalLane {
+    /// The tag that puts a query on the docs lane.
+    pub const DOCS_TAG: &'static str = "lane:docs";
+    /// The tag that puts a query on the code results followed by the docs.
+    pub const UNION_TAG: &'static str = "lane:union";
+}
+
+impl EvalQuery {
+    /// The list this query is scored on: [`EvalLane::Docs`] with the tag
+    /// `lane:docs`, [`EvalLane::Union`] with `lane:union` (the docs tag wins
+    /// when both are present), otherwise [`EvalLane::Code`].
+    pub fn lane(&self) -> EvalLane {
+        let tagged = |tag: &str| self.tags.iter().any(|candidate| candidate == tag);
+        if tagged(EvalLane::DOCS_TAG) {
+            EvalLane::Docs
+        } else if tagged(EvalLane::UNION_TAG) {
+            EvalLane::Union
+        } else {
+            EvalLane::Code
+        }
+    }
 }
 
 /// Validate a repository-relative path pattern.

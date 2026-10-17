@@ -1883,7 +1883,8 @@ async fn c_and_cpp_header_and_source_extensions_reuse_update_delete_and_keep_the
 async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_keeps_the_snapshot() {
     use local_code_intelligence::filter::{FilterRequest, SourceRole};
 
-    let (temp, config, fake, task) = fixture().await;
+    let (temp, mut config, fake, task) = fixture().await;
+    config.docs_lane.top_k = 10;
     let workspace = temp.path().join("docs-repo");
     let guide = "# Guide\nHow to run the quarantine_policy checker.\n\n## Install\nInstall steps for the checker.\n\n## Usage\nRun the checker nightly.\n";
     write(
@@ -1945,9 +1946,23 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         .search(&workspace, "quarantine_policy", Some(10))
         .await
         .unwrap();
+    // Markdown never enters the code list; it comes back in `docs`.
+    assert!(
+        found
+            .results
+            .iter()
+            .all(|hit| hit.chunk.language != "markdown")
+    );
+    let docs = found.docs.as_ref().expect("the index holds Markdown");
+    assert!(
+        docs.results
+            .iter()
+            .all(|hit| hit.chunk.language == "markdown")
+    );
     let hits: std::collections::BTreeMap<_, _> = found
         .results
         .iter()
+        .chain(docs.results.iter())
         .map(|hit| {
             (
                 (hit.chunk.relative_file_path.as_str(), hit.chunk.start_line),
@@ -1964,14 +1979,11 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         hits[&("tests/NOTES.md", 1)],
         ("markdown", SourceRole::Documentation)
     );
-    assert!(
-        found
-            .results
-            .iter()
-            .all(|hit| !hit.chunk.relative_file_path.contains("secret")
-                && !hit.chunk.relative_file_path.contains("built")
-                && !hit.chunk.relative_file_path.contains("UPPER"))
-    );
+    assert!(found.results.iter().chain(docs.results.iter()).all(|hit| {
+        !hit.chunk.relative_file_path.contains("secret")
+            && !hit.chunk.relative_file_path.contains("built")
+            && !hit.chunk.relative_file_path.contains("UPPER")
+    }));
 
     // `markdown` is a language filter value, and the role filter agrees.
     for request in [
@@ -1989,6 +2001,8 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
             .await
             .unwrap();
         assert!(!only_docs.results.is_empty());
+        // The request names documentation: one list, no split.
+        assert!(only_docs.docs.is_none());
         assert!(only_docs.results.iter().all(|hit| {
             hit.chunk.language == "markdown" && hit.source_role == SourceRole::Documentation
         }));
@@ -2039,11 +2053,17 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         .search(&workspace, "checker hourly", Some(10))
         .await
         .unwrap();
-    assert!(updated.results.iter().any(|hit| {
-        hit.chunk.relative_file_path == "docs/guide.md"
-            && hit.chunk.start_line == 7
-            && hit.chunk.code.contains("hourly")
-    }));
+    assert!(
+        updated
+            .docs
+            .iter()
+            .flat_map(|lane| &lane.results)
+            .any(|hit| {
+                hit.chunk.relative_file_path == "docs/guide.md"
+                    && hit.chunk.start_line == 7
+                    && hit.chunk.code.contains("hourly")
+            })
+    );
 
     // Deleting a Markdown file removes its chunks from the next snapshot.
     std::fs::remove_file(workspace.join("tests/NOTES.md")).unwrap();
@@ -2067,7 +2087,8 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         .search(&workspace, "Overview of the repository", Some(10))
         .await
         .unwrap();
-    let readme = retained
+    let retained_docs = retained.docs.as_ref().expect("the snapshot holds Markdown");
+    let readme = retained_docs
         .results
         .iter()
         .find(|hit| hit.chunk.relative_file_path == "README.md")
@@ -2077,8 +2098,340 @@ async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_kee
         retained
             .results
             .iter()
+            .chain(retained_docs.results.iter())
             .all(|hit| !hit.chunk.code.contains("UNCOMMITTED_SNAPSHOT_MARKER"))
     );
+    task.abort();
+}
+
+/// A workspace of code files, and the same files plus Markdown that matches
+/// the queries below better than any code does.
+fn write_code_and_prose_workspaces(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let code = [
+        (
+            "src/lib.rs",
+            "pub fn translator() -> u32 {\n    1\n}\n\npub fn helper() -> u32 {\n    2\n}\n",
+        ),
+        (
+            "src/app.ts",
+            "export function translatorFactory() {\n  return 1;\n}\n",
+        ),
+        ("tools/run.py", "def run_translator():\n    return 3\n"),
+        ("src/other.rs", "pub fn unrelated() -> u32 {\n    4\n}\n"),
+    ];
+    let prose = [
+        (
+            "README.md",
+            "# Readme\nThe translator overview.\n\n## Layout\ntranslator translator translator in src.\n",
+        ),
+        (
+            "docs/guide.md",
+            "# Guide\nHow to run the translator.\n\n## Usage\nUse the translator daily, translator again.\n",
+        ),
+        ("docs/more.md", "# More\nAnother translator note.\n"),
+    ];
+    let plain = root.join("plain");
+    let mixed = root.join("mixed");
+    for (name, body) in code {
+        write(&plain, name, body);
+        write(&mixed, name, body);
+    }
+    for (name, body) in prose {
+        write(&mixed, name, body);
+    }
+    (plain, mixed)
+}
+
+/// The serialized code `results` of a report, byte for byte, except for the
+/// absolute `file_path` (it names the workspace directory, which differs
+/// between the two fixtures; `relative_file_path` stays).
+fn code_list_json(report: &local_code_intelligence::app::SearchReport) -> String {
+    let mut results = serde_json::to_value(&report.results).unwrap();
+    for hit in results.as_array_mut().unwrap() {
+        hit.as_object_mut().unwrap().remove("file_path");
+    }
+    results.to_string()
+}
+
+#[tokio::test]
+async fn the_code_results_are_byte_identical_with_or_without_markdown_and_docs_come_separately() {
+    use local_code_intelligence::{app::SearchOptions, filter::FilterRequest};
+
+    let (temp, config, fake, task) = fixture().await;
+    let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    let app = App::open(config).await.unwrap();
+    for rerank_fails in [false, true] {
+        fake.rerank_fails.store(rerank_fails, Ordering::SeqCst);
+        for query in ["translator", "run translator daily", "unrelated helper"] {
+            let without = app.search(&plain, query, Some(5)).await.unwrap();
+            let with = app.search(&mixed, query, Some(5)).await.unwrap();
+            assert_eq!(
+                code_list_json(&with),
+                code_list_json(&without),
+                "code results differ for {query:?} (rerank_fails={rerank_fails})"
+            );
+            assert_eq!(with.warning, without.warning);
+            assert_eq!(with.reranked, without.reranked);
+            assert_eq!(with.candidate_count, without.candidate_count);
+            assert_eq!(with.notes, without.notes);
+            // The traced candidate pool of the code lane is the one the plain
+            // index produces too (ranks, scores, order).
+            let traced = |path: &Path| {
+                let app = &app;
+                let path = path.to_owned();
+                async move {
+                    let report = app
+                        .search_with_options(
+                            &path,
+                            query,
+                            Some(5),
+                            FilterRequest::default(),
+                            SearchOptions {
+                                trace_candidates: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    (
+                        serde_json::to_value(report.candidates.as_ref().unwrap()).unwrap(),
+                        serde_json::to_value(report.rerank_outcome).unwrap(),
+                    )
+                }
+            };
+            assert_eq!(
+                traced(&mixed).await,
+                traced(&plain).await,
+                "candidate pool differs for {query:?} (rerank_fails={rerank_fails})"
+            );
+            assert!(without.docs.is_none(), "no Markdown, no docs list");
+            assert!(
+                with.results
+                    .iter()
+                    .all(|hit| hit.chunk.language != "markdown")
+            );
+
+            let docs = with.docs.as_ref().expect("the lane ran over Markdown");
+            assert!(!docs.results.is_empty());
+            assert!(docs.results.len() <= 2, "the default docs list is two");
+            assert!(
+                docs.results
+                    .iter()
+                    .all(|hit| hit.chunk.language == "markdown")
+            );
+            assert_eq!(docs.reranked, !rerank_fails);
+            // Fail-open: the failure shows on the lane only, as the code
+            // list's own warning does for the code reranker.
+            assert_eq!(docs.warning.is_some(), rerank_fails);
+        }
+    }
+    fake.rerank_fails.store(false, Ordering::SeqCst);
+
+    // Only an explicit role filter folds Markdown back into one list.
+    for roles in [vec!["documentation"], vec!["source", "documentation"]] {
+        let one_list = app
+            .search_with_filters(
+                &mixed,
+                "translator",
+                Some(10),
+                FilterRequest {
+                    source_roles: Some(roles.iter().map(|role| role.to_string()).collect()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(one_list.docs.is_none());
+        assert!(
+            one_list
+                .results
+                .iter()
+                .any(|hit| hit.chunk.language == "markdown")
+        );
+    }
+    let code_only_role = app
+        .search_with_filters(
+            &mixed,
+            "translator",
+            Some(10),
+            FilterRequest {
+                source_roles: Some(vec!["source".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(code_only_role.docs.is_none());
+    assert!(
+        code_only_role
+            .results
+            .iter()
+            .all(|hit| hit.chunk.language != "markdown")
+    );
+    task.abort();
+}
+
+/// The semantic fetch widens until it has `semantic_candidate_count` hits
+/// even above its 160-row first fetch, so the code lane of a mixed index (which
+/// refetches past the nearer prose) and the plain index agree there too.
+#[tokio::test]
+async fn the_code_results_stay_identical_at_the_largest_semantic_candidate_count() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    config.semantic_candidate_count = 200;
+    let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    // 170 more code files, none of which the fake embedder places near the
+    // query, so the Markdown chunks are the nearest rows of the mixed index.
+    for index in 0..170 {
+        let body = format!("pub fn generated_{index}() -> u32 {{\n    {index}\n}}\n");
+        write(&plain, &format!("src/gen/f{index}.rs"), &body);
+        write(&mixed, &format!("src/gen/f{index}.rs"), &body);
+    }
+    let app = App::open(config).await.unwrap();
+    let without = app.search(&plain, "translator", Some(3)).await.unwrap();
+    let with = app.search(&mixed, "translator", Some(3)).await.unwrap();
+    // The fused pool passes the 160-row first fetch only if the semantic
+    // channel returned more than 160 hits.
+    let traced = app
+        .search_with_options(
+            &plain,
+            "translator",
+            Some(3),
+            Default::default(),
+            local_code_intelligence::app::SearchOptions {
+                trace_candidates: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(traced.candidates.unwrap().len() > 160);
+    assert_eq!(code_list_json(&with), code_list_json(&without));
+    assert_eq!(with.candidate_count, without.candidate_count);
+    assert_eq!(with.warning, without.warning);
+    assert_eq!(with.notes, without.notes);
+    assert!(with.docs.is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_failing_docs_reranker_is_reported_on_the_docs_list_and_keeps_fusion_order() {
+    let (temp, config, fake, task) = fixture().await;
+    let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    let app = App::open(config).await.unwrap();
+    // The fake answers an out-of-range index to both rerank calls.
+    fake.malformed_rerank.store(true, Ordering::SeqCst);
+    let without = app.search(&plain, "translator", Some(5)).await.unwrap();
+    let with = app.search(&mixed, "translator", Some(5)).await.unwrap();
+    assert_eq!(code_list_json(&with), code_list_json(&without));
+    assert_eq!(with.warning, without.warning);
+    assert!(without.warning.is_some());
+    let docs = with.docs.as_ref().unwrap();
+    assert!(!docs.reranked);
+    assert!(!docs.results.is_empty());
+    assert!(docs.warning.as_deref().unwrap().contains("Docs reranker"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_docs_lane_can_be_turned_off_and_still_keeps_markdown_out_of_the_code_list() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    for (enabled, top_k) in [(false, 2), (true, 0)] {
+        config.docs_lane.enabled = enabled;
+        config.docs_lane.top_k = top_k;
+        let app = App::open(config.clone()).await.unwrap();
+        let without = app.search(&plain, "translator", Some(5)).await.unwrap();
+        let with = app.search(&mixed, "translator", Some(5)).await.unwrap();
+        assert_eq!(code_list_json(&with), code_list_json(&without));
+        assert!(with.docs.is_none());
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn evaluation_scores_a_query_on_the_lane_its_tag_names_and_counts_both_lists_in_tokens() {
+    use lci_core::evaluation::EvalLane;
+    use local_code_intelligence::evaluate::run_evaluation;
+
+    let (temp, config, _fake, task) = fixture().await;
+    let (_plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    let app = App::open(config).await.unwrap();
+    let query = |tags: &[&str], expected: &str| EvalQuery {
+        query: "translator".to_owned(),
+        workspace: "mixed".to_owned(),
+        top_k: Some(5),
+        filters: None,
+        expected_paths: expected.split(',').map(str::to_owned).collect(),
+        preferred_paths: Vec::new(),
+        disfavored_paths: Vec::new(),
+        expected_roles: Vec::new(),
+        required_snippet: None,
+        tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+    };
+    let definition = EvaluationFile {
+        workspaces: vec![EvalWorkspace {
+            key: "mixed".to_owned(),
+            required: true,
+        }],
+        queries: vec![
+            query(&[], "src/lib.rs"),
+            query(
+                &[EvalLane::DOCS_TAG],
+                "docs/guide.md,README.md,docs/more.md",
+            ),
+            query(
+                &[EvalLane::UNION_TAG],
+                "docs/guide.md,README.md,docs/more.md",
+            ),
+            // A code query that names a document finds nothing: Markdown is
+            // not in the code list.
+            query(&[], "docs/guide.md"),
+        ],
+    };
+    let mappings = parse_workspace_mappings(&[format!("mixed={}", mixed.display())]).unwrap();
+    let report = run_evaluation(&app, &definition, &mappings).await.unwrap();
+    let [code, docs, union, code_for_doc] = &report.queries[..] else {
+        panic!("four queries")
+    };
+
+    assert!(code.metrics.hit, "{:?}", code.evidence);
+    assert!(code.evidence.iter().all(|row| row.language != "markdown"));
+    assert!(!code.unscored_evidence.is_empty());
+    assert!(
+        code.unscored_evidence
+            .iter()
+            .all(|row| row.language == "markdown")
+    );
+
+    assert!(docs.metrics.hit, "{:?}", docs.evidence);
+    assert!(docs.evidence.iter().all(|row| row.language == "markdown"));
+    assert!(docs.evidence.len() <= 2);
+    // The default docs list is two long: a query asking for five says so.
+    assert_eq!(docs.notes.len(), 1, "{:?}", docs.notes);
+    assert!(docs.notes[0].contains("docs_lane"), "{:?}", docs.notes);
+    assert!(code.notes.is_empty());
+    assert!(!docs.unscored_evidence.is_empty());
+
+    // The union is the code list, then the docs list, renumbered.
+    assert_eq!(
+        union.evidence.len(),
+        code.evidence.len() + docs.evidence.len()
+    );
+    assert!(union.unscored_evidence.is_empty());
+    assert!(union.metrics.hit);
+    assert!(
+        union
+            .evidence
+            .iter()
+            .enumerate()
+            .all(|(index, row)| row.rank == index + 1)
+    );
+
+    assert!(!code_for_doc.metrics.hit);
+
+    // The token proxy counts both lists the call returned, whatever the lane.
+    assert_eq!(code.metrics.returned_tokens, docs.metrics.returned_tokens);
+    assert_eq!(code.metrics.returned_tokens, union.metrics.returned_tokens);
+    assert!(code.metrics.returned_tokens.unwrap() > 0);
+    assert!(report.mean_returned_tokens.unwrap() > 0.0);
     task.abort();
 }
 

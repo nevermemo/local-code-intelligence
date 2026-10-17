@@ -103,6 +103,12 @@ impl LanguageAdapter {
         self.extractor
     }
 
+    /// Whether this adapter cuts prose by its own splitter (Markdown) rather
+    /// than parsing code with a Tree-sitter grammar.
+    pub const fn is_prose(&self) -> bool {
+        matches!(self.extractor, Extractor::Prose(_))
+    }
+
     /// The syntax family of a code adapter; `None` for prose.
     const fn syntax(&self) -> Option<Syntax> {
         match self.extractor {
@@ -775,6 +781,15 @@ pub fn is_registered_identifier(identifier: &str) -> bool {
         .any(|adapter| adapter.identifier == identifier)
 }
 
+/// Whether `identifier` is a registered language whose chunks come from a
+/// prose extractor (Markdown today). The documentation lane of a search is
+/// split on this, not on the `documentation` source role.
+pub fn is_prose_language(identifier: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.identifier == identifier && adapter.is_prose())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1078,23 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn prose_languages_are_exactly_the_registrys_prose_adapters() {
+        for adapter in ADAPTERS {
+            assert_eq!(
+                is_prose_language(adapter.identifier()),
+                matches!(adapter.extractor(), Extractor::Prose(_)),
+                "{}",
+                adapter.identifier()
+            );
+            assert_eq!(adapter.is_prose(), adapter.identifier() == "markdown");
+        }
+        assert!(is_prose_language("markdown"));
+        assert!(!is_prose_language("rust"));
+        assert!(!is_prose_language("md"));
+        assert!(!is_prose_language("unknown"));
+    }
+
     #[test]
     fn markdown_is_a_prose_adapter_and_code_adapters_keep_tree_sitter() {
         for adapter in ADAPTERS {

@@ -271,6 +271,24 @@ lexical_weight = 1.0
 lsp_weight = 1.0
 max_chunks_per_file = 2
 
+# The documentation lane. Markdown chunks never enter the code `results` list
+# (when no source_roles filter is given, that list is exactly what an index of
+# the same files without Markdown would return); they are searched on their own
+# and come back in a separate `docs` list of search_code, with a second rerank
+# when the reranker is on. The lane is fail-open: a failure there only sets
+# docs.warning and never touches the code list. top_k (0..=10) is the length of
+# the docs list; 0 leaves the lane off. rerank_candidate_count (1..=200) is the
+# docs shortlist. semantic_candidate_count is the semantic depth of the docs
+# lane. enabled = false drops the lane (Markdown is then absent from default
+# searches; name source_roles = ["documentation"] to search it). A search profile
+# may override docs_top_k and docs_reranker; the reranker otherwise follows
+# [channels].
+[docs_lane]
+enabled = true
+top_k = 2
+rerank_candidate_count = 12
+semantic_candidate_count = 20
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).

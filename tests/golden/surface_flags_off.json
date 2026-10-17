@@ -1333,7 +1333,7 @@
       "name": "list_indexed_files"
     },
     {
-      "description": "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code and Markdown documentation using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. A missing index is auto-created on first search.",
+      "description": "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code and Markdown documentation using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. Documentation chunks (Markdown) are returned in a separate `docs` list (default 2) unless `source_roles` names documentation. A missing index is auto-created on first search.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
