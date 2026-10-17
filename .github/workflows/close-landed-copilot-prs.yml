@@ -2,14 +2,14 @@ name: Close landed Copilot PRs
 
 # Copilot cloud agent PRs are landed by hand (diff-apply plus a commit whose message says
 # "Copilot cloud agent PR #N"), so GitHub never marks them merged. After each push to
-# fix/verified-bugs this closes every still-open Copilot PR that a recent commit names, with a
+# main this closes every still-open Copilot PR that a recent commit names, with a
 # comment pointing at the commit, and deletes its copilot/* branch. Scanning the last
 # SCAN_DEPTH commits (not only the pushed range) makes the first run close the backlog too;
 # closing is idempotent.
 
 on:
   push:
-    branches: [fix/verified-bugs]
+    branches: [main]
 
 permissions:
   contents: write       # delete the copilot/* head branch
