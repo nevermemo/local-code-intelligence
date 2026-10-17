@@ -208,9 +208,8 @@ async fn sigterm_ends_serve_while_a_reindex_waits_for_another_process_lock() {
     config.watch_poll_milliseconds = 50;
     config.watch_debounce_milliseconds = 50;
     config.channels.lsp = false;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    config.port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let [port] = free_ports();
+    config.port = port;
     let workspace = temp.path().join("watched");
     write(&workspace, "lib.rs", "fn before_lock() {}\n");
     let config_path = temp.path().join("serve.toml");

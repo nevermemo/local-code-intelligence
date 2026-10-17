@@ -25,6 +25,65 @@ use std::{
     time::Duration,
 };
 
+/// Ports a test chose and then released for a server or a probe to take. The
+/// OS may hand a released port to the next `127.0.0.1:0` bind, and tests run
+/// in parallel threads: a client polling the chosen port would then reach that
+/// other test's socket (and a server would fail to bind). Every ephemeral bind
+/// in this binary goes through [`bind_unreleased`], which skips these ports.
+fn released_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
+    static PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    PORTS.get_or_init(Default::default)
+}
+
+/// Calls `bind` (an ephemeral loopback bind) until the port it got is not one
+/// [`free_ports`] released. Rejected sockets stay held while it retries, so
+/// the same port is not drawn again.
+fn bind_unreleased<T>(bind: impl Fn() -> T, port_of: impl Fn(&T) -> u16) -> T {
+    let mut rejected = Vec::new();
+    loop {
+        let candidate = bind();
+        let released = released_ports()
+            .lock()
+            .unwrap()
+            .contains(&port_of(&candidate));
+        if !released {
+            return candidate;
+        }
+        rejected.push(candidate);
+    }
+}
+
+/// A loopback listener on an ephemeral port no test has released.
+fn loopback_listener() -> std::net::TcpListener {
+    bind_unreleased(
+        || std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        |listener| listener.local_addr().unwrap().port(),
+    )
+}
+
+/// [`loopback_listener`] as a tokio listener; call it inside the runtime.
+fn loopback_tokio_listener() -> tokio::net::TcpListener {
+    let listener = loopback_listener();
+    listener.set_nonblocking(true).unwrap();
+    tokio::net::TcpListener::from_std(listener).unwrap()
+}
+
+/// Ports for a server or a probe to take, all distinct: they are held together
+/// until every one is chosen, then released and recorded so that no later
+/// ephemeral bind in this binary takes one. Nothing outside the test process
+/// is guarded against.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: Vec<std::net::TcpListener> = (0..N).map(|_| loopback_listener()).collect();
+    let mut ports = [0; N];
+    for (port, listener) in ports.iter_mut().zip(&held) {
+        *port = listener.local_addr().unwrap().port();
+    }
+    // Recorded before `held` drops, while the OS still keeps the ports unique.
+    released_ports().lock().unwrap().extend(ports);
+    ports
+}
+
 /// A loopback port that refuses connections for as long as this value lives.
 /// Its socket is bound but never listens: a connection to it is refused, as
 /// to a port nothing holds, and no other socket can take the port meanwhile,
@@ -46,10 +105,16 @@ struct ClosedPort {
 impl ClosedPort {
     #[cfg(not(target_os = "macos"))]
     fn new() -> Self {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket
-            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .unwrap();
+        let socket = bind_unreleased(
+            || {
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket
+                    .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .unwrap();
+                socket
+            },
+            |socket| socket.local_addr().unwrap().port(),
+        );
         let port = socket.local_addr().unwrap().port();
         Self {
             _socket: socket,
@@ -258,7 +323,7 @@ async fn fixture() -> (
         .route("/v1/embeddings", post(embed))
         .route("/rerank", get(model_endpoint).post(rerank))
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
