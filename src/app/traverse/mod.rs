@@ -70,6 +70,7 @@ use lci_maps::{
     probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::SCIP_MAP_ID,
     scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
+    scip_implements::{ImplementsMap, ImplementsOptions, SCIP_IMPLEMENTS_ID},
     search_maps::{
         ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
     },
@@ -98,7 +99,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use index::{Loaded, Shared, config_key_map, impact_map, load};
+use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
@@ -128,14 +129,17 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// `search.vector` (the chunks nearest to a node's stored embedding; one
 /// counted embedding call when none is stored; needs the embedder) and
 /// `scip.impact` (the declarations that reference a symbol, the reverse
-/// closure of the SCIP impact index). `lsp.live` asks a language server for
+/// closure of the SCIP impact index), and `scip.implements` (the traits a type
+/// implements, the types that implement a trait and the members that implement
+/// a trait method, read from the `impl .. for ..` headers of the tree and the
+/// SCIP index). `lsp.live` asks a language server for
 /// definition, references and document symbols (starts the server at the first
 /// expansion; needs its binary). The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 10] = [
+pub const OPT_IN_MAPS: [MapId; 11] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -143,6 +147,7 @@ pub const OPT_IN_MAPS: [MapId; 10] = [
     SEARCH_LEXICAL_ID,
     SEARCH_VECTOR_ID,
     SCIP_IMPACT_ID,
+    SCIP_IMPLEMENTS_ID,
     LSP_LIVE_ID,
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
@@ -821,6 +826,40 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             }
         }
     }
+    let mut implements = None;
+    if wants(SCIP_IMPLEMENTS_ID) {
+        match call.scip_root {
+            None => notes.push("scip.implements needs the tree: give --root".to_owned()),
+            Some(root) => {
+                let map = match implements_map(call.scip_index, root, &loaded).await {
+                    Ok(map) => {
+                        let stats = map.stats();
+                        let report = &loaded.scip.graph().report;
+                        notes.push(format!(
+                            "scip.implements: {} impl headers read ({} with a trait, {} external; {} macro and {} other unresolved, {} documents without source), {} type-trait and {} method pairs, {} facts dropped for lack of a node id, cap {} edges per node",
+                            report.impl_headers,
+                            report.impl_resolved,
+                            report.impl_external_trait,
+                            report.impl_unresolved_macro,
+                            report.impl_unresolved_other,
+                            report.impl_no_source,
+                            stats.type_trait,
+                            stats.methods,
+                            stats.dropped,
+                            map.options().cap
+                        ));
+                        map
+                    }
+                    Err(error) => {
+                        notes.push(format!("scip.implements has no edges: {error:#}"));
+                        Arc::new(ImplementsMap::empty(ImplementsOptions::default()))
+                    }
+                };
+                implements = Some(map.clone());
+                register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+            }
+        }
+    }
     // The exact operators are descriptor-only maps; their cards are the first
     // stage, made once per call and not on a continuation.
     if wants(EXACT_CLOSURE_ID) {
@@ -1110,6 +1149,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .as_ref()
             .map(|map| (SEARCH_VECTOR_ID, map.log())),
         impact.as_ref().map(|map| (SCIP_IMPACT_ID, map.log())),
+        implements
+            .as_ref()
+            .map(|map| (SCIP_IMPLEMENTS_ID, map.log())),
     ];
     for (id, log) in costs.into_iter().flatten() {
         if let Some(p50) = log.p50() {

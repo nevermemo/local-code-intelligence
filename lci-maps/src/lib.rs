@@ -33,6 +33,7 @@ pub mod reads_key;
 pub mod run_record;
 pub mod scip_graph;
 pub mod scip_impact;
+pub mod scip_implements;
 pub mod scratch;
 pub mod search_maps;
 pub mod symdefs;

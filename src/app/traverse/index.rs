@@ -11,6 +11,7 @@ use lci_maps::{
     impact::{Decl, ImpactIndex},
     scip_graph::{DirSource, ScipMap, SourceText},
     scip_impact::{ImpactMap, ImpactOptions},
+    scip_implements::{ImplementsMap, ImplementsOptions},
 };
 use std::{
     collections::HashMap,
@@ -191,6 +192,36 @@ pub(super) async fn impact_map(
     })
     .await
     .context("build scip.impact")??;
+    Ok(cache.put(index, root, loaded.stamp, map))
+}
+
+/// The `scip.implements` map of a SCIP index and a tree, built once per index
+/// stamp from the trait-impl facts of the loaded graph. Functions take the
+/// ids of the SCIP graph, types and traits those of `scip.impact` (so the
+/// edges meet that map's nodes).
+pub(super) async fn implements_map(
+    index: &Path,
+    root: &Path,
+    loaded: &Loaded,
+) -> Result<Arc<ImplementsMap>> {
+    static CACHE: OnceLock<StampCache<ImplementsMap>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(map) = cache.get(index, root, loaded.stamp) {
+        return Ok(map);
+    }
+    let impact = impact_map(index, root, loaded).await?;
+    let scip = loaded.scip.clone();
+    let map = tokio::task::spawn_blocking(move || {
+        let resolve = |symbol: &str| {
+            scip.graph()
+                .node_index(symbol)
+                .map(|node| scip.node_id(node).clone())
+                .or_else(|| impact.node_of(symbol).cloned())
+        };
+        ImplementsMap::new(scip.graph(), &resolve, ImplementsOptions::default())
+    })
+    .await
+    .context("build scip.implements")?;
     Ok(cache.put(index, root, loaded.stamp, map))
 }
 
