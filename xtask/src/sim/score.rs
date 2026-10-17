@@ -7,7 +7,7 @@
 //! (impact: the R1 files; flow: the intermediate files). Spans exist only for
 //! where-to (see `gold_spans`).
 
-use super::sim_loop::Trace;
+use super::sim_loop::{Step, Trace};
 use crate::gold::{self, Set};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -95,6 +95,23 @@ impl GoldTarget {
     }
 }
 
+/// What a listing step showed, as (path, first line, last line): the line of
+/// each listed occurrence (grep, `lci traverse` sites), or the whole span of
+/// each snippet (`lci search` shows the code itself).
+fn listing(step: &Step) -> Vec<(String, u32, u32)> {
+    if step.kind == "lci-search" {
+        step.windows
+            .iter()
+            .map(|w| (w.path.clone(), w.start, w.end))
+            .collect()
+    } else {
+        step.listed
+            .iter()
+            .map(|(path, line)| (path.clone(), *line, *line))
+            .collect()
+    }
+}
+
 /// The scores of one item.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ItemScore {
@@ -115,6 +132,10 @@ pub struct ItemScore {
     /// False when the item has no gold to hit (hits are then not defined).
     pub gold_known: bool,
     pub trace: Trace,
+    /// What the opening call reported about itself (the enabled maps of A2).
+    pub tool: Option<Value>,
+    /// The raw reply of the opening traversal (A2), for the flags `maps compare` reads.
+    pub raw: Option<Value>,
 }
 
 impl ItemScore {
@@ -125,22 +146,25 @@ impl ItemScore {
                 .any(|w| target.hits(&w.path, w.start, w.end))
         });
         let calls_to_gold = first_hit.map(|s| s.call);
+        // The first listing the agent was shown: the `lci` call of A1 or A2,
+        // else the A0 search.
         let listed_at = trace
             .steps
             .iter()
-            .find(|s| s.kind == "search")
-            .and_then(|search| {
+            .filter(|s| matches!(s.kind, "search" | "lci-search" | "lci-traverse"))
+            .map(listing)
+            .find(|entries| !entries.is_empty())
+            .and_then(|entries| {
                 let mut files: Vec<&str> = Vec::new();
-                for (path, _) in &search.listed {
+                for (path, _, _) in &entries {
                     if !files.contains(&path.as_str()) {
                         files.push(path);
                     }
                 }
                 files.iter().position(|file| {
-                    search
-                        .listed
+                    entries
                         .iter()
-                        .any(|(p, line)| p == file && target.hits(p, *line, *line))
+                        .any(|(p, a, b)| p == file && target.hits(p, *a, *b))
                 })
             })
             .map(|i| i as u32 + 1);
@@ -155,6 +179,8 @@ impl ItemScore {
             listed_at,
             gold_known: target.is_known(),
             trace,
+            tool: None,
+            raw: None,
         }
     }
 
@@ -182,21 +208,38 @@ impl ItemScore {
         })
     }
 
+    /// The run file's answers: the text the agent was shown, one
+    /// `{path, line}` per distinct window (its first line), in call order.
+    /// The gold scorer's own metrics on this list are a by-product (it is a
+    /// reading list, not an answer set); the numbers of `metrics_json` are
+    /// the result.
+    pub fn answers_json(&self) -> Vec<Value> {
+        let mut seen: BTreeSet<(&str, u32)> = BTreeSet::new();
+        self.trace
+            .steps
+            .iter()
+            .flat_map(|step| &step.windows)
+            .filter(|w| seen.insert((w.path.as_str(), w.start)))
+            .map(|w| json!({ "path": w.path, "line": w.start }))
+            .collect()
+    }
+
     /// The full record of `sim.json`, with the trace.
     pub fn full_json(&self) -> Value {
         let mut record = self.metrics_json();
         record["id"] = json!(self.id);
         record["gold_known"] = json!(self.gold_known);
         record["trace"] = self.trace.to_json();
+        record["tool"] = self.tool.clone().unwrap_or(Value::Null);
         record
     }
 }
 
 /// Means and rates over the items; hit rates and the means to the gold are
 /// over the items that have gold.
-pub fn aggregate(scores: &[ItemScore]) -> Value {
+pub fn aggregate(scores: &[&ItemScore]) -> Value {
     let n = scores.len();
-    let known: Vec<&ItemScore> = scores.iter().filter(|s| s.gold_known).collect();
+    let known: Vec<&ItemScore> = scores.iter().copied().filter(|s| s.gold_known).collect();
     let mean = |values: Vec<f64>| -> Value {
         if values.is_empty() {
             Value::Null

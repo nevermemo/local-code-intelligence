@@ -53,7 +53,7 @@ pub fn run(command: BaselineCommand) -> Result<()> {
 // ------------------------------------------------------------ the run dir
 
 /// What a written arm looks like in one line.
-pub(super) struct ArmSummary {
+pub(crate) struct ArmSummary {
     pub n: usize,
     pub precision: f64,
     pub f05: f64,
@@ -64,7 +64,7 @@ pub(super) struct ArmSummary {
 /// for the scored `(item, answers)` pairs, with `expansions` and `model_calls`
 /// per pair (0 for the arms that make no model calls; the oracle filter carries
 /// its source run's).
-pub(super) fn write_arm_run(
+pub(crate) fn write_arm_run(
     dir: &Path,
     set: Set,
     scored: &[(&Value, Vec<Value>)],

@@ -401,7 +401,7 @@ fn repo_root() -> PathBuf {
         .unwrap_or_default()
 }
 
-fn default_lci() -> Result<PathBuf> {
+pub(crate) fn default_lci() -> Result<PathBuf> {
     let exe = if cfg!(windows) {
         "local-code-intelligence.exe"
     } else {
@@ -561,7 +561,7 @@ fn policy_label(policy: &str) -> String {
         .to_string()
 }
 
-pub(super) fn slug(text: &str) -> String {
+pub(crate) fn slug(text: &str) -> String {
     let s: String = text
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })

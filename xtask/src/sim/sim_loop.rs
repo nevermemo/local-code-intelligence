@@ -1,7 +1,10 @@
-//! The deterministic loop of arm A0 (grep-only). No model, no gold: the only
-//! inputs are the question and the tree. See `docs/spike/multimap/v2/sim-agent.md`.
+//! The deterministic loop of arm A0 (grep-only), optionally behind the one
+//! `lci` call of A1 or A2 (an [`Opening`]). No model, no gold: the only inputs
+//! are the question and the tree. See `docs/spike/multimap/v2/sim-agent.md`.
 //!
-//! One question runs as:
+//! Arms A1 and A2 start with the opening call (and, for A2, a read of its
+//! sites); the names in the text it showed join the frontier, and the chain
+//! below then runs unchanged. One question runs as:
 //! 1. probe: one grep per probed query term (a call each); a term's rarity is
 //!    the number of files it occurs in;
 //! 2. search: one grep listing the occurrences of the (up to three) rarest
@@ -27,7 +30,7 @@ const SEARCH_LISTING: usize = 50;
 const FOLLOW_LISTING: usize = 20;
 /// Files named in a probe's output.
 const PROBE_LISTING: usize = 20;
-const LISTING_LINE_CHARS: usize = 160;
+pub const LISTING_LINE_CHARS: usize = 160;
 
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -95,12 +98,39 @@ pub struct Window {
     pub end: u32,
 }
 
+/// The first call of arm A1 or A2, made before the A0 chain (built by
+/// `arms`; the loop only charges and reads it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Opening {
+    /// `lci-search` (A1) or `lci-traverse` (A2).
+    pub kind: &'static str,
+    /// The query the tool was given.
+    pub arg: String,
+    /// What the tool printed, as the agent sees it (charged).
+    pub output: String,
+    /// The sites the output lists (path, 1-based line).
+    pub listed: Vec<(String, u32)>,
+    /// Text the output itself shows (A1: the snippet spans).
+    pub windows: Vec<Window>,
+    /// Files with lines to read as windows after the call, one read call per
+    /// file, in order (A2: the sites of the results).
+    pub reads: Vec<(String, Vec<u32>)>,
+    /// The tool's raw JSON (A2), written to `raw/<id>.json` for `maps compare`.
+    /// Not used by the loop.
+    pub raw: Option<Value>,
+    /// What the run files record about the call (status, stop reason, maps
+    /// enabled, flags). Not used by the loop.
+    pub info: Option<Value>,
+}
+
 /// One tool call.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
     /// 1-based position among the calls.
     pub call: u32,
-    /// `probe`, `search`, `read`, `follow-grep` or `follow-read`.
+    /// `lci-search` or `lci-traverse` (arms A1 and A2 only, always the first
+    /// call), `site-read` (A2), then `probe`, `search`, `read`, `follow-grep`
+    /// or `follow-read`.
     pub kind: &'static str,
     /// The term, name or path the call was about.
     pub arg: String,
@@ -187,18 +217,21 @@ impl Trace {
     }
 }
 
-/// Runs the A0 loop for one question. `stop_at` is only used with
+/// Runs the loop for one question: the A0 chain, behind `opening` (the
+/// `lci` call of A1 or A2) when given. `stop_at` is only used with
 /// `cfg.stop_at_gold`.
 pub fn run_question(
     searcher: &mut Searcher,
     cfg: &SimConfig,
     question: &str,
     stop_at: Option<&GoldTarget>,
+    opening: Option<&Opening>,
 ) -> Trace {
     let terms = query_terms(question);
     let mut run = Run {
         searcher,
         cfg,
+        opening,
         stop_at: stop_at.filter(|_| cfg.stop_at_gold),
         steps: Vec::new(),
         tokens: 0,
@@ -220,6 +253,7 @@ pub fn run_question(
 struct Run<'a> {
     searcher: &'a mut Searcher,
     cfg: &'a SimConfig,
+    opening: Option<&'a Opening>,
     stop_at: Option<&'a GoldTarget>,
     steps: Vec<Step>,
     tokens: u64,
@@ -236,6 +270,96 @@ type Lines = (u32, u32);
 
 impl Run<'_> {
     fn go(&mut self, terms: &[String]) -> Result<(), Stop> {
+        // The opening call (A1, A2) comes first; its names join the frontier.
+        let mut names = match self.opening {
+            Some(opening) => self.open(opening)?,
+            None => Vec::new(),
+        };
+        match self.start_chain(terms) {
+            Ok(more) => names.extend(more),
+            // The grep chain found nothing, but the opening call showed text:
+            // follow the names in it.
+            Err(Stop::NoMatch | Stop::NoTerms) if !names.is_empty() => {}
+            Err(stop) => return Err(stop),
+        }
+        let mut frontier = Frontier::new(self.cfg.policy);
+        frontier.push_batch(self.batch(names, 1));
+
+        // Follow names until the budget or the frontier runs out.
+        while let Some(candidate) = frontier.pop() {
+            let hits = self.searcher.search(&candidate.name);
+            let Some(target) = hits
+                .matches
+                .iter()
+                .find(|m| !self.is_covered(&m.path, m.line + 1))
+            else {
+                continue;
+            };
+            let listed: Vec<(String, u32)> = hits
+                .matches
+                .iter()
+                .take(FOLLOW_LISTING)
+                .map(|m| (m.path.clone(), m.line + 1))
+                .collect();
+            let output = self.listing_text(&listed);
+            self.charge(
+                "follow-grep",
+                &candidate.name,
+                &output,
+                candidate.depth,
+                Vec::new(),
+                Vec::new(),
+            )?;
+            if let Some(step) = self.steps.last_mut() {
+                step.rarity = Some(candidate.rarity);
+            }
+            let total = self.searcher.text(&target.path).lines.len() as u32;
+            let windows = self.windows(total, &[target.line + 1]);
+            let names = self.read("follow-read", &target.path, &windows, candidate.depth)?;
+            frontier.push_batch(self.batch(names, candidate.depth + 1));
+        }
+        Ok(())
+    }
+
+    /// The opening call of A1 or A2, then the reads of its sites; returns the
+    /// identifier names in all the text shown.
+    fn open(&mut self, opening: &Opening) -> Result<Vec<String>, Stop> {
+        self.charge(
+            opening.kind,
+            &opening.arg,
+            &opening.output,
+            0,
+            opening.windows.clone(),
+            opening.listed.clone(),
+        )?;
+        let mut names = self.note_read(opening.windows.clone())?;
+        let mut files = 0;
+        for (path, lines) in &opening.reads {
+            if files >= self.cfg.read_files {
+                break;
+            }
+            let total = self.searcher.text(path).lines.len() as u32;
+            // A site outside the file (or in a file that is not there) is
+            // nothing to read, and costs no call.
+            let inside: Vec<u32> = lines
+                .iter()
+                .copied()
+                .filter(|line| (1..=total).contains(line))
+                .collect();
+            if inside.is_empty() {
+                continue;
+            }
+            files += 1;
+            let mut windows = self.windows(total, &inside);
+            windows.truncate(self.cfg.windows_per_file);
+            names.extend(self.read("site-read", path, &windows, 0)?);
+        }
+        Ok(names)
+    }
+
+    /// Probe, first search and first reads of the A0 chain; returns the
+    /// identifier names in the text read.
+    fn start_chain(&mut self, terms: &[String]) -> Result<Vec<String>, Stop> {
         if terms.is_empty() {
             return Err(Stop::NoTerms);
         }
@@ -306,47 +430,39 @@ impl Run<'_> {
         let mut names: Vec<String> = Vec::new();
         for (path, lines) in to_read {
             let total = self.searcher.text(&path).lines.len() as u32;
+            // Text the opening call already showed is not read again; a file
+            // with nothing new left costs no call (as follow targets do).
             let mut windows = self.windows(total, &lines);
+            windows.retain(|&(start, end)| !self.is_range_covered(&path, start, end));
             windows.truncate(self.cfg.windows_per_file);
+            if windows.is_empty() {
+                continue;
+            }
             names.extend(self.read("read", &path, &windows, 0)?);
         }
-        let mut frontier = Frontier::new(self.cfg.policy);
-        frontier.push_batch(self.batch(names, 1));
+        Ok(names)
+    }
 
-        // Follow names until the budget or the frontier runs out.
-        while let Some(candidate) = frontier.pop() {
-            let hits = self.searcher.search(&candidate.name);
-            let Some(target) = hits
-                .matches
-                .iter()
-                .find(|m| !self.is_covered(&m.path, m.line + 1))
-            else {
-                continue;
-            };
-            let listed: Vec<(String, u32)> = hits
-                .matches
-                .iter()
-                .take(FOLLOW_LISTING)
-                .map(|m| (m.path.clone(), m.line + 1))
-                .collect();
-            let output = self.listing_text(&listed);
-            self.charge(
-                "follow-grep",
-                &candidate.name,
-                &output,
-                candidate.depth,
-                Vec::new(),
-                Vec::new(),
-            )?;
-            if let Some(step) = self.steps.last_mut() {
-                step.rarity = Some(candidate.rarity);
+    /// Whether every line of `start..=end` of `path` was already shown.
+    fn is_range_covered(&self, path: &str, start: u32, end: u32) -> bool {
+        let mut next = start;
+        let mut spans: Vec<(u32, u32)> = self
+            .covered
+            .iter()
+            .filter(|w| w.path == path)
+            .map(|w| (w.start, w.end))
+            .collect();
+        spans.sort_unstable();
+        for (a, b) in spans {
+            if a > next {
+                break;
             }
-            let total = self.searcher.text(&target.path).lines.len() as u32;
-            let windows = self.windows(total, &[target.line + 1]);
-            let names = self.read("follow-read", &target.path, &windows, candidate.depth)?;
-            frontier.push_batch(self.batch(names, candidate.depth + 1));
+            next = next.max(b.saturating_add(1));
+            if next > end {
+                return true;
+            }
         }
-        Ok(())
+        next > end
     }
 
     /// Records one call, or says why it cannot be made.
@@ -410,9 +526,16 @@ impl Run<'_> {
             })
             .collect();
         self.charge(kind, path, &output, depth, read.clone(), Vec::new())?;
+        self.note_read(read)
+    }
+
+    /// Takes in text the agent has been shown: returns its identifier names,
+    /// marks it covered, and ends the run if it hit the gold (`stop_at_gold`).
+    fn note_read(&mut self, read: Vec<Window>) -> Result<Vec<String>, Stop> {
         let mut names = Vec::new();
-        for &(start, end) in windows {
-            names.extend(identifiers_in(path, &text.source, start, end));
+        for w in &read {
+            let text = self.searcher.text(&w.path);
+            names.extend(identifiers_in(&w.path, &text.source, w.start, w.end));
         }
         let gold = self
             .stop_at

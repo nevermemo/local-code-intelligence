@@ -92,7 +92,9 @@ enum Command {
     },
     /// Simulated agent: a deterministic, model-free loop of greps and reads
     /// over a frozen tree, scored against a gold set (calls and tokens to the
-    /// gold). Arm A0 is grep-only. See docs/spike/multimap/v2/sim-agent.md.
+    /// gold). Arm A0 is grep-only; A1 and A2 put one `lci search` or
+    /// `lci traverse --scip` call in front of the same chain. See
+    /// docs/spike/multimap/v2/sim-agent.md.
     Sim(sim::SimArgs),
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
