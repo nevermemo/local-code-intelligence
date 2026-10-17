@@ -2051,22 +2051,50 @@ async fn exact_pickaxe_answers_with_commits_and_counts_its_git_calls() {
     );
 }
 
-#[tokio::test]
-async fn exact_pickaxe_stops_asking_git_when_the_deadline_has_passed() {
+/// The pickaxe is driven here through the same `BudgetedGit` the run builds
+/// (`end` is the call's deadline), with the clock set by hand: a run-level
+/// `deadline_ms` of 1 would depend on a millisecond passing before the first
+/// git call, which a fast machine does not guarantee. The run-level wiring of
+/// `git_calls` into the response is covered by
+/// `exact_pickaxe_answers_with_commits_and_counts_its_git_calls`.
+#[test]
+fn exact_pickaxe_stops_asking_git_when_the_deadline_has_passed() {
     let tree = ScipTree::new();
     tree.commit();
-    let maps = ["graph.scip", EXACT_PICKAXE_ID];
-    // The deadline is spent by the time the index is loaded: the first
-    // stage runs no git, keeps what it found (nothing) and says so.
-    let response = tree
-        .run(&stage_limits(false, false), &maps, &[], Some(1))
-        .await;
-    assert_eq!(response["exact"][0]["git_calls"], 0, "{response}");
-    assert_eq!(response["exact"][0]["answered"], false, "{response}");
-    let notes = response["notes"].to_string();
+    let question = "Which commit first created `Foo`?";
+    let budgeted = |end: Instant| BudgetedGit {
+        git: PathBuf::from("git"),
+        tree: tree.dir.path().to_path_buf(),
+        per_call: Duration::from_secs(20),
+        end,
+    };
+
+    // Control: with time left, the same repository gives the commit.
+    let open = pickaxe_cards(
+        &budgeted(Instant::now() + Duration::from_secs(60)),
+        question,
+        8,
+    );
     assert!(
-        notes.contains("stopped: the first stage's time ran out"),
-        "{notes}"
+        open.git_calls >= 1 && !open.cards.is_empty(),
+        "{}",
+        open.note
+    );
+
+    // The deadline is already behind us: no git runs, nothing is found, and
+    // the note says why. (If the clock cannot go back a second, `now` is
+    // itself never ahead of the later reading, so the budget is spent too.)
+    let spent = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let late = pickaxe_cards(&budgeted(spent), question, 8);
+    assert_eq!(late.git_calls, 0, "{}", late.note);
+    assert!(late.cards.is_empty(), "{}", late.note);
+    assert!(
+        late.note
+            .contains("stopped: the first stage's time ran out"),
+        "{}",
+        late.note
     );
 }
 

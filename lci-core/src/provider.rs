@@ -523,7 +523,6 @@ impl Provider for MockProvider {
 mod tests {
     use super::*;
     use crate::models::is_connect_error;
-    use std::net::SocketAddr;
 
     fn request(constraint: Option<Constraint>) -> CompletionRequest {
         CompletionRequest {
@@ -706,12 +705,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_endpoint_is_a_quick_connect_error() {
-        // Bound but never listening: refused while the socket lives.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let address = socket.local_addr().unwrap();
+        // Refused at once on every OS (the shared helper explains how, and why
+        // macOS needs a different port than a bound-but-not-listening one).
+        let closed = crate::models::tests::closed_local_address();
         let config = SystemOneConfig {
-            url: format!("http://{address}/v1"),
+            url: format!("http://{closed}/v1"),
             ..SystemOneConfig::default()
         };
         let provider = config.build().unwrap();
@@ -726,6 +724,6 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        drop(socket);
+        drop(closed);
     }
 }

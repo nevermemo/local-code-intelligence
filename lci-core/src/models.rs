@@ -620,7 +620,7 @@ impl Models {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         net::SocketAddr,
@@ -631,10 +631,14 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
 
-    /// An address on which nothing listens. The socket is bound but never
-    /// listens, so connections are refused and, while it lives, no parallel
-    /// test's server can take the port (releasing it raced with them).
-    struct Refused(#[allow(dead_code)] tokio::net::TcpSocket, SocketAddr);
+    /// An address on which nothing listens. Where the platform allows it the
+    /// socket is bound but never listens, so connections are refused and,
+    /// while it lives, no parallel test's server can take the port (releasing
+    /// it raced with them). Shared with the provider tests.
+    pub(crate) struct Refused(
+        #[allow(dead_code)] Option<tokio::net::TcpSocket>,
+        SocketAddr,
+    );
 
     impl std::fmt::Display for Refused {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -642,11 +646,28 @@ mod tests {
         }
     }
 
-    fn closed_local_address() -> Refused {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let address = socket.local_addr().unwrap();
-        Refused(socket, address)
+    pub(crate) fn closed_local_address() -> Refused {
+        // macOS does not refuse a connect to a loopback port that is bound but
+        // not listening: it sends no reset, so the client waits out its connect
+        // timeout (~5 s). A port that was listening and has been closed does
+        // answer with a reset there, so on macOS take a free port by binding a
+        // listener and dropping it. That leaves a small window in which a
+        // parallel test's server could take the port; the bound-socket form
+        // used elsewhere has none, and Linux and Windows refuse it at once.
+        #[cfg(target_os = "macos")]
+        {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            Refused(None, address)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let address = socket.local_addr().unwrap();
+            Refused(Some(socket), address)
+        }
     }
 
     /// What the fake model server does with one request on a connection.
