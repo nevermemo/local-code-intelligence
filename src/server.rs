@@ -669,6 +669,77 @@ mod tests {
     use super::check_loopback_headers;
     use axum::http::{HeaderMap, HeaderValue, Uri, header};
 
+    /// `SearchCodeArgs` repeats the fields of `SearchArgs` by hand (serde cannot
+    /// combine `flatten` with `deny_unknown_fields`). This fails when a field
+    /// is added to, removed from or changed in only one of them, in name,
+    /// type, description or required-ness.
+    #[test]
+    fn search_code_args_schema_repeats_search_args() {
+        use super::{SearchArgs, SearchCodeArgs};
+        use rmcp::handler::server::common::schema_for_input;
+        use serde_json::{Map, Value};
+
+        const TRAVERSE_ONLY: [&str; 4] = ["mode", "budget", "steer", "handle"];
+
+        let search = schema_for_input::<SearchArgs>().expect("SearchArgs has an object schema");
+        let code =
+            schema_for_input::<SearchCodeArgs>().expect("SearchCodeArgs has an object schema");
+
+        let properties = |schema: &Map<String, Value>| -> Map<String, Value> {
+            schema["properties"]
+                .as_object()
+                .expect("schema has properties")
+                .clone()
+        };
+        let required = |schema: &Map<String, Value>| -> Vec<String> {
+            let mut names: Vec<String> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|name| name.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+
+        let mut code_properties = properties(&code);
+        let mut extra: Vec<String> = TRAVERSE_ONLY
+            .iter()
+            .filter(|name| code_properties.remove(**name).is_some())
+            .map(|name| name.to_string())
+            .collect();
+        extra.sort();
+        let mut expected_extra: Vec<String> =
+            TRAVERSE_ONLY.iter().map(|name| name.to_string()).collect();
+        expected_extra.sort();
+        assert_eq!(
+            extra, expected_extra,
+            "SearchCodeArgs lost one of its traverse-only fields"
+        );
+
+        let search_properties = properties(&search);
+        assert_eq!(
+            code_properties.keys().collect::<Vec<_>>(),
+            search_properties.keys().collect::<Vec<_>>(),
+            "SearchCodeArgs and SearchArgs name different search fields; update both"
+        );
+        for (name, schema) in &search_properties {
+            assert_eq!(
+                &code_properties[name], schema,
+                "field `{name}` differs between SearchArgs and SearchCodeArgs"
+            );
+        }
+        assert_eq!(
+            required(&code),
+            required(&search),
+            "required fields differ between SearchCodeArgs and SearchArgs"
+        );
+    }
+
     fn headers(host: Option<&str>, origin: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(host) = host {
