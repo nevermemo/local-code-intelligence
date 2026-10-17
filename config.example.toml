@@ -22,23 +22,8 @@ reranker_model = "qwen3-reranker-4b"
 # embedding_api_key_env = "EMBEDDING_API_KEY"
 # reranker_api_key_env = "RERANKER_API_KEY"
 #
-# [system_one] is the slot for a small model planned to steer a traversal (the
-# configuration and provider client exist; no traversal rung calls it yet). Off
-# when the section is absent. It must be a table, so uncomment it after the last
-# top-level key of this file (it is shown here beside the other model
-# settings).
-#   provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)
-#   url = "http://127.0.0.1:8080/v1"   # base URL; /chat/completions or /completions is appended
-#   model = "your-model-name"
-#   api = "chat"                 # "chat" or "completion"
-#   timeout_ms = 30000           # 100 to 600000; one attempt, no retry
-#   api_key_env = "SYSTEM_ONE_API_KEY"
-#   allow_remote = false         # a non-loopback host in url is refused unless true
-#   replay_file = "pairs.json"   # provider = "mock" only
-#   [system_one.capabilities]
-#   constraint = "json_schema"   # "gbnf" (llama.cpp grammar), "json_schema" or "none"
-#   logprobs = false             # the server returns top log-probabilities
-#   batch = false
+# The optional [system_one] section (a small model planned to steer a traversal)
+# is a table, so its commented example is at the end of this file.
 default_top_k = 8
 # Defaults to the OS-native local data directory joined with
 # "local-code-intelligence": %LOCALAPPDATA% on Windows, ~/Library/Application
@@ -440,13 +425,15 @@ exact_seeds = true
 # Over MCP the default top_k is 8, so first_k 10 + top_k 8 = 18 answers. That point
 # was not measured; the threshold sits at the measured point (20), so where-to
 # does not walk over MCP with the default top_k and gets its walk from top_k 10.
-# [traverse.policies.impact]
-# walk = true
 # Edges of one expansion the walk follows once it offers more than 8: the best
 # `beam` by the hop score are adopted, the rest are dropped. A search heuristic,
 # not a limit of the maps (config.key offers up to 256 edges per node,
 # scip.impact 64). 16 is what the walk always used; 1 to 256.
 beam = 16
+# A per-policy table must come after every [traverse] key above; a key placed
+# below its header would belong to the policy, not to [traverse]. Example:
+# [traverse.policies.impact]
+# walk = true
 
 # Named server-side recipes (config_readers, impact_rings, flow_path, flow_from,
 # config_neighbours): fixed chains of the operators above, each answering with
@@ -466,3 +453,21 @@ flow_judge = false
 # [recipes]. Needs [traverse] scip_index.
 [compose]
 enabled = false
+
+# [system_one] is the slot for a small model planned to steer a traversal (the
+# configuration and provider client exist; no traversal rung calls it yet). Off
+# when the section is absent. Uncomment the whole block, header included; it is
+# last in this file because a table header ends the table before it.
+# [system_one]
+# provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)
+# url = "http://127.0.0.1:8080/v1"   # base URL; /chat/completions or /completions is appended
+# model = "your-model-name"
+# api = "chat"                 # "chat" or "completion"
+# timeout_ms = 30000           # 100 to 600000; one attempt, no retry
+# api_key_env = "SYSTEM_ONE_API_KEY"
+# allow_remote = false         # a non-loopback host in url is refused unless true
+# replay_file = "pairs.json"   # provider = "mock" only
+# [system_one.capabilities]
+# constraint = "json_schema"   # "gbnf" (llama.cpp grammar), "json_schema" or "none"
+# logprobs = false             # the server returns top log-probabilities
+# batch = false

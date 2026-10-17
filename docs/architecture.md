@@ -203,7 +203,7 @@ list, schemas and REST routes are exactly those of a server without them.
   `service_status`), 5 with `[recipes] enabled` (`config_readers`, `impact_rings`, `flow_path`, `flow_from`,
   `config_neighbours`) and `lci_compose` with `[compose] enabled`. `search_code` takes `workspace_path`, `query`,
   `top_k`, `languages`, `include_paths`, `exclude_paths`, `source_roles` and, with `[traverse] enabled`, `mode`,
-  `budget`, `steer`, `handle`. An argument a tool does not have is refused with a tool error naming it (REST: HTTP 422). Parameter semantics: README.
+  `budget`, `steer`, `handle`. An argument a tool does not have is refused with a tool error naming it (REST: HTTP 422); `service_status` takes no arguments and is exempt. Parameter semantics: README.
 - **REST** (`src/rest.rs`) exposes each tool as `POST /v1/<tool>` (`GET /v1/service_status`), `search_code` takes
   `?search_profile=`, plus `POST /v1/release_workspace` (no MCP tool: releases the workspace's language servers),
   `GET /openapi.json` (hand-assembled), `/health`, `/ready`. REST, `/openapi.json`, `/health` and `/ready` check Host and
