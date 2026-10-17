@@ -186,7 +186,7 @@ Code: `lci-maps/src/symdefs.rs`, `lci-maps/src/fresh.rs` (`Target`, `Refreshable
   lookup); the registry's timeout still applies.
 - **Kit.** C1 (`check_fail_open`) and C6 (`check_determinism`) pass for `sym.defs` against a control map; registered beside it, its hits fuse with weight 1. No
   production search or traversal call uses it: it lives in `lci-maps` and runs in the contract kit and the audit, and the traversal map selector (`MAPS`
-  and `OPT_IN_MAPS` in `src/app/traverse.rs`) neither lists nor accepts it ([../engine.md](../engine.md), "Other maps").
+  and `OPT_IN_MAPS` in `src/app/traverse/mod.rs`) neither lists nor accepts it ([../engine.md](../engine.md), "Other maps").
 
 ## 4. Open decisions
 

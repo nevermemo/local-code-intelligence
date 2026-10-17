@@ -77,7 +77,7 @@ What a paused step returns, bounded to about 1k tokens by default (idea S7): han
 elapsed), up to `frontier_rows` rows (default 12) of NodeId, path, line range, role, score, per-map contributions and a short snippet (the existing bounded snippet cut further), the frontier size, counts of seen and
 pruned nodes, and the step's warnings and notes. The full frontier is in the RunRecord, not in the packet.
 
-### 3.6 Built: the ladder, `steer` and handles (`lci-maps/src/traverse/`, `src/app/traverse.rs`)
+### 3.6 Built: the ladder, `steer` and handles (`lci-maps/src/traverse/`, `src/app/traverse/`)
 
 What shipped is a different, smaller surface than 3.1 to 3.5, reached through `search_code mode="traverse"` and `lci traverse` (no new tools, no `App.traversals`):
 

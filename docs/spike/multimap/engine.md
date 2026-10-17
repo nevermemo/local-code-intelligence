@@ -31,8 +31,8 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 
 | Map id | Role | Source | Freshness | Module |
 | --- | --- | --- | --- | --- |
-| `seeds.hybrid` (default) | start nodes | top `seed_k` hits of the hybrid search, mapped to SCIP symbols | PerFile | `src/app/traverse.rs` (`SeedMap`) |
-| `seeds.scip_names` (default) | start nodes | question words matched to symbol names; stand-in when the hybrid search is unavailable or empty | PerFile | `src/app/traverse.rs` |
+| `seeds.hybrid` (default) | start nodes | top `seed_k` hits of the hybrid search, mapped to SCIP symbols | PerFile | `src/app/traverse/seeds.rs` (`SeedMap`) |
+| `seeds.scip_names` (default) | start nodes | question words matched to symbol names; stand-in when the hybrid search is unavailable or empty | PerFile | `src/app/traverse/seeds.rs` |
 | `graph.scip` (default) | expansion | the SCIP index (`rust-analyzer scip`, file `scip_index`), read and cached in memory by file stamp | PerFile | `scip_graph.rs` |
 | `structure.contains` (default) | expansion | containment derived from the SCIP graph; lets a chunk or file start node reach its symbols | PerFile | `contains.rs` |
 | `grep.live` | expansion | a search of the tree's current bytes | Live | `live_grep.rs` |
@@ -199,7 +199,7 @@ and `handles/` under another directory.
 ## Surfaces
 
 - `search_code` with `mode = "traverse"` (only when `[traverse] enabled`; otherwise schema and instructions are those of a server without the mode and the request is an error): extra args `budget`, `steer`, `handle`
-  (continuation; the query is then ignored); `top_k` limits the returned nodes (`MAX_TOP_K` 40). `src/app/traverse.rs` `run()` serves it and `lci traverse`.
+  (continuation; the query is then ignored); `top_k` limits the returned nodes (`MAX_TOP_K` 40). `src/app/traverse/mod.rs` `run()` serves it and `lci traverse`.
 - `lci traverse --scip <index> [--root <tree>] (--question | --seeds | --handle [--steer])`, flags `--maps`, `--search-profile`, `--policy` (a preset name, a JSON file, or inline JSON: an array of rules or the
   `steer` object), `--stops`, `--pops`, `--max-depth`, `--top-k` (default 8), `--fusion`, `--pass-through`, `--rerank-frontier`, `--no-score-bound`, `--priors`/`--question-type`, `--tie-break`, `--first-stage`,
   `--first-k`, `--answer-seeds`, `--exact-seeds`, `--out`. It ignores `enabled`.

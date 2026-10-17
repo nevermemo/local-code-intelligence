@@ -1,0 +1,581 @@
+//! Start nodes: the name-token stand-in, the hybrid search seam, the mapping of
+//! search hits to graph nodes, and the descriptor-only seed maps.
+
+use super::first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID};
+use super::{Call, SEEDS_HYBRID, SEEDS_MAP, chunks, index::Loaded};
+use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
+use anyhow::{Context, Result, anyhow};
+use lci_core::node::{NodeId, NodeKind};
+use lci_maps::{
+    Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse, MapStatus,
+    SnapshotView, SourceLabel, contains::CONTAINS_MAP_ID, scip_graph::ScipMap,
+    search_maps::ChunkSearch, traverse::Seed, walk::tokenize,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Start nodes the name-token stand-in takes from the question.
+const SEED_COUNT: usize = 3;
+/// Most symbols one hit of the hybrid search may start from (a chunk that
+/// holds more definitions keeps the ones the question's words name best).
+const MAX_SYMBOLS_PER_HIT: usize = 3;
+
+/// Matches the question's words against symbol names: the stand-in for the
+/// lexical and vector channels until they are wrapped as maps.
+pub(super) struct NameSeeds {
+    names: Vec<(NodeId, HashSet<String>)>,
+}
+
+impl NameSeeds {
+    pub(super) fn new(scip: &ScipMap) -> Self {
+        let graph = scip.graph();
+        Self {
+            names: (0..graph.nodes.len())
+                .map(|i| {
+                    (
+                        scip.node_id(i).clone(),
+                        tokenize(&graph.nodes[i].name).into_iter().collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The best `limit` nodes by the number of the text's words in their
+    /// name, with that number.
+    fn matches(&self, text: &str, limit: usize) -> Vec<(NodeId, usize)> {
+        let words = tokenize(text);
+        let mut scored: Vec<(usize, &NodeId)> = self
+            .names
+            .iter()
+            .map(|(id, tokens)| (words.iter().filter(|w| tokens.contains(*w)).count(), id))
+            .filter(|(n, _)| *n > 0)
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(n, id)| (id.clone(), n))
+            .collect()
+    }
+}
+
+/// One hit of the hybrid search, as the start-node mapping needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedHit {
+    /// The chunk's file, relative to the workspace.
+    pub path: String,
+    /// The chunk's lines, 1-based and inclusive (as the index stores them).
+    pub start_line: u32,
+    pub end_line: u32,
+    pub content_hash: String,
+    /// The chunk's ordinal among the chunks of its file with the same
+    /// content hash (a part of its node id); `None` when the index's chunk
+    /// list could not be read, which reads as 0.
+    pub ordinal: Option<u32>,
+    /// Position in the search result, 1-based.
+    pub rank: usize,
+    /// The retrievers that returned the chunk (`semantic`, `lexical`, `lsp`).
+    pub retrievers: Vec<String>,
+    pub semantic_rank: Option<usize>,
+    pub lexical_rank: Option<usize>,
+    pub lsp_rank: Option<usize>,
+    pub fusion_score: f32,
+    pub reranker_score: Option<f32>,
+}
+
+impl SeedHit {
+    /// The score the search ordered the hit by: the reranker's when it ran
+    /// for the hit, else the fusion score, with the name of which it is.
+    fn score(&self) -> (f32, &'static str) {
+        match self.reranker_score {
+            Some(score) => (score, "reranker"),
+            None => (self.fusion_score, "fusion"),
+        }
+    }
+}
+
+/// The search that turns a question into [`SeedHit`]s.
+#[lci_maps::async_trait]
+pub trait SeedSearch: Send + Sync {
+    /// The best `k` hits of the question, best first.
+    async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>>;
+
+    /// The chunks of the workspace's index, for the maps `search.lexical` and
+    /// `search.vector`; `None` when this search has no index to offer.
+    fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
+        None
+    }
+
+    /// The reranker client, for `[traverse] rerank_frontier`; `None` when this
+    /// search has none.
+    fn reranker(&self) -> Option<&Models> {
+        None
+    }
+
+    /// The reranker's model and endpoint as text a handle keeps, so a resume
+    /// can refuse another reranker; `None` when this search cannot say. The
+    /// text names no path and no secret.
+    fn reranker_identity(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The search `search_code` runs in its normal mode, over one workspace and
+/// with the retrievers and reranker of one profile.
+pub struct AppSeeds<'a> {
+    pub app: &'a App,
+    pub workspace: &'a Path,
+    pub profile: Option<&'a str>,
+}
+
+#[lci_maps::async_trait]
+impl SeedSearch for AppSeeds<'_> {
+    fn chunk_search(&self) -> Option<Arc<dyn ChunkSearch + '_>> {
+        Some(Arc::new(chunks::AppChunks::new(self.app, self.workspace)))
+    }
+
+    fn reranker(&self) -> Option<&Models> {
+        Some(&self.app.models)
+    }
+
+    fn reranker_identity(&self) -> Option<String> {
+        let config = &self.app.config;
+        // The endpoint is kept as a hash: the URL may carry a host or a token
+        // that does not belong in a handle.
+        Some(format!(
+            "{} @ u{}",
+            config.reranker_model,
+            lci_maps::traverse::trace::hash16(config.reranker_url.as_bytes())
+        ))
+    }
+
+    async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
+        let report = self
+            .app
+            .search_in_profile(
+                self.workspace,
+                question,
+                Some(k),
+                FilterRequest::default(),
+                self.profile,
+            )
+            .await?;
+        if report.results.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The ordinal of a chunk in its node id needs the chunk list of its
+        // file, which only the index's manifest has.
+        let data_dir = self.app.config.data_dir.clone();
+        let workspace = report.workspace.clone();
+        let manifest =
+            tokio::task::spawn_blocking(move || crate::manifest::try_load(&data_dir, &workspace))
+                .await
+                .context("read the chunk list of the index")?
+                .ok();
+        Ok(report
+            .results
+            .iter()
+            .zip(1..)
+            .map(|(hit, rank)| {
+                let chunk = &hit.chunk;
+                let ordinal = manifest.as_ref().and_then(|manifest| {
+                    let file = manifest.files.get(&chunk.relative_file_path)?;
+                    let at = file.chunks.iter().position(|c| {
+                        (c.start_line, c.end_line, &c.content_hash)
+                            == (chunk.start_line, chunk.end_line, &chunk.content_hash)
+                    })?;
+                    match lci_core::node::chunk_ids(&file.chunks).swap_remove(at) {
+                        NodeId::Chunk { ordinal, .. } => Some(ordinal),
+                        _ => None,
+                    }
+                });
+                SeedHit {
+                    path: chunk.relative_file_path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    content_hash: chunk.content_hash.clone(),
+                    ordinal,
+                    rank,
+                    retrievers: hit.retrieval_channels.clone(),
+                    semantic_rank: hit.semantic_rank,
+                    lexical_rank: hit.lexical_rank,
+                    lsp_rank: hit.lsp_rank,
+                    fusion_score: hit.fusion_score,
+                    reranker_score: hit.reranker_score,
+                }
+            })
+            .collect())
+    }
+}
+
+/// A search that is known to be unavailable: it fails with the reason, which
+/// the response names as the reason for the stand-in.
+pub struct NoSearch(pub String);
+
+#[lci_maps::async_trait]
+impl SeedSearch for NoSearch {
+    async fn search(&self, _question: &str, _k: usize) -> Result<Vec<SeedHit>> {
+        Err(anyhow!("{}", self.0))
+    }
+}
+
+/// A start node and what is known of where it came from.
+pub(super) struct MappedSeed {
+    pub(super) node: NodeId,
+    /// The `seed_hits` record of the response and the trace.
+    pub(super) info: Value,
+}
+
+/// Where in the graph a hit's chunk is.
+enum Place {
+    /// Functions whose name is on a line of the chunk, at most
+    /// [`MAX_SYMBOLS_PER_HIT`] of `total`.
+    Defined { nodes: Vec<usize>, total: usize },
+    /// The chunk lies inside this function (the innermost around it).
+    Inside(usize),
+    /// No function of the graph: the chunk stays a chunk node.
+    Nowhere,
+}
+
+/// Finds the graph nodes a hit's chunk defines or lies in. Lines: the chunk's
+/// are 1-based, the graph's 0-based; a chunk holds a function when the line
+/// of the function's name is one of the chunk's lines, and lies in a function
+/// when the function's whole range covers the chunk's lines. A chunk that
+/// does neither (the gap between two functions, a type, a constant, a file
+/// the index does not list) is not attributed to its neighbour.
+fn place(loaded: &Loaded, hit: &SeedHit, words: &[String]) -> Place {
+    let graph = loaded.scip.graph();
+    let Some(nodes) = loaded.by_file.get(&hit.path.replace('\\', "/")) else {
+        return Place::Nowhere;
+    };
+    let first = hit.start_line.saturating_sub(1);
+    let last = hit.end_line.max(hit.start_line).saturating_sub(1);
+    let mut defined: Vec<usize> = nodes
+        .iter()
+        .copied()
+        .filter(|&i| (first..=last).contains(&graph.nodes[i].line))
+        .collect();
+    if !defined.is_empty() {
+        let total = defined.len();
+        if total > MAX_SYMBOLS_PER_HIT {
+            let overlap = |i: usize| {
+                let tokens = &loaded.names.names[i].1;
+                words.iter().filter(|w| tokens.contains(*w)).count()
+            };
+            defined.sort_by_key(|&i| (std::cmp::Reverse(overlap(i)), graph.nodes[i].line, i));
+            defined.truncate(MAX_SYMBOLS_PER_HIT);
+        }
+        defined.sort_by_key(|&i| (graph.nodes[i].line, i));
+        return Place::Defined {
+            nodes: defined,
+            total,
+        };
+    }
+    let around = nodes
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let (from, to) = graph.nodes[i].span;
+            from <= first && last <= to
+        })
+        .min_by_key(|&i| {
+            let (from, to) = graph.nodes[i].span;
+            (to - from, std::cmp::Reverse(from), i)
+        });
+    around.map_or(Place::Nowhere, Place::Inside)
+}
+
+/// Maps the hits of the hybrid search to start nodes, best hit first: a
+/// symbol node of the SCIP graph where the hit's chunk defines or lies in a
+/// function (see [`place`]), else the chunk's own node. A node that several
+/// hits map to is one seed that lists the ranks of all of them; its other
+/// fields are those of its best hit. A hit whose file or hash cannot make a
+/// node id is dropped.
+pub(super) fn map_hits(loaded: &Loaded, question: &str, hits: &[SeedHit]) -> Vec<MappedSeed> {
+    let words = tokenize(question);
+    let graph = loaded.scip.graph();
+    let mut seeds: Vec<MappedSeed> = Vec::new();
+    let mut at: HashMap<NodeId, usize> = HashMap::new();
+    for hit in hits {
+        let (score, score_kind) = hit.score();
+        // (node, how, definitions in the chunk, graph index)
+        let candidates: Vec<(NodeId, &'static str, Option<usize>, Option<usize>)> =
+            match place(loaded, hit, &words) {
+                Place::Defined { nodes, total } => nodes
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            loaded.scip.node_id(i).clone(),
+                            "defined",
+                            Some(total),
+                            Some(i),
+                        )
+                    })
+                    .collect(),
+                Place::Inside(i) => vec![(loaded.scip.node_id(i).clone(), "inside", None, Some(i))],
+                Place::Nowhere => {
+                    let chunk = NodeId::chunk(
+                        hit.path.clone(),
+                        hit.content_hash.clone(),
+                        hit.ordinal.unwrap_or(0),
+                    )
+                    .or_else(|_| NodeId::file(hit.path.clone()));
+                    match chunk {
+                        Ok(node) => vec![(node, "chunk", None, None)],
+                        Err(_) => Vec::new(),
+                    }
+                }
+            };
+        for (node, how, symbols_in_chunk, graph_index) in candidates {
+            if let Some(&known) = at.get(&node) {
+                if let Some(list) = seeds[known].info["also_hit_ranks"].as_array_mut() {
+                    list.push(json!(hit.rank));
+                }
+                continue;
+            }
+            let symbol = node.kind() == NodeKind::Symbol;
+            let mut info = json!({
+                "node": node.to_string(),
+                "kind": if symbol { "symbol" } else if node.kind() == NodeKind::Chunk { "chunk" } else { "file" },
+                "how": how,
+                "path": hit.path,
+                "lines": [hit.start_line, hit.end_line],
+                "hit_rank": hit.rank,
+                "retrievers": hit.retrievers,
+                "channel_ranks": {
+                    "semantic": hit.semantic_rank,
+                    "lexical": hit.lexical_rank,
+                    "lsp": hit.lsp_rank,
+                },
+                "score": score,
+                "score_kind": score_kind,
+                "also_hit_ranks": [],
+            });
+            if let Some(object) = info.as_object_mut() {
+                if let Some(total) = symbols_in_chunk {
+                    object.insert("symbols_in_chunk".into(), json!(total));
+                }
+                if let Some(index) = graph_index {
+                    object.insert("symbol".into(), json!(graph.nodes[index].name));
+                }
+            }
+            at.insert(node.clone(), seeds.len());
+            seeds.push(MappedSeed { node, info });
+        }
+    }
+    seeds
+}
+
+/// A start-node or first-stage source as a registered map: its descriptor
+/// only. The walk never queries it; registering it puts its id in the
+/// selectors, the maps list and the trace (`seeds.hybrid`, `seeds.scip_names`,
+/// `exact.closure`, `exact.pickaxe`).
+pub(super) struct SeedMap {
+    descriptor: MapDescriptor,
+}
+
+impl SeedMap {
+    fn new(id: MapId, emits: Vec<NodeKind>, labels: Vec<SourceLabel>) -> Self {
+        Self {
+            descriptor: MapDescriptor {
+                id,
+                version: 1,
+                contribution: Contribution::RankList,
+                accepts_text: true,
+                accepts: Vec::new(),
+                emits,
+                freshness: FreshnessModel::PerFile,
+                source_labels: labels,
+                needs: Vec::new(),
+            },
+        }
+    }
+
+    /// The hits of the hybrid search.
+    pub(super) fn hybrid() -> Self {
+        Self::new(
+            SEEDS_HYBRID,
+            vec![NodeKind::Symbol, NodeKind::Chunk, NodeKind::File],
+            vec![SourceLabel::Vector, SourceLabel::Lexical, SourceLabel::Lsp],
+        )
+    }
+
+    /// The symbols whose names hold the question's words.
+    pub(super) fn name_tokens() -> Self {
+        Self::new(
+            SEEDS_MAP,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Lexical],
+        )
+    }
+
+    /// The declarations that reference the symbol the question names.
+    pub(super) fn exact_closure() -> Self {
+        Self::new(
+            EXACT_CLOSURE_ID,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Scip],
+        )
+    }
+
+    /// The commits `git log -G/-S/--grep` finds for a history question.
+    pub(super) fn exact_pickaxe() -> Self {
+        Self::new(
+            EXACT_PICKAXE_ID,
+            vec![NodeKind::Commit],
+            vec![SourceLabel::Git],
+        )
+    }
+}
+
+#[lci_maps::async_trait]
+impl Map for SeedMap {
+    fn describe(&self) -> &MapDescriptor {
+        &self.descriptor
+    }
+
+    async fn query(&self, _request: &MapRequest<'_>, view: &SnapshotView<'_>) -> MapResponse {
+        MapResponse::empty(&self.descriptor, view, MapStatus::Ok)
+    }
+}
+
+fn parse_seeds(seeds: &[String]) -> Result<Vec<NodeId>> {
+    seeds
+        .iter()
+        .map(|text| NodeId::from_str(text).map_err(|e| anyhow!("seed {text:?}: {e}")))
+        .collect()
+}
+
+/// The start nodes of a call and where they came from.
+#[derive(Default)]
+pub(super) struct Seeds {
+    pub(super) nodes: Vec<Seed>,
+    /// `given`, `hybrid` or `name_tokens`; empty on a continuation.
+    pub(super) source: &'static str,
+    /// One record per start node: the retrievers that found it and its score.
+    pub(super) details: Vec<Value>,
+    /// Why the stand-in replaced the hybrid search, if it did.
+    pub(super) fallback: Option<String>,
+    pub(super) notes: Vec<String>,
+    /// How long the hybrid search ran (zero when it did not). The walk's
+    /// deadline does not run while it does: the search is bounded by the
+    /// embedding and reranker timeouts, not by `deadline_ms`.
+    pub(super) search_time: Duration,
+}
+
+/// Finds the start nodes: the caller's, else the hybrid search's, else (when
+/// that is unavailable or finds nothing) the name-token stand-in, and the
+/// stand-in alone when it is the only seeds map wanted.
+pub(super) async fn find_seeds(
+    limits: &TraverseConfig,
+    call: &Call<'_>,
+    loaded: &Loaded,
+    wanted: &[MapId],
+) -> Result<Seeds> {
+    let explicit = parse_seeds(call.seeds)?;
+    if !explicit.is_empty() {
+        return Ok(Seeds {
+            nodes: explicit
+                .into_iter()
+                .map(|node| Seed { node, map: None })
+                .collect(),
+            source: "given",
+            ..Seeds::default()
+        });
+    }
+    let mut found = Seeds::default();
+    let mut reason = None;
+    if wanted.contains(&SEEDS_HYBRID) {
+        match call.seed_search {
+            None => {
+                reason = Some(
+                    "no search is available for this call (it has no workspace to search)"
+                        .to_owned(),
+                );
+            }
+            Some(_) if call.question.trim().is_empty() => {
+                reason = Some("the question is empty".to_owned());
+            }
+            Some(search) => {
+                let started = Instant::now();
+                let hits = search.search(call.question, limits.seed_k as usize).await;
+                found.search_time = started.elapsed();
+                match hits {
+                    Err(error) => reason = Some(format!("the hybrid search failed: {error:#}")),
+                    Ok(hits) if hits.is_empty() => {
+                        reason = Some("the hybrid search returned no hits".to_owned());
+                    }
+                    Ok(hits) => {
+                        let mapped = map_hits(loaded, call.question, &hits);
+                        let kinds = |kind: &str| {
+                            mapped
+                                .iter()
+                                .filter(|seed| seed.info["kind"] == kind)
+                                .count()
+                        };
+                        let chunks = kinds("chunk") + kinds("file");
+                        if chunks > 0 {
+                            found.notes.push(if wanted.contains(&CONTAINS_MAP_ID) {
+                            format!(
+                                "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; {CONTAINS_MAP_ID} expands them to the symbols they contain",
+                                mapped.len()
+                            )
+                        } else {
+                            format!(
+                                "{chunks} of {} start nodes are chunks or files that the SCIP graph does not hold; nothing expands them (add {CONTAINS_MAP_ID} to the maps)",
+                                mapped.len()
+                            )
+                        });
+                        }
+                        found.source = "hybrid";
+                        for seed in mapped {
+                            found.nodes.push(Seed {
+                                node: seed.node,
+                                map: Some(SEEDS_HYBRID),
+                            });
+                            found.details.push(seed.info);
+                        }
+                        return Ok(found);
+                    }
+                }
+            }
+        }
+    }
+    if wanted.contains(&SEEDS_MAP) {
+        found.source = "name_tokens";
+        for (node, matched) in loaded.names.matches(call.question, SEED_COUNT) {
+            found.details.push(json!({
+                "node": node.to_string(),
+                "kind": "symbol",
+                "how": "name",
+                "retrievers": ["name_tokens"],
+                "score": matched,
+                "score_kind": "words_in_name",
+            }));
+            found.nodes.push(Seed {
+                node,
+                map: Some(SEEDS_MAP),
+            });
+        }
+        if let Some(reason) = reason {
+            found.notes.push(format!(
+                "seed_source is name_tokens, the stand-in that matches the question's words against symbol names: {reason}"
+            ));
+            found.fallback = Some(reason);
+        }
+    } else if let Some(reason) = reason {
+        found.source = "hybrid";
+        found.fallback = Some(reason);
+    }
+    if found.source.is_empty() {
+        found.source = "none";
+    }
+    Ok(found)
+}
