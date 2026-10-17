@@ -26,10 +26,7 @@
 //! the ranking and the early stop depend on is kept and checked: the
 //! corroboration boost ([`Snapshot::check_boost`]), the score bound's `k`
 //! ([`Snapshot::check_top_k`]), the hop priors, the tie-break file, the
-//! reranker and the edge bandit's settings ([`Snapshot::check_bandit`]; its stats
-//! are not kept, so the queue priorities the handle holds are the weighted ones
-//! the first call left, and a state it held back at its depth limit is queued
-//! at its potential); a caller refuses a handle whose setting it does not
+//! reranker; a caller refuses a handle whose setting it does not
 //! repeat. The
 //! budget is absolute for the whole traversal (`pops`, `est_tokens`,
 //! `external_calls` and the reranker calls count from the first call), with a
@@ -95,13 +92,6 @@ pub enum HandleError {
     /// caller gives (see [`Snapshot::check_rerank`]); each side is the floor
     /// and the reranker's identity, or `off`.
     WrongRerank {
-        handle: String,
-        found: String,
-        expected: String,
-    },
-    /// The handle was made with other edge bandit settings than the caller gives
-    /// (see [`Snapshot::check_bandit`]); each side is the settings as text, or `off`.
-    WrongBandit {
         handle: String,
         found: String,
         expected: String,
@@ -172,16 +162,6 @@ impl fmt::Display for HandleError {
                 "handle {handle} was made with the reranker frontier {found}, this call has \
                  {expected}; give the same rerank_frontier, rerank_floor, rerank_scores and \
                  reranker, or start a new traversal"
-            ),
-            Self::WrongBandit {
-                handle,
-                found,
-                expected,
-            } => write!(
-                f,
-                "handle {handle} was made with the edge bandit {found}, this call has \
-                 {expected}; give the same edge_bandit, bandit_rate, bandit_signal and its \
-                 settings, or start a new traversal"
             ),
             Self::WrongBoost {
                 handle,
@@ -287,11 +267,6 @@ pub struct Snapshot {
     /// The content hash of the tie-break file the first call ranked with (none:
     /// discovery order). Written to the handle only when there is one.
     pub tie_break: Option<String>,
-    /// The settings of the edge bandit the first call ran with, as
-    /// [`Traversal::bandit_fingerprint`] writes them (none: it was off).
-    /// Written to the handle only when there are some. The stats are not kept;
-    /// the priorities in `frontier` are the weighted ones the call left.
-    pub bandit: Option<String>,
 }
 
 impl Snapshot {
@@ -324,17 +299,6 @@ impl Snapshot {
             }
             if let Some(identity) = &self.rerank_identity {
                 object.insert("rerank_identity".into(), json!(identity));
-            }
-            if let Some(bandit) = &self.bandit {
-                object.insert("bandit".into(), json!(bandit));
-            }
-            // Left out when there are none, so a handle of a walk without the
-            // bandit is what it was.
-            if let Some(totals) = object.get_mut("totals").and_then(Value::as_object_mut)
-                && (self.totals.bandit_calls > 0 || self.totals.bandit_docs > 0)
-            {
-                totals.insert("bandit_calls".into(), json!(self.totals.bandit_calls));
-                totals.insert("bandit_docs".into(), json!(self.totals.bandit_docs));
             }
         }
         value
@@ -473,23 +437,6 @@ impl Snapshot {
         })
     }
 
-    /// Refuses a snapshot made with other edge bandit settings than `setting`
-    /// (the text [`Traversal::bandit_fingerprint`] writes; none: the bandit is
-    /// off). The priorities a handle holds are weighted by the bandit of the
-    /// call that made it, so another setting would mix two orders in one
-    /// queue. The stats are not kept: a resume starts a new bandit.
-    pub fn check_bandit(&self, setting: Option<&str>) -> Result<(), HandleError> {
-        if self.bandit.as_deref() == setting {
-            return Ok(());
-        }
-        let show = |setting: Option<&str>| setting.unwrap_or("off").to_owned();
-        Err(HandleError::WrongBandit {
-            handle: self.handle(),
-            found: show(self.bandit.as_deref()),
-            expected: show(setting),
-        })
-    }
-
     /// Refuses a snapshot that ranked with another corroboration boost than
     /// `boost` (the caller's explicit one, sanitised as
     /// [`Traversal::corroboration_boost`] does). A resume would otherwise rank
@@ -531,6 +478,13 @@ impl Snapshot {
         let obj = value.as_object().ok_or("snapshot is not an object")?;
         if get(obj, "version")?.as_u64() != Some(u64::from(VERSION)) {
             return Err("unsupported snapshot version".into());
+        }
+        // Only a walk with the removed edge bandit on wrote this key, and its
+        // queue priorities are weighted by a bandit this build no longer has.
+        if obj.get("bandit").is_some_and(|v| !v.is_null()) {
+            return Err(
+                "snapshot was made with the edge bandit, which this build no longer has".into(),
+            );
         }
         let states = array(obj, "states")?
             .iter()
@@ -744,14 +698,6 @@ impl Snapshot {
                     .map(|(reason, n)| Ok((reason.parse::<RerankFailure>()?, u32_of(n)?)))
                     .collect::<Result<_, String>>()?,
                 rerank_skipped: u32_of(get(totals, "rerank_skipped")?)?,
-                bandit_calls: match totals.get("bandit_calls") {
-                    None => 0,
-                    Some(v) => u32_of(v)?,
-                },
-                bandit_docs: match totals.get("bandit_docs") {
-                    None => 0,
-                    Some(v) => u32_of(v)?,
-                },
                 physical_map_calls: u32_of(get(totals, "physical_map_calls")?)?,
                 physical_external_calls: u32_of(get(totals, "physical_external_calls")?)?,
                 stops: u32_of(get(totals, "stops")?)?,
@@ -799,10 +745,6 @@ impl Snapshot {
                 }
             },
             tie_break: match obj.get("tie_break") {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(string_of(v)?),
-            },
-            bandit: match obj.get("bandit") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(string_of(v)?),
             },
@@ -1065,7 +1007,6 @@ impl Run<'_> {
                 .fingerprint()
                 .map(|(question_type, hash)| (question_type.to_owned(), hash.to_owned())),
             tie_break: self.t.tie_break.as_ref().map(|t| t.hash().to_owned()),
-            bandit: self.t.bandit_fingerprint(),
         }
     }
 

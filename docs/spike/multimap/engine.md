@@ -115,7 +115,7 @@ becomes a state once and is expanded at most once. A start node is never "found 
   keeps its state and the route is traced once as `alt_path`.
 - Corroboration (fusion `boost`, default): rank = potential * (1 + boost * (n_maps - 1)), `corroboration_boost` 0.1 (0 to 10). Maps that found the seeds are not evidence; dependent maps (cards say `dependent`:
   `structure.contains`, `graph.scip`, `scip.impact`, one graph) count once.
-- Fusion `rrf`: per evidence source rank by best potential; score = sum of `weight/(rank+2)` (`RRF_K` 2.0); equal scores order by node id; the score bound is off under `rrf`; the edge bandit cannot combine with it.
+- Fusion `rrf`: per evidence source rank by best potential; score = sum of `weight/(rank+2)` (`RRF_K` 2.0); equal scores order by node id; the score bound is off under `rrf`.
 - Budgets (all checked, none exceeded): `pops` (200) and `deadline` before every pop and inside every map call, `est_tokens` (`TOKENS_PER_EDGE` 12 per adopted hop plus the maps' own estimate) and `external_calls`
   (`EXTERNAL_CALLS` 100, shared among maps in registry order) around every expansion. A pop cut by a budget is requeued and pays for its calls once. `pops`, `est_tokens` and `external_calls` are absolute for the
   traversal; `deadline` and `max_depth` belong to one call, and the deadline excludes the hybrid seed search (its time is added once it returns; index load still counts, d362); a state at `max_depth` is recorded, not expanded. Only the outer agent can add pops and tokens (`RAISE_MAX_POPS` 200, `RAISE_MAX_TOKENS` 20000 in total).
@@ -126,8 +126,7 @@ becomes a state once and is expanded at most once. A start node is never "found 
 - `pass_through` (off): popping a connective node (file, commit, config key) is free; the pop cap applies to the free pops too (at most twice the cap); counted in `Totals::pass_through_pops`.
 - Reranker frontier (`rerank_frontier`, off): one batched call per expansion multiplies each kept hop by `rerank_floor + (1 - rerank_floor) * s` (floor 0.25; factor in [floor, 1], so the bound stays sound); a failed
   call leaves factor 1 and is counted by reason; `max_model_calls` caps the calls (absent: no cap). `lci-maps` has no HTTP; the caller supplies the rescorer.
-- Edge bandit (`edge_bandit`, off): within one request each child's frontier priority is multiplied by a weight in [`WEIGHT_MIN` 0.5, `WEIGHT_MAX` 2.0]: smoothed hit rate `(hits+1)/(tries+2)` over the mean of the
-  tried kinds, raised to `bandit_rate`. Signals: `topk` (diagnostic, reinforces itself), `rerank`, `fixed`, `random`. Only queue order changes; nothing carries over between requests.
+- Edge bandit: removed (decision d365; the N2 experiment was dropped, d252, and its code is kept at tag `keep/n2-bandit`). The `[traverse]` keys `edge_bandit` and `bandit_*`, the `lci traverse` and bench flags `--edge-bandit` and `--bandit-*`, `totals.bandit*` and the trace event `bandit` are gone; a config with a bandit key fails to load naming it, and a handle that carries `bandit` is refused.
 - Edge sources: `OnTheFly` (asks every enabled map whose `accepts` holds; noisy-OR of the best confidence per map) and `PreMerged` (`merged.rs`, a materialised union built once; a node it never reached gets one call
   named `GAP_MAP` = `merged.adjacency`; `audit_edge_sources` checks equality on fixtures).
 
@@ -168,7 +167,7 @@ response's `effective_policy` shows what ran. `BudgetArgs` {`pops`, `max_depth`,
 
 Handles (`handle.rs`): the hash of the snapshot JSON, file `<data_dir>/traverse/handles/<handle>.json` (`MAX_HANDLE` 64 characters), bound to the workspace and index it was made on (`check_identity`). A snapshot
 holds states, queue, held-back states, counters, cleared set, map weights and switches, pop count, paid costs, traced `alt_path` pairs; not the event log, edge source, scorer or handler. A resume must repeat the
-boost, `top_k`, priors, tie-break file, reranker identity and bandit settings or is refused; no TTL, no cap on live handles. Stable policies: [v2/policies/README.md](v2/policies/README.md). Design of the unbuilt ops
+boost, `top_k`, priors, tie-break file or reranker identity, or is refused; no TTL, no cap on live handles. Stable policies: [v2/policies/README.md](v2/policies/README.md). Design of the unbuilt ops
 and tools: [specs/steering-ops.md](specs/steering-ops.md).
 
 ## Recipes and compose
@@ -185,15 +184,15 @@ runs called a recipe tool off-shape, +11.6% input tokens); recipes stay opt-in (
 Schema `lci.runrecord/0` (`lci-maps/src/run_record.rs`, schema file `specs/runrecord-0.schema.json`; hand-written checker): a spike-feature writer and an offline harness are built, no production writer
 ([specs/run-record.md](specs/run-record.md)). The traversal writes its own trace, JSONL at `<data_dir>/traces/<name>.jsonl` (`trace.rs`): no wall-clock values (equal inputs give byte-identical files), hashes are the
 first 16 hex digits of SHA-256. Events: `start`, `expand`, `hop`, `relax`, `alt_path`, `stop` (reason and all triggers that held, hash of the checkpoint), `steer` (`rung`, `handler`, `confidence`, `actions`,
-`outcome` `applied`, `uncertain` or `returned`; cites `inputs_hash`), `return` (`escalated`, `handler_stop`, `budget`), `bound`, `resume` (names the handle), `end` (totals incl. `bandit`). `--out` writes `traces/`
+`outcome` `applied`, `uncertain` or `returned`; cites `inputs_hash`), `return` (`escalated`, `handler_stop`, `budget`), `bound`, `resume` (names the handle), `end` (totals). `--out` writes `traces/`
 and `handles/` under another directory.
 
 ## Configuration keys
 
 `[traverse]` (`TraverseConfig`; comments and ranges in `config.example.toml`): `enabled` false, `scip_index` "index.scip", `max_pops` 200, `max_depth` 6, `max_est_tokens` 20000, `deadline_ms` 5000, `max_stops` 4,
 `tau` 0.8, `corroboration_boost` 0.1, `fusion` "boost", `pass_through` false, `rerank_frontier` false, `rerank_floor` 0.25, `rerank_scores` "probability" (or "logit"), `max_model_calls` absent, `score_bound` true,
-`priors` and `question_type` (both or neither, absent), `tie_break` (absent), `seed_k` 8 (1 to 40), `first_stage` "append", `first_k` 10 (0 to 200), `answer_seeds` true, `exact_seeds` true, `beam` 16, `edge_bandit`
-false, `bandit_rate` 1.0 (0 to 4), `bandit_signal` "topk", `bandit_threshold` 0.5, `bandit_every` 3 (1 to 64), `bandit_sample` 4 (1 to 32), `bandit_seed` 0, `bandit_fixed` absent. `[traverse.policies.<name>]`:
+`priors` and `question_type` (both or neither, absent), `tie_break` (absent), `seed_k` 8 (1 to 40), `first_stage` "append", `first_k` 10 (0 to 200), `answer_seeds` true, `exact_seeds` true, `beam` 16.
+`[traverse.policies.<name>]`:
 `walk`, `walk_min_answers`, `extra_maps`, `first_k`, `seed_k`. `[recipes]`: `enabled` false, `flow_judge` false. `[compose]`: `enabled` false. Requests can lower the caps, never raise them. Embedding default model
 `qwen3-embedding-4b`; ports and the reserved-port rule are in the top-level README and `AGENTS.md`.
 
@@ -203,7 +202,7 @@ false, `bandit_rate` 1.0 (0 to 4), `bandit_signal` "topk", `bandit_threshold` 0.
   (continuation; the query is then ignored); `top_k` limits the returned nodes (`MAX_TOP_K` 40). `src/app/traverse.rs` `run()` serves it and `lci traverse`.
 - `lci traverse --scip <index> [--root <tree>] (--question | --seeds | --handle [--steer])`, flags `--maps`, `--search-profile`, `--policy` (a preset name, a JSON file, or inline JSON: an array of rules or the
   `steer` object), `--stops`, `--pops`, `--max-depth`, `--top-k` (default 8), `--fusion`, `--pass-through`, `--rerank-frontier`, `--no-score-bound`, `--priors`/`--question-type`, `--tie-break`, `--first-stage`,
-  `--first-k`, `--answer-seeds`, `--exact-seeds`, `--edge-bandit` and the `--bandit-*` flags, `--out`. It ignores `enabled`.
+  `--first-k`, `--answer-seeds`, `--exact-seeds`, `--out`. It ignores `enabled`.
 - Recipe tools `config_readers`, `impact_rings`, `flow_path`, `flow_from`, `config_neighbours`, `lci_compose` (MCP and REST `POST /v1/<name>`, only when enabled); `lci recipe <name> --root <tree> [--scip] [--args]`
   always runs; `config_readers`, `config_neighbours` and a `config.key` compose step need `rg` on PATH.
 - Compact view (`src/app/compact.rs`): `[search_profiles.<name>] response = "compact"` drops retrieval metadata after retrieval; presentation only.

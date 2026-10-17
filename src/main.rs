@@ -498,43 +498,6 @@ struct TraverseArgs {
     /// configured `true` off.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     exact_seeds: Option<bool>,
-    /// The in-request edge bandit (the `[traverse] edge_bandit` setting, off by
-    /// default): within one request, the queue priority of each new node is
-    /// weighted (0.5 to 2) by how well its kind of edge has paid. Only the
-    /// queue order changes. A continuation must be given the same bandit
-    /// settings; `--edge-bandit=false` turns a configured `true` off.
-    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-    edge_bandit: Option<bool>,
-    /// The exponent of the bandit's weight, 0 to 4 (the `[traverse]
-    /// bandit_rate` setting).
-    #[arg(long)]
-    bandit_rate: Option<f64>,
-    /// What counts as a hit: `topk` (diagnostic), `rerank` (a sample of new
-    /// nodes rated by the reranker; needs --root and counts model calls),
-    /// `fixed` or `random` (cost-free baselines); the `[traverse]
-    /// bandit_signal` setting.
-    #[arg(long)]
-    bandit_signal: Option<local_code_intelligence::config::TraverseBanditSignal>,
-    /// `rerank`: a rated node is a hit at this score or above, 0 to 1 (the
-    /// `[traverse] bandit_threshold` setting).
-    #[arg(long)]
-    bandit_threshold: Option<f64>,
-    /// `rerank`: rate after every this many expansions (the `[traverse]
-    /// bandit_every` setting).
-    #[arg(long)]
-    bandit_every: Option<u32>,
-    /// `rerank`: rate at most this many new nodes per round (the `[traverse]
-    /// bandit_sample` setting).
-    #[arg(long)]
-    bandit_sample: Option<u32>,
-    /// `random`: the seed of the per-kind weights; `rerank`: of the sample draw (the `[traverse]
-    /// bandit_seed` setting).
-    #[arg(long)]
-    bandit_seed: Option<u64>,
-    /// `fixed`: per-kind weights as `kind=weight,kind=weight`, each 0.5 to 2
-    /// (the `[traverse] bandit_fixed` table), e.g. `contains=1.5,tests=0.8`.
-    #[arg(long)]
-    bandit_fixed: Option<String>,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -624,24 +587,6 @@ async fn run_recipe(
     Ok(())
 }
 
-/// `kind=weight,kind=weight` as the `[traverse] bandit_fixed` table. The names
-/// are checked when the traversal runs.
-fn parse_bandit_fixed(text: &str) -> Result<std::collections::BTreeMap<String, f64>> {
-    text.split(',')
-        .filter(|part| !part.trim().is_empty())
-        .map(|part| {
-            let (kind, weight) = part
-                .split_once('=')
-                .with_context(|| format!("--bandit-fixed {part:?}: expected kind=weight"))?;
-            let weight: f64 = weight
-                .trim()
-                .parse()
-                .with_context(|| format!("--bandit-fixed {part:?}: the weight is not a number"))?;
-            Ok((kind.trim().to_owned(), weight))
-        })
-        .collect()
-}
-
 /// JSON given inline or as the path of a file.
 fn json_argument(text: &str) -> Result<Value> {
     let trimmed = text.trim_start();
@@ -705,30 +650,6 @@ async fn run_traverse(
     }
     if let Some(exact_seeds) = args.exact_seeds {
         config.traverse.exact_seeds = exact_seeds;
-    }
-    if let Some(edge_bandit) = args.edge_bandit {
-        config.traverse.edge_bandit = edge_bandit;
-    }
-    if let Some(rate) = args.bandit_rate {
-        config.traverse.bandit_rate = rate;
-    }
-    if let Some(signal) = args.bandit_signal {
-        config.traverse.bandit_signal = signal;
-    }
-    if let Some(threshold) = args.bandit_threshold {
-        config.traverse.bandit_threshold = threshold;
-    }
-    if let Some(every) = args.bandit_every {
-        config.traverse.bandit_every = every;
-    }
-    if let Some(sample) = args.bandit_sample {
-        config.traverse.bandit_sample = sample;
-    }
-    if let Some(seed) = args.bandit_seed {
-        config.traverse.bandit_seed = seed;
-    }
-    if let Some(table) = &args.bandit_fixed {
-        config.traverse.bandit_fixed = parse_bandit_fixed(table)?;
     }
     // The overrides come after the configuration was checked: check it again.
     config.validate().context("traverse options")?;
@@ -1561,23 +1482,5 @@ mod tests {
                 "lci_core::lsp"
             ]
         );
-    }
-
-    #[test]
-    fn bandit_fixed_is_parsed_as_kind_weight_pairs() {
-        let table = super::parse_bandit_fixed("contains=1.5, calls_or_refs = 0.8,").unwrap();
-        assert_eq!(table.len(), 2);
-        assert_eq!(table["contains"], 1.5);
-        assert_eq!(table["calls_or_refs"], 0.8);
-        assert!(super::parse_bandit_fixed("").unwrap().is_empty());
-        // A part without `=` or with a weight that is not a number is named.
-        let error = super::parse_bandit_fixed("contains")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("expected kind=weight"), "{error}");
-        let error = super::parse_bandit_fixed("contains=heavy")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not a number"), "{error}");
     }
 }

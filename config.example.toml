@@ -447,43 +447,6 @@ exact_seeds = true
 # not a limit of the maps (config.key offers up to 256 edges per node,
 # scip.impact 64). 16 is what the walk always used; 1 to 256.
 beam = 16
-# In-request edge bandit (off by default): inside one request, each new node's queue
-# priority is multiplied by a weight from how well its kind of edge has paid so far:
-# the smoothed hit rate, (hits + 1) / (tries + 2), over the mean of the kinds tried,
-# raised to bandit_rate and clamped to 0.5..2. Only the queue order changes: the scores
-# the results are ranked by and the score bound are the same (an unblocked, deferred or
-# relaxed state keeps the weight of the kind that found it; a resumed state is queued at
-# its raw potential). Nothing carries over between requests; a handle records the bandit
-# settings and a continuation must use the same ones. The trace's end event and the
-# response's totals report tries, hits and weight per edge kind as `bandit`. Not
-# combinable with fusion = "rrf".
-# measured off (N2, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md)
-edge_bandit = false
-# The exponent of the weight, 0 to 4: 0 has no effect, larger shifts the queue harder.
-bandit_rate = 1.0
-# What counts as a hit:
-#   "topk"   diagnostic. A new node that would place in the walk's current top k by the
-#            walk's own score (recorded only once that list is full). That score is built
-#            from the same kind priors the bandit reweights, so it reinforces itself.
-#   "rerank" the reranker rates a sample of new nodes every bandit_every expansions (up
-#            to bandit_sample of them per round) and a score of bandit_threshold or more
-#            is a hit. Needs a reranker, uses its own model calls (counted in
-#            totals.bandit_calls and bandit_docs and against model_calls), and a failed
-#            call records nothing.
-#   "fixed"  cost-free baseline: the weights come from the bandit_fixed table, no stats.
-#   "random" cost-free baseline: seeded per-kind weights in 0.5..2 (bandit_seed).
-bandit_signal = "topk"
-# rerank: a rated node is a hit at this score or above (0 to 1).
-bandit_threshold = 0.5
-# rerank: rate after every this many expansions (1 to 64).
-bandit_every = 3
-# rerank: rate at most this many new nodes per round (1 to 32).
-bandit_sample = 4
-# random: the seed of the per-kind weights; rerank: the seed of the draw of the
-# (at most bandit_sample) nodes each round rates, uniform over the nodes found since.
-bandit_seed = 0
-# fixed: weight per kind of edge, each 0.5 to 2 (e.g. { contains = 1.5, tests = 0.8 }).
-# bandit_fixed = { contains = 1.5 }
 
 # Named server-side recipes (config_readers, impact_rings, flow_path, flow_from,
 # config_neighbours): fixed chains of the operators above, each answering with

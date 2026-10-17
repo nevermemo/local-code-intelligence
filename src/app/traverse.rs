@@ -51,8 +51,8 @@ use lci_core::{
     node::{NodeId, NodeKind},
 };
 use lci_maps::{
-    Budget, Contribution, EdgeKind, FreshnessModel, Map, MapDescriptor, MapId, MapRequest,
-    MapResponse, MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
+    Budget, Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse,
+    MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::{CONTAINS_MAP_ID, ContainsMap},
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
@@ -67,7 +67,6 @@ use lci_maps::{
     },
     traverse::{
         Seed, Traversal, TraversalBudget, TraversalResult,
-        bandit::{Options as BanditOptions, Settings as BanditSettings, Signal as BanditSignal},
         frontier::HopPrice,
         handle::HandleStore,
         handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
@@ -670,36 +669,6 @@ impl SeedSearch for NoSearch {
 
 /// The longest text the reranker frontier sends for one node, in characters.
 const RERANK_TEXT_CHARS: usize = 1000;
-
-/// The edge bandit's settings from the configuration (none: it is off). A name in
-/// `bandit_fixed` that is not an edge kind is an error, not ignored.
-fn bandit_settings(limits: &TraverseConfig) -> Result<Option<BanditSettings>> {
-    if !limits.edge_bandit {
-        return Ok(None);
-    }
-    let mut fixed = std::collections::BTreeMap::new();
-    for (name, weight) in &limits.bandit_fixed {
-        let Some(kind) = EdgeKind::from_name(name) else {
-            let names: Vec<&str> = EdgeKind::ALL.iter().map(|kind| kind.as_str()).collect();
-            bail!(
-                "[traverse] bandit_fixed names {name:?}, which is not an edge kind (one of: {})",
-                names.join(", ")
-            );
-        };
-        fixed.insert(kind, *weight);
-    }
-    Ok(Some(BanditSettings {
-        rate: limits.bandit_rate,
-        signal: limits.bandit_signal,
-        options: BanditOptions {
-            threshold: limits.bandit_threshold,
-            every: limits.bandit_every,
-            sample: limits.bandit_sample,
-            seed: limits.bandit_seed,
-            fixed,
-        },
-    }))
-}
 
 /// The reranker frontier's rescorer: rates the destinations of an expansion
 /// with the configured reranker (`Models::rerank`, one batched call). The text
@@ -1451,14 +1420,6 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     } else {
         None
     };
-    // The edge bandit's own rescorer, independent of rerank_frontier.
-    let bandit = bandit_settings(limits)?;
-    let bandit_rescorer = match &bandit {
-        Some(settings) if settings.signal == BanditSignal::Rerank => {
-            Some(make_rescorer("bandit_signal = \"rerank\"")?)
-        }
-        _ => None,
-    };
     if let Some(snapshot) = &snapshot {
         snapshot
             .check_identity(&identity)
@@ -1481,15 +1442,6 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .map_err(|e| anyhow!("{e}"))?;
         snapshot
             .check_top_k(call.top_k)
-            .map_err(|e| anyhow!("{e}"))?;
-        let bandit_identity = bandit_rescorer.as_ref().map(|rescorer| rescorer.identity());
-        snapshot
-            .check_bandit(
-                bandit
-                    .as_ref()
-                    .map(|settings| settings.fingerprint(bandit_identity.as_deref()))
-                    .as_deref(),
-            )
             .map_err(|e| anyhow!("{e}"))?;
     }
     let wants = |id: MapId| wanted.contains(&id);
@@ -1875,7 +1827,6 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         .fusion(limits.fusion)
         .pass_through(limits.pass_through)
         .score_bound(limits.score_bound)
-        .edge_bandit_with(bandit)
         .priors(priors)
         .tie_break(tie_break)
         .top_k(call.top_k, expanding)
@@ -1888,12 +1839,8 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
         None => traversal,
     };
-    let traversal = match &bandit_rescorer {
-        Some(rescorer) => traversal.bandit_rescorer(rescorer),
-        None => traversal,
-    };
-    // The cap on model calls covers both rescorers.
-    let traversal = if rescorer.is_some() || bandit_rescorer.is_some() {
+    // The cap on model calls covers the reranker frontier's calls.
+    let traversal = if rescorer.is_some() {
         traversal.model_calls(limits.max_model_calls)
     } else {
         traversal
@@ -1944,13 +1891,6 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
     // The engine's warnings: reranker failures by reason, the model_calls cap,
     // a boost or switches the handle did not take.
     warnings.extend(result.warnings.iter().cloned());
-    if let Some(rescorer) = &bandit_rescorer
-        && let Some(first) = rescorer.errors().first()
-    {
-        notes.push(format!(
-            "edge_bandit: the first of the reranker calls that failed in this call: {first}"
-        ));
-    }
     if let Some(rescorer) = &rescorer {
         let errors = rescorer.errors();
         if let Some(first) = errors.first() {
@@ -2473,16 +2413,6 @@ fn response_json(
                 "pass_through_pops".into(),
                 json!(result.totals.pass_through_pops),
             );
-        }
-        if let (Some(bandit), Some(totals)) = (
-            &result.bandit,
-            object.get_mut("totals").and_then(Value::as_object_mut),
-        ) {
-            totals.insert("bandit".into(), bandit.to_json());
-            if bandit.signal == BanditSignal::Rerank {
-                totals.insert("bandit_calls".into(), json!(result.totals.bandit_calls));
-                totals.insert("bandit_docs".into(), json!(result.totals.bandit_docs));
-            }
         }
         if let (Some(_), Some(totals)) = (
             result.rerank_floor,
@@ -5000,23 +4930,5 @@ mod tests {
         assert_eq!(TraverseConfig::default().beam, 16);
         assert_eq!(hops(TraverseConfig::default().beam).await, 16);
         assert_eq!(hops(64).await, 21);
-    }
-
-    #[test]
-    fn bandit_settings_are_none_when_off_and_name_an_unknown_fixed_kind() {
-        assert!(bandit_settings(&limits()).unwrap().is_none());
-        let mut on = limits();
-        on.edge_bandit = true;
-        on.bandit_fixed.insert("contains".into(), 1.5);
-        let settings = bandit_settings(&on).unwrap().expect("on");
-        assert_eq!(settings.options.fixed[&EdgeKind::Contains], 1.5);
-        on.bandit_fixed.insert("no_such_kind".into(), 1.2);
-        let error = bandit_settings(&on).expect_err("an error").to_string();
-        assert!(error.contains("\"no_such_kind\""), "{error}");
-        assert!(error.contains("not an edge kind"), "{error}");
-        assert!(
-            error.contains("contains"),
-            "the valid kinds are listed: {error}"
-        );
     }
 }

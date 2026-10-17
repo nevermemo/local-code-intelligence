@@ -191,33 +191,6 @@ pub struct BenchArgs {
     /// `lci traverse --exact-seeds`: exact cards the graph holds start the walk.
     #[arg(long)]
     exact_seeds: bool,
-    /// `lci traverse --edge-bandit`: the in-request edge bandit. The row's note
-    /// says `edge-bandit <signal>` and, for the `rerank` signal, counts the
-    /// bandit's model calls (they count toward the physical cost).
-    #[arg(long)]
-    edge_bandit: bool,
-    /// `lci traverse --bandit-rate` (0 to 4).
-    #[arg(long, requires = "edge_bandit")]
-    bandit_rate: Option<f64>,
-    /// `lci traverse --bandit-signal`: `topk` (diagnostic), `rerank`, or the
-    /// cost-free baselines `fixed` and `random`.
-    #[arg(long, requires = "edge_bandit", value_parser = ["topk", "rerank", "fixed", "random"])]
-    bandit_signal: Option<String>,
-    /// `lci traverse --bandit-threshold` (`rerank`).
-    #[arg(long, requires = "edge_bandit")]
-    bandit_threshold: Option<f64>,
-    /// `lci traverse --bandit-every` (`rerank`).
-    #[arg(long, requires = "edge_bandit")]
-    bandit_every: Option<u32>,
-    /// `lci traverse --bandit-sample` (`rerank`).
-    #[arg(long, requires = "edge_bandit")]
-    bandit_sample: Option<u32>,
-    /// `lci traverse --bandit-seed` (`random`).
-    #[arg(long, requires = "edge_bandit")]
-    bandit_seed: Option<u64>,
-    /// `lci traverse --bandit-fixed` (`fixed`): `kind=weight,kind=weight`.
-    #[arg(long, requires = "edge_bandit")]
-    bandit_fixed: Option<String>,
     /// Free text for the row's note column (build profile, tree, seeding).
     #[arg(long)]
     note: Option<String>,
@@ -304,7 +277,6 @@ pub fn run(args: BenchArgs) -> Result<()> {
         first_k: args.first_k,
         answer_seeds: args.answer_seeds,
         exact_seeds: args.exact_seeds,
-        bandit: BanditFlags::from_args(&args),
         top_k: args.top_k,
         out: out_dir.join("cli"),
         timeout: Duration::from_secs(args.timeout_s),
@@ -519,7 +491,6 @@ fn extra_notes(args: &BenchArgs) -> Vec<Option<String>> {
         first_stage_note(args),
         args.answer_seeds.then(|| "answer-seeds".to_owned()),
         args.exact_seeds.then(|| "exact-seeds".to_owned()),
-        bandit_note(args),
         args.policy_dir.as_ref().map(|_| {
             "ORACLE: per-item policies built from the gold (bench-only, gold-aware steering ceiling)"
                 .to_owned()
@@ -713,120 +684,13 @@ pub struct Totals {
     pub rerank_calls: u64,
     pub rerank_docs: u64,
     pub rerank_failures: u64,
-    /// The bandit's model calls and rated nodes (`rerank` signal only).
-    pub bandit_calls: u64,
-    pub bandit_docs: u64,
-    /// Tries and hits summed over the kinds of edge.
-    pub bandit_tries: u64,
-    pub bandit_hits: u64,
-    /// The bandit's failed rating calls.
-    pub bandit_failures: u64,
-    /// The bandit's signal, when the traversal ran one.
-    pub bandit_signal: Option<String>,
 }
 
 impl Totals {
-    /// Model calls of the traversal: the reranker frontier's plus the bandit's.
+    /// Model calls of the traversal: the reranker frontier's.
     pub fn model_calls(&self) -> u64 {
-        self.rerank_calls.saturating_add(self.bandit_calls)
+        self.rerank_calls
     }
-}
-
-/// The edge-bandit flags passed to `lci traverse` (all unset: the
-/// configuration's settings apply).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct BanditFlags {
-    pub on: bool,
-    pub rate: Option<f64>,
-    pub signal: Option<String>,
-    pub threshold: Option<f64>,
-    pub every: Option<u32>,
-    pub sample: Option<u32>,
-    pub seed: Option<u64>,
-    pub fixed: Option<String>,
-}
-
-impl BanditFlags {
-    fn from_args(args: &BenchArgs) -> Self {
-        Self {
-            on: args.edge_bandit,
-            rate: args.bandit_rate,
-            signal: args.bandit_signal.clone(),
-            threshold: args.bandit_threshold,
-            every: args.bandit_every,
-            sample: args.bandit_sample,
-            seed: args.bandit_seed,
-            fixed: args.bandit_fixed.clone(),
-        }
-    }
-
-    /// Add `--edge-bandit` and the settings that were given.
-    fn add_to(&self, command: &mut Command) {
-        if !self.on {
-            return;
-        }
-        command.arg("--edge-bandit");
-        if let Some(rate) = self.rate {
-            command.arg(format!("--bandit-rate={rate}"));
-        }
-        if let Some(signal) = &self.signal {
-            command.arg(format!("--bandit-signal={signal}"));
-        }
-        if let Some(threshold) = self.threshold {
-            command.arg(format!("--bandit-threshold={threshold}"));
-        }
-        if let Some(every) = self.every {
-            command.arg(format!("--bandit-every={every}"));
-        }
-        if let Some(sample) = self.sample {
-            command.arg(format!("--bandit-sample={sample}"));
-        }
-        if let Some(seed) = self.seed {
-            command.arg(format!("--bandit-seed={seed}"));
-        }
-        if let Some(fixed) = &self.fixed {
-            command.arg(format!("--bandit-fixed={fixed}"));
-        }
-    }
-}
-
-/// `edge-bandit <signal>` (with the given settings) for the row's note.
-fn bandit_note(args: &BenchArgs) -> Option<String> {
-    if !args.edge_bandit {
-        return None;
-    }
-    let mut parts = vec![format!(
-        "edge-bandit {}",
-        args.bandit_signal.as_deref().unwrap_or("config signal")
-    )];
-    if let Some(rate) = args.bandit_rate {
-        parts.push(format!("rate={rate}"));
-    }
-    if let Some(threshold) = args.bandit_threshold {
-        parts.push(format!("threshold={threshold}"));
-    }
-    if let Some(every) = args.bandit_every {
-        parts.push(format!("every={every}"));
-    }
-    if let Some(sample) = args.bandit_sample {
-        parts.push(format!("sample={sample}"));
-    }
-    if let Some(seed) = args.bandit_seed {
-        parts.push(format!("seed={seed}"));
-    }
-    if let Some(fixed) = &args.bandit_fixed {
-        parts.push(format!("fixed={fixed}"));
-    }
-    Some(parts.join(" "))
-}
-
-/// The sum of `field` (`tries` or `hits`) over the kinds of a traversal's
-/// `totals.bandit` object; 0 when there is none.
-fn bandit_sum(bandit: &Value, field: &str) -> u64 {
-    bandit["kinds"]
-        .as_object()
-        .map(|kinds| kinds.values().filter_map(|k| k[field].as_u64()).sum())
-        .unwrap_or(0)
 }
 
 /// What one `lci traverse` call returned, reduced to what the bench uses.
@@ -911,12 +775,6 @@ impl Traversed {
                 rerank_calls: t["rerank_calls"].as_u64().unwrap_or(0),
                 rerank_docs: t["rerank_docs"].as_u64().unwrap_or(0),
                 rerank_failures: t["rerank_failures"].as_u64().unwrap_or(0),
-                bandit_calls: t["bandit_calls"].as_u64().unwrap_or(0),
-                bandit_docs: t["bandit_docs"].as_u64().unwrap_or(0),
-                bandit_tries: bandit_sum(&t["bandit"], "tries"),
-                bandit_hits: bandit_sum(&t["bandit"], "hits"),
-                bandit_failures: t["bandit"]["failures"].as_u64().unwrap_or(0),
-                bandit_signal: t["bandit"]["signal"].as_str().map(str::to_owned),
             });
         Traversed {
             status: value["status"].as_str().unwrap_or("unknown").to_string(),
@@ -951,12 +809,8 @@ impl ItemFlags {
             .sum();
         Self {
             deadline: raw["stop_reason"].as_str() == Some("deadline"),
-            // The reranker frontier's failed calls and the edge bandit's failed
-            // rating calls both make a row unreliable.
-            rerank_failures: raw["totals"]["rerank_failures"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(raw["totals"]["bandit"]["failures"].as_u64().unwrap_or(0)),
+            // The reranker frontier's failed calls make a row unreliable.
+            rerank_failures: raw["totals"]["rerank_failures"].as_u64().unwrap_or(0),
             map_failures,
         }
     }
@@ -1136,8 +990,6 @@ pub struct CliTraverser {
     pub first_k: Option<u32>,
     pub answer_seeds: bool,
     pub exact_seeds: bool,
-    /// The edge-bandit flags for the CLI; unset leaves the configuration's.
-    pub bandit: BanditFlags,
     pub top_k: usize,
     pub out: PathBuf,
     pub timeout: Duration,
@@ -1224,7 +1076,6 @@ impl CliTraverser {
         if self.exact_seeds {
             command.arg("--exact-seeds");
         }
-        self.bandit.add_to(&mut command);
         command
     }
 
@@ -1857,9 +1708,6 @@ struct Sums {
     flagged: [usize; 3],
     /// Reranker frontier calls, nodes rated and calls that failed.
     rerank: [u64; 3],
-    /// The bandit's model calls, rated nodes, tries and hits, and its signal.
-    bandit: [u64; 5],
-    bandit_signal: Option<String>,
     answer_chars_tokens: u64,
     engine_ms: Vec<f64>,
     wall_ms: Vec<f64>,
@@ -2021,7 +1869,7 @@ pub fn bench_set(
     let mut scored: Vec<(Vec<Value>, &Value)> = Vec::new();
     // Work per scored item (pops, pass-through pops), for `items.json`.
     // Per scored item: pops, pass-through pops and model calls (frontier rerank
-    // calls + the edge bandit's rating calls).
+    // calls).
     let mut work: Vec<[u64; 3]> = Vec::new();
     let started = Instant::now();
     for (index, item) in items.iter().enumerate() {
@@ -2078,18 +1926,6 @@ pub fn bench_set(
                         t.rerank_failures,
                     ]) {
                         *sum += n;
-                    }
-                    for (sum, n) in sums.bandit.iter_mut().zip([
-                        t.bandit_calls,
-                        t.bandit_docs,
-                        t.bandit_tries,
-                        t.bandit_hits,
-                        t.bandit_failures,
-                    ]) {
-                        *sum += n;
-                    }
-                    if t.bandit_signal.is_some() {
-                        sums.bandit_signal.clone_from(&t.bandit_signal);
                     }
                     sums.engine_ms.push(t.elapsed_ms);
                 }
@@ -2190,22 +2026,14 @@ pub fn bench_set(
             "rerank calls={calls} docs={docs} failed={failures}"
         ));
     }
-    if let Some(signal) = &sums.bandit_signal {
-        let [bandit_calls, bandit_docs, tries, hits, failed] = sums.bandit;
-        notes.push(format!(
-            "bandit {signal}: tries={tries} hits={hits} bandit calls={bandit_calls} docs={bandit_docs} failed={failed}"
-        ));
-    }
-    if sums.bandit_signal.is_some() || calls + sums.bandit[0] > 0 {
+    if calls > 0 {
         // Two components, never combined: no weight of a model call against an
         // expansion is assumed. Judge each against the F-append arm's own total
         // (1.5x rule per component); `items.json` carries both per item.
         notes.push(format!(
-            "cost: expansions={} (hops {}) model calls={} (rerank {calls} + bandit {}); each component is judged apart against the F-append arm, 1.5x rule per component",
+            "cost: expansions={} (hops {}) model calls={calls} (rerank {calls}); each component is judged apart against the F-append arm, 1.5x rule per component",
             sums.pops + sums.pass_through_pops,
             sums.hops,
-            calls + sums.bandit[0],
-            sums.bandit[0]
         ));
     }
     if !sums.stop_reasons.is_empty() {
@@ -2249,7 +2077,7 @@ pub fn bench_set(
 }
 
 /// The row-note marker for a run whose items include a deadline stop, model
-/// call failures (reranker or bandit) or map call failures (`flagged` counts the items of each kind);
+/// call failures (reranker) or map call failures (`flagged` counts the items of each kind);
 /// such a row is not a clean measurement and should not decide anything.
 fn unreliable_marker([deadline, rerank, map]: [usize; 3]) -> Option<String> {
     (deadline + rerank + map > 0).then(|| {
@@ -2774,16 +2602,10 @@ mod tests {
             (3, false, true)
         );
         assert!(!ItemFlags::from_raw(&json!({"stop_reason": "bound"})).any());
-        // A failed bandit rating call makes the item unreliable, as a failed
-        // frontier rerank call does.
-        let bandit = ItemFlags::from_raw(&json!({"totals": {"bandit": {"failures": 2}}}));
-        assert_eq!((bandit.rerank_failures, bandit.any()), (2, true));
-        let clean = ItemFlags::from_raw(&json!({"totals": {"bandit": {"failures": 0}}}));
-        assert!(!clean.any());
     }
 
     #[test]
-    fn bandit_totals_are_summed_into_the_note_and_the_physical_cost() {
+    fn rerank_calls_are_summed_into_the_cost_note() {
         let items = vec![impact_item(
             "i1",
             "q one",
@@ -2792,17 +2614,6 @@ mod tests {
         )];
         let mut one = traversal(&["x"], &[SEARCH_FN], 6);
         one["totals"]["rerank_calls"] = json!(2);
-        one["totals"]["bandit_calls"] = json!(3);
-        one["totals"]["bandit_docs"] = json!(9);
-        one["totals"]["bandit"] = json!({
-            "rate": 1.0,
-            "signal": "rerank",
-            "failures": 2,
-            "kinds": {
-                "contains": {"tries": 4, "hits": 1, "weight": 0.8},
-                "calls": {"tries": 5, "hits": 3, "weight": 1.2}
-            }
-        });
         let answers = BTreeMap::from([("q one".to_owned(), one)]);
         let outcome = bench_set(
             Set::Impact,
@@ -2812,20 +2623,16 @@ mod tests {
         )
         .unwrap();
         // The per-item record carries the model calls next to the expansions.
-        assert_eq!(outcome.items["items"]["i1"]["model_calls"], 5);
+        assert_eq!(outcome.items["items"]["i1"]["model_calls"], 2);
         assert_eq!(outcome.items["items"]["i1"]["expansions"], 6);
         let note = &outcome.row.cells[20];
         assert!(
-            note.contains("bandit rerank: tries=9 hits=4 bandit calls=3 docs=9 failed=2"),
-            "{note}"
-        );
-        assert!(
             note.contains("cost: expansions=6 (hops ")
-                && note.contains("model calls=5 (rerank 2 + bandit 3)")
+                && note.contains("model calls=2 (rerank 2)")
                 && note.contains("1.5x rule per component"),
             "{note}"
         );
-        // A run without a bandit says nothing of one.
+        // A run without reranker calls has no model-call cost.
         let plain = BTreeMap::from([("q one".to_owned(), traversal(&["x"], &[SEARCH_FN], 6))]);
         let outcome = bench_set(
             Set::Impact,
@@ -2834,66 +2641,7 @@ mod tests {
             &config(&["graph.scip", "seeds.scip_names"]),
         )
         .unwrap();
-        assert!(!outcome.row.cells[20].contains("bandit"));
-    }
-
-    #[test]
-    fn the_bandit_flags_reach_the_cli_and_the_note() {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Wrapper {
-            #[command(flatten)]
-            args: BenchArgs,
-        }
-        let mut t = cli_traverser();
-        let plain = args_of(&t.command(&t.maps, &[], "q", None));
-        assert!(!plain.iter().any(|a| a.contains("bandit")));
-        t.bandit = BanditFlags {
-            on: true,
-            rate: Some(1.5),
-            signal: Some("rerank".into()),
-            threshold: Some(0.4),
-            every: Some(2),
-            sample: Some(3),
-            seed: Some(7),
-            fixed: Some("contains=1.5".into()),
-        };
-        let args = args_of(&t.command(&t.maps, &[], "q", None));
-        for flag in [
-            "--edge-bandit",
-            "--bandit-rate=1.5",
-            "--bandit-signal=rerank",
-            "--bandit-threshold=0.4",
-            "--bandit-every=2",
-            "--bandit-sample=3",
-            "--bandit-seed=7",
-            "--bandit-fixed=contains=1.5",
-        ] {
-            assert!(args.contains(&flag.to_owned()), "{flag} in {args:?}");
-        }
-        let none = Wrapper::parse_from(["x", "--set", "impact", "--gold-dir", "g"]).args;
-        assert_eq!(bandit_note(&none), None);
-        let given = Wrapper::parse_from([
-            "x",
-            "--set",
-            "impact",
-            "--gold-dir",
-            "g",
-            "--edge-bandit",
-            "--bandit-signal",
-            "random",
-            "--bandit-seed",
-            "3",
-        ])
-        .args;
-        assert_eq!(
-            bandit_note(&given).as_deref(),
-            Some("edge-bandit random seed=3")
-        );
-        assert_eq!(
-            BanditFlags::from_args(&given).signal.as_deref(),
-            Some("random")
-        );
+        assert!(!outcome.row.cells[20].contains("model calls"));
     }
 
     #[test]
@@ -3409,7 +3157,6 @@ mod tests {
             first_k: None,
             answer_seeds: false,
             exact_seeds: false,
-            bandit: BanditFlags::default(),
             top_k: 10,
             out: PathBuf::from("out"),
             timeout: Duration::from_secs(1),

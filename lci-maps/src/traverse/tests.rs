@@ -2478,5 +2478,3 @@ mod priors;
 mod rescore;
 
 mod tiebreak;
-
-mod bandit;

@@ -568,6 +568,14 @@ async fn a_version_10_handle_round_trips_its_new_fields() {
     let mut old = json.clone();
     old["version"] = json!(9);
     assert!(Snapshot::from_json(&old).unwrap_err().contains("version"));
+    // A handle made with the removed edge bandit is refused with a clear reason.
+    let mut banded = json.clone();
+    banded["bandit"] = json!("rate=1");
+    assert!(
+        Snapshot::from_json(&banded)
+            .unwrap_err()
+            .contains("edge bandit")
+    );
     // The new totals are required.
     let mut missing = json.clone();
     missing["totals"]

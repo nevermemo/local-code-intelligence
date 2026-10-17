@@ -590,7 +590,7 @@ mod tests {
             ],
             "totals": {
                 "pops": 7, "hops": 9, "elapsed_ms": 1.0,
-                "rerank_calls": 2, "bandit_calls": 3
+                "rerank_calls": 2
             }
         });
         let run_dir = root.join("run");
@@ -614,11 +614,11 @@ mod tests {
         let data = super::super::compare::load_run(&dir, None).unwrap();
         assert_eq!(data.items["impact-t1"]["decl_recall"], Some(1.0));
         assert_eq!(data.items["impact-t1"]["expansions"], Some(7.0));
-        // The arm carries its source's model calls (rerank 2 + bandit 3), the
+        // The arm carries its source's model calls (rerank 2), the
         // same sum the bench stamps on the source run's own items.
         let source = Traversed::from_json(&raw, None).totals.unwrap();
-        assert_eq!(source.model_calls(), 5);
-        assert_eq!(data.items["impact-t1"]["model_calls"], Some(5.0));
+        assert_eq!(source.model_calls(), 2);
+        assert_eq!(data.items["impact-t1"]["model_calls"], Some(2.0));
         // The raw output travelled with it, so compare can read its flags.
         assert!(dir.join("raw").join("impact-t1.json").is_file());
         assert!(data.flags["impact-t1"].is_some());

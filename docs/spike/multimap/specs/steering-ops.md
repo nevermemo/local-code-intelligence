@@ -96,7 +96,7 @@ What shipped is a different, smaller surface than 3.1 to 3.5, reached through `s
 - **Handles** (`handle.rs`): a stopped or budget-limited traversal leaves a `Snapshot` of its state, a `HandleStore` keeps it as `<data_dir>/traverse/handles/<handle>.json` under the hash of its JSON (equal runs
   give equal handles; a stored file is checked on load), and `Traversal::resumed` continues from it. A handle is bound to the workspace and index it was made on (`check_identity`). Budgets (`pops`, `est_tokens`,
   `external_calls`) are absolute for the whole traversal; `deadline` and `max_depth` belong to the call; what the agent raised stays with the traversal. A resume refuses a changed corroboration boost, score-bound
-  `k`, hop priors, tie-break file, reranker identity or bandit settings. Handle text is at most 64 characters. There is no TTL, cap on live handles, endpoint binding or `seq`, and no drift handling beyond the
+  `k`, hop priors, tie-break file or reranker identity. Handle text is at most 64 characters. There is no TTL, cap on live handles, endpoint binding or `seq`, and no drift handling beyond the
   identity check. S-1 to S-8 describe the design of 3.1 to 3.5 only.
 
 ## 4. Open decisions
