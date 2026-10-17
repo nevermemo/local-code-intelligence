@@ -1,5 +1,9 @@
 # Agent payload and tool-text notes
 
+Status: dated record of the U1 study; the figures are not re-measured. N28 to N31 landed in `0aa374c` on 2026-10-14
+(`spike/v2`); N32 to N34 are open in [roadmap.md](roadmap.md). The per-tool figures below cover the 10 tools the
+study measured; a server with `[recipes]` and `[compose]` enabled lists 16 (see [architecture.md](../architecture.md#mcp-rest-and-cli-surfaces)).
+
 Background for roadmap items N28 to N34: how large the MCP tool list and the `search_code` result are for an agent, what was
 measured, and the candidate model-facing texts. The numbers come from the U1 uptake study (Claude agents, 9 real
 repository tasks, 3 repetitions per arm) and from cross-family design and audit lanes whose factual claims were checked by
@@ -65,7 +69,7 @@ Data: the 40 parsed `search_code` calls of the D-forced and D-cue arms (27 + 13)
   with warnings, notes, filters and index lifecycle. Estimated about 19% smaller (17.5k to about 14.2k characters,
   **inferred**).
 - Consumers of the default JSON that must not change: `xtask/src/acceptance/lsp_full.rs` reads `retrieval_channels` and
-  `semantic_score` from the MCP result (lines 672 and 691); `tests/cases/mcp.rs` pins the report keys and the MCP-versus-REST
+  `semantic_score` from each MCP hit; `tests/cases/mcp.rs` pins the report keys and the MCP-versus-REST
   equality; `src/evaluate/runner.rs` consumes the typed report, not JSON; the test
   `reranker_documents_are_capped_while_results_keep_full_chunks` requires full chunks in application results. Put the view
   after `App::search_in_profile` and do not change `Hit` serde (it derives `Serialize` only).
@@ -143,8 +147,8 @@ Known issues in the candidates, to resolve before use:
 Confirmed by reading and by a cross-family refuter: the navigation tools fail with "workspace is not indexed; call
 index_workspace first" and never create an index, while `search_code` does; the README says TypeScript and Python
 workspace symbols depend on files the server has opened; chunk limits are 6000 and 24000 bytes; only `WorkspaceArgs`
-carries a `workspace_path` description; profiles cannot hide tools (five keys, `deny_unknown_fields`, `McpServer::new`
-installs the full router) and `tests/cases/mcp.rs` asserts the exact ten tool names on every endpoint; the `top_k` text
+carries a `workspace_path` description; at the time of the study profiles could not hide tools (five keys, `deny_unknown_fields`, `McpServer::new`
+installs the full router) and `tests/cases/mcp.rs` asserts the exact ten tool names on every endpoint (since then a profile with `tools = "search"` keeps only `SEARCH_ONLY_TOOLS` and removes the other routes, `src/server.rs`); the `top_k` text
 says "(8)" while the default is configurable. Refuted: one lane's "zero test breakages" for dropping per-hit fields
 (`lsp_full.rs` reads two of them). One lane's "255-character `workspace_path` description" was a wrong premise: the
 description is 73 characters and appears on five tools. Not read by the lanes: the U1 harness and transcripts, the agent

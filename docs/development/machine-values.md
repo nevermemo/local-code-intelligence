@@ -181,7 +181,7 @@ exits 1. The built-in patterns are generic:
 | --- | --- |
 | drive-letter user profile path | a drive letter, a colon, a separator, the Users folder, a separator and a name; either kind of separator (an escaped, doubled backslash too), any case |
 | macOS user directory | `/Users/`, a name and a slash (exact case, so a web route in lower case is fine) |
-| Linux home directory | `/home/`, a name and a slash |
+| Linux home directory | a slash, the word `home`, a slash, a name and a slash |
 | `AppData` path component | the word AppData as a path component, directly followed by a separator |
 | client session folder | a `Temp` component, a separator and the client's `claude` folder |
 

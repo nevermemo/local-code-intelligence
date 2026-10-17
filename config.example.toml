@@ -103,8 +103,8 @@ rust_analyzer_trusted = false
 lsp_timeout_seconds = 60
 lsp_candidate_count = 40
 # Most milliseconds one search waits for the language-server channel
-# (100-60000). A server that is still starting (rust-analyzer takes ~10 s to
-# index a workspace) or slow to answer costs a search at most this long: the
+# (100-60000). A server that is still starting (rust-analyzer takes about 10 s
+# to index a workspace; an estimate) or slow to answer costs a search at most this long: the
 # search returns without symbol candidates, notes that in its "notes" field
 # (not "warning": nothing failed), and the server keeps starting in the
 # background so a later search uses it. Raise it to wait longer for a cold
@@ -174,7 +174,7 @@ lsp_stuck_seconds = 900
 # and platform config dir under that directory itself. Optional and
 # fail-open, same as csharp above.
 # [java]
-# path = "C:/tools/jdtls"
+# path = "/path/to/jdtls"
 # args = []
 # disabled = false
 
@@ -258,10 +258,8 @@ reranker = true
 # weight / (rrf_k + rank) for each chunk it returns, and a chunk several
 # channels return sums those terms; the source-role prior is added afterwards
 # and is never scaled. All three weights default to 1.0, which is plain
-# unweighted RRF. A semantic_weight of 2.0 was the default for a while
-# (roadmap F2a) and was reverted: an exact offline replay with the LSP channel
-# present found no significant effect, so the simpler plain RRF is the default.
-# A file without this section uses the defaults. Set max_chunks_per_file to 0
+# unweighted RRF (a semantic_weight of 2.0 had no significant effect in an exact
+# offline replay; see docs/decisions.md). A file without this section uses the defaults. Set max_chunks_per_file to 0
 # for plain RRF with no file cap, for example for an evaluation arm that must
 # match earlier reports. Each weight must be finite and greater than zero: a
 # zero weight is rejected at startup, because turning a channel off is what
@@ -278,10 +276,8 @@ reranker = true
 # demoted chunks when there are too few files. fusion_score is not rescaled, so
 # a demoted chunk can appear after a chunk with a lower fusion_score. The
 # reranker's own output order is not capped again. The default of 2 was
-# measured on the mined evaluation set and core (roadmap F2b): fusion-only
-# nDCG@10 +0.049 on the mined set, significant in both halves, and +0.168 on
-# core, significant; reranked on the mined set nDCG@10 +0.046 (significant) and
-# MRR -0.023 (not significant).
+# measured on the mined evaluation set and core; the numbers are in
+# docs/decisions.md.
 [fusion]
 semantic_weight = 1.0
 lexical_weight = 1.0
@@ -312,10 +308,11 @@ wait_for_existing_job_seconds = 120
 # the steering ladder could not decide a stop or the budget ran out. The
 # limits below are caps: a request may lower them, never raise them. The same
 # walk runs as `lci traverse`, which ignores enabled and, given --root, seeds
-# from the hybrid search of that tree (the model services it configures). A stand-in that matches the question's words against symbol names
-# replaces the hybrid search only when it is unavailable or finds nothing, and
-# the response and the trace say so (seed_source). Traces and handles are
-# written under data_dir.
+# from the hybrid search of that tree (the model services it configures). A
+# stand-in that matches the question's words against symbol names replaces the
+# hybrid search only when it is unavailable or finds nothing, and the response
+# and the trace say so (seed_source). Traces and handles are written under
+# data_dir. Engine reference: docs/spike/multimap/engine.md.
 [traverse]
 enabled = false
 # A relative path is taken from the workspace directory.
@@ -398,7 +395,7 @@ seed_k = 8
 # the walk's alone and the response is as without these keys. first_k caps the
 # first stage, 0 to 200 (0: no cap). A continuation (handle) returns the walk
 # alone. The defaults here (append, answer_seeds, exact_seeds) are the measured
-# ones: the gains of the spike came from the first stage (N0, N0b in
+# ones: the gains came from the first stage (N0, N0b; 2026-10-15,
 # docs/spike/multimap/v2/engine-results.md); see [traverse.policies] below for
 # the per-question-type walk.
 first_stage = "append"
@@ -411,7 +408,7 @@ answer_seeds = true
 exact_seeds = true
 # Per steering policy (the question type: steer.policy, `lci traverse --policy`),
 # settings of the first stage and the walk. The built-in values below are the
-# measured defaults (N0, N0b of docs/spike/multimap/v2); a key given in a
+# measured defaults (N0, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md); a key given in a
 # [traverse.policies.<name>] table wins over the built-in value of that policy,
 # which wins over the [traverse] key of the same name. A call with no named
 # policy, or with `explore`, uses the [traverse] keys alone: first stage, then
@@ -456,7 +453,7 @@ beam = 16
 # settings and a continuation must use the same ones. The trace's end event and the
 # response's totals report tries, hits and weight per edge kind as `bandit`. Not
 # combinable with fusion = "rrf".
-# measured off (N2/N0b), see docs/spike/multimap/v2
+# measured off (N2, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md)
 edge_bandit = false
 # The exponent of the weight, 0 to 4: 0 has no effect, larger shifts the queue harder.
 bandit_rate = 1.0
@@ -494,7 +491,7 @@ bandit_seed = 0
 # note.
 [recipes]
 enabled = false
-# measured off (N2/N0b), see docs/spike/multimap/v2
+# measured off (N2, N0b; 2026-10-15, docs/spike/multimap/v2/engine-results.md)
 flow_judge = false
 
 # lci_compose: up to 6 operator steps in one call, with $sN.field references to

@@ -7,8 +7,9 @@ the full deterministic gates once after the complete change is ready.
 
 The workspace is split into `lci-core` (chunking, language adapters, filters,
 lexical search, manifest, workspace identity, config, models, LSP adapters --
-everything with no dependency on LanceDB/arrow) and the root
-`local-code-intelligence` crate (`App`, `Store`, the MCP server, `main`).
+everything with no dependency on LanceDB/arrow), `lci-maps` (the map layer and
+traversal engine), the root `local-code-intelligence` crate (`App`, `Store`, the
+MCP server, `main`) and `xtask` (see [architecture.md](../architecture.md#crates)).
 While a change stays inside `lci-core`, scope checks to that package instead
 of the whole workspace:
 
@@ -37,6 +38,7 @@ check instead of another narrow invocation.
 
 | Change | Focused command |
 | --- | --- |
+| Any unit test, all crates | `cargo xtask test --suite Unit` (`cargo test --workspace --lib`) |
 | Chunking or scanning | `cargo xtask test --suite Chunk` (or `cargo test -p lci-core --lib chunk::` while iterating) |
 | Retrieval filters or source roles | `cargo xtask test --suite Filter` (or `cargo test -p lci-core --lib filter::`) |
 | Configuration layers, the local overlay, `lci config`, or `lci init` | `cargo xtask test --suite Config` (or `cargo test -p lci-core --lib config::` / `cargo test -p local-code-intelligence --lib init::` while iterating) |
@@ -44,7 +46,7 @@ check instead of another narrow invocation.
 | Mined-query generator (`xtask/src/mine.rs`) | `cargo test -p xtask mine::` (xtask is a binary crate, so the `--lib` unit suites do not run it); `--suite Evaluation` also checks the checked-in mined set |
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
 | Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |
-| Index lifecycle or persistence | `cargo xtask test --suite Indexing` |
+| Index lifecycle or persistence | `cargo xtask test --suite Indexing` (runs with the `spike-maps` feature) |
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
 | Watched refresh | `cargo xtask test --suite Watching` |
@@ -57,7 +59,10 @@ they share `--suite Full`'s feature resolution and build cache. Every focused
 suite counts the tests it executed and fails when its filter matched none, so
 a renamed or moved module can't make a suite pass vacuously.
 
-`cargo xtask test --suite Full` runs the machine-value lint, formatting, all workspace tests, and Clippy.
+`cargo xtask test --suite Full` runs, in order: the machine-value lint, `cargo fmt --all -- --check`, `cargo test
+--workspace --locked --features local-code-intelligence/spike-maps`, and Clippy with the same `--locked` and feature
+flags. `--locked` makes a pull request that edits `Cargo.toml` without its lockfile fail here instead of in a locked
+build later; the focused suites stay unlocked. The `spike-maps` feature compiles the test-only map entry points.
 Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
 it depends on locally running services. Generated reports belong under
 `test-results` and are never committed.
@@ -93,8 +98,8 @@ linker = "<path to your toolchain's bundled rust-lld.exe>"   # bundled under
 # equivalent target triple's rust-lld on macOS/Linux if you want the same win.
 ```
 
-On a machine with both set up, a full-workspace `cargo xtask test --suite
-Full` after touching a file outside `lci-core` dropped from 8-9 minutes to
-under a minute in practice -- most of that from sccache reusing previously
+Estimate, undated and unsourced: on a machine with both set up, a full-workspace
+`cargo xtask test --suite Full` after touching a file outside `lci-core` dropped
+from 8-9 minutes to under a minute -- most of that from sccache reusing previously
 compiled objects across the large `lancedb`/`arrow` dependency tree, the rest
 from lld linking faster than the default MSVC linker on a binary this size.
