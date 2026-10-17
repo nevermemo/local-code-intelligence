@@ -12,9 +12,9 @@ The Cargo workspace has four members: the root package `local-code-intelligence`
 
 | Crate | Path | Holds | Depends on |
 | --- | --- | --- | --- |
-| `local-code-intelligence` (root) | `src/` | `app`, `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server` (MCP), `rest`, `init` (`lci init`), `main` (CLI). Re-exports the `lci-core` modules from `src/lib.rs` so `crate::chunk`-style paths resolve. Cargo feature `map-equivalence` compiles test-only entry points (`App::fuse_through_maps`, `App::record_through_maps`) and the wrapped legacy maps. | `lci-core`, `lci-maps` |
+| `local-code-intelligence` (root) | `src/` | `app`, `store` (the only code that imports LanceDB and Arrow), `evaluate`, `server` (MCP), `rest`, `init` (`lci init`), `main` (CLI). Re-exports the `lci-core` modules from `src/lib.rs` so `crate::chunk`-style paths resolve. Cargo feature `map-equivalence` compiles test-only entry points (`App::fuse_through_maps`, `App::record_through_maps`) and the retrieval channels wrapped as maps (`src/app/search/channel_maps`). | `lci-core`, `lci-maps` |
 | `lci-core` | `lci-core/src/` | Pure logic: `bundle`, `chunk`, `config` (with `config::layers`), `endpoint`, `evaluation` (portable evaluation definitions and validation), `filter`, `language`, `lexical`, `lsp`, `manifest`, `models`, `node` (stable `NodeId`), `path`, `provider` (completion providers for System One), `workspace`, plus the Tree-sitter grammars | none of LanceDB, Arrow, axum, rmcp |
-| `lci-maps` | `lci-maps/src/` | The map layer of the multimap spike: the `Map` trait, `Registry` (fail-open, fusion in today's arithmetic and order), the traversal engine (`traverse`, `walk`), the maps (SCIP graph and impact, config key, git history, live grep, LSP, search, symbol definitions, probe), the contract kit, the RunRecord writer | `lci-core` |
+| `lci-maps` | `lci-maps/src/` | The maps, the registry and the traversal engine behind `search_code mode="traverse"`, `lci traverse` and the recipes: the `Map` trait, `Registry` (fail-open, fusion in today's arithmetic and order), the traversal engine (`traverse`, `walk`), the maps (SCIP graph and impact, config key, git history, live grep, LSP, search, symbol definitions, probe), the contract kit, the RunRecord writer | `lci-core` |
 | `xtask` | `xtask/src/` | `cargo xtask` subcommands setup, build, test, acceptance, live-acceptance, env, lint-machine-paths, docs, gold, maps, mine-queries | `lci-core`, `lci-maps` |
 
 The split exists for build time (commit `0729d9a`): the LanceDB/Arrow tree takes minutes to compile, so a change that stays inside
@@ -34,7 +34,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 | `filter` | core | Validates retrieval controls (`FilterRequest` to `EffectiveFilter`) and classifies source roles |
 | `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source |
 | `evaluate` | root | Measures retrieval behaviour without influencing ranking (see Evaluation harness) |
-| `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse`; named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
+| `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse` (`src/app/traverse/`: `mod` holds the types, `run` and registration; `index` the SCIP index and map loading; `seeds` the seed search; `rescore` the `GraphRescorer`; `response` the response builders; `first_stage`, `presets`, `chunks`); named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
 | `server`, `rest`, `main` | root | MCP (rmcp, streamable HTTP), the REST/OpenAPI mirror on the same process and port, and the CLI |
 
 ## Ports and services
@@ -203,7 +203,7 @@ list, schemas and REST routes are exactly those of a server without them.
   `service_status`), 5 with `[recipes] enabled` (`config_readers`, `impact_rings`, `flow_path`, `flow_from`,
   `config_neighbours`) and `lci_compose` with `[compose] enabled`. `search_code` takes `workspace_path`, `query`,
   `top_k`, `languages`, `include_paths`, `exclude_paths`, `source_roles` and, with `[traverse] enabled`, `mode`,
-  `budget`, `steer`, `handle`. Parameter semantics: README.
+  `budget`, `steer`, `handle`. An argument a tool does not have is refused with a tool error naming it (REST: HTTP 422). Parameter semantics: README.
 - **REST** (`src/rest.rs`) exposes each tool as `POST /v1/<tool>` (`GET /v1/service_status`), `search_code` takes
   `?search_profile=`, plus `POST /v1/release_workspace` (no MCP tool: releases the workspace's language servers),
   `GET /openapi.json` (hand-assembled), `/health`, `/ready`. REST, `/openapi.json`, `/health` and `/ready` check Host and
