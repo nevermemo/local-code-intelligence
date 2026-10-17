@@ -75,6 +75,24 @@ impl Endpoint {
         Ok(())
     }
 
+    /// A one-line warning when an API key would travel unencrypted: a key is
+    /// configured (`api_key_env`), the URL scheme is plain `http` and the host
+    /// is not loopback. `url_key` is the configuration key that holds the URL
+    /// (`embedding_url`, `system_one.url`). Names the variable, never its
+    /// value; `None` for `https`, a loopback host, no key, or a URL that does
+    /// not parse (other validation reports that).
+    pub fn cleartext_key_warning(&self, url_key: &str) -> Option<String> {
+        let name = self.api_key_env.as_deref()?;
+        let url = reqwest::Url::parse(&self.url).ok()?;
+        if url.scheme() != "http" || !self.is_remote() {
+            return None;
+        }
+        Some(format!(
+            "{url_key} uses plain http to the non-loopback host `{}`, so the API key from `{name}` is sent unencrypted; use https",
+            self.host().unwrap_or_default()
+        ))
+    }
+
     /// The URL with `suffix` after its path (trailing slashes of the path
     /// dropped first); the query stays where it is.
     pub fn join(&self, suffix: &str) -> Result<reqwest::Url> {
@@ -277,6 +295,48 @@ mod tests {
             assert!(error.contains("embedding_api_key_env"), "{error}");
             assert!(bad.is_empty() || !error.contains(bad), "{error}");
         }
+    }
+
+    #[test]
+    fn a_key_over_plain_http_to_a_remote_host_warns_without_the_secret() {
+        let keyed = |url: &str| Endpoint {
+            api_key_env: Some("MY_KEY".into()),
+            ..endpoint(url, true)
+        };
+        let warning = keyed("http://gpu-box:8766/v1")
+            .cleartext_key_warning("embedding_url")
+            .unwrap();
+        assert!(warning.contains("embedding_url"), "{warning}");
+        assert!(warning.contains("gpu-box"), "{warning}");
+        assert!(warning.contains("MY_KEY"), "{warning}");
+        assert!(warning.contains("https"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+        assert!(
+            keyed("http://192.168.1.20:8080/v1")
+                .cleartext_key_warning("system_one.url")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn no_cleartext_warning_for_https_loopback_no_key_or_a_bad_url() {
+        let keyed = |url: &str| Endpoint {
+            api_key_env: Some("MY_KEY".into()),
+            ..endpoint(url, true)
+        };
+        for url in [
+            "https://api.example.com/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+            "not a url",
+        ] {
+            assert_eq!(keyed(url).cleartext_key_warning("k"), None, "{url}");
+        }
+        assert_eq!(
+            endpoint("http://gpu-box:8766/v1", true).cleartext_key_warning("k"),
+            None
+        );
     }
 
     #[test]

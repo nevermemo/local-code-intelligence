@@ -375,6 +375,9 @@ impl OpenAiCompat {
     pub fn new(config: &SystemOneConfig) -> Result<Self> {
         let endpoint = config.endpoint();
         endpoint.require_local_unless_allowed("system_one")?;
+        if let Some(warning) = endpoint.cleartext_key_warning("system_one.url") {
+            tracing::warn!("{warning}");
+        }
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))

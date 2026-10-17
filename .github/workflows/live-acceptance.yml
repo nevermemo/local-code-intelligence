@@ -13,6 +13,10 @@ on:
 # what to install and how to register the runner. Deliberately never
 # triggers on `pull_request`: a self-hosted runner must not execute code
 # from an untrusted fork PR.
+# The job only checks out and runs cargo: a read-only token is enough.
+permissions:
+  contents: read
+
 concurrency:
   group: live-acceptance
   cancel-in-progress: false
