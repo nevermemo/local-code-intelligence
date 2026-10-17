@@ -35,13 +35,31 @@ impl NonSource {
     }
 }
 
+/// The prose formats that have their own extractor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProseKind {
+    /// Markdown (CommonMark headings and fences, YAML front matter).
+    Markdown,
+}
+
+/// How an adapter cuts a file into chunks. Code is cut along Tree-sitter
+/// syntax nodes; prose has no grammar and is cut by its own hand-written
+/// splitter, so a prose adapter never carries a placeholder grammar.
+#[derive(Clone, Copy)]
+pub(crate) enum Extractor {
+    TreeSitter {
+        grammar: fn() -> Language,
+        syntax: Syntax,
+    },
+    Prose(ProseKind),
+}
+
 #[derive(Clone, Copy)]
 pub struct LanguageAdapter {
     extension: &'static str,
     identifier: &'static str,
     cache_version: &'static str,
-    grammar: fn() -> Language,
-    syntax: Syntax,
+    extractor: Extractor,
 }
 
 impl LanguageAdapter {
@@ -68,8 +86,29 @@ impl LanguageAdapter {
         self.cache_version
     }
 
+    /// The Tree-sitter grammar of a code adapter.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a prose adapter, which has no grammar. A caller that can
+    /// meet one branches on [`Self::extractor`] first.
     pub fn grammar(&self) -> Language {
-        (self.grammar)()
+        match self.extractor {
+            Extractor::TreeSitter { grammar, .. } => grammar(),
+            Extractor::Prose(kind) => panic!("{kind:?} is prose and has no Tree-sitter grammar"),
+        }
+    }
+
+    pub(crate) const fn extractor(&self) -> Extractor {
+        self.extractor
+    }
+
+    /// The syntax family of a code adapter; `None` for prose.
+    const fn syntax(&self) -> Option<Syntax> {
+        match self.extractor {
+            Extractor::TreeSitter { syntax, .. } => Some(syntax),
+            Extractor::Prose(_) => None,
+        }
     }
 
     pub fn glob(&self) -> &'static str {
@@ -91,12 +130,16 @@ impl LanguageAdapter {
             "cxx" => "*.cxx",
             "hh" => "*.hh",
             "hxx" => "*.hxx",
+            "md" => "*.md",
             _ => unreachable!(),
         }
     }
 
     pub(crate) fn is_container(&self, kind: &str) -> bool {
-        match self.syntax {
+        let Some(syntax) = self.syntax() else {
+            return false;
+        };
+        match syntax {
             Syntax::Rust => matches!(
                 kind,
                 "source_file" | "declaration_list" | "impl_item" | "mod_item" | "trait_item"
@@ -162,7 +205,10 @@ impl LanguageAdapter {
     }
 
     pub(crate) fn is_boundary(&self, kind: &str) -> bool {
-        match self.syntax {
+        let Some(syntax) = self.syntax() else {
+            return false;
+        };
+        match syntax {
             Syntax::EcmaScript => matches!(
                 kind,
                 "export_statement"
@@ -198,7 +244,10 @@ impl LanguageAdapter {
     }
 
     pub(crate) fn is_declaration(&self, kind: &str) -> bool {
-        match self.syntax {
+        let Some(syntax) = self.syntax() else {
+            return false;
+        };
+        match syntax {
             Syntax::Rust => matches!(
                 kind,
                 "function_item" | "struct_item" | "enum_item" | "macro_definition"
@@ -300,7 +349,10 @@ impl LanguageAdapter {
     }
 
     pub(crate) fn is_prefix(&self, kind: &str) -> bool {
-        match self.syntax {
+        let Some(syntax) = self.syntax() else {
+            return false;
+        };
+        match syntax {
             Syntax::Rust => matches!(
                 kind,
                 "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item"
@@ -322,7 +374,10 @@ impl LanguageAdapter {
     }
 
     pub(crate) fn attaches_header_to_child(&self, parent: &str, child: &str) -> bool {
-        match self.syntax {
+        let Some(syntax) = self.syntax() else {
+            return false;
+        };
+        match syntax {
             Syntax::EcmaScript => {
                 matches!(
                     parent,
@@ -520,71 +575,91 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         extension: "rs",
         identifier: "rust",
         cache_version: "rust-chunks-v4",
-        grammar: rust,
-        syntax: Syntax::Rust,
+        extractor: Extractor::TreeSitter {
+            grammar: rust,
+            syntax: Syntax::Rust,
+        },
     },
     LanguageAdapter {
         extension: "ts",
         identifier: "typescript",
         cache_version: "typescript-chunks-v4",
-        grammar: typescript,
-        syntax: Syntax::EcmaScript,
+        extractor: Extractor::TreeSitter {
+            grammar: typescript,
+            syntax: Syntax::EcmaScript,
+        },
     },
     LanguageAdapter {
         extension: "tsx",
         identifier: "tsx",
         cache_version: "tsx-chunks-v4",
-        grammar: tsx,
-        syntax: Syntax::EcmaScript,
+        extractor: Extractor::TreeSitter {
+            grammar: tsx,
+            syntax: Syntax::EcmaScript,
+        },
     },
     LanguageAdapter {
         extension: "js",
         identifier: "javascript",
         cache_version: "javascript-chunks-v4",
-        grammar: javascript,
-        syntax: Syntax::EcmaScript,
+        extractor: Extractor::TreeSitter {
+            grammar: javascript,
+            syntax: Syntax::EcmaScript,
+        },
     },
     LanguageAdapter {
         extension: "jsx",
         identifier: "jsx",
         cache_version: "jsx-chunks-v4",
-        grammar: javascript,
-        syntax: Syntax::EcmaScript,
+        extractor: Extractor::TreeSitter {
+            grammar: javascript,
+            syntax: Syntax::EcmaScript,
+        },
     },
     LanguageAdapter {
         extension: "py",
         identifier: "python",
         cache_version: "python-chunks-v4",
-        grammar: python,
-        syntax: Syntax::Python,
+        extractor: Extractor::TreeSitter {
+            grammar: python,
+            syntax: Syntax::Python,
+        },
     },
     LanguageAdapter {
         extension: "cs",
         identifier: "csharp",
         cache_version: "csharp-chunks-v4",
-        grammar: csharp,
-        syntax: Syntax::CSharp,
+        extractor: Extractor::TreeSitter {
+            grammar: csharp,
+            syntax: Syntax::CSharp,
+        },
     },
     LanguageAdapter {
         extension: "go",
         identifier: "go",
         cache_version: "go-chunks-v4",
-        grammar: go,
-        syntax: Syntax::Go,
+        extractor: Extractor::TreeSitter {
+            grammar: go,
+            syntax: Syntax::Go,
+        },
     },
     LanguageAdapter {
         extension: "java",
         identifier: "java",
         cache_version: "java-chunks-v4",
-        grammar: java,
-        syntax: Syntax::Java,
+        extractor: Extractor::TreeSitter {
+            grammar: java,
+            syntax: Syntax::Java,
+        },
     },
     LanguageAdapter {
         extension: "c",
         identifier: "c",
         cache_version: "c-chunks-v4",
-        grammar: c,
-        syntax: Syntax::C,
+        extractor: Extractor::TreeSitter {
+            grammar: c,
+            syntax: Syntax::C,
+        },
     },
     // `.h` is registered as `c`, a documented decision and not a heuristic:
     // the extension alone cannot tell a C header from a C++ one, and the
@@ -598,50 +673,70 @@ pub const ADAPTERS: &[LanguageAdapter] = &[
         extension: "h",
         identifier: "c",
         cache_version: "c-chunks-v4",
-        grammar: c,
-        syntax: Syntax::C,
+        extractor: Extractor::TreeSitter {
+            grammar: c,
+            syntax: Syntax::C,
+        },
     },
     LanguageAdapter {
         extension: "cpp",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
     },
     LanguageAdapter {
         extension: "hpp",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
     },
     LanguageAdapter {
         extension: "cc",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
     },
     LanguageAdapter {
         extension: "cxx",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
     },
     LanguageAdapter {
         extension: "hh",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
     },
     LanguageAdapter {
         extension: "hxx",
         identifier: "cpp",
         cache_version: "cpp-chunks-v4",
-        grammar: cpp,
-        syntax: Syntax::Cpp,
+        extractor: Extractor::TreeSitter {
+            grammar: cpp,
+            syntax: Syntax::Cpp,
+        },
+    },
+    LanguageAdapter {
+        extension: "md",
+        identifier: "markdown",
+        cache_version: "markdown-chunks-v1",
+        extractor: Extractor::Prose(ProseKind::Markdown),
     },
 ];
 
@@ -704,6 +799,7 @@ mod tests {
             ("cxx", "cpp", "*.cxx", "cpp-chunks-v4"),
             ("hh", "cpp", "*.hh", "cpp-chunks-v4"),
             ("hxx", "cpp", "*.hxx", "cpp-chunks-v4"),
+            ("md", "markdown", "*.md", "markdown-chunks-v1"),
         ] {
             let adapter = for_extension(extension).unwrap();
             assert_eq!(adapter.identifier(), identifier);
@@ -713,7 +809,8 @@ mod tests {
         for extension in [
             "RS", "TS", "mts", "cts", "mjs", "cjs", "PY", "CS", "GO", "JAVA", "class", "C", "H",
             "CPP", "HPP", "CC", "CXX", "HH", "HXX", "Cc", "Hxx", "c++", "h++", "hp", "ino", "inl",
-            "ipp", "tpp", "cu", "m", "mm",
+            "ipp", "tpp", "cu", "m", "mm", "MD", "Md", "mD", "markdown", "mdx", "mkd", "mdown",
+            "rst", "adoc", "txt",
         ] {
             assert!(for_extension(extension).is_none(), "{extension}");
         }
@@ -850,7 +947,8 @@ mod tests {
                 "go",
                 "java",
                 "c",
-                "cpp"
+                "cpp",
+                "markdown"
             ]
         );
     }
@@ -964,5 +1062,69 @@ mod tests {
                 assert_eq!(adapter.non_source(catalog), expected, "{}", adapter.glob());
             }
         }
+    }
+    #[test]
+    fn markdown_is_a_prose_adapter_and_code_adapters_keep_tree_sitter() {
+        for adapter in ADAPTERS {
+            let prose = adapter.glob() == "*.md";
+            assert_eq!(
+                matches!(adapter.extractor(), Extractor::Prose(ProseKind::Markdown)),
+                prose,
+                "{}",
+                adapter.glob()
+            );
+            assert_eq!(
+                matches!(adapter.extractor(), Extractor::TreeSitter { .. }),
+                !prose,
+                "{}",
+                adapter.glob()
+            );
+        }
+        // Every glob of the registry is defined (`glob` panics otherwise).
+        assert_eq!(ADAPTERS.iter().map(LanguageAdapter::glob).count(), 18);
+    }
+
+    #[test]
+    fn markdown_matches_only_the_lowercase_md_extension_in_a_path() {
+        for path in [
+            "README.md",
+            "docs/guide.md",
+            "a/b.c/notes.md",
+            ".github/x.md",
+        ] {
+            let adapter = for_path(Path::new(path)).unwrap();
+            assert_eq!(adapter.identifier(), "markdown", "{path}");
+        }
+        for path in [
+            "README.MD",
+            "notes.markdown",
+            "page.mdx",
+            "md",
+            ".md",
+            "a.md.bak",
+        ] {
+            assert!(for_path(Path::new(path)).is_none(), "{path}");
+        }
+        assert!(is_registered_identifier("markdown"));
+        assert!(!is_registered_identifier("md"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no Tree-sitter grammar")]
+    fn a_prose_adapter_has_no_grammar() {
+        let _ = for_extension("md").unwrap().grammar();
+    }
+
+    #[test]
+    fn prose_adapters_answer_false_to_every_syntax_question() {
+        let markdown = for_extension("md").unwrap();
+        for kind in ["source_file", "function_item", "comment", "heading"] {
+            assert!(!markdown.is_container(kind), "{kind}");
+            assert!(!markdown.is_boundary(kind), "{kind}");
+            assert!(!markdown.is_declaration(kind), "{kind}");
+            assert!(!markdown.is_prefix(kind), "{kind}");
+            assert!(!markdown.attaches_header_to_child(kind, kind), "{kind}");
+        }
+        assert!(markdown.non_source(b"<?xml version=\"1.0\"?>").is_none());
     }
 }

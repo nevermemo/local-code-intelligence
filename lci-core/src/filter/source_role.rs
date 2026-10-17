@@ -99,7 +99,8 @@ impl std::error::Error for SourceRoleError {}
 
 /// Classify the source role of a normalized repository-relative path.
 ///
-/// Precedence: generated > test > benchmark > example > documentation >
+/// Precedence: a Markdown file (`.md`) is documentation wherever it sits;
+/// otherwise generated > test > benchmark > example > documentation >
 /// configuration > source. Path separators are treated as normalized `/`.
 /// Directory conventions use exact component matching only.
 pub fn classify_source_role(relative_path: &str) -> SourceRole {
@@ -112,6 +113,12 @@ pub fn classify_source_role(relative_path: &str) -> SourceRole {
         .take(components.len().saturating_sub(1))
         .collect();
 
+    // Prose is documentation by what it is, not by the directory it is in:
+    // a `tests/README.md` or `examples/walkthrough.md` explains code, it is
+    // not a test or an example.
+    if is_documentation_file_name(file_name) {
+        return SourceRole::Documentation;
+    }
     if is_generated(&dir_components, file_name) {
         return SourceRole::Generated;
     }
@@ -314,6 +321,14 @@ fn is_benchmark_file_name(file_name: &str) -> bool {
 fn is_example(dirs: &[&str], _file_name: &str) -> bool {
     dirs.iter()
         .any(|c| matches!(*c, "example" | "examples" | "samples"))
+}
+
+/// Whether `file_name` is a Markdown file: the lowercase extension `md` after
+/// a non-empty stem, the same exact match the language registry makes.
+fn is_documentation_file_name(file_name: &str) -> bool {
+    file_name
+        .rsplit_once('.')
+        .is_some_and(|(stem, extension)| !stem.is_empty() && extension == "md")
 }
 
 fn is_documentation(dirs: &[&str]) -> bool {

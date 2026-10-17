@@ -227,6 +227,71 @@ fn classify_source_role_by_path() {
     }
 }
 
+/// A `.md` file is documentation in any directory; lookalike extensions are
+/// not, and code in the same directories keeps its role.
+#[test]
+fn markdown_files_are_documentation_regardless_of_directory() {
+    for path in [
+        "README.md",
+        "docs/guide.md",
+        "src/notes.md",
+        "tests/README.md",
+        "src/tests/cases.md",
+        "benches/results.md",
+        "examples/walkthrough.md",
+        "generated/api.md",
+        "src/api.generated.md",
+        "scripts/usage.md",
+        "tools/lint/README.md",
+        "config/schema.md",
+        "build/notes.md",
+        r"docs\sub\page.md",
+        ".agents/skills/x/SKILL.md",
+    ] {
+        assert_eq!(
+            classify_source_role(path),
+            SourceRole::Documentation,
+            "{path}"
+        );
+    }
+    for (path, role) in [
+        // Not a registered extension: the directory rules still decide.
+        ("tests/README.MD", SourceRole::Test),
+        ("tests/notes.markdown", SourceRole::Test),
+        ("examples/page.mdx", SourceRole::Example),
+        ("tests/md", SourceRole::Test),
+        ("src/md", SourceRole::Source),
+        ("src/.md", SourceRole::Source),
+        ("src/readme.md.txt", SourceRole::Source),
+        // Code in the same directories keeps its role.
+        ("tests/cases.rs", SourceRole::Test),
+        ("scripts/build.py", SourceRole::Configuration),
+        ("src/lib.rs", SourceRole::Source),
+    ] {
+        assert_eq!(classify_source_role(path), role, "{path}");
+    }
+}
+
+#[test]
+fn markdown_is_a_registered_language_filter_value() {
+    let filter = EffectiveFilter::from_request(&FilterRequest {
+        languages: Some(vec!["markdown".into()]),
+        source_roles: Some(vec!["documentation".into()]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(filter.matches("markdown", "tests/README.md", SourceRole::Documentation));
+    assert!(!filter.matches("rust", "src/lib.rs", SourceRole::Source));
+    // The extension is not a language identifier.
+    assert!(matches!(
+        EffectiveFilter::from_request(&FilterRequest {
+            languages: Some(vec!["md".into()]),
+            ..Default::default()
+        }),
+        Err(FilterError::UnknownLanguage { .. })
+    ));
+}
+
 #[test]
 #[cfg(windows)]
 fn backslash_separators_are_normalized() {

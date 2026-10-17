@@ -149,7 +149,7 @@ async fn until_shutdown_signal<T>(
 #[derive(Parser)]
 #[command(
     version,
-    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code retrieval over MCP or plain REST/OpenAPI, with optional language-server navigation for every language (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd)"
+    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code and Markdown documentation retrieval over MCP or plain REST/OpenAPI, with optional language-server navigation for every code language (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd)"
 )]
 struct Cli {
     /// Configuration file. Without it `LCI_CONFIG` names one, and without
