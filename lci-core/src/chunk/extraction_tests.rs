@@ -14,6 +14,10 @@ use crate::node::rust_declarations;
 fn write_multilanguage_tree(root: &Path) {
     let files = [
         (
+            "docs/guide.md",
+            "# Guide\nHow to use the tool.\n\n## Install\n```sh\n# not a heading\ncargo install lci\n```\n\n## Usage\nRun `lci search`.\n",
+        ),
+        (
             "src/lib.rs",
             "//! Crate docs.\n\nuse std::fmt;\n\n/// A point.\n#[derive(Debug)]\npub struct Point { x: i32 }\n\nimpl fmt::Display for Point {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"{}\", self.x)\n    }\n}\n\nmod inner {\n    pub fn helper() -> u8 { 1 }\n}\n\npub trait Shape { fn area(&self) -> f64; }\n\nmacro_rules! twice { ($e:expr) => { $e * 2 }; }\n",
         ),

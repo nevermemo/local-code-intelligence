@@ -48,7 +48,7 @@ Ordered; the first item with all dependencies met is next. Every item gets its k
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| 1 | Doc-type prose adapters: `.md`, `.rst`, `.adoc`, `.txt` | ready | Real adapters, never wrapped as code-like files (d317, d325); includes the Markdown adapter. Chunking by heading and doc-section nodes are the proposed shape (the N1 study found no doc-section nodes, d251); acceptance to be written with the slice. |
+| 1 | Doc-type prose adapters: `.md`, `.rst`, `.adoc`, `.txt` | partly done: `.txt`, `.rst`, `.adoc` (each its own slice behind the Markdown tests); DocSection nodes and a `doc.sections` map after (shaping count 54.9% > the 30% bar) | Real adapters, never wrapped as code-like files (d317, d325). Markdown landed as heading sections (d375); its before/after evaluation is in the commit. |
 | 2 | Structured formats `.json`, `.yaml`, `.toml` | ready after 1 | Start on the grep fallback with size and generated-file filters (d325). Real adapters only if a measured gap appears. |
 | 3 | Rust SCIP builds for the evaluation repositories | ready | Build scripts are trusted, SCIP is built when needed (d317); the warm indexes of bevy, tauri and deno are kept for this (d312). Record build time and size per repository. |
 | 4 | Walk-on-SCIP premise test | blocked(3) | Trait-impl set plus an R1 re-run with the walk on (d320). On the R1 and external-repository trees the walk was never measured with SCIP edges (d333); the frozen tree `bfaff44` already has a SCIP index and its walk benches are in `docs/spike/multimap/v2/engine-results.md`, so the test targets the new trees. Kill rule set before the run; the comparison is against plain `lci search` (R1 span hit .64) and against rg. |
@@ -90,6 +90,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N87 | The live-acceptance workflow does not use `--require-all`, so a missing tool reads green (roadmap@bbd3292 N87) | ready | S | N56 done |
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
 | N94 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
+| N95 | A Markdown language server (marksman, MIT) for prose navigation: links, headings, references; the language bar's LSP item is waived for prose until then (d375) | research | S | - |
 | N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.

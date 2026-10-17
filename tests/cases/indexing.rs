@@ -1880,6 +1880,209 @@ async fn c_and_cpp_header_and_source_extensions_reuse_update_delete_and_keep_the
 }
 
 #[tokio::test]
+async fn markdown_is_indexed_as_documentation_and_reuses_updates_deletes_and_keeps_the_snapshot() {
+    use local_code_intelligence::filter::{FilterRequest, SourceRole};
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("docs-repo");
+    let guide = "# Guide\nHow to run the quarantine_policy checker.\n\n## Install\nInstall steps for the checker.\n\n## Usage\nRun the checker nightly.\n";
+    write(
+        &workspace,
+        "README.md",
+        "# Readme\nOverview of the repository.\n\n## Layout\nSources live in src.\n",
+    );
+    write(&workspace, "docs/guide.md", guide);
+    // Documentation in a tests directory is still documentation.
+    write(
+        &workspace,
+        "tests/NOTES.md",
+        "# Notes\nHow the tests are organised.\n",
+    );
+    write(
+        &workspace,
+        "src/lib.rs",
+        "pub fn quarantine_policy_checker() -> u32 {\n    1\n}\n",
+    );
+    // Case variants and other prose extensions are not indexed, and the
+    // shared ignore files apply to Markdown like to code.
+    write(&workspace, "UPPER.MD", "# Upper\nnot indexed\n");
+    write(&workspace, "notes.markdown", "# Long\nnot indexed\n");
+    write(&workspace, "page.mdx", "# Mdx\nnot indexed\n");
+    write(&workspace, ".gitignore", "built/\n");
+    write(
+        &workspace,
+        "built/out.md",
+        "# Built\nignored by gitignore\n",
+    );
+    write(&workspace, ".lciignore", "private/**\n");
+    write(
+        &workspace,
+        "private/secret.md",
+        "# Secret\nignored by lciignore\n",
+    );
+
+    let app = App::open(config.clone()).await.unwrap();
+    let first = app.index(&workspace).await.unwrap();
+    assert_eq!(first.files, 4);
+    assert_eq!(first.parsed_files, 4);
+    // README: 2 sections, guide: 3, notes: 1, lib.rs: 1.
+    assert_eq!(first.chunks, 7);
+    assert_eq!(first.embedded_chunks, 7);
+    assert_eq!(fake.documents.load(Ordering::SeqCst), 7);
+    let indexed = app.indexed_files(&workspace).await.unwrap();
+    assert_eq!(
+        indexed_paths(&indexed),
+        [
+            ("README.md", "markdown"),
+            ("docs/guide.md", "markdown"),
+            ("src/lib.rs", "rust"),
+            ("tests/NOTES.md", "markdown"),
+        ]
+    );
+
+    // Hits carry the language and the Documentation role, in any directory.
+    let found = app
+        .search(&workspace, "quarantine_policy", Some(10))
+        .await
+        .unwrap();
+    let hits: std::collections::BTreeMap<_, _> = found
+        .results
+        .iter()
+        .map(|hit| {
+            (
+                (hit.chunk.relative_file_path.as_str(), hit.chunk.start_line),
+                (hit.chunk.language.as_str(), hit.source_role),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hits[&("docs/guide.md", 1)],
+        ("markdown", SourceRole::Documentation)
+    );
+    assert_eq!(hits[&("src/lib.rs", 1)], ("rust", SourceRole::Source));
+    assert_eq!(
+        hits[&("tests/NOTES.md", 1)],
+        ("markdown", SourceRole::Documentation)
+    );
+    assert!(
+        found
+            .results
+            .iter()
+            .all(|hit| !hit.chunk.relative_file_path.contains("secret")
+                && !hit.chunk.relative_file_path.contains("built")
+                && !hit.chunk.relative_file_path.contains("UPPER"))
+    );
+
+    // `markdown` is a language filter value, and the role filter agrees.
+    for request in [
+        FilterRequest {
+            languages: Some(vec!["markdown".into()]),
+            ..Default::default()
+        },
+        FilterRequest {
+            source_roles: Some(vec!["documentation".into()]),
+            ..Default::default()
+        },
+    ] {
+        let only_docs = app
+            .search_with_filters(&workspace, "quarantine_policy", Some(10), request)
+            .await
+            .unwrap();
+        assert!(!only_docs.results.is_empty());
+        assert!(only_docs.results.iter().all(|hit| {
+            hit.chunk.language == "markdown" && hit.source_role == SourceRole::Documentation
+        }));
+    }
+    let only_code = app
+        .search_with_filters(
+            &workspace,
+            "quarantine_policy",
+            Some(10),
+            FilterRequest {
+                languages: Some(vec!["rust".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        only_code
+            .results
+            .iter()
+            .all(|hit| hit.chunk.relative_file_path == "src/lib.rs")
+    );
+
+    // Zero work on a repeat, in the same process and after a restart.
+    let unchanged = app.index(&workspace).await.unwrap();
+    assert_eq!(unchanged.parsed_files, 0);
+    assert_eq!(unchanged.embedded_chunks, 0);
+    drop(app);
+    let app = App::open(config).await.unwrap();
+    let restarted = app.index(&workspace).await.unwrap();
+    assert_eq!(restarted.parsed_files, 0);
+    assert_eq!(restarted.embedded_chunks, 0);
+    assert_eq!(restarted.unchanged_files, 4);
+
+    // A one-file update reparses that file and re-embeds only the section
+    // that changed.
+    write(
+        &workspace,
+        "docs/guide.md",
+        &guide.replace("Run the checker nightly.", "Run the checker hourly."),
+    );
+    let changed = app.index(&workspace).await.unwrap();
+    assert_eq!(changed.parsed_files, 1);
+    assert_eq!(changed.unchanged_files, 3);
+    assert_eq!(changed.embedded_chunks, 1);
+    assert_eq!(changed.reused_chunks, 6);
+    let updated = app
+        .search(&workspace, "checker hourly", Some(10))
+        .await
+        .unwrap();
+    assert!(updated.results.iter().any(|hit| {
+        hit.chunk.relative_file_path == "docs/guide.md"
+            && hit.chunk.start_line == 7
+            && hit.chunk.code.contains("hourly")
+    }));
+
+    // Deleting a Markdown file removes its chunks from the next snapshot.
+    std::fs::remove_file(workspace.join("tests/NOTES.md")).unwrap();
+    let deleted = app.index(&workspace).await.unwrap();
+    assert_eq!(deleted.removed_files, 1);
+    assert_eq!(deleted.files, 3);
+    assert_eq!(deleted.chunks, 6);
+
+    // A failed update keeps the previous snapshot searchable.
+    write(
+        &workspace,
+        "README.md",
+        "# Readme\nOverview of the repository.\n\n## Layout\nSources live in src.\n\n## Uncommitted\nUNCOMMITTED_SNAPSHOT_MARKER\n",
+    );
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    assert!(app.index(&workspace).await.is_err());
+    assert_eq!(app.status(&workspace).await.unwrap().chunks, deleted.chunks);
+    assert!(app.status(&workspace).await.unwrap().stale);
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let retained = app
+        .search(&workspace, "Overview of the repository", Some(10))
+        .await
+        .unwrap();
+    let readme = retained
+        .results
+        .iter()
+        .find(|hit| hit.chunk.relative_file_path == "README.md")
+        .unwrap();
+    assert!(readme.chunk.code.contains("Overview"));
+    assert!(
+        retained
+            .results
+            .iter()
+            .all(|hit| !hit.chunk.code.contains("UNCOMMITTED_SNAPSHOT_MARKER"))
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn non_utf8_source_is_indexed_lossily_and_never_breaks_search_or_status() {
     let (temp, mut config, _fake, task) = fixture().await;
     config.index.stale_check_interval_seconds = 0;

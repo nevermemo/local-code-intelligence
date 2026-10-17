@@ -207,11 +207,31 @@ pub fn extract_with_adapter(
     extract(path, source, adapter, true)
 }
 
-/// The one chunker: parses `source`, cuts the tree into chunks, and walks
-/// the declarations only when `with_declarations` asks for them (and the
-/// language has an extractor), so a caller that wants chunks alone pays
-/// for no declaration walk.
+/// The one chunker: picks the adapter's extractor. Code is parsed and cut
+/// along its syntax tree; prose goes through its own splitter and has no
+/// declarations.
 fn extract(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+    with_declarations: bool,
+) -> Result<Extraction> {
+    match adapter.extractor() {
+        language::Extractor::TreeSitter { .. } => {
+            extract_tree_sitter(path, source, adapter, with_declarations)
+        }
+        language::Extractor::Prose(language::ProseKind::Markdown) => Ok(Extraction {
+            chunks: markdown::chunks(path, source, adapter.identifier()),
+            declarations: None,
+        }),
+    }
+}
+
+/// The Tree-sitter chunker: parses `source`, cuts the tree into chunks, and
+/// walks the declarations only when `with_declarations` asks for them (and
+/// the language has an extractor), so a caller that wants chunks alone pays
+/// for no declaration walk.
+fn extract_tree_sitter(
     path: &str,
     source: &str,
     adapter: &language::LanguageAdapter,
@@ -444,8 +464,13 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
     Ok(scan_incremental(root, &HashMap::new())?.chunks)
 }
 
+mod markdown;
+
 #[cfg(test)]
 mod extraction_tests;
+
+#[cfg(test)]
+mod markdown_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1040,6 +1065,10 @@ export interface TelemetryLifecycle {
             ("runtime.js", "export function run() {}\n"),
             ("view.jsx", "export const View = () => <main />;\n"),
             ("Service.cs", "public sealed class Service {}\n"),
+            ("guide.md", "# Guide\ntext\n"),
+            ("ignored.MD", "# Upper\ntext\n"),
+            ("ignored.markdown", "# Long\ntext\n"),
+            ("ignored.mdx", "# Mdx\ntext\n"),
             ("ignored.RS", "fn uppercase() {}\n"),
             ("ignored.CS", "public sealed class Ignored {}\n"),
             ("ignored.mts", "export const ignored = 1;\n"),
@@ -1061,7 +1090,8 @@ export interface TelemetryLifecycle {
                 "runtime.js",
                 "view.jsx",
                 "ignored.py",
-                "Service.cs"
+                "Service.cs",
+                "guide.md"
             ])
         );
     }
