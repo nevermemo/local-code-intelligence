@@ -1,16 +1,22 @@
 //! `cargo xtask docs check`: every relative Markdown link and anchor in the
-//! tracked `*.md` files must resolve to an existing file, and the anchor to a
+//! tracked `*.md` files must resolve to a tracked path, and the anchor to a
 //! heading slug in GitHub's style (`docs/development/documentation.md`, rule 9).
 //!
-//! External links (any `scheme:` target such as http, https or mailto) are
-//! skipped, and so are fenced code blocks and inline code spans. Vendored
-//! `.agents/skills/rust-skills/**` is not scanned. Frozen records (the
-//! pre-registrations and results under `docs/spike/multimap/v2`) are scanned
-//! and reported but never fail the check, because they are never edited.
+//! Documents are parsed with `pulldown-cmark`, so inline, reference (used or
+//! only defined) and image links, angle-bracket targets, nested brackets, and
+//! ATX and setext headings follow CommonMark. Links inside code are not links.
+//! External targets (`scheme:` such as http, https or mailto, and `//host`)
+//! are skipped. Targets resolve against the `git ls-files` paths with `/`
+//! separators and case-sensitive matching, never the host filesystem, so the
+//! result is the same on every OS. Vendored `.agents/skills/rust-skills/**` is
+//! not scanned. Frozen records (the pre-registrations and results under
+//! `docs/spike/multimap/v2`) are scanned and reported but never fail the
+//! check, because they are never edited.
 
 use crate::acceptance::workspace_root;
 use crate::lint::tracked_files;
 use anyhow::{Context, Result, bail};
+use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag, TagEnd};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -27,167 +33,171 @@ fn is_frozen(rel: &str) -> bool {
         })
 }
 
-fn is_fence(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("```") || line.starts_with("~~~")
-}
-
-/// GitHub's heading anchor: link syntax reduced to its text, lower-cased,
+/// GitHub's heading anchor for the plain text of a heading: lower-cased,
 /// everything but letters, digits, spaces, `-` and `_` dropped, spaces to `-`.
 pub fn slug(heading: &str) -> String {
-    let mut text = String::new();
-    let mut rest = heading;
-    while let Some(open) = rest.find('[') {
-        let after = &rest[open + 1..];
-        let linked = after.find(']').and_then(|close| {
-            after[close + 1..]
-                .starts_with('(')
-                .then(|| (close, after[close + 1..].find(')')))
-        });
-        match linked {
-            Some((close, Some(end))) => {
-                text.push_str(&rest[..open]);
-                text.push_str(&after[..close]);
-                rest = &after[close + 1 + end + 1..];
-            }
-            _ => {
-                text.push_str(&rest[..=open]);
-                rest = after;
-            }
-        }
-    }
-    text.push_str(rest);
-    text.to_lowercase()
+    heading
+        .to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
         .map(|c| if c == ' ' { '-' } else { c })
         .collect()
 }
 
-/// The text of an ATX heading line (`## Title ##`), or `None`.
-fn heading_text(line: &str) -> Option<&str> {
-    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
-    let rest = line.get(hashes..)?;
-    if !(1..=6).contains(&hashes) || !rest.starts_with([' ', '\t']) {
-        return None;
-    }
-    let text = rest.trim();
-    // A closing run of `#` counts only after a space (so `C#` keeps its `#`).
-    let stripped = text.trim_end_matches('#');
-    if stripped.len() == text.len() {
-        Some(text)
-    } else if stripped.is_empty() {
-        Some("")
-    } else if stripped.ends_with([' ', '\t']) {
-        Some(stripped.trim_end())
-    } else {
-        Some(text)
-    }
-}
-
-/// Every anchor a document defines. A repeated heading gets `-1`, `-2`, ...
-pub fn anchors(text: &str) -> HashSet<String> {
-    let mut found = HashSet::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut fence = false;
-    for line in text.lines() {
-        if is_fence(line) {
-            fence = !fence;
-        } else if !fence && let Some(heading) = heading_text(line) {
-            let base = slug(heading);
-            match seen.get_mut(&base) {
-                Some(count) => {
-                    found.insert(format!("{base}-{count}"));
-                    *count += 1;
-                }
-                None => {
-                    found.insert(base.clone());
-                    seen.insert(base, 1);
-                }
-            }
-        }
-    }
-    found
-}
-
-/// One line with its inline code spans blanked out.
-fn blank_code_spans(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(open) = rest.find('`') {
-        let after = &rest[open + 1..];
-        match after.find('`') {
-            Some(close) => {
-                out.push_str(&rest[..open]);
-                out.extend(rest[open..open + close + 2].chars().map(|_| ' '));
-                rest = &after[close + 1..];
-            }
-            None => break,
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The targets of `[text](target)` and `![alt](target)` on one line, with an
-/// optional `"title"` after the target.
-fn line_links(line: &str) -> Vec<String> {
-    let mut targets = Vec::new();
+/// The `id` and `name` attributes of the `<a ...>` tags in a piece of HTML.
+fn html_anchors(html: &str, out: &mut HashSet<String>) {
+    let lowered = html.to_ascii_lowercase();
     let mut from = 0;
-    while let Some(at) = line[from..].find("](").map(|at| at + from) {
+    while let Some(at) = lowered[from..].find("<a").map(|at| at + from) {
         from = at + 2;
-        let Some(open) = line[..at].rfind('[') else {
-            continue;
-        };
-        if line[open + 1..at].contains(']') {
+        if !lowered[from..].starts_with(|c: char| c.is_ascii_whitespace()) {
             continue;
         }
-        let rest = &line[at + 2..];
-        let end = rest
-            .find(|c: char| c == ')' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        if end == 0 {
-            continue;
+        let end = lowered[from..]
+            .find('>')
+            .map_or(html.len(), |end| end + from);
+        let tag = &html[from..end];
+        let mut rest = tag;
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+            let name_len = rest
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '/'))
+                .unwrap_or(rest.len());
+            if name_len == 0 {
+                break;
+            }
+            let name = rest[..name_len].to_ascii_lowercase();
+            rest = rest[name_len..].trim_start();
+            let Some(after_eq) = rest.strip_prefix('=') else {
+                continue;
+            };
+            let after_eq = after_eq.trim_start();
+            let (value, tail) = match after_eq.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    let body = &after_eq[1..];
+                    let close = body.find(quote).unwrap_or(body.len());
+                    (&body[..close], body.get(close + 1..).unwrap_or(""))
+                }
+                _ => {
+                    let close = after_eq
+                        .find(|c: char| c.is_ascii_whitespace())
+                        .unwrap_or(after_eq.len());
+                    (&after_eq[..close], &after_eq[close..])
+                }
+            };
+            if (name == "id" || name == "name") && !value.is_empty() {
+                out.insert(value.to_owned());
+            }
+            rest = tail;
         }
-        let tail = &rest[end..];
-        let closes = tail.starts_with(')')
-            || tail
-                .strip_prefix(char::is_whitespace)
-                .is_some_and(|titled| {
-                    titled
-                        .trim_start()
-                        .strip_prefix('"')
-                        .and_then(|title| title.split_once('"'))
-                        .is_some_and(|(_, after)| after.starts_with(')'))
-                });
-        if closes {
-            targets.push(rest[..end].to_owned());
-        }
+        from = end;
     }
-    targets
 }
 
-/// Every link target in a document, numbered from line 1, outside fenced
-/// blocks and inline code.
-pub fn links(text: &str) -> Vec<(usize, String)> {
-    let mut found = Vec::new();
-    let mut fence = false;
-    for (index, line) in text.lines().enumerate() {
-        if is_fence(line) {
-            fence = !fence;
-        } else if !fence {
-            found.extend(
-                line_links(&blank_code_spans(line))
-                    .into_iter()
-                    .map(|target| (index + 1, target)),
-            );
+/// What one Markdown document contains that the check cares about.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Scan {
+    /// `(line, target)` of every link, image and reference definition, as the
+    /// parser decoded it (escapes and entities resolved), in line order.
+    pub links: Vec<(usize, String)>,
+    /// `(line, label)` of every `[text][label]` or `[text][]` whose label has
+    /// no definition. A bare `[text]` without a definition is plain text.
+    pub undefined: Vec<(usize, String)>,
+    /// Every anchor the document defines: heading slugs (a repeated heading
+    /// gets `-1`, `-2`, ...) and `<a id>` or `<a name>` attributes.
+    pub anchors: HashSet<String>,
+}
+
+/// Parses a document.
+pub fn scan(text: &str) -> Scan {
+    let mut line_starts = vec![0];
+    line_starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+    let line_of = |offset: usize| line_starts.partition_point(|start| *start <= offset);
+
+    let mut found = Scan::default();
+    let mut undefined = Vec::new();
+    let mut headings: Vec<String> = Vec::new();
+    {
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_FOOTNOTES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS;
+        let callback = |link: BrokenLink<'_>| {
+            if matches!(link.link_type, LinkType::Reference | LinkType::Collapsed) {
+                undefined.push((link.span.start, link.reference.to_string()));
+            }
+            None
+        };
+        let mut parser =
+            Parser::new_with_broken_link_callback(text, options, Some(callback)).into_offset_iter();
+        let mut heading: Option<String> = None;
+        for (event, range) in &mut parser {
+            match event {
+                Event::Start(Tag::Heading { .. }) => heading = Some(String::new()),
+                Event::End(TagEnd::Heading(_)) => headings.extend(heading.take()),
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some(heading) = heading.as_mut() {
+                        heading.push_str(&text);
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some(heading) = heading.as_mut() {
+                        heading.push(' ');
+                    }
+                }
+                Event::Html(html) | Event::InlineHtml(html) => {
+                    html_anchors(&html, &mut found.anchors);
+                }
+                Event::Start(Tag::Link {
+                    link_type: LinkType::Inline,
+                    dest_url,
+                    ..
+                })
+                | Event::Start(Tag::Image {
+                    link_type: LinkType::Inline,
+                    dest_url,
+                    ..
+                }) => found
+                    .links
+                    .push((line_of(range.start), dest_url.to_string())),
+                _ => {}
+            }
+        }
+        for (_, definition) in parser.reference_definitions().iter() {
+            found
+                .links
+                .push((line_of(definition.span.start), definition.dest.to_string()));
+        }
+    }
+    found.links.sort_by_key(|(line, _)| *line);
+    found.undefined = undefined
+        .into_iter()
+        .map(|(offset, label)| (line_of(offset), label))
+        .collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for heading in headings {
+        let base = slug(&heading);
+        match seen.get_mut(&base) {
+            Some(count) => {
+                found.anchors.insert(format!("{base}-{count}"));
+                *count += 1;
+            }
+            None => {
+                found.anchors.insert(base.clone());
+                seen.insert(base, 1);
+            }
         }
     }
     found
 }
 
-/// `scheme:` with at least two scheme characters, so a drive letter is not one.
-fn has_scheme(target: &str) -> bool {
+/// `scheme:` with at least two scheme characters (so a drive letter is not
+/// one), or a protocol-relative `//host`.
+fn is_external(target: &str) -> bool {
+    if target.starts_with("//") {
+        return true;
+    }
     let Some((scheme, _)) = target.split_once(':') else {
         return false;
     };
@@ -222,43 +232,105 @@ fn unquote(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Why a link does not resolve, or `None` when it does. `md_rel` is the
-/// linking file relative to `root`; `cache` holds the anchors per target.
-fn broken_reason(
-    root: &Path,
-    md_rel: &str,
-    target: &str,
-    cache: &mut HashMap<String, HashSet<String>>,
-) -> Option<String> {
-    if has_scheme(target) {
-        return None;
-    }
-    let (path, anchor) = target.split_once('#').unwrap_or((target, ""));
-    let (path, anchor) = (unquote(path), unquote(anchor));
-    let linked = if path.is_empty() {
-        md_rel.to_owned()
-    } else if let Some(from_root) = path.strip_prefix('/') {
-        from_root.to_owned()
-    } else {
-        match md_rel.rsplit_once('/') {
-            Some((dir, _)) => format!("{dir}/{path}"),
-            None => path,
+/// Splits a link target into its decoded path and fragment. The fragment
+/// starts at the first `#` (an escaped one is `%23` and stays in the path);
+/// a query string is dropped from the path.
+fn split_target(target: &str) -> (String, String) {
+    let (path, fragment) = target.split_once('#').unwrap_or((target, ""));
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    (unquote(path), unquote(fragment))
+}
+
+/// The tracked paths, as sets for exact, case-sensitive lookups.
+#[derive(Debug, Default)]
+struct Tracked {
+    files: HashSet<String>,
+    dirs: HashSet<String>,
+    /// Lower-cased path to the path as tracked, to name a case mismatch.
+    folded: HashMap<String, String>,
+}
+
+impl Tracked {
+    fn new(paths: &[String]) -> Self {
+        let mut tracked = Self::default();
+        tracked.dirs.insert(String::new());
+        for path in paths {
+            tracked.files.insert(path.clone());
+            tracked.folded.insert(path.to_lowercase(), path.clone());
+            for (at, _) in path.match_indices('/') {
+                let dir = &path[..at];
+                tracked.dirs.insert(dir.to_owned());
+                tracked.folded.insert(dir.to_lowercase(), dir.to_owned());
+            }
         }
+        tracked
+    }
+}
+
+/// The repository-relative path a link names, with `.` and `..` resolved
+/// lexically; `None` when it climbs out of the repository. `md_rel` is the
+/// linking file; a leading `/` is the repository root.
+fn resolve(md_rel: &str, path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        let mut dir: Vec<&str> = md_rel.split('/').collect();
+        dir.pop();
+        dir
     };
-    let full = root.join(&linked);
-    if !full.exists() {
-        return Some("file not found".to_owned());
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            name => parts.push(name),
+        }
     }
-    if anchor.is_empty() || !linked.ends_with(".md") || !full.is_file() {
-        return None;
+    Some(parts.join("/"))
+}
+
+/// Checks links against the tracked paths and caches each target's anchors.
+struct Checker<'a> {
+    root: &'a Path,
+    tracked: Tracked,
+    anchors: HashMap<String, HashSet<String>>,
+}
+
+impl Checker<'_> {
+    /// Why a link does not resolve, or `None` when it does.
+    fn broken_reason(&mut self, md_rel: &str, target: &str) -> Result<Option<String>> {
+        let (path, anchor) = split_target(target);
+        let linked = if path.is_empty() {
+            md_rel.to_owned()
+        } else {
+            match resolve(md_rel, &path) {
+                Some(linked) => linked,
+                None => return Ok(Some("outside the repository".to_owned())),
+            }
+        };
+        let is_file = self.tracked.files.contains(&linked);
+        if !is_file && !self.tracked.dirs.contains(&linked) {
+            return Ok(Some(
+                match self.tracked.folded.get(&linked.to_lowercase()) {
+                    Some(real) => format!("not a tracked path; differs only in case from {real}"),
+                    None => "not a tracked path".to_owned(),
+                },
+            ));
+        }
+        if anchor.is_empty() || !is_file || !linked.ends_with(".md") {
+            return Ok(None);
+        }
+        if !self.anchors.contains_key(&linked) {
+            let bytes = std::fs::read(self.root.join(&linked))
+                .with_context(|| format!("read {linked} (a link target)"))?;
+            self.anchors.insert(
+                linked.clone(),
+                scan(&String::from_utf8_lossy(&bytes)).anchors,
+            );
+        }
+        Ok((!self.anchors[&linked].contains(&anchor)).then(|| "anchor not found".to_owned()))
     }
-    if !cache.contains_key(&linked) {
-        let text = std::fs::read(&full)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        cache.insert(linked.clone(), anchors(&text));
-    }
-    (!cache[&linked].contains(&anchor)).then(|| "anchor not found".to_owned())
 }
 
 /// One link that does not resolve.
@@ -287,35 +359,58 @@ impl Report {
 
 /// Checks every tracked `*.md` file under `root` (a git working tree).
 pub fn check_repo(root: &Path) -> Result<Report> {
+    let paths = tracked_files(root)?;
+    let mut checker = Checker {
+        root,
+        tracked: Tracked::new(&paths),
+        anchors: HashMap::new(),
+    };
     let mut report = Report::default();
-    let mut cache = HashMap::new();
-    for rel in tracked_files(root)? {
+    for rel in &paths {
         if !rel.ends_with(".md") || rel.starts_with(VENDORED_PREFIX) {
             continue;
         }
-        let path = root.join(&rel);
+        let path = root.join(rel);
+        // Tracked but deleted in the working tree: nothing to read.
         if !path.is_file() {
             continue;
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read {rel}"))?;
         report.files += 1;
-        let frozen = is_frozen(&rel);
-        for (line, target) in links(&String::from_utf8_lossy(&bytes)) {
-            if has_scheme(&target) {
+        let frozen = is_frozen(rel);
+        let found = scan(&String::from_utf8_lossy(&bytes));
+        let mut broken = |line: usize, target: String, reason: String| {
+            report.broken.push(Broken {
+                path: rel.clone(),
+                line,
+                target,
+                reason,
+                frozen,
+            });
+        };
+        let mut checked = 0;
+        for (line, target) in found.links {
+            if is_external(&target) {
                 continue;
             }
-            report.links += 1;
-            if let Some(reason) = broken_reason(root, &rel, &target, &mut cache) {
-                report.broken.push(Broken {
-                    path: rel.clone(),
-                    line,
-                    target,
-                    reason,
-                    frozen,
-                });
+            checked += 1;
+            if let Some(reason) = checker.broken_reason(rel, &target)? {
+                broken(line, target, reason);
             }
         }
+        for (line, label) in found.undefined {
+            checked += 1;
+            broken(line, format!("[{label}]"), "undefined reference".to_owned());
+        }
+        report.links += checked;
     }
+    report.broken.sort_by(|a, b| {
+        (a.path.as_str(), a.line, a.target.as_str()).cmp(&(
+            b.path.as_str(),
+            b.line,
+            b.target.as_str(),
+        ))
+    });
     Ok(report)
 }
 
@@ -396,13 +491,21 @@ mod tests {
         }
     }
 
+    fn targets(text: &str) -> Vec<(usize, String)> {
+        scan(text).links
+    }
+
+    fn sorted(set: &HashSet<String>) -> Vec<&str> {
+        let mut all: Vec<&str> = set.iter().map(String::as_str).collect();
+        all.sort_unstable();
+        all
+    }
+
     #[test]
     fn slugs_follow_github() {
         for (heading, expected) in [
             ("Plain Title", "plain-title"),
             ("What's new? (v2.0)", "whats-new-v20"),
-            ("`code` in a heading", "code-in-a-heading"),
-            ("[Linked](other.md) text", "linked-text"),
             ("snake_case and-dash", "snake_case-and-dash"),
             ("Two  spaces", "two--spaces"),
             ("Ünïcode Ärger", "ünïcode-ärger"),
@@ -413,44 +516,164 @@ mod tests {
     }
 
     #[test]
-    fn anchors_dedupe_skip_fences_and_strip_closing_hashes() {
-        let text =
-            "# Title\n## Same\n## Same\n### Same ###\n```\n# not a heading\n```\n#nospace\n## C#\n";
-        let found = anchors(text);
-        for expected in ["title", "same", "same-1", "same-2", "c"] {
-            assert!(found.contains(expected), "{expected} in {found:?}");
-        }
-        assert!(!found.contains("not-a-heading"));
-        assert!(!found.contains("nospace"));
-        assert_eq!(found.len(), 5);
-    }
-
-    #[test]
-    fn links_are_found_with_line_numbers() {
-        let text = "See [a](one.md) and ![img](pic.png \"A title\").\n\
-                    ```\n[skipped](fenced.md)\n```\n\
-                    Code `[x](inline.md)` is skipped, [b](two.md#sec) is not.\n\
-                    [brackets] (not a link) and [open](missing-close.md\n\
-                    [out](https://example.com/x) and [mail](mailto:a@b.c)\n";
+    fn heading_anchors_come_from_the_rendered_text() {
+        let text = "# Title\n## `code` and *emphasis*\n## [Linked](other.md) text\n\
+                    ## Same\n## Same\n### Same ###\n## C#\n\
+                    ```\n# not a heading\n```\n#nospace\n";
+        let found = scan(text).anchors;
         assert_eq!(
-            links(text),
+            sorted(&found),
             [
-                (1, "one.md".to_owned()),
-                (1, "pic.png".to_owned()),
-                (5, "two.md#sec".to_owned()),
-                (7, "https://example.com/x".to_owned()),
-                (7, "mailto:a@b.c".to_owned()),
+                "c",
+                "code-and-emphasis",
+                "linked-text",
+                "same",
+                "same-1",
+                "same-2",
+                "title"
             ]
         );
     }
 
     #[test]
+    fn setext_headings_are_anchors() {
+        let found = scan("Big title\n=========\n\nSecond `part`\n-------------\n").anchors;
+        assert_eq!(sorted(&found), ["big-title", "second-part"]);
+    }
+
+    #[test]
+    fn html_anchors_by_id_and_name_are_anchors() {
+        let text = "<a id=\"by-id\"></a>\n\nText <a href=\"x\" name='by-name'>here</a> and \
+                    <A ID=upper>x</A> and <abbr id=\"not-an-anchor\">y</abbr>.\n";
+        let found = scan(text).anchors;
+        assert_eq!(sorted(&found), ["by-id", "by-name", "upper"]);
+    }
+
+    #[test]
+    fn inline_links_and_images_are_found_with_line_numbers() {
+        let text = "See [a](one.md) and ![img](pic.png \"A title\").\n\
+                    ```\n[skipped](fenced.md)\n```\n\
+                    Code `[x](inline.md)` is skipped, [b](two.md#sec) is not.\n\
+                    [out](https://example.com/x) and [mail](mailto:a@b.c)\n";
+        assert_eq!(
+            targets(text),
+            [
+                (1, "one.md".to_owned()),
+                (1, "pic.png".to_owned()),
+                (5, "two.md#sec".to_owned()),
+                (6, "https://example.com/x".to_owned()),
+                (6, "mailto:a@b.c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_definitions_are_links_used_or_not() {
+        let text = "Use [full][one], [collapsed][] and [short].\n\n\
+                    [one]: docs/one.md\n[collapsed]: docs/two.md#sec \"Title\"\n\
+                    [short]: <docs/with space.md>\n[unused]: docs/unused.md\n";
+        let mut found: Vec<_> = targets(text).into_iter().map(|(_, t)| t).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "docs/one.md",
+                "docs/two.md#sec",
+                "docs/unused.md",
+                "docs/with space.md"
+            ]
+        );
+        assert_eq!(targets(text).first().map(|(line, _)| *line), Some(3));
+    }
+
+    #[test]
+    fn undefined_references_are_reported_but_bare_brackets_are_text() {
+        let found = scan("A [text][nowhere] and [other][] and [just brackets] and [ ] and [x].\n");
+        assert_eq!(
+            found.undefined,
+            [(1, "nowhere".to_owned()), (1, "other".to_owned())]
+        );
+        assert!(found.links.is_empty());
+    }
+
+    #[test]
+    fn angle_bracket_nested_and_parenthesised_targets_follow_commonmark() {
+        let text = "[a](<my file.md>) [b [nested] text](two.md) [c](three(1).md) \
+                    [d](four.md \"a (title)\")\n";
+        assert_eq!(
+            targets(text),
+            [
+                (1, "my file.md".to_owned()),
+                (1, "two.md".to_owned()),
+                (1, "three(1).md".to_owned()),
+                (1, "four.md".to_owned()),
+            ]
+        );
+        // A link whose text spans lines.
+        assert_eq!(
+            targets("[multi\nline](split.md)\n"),
+            [(1, "split.md".to_owned())]
+        );
+    }
+
+    #[test]
+    fn targets_split_into_path_and_fragment_safely() {
+        for (target, path, fragment) in [
+            ("a.md", "a.md", ""),
+            ("a.md#sec", "a.md", "sec"),
+            ("#sec", "", "sec"),
+            ("a.md?raw=true", "a.md", ""),
+            ("a.md?x=1#sec", "a.md", "sec"),
+            ("a%20b.md#two%20words", "a b.md", "two words"),
+            // An escaped '#' belongs to the file name.
+            ("a%23b.md", "a#b.md", ""),
+            ("a%23b.md#sec", "a#b.md", "sec"),
+            ("a.md#x#y", "a.md", "x#y"),
+        ] {
+            assert_eq!(
+                split_target(target),
+                (path.to_owned(), fragment.to_owned()),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
     fn schemes_are_external_but_drive_letters_are_not() {
-        assert!(has_scheme("https://example.com"));
-        assert!(has_scheme("mailto:a@b.c"));
-        assert!(!has_scheme("C:/dir/file.md"));
-        assert!(!has_scheme("docs/a.md#x:y"));
-        assert!(!has_scheme("#anchor"));
+        assert!(is_external("https://example.com"));
+        assert!(is_external("mailto:a@b.c"));
+        assert!(is_external("//cdn.example.com/x.js"));
+        assert!(!is_external("C:/dir/file.md"));
+        assert!(!is_external("docs/a.md#x:y"));
+        assert!(!is_external("#anchor"));
+    }
+
+    #[test]
+    fn paths_resolve_lexically_from_the_linking_file() {
+        assert_eq!(
+            resolve("README.md", "docs/a.md").as_deref(),
+            Some("docs/a.md")
+        );
+        assert_eq!(
+            resolve("docs/a.md", "../README.md").as_deref(),
+            Some("README.md")
+        );
+        assert_eq!(
+            resolve("docs/a.md", "./b/../c.md").as_deref(),
+            Some("docs/c.md")
+        );
+        assert_eq!(resolve("docs/a.md", "/x/y.md").as_deref(), Some("x/y.md"));
+        assert_eq!(resolve("docs/a.md", "sub/").as_deref(), Some("docs/sub"));
+        assert_eq!(resolve("README.md", "../outside.md"), None);
+    }
+
+    fn broken_in(repo: &TempRepo) -> Vec<(String, usize, String, String, bool)> {
+        check_repo(&repo.0)
+            .unwrap()
+            .broken
+            .into_iter()
+            .map(|b| (b.path, b.line, b.target, b.reason, b.frozen))
+            .collect()
     }
 
     #[test]
@@ -470,36 +693,36 @@ mod tests {
         repo.track();
 
         let report = check_repo(&repo.0).unwrap();
-        let found: Vec<_> = report
-            .broken
-            .iter()
-            .map(|b| {
-                (
-                    b.path.as_str(),
-                    b.line,
-                    b.target.as_str(),
-                    b.reason.as_str(),
-                    b.frozen,
-                )
-            })
-            .collect();
+        let tracked_path = "not a tracked path";
         assert_eq!(
-            found,
+            broken_in(&repo),
             [
-                ("README.md", 3, "docs/missing.md", "file not found", false),
-                ("README.md", 4, "docs/a.md#nope", "anchor not found", false),
                 (
-                    "docs/spike/multimap/v2/guide.md",
-                    1,
-                    "gone.md",
-                    "file not found",
+                    "README.md".to_owned(),
+                    3,
+                    "docs/missing.md".to_owned(),
+                    tracked_path.to_owned(),
                     false
                 ),
                 (
-                    "docs/spike/multimap/v2/m1-prereg.md",
+                    "README.md".to_owned(),
+                    4,
+                    "docs/a.md#nope".to_owned(),
+                    "anchor not found".to_owned(),
+                    false
+                ),
+                (
+                    "docs/spike/multimap/v2/guide.md".to_owned(),
                     1,
-                    "gone.md",
-                    "file not found",
+                    "gone.md".to_owned(),
+                    tracked_path.to_owned(),
+                    false
+                ),
+                (
+                    "docs/spike/multimap/v2/m1-prereg.md".to_owned(),
+                    1,
+                    "gone.md".to_owned(),
+                    tracked_path.to_owned(),
                     true
                 ),
             ]
@@ -507,6 +730,112 @@ mod tests {
         assert_eq!(report.failures(), 3);
         // The vendored file is not scanned at all.
         assert_eq!(report.files, 5);
+    }
+
+    #[test]
+    fn a_repository_check_covers_the_markdown_forms_inline_scanning_missed() {
+        let repo = TempRepo::new();
+        repo.write(
+            "index.md",
+            "[ref ok][good] and [ref bad][bad] and [undef][nowhere]\n\n\
+             [good]: docs/a.md#setext-title\n[bad]: docs/gone.md\n\n\
+             [angle ok](<docs/with space.md>) [angle bad](<docs/no space.md>)\n\
+             [nested [ok] text](docs/a.md#html-spot) [nested [inner] text](docs/gone2.md)\n\
+             [escaped](docs/a%23b.md) [escaped frag](docs/a.md#setext-title) \
+             [query](docs/a.md?plain=1#setext-title) [badfrag](docs/a.md#x#y)\n",
+        );
+        repo.write(
+            "docs/a.md",
+            "Setext Title\n============\n\n<a id=\"html-spot\"></a>\n",
+        );
+        repo.write("docs/a#b.md", "hash in the name\n");
+        repo.write("docs/with space.md", "x\n");
+        repo.track();
+
+        let found: Vec<(usize, String, String)> = broken_in(&repo)
+            .into_iter()
+            .map(|(_, line, target, reason, _)| (line, target, reason))
+            .collect();
+        let tracked_path = "not a tracked path".to_owned();
+        assert_eq!(
+            found,
+            [
+                (1, "[nowhere]".to_owned(), "undefined reference".to_owned()),
+                (4, "docs/gone.md".to_owned(), tracked_path.clone()),
+                (6, "docs/no space.md".to_owned(), tracked_path.clone()),
+                (7, "docs/gone2.md".to_owned(), tracked_path),
+                (8, "docs/a.md#x#y".to_owned(), "anchor not found".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrong_case_path_fails_on_every_platform() {
+        let repo = TempRepo::new();
+        repo.write(
+            "README.md",
+            "[wrong file](docs/Guide.md) [wrong dir](Docs/guide.md) [right](docs/guide.md)\n\
+             [back\\slash](docs\\guide.md)\n",
+        );
+        repo.write("docs/guide.md", "# Guide\n");
+        repo.track();
+        let found: Vec<(usize, String, String)> = broken_in(&repo)
+            .into_iter()
+            .map(|(_, line, target, reason, _)| (line, target, reason))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    1,
+                    "Docs/guide.md".to_owned(),
+                    "not a tracked path; differs only in case from docs/guide.md".to_owned()
+                ),
+                (
+                    1,
+                    "docs/Guide.md".to_owned(),
+                    "not a tracked path; differs only in case from docs/guide.md".to_owned()
+                ),
+                (
+                    2,
+                    "docs\\guide.md".to_owned(),
+                    "not a tracked path".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_out_of_the_repository_and_an_untracked_target_fail() {
+        let repo = TempRepo::new();
+        repo.write("README.md", "[up](../elsewhere.md) [new](new.md)\n");
+        repo.track();
+        repo.write("new.md", "not added to git\n");
+        let found: Vec<_> = broken_in(&repo)
+            .into_iter()
+            .map(|(_, _, target, reason, _)| (target, reason))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "../elsewhere.md".to_owned(),
+                    "outside the repository".to_owned()
+                ),
+                ("new.md".to_owned(), "not a tracked path".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_anchor_target_is_an_error_not_a_pass() {
+        let repo = TempRepo::new();
+        repo.write("README.md", "[x](other.md#top)\n");
+        repo.write("other.md", "# Top\n");
+        repo.track();
+        std::fs::remove_file(repo.0.join("other.md")).unwrap();
+        let error = check_repo(&repo.0).unwrap_err();
+        assert!(format!("{error:#}").contains("other.md"), "{error:#}");
     }
 
     #[test]
