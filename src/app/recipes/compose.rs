@@ -323,7 +323,7 @@ fn callee_reach(sources: &Sources, start: &[usize], depth: u32) -> (Out, u64) {
             continue;
         }
         pops += 1;
-        for edge in &graph.out[node] {
+        for edge in followed(&graph.out[node]) {
             dist.entry(edge.to).or_insert_with(|| {
                 queue.push_back(edge.to);
                 here + 1

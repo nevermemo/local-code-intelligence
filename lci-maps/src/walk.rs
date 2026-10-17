@@ -255,6 +255,7 @@ pub fn kind_prior(kind: GraphEdgeKind) -> f64 {
     match kind {
         GraphEdgeKind::CallsOrRefs => 1.0,
         GraphEdgeKind::Contains => 0.5,
+        GraphEdgeKind::Implements => 0.9,
     }
 }
 
