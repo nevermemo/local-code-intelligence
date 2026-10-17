@@ -22,4 +22,4 @@ Always report:
 - Retrieval metrics and fallbacks where ranking is exercised.
 - Remaining limitations and uncommitted files.
 
-Generated `test-results`, disposable fixtures, `.tools` downloads, `target`, model weights, local configuration (`config.toml`), and editor settings do not belong in a release commit. The application may use ports 8766, 8767, and 8768 according to their documented roles, and the acceptance harness uses 8769; port 8765 remains external and untouched.
+Generated `test-results`, disposable fixtures, `.tools` downloads, `target`, model weights, local configuration (`config.toml`), and editor settings (`.vscode/`, `.claude/settings.local.json`; both gitignored) do not belong in a release commit. The application may use ports 8766, 8767, and 8768 according to their documented roles, and the acceptance harness uses 8769; port 8765 remains external and untouched.

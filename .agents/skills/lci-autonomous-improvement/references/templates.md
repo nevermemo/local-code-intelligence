@@ -111,11 +111,11 @@ The author answers every B and S item in the document's amendment log (adopted, 
 
 ## Sanity checkpoint brief
 
-Source of the checkpoints: roadmap "Strategy checkpoint" (keep the list below in sync with it). A fresh reviewer with no stake (stronger model, read-only, web research allowed for prior art) is briefed with:
+The checkpoints are listed in the table below; the verdicts so far are in `docs/decisions.md`. A fresh reviewer with no stake (stronger model, read-only, web research allowed for prior art) is briefed with:
 
 ```text
 Sanity checkpoint <SC1..SC6 | recurring: renewal, every fifth slice, surprising result, owner request>, <date>.
-Edit nothing, start no service. Read the roadmap "Strategy checkpoint", the items under test, <pre-registration, results, logs>, and `git log` since <last checkpoint>.
+Edit nothing, start no service. Read the checkpoint table below, the items under test, <pre-registration, results, logs>, and `git log` since <last checkpoint>.
 Answer with evidence (file:line or URL; [unverified] if you could not open it):
   1. Is the goal still sound? What is measured and what is only assumed?
   2. Does this already exist elsewhere (prior art, what vendors do)?
@@ -134,7 +134,7 @@ One page.
 | SC5 | before pre-registering phase 2 (cross-map verbs and interfaces) and before any training or distillation on the RTX 5090 | phase 2's premise and its pre-registered measurement; the cost of being wrong |
 | SC6 | after A7 (portable configuration) implementation and docs are in place | measured first: fresh agents (clean worktree with no local files; the owner's machine) find or create every path, port and URL through the documented resolvers without guessing; then neutrality evidence, docs consistency, nothing machine-specific committed |
 
-The coordinator records the verdict and what changed in the roadmap "Strategy checkpoint".
+The coordinator records the verdict as a finding line in `docs/decisions.md` and, when a plan changes, in the roadmap.
 
 ## Pre-registration
 
@@ -207,10 +207,10 @@ Current state only, at most about 7 KB (the post-compaction hook prints it whole
 ```text
 # Run checkpoint -- <date time>. Last pushed: <hash> (<branch>, <PR>). Tree: <clean | uncommitted: files>
 Active run: <yes (since <date>; what) | no>
-FIRST AFTER ANY COMPACTION: run the post-compaction hook (owner-local); call get_usage; read this file; read the roadmap "In progress" section and `git status`.
+FIRST AFTER ANY COMPACTION: run the post-compaction hook (owner-local); call get_usage; read this file; read the roadmap "Now and next" section and `git status`.
 
 ## Standing mandate
-<what the owner asked for; stop starting new work at 90% of either the 5-hour or the weekly window; pointer to the memory file holding the preferences>
+<what the owner asked for; the owner's stop rule as stated (usually 90% of a usage window; how to apply it: skill "Stopping at the usage limit"); pointer to the memory file holding the preferences>
 
 ## Approvals
 - <date>: "<verbatim scope>". Does not cover: <...>

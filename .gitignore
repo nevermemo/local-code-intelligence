@@ -6,3 +6,6 @@
 /.local/
 # Local overlay files hold machine values and never belong in the public repository.
 *.local.toml
+# Editor and agent-client settings are per machine (D8, 2026-10-17).
+/.vscode/
+/.claude/settings.local.json

@@ -15,6 +15,7 @@ Any change to the query instruction, document representation, embedding identity
 4. Apply requested filters before reranker input and defensively before final output.
 5. Preserve valid empty filtered results and independent fail-open channels.
 6. Keep evaluation expectations outside production ranking code.
+7. The embedder-plus-reranker retrieval sets (`evaluations/core.toml`, the mined set) are regression checks only: run them to show a change did not hurt, and do not add new embedder or reranker comparison arms. Where the project's measuring effort goes (traversal on a code graph, the three metric tiers, the simulated agent) is in [docs/spike/multimap/evaluation.md](../../../docs/spike/multimap/evaluation.md).
 
 Where things live: retrieval pipeline in `src/app/search.rs`; filters and source roles in `lci-core/src/filter.rs` and `lci-core/src/filter/`; model clients in `lci-core/src/models.rs`; lexical channel in `lci-core/src/lexical.rs`; evaluation runner, definitions, and metrics in `src/evaluate/`; the checked-in definition in `evaluations/core.toml`.
 
