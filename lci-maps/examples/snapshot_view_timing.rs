@@ -1,5 +1,5 @@
 //! Times `SnapshotView::new` (merge condition M4,
-//! `docs/spike/multimap/merge-conditions.md`): the per-search pass that
+//! `docs/spike/multimap/engine.md`, "Seams and invariants"): the per-search pass that
 //! derives a Chunk NodeId for every chunk of the filtered universe. The
 //! universe here is a scan of `--root` (default: this repository), the
 //! whole tree unfiltered, as a search without filters sees it.

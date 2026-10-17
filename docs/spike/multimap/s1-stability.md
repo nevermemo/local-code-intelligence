@@ -1,4 +1,6 @@
 # S1 evidence: chunk identity across this repository's history
+Status: frozen measurement (2026-10-12, slice S1, built); it supports decision N-5 in [specs/node-id.md](specs/node-id.md) and is indexed in [results.md](results.md).
+The figures and commands below are as measured at that time; the code has moved since, so rerun before quoting a number.
 
 Measured 2026-10-12T11:15Z (`date -u`) in the cloud run that built S1. The question: does
 dropping `start_line` from chunk identity (node-id.md, decision behind lesson L4) keep ids

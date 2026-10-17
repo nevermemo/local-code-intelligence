@@ -1,192 +1,87 @@
 # Spec: map card schema
 
-Status: **v0, pre-freeze.** Written 2026-10-12T10:09Z (`date -u`) at slice S0. Docs only.
-Schema id `lci.mapcard/0`.
-
-Code read at spike head `df7faaa` (code of `7f9c636`). Labels: **Read** = in the code or docs at
-that tree; **Inferred** = designed here.
+Status: **v0, pre-freeze.** Written 2026-10-12 at slice S0. The measured file format below is design only (not built); the in-code
+`MapCard` stub of 3.5 is built. Schema id `lci.mapcard/0`. Labels: **Read** = in the code or docs; **Inferred** = designed here; **as built** =
+checked against the code at the S1 tree.
 
 ## 1. Purpose
 
-A map card says, per map: what it costs, what it covers, how fresh it is, what it is good
-for, and which contracts it passes (idea N3, [../ideas.md](../ideas.md)). It has two readers:
-the traversal (to order and budget map calls, and to show the agent a menu at a checkpoint)
-and the index-time storage selection (idea S9). Cards are updated from benchmark RunRecords,
-never by hand-typed numbers. Every number carries an evidence label: **M** measured (from
-named runs), **A** approximate (derived from measurements), **G** guess.
+A map card says, per map: what it costs, what it covers, how fresh it is, what it is good for, and which contracts it passes (idea N3,
+[../ideas.md](../ideas.md)). It has two readers: the traversal (to order and budget map calls, and to show the agent a menu at a checkpoint) and
+the index-time storage selection (idea S9). Cards are updated from benchmark RunRecords, never by hand-typed numbers. Every number carries an
+evidence label: **M** measured (from named runs), **A** approximate (derived from measurements), **G** guess.
 
 ## 2. What exists today (Read)
 
-| Item | Where | Use |
+| Item | Where (symbols) | Use |
 | --- | --- | --- |
-| Inventory rows with estimated costs and update models | [../maps-inventory.md](../maps-inventory.md), "Inventory" (all costs "estimates, not measurements") | Seed the first cards with label G. |
-| Per-search stage timings | `Timings`, `src/app/search.rs:28-37`; latency percentiles in `src/evaluate/metrics.rs:397` (`aggregate`) | Source of the first M query costs for the three legacy maps. |
-| Per-query metrics and paired deltas | `src/evaluate/metrics.rs:50` (`query_metrics`); `src/evaluate/compare.rs:221`, paired bootstrap `:382` | Source of `good_for` deltas. |
-| Readiness of optional dependencies | `App::service_status`, `src/app/readiness.rs:98`; `/ready`, `src/server.rs:271-282` | `needs` and availability. |
-| Evaluation tags (`keyword`, `short-query`, ...) | miner, `xtask/src/mine.rs` (architecture-map.md, 8) | Question shapes for `good_for`. |
+| Inventory rows with estimated costs and update models | The retired maps inventory (its facts are in [../engine.md](../engine.md), "Maps") | Seed the first cards with label G. |
+| Per-search stage timings | `Timings` in `src/app/search.rs`; latency percentiles `aggregate` in `src/evaluate/metrics.rs` | Source of the first M query costs for the three legacy maps. |
+| Per-query metrics and paired deltas | `query_metrics` in `src/evaluate/metrics.rs`; paired bootstrap in `src/evaluate/compare.rs` | Source of `good_for` deltas. |
+| Readiness of optional dependencies | `App::service_status` (`src/app/readiness.rs`); `/ready` in `src/server.rs` | `needs` and availability. |
+| Evaluation tags (`keyword`, `short-query`, ...) | the miner, `xtask/src/mine.rs` | Question shapes for `good_for`. |
 | Question families in the public seed sets | `eval-seed.json` map kinds; `gold-bugloc.json` `change_kind` | Question types for `good_for`. |
 
-## 3. Design (Inferred)
+## 3. Design
 
-### 3.1 Two parts
+### 3.1 Two parts (Inferred)
 
-- **Static part**, compiled into the binary from the map's `MapDescriptor`
-  ([map-trait.md](map-trait.md)): id, version, contribution kind, node kinds, freshness
-  model, source labels, needs.
-- **Measured part**, a JSON file per map produced by the harness from RunRecords:
-  committed as `docs/spike/multimap/cards/<map-id>.json` for public gold sets only. At run
-  time the engine reads the compiled defaults and, if present, a card file under
-  `<data_dir>/cards/` (never inside a workspace, `AGENTS.md`). A card file with a different
-  `map.version` than the binary's map is ignored with a note.
+- **Static part**, compiled into the binary from the map's `MapDescriptor` ([map-trait.md](map-trait.md)): id, version, contribution kind, node
+  kinds, freshness model, source labels, needs.
+- **Measured part**, a JSON file per map produced by the harness from RunRecords: committed as `docs/spike/multimap/cards/<map-id>.json` for
+  public gold sets only. At run time the engine reads the compiled defaults and, if present, a card file under `<data_dir>/cards/` (never inside a
+  workspace, `AGENTS.md`). A card file with a different `map.version` than the binary's map is ignored with a note.
 
-### 3.2 Schema
+### 3.2 Schema (Inferred, not built; JSON Schema 2020-12, `$id` `lci.mapcard/0`)
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "lci.mapcard/0",
-  "type": "object",
-  "required": ["schema", "map", "updated_at", "cost", "coverage", "freshness", "good_for", "contracts"],
-  "$defs": {
-    "evidence": { "enum": ["M", "A", "G"] },
-    "num": {
-      "type": "object",
-      "required": ["value", "label"],
-      "properties": {
-        "value": { "type": "number" },
-        "unit": { "type": "string" },
-        "label": { "$ref": "#/$defs/evidence" },
-        "runs": { "type": "array", "items": { "type": "string" }, "description": "RunRecord run ids or a harness batch id; required when label is M or A" },
-        "n": { "type": "integer", "description": "sample size behind the value" },
-        "repo_profile": { "type": "string", "description": "which repository size the number is for, e.g. self or large" }
-      }
-    },
-    "delta": {
-      "type": "object",
-      "required": ["metric", "vs", "mean", "ci95", "n", "label"],
-      "properties": {
-        "metric": { "type": "string", "description": "e.g. ndcg@10, recall@8, file_hit@5, first_gold_step" },
-        "vs": { "enum": ["no-graph", "random", "churn", "reference"] },
-        "mean": { "type": "number" },
-        "ci95": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
-        "n": { "type": "integer" },
-        "label": { "$ref": "#/$defs/evidence" },
-        "runs": { "type": "array", "items": { "type": "string" } }
-      }
-    }
-  },
-  "properties": {
-    "schema": { "const": "lci.mapcard/0" },
-    "map": {
-      "type": "object",
-      "required": ["id", "version", "contribution", "accepts", "emits", "source_labels", "needs"],
-      "properties": {
-        "id": { "type": "string" },
-        "version": { "type": "integer" },
-        "title": { "type": "string" },
-        "inventory_row": { "type": "string", "description": "row number in maps-inventory.md, e.g. 1, 2a, 13" },
-        "contribution": { "enum": ["rank-list", "prior", "filter", "expansion"] },
-        "accepts": { "type": "array", "items": { "type": "string" } },
-        "emits": { "type": "array", "items": { "type": "string" } },
-        "source_labels": { "type": "array", "items": { "type": "string" } },
-        "needs": { "type": "array", "items": { "type": "string" } },
-        "status": { "enum": ["default", "opt-in", "parked"] },
-        "parked_condition": { "type": "string", "description": "copied from the lessons.md parking log" }
-      }
-    },
-    "updated_at": { "type": "string", "format": "date-time", "description": "UTC, from the system clock when the harness wrote the card" },
-    "tree": { "type": "string", "description": "commit of the indexed tree behind the measurements" },
-    "cost": {
-      "type": "object",
-      "properties": {
-        "build_ms": { "$ref": "#/$defs/num" },
-        "update_ms_per_file": { "$ref": "#/$defs/num" },
-        "storage_bytes": { "$ref": "#/$defs/num" },
-        "resident_bytes": { "$ref": "#/$defs/num" },
-        "query_ms_p50": { "$ref": "#/$defs/num" },
-        "query_ms_p95": { "$ref": "#/$defs/num" },
-        "external_calls_per_query": { "$ref": "#/$defs/num" },
-        "est_tokens_per_query": { "$ref": "#/$defs/num" },
-        "cold_start_ms": { "$ref": "#/$defs/num" }
-      }
-    },
-    "coverage": {
-      "type": "object",
-      "properties": {
-        "languages": { "type": "array", "items": { "type": "string" } },
-        "node_fraction": { "type": "object", "additionalProperties": { "$ref": "#/$defs/num" }, "description": "per node kind: share of the snapshot's nodes the map can return" },
-        "edge_precision": { "$ref": "#/$defs/num" },
-        "edge_recall": { "$ref": "#/$defs/num" },
-        "edge_reference": { "type": "string", "description": "what precision and recall were measured against, e.g. scip at a named commit" },
-        "hub_nodes": { "type": "array", "items": { "type": "string" }, "description": "NodeIds the map reaches from most seeds (files every commit touches, lesson L13)" }
-      }
-    },
-    "freshness": {
-      "type": "object",
-      "required": ["model"],
-      "properties": {
-        "model": { "enum": ["per-file", "per-commit", "live", "global"] },
-        "observed": { "enum": ["snapshot", "live-tree", "as-of"] },
-        "staleness_window": { "$ref": "#/$defs/num" },
-        "invalidated_by": { "type": "array", "items": { "type": "string" }, "description": "e.g. content hash, adapter version, HEAD move, config change" }
-      }
-    },
-    "good_for": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["question_type", "deltas"],
-        "properties": {
-          "question_type": { "type": "string", "description": "a map kind of eval-seed, a change_kind of gold-bugloc, a query-shape tag, or a family of a private set by opaque id" },
-          "deltas": { "type": "array", "items": { "$ref": "#/$defs/delta" } },
-          "condition": { "type": "string", "description": "when the gain appears, e.g. clean seeds only (lesson L11)" }
-        }
-      }
-    },
-    "bad_for": { "type": "array", "items": { "type": "object" }, "description": "same shape as good_for, for significant losses" },
-    "contracts": {
-      "type": "object",
-      "description": "C1..C9 from contract-kit.md",
-      "propertyNames": { "pattern": "^C[1-9]$" },
-      "additionalProperties": {
-        "type": "object",
-        "required": ["state"],
-        "properties": {
-          "state": { "enum": ["pass", "fail", "n/a", "not-run"] },
-          "test": { "type": "string" },
-          "commit": { "type": "string" }
-        }
-      }
-    }
-  }
-}
-```
+Required top level: `schema` (const `lci.mapcard/0`), `map`, `updated_at`, `cost`, `coverage`, `freshness`, `good_for`, `contracts`. Optional: `tree`,
+`bad_for`.
 
-### 3.3 Update rules
+| Field | Type and meaning |
+| --- | --- |
+| `evidence` | enum `M`, `A`, `G`. |
+| `num` | `{value, label}` required; optional `unit`, `runs` (RunRecord run ids or a harness batch id; required when label is M or A), `n` (sample size), `repo_profile` (which repository size the number is for, for example `self` or `large`). |
+| `delta` | `{metric, vs, mean, ci95, n, label}` required; optional `runs`. `metric` is for example ndcg@10, recall@8, file_hit@5, first_gold_step. `vs` is `no-graph`, `random`, `churn` or `reference`. `ci95` is two numbers. |
+| `map` | Required `id`, `version` (integer), `contribution` (`rank-list`, `prior`, `filter`, `expansion`), `accepts`, `emits`, `source_labels`, `needs` (string arrays). Optional `title`, `inventory_row` (row in the retired maps inventory), `status` (`default`, `opt-in`, `parked`), `parked_condition` (copied from the [../lessons.md](../lessons.md) parking log). |
+| `updated_at` | date-time, UTC, from the system clock when the harness wrote the card. |
+| `tree` | Commit of the indexed tree behind the measurements. |
+| `cost` | Optional `num` fields: `build_ms`, `update_ms_per_file`, `storage_bytes`, `resident_bytes`, `query_ms_p50`, `query_ms_p95`, `external_calls_per_query`, `est_tokens_per_query`, `cold_start_ms`. |
+| `coverage` | `languages` (strings); `node_fraction` (per node kind, a `num`: share of the snapshot's nodes the map can return); `edge_precision` and `edge_recall` (`num`); `edge_reference` (what they were measured against, for example scip at a named commit); `hub_nodes` (NodeIds the map reaches from most seeds, such as files every commit touches, lesson L13). |
+| `freshness` | Required `model` (`per-file`, `per-commit`, `live`, `global`); optional `observed` (`snapshot`, `live-tree`, `as-of`), `staleness_window` (`num`), `invalidated_by` (for example content hash, adapter version, HEAD move, config change). |
+| `good_for` | Array of `{question_type, deltas}` plus optional `condition` (when the gain appears, for example clean seeds only, lesson L11). `question_type` is a map kind of eval-seed, a `change_kind` of gold-bugloc, a query-shape tag, or a family of a private set by opaque id. |
+| `bad_for` | Same shape as `good_for`, for significant losses. |
+| `contracts` | Keys `C1` to `C9` ([contract-kit.md](contract-kit.md)); each `{state}` required (`pass`, `fail`, `n/a`, `not-run`), optional `test`, `commit`. |
 
-1. Only the harness writes the measured part, from RunRecords of one batch on one tree with a
-   frozen binary (`AGENTS.md`, Working method: copy the binary before timed comparisons).
-2. A value is M only if every run it cites exists in the batch; A if derived (for example
-   scaled to another repository size); G otherwise. A card never upgrades a label without new
-   runs.
-3. `good_for` lists a question type only when the paired 95% interval against the map's own
-   control (contract C7) excludes zero; `bad_for` likewise for losses. Other types are simply
-   not listed. A `reference` delta (against a baseline arm such as lexical plus reading) is
-   recorded for tracking improvement and never decides `status`.
-4. A card for a private gold set stays outside the repository; a committed card names only
-   public sets (`eval-seed`, `gold-bugloc`, the mined and core evaluations).
-5. Every card update is one commit with the batch id in the message, so `git log` on a card
-   is its history.
+### 3.3 Update rules (Inferred)
 
-### 3.4 How the traversal reads a card (MVP)
+1. Only the harness writes the measured part, from RunRecords of one batch on one tree with a frozen binary (`AGENTS.md`, Working method: copy the
+   binary before timed comparisons).
+2. A value is M only if every run it cites exists in the batch; A if derived (for example scaled to another repository size); G otherwise. A card
+   never upgrades a label without new runs.
+3. `good_for` lists a question type only when the paired 95% interval against the map's own control (contract C7) excludes zero; `bad_for` likewise
+   for losses. Other types are simply not listed. A `reference` delta (against a baseline arm such as lexical plus reading) is recorded for tracking
+   improvement and never decides `status`.
+4. A card for a private gold set stays outside the repository; a committed card names only public sets (`eval-seed`, `gold-bugloc`, the mined and
+   core evaluations).
+5. Every card update is one commit with the batch id in the message, so `git log` on a card is its history.
 
-- Order map calls within a step by `cost.query_ms_p95` (cheap first) when the budget is
-  tight; skip a map whose `cost` would exceed the remaining budget, with a note.
-- Show the agent at a checkpoint: id, title, `good_for` question types, `cost.query_ms_p50`,
-  freshness model, and whether it is stale for this snapshot (the packet budget allows about
-  one line per map).
-- Never change fusion weights from a card in the MVP. Weight learning from cards is idea U5
-  and a later study.
+### 3.4 How the traversal reads a card (Inferred; MVP)
+
+- Order map calls within a step by `cost.query_ms_p95` (cheap first) when the budget is tight; skip a map whose `cost` would exceed the remaining
+  budget, with a note.
+- Show the agent at a checkpoint: id, title, `good_for` question types, `cost.query_ms_p50`, freshness model, and whether it is stale for this
+  snapshot (the packet budget allows about one line per map).
+- Never change fusion weights from a card in the MVP. Weight learning from cards is idea U5 and a later study.
+
+### 3.5 The `MapCard` stub (as built, `lci-maps/src/edge.rs`)
+
+`Map::card()` returns `edge::MapCard`, a stub with five fields: `expand_p50_ms: Option<f64>`, `coverage: Vec<NodeKind>`, `freshness_lag:
+Option<Duration>`, `good_for: Vec<QuestionType>`, `dependent: bool`. `QuestionType` is Impact, Flow, WhereTo, History, Instructions. The default
+`MapCard::from_descriptor` fills only `coverage` (the descriptor's `emits`). The maps `config.key`, `git.history`, `grep.live`, `lsp.live`,
+`probe.compile` and `scip.impact` fill `expand_p50_ms` (measured, `git.history` falls back to a prior) and `good_for`. `structure.contains` sets
+`dependent: true`; `Registry::independent_expanders` counts maps whose card says `dependent` once together, which bounds the corroboration count of
+a node (see [../engine.md](../engine.md), "Walk"). None of the file format, the `cost`/`freshness`/`contracts` blocks, the harness writer or the
+`<data_dir>/cards/` loader is built.
 
 ## 4. Open decisions
 
@@ -199,6 +94,8 @@ named runs), **A** approximate (derived from measurements), **G** guess.
 | D-5 | One card per map version. | One card per (map, repository profile). Partly covered by `repo_profile` on each number. | When a second repository is benchmarked. |
 
 ## 5. How a test proves it
+
+All rows are design (not built); the stub of 3.5 is covered by per-map tests (`card.good_for`, `expand_p50_ms`) in the map modules.
 
 | Property | Test |
 | --- | --- |

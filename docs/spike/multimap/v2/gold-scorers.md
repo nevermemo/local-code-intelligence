@@ -191,13 +191,16 @@ already exist; anything that would need a bench rerun is listed under
 
 ### Sets beside the frozen five
 
+States are as of 2026-10-16; the tests-for-code and docs-for-code rows are possibly stale, so read the current state in
+[../evaluation.md](../evaluation.md) ("Sets") and the results in [../results.md](../results.md).
+
 | set | state | numbers | rule |
 | --- | --- | --- | --- |
 | error (34 items) | kept as a regression check, not a discriminating set | first scored 2026-10-16 by a stand-alone scorer (not the `xtask gold` path, tolerance 3 lines for grep): hit@10 for the stored fixed-string fragment .971, for the whole quoted message .735, for `lci search` on the question .50 and on the quoted message .59 (reranker off) | Report the grep columns beside search always; the message-to-site question is saturated by a fixed-string search, and search sits below it (an exact-message routing gap). Primary scoring should add the entry-point chain. It needs its own id, seed, hash and prereg before any further scoring, and enters `xtask gold` only through a reviewed change. |
-| trait-dispatch | not built | 34 qualifying traits (at least 3 non-test impls and 3 non-test call sites) over three repositories, 33 of them in tantivy; bar 40 | Do not propose it again without a second repository that has traits. |
+| trait-dispatch (trait implementors) | not built (as of 2026-10-16) | 34 qualifying traits (at least 3 non-test impls and 3 non-test call sites) over three repositories, 33 of them in tantivy; bar 40 | Do not propose it again without a second repository that has traits. |
 | co-change | parked | prior co-change hit@10 .456 against .500 for same directory by recent modification | The baseline equals the premise, so a set would not discriminate. |
-| tests-for-code | frozen | - | Added beside the five; scored on its own. |
-| docs-for-code | being built | - | Added beside the five when frozen. |
+| tests-for-code | frozen (as of 2026-10-16; possibly stale, see `evaluation.md` and `results.md`) | - | Added beside the five; scored on its own. |
+| docs-for-code | being built (as of 2026-10-16; possibly stale, see `evaluation.md` and `results.md`) | - | Added beside the five when frozen. |
 
 ### Deferred (needs a run or a frozen-set edit, not done)
 

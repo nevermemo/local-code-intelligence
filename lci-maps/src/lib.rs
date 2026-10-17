@@ -72,7 +72,7 @@ pub enum Contribution {
     Expansion,
 }
 
-/// The update model of maps-inventory.md, "Update model vocabulary".
+/// The update model of `docs/spike/multimap/engine.md`, "Maps".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshnessModel {
     PerFile,
