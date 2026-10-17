@@ -270,6 +270,12 @@ async fn fixture() -> (
         rust_analyzer_path: "definitely-missing-rust-analyzer".into(),
         ..Config::default()
     };
+    // The shipped defaults leave Markdown unindexed and the docs lane
+    // unreranked; most tests exercise Markdown and the docs lane, so the
+    // fixture opts into both. Tests of the defaults reset these two switches.
+    let mut config = config;
+    config.index.prose = true;
+    config.docs_lane.reranker = true;
     (temp, config, state, task)
 }
 

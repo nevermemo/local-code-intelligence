@@ -2312,6 +2312,99 @@ async fn the_code_results_stay_identical_at_the_largest_semantic_candidate_count
 }
 
 #[tokio::test]
+async fn by_default_markdown_is_not_indexed_and_the_results_equal_a_workspace_without_it() {
+    use local_code_intelligence::filter::FilterRequest;
+
+    let (temp, mut config, _fake, task) = fixture().await;
+    // The shipped defaults (the fixture opts into prose and docs reranking).
+    let defaults = Config::default();
+    assert!(!defaults.index.prose && !defaults.docs_lane.reranker);
+    config.index.prose = defaults.index.prose;
+    config.docs_lane.reranker = defaults.docs_lane.reranker;
+    let (plain, mixed) = write_code_and_prose_workspaces(temp.path());
+    let app = App::open(config).await.unwrap();
+    for query in ["translator", "run translator daily", "unrelated helper"] {
+        let without = app.search(&plain, query, Some(5)).await.unwrap();
+        let with = app.search(&mixed, query, Some(5)).await.unwrap();
+        assert_eq!(code_list_json(&with), code_list_json(&without), "{query}");
+        assert_eq!(with.warning, without.warning);
+        assert_eq!(with.reranked, without.reranked);
+        assert_eq!(with.candidate_count, without.candidate_count);
+        assert_eq!(with.notes, without.notes);
+        assert!(with.docs.is_none() && without.docs.is_none(), "{query}");
+        assert!(serde_json::to_value(&with).unwrap().get("docs").is_none());
+    }
+    // No Markdown chunk exists: the index holds the plain workspace's chunks,
+    // and even an explicit documentation filter finds nothing.
+    assert_eq!(
+        app.status(&mixed).await.unwrap().chunks,
+        app.status(&plain).await.unwrap().chunks
+    );
+    let role = app
+        .search_with_filters(
+            &mixed,
+            "translator",
+            Some(10),
+            FilterRequest {
+                source_roles: Some(vec!["documentation".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        role.results
+            .iter()
+            .all(|hit| hit.chunk.language != "markdown")
+    );
+    assert!(role.docs.is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_prose_switch_adds_and_drops_exactly_the_markdown_files_on_the_next_refresh() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let (_plain, mixed) = write_code_and_prose_workspaces(temp.path());
+
+    config.index.prose = false;
+    let app = App::open(config.clone()).await.unwrap();
+    let off = app.search(&mixed, "translator", Some(5)).await.unwrap();
+    assert!(off.docs.is_none());
+    let code_chunks = app.status(&mixed).await.unwrap().chunks;
+    drop(app);
+
+    // The switch is part of what staleness compares: the snapshot is stale
+    // under the new setting, the search refreshes it incrementally (no full
+    // rebuild: the code files are reused), and the docs lane appears.
+    config.index.prose = true;
+    let app = App::open(config.clone()).await.unwrap();
+    assert!(app.status(&mixed).await.unwrap().stale);
+    let on = app.search(&mixed, "translator", Some(5)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&on.index).unwrap()["action"],
+        "refreshed_incrementally"
+    );
+    assert!(
+        on.docs
+            .as_ref()
+            .is_some_and(|docs| !docs.results.is_empty())
+    );
+    assert_eq!(code_list_json(&on), code_list_json(&off));
+    let prose_chunks = app.status(&mixed).await.unwrap().chunks;
+    assert!(prose_chunks > code_chunks);
+    drop(app);
+
+    config.index.prose = false;
+    let app = App::open(config).await.unwrap();
+    assert!(app.status(&mixed).await.unwrap().stale);
+    let off_again = app.search(&mixed, "translator", Some(5)).await.unwrap();
+    assert!(off_again.docs.is_none());
+    assert_eq!(app.status(&mixed).await.unwrap().chunks, code_chunks);
+    assert_eq!(code_list_json(&off_again), code_list_json(&off));
+    task.abort();
+}
+
+#[tokio::test]
 async fn a_failing_docs_reranker_is_reported_on_the_docs_list_and_keeps_fusion_order() {
     let (temp, config, fake, task) = fixture().await;
     let (plain, mixed) = write_code_and_prose_workspaces(temp.path());

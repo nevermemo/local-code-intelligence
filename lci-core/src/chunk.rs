@@ -303,12 +303,13 @@ struct Sources {
     skipped: Vec<SkippedFile>,
 }
 
-fn sources(root: &Path) -> Result<Sources> {
-    sources_with_read(root, |path| std::fs::read(path))
+fn sources(root: &Path, prose: bool) -> Result<Sources> {
+    sources_with_read(root, prose, |path| std::fs::read(path))
 }
 
 fn sources_with_read(
     root: &Path,
+    prose: bool,
     mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<Sources> {
     let mut files = Vec::new();
@@ -328,6 +329,10 @@ fn sources_with_read(
         let Some(adapter) = language::for_path(entry.path()) else {
             continue;
         };
+        // `[index].prose = false`: prose files are not indexed at all.
+        if !prose && adapter.is_prose() {
+            continue;
+        }
         let path = entry.path().strip_prefix(root)?;
         let relative = path
             .components()
@@ -381,8 +386,15 @@ fn fingerprint_material(file: &SourceFile) -> String {
     )
 }
 
+/// The workspace fingerprint with every registered adapter, prose included.
 pub fn fingerprint(root: &Path) -> Result<String> {
-    let material = sources(root)?
+    fingerprint_with(root, true)
+}
+
+/// The workspace fingerprint; with `prose = false` the files of prose
+/// adapters (Markdown) are left out, as `[index].prose = false` does.
+pub fn fingerprint_with(root: &Path, prose: bool) -> Result<String> {
+    let material = sources(root, prose)?
         .files
         .iter()
         .map(fingerprint_material)
@@ -390,9 +402,23 @@ pub fn fingerprint(root: &Path) -> Result<String> {
     Ok(hash(&material))
 }
 
+/// [`scan_incremental_with`] with every registered adapter, prose included.
 pub fn scan_incremental(
     root: &Path,
     previous: &HashMap<String, crate::manifest::CachedFile>,
+) -> Result<Scan> {
+    scan_incremental_with(root, previous, true)
+}
+
+/// Scans the workspace, reusing `previous` entries whose file is unchanged.
+/// With `prose = false` the files of prose adapters (Markdown) are not
+/// indexed (`[index].prose = false`): they yield no chunks, and a file that
+/// `previous` holds counts as removed, so flipping the switch re-indexes
+/// exactly those files.
+pub fn scan_incremental_with(
+    root: &Path,
+    previous: &HashMap<String, crate::manifest::CachedFile>,
+    prose: bool,
 ) -> Result<Scan> {
     let mut chunks = Vec::new();
     let mut files = HashMap::new();
@@ -401,7 +427,7 @@ pub fn scan_incremental(
     let Sources {
         files: source_files,
         skipped: skipped_files,
-    } = sources(root)?;
+    } = sources(root, prose)?;
     let present: HashSet<_> = source_files
         .iter()
         .map(|file| file.relative_path.as_str())
@@ -978,7 +1004,7 @@ export interface TelemetryLifecycle {
         let previous = scan_incremental(temp.path(), &HashMap::new()).unwrap();
         let mut removed = false;
 
-        let result = sources_with_read(temp.path(), |path| {
+        let result = sources_with_read(temp.path(), true, |path| {
             if path == victim {
                 std::fs::remove_file(path).unwrap();
                 removed = true;
@@ -1000,11 +1026,41 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
+    fn prose_files_are_indexed_only_when_asked_and_the_switch_changes_the_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Title\nSome prose.\n").unwrap();
+
+        let without = scan_incremental_with(temp.path(), &HashMap::new(), false).unwrap();
+        assert!(without.files.keys().eq(["lib.rs"]));
+        assert!(without.chunks.iter().all(|c| c.language != "markdown"));
+        let with = scan_incremental_with(temp.path(), &without.files, true).unwrap();
+        assert!(with.files.contains_key("README.md"));
+        assert_eq!((with.parsed_files, with.unchanged_files), (1, 1));
+        assert_ne!(without.fingerprint, with.fingerprint);
+        assert_eq!(
+            fingerprint_with(temp.path(), false).unwrap(),
+            without.fingerprint
+        );
+        assert_eq!(
+            fingerprint_with(temp.path(), true).unwrap(),
+            with.fingerprint
+        );
+        // Switching back drops the prose file and reuses the code file.
+        let back = scan_incremental_with(temp.path(), &with.files, false).unwrap();
+        assert_eq!(
+            (back.removed_files, back.parsed_files, back.unchanged_files),
+            (1, 0, 1)
+        );
+        assert_eq!(back.fingerprint, without.fingerprint);
+    }
+
+    #[test]
     fn scan_fails_on_a_read_error_other_than_a_removed_file() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
 
-        let result = sources_with_read(temp.path(), |_| {
+        let result = sources_with_read(temp.path(), true, |_| {
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         });
 
