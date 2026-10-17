@@ -235,7 +235,7 @@ C4 replay auditor is ignored in the Full run (CI has no history). Owner decision
 ## Known gaps
 
 - No exact-literal seed channel: traverse cannot start from an exact string match (a grep-style step); `grep.live` only expands from nodes the walk already has. A building block to add (owner direction, 2026-10-17).
-- No SCIP index in the evaluation trees, so `traverse` there falls back to chunks (R1 stage 2 never measured the walk, d333). "Which types implement this trait" was never measured (d315); its hypotheses (no SCIP in
+- No SCIP index in the R1 and external-repository evaluation trees, so `traverse` there falls back to chunks (R1 stage 2 never measured the walk, d333); the frozen tree `bfaff44` has one, and the walk benches in [v2/engine-results.md](v2/engine-results.md) used it. "Which types implement this trait" was never measured (d315); its hypotheses (no SCIP in
   the trees, implementation relationship not ingested, no `textDocument/implementation` request) are unchecked.
 - Docs are not indexed: no Markdown or other prose adapter, no `doc:` nodes in any map (17 supported extensions, none a documentation format).
 - The hop `kind_prior` table (call 1, containment 0.5) is a guess unless a fitted table is given (`priors`); the System One rung (S8) is a slot with a test double; the pre-merged edge source has no `[traverse]` key.

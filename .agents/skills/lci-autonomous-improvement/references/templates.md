@@ -86,7 +86,7 @@ The diff is the deliverable; keep prose short.
 
 ```text
 Reviewer: slice <ID>. Read <plans_dir>/<plan file>, then `git diff <base>..<head>` and <evidence paths>. Do not edit.
-Check in order: correctness against the acceptance; AGENTS.md "Hard rules"; test honesty; doc drift (README, config.example.toml, skill references, roadmap decision line if a default moved); scope.
+Check in order: correctness against the acceptance; AGENTS.md "Hard rules"; test honesty; doc drift (README, config.example.toml, skill references, decision line in `docs/decisions.md` if a default moved); scope.
 Report file:line, severity (blocker | should-fix | nit), one line each; say "none" for an empty category.
 lci MCP: <connected | not connected; use Grep/Read>.
 Do not run live evaluations or start services.
@@ -179,12 +179,12 @@ Limitations: <what was not verified, prerequisites unavailable>.
 
 ## Roadmap status entry
 
-Use the roadmap's own status vocabulary and layout. Each item touched in a slice records, at minimum:
+The roadmap holds open work only (`docs/development/documentation.md`); outcomes live once in `docs/decisions.md`. In the commit that does the work:
 
 ```text
-status: <ready | in-progress (YYYY-MM-DD) | done (commit <hash>) | blocked (reason)>
-evidence: <suite counts; report names; metric deltas>
-follow-ups: <new items discovered, added to the backlog with a link back>
+finished item:   delete its roadmap row; set the status of a successor it alone blocked; add follow-ups as new rows under the next free id of their letter
+unfinished item: keep the row with status <ready | in-progress (YYYY-MM-DD) | blocked (reason)> and what remains; no result text
+decisions.md:    | d<next free id> | <date> | <DECISION | FINDING | DROPPED | LESSON> | <area> | <statement with its numbers> | <commit hash; report names; "owner, chat <date>"> |
 ```
 
 ## End-of-run report
@@ -202,7 +202,7 @@ Stopped because: <usage at N% | roadmap empty | approval needed>
 
 ## Run checkpoint file
 
-Current state only, at most about 7 KB (the post-compaction hook prints it whole), re-read whole after every compaction. Delete a finished item at the next refresh (its record is the roadmap, a commit or the agent's memory); refresh after every push. The post-compaction check asserts these strings, so keep them verbatim: `Active run: yes|no`, `Last pushed: <7 hex characters>`, `Standing mandate`, `Approvals`, `90%`.
+Current state only, at most about 7 KB (the post-compaction hook prints it whole), re-read whole after every compaction. Delete a finished item at the next refresh (its record is `docs/decisions.md`, a commit or the agent's memory); refresh after every push. The post-compaction check asserts these strings, so keep them verbatim: `Active run: yes|no`, `Last pushed: <7 hex characters>`, `Standing mandate`, `Approvals`, `90%`.
 
 ```text
 # Run checkpoint -- <date time>. Last pushed: <hash> (<branch>, <PR>). Tree: <clean | uncommitted: files>
@@ -210,7 +210,7 @@ Active run: <yes (since <date>; what) | no>
 FIRST AFTER ANY COMPACTION: run the post-compaction hook (owner-local); call get_usage; read this file; read the roadmap "Now and next" section and `git status`.
 
 ## Standing mandate
-<what the owner asked for; the owner's stop rule as stated (usually 90% of a usage window; how to apply it: skill "Stopping at the usage limit"); pointer to the memory file holding the preferences>
+<what the owner asked for; the owner's stop rule as stated (the standing default is a 5-hour pause at 85% and a weekly stop at 90%; how to apply it: skill "Stopping at the usage limit"); pointer to the memory file holding the preferences>
 
 ## Approvals
 - <date>: "<verbatim scope>". Does not cover: <...>

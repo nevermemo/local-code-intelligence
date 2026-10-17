@@ -185,7 +185,8 @@ Code: `lci-maps/src/symdefs.rs`, `lci-maps/src/fresh.rs` (`Target`, `Refreshable
 - **Cost.** `nodes_touched` is the number of declarations held; `elapsed_ms` is measured. The deadline is not checked inside the call (the answer is an in-memory
   lookup); the registry's timeout still applies.
 - **Kit.** C1 (`check_fail_open`) and C6 (`check_determinism`) pass for `sym.defs` against a control map; registered beside it, its hits fuse with weight 1. No
-  production search registers it (the traverse engine does, [../engine.md](../engine.md)).
+  production search or traversal call uses it: it lives in `lci-maps` and runs in the contract kit and the audit, and the traversal map selector (`MAPS`
+  and `OPT_IN_MAPS` in `src/app/traverse.rs`) neither lists nor accepts it ([../engine.md](../engine.md), "Other maps").
 
 ## 4. Open decisions
 

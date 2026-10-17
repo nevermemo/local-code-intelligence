@@ -51,7 +51,9 @@ cargo xtask live-acceptance --require-all                # a skipped step (missi
 
 A step whose tool is missing is listed as SKIPPED and the run ends with "Completed with skipped steps." Logs go to
 `test-results/live-acceptance-logs/<timestamp>/` (gitignored via `/test-results/`): a `<step>.stdout.log` and
-`<step>.stderr.log` per step and a `summary.txt`. The exit code is non-zero if any step did not pass.
+`<step>.stderr.log` per step and a `summary.txt`. The exit code is non-zero if any step fails or times out; a skipped step
+(missing tool) leaves the exit code zero unless `--require-all` is given, which counts each skip as a failure. Use
+`--require-all` wherever the whole matrix must have run.
 
 The prerequisites are the table in [live-acceptance-ci.md](live-acceptance-ci.md#prerequisites), but the tools must be on
 the interactive shell's `PATH`, not a runner process's. A shell captures `PATH` at startup: a tool installed during the

@@ -9,7 +9,7 @@ Notes that apply to every row:
 - A file name starting with `v2/` or `s1-` is in this repository and frozen (never edited). "private record X" names a
   record held outside the repository, which is not reproducible from here.
 - The frozen files cite files that were retired in the 2026-10-17 cleanup (`next-slices.md`, `gold-bugloc.md`,
-  `ab-prereg-addendum-draft.md`, `eval-seed.md`, `recycled-research.md`, `maps-inventory.md`, `architecture-map.md`). Their
+  `ab-prereg-addendum-draft.md`, `recycled-research.md`, `maps-inventory.md`, `architecture-map.md`). Their
   content moved: slices, sets and A/B method to [evaluation.md](evaluation.md); lessons to [lessons.md](lessons.md);
   engine facts to [engine.md](engine.md) and [../../architecture.md](../../architecture.md).
 - Ceiling metrics and the reading rules for every table: [evaluation.md](evaluation.md), "Scorers and reporting rules".

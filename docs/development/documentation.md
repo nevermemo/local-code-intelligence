@@ -23,8 +23,9 @@ Agents read these files without chat context and pay for every token, so the fil
 8. No machine-specific values: no user profile paths, drive letters, client session folders, local port layouts
    other than the product's own defaults, model aliases of one machine, or secrets. `cargo xtask lint-machine-paths`
    enforces part of this; the rest is reviewed.
-9. Links are relative and resolve; anchors match a heading in the target. `python -I <linkcheck>` (or `cargo xtask`
-   once it absorbs it) must report zero missing.
+9. Links are relative and resolve; anchors match a heading in the target. No link checker is checked in yet (open work:
+   roadmap N92, an `xtask` subcommand). Until it lands, check every relative link and anchor in the files you
+   touched by hand, or with a script of your own kept outside the repository; none may be missing.
 10. Short over complete: a table over prose for facts with the same shape; one example instead of three; a pointer
     instead of a copy. Target sizes: README <= 260 lines, any guide <= 250, the roadmap <= 350, the log <= 300.
 11. Vendored third-party files (`.agents/skills/rust-skills/**`) are not edited.

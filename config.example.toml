@@ -22,8 +22,9 @@ reranker_model = "qwen3-reranker-4b"
 # embedding_api_key_env = "EMBEDDING_API_KEY"
 # reranker_api_key_env = "RERANKER_API_KEY"
 #
-# [system_one] is the small model that steers a traversal. Off when the
-# section is absent. It must be a table, so uncomment it after the last
+# [system_one] is the slot for a small model planned to steer a traversal (the
+# configuration and provider client exist; no traversal rung calls it yet). Off
+# when the section is absent. It must be a table, so uncomment it after the last
 # top-level key of this file (it is shown here beside the other model
 # settings).
 #   provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)

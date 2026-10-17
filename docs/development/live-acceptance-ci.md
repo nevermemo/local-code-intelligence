@@ -41,8 +41,11 @@ An agent cannot do these steps:
    Actions, Runners, "New self-hosted runner", or `gh api repos/<owner>/<repo>/actions/runners/registration-token`,
    then the download and config steps GitHub shows, with `--labels lci-live` so only this workflow schedules onto it.
    List existing runners first with `gh api repos/<owner>/<repo>/actions/runners`.
-3. Install the runner as a persistent Windows service (`.\svc install`, `.\svc start` in the runner directory) so it
-   survives reboots and logouts.
+3. Install the runner as a persistent service so it survives reboots and logouts, by the procedure in GitHub's
+   self-hosted runner documentation ("Configuring the self-hosted runner application as a service"). On Windows the
+   service is set up with the runner's own `config.cmd` (it offers to run the runner as a service); on Linux and macOS
+   the runner directory has `svc.sh` (`install`, then `start`). The runner uses the machine's account, so check that
+   account can see the tools in the Prerequisites table on its `PATH`.
 4. The repository is public (checked 2026-10-11 with `gh api repos/<owner>/<repo> --jq .visibility`): review the
    fork-PR protections under Settings, Actions, General before registering, and keep the `pull_request`-less trigger.
    Self-hosted runners on public repositories are a code-execution risk if that default changes.

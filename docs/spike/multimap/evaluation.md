@@ -75,7 +75,7 @@ Prior art (preprints, summaries only): IR user simulation (sDCG, effort-vs-effec
 papers that measure tokens next to localisation (reads and searches are more than half of agent tool turns and nearly half of its tokens).
 
 ## Framing: Wikirace on a code graph
-LCI's core loop is a Wikirace on a code graph with a System 1 racer and compiler-grade links (summary in the root [README](../../../README.md)).
+LCI's core loop is a Wikirace on a code graph with a (planned) System 1 racer and compiler-grade links (summary in the root [README](../../../README.md)).
 Inspiration: an external Wikirace demo (vendor-reported 0.114 s against 8.566 s for a large model; no published source found for the hop-count
 win). Mapping: pages are symbols, files, tests, docs and commits; links are edges (calls, implements, tested-by, mentioned-in, changed-in);
 picking the next link is the walk policy; hops to the target are the pops/hops proxy.
@@ -83,12 +83,14 @@ picking the next link is the walk policy; hops to the target are the pops/hops p
 Consequences for evaluation: (1) a racer is only as good as its links; without SCIP and doc edges the graph is sparse and traverse equalled
 search, so building the edges is building the map; (2) the target is described, not named, so the racer must judge closeness and decide when to
 stop, which is why confidence calibration is a tier-2 metric; (3) the N4/N4b local head losing means that head was too weak, not that System 1
-does not fit; the shipped racer is a local model with an allowed licence, chosen per role.
+does not fit; the planned racer is a local model with an allowed licence, chosen per role. No such rung is built: the ladder runs the agent's rules,
+then the calling agent, and `steer.ladder` rejects `system_one` ([engine.md](engine.md), "Known gaps").
 
 ## Walk-on-SCIP premise test (PLAN: sanity adjustment 1, owner approved 2026-10-17)
 Run right after doc types and Rust SCIP, before more walk features: the trait-implementation questions, and the R1 re-run with the walk enabled.
 Why: traverse's first stage is hybrid search, LCI's proven asset (R1 span hit@10 .64 against BM25 over function units .19; I1 +.157 over rg); the
-walk has never been measured with SCIP (N2 stopped, N4 killed, S1 gains small); R1 stage 2 ran the walk on an empty SCIP file. Re-aiming I1 and D1
+walk was never measured with SCIP on the R1 and external-repository trees (R1 stage 2 ran the walk on an empty SCIP file); on the frozen tree
+`bfaff44`, which has a SCIP index, it was measured ([v2/engine-results.md](v2/engine-results.md)) and the gains were small (N2 stopped, N4 killed, S1). Re-aiming I1 and D1
 at traverse only makes sense after the edges exist.
 
 ## Error-to-commit set (PLAN: sanity adjustment 5, owner 2026-10-17)
@@ -99,7 +101,7 @@ verification; first check that enough usable fix commits exist. Baselines: grep 
 
 ## Trait-implementor set and doc types (PLAN: sanity adjustments 5 and 6, owner 2026-10-17)
 "Which types implement this trait" was never built (34 qualifying traits against a bar of 40, 33 of them in tantivy), so LCI was never measured on
-it; it should be trivial from a code graph. Hypotheses to check: (1) no SCIP in the eval trees, so traverse falls back to chunks (seen in R1 stage
+it; it should be trivial from a code graph. Hypotheses to check: (1) no SCIP in the R1 and external-repository trees, so traverse falls back to chunks (seen in R1 stage
 2); (2) the SCIP implementation relationship may not be ingested; (3) the LSP channel may not send `textDocument/implementation`; (4) Rust derive,
 blanket and macro impls. Baseline beyond grep: an LSP-MCP tool (rust-analyzer `textDocument/implementation`, Serena-like). Doc file types come in
 two parts: adapters for prose (.md .rst .adoc .txt) first; structured formats (.json .yaml .toml) start on the grep fallback with size and
@@ -128,12 +130,18 @@ A premise check of the candidate sets, before further set work. Nothing frozen c
   state: [../../decisions.md](../../decisions.md)).
 
 ## Slice order and freshness (2026-10-16 direction; results are in results.md)
-Order set by the owner: N0 first, then N1, N2, N3; N4 runs in parallel once N0b's judge harness exists. N0 and N1 run in parallel; N2's code is
-written in parallel and benched only after N0b. Dependencies: N0b needs N0; N2 needs N0b to keep the walk somewhere; N3 needs N1's verdict; N4
-needs N0b's harness. An option the owner may take: a thin N3 (recipes only) in parallel with N2, since N3 does not depend on N2; not taken by
-default, the owner's order stands. Slice questions: N0 first stage alone against first stage plus walk at matched answer budget; N0b the same arms
-with and without a local judge as result filter; N1 chained-query plans executed offline (Wizard of Oz); N2 in-request edge bandit; N3 chained
-executor or recipes only; N4 result filter trained on offline labels.
+The 2026-10-16 slice sequence N0, N0b, N1, N2, N3, N4 is finished (the heading keeps its old name for links); nothing in this section is a run instruction. What to do next is in the
+[roadmap](../../development/roadmap.md) only; the slice designs are decisions d346 to d351 in [../../decisions.md](../../decisions.md). Each slice
+asked one question, and its outcome is in [results.md](results.md) ("Engine benches" for N0 and N0b, "Slices N1 to N4 and the model roles" for the rest):
+- N0: first stage alone against first stage plus walk at a matched answer budget. Outcome: the walk is the default on flow and where-to, opt-in on
+  impact and history (results.md, row N0).
+- N0b: the same arms with and without a local judge as result filter. Outcome: no filter adopted (row N0b).
+- N1: chained-query plans executed offline (Wizard of Oz). Outcome: killed; recipes are the agent-facing form (row N1).
+- N2: an in-request edge bandit. Outcome: no verdict, then stopped; `edge_bandit` stays off (row N2).
+- N3: a chained executor, or recipes only. Outcome: recipes survived the frozen rule (rows N3, N3 follow-ups); off-shape tasks were null (row N3b).
+- N4: a result filter trained on offline labels. Outcome: killed (row N4).
+
+Method facts that outlive the sequence:
 - Freshness is out of scope for now (owner 2026-10-16): the spike works on frozen trees, so every N1 and N3 task runs read-only on the frozen
   tree. One review called a freshness contract a blocker for live use; that stays true for a release.
 - Later F1 (verify on read): every answer carries the content hash of its file and is checked against the live file before it is returned; a stale
@@ -202,7 +210,7 @@ tasks of this repository.
   pass can carry.
 
 ## Seed questions (28)
-The questions live only in [eval-seed.json](eval-seed.json) (ids q01 to q28; machine-readable twin of the retired eval-seed.md). Counts: easy 4,
+The questions live in [eval-seed.json](eval-seed.json) (ids q01 to q28); [eval-seed.md](eval-seed.md), kept frozen, is the readable form of the same set. Counts: easy 4,
 medium 16, hard 8; `needs_model_service` is false for all. Generated 2026-10-12T04:22Z; revised 06:51Z (fact-check corrections to q07, q08, q11,
 q13, q14, q15, q22 and q23; baseline expectations and the Baseline section added). Base commit `7f9c636` (`origin/fix/verified-bugs`, 188 commits
 of history). Answers, co-change counts, recency and commit answers were verified there. The spike branch adds only docs under
@@ -241,7 +249,8 @@ at spike commit `842a5e9` (the count first written into q08), 192 at `b5e5851`; 
   `search_symbols`/`find_definition` or a grep for its `fn`/`const`/`impl` line; accept an answer at the same symbol even if lines moved); lines
   are a secondary check and a tie-breaker when a symbol name occurs more than once. Commit answers match by sha. Co-change counts only grow, so
   re-run the recorded command and compare rankings, not exact numbers. A renamed or removed symbol means re-verifying the question by hand. The
-  JSON note "see eval-seed.md, Baseline" refers to the Baseline and guess-class items above.
+  JSON note "see eval-seed.md, Baseline" refers to the Baseline section of the frozen [eval-seed.md](eval-seed.md), summarised in the Baseline and
+  guess-class items above.
 
 ## Bug-localisation set (34 items)
 Data: [gold-bugloc.json](gold-bugloc.json). Generated 2026-10-12T08:55Z from `origin/fix/verified-bugs` at `bfbe51d`. Each item is a real bug

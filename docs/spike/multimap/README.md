@@ -16,7 +16,7 @@ agent, not by wall time ([evaluation.md](evaluation.md)).
 - Measured defaults per question type are in `engine.md` ("Walk"); one open item: the MCP default `top_k` 8 gives 18 answers, which nobody measured
   (roadmap row S1b).
 - Not built: the unbuilt parts of [specs/](specs/README.md) (steering ops v1 and `traverse_*` tools, production RunRecord writer, map-card files),
-  a System One rung, an exact-literal seed channel, doc-file support, SCIP in the evaluation trees ([engine.md](engine.md), "Known gaps").
+  a System One rung, an exact-literal seed channel, doc-file support, SCIP in the R1 and external-repository evaluation trees ([engine.md](engine.md), "Known gaps").
 - Next steps and priorities live in [../../development/roadmap.md](../../development/roadmap.md); decisions and findings with ids in
   [../../decisions.md](../../decisions.md).
 

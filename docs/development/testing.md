@@ -34,6 +34,17 @@ scratch, that's the likely cause -- let it finish once rather than
 interrupting it, and prefer `cargo xtask test --suite Full` for the next full
 check instead of another narrow invocation.
 
+## Prerequisites for the test gate
+
+Beyond the build prerequisites in the [README](../../README.md#build-and-run):
+
+- ripgrep (`rg`) on `PATH` is required for `cargo xtask test --suite Full` and for the integration suites, because the
+  lexical channel runs it and the integration cases exercise that channel; without it they fail with "Lexical retrieval
+  unavailable" (CI installs it with the system package manager and prints `rg --version` first, see
+  `.github/workflows/ci.yml`). It stays optional for serving, where a missing `rg` only fails the lexical channel open.
+- `git` on `PATH` for the cases noted in the table below.
+- No model service, language server or network is needed: the tests use the fakes under `tests/support`.
+
 ## Suite-to-command mapping
 
 | Change | Focused command |
