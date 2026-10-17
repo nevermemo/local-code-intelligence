@@ -2652,3 +2652,143 @@ async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
     server.abort();
     models_task.abort();
 }
+
+/// Every tool refuses a key its arguments do not have, naming the key, before
+/// it touches the workspace: one table over the tools, with the recipe and
+/// compose tools switched on. A misspelt optional argument (`top_kk`) must
+/// not be dropped silently.
+#[tokio::test]
+async fn every_tool_rejects_an_unknown_argument_naming_it() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.recipes.enabled = true;
+    config.compose.enabled = true;
+    config.traverse.enabled = true;
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let workspace = temp.path().join("never-created");
+
+    let tools = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    let listed: std::collections::BTreeSet<&str> = tool_names(&tools).into_iter().collect();
+
+    let w = json!(workspace);
+    let cases = [
+        ("index_workspace", json!({"workspace_path": w})),
+        ("index_status", json!({"workspace_path": w})),
+        ("list_indexed_files", json!({"workspace_path": w})),
+        ("watch_workspace", json!({"workspace_path": w})),
+        ("unwatch_workspace", json!({"workspace_path": w})),
+        ("search_code", json!({"workspace_path": w, "query": "q"})),
+        (
+            "search_code",
+            json!({"workspace_path": w, "query": "q", "mode": "traverse"}),
+        ),
+        ("search_symbols", json!({"workspace_path": w, "query": "q"})),
+        (
+            "find_definition",
+            json!({"workspace_path": w, "relative_file_path": "a.rs", "line": 1, "character": 0}),
+        ),
+        (
+            "find_references",
+            json!({"workspace_path": w, "relative_file_path": "a.rs", "line": 1, "character": 0}),
+        ),
+        ("config_readers", json!({"workspace_path": w, "key": "a.b"})),
+        ("impact_rings", json!({"workspace_path": w, "symbol": "s"})),
+        (
+            "flow_path",
+            json!({"workspace_path": w, "from": "a", "to": "b"}),
+        ),
+        ("flow_from", json!({"workspace_path": w, "entry": "a"})),
+        (
+            "config_neighbours",
+            json!({"workspace_path": w, "symbol": "s"}),
+        ),
+        (
+            "lci_compose",
+            json!({"workspace_path": w, "steps": [{"id": "s1", "op": "pick", "in": {}}]}),
+        ),
+    ];
+    // The table covers every tool except the one with no arguments.
+    let covered: std::collections::BTreeSet<&str> = cases.iter().map(|(name, _)| *name).collect();
+    for name in &listed {
+        assert!(
+            covered.contains(name) || *name == "service_status",
+            "{name} has no unknown-argument case"
+        );
+    }
+
+    // Unknown keys at the top level, and inside the nested argument objects.
+    let mut calls: Vec<(String, Value, &str)> = Vec::new();
+    for (name, arguments) in &cases {
+        let mut with_extra = arguments.clone();
+        with_extra["top_kk"] = json!(3);
+        calls.push((name.to_string(), with_extra, "top_kk"));
+    }
+    calls.push((
+        "search_code".to_owned(),
+        json!({"workspace_path": w, "query": "q", "mode": "traverse", "budget": {"pop": 1}}),
+        "pop",
+    ));
+    calls.push((
+        "search_code".to_owned(),
+        json!({"workspace_path": w, "query": "q", "mode": "traverse", "steer": {"polcy": "impact"}}),
+        "polcy",
+    ));
+    calls.push((
+        "lci_compose".to_owned(),
+        json!({"workspace_path": w, "steps": [{"id": "s1", "op": "pick", "inn": {}}]}),
+        "inn",
+    ));
+
+    for (name, arguments, key) in calls {
+        let response = mcp_post(
+            &client,
+            &format!("{base}/mcp"),
+            Some(&session),
+            &json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+        )
+        .await;
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        let message = rpc_response(&body);
+        // rmcp refuses the call before the tool runs: a tool error result
+        // (`isError`) that names the field. This is what it already did for a
+        // wrong type or a missing argument.
+        assert_eq!(
+            message["result"]["isError"], true,
+            "{name} {key}: {status} {body}"
+        );
+        let text = message["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.starts_with("failed to deserialize parameters: unknown field")
+                && text.contains(key),
+            "{name} {key}: {status} {body}"
+        );
+    }
+
+    // The REST bodies share the structs, so they refuse it too (axum answers
+    // an unusable JSON body with 422). The `search_profile` query parameter is
+    // a separate struct, left open, and is covered by its own test.
+    let rest = client
+        .post(format!("{base}/v1/search_symbols"))
+        .json(&json!({"workspace_path": w, "query": "q", "top_kk": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), 422);
+    assert!(
+        rest.text()
+            .await
+            .unwrap()
+            .contains("unknown field `top_kk`")
+    );
+
+    // Nothing was created for any of them.
+    assert!(!workspace.exists());
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}

@@ -212,7 +212,7 @@ Search uses the enabled language servers for the indexed languages; symbol searc
 
 ## MCP tools
 
-All tools return structured JSON, also available as MCP text content. Tool failures set MCP `isError`. `workspace_path` is an absolute workspace directory (on Windows a drive path with doubled backslashes in JSON). Example arguments for `search_code` on this repository: `{"workspace_path": "/path/to/local-code-intelligence", "query": "plain REST JSON-over-HTTP mirror of the MCP tools", "top_k": 8}`.
+All tools return structured JSON, also available as MCP text content. Tool failures set MCP `isError`. A tool call with an argument the tool does not have (a misspelt `top_kk`, say) is refused with a tool error ("unknown field") that names it; the REST request bodies, which use the same argument structs, refuse it the same way. `workspace_path` is an absolute workspace directory (on Windows a drive path with doubled backslashes in JSON). Example arguments for `search_code` on this repository: `{"workspace_path": "/path/to/local-code-intelligence", "query": "plain REST JSON-over-HTTP mirror of the MCP tools", "top_k": 8}`.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |

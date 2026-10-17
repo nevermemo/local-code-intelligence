@@ -41,11 +41,13 @@ const INDEX_FIRST: &str = "call index_workspace first";
 const SEARCH_FIRST: &str = "run search_code on this workspace first, which builds the index";
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceArgs {
     /// Absolute workspace directory. Canonicalized to a persistent workspace ID.
     pub workspace_path: String,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     pub workspace_path: String,
     pub query: String,
@@ -71,13 +73,32 @@ pub enum SearchMode {
     /// returning a ranked list (needs `[traverse] enabled` on the server).
     Traverse,
 }
-/// The MCP `search_code` arguments: [`SearchArgs`] and, when the server has
-/// `[traverse] enabled`, the traversal fields. With it off the tool's schema
-/// is that of [`SearchArgs`] alone.
+/// The MCP `search_code` arguments: the fields of [`SearchArgs`] and, when
+/// the server has `[traverse] enabled`, the traversal fields. With it off the
+/// tool's schema is that of [`SearchArgs`] alone.
+///
+/// The fields of [`SearchArgs`] are repeated here instead of flattened,
+/// because serde does not support `deny_unknown_fields` on a struct that
+/// flattens another; [`Self::into_parts`] hands the search fields back as a
+/// [`SearchArgs`].
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchCodeArgs {
-    #[serde(flatten)]
-    pub search: SearchArgs,
+    pub workspace_path: String,
+    pub query: String,
+    /// Number of results, 1 through 40; defaults to configured top-k (8). A
+    /// search returns at most `rerank_candidate_count` results (24 unless
+    /// configured), whatever top_k says; a larger top_k you pass adds a note
+    /// to the response.
+    pub top_k: Option<usize>,
+    /// Registered language identifiers to include.
+    pub languages: Option<Vec<String>>,
+    /// Repository-relative include globs.
+    pub include_paths: Option<Vec<String>>,
+    /// Repository-relative exclude globs.
+    pub exclude_paths: Option<Vec<String>>,
+    /// Source roles to include.
+    pub source_roles: Option<Vec<String>>,
     /// `traverse`: walk the code graph (callers, callees, references) from the
     /// symbols `query` names, under `budget` and `steer`, instead of ranking
     /// chunks. `top_k` then limits the reached nodes returned.
@@ -92,12 +113,36 @@ pub struct SearchCodeArgs {
     /// `checkpoint` an earlier call returned (the query is then ignored).
     pub handle: Option<String>,
 }
+type SearchCodeParts = (
+    SearchArgs,
+    Option<SearchMode>,
+    Option<traverse::BudgetArgs>,
+    Option<traverse::SteerArgs>,
+    Option<String>,
+);
+impl SearchCodeArgs {
+    /// The plain-search fields, then `mode`, `budget`, `steer` and `handle`.
+    fn into_parts(self) -> SearchCodeParts {
+        let search = SearchArgs {
+            workspace_path: self.workspace_path,
+            query: self.query,
+            top_k: self.top_k,
+            languages: self.languages,
+            include_paths: self.include_paths,
+            exclude_paths: self.exclude_paths,
+            source_roles: self.source_roles,
+        };
+        (search, self.mode, self.budget, self.steer, self.handle)
+    }
+}
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolArgs {
     pub workspace_path: String,
     pub query: String,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PositionArgs {
     pub workspace_path: String,
     /// Workspace-relative source path (Rust, C#, TypeScript, TSX,
@@ -109,6 +154,7 @@ pub struct PositionArgs {
     pub character: u32,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReferencesArgs {
     pub workspace_path: String,
     pub relative_file_path: String,
@@ -291,13 +337,7 @@ impl McpServer {
         description = "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. A missing index is auto-created on first search."
     )]
     async fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> CallToolResult {
-        let SearchCodeArgs {
-            search: args,
-            mode,
-            budget,
-            steer,
-            handle,
-        } = args;
+        let (args, mode, budget, steer, handle) = args.into_parts();
         if mode.is_some() {
             return self.answer(
                 traverse::search(
