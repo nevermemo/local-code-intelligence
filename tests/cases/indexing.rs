@@ -2340,6 +2340,14 @@ async fn by_default_markdown_is_not_indexed_and_the_results_equal_a_workspace_wi
         app.status(&mixed).await.unwrap().chunks,
         app.status(&plain).await.unwrap().chunks
     );
+    let manifest = app.indexed_files(&mixed).await.unwrap();
+    assert!(!manifest.files.is_empty());
+    assert!(
+        manifest
+            .files
+            .iter()
+            .all(|file| !file.relative_file_path.ends_with(".md"))
+    );
     let role = app
         .search_with_filters(
             &mixed,
