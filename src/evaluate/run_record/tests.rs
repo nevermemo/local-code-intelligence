@@ -253,17 +253,17 @@ async fn the_replay_refuses_a_record_off_by_one_bit_or_out_of_order() {
         }),
         edit(&raw, 2, |fuse| fuse["frontier"]["size"] = json!(4)),
         edit(&raw, 0, |run| {
-            run["plan"]["maps"][0]["weight"] = json!(0.71)
+            run["plan"]["maps"][0]["weight"] = json!(0.71);
         }),
         edit(&raw, 1, |fan_out| {
-            fan_out["map_calls"][0]["hits"][0]["rank"] = json!(2)
+            fan_out["map_calls"][0]["hits"][0]["rank"] = json!(2);
         }),
         edit(&raw, 2, |fuse| {
             fuse["map_calls"][0]["hits"][0]["score"] = json!(0.005);
         }),
         // A call recorded as failed keeps its hits out of the fusion.
         edit(&raw, 1, |fan_out| {
-            fan_out["map_calls"][0]["status"] = json!("failed")
+            fan_out["map_calls"][0]["status"] = json!("failed");
         }),
         edit(&raw, 2, |fuse| fuse["frontier"]["rows"] = json!([])),
     ];
@@ -321,7 +321,7 @@ async fn the_reader_keeps_a_prefix_and_refuses_broken_records() {
         format!("{raw}{}\n", lines[1]),
         edit(&raw, 1, |step| step["kind"] = json!("fan-out")),
         edit(&raw, 2, |step| {
-            step["run_id"] = json!("01HF7YAT000000000000000000")
+            step["run_id"] = json!("01HF7YAT000000000000000000");
         }),
         format!("{}\nnot json\n", lines[0]),
     ];

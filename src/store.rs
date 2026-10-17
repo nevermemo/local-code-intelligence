@@ -361,11 +361,11 @@ impl Store {
         let legacy = workspace.legacy_table_name();
         match self.db.drop_table(&legacy, &[]).await {
             Ok(()) => {
-                tracing::info!(workspace_id = %workspace.id, table = %legacy, "migrated the index to the short table name")
+                tracing::info!(workspace_id = %workspace.id, table = %legacy, "migrated the index to the short table name");
             }
             Err(lancedb::Error::TableNotFound { .. }) => {}
             Err(error) => {
-                tracing::warn!(workspace_id = %workspace.id, table = %legacy, error = %error, "could not drop the legacy-named index table; the next commit retries")
+                tracing::warn!(workspace_id = %workspace.id, table = %legacy, error = %error, "could not drop the legacy-named index table; the next commit retries");
             }
         }
     }

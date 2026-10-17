@@ -1156,14 +1156,12 @@ mod tests {
     #[test]
     fn parses_name_status_log_output() {
         let raw = format!(
-            "{rs}aaaa{us}Add the metric helper{us}First paragraph.\n\nSecond one.{us}\n\n\
+            "{RECORD_SEPARATOR}aaaa{FIELD_SEPARATOR}Add the metric helper{FIELD_SEPARATOR}First paragraph.\n\nSecond one.{FIELD_SEPARATOR}\n\n\
              M\tsrc/metric.rs\nA\tsrc/new.rs\nD\tsrc/old.rs\nR087\tsrc/before.rs\tsrc/after.rs\n\
              C075\tsrc/origin.rs\tsrc/copy.rs\nR100\t\"src/we\\\"ird.rs\"\tsrc/fixed.rs\n\
              M\t\"src/we\\\"ird.rs\"\n\
-             {rs}bbbb{us}Subject only{us}{us}\n\nM\tREADME.md\r\n\
-             {rs}cccc{us}No files{us}{us}\n",
-            rs = RECORD_SEPARATOR,
-            us = FIELD_SEPARATOR,
+             {RECORD_SEPARATOR}bbbb{FIELD_SEPARATOR}Subject only{FIELD_SEPARATOR}{FIELD_SEPARATOR}\n\nM\tREADME.md\r\n\
+             {RECORD_SEPARATOR}cccc{FIELD_SEPARATOR}No files{FIELD_SEPARATOR}{FIELD_SEPARATOR}\n",
         );
         let commits = parse_log(&raw);
         assert_eq!(commits.len(), 3);
@@ -1195,12 +1193,10 @@ mod tests {
     #[test]
     fn parses_numstat_log_output() {
         let raw = format!(
-            "{rs}aaaa{us}\n\n12\t3\tsrc/metric.rs\n-\t-\tassets/logo.png\n\
+            "{RECORD_SEPARATOR}aaaa{FIELD_SEPARATOR}\n\n12\t3\tsrc/metric.rs\n-\t-\tassets/logo.png\n\
              4\t5\t\"src/we\\\"ird.rs\"\n0\t323\tsrc/lexical.rs\r\n\
-             {rs}bbbb{us}\n\n323\t0\tlci-core/src/lexical.rs\n0\t323\tsrc/lexical.rs\r\n\
-             {rs}cccc{us}\n",
-            rs = RECORD_SEPARATOR,
-            us = FIELD_SEPARATOR,
+             {RECORD_SEPARATOR}bbbb{FIELD_SEPARATOR}\n\n323\t0\tlci-core/src/lexical.rs\n0\t323\tsrc/lexical.rs\r\n\
+             {RECORD_SEPARATOR}cccc{FIELD_SEPARATOR}\n",
         );
         let numstat = parse_numstat(&raw);
         assert_eq!(numstat.len(), 3);

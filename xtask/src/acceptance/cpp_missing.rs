@@ -11,10 +11,10 @@ const CALCULATOR_CPP: &str = "namespace acceptance {\n// Calculator performs bas
 // fail with a tooling error naming it, not be rejected as an unrecognized file.
 const TALLY_HXX: &str = "namespace acceptance {\n// Tally counts acceptance steps.\nclass Tally {\npublic:\n    // bump increments the tally.\n    int bump(int n) { return n + 1; }\n};\n}\n";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

@@ -91,7 +91,7 @@ impl Case {
     fn new(seed: u64, pass_through: bool) -> Self {
         let mut rng = SplitMix(seed);
         let nodes = 3 + below(&mut rng, 8);
-        let maps = (0..1 + below(&mut rng, 3))
+        let maps = (0..=below(&mut rng, 3))
             .map(|i| MapSpec {
                 id: ["m0", "m1", "m2"][i],
                 edges: (0..below(&mut rng, 3 * nodes))

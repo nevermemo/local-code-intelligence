@@ -81,7 +81,7 @@ fn row(path: &str, start_line: u32, content_hash: &str) -> CandidateTrace {
 fn rows(rng: &mut Rng) -> Vec<CandidateTrace> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for _ in 0..rng.below(14) + 1 {
+    for _ in 0..=rng.below(14) {
         let path = PATHS[rng.below(PATHS.len())];
         let start = [1, 11][rng.below(2)];
         let hash = HASHES[rng.below(HASHES.len())];

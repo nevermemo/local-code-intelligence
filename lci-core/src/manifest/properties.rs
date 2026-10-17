@@ -118,7 +118,7 @@ fn mutate(rng: &mut Rng, root: &Path) -> String {
                 let _ = std::fs::remove_file(&file);
                 format!("remove {directory}.lciignore")
             } else {
-                let lines: Vec<&str> = (0..rng.below(3) + 1)
+                let lines: Vec<&str> = (0..=rng.below(3))
                     .map(|_| *rng.pick(IGNORE_LINES))
                     .collect();
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();

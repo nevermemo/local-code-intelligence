@@ -170,7 +170,7 @@ fn chunk(path: &str, start_line: u32) -> Chunk {
         start_line,
         end_line: start_line + 2,
         code: String::new(),
-        content_hash: format!("{:016x}", start_line),
+        content_hash: format!("{start_line:016x}"),
     }
 }
 

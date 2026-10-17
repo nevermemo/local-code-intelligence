@@ -945,7 +945,7 @@ mod tests {
             let root = utf16("<TS version=\"2.1\">", big_endian, true);
             let cut = 2 + 2 * "<TS version".len();
             assert_eq!(ts_non_source(&root[..cut]), None);
-            assert_eq!(ts_non_source(&root[..cut + 1]), None);
+            assert_eq!(ts_non_source(&root[..=cut]), None);
             assert_eq!(ts_non_source(&root[..cut + 2]), Some(NonSource::QtLinguist));
         }
         assert_eq!(ts_non_source(b"\xFF\xFE<"), None);

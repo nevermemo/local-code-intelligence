@@ -797,7 +797,7 @@ startTelemetry();
 
     #[test]
     fn chunks_class_methods_and_interface_signatures_at_member_boundaries() {
-        let source = r#"/** Coordinates telemetry. */
+        let source = r"/** Coordinates telemetry. */
 export class TelemetryCoordinator {
   // Starts collection.
   start(): void {}
@@ -810,7 +810,7 @@ export interface TelemetryLifecycle {
   start(): void;
   stop(): void;
 }
-"#;
+";
         let chunks = chunks_for_path("lifecycle.ts", source).unwrap();
         let start_method = chunks
             .iter()
@@ -1654,8 +1654,7 @@ if TOP:
                 lines[(chunk.start_line - 1) as usize..chunk.end_line as usize]
                     .join("\n")
                     .contains(&chunk.code),
-                "invalid range for {:#?}",
-                chunk
+                "invalid range for {chunk:#?}"
             );
         }
     }
@@ -1836,7 +1835,7 @@ if TOP:
 
     #[test]
     fn chunks_go_and_c_declarations_with_leading_comments_attached() {
-        let go = r#"package example
+        let go = r"package example
 
 // Add returns the sum of two numbers.
 func Add(a, b int) int {
@@ -1856,8 +1855,8 @@ func (c *Counter) Increment(n int) {
 const MaxRetries = 3
 
 var DefaultTimeout = 30
-"#;
-        let c = r#"#include <stdio.h>
+";
+        let c = r"#include <stdio.h>
 
 // Add returns the sum of two numbers.
 int add(int a, int b) {
@@ -1877,7 +1876,7 @@ void increment(struct Counter *c, int n) {
 #define MAX_RETRIES 3
 
 int default_timeout = 30;
-"#;
+";
         // (path, language, source, [(declaration, the chunk starts with)], other
         // chunk fragments, a declaration that appears in exactly one chunk)
         let cases = [
@@ -2018,7 +2017,7 @@ public interface ITelemetrySink
     void Write(string value);
 }
 "#;
-        let cpp = r#"namespace telemetry {
+        let cpp = r"namespace telemetry {
 
 // Processes production telemetry events.
 class Processor {
@@ -2039,7 +2038,7 @@ T add(T a, T b) {
 }
 
 }
-"#;
+";
         // (path, language, source, fragments some chunk must contain,
         // [(a chunk's identifying text, fragments that chunk must also contain)])
         type Case<'a> = (

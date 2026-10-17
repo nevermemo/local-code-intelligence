@@ -56,7 +56,7 @@ fn script() -> Vec<(Step, Edit)> {
                     root,
                     "src/a.rs",
                     &format!("\n\n\n{}", A.replace("    1\n", "    2\n")),
-                )
+                );
             }),
         ),
         (

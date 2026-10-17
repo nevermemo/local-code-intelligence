@@ -11,10 +11,10 @@ const CALCULATOR_C: &str = "// Calculator performs basic arithmetic for acceptan
 // fail with a tooling error naming it, not be rejected as an unrecognized file.
 const COUNTER_H: &str = "// Counter tracks how many items an acceptance run has seen.\ntypedef struct Counter {\n    int value;\n} Counter;\n\n// counter_next returns the value that follows current.\nint counter_next(int current);\n";
 
-const LIB_RS: &str = r#"pub fn add(left: i32, right: i32) -> i32 {
+const LIB_RS: &str = r"pub fn add(left: i32, right: i32) -> i32 {
     left + right
 }
-"#;
+";
 
 pub async fn run() -> Result<()> {
     super::missing::run(MissingServerSpec {

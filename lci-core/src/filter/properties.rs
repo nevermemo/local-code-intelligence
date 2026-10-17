@@ -49,14 +49,14 @@ const GLOB_COMPONENTS: &[&str] = &[
 ];
 
 fn path(rng: &mut Rng) -> String {
-    (0..rng.below(4) + 1)
+    (0..=rng.below(4))
         .map(|_| *rng.pick(COMPONENTS))
         .collect::<Vec<_>>()
         .join("/")
 }
 
 fn pattern(rng: &mut Rng) -> String {
-    (0..rng.below(3) + 1)
+    (0..=rng.below(3))
         .map(|_| *rng.pick(GLOB_COMPONENTS))
         .collect::<Vec<_>>()
         .join("/")
@@ -244,7 +244,7 @@ fn effective_filters_are_the_conjunction_of_their_parts_in_any_order() {
     for seed in 0..FILTER_SEEDS {
         let mut rng = Rng(seed);
         let list = |rng: &mut Rng| -> Option<Vec<String>> {
-            (rng.below(3) != 0).then(|| (0..rng.below(3) + 1).map(|_| pattern(rng)).collect())
+            (rng.below(3) != 0).then(|| (0..=rng.below(3)).map(|_| pattern(rng)).collect())
         };
         let request = FilterRequest {
             languages: (rng.below(3) == 0).then(|| vec![rng.pick(LANGUAGES).to_string()]),

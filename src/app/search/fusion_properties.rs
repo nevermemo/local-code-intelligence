@@ -92,7 +92,7 @@ fn chunk_hit(path: &str, start_line: u32, content_hash: &str) -> Hit {
 fn chunks(rng: &mut Rng) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for _ in 0..rng.below(14) + 1 {
+    for _ in 0..=rng.below(14) {
         let path = PATHS[rng.below(PATHS.len())];
         let start = [1, 11][rng.below(2)];
         let hash = HASHES[rng.below(HASHES.len())];

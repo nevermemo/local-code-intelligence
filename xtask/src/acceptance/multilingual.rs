@@ -11,47 +11,47 @@ const RUST_LIB: &str = r#"pub fn rust_fixture_anchor() -> &'static str {
 }
 "#;
 
-const TELEMETRY_TS_V1: &str = r#"// Production event normalization used by the live telemetry path.
+const TELEMETRY_TS_V1: &str = r"// Production event normalization used by the live telemetry path.
 export function buildProductionTelemetryPipeline(events: string[]): string[] {
   return events.map(event => event.trim()).filter(Boolean);
 }
-"#;
+";
 
-const TELEMETRY_PANEL_TSX: &str = r#"export const TelemetryPanel = () => <section>Live telemetry</section>;
-"#;
+const TELEMETRY_PANEL_TSX: &str = r"export const TelemetryPanel = () => <section>Live telemetry</section>;
+";
 
 const AUDIT_JS: &str = r#"export function flushAuditBeacon() {
   return "sent";
 }
 "#;
 
-const BADGE_JSX: &str = r#"export const TelemetryBadge = () => <strong>Ready</strong>;
-"#;
+const BADGE_JSX: &str = r"export const TelemetryBadge = () => <strong>Ready</strong>;
+";
 
 const TELEMETRY_TEST_TS: &str = r#"// Search decoy: buildProductionTelemetryPipeline is mentioned only in a test.
 export const productionPipelineDocumentation = "trim and filter events";
 "#;
 
-const FEATURE_PIPELINE_PY_V1: &str = r#"# Production feature normalization used by the live feature pipeline.
+const FEATURE_PIPELINE_PY_V1: &str = r"# Production feature normalization used by the live feature pipeline.
 
 
 def build_production_feature_pipeline(features):
     normalized = [feature.strip().lower() for feature in features]
     return [feature for feature in normalized if feature]
-"#;
+";
 
 const FEATURE_PIPELINE_TEST_PY: &str = r#"# Search decoy: build_production_feature_pipeline is mentioned only in a test.
 production_pipeline_documentation = "strip, lowercase, and drop empty features"
 "#;
 
-const TELEMETRY_PROCESSOR_CS_V1: &str = r#"namespace Telemetry;
+const TELEMETRY_PROCESSOR_CS_V1: &str = r"namespace Telemetry;
 
 /// <summary>Production event normalization used by the live telemetry path.</summary>
 public sealed class TelemetryProcessor
 {
     public string NormalizeProductionEvent(string value) => value.Trim().ToLowerInvariant();
 }
-"#;
+";
 
 const TELEMETRY_PROCESSOR_TESTS_CS: &str = r#"namespace Telemetry.Tests;
 
@@ -81,7 +81,7 @@ const PIPELINE_TEST_GO: &str = r#"package pipeline
 const ExpectedPipelineDescription = "trim and filter events"
 "#;
 
-const ORDER_VALIDATOR_JAVA_V1: &str = r#"package orders;
+const ORDER_VALIDATOR_JAVA_V1: &str = r"package orders;
 
 import java.util.List;
 
@@ -91,7 +91,7 @@ public final class OrderValidator {
         return orderId != null && !orderId.isEmpty() && !items.isEmpty();
     }
 }
-"#;
+";
 
 const ORDER_VALIDATOR_TEST_JAVA: &str = r#"package orders;
 
@@ -102,7 +102,7 @@ public final class OrderValidatorTest {
 }
 "#;
 
-const CACHE_C_V1: &str = r#"// Evicts the least-recently-used entry once the cache exceeds its capacity.
+const CACHE_C_V1: &str = r"// Evicts the least-recently-used entry once the cache exceeds its capacity.
 int evict_least_recently_used(int *usage, int count, int capacity) {
     if (count <= capacity) {
         return -1;
@@ -115,13 +115,13 @@ int evict_least_recently_used(int *usage, int count, int capacity) {
     }
     return oldest_index;
 }
-"#;
+";
 
 const CACHE_TEST_C: &str = r#"// Search decoy: evict_least_recently_used is mentioned only in a test.
 const char *expected_cache_eviction_description = "evict least recently used entry";
 "#;
 
-const RATE_LIMITER_CPP_V1: &str = r#"namespace throttling {
+const RATE_LIMITER_CPP_V1: &str = r"namespace throttling {
 
 // Determines whether a new request should be admitted given recent request timestamps.
 class RateLimiter {
@@ -132,7 +132,7 @@ public:
 };
 
 }
-"#;
+";
 
 const RATE_LIMITER_TEST_CPP: &str = r#"namespace throttling {
 
@@ -144,11 +144,11 @@ const char *expected_rate_limiter_description = "admit requests under the config
 
 // The remaining C and C++ extensions: `.h` is indexed as `c`; `.cc`, `.cxx`,
 // `.hh`, and `.hxx` as `cpp`.
-const CACHE_H_V1: &str = r#"// Declares the eviction entry point of the least-recently-used cache.
+const CACHE_H_V1: &str = r"// Declares the eviction entry point of the least-recently-used cache.
 int evict_oldest_cached_entry(int *usage, int count, int capacity);
-"#;
+";
 
-const THROTTLE_CC_V1: &str = r#"namespace throttling {
+const THROTTLE_CC_V1: &str = r"namespace throttling {
 
 // Decides whether a request is admitted while the throttle still has budget.
 bool admit_throttled_request(int recent_count, int budget) {
@@ -156,7 +156,7 @@ bool admit_throttled_request(int recent_count, int budget) {
 }
 
 }
-"#;
+";
 
 const THROTTLE_TEST_CC: &str = r#"namespace throttling {
 
@@ -166,25 +166,25 @@ const char *expected_throttle_description = "admit requests while budget remains
 }
 "#;
 
-const WINDOW_CXX: &str = r#"// Counts the requests seen between two timestamps of the sliding window.
+const WINDOW_CXX: &str = r"// Counts the requests seen between two timestamps of the sliding window.
 int count_window_requests(int window_start, int window_end) {
     return window_end - window_start;
 }
-"#;
+";
 
-const WINDOW_HH: &str = r#"// Tracks how many requests fell inside the sliding window.
+const WINDOW_HH: &str = r"// Tracks how many requests fell inside the sliding window.
 class WindowCounter {
 public:
     int total_in_window() const;
 };
-"#;
+";
 
-const WINDOW_HXX: &str = r#"// Clears the sliding window counter after a rollover.
+const WINDOW_HXX: &str = r"// Clears the sliding window counter after a rollover.
 inline int reset_window_counter_state(int *counter) {
     *counter = 0;
     return 0;
 }
-"#;
+";
 
 const FIXTURE_CARGO_TOML: &str = r#"[package]
 name = "multilingual-acceptance-fixture"

@@ -3489,13 +3489,13 @@ fusion = \"{fusion}\"
             ("scip_index", |t| t.scip_index = " ".into()),
             ("max_pops", |t| t.max_pops = 0),
             ("max_pops", |t| {
-                t.max_pops = TraverseConfig::MAX_POPS_LIMIT + 1
+                t.max_pops = TraverseConfig::MAX_POPS_LIMIT + 1;
             }),
             ("max_depth", |t| t.max_depth = 0),
             ("max_est_tokens", |t| t.max_est_tokens = 0),
             ("deadline_ms", |t| t.deadline_ms = 0),
             ("max_stops", |t| {
-                t.max_stops = TraverseConfig::MAX_STOPS_LIMIT + 1
+                t.max_stops = TraverseConfig::MAX_STOPS_LIMIT + 1;
             }),
             ("tau", |t| t.tau = 1.5),
             ("tau", |t| t.tau = f32::NAN),
@@ -3503,7 +3503,7 @@ fusion = \"{fusion}\"
             ("corroboration_boost", |t| t.corroboration_boost = f64::NAN),
             ("corroboration_boost", |t| t.corroboration_boost = 1e308),
             ("corroboration_boost", |t| {
-                t.corroboration_boost = TraverseConfig::MAX_CORROBORATION_BOOST + 0.5
+                t.corroboration_boost = TraverseConfig::MAX_CORROBORATION_BOOST + 0.5;
             }),
             ("rerank_floor", |t| t.rerank_floor = -0.1),
             ("rerank_floor", |t| t.rerank_floor = 1.5),
@@ -3513,12 +3513,12 @@ fusion = \"{fusion}\"
             ("question_type", |t| t.question_type = Some("flow".into())),
             ("priors", |t| {
                 t.priors = Some(" ".into());
-                t.question_type = Some("flow".into())
+                t.question_type = Some("flow".into());
             }),
             ("tie_break", |t| t.tie_break = Some(" ".into())),
             ("seed_k", |t| t.seed_k = 0),
             ("seed_k", |t| {
-                t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1
+                t.seed_k = TraverseConfig::MAX_SEED_K_LIMIT + 1;
             }),
             ("beam", |t| t.beam = 0),
             ("beam", |t| t.beam = TraverseConfig::MAX_BEAM_LIMIT + 1),
