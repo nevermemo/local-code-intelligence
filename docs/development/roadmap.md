@@ -89,8 +89,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N82 | Windows `finish_holder_test` skips an ordinal whose pid file is missing, so a missing sleeper goes unchecked (roadmap@bbd3292 N82) | ready, local, low | XS | - |
 | N87 | The live-acceptance workflow does not use `--require-all`, so a missing tool reads green (roadmap@bbd3292 N87) | ready | S | N56 done |
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
-| N89 | An API key is sent as a bearer header over plain http to a non-loopback embedder, reranker or System One host (allowed today; CodeQL on PR 78); decide reject vs warn without breaking an http LAN setup (d371) | ready | S | - |
-| N90 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
+| N94 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
 | N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.

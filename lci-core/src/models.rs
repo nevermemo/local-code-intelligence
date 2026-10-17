@@ -367,6 +367,15 @@ fn with_bearer(builder: reqwest::RequestBuilder, key: Option<&ApiKey>) -> reqwes
 
 impl Models {
     pub fn new(config: &Config) -> Result<Self> {
+        // Once per client, not per request.
+        for (url_key, endpoint) in [
+            ("embedding_url", config.embedder_endpoint()),
+            ("reranker_url", config.reranker_endpoint()),
+        ] {
+            if let Some(warning) = endpoint.cleartext_key_warning(url_key) {
+                tracing::warn!("{warning}");
+            }
+        }
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))

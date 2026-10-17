@@ -18,7 +18,8 @@ reranker_model = "qwen3-reranker-4b"
 # holds an API key (sent as a bearer token). The key itself never belongs in a
 # configuration file; the name is upper-case letters, digits and '_'. Each
 # service can be a local server, a server on another machine, or a hosted
-# provider; the defaults point at local servers.
+# provider; the defaults point at local servers. A key sent over plain http to a
+# non-loopback host travels unencrypted; LCI logs a warning at startup. Use https.
 # embedding_api_key_env = "EMBEDDING_API_KEY"
 # reranker_api_key_env = "RERANKER_API_KEY"
 #
