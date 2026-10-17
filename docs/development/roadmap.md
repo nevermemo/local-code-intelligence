@@ -91,7 +91,6 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N82 | Windows `finish_holder_test` skips an ordinal whose pid file is missing, so a missing sleeper goes unchecked (roadmap@bbd3292 N82) | ready, local, low | XS | - |
 | N87 | The live-acceptance workflow does not use `--require-all`, so a missing tool reads green (roadmap@bbd3292 N87) | ready | S | N56 done |
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
-| N92 | Checked-in documentation link check: an `xtask` subcommand (for example `cargo xtask check-links`) that reports every relative Markdown link or anchor that does not resolve; unit tests on a synthetic tree; run from the `Full` gate or CI; replaces the by-hand check in `docs/development/documentation.md` rule 9 | ready | S | - |
 | N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 11) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.

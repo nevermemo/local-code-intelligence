@@ -230,7 +230,7 @@ pub fn scan_bytes(bytes: &[u8], extra: &Extra) -> Option<Vec<Hit>> {
 }
 
 /// The tracked paths, as git prints them (forward slashes on every platform).
-fn tracked_files(root: &Path) -> Result<Vec<String>> {
+pub(crate) fn tracked_files(root: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

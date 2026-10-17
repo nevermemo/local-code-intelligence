@@ -57,6 +57,7 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 | Mined-query generator (`xtask/src/mine.rs`) | `cargo test -p xtask mine::` (xtask is a binary crate, so the `--lib` unit suites do not run it); `--suite Evaluation` also checks the checked-in mined set |
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
 | Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |
+| Documentation link check (`xtask/src/docs.rs`) | `cargo test -p xtask docs::` (its repository case needs `git` on `PATH`); `cargo xtask docs check` runs the check itself and is the second step of `--suite Full` |
 | Index lifecycle or persistence | `cargo xtask test --suite Indexing` (runs with the `spike-maps` feature) |
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
@@ -70,7 +71,7 @@ they share `--suite Full`'s feature resolution and build cache. Every focused
 suite counts the tests it executed and fails when its filter matched none, so
 a renamed or moved module can't make a suite pass vacuously.
 
-`cargo xtask test --suite Full` runs, in order: the machine-value lint, `cargo fmt --all -- --check`, `cargo test
+`cargo xtask test --suite Full` runs, in order: the machine-value lint, the documentation link check, `cargo fmt --all -- --check`, `cargo test
 --workspace --locked --features local-code-intelligence/spike-maps`, and Clippy with the same `--locked` and feature
 flags. `--locked` makes a pull request that edits `Cargo.toml` without its lockfile fail here instead of in a locked
 build later; the focused suites stay unlocked. The `spike-maps` feature compiles the test-only map entry points.

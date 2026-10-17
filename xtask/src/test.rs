@@ -90,7 +90,7 @@ fn invoke_focused(args: &[&str]) -> Result<()> {
 /// vanish from the gate (merge condition M3).
 const SPIKE_MAPS: &str = "local-code-intelligence/spike-maps";
 
-/// The cargo calls of [`Suite::Full`] after the path lint, in order. The ones
+/// The cargo calls of [`Suite::Full`] after the path lint and the docs check, in order. The ones
 /// that resolve dependencies run `--locked`, so a pull request that edits a
 /// `Cargo.toml` and forgets `Cargo.lock` fails here (as `cargo xtask build`
 /// does) instead of passing and failing later in a locked build. `cargo fmt`
@@ -144,6 +144,8 @@ pub fn run(suite: Suite) -> Result<()> {
         Suite::Full => {
             println!("> cargo xtask lint-machine-paths");
             crate::lint::run()?;
+            println!("> cargo xtask docs check");
+            crate::docs::run()?;
             for step in FULL_STEPS {
                 invoke(step)?;
             }

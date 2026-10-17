@@ -1,5 +1,6 @@
 mod acceptance;
 mod build;
+mod docs;
 mod env;
 mod gold;
 mod lint;
@@ -69,6 +70,11 @@ enum Command {
     /// file:line for each hit. Also part of `test --suite Full`. See
     /// docs/development/machine-values.md, "Lint".
     LintMachinePaths,
+    /// Documentation checks. See docs/development/documentation.md, rule 9.
+    Docs {
+        #[command(subcommand)]
+        which: DocsCommand,
+    },
     /// Score, baseline and convert the local gold sets (impact, flow,
     /// where-to, history, instructions). The gold files live outside the
     /// repository and are passed with --gold. See
@@ -102,6 +108,16 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         max: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    /// Fail when a relative Markdown link or anchor in a tracked *.md file does
+    /// not resolve (external links are skipped). Excludes the vendored
+    /// .agents/skills/rust-skills; broken links in the frozen records under
+    /// docs/spike/multimap/v2 (*-prereg*.md, *-results.md) are reported but
+    /// never fail. Prints path:line: target (reason).
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -272,6 +288,9 @@ async fn main() -> Result<()> {
         } => live_acceptance::run(only, skip_build, require_all),
         Command::Env(args) => env::run(args),
         Command::LintMachinePaths => lint::run(),
+        Command::Docs { which } => match which {
+            DocsCommand::Check => docs::run(),
+        },
         Command::Gold { which } => gold::run(which),
         Command::Maps { which } => maps::run(which),
         Command::MineQueries {
