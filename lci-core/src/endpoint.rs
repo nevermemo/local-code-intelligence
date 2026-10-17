@@ -298,19 +298,21 @@ mod tests {
     }
 
     #[test]
-    fn a_key_over_plain_http_to_a_remote_host_warns_without_the_secret() {
+    fn a_key_over_plain_http_to_a_remote_host_warns() {
         let keyed = |url: &str| Endpoint {
             api_key_env: Some("MY_KEY".into()),
             ..endpoint(url, true)
         };
+        // No assertion message prints the warning: it names the key variable,
+        // which code scanning treats as sensitive in a log.
         let warning = keyed("http://gpu-box:8766/v1")
             .cleartext_key_warning("embedding_url")
             .unwrap();
-        assert!(warning.contains("embedding_url"), "{warning}");
-        assert!(warning.contains("gpu-box"), "{warning}");
-        assert!(warning.contains("MY_KEY"), "{warning}");
-        assert!(warning.contains("https"), "{warning}");
-        assert!(!warning.contains('\n'), "{warning}");
+        assert!(warning.contains("embedding_url"));
+        assert!(warning.contains("gpu-box"));
+        assert!(warning.contains("MY_KEY"));
+        assert!(warning.contains("https"));
+        assert!(!warning.contains('\n'));
         assert!(
             keyed("http://192.168.1.20:8080/v1")
                 .cleartext_key_warning("system_one.url")
