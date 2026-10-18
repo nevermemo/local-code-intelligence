@@ -1,0 +1,466 @@
+{
+  "version": 1,
+  "repo": "lci",
+  "revision": "579a5bec69309d98c78825654aabe8f03ab64421",
+  "seed": 20261018,
+  "families": [
+    {
+      "id": "lci.embedding_document_template",
+      "split": "dev",
+      "format": "toml",
+      "key": "embedding_document_template",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 60,
+          "end_line": 60,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "\"{code}\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/traverse/chunks.rs",
+          "line": 178,
+          "end_line": 178,
+          "sha256": "f5ca892d2522e54ba969d90fc169211d78c130cb31443ee8296ec2c2d5dfcba3",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/traverse/chunks.rs::score_chunks",
+      "excluded_readers": [],
+      "behaviour": "Formats indexed chunks with source and optional path placeholders; changing it changes vector identity.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 489,
+          "end_line": 496,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.embedding_query_template",
+      "split": "heldout",
+      "format": "toml",
+      "key": "embedding_query_template",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 48,
+          "end_line": 48,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "\"Instruct: Given a code search query, retrieve relevant code passages that answer the query\\nQuery: {query}\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "lci-core/src/models.rs",
+          "line": 648,
+          "end_line": 648,
+          "sha256": "cb9360e8fe35b1b6c3f42b476088ceac58a7f7121d67663b2d12254b027854a9",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:lci-core/src/models.rs::query_text",
+      "excluded_readers": [],
+      "behaviour": "Formats a search query before embedding, substituting its query placeholder without invalidating stored vectors.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 484,
+          "end_line": 488,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.fusion.semantic_weight",
+      "split": "dev",
+      "format": "toml",
+      "key": "fusion.semantic_weight",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 277,
+          "end_line": 277,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "1.0",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/search.rs",
+          "line": 1560,
+          "end_line": 1560,
+          "sha256": "1c42c3064afe36532af4caca8a8967d3393962345d44519f91dac7804806ffa6",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/search.rs::fuse_hits",
+      "excluded_readers": [],
+      "behaviour": "Scales the vector channel reciprocal-rank contribution.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 389,
+          "end_line": 390,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.index.freshness",
+      "split": "heldout",
+      "format": "toml",
+      "key": "index.freshness",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 306,
+          "end_line": 306,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "\"on-search\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/search.rs",
+          "line": 1267,
+          "end_line": 1267,
+          "sha256": "1c42c3064afe36532af4caca8a8967d3393962345d44519f91dac7804806ffa6",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/search.rs",
+      "excluded_readers": [],
+      "behaviour": "Selects automatic search-time refresh, watcher-managed refresh, or explicit refresh.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 11,
+          "end_line": 24,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.index.stale_check_interval_seconds",
+      "split": "dev",
+      "format": "toml",
+      "key": "index.stale_check_interval_seconds",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 309,
+          "end_line": 309,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "10",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/indexing.rs",
+          "line": 424,
+          "end_line": 424,
+          "sha256": "6adfce4c731551e4a00d27e6ee7ac805b99494a2963e4027fb0fa3fdfad3fe5e",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/indexing.rs",
+      "excluded_readers": [],
+      "behaviour": "Throttles filesystem staleness checks during on-search refresh.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 31,
+          "end_line": 34,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.index.wait_for_existing_job_seconds",
+      "split": "dev",
+      "format": "toml",
+      "key": "index.wait_for_existing_job_seconds",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 312,
+          "end_line": 312,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "120",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/indexing.rs",
+          "line": 467,
+          "end_line": 467,
+          "sha256": "6adfce4c731551e4a00d27e6ee7ac805b99494a2963e4027fb0fa3fdfad3fe5e",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/indexing.rs",
+      "excluded_readers": [],
+      "behaviour": "Bounds how long search waits for an ongoing refresh before using the previous snapshot.",
+      "docs": [
+        {
+          "path": "lci-core/src/config.rs",
+          "line": 35,
+          "end_line": 37,
+          "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6"
+        }
+      ]
+    },
+    {
+      "id": "lci.readiness_timeout_seconds",
+      "split": "heldout",
+      "format": "toml",
+      "key": "readiness_timeout_seconds",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 78,
+          "end_line": 78,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "5",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "src/app/readiness.rs",
+          "line": 99,
+          "end_line": 99,
+          "sha256": "cc0e0c9c4149f8fe64f894420c8047577199873aa8c08ebfd88f2a12a336d166",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:src/app/readiness.rs::service_status",
+      "excluded_readers": [],
+      "behaviour": "Bounds dependency probes used in the readiness report.",
+      "docs": [
+        {
+          "path": "config.example.toml",
+          "line": 77,
+          "end_line": 77,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9"
+        }
+      ]
+    },
+    {
+      "id": "lci.rust_analyzer_trusted",
+      "split": "heldout",
+      "format": "toml",
+      "key": "rust_analyzer_trusted",
+      "assignments": [
+        {
+          "path": "config.example.toml",
+          "line": 95,
+          "end_line": 95,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+          "value": "false",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "lci-core/src/lsp/rust.rs",
+          "line": 32,
+          "end_line": 32,
+          "sha256": "0ef2510dcc37cd7d229a1f3c05ad80a49cd83b3316e449976ba728c80dd78ff7",
+          "how": "serde"
+        }
+      ],
+      "readers_scope": "component:lci-core/src/lsp/rust.rs::RustAdapter::new (handoff to adapter state)",
+      "excluded_readers": [],
+      "behaviour": "Restores the language server execution and network defaults for trusted repositories and dependencies.",
+      "docs": [
+        {
+          "path": "config.example.toml",
+          "line": 93,
+          "end_line": 94,
+          "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "lci.embedding_document_template.q1",
+      "family": "lci.embedding_document_template",
+      "type": "setting_location",
+      "text": "Where is `embedding_document_template` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.embedding_document_template.q2",
+      "family": "lci.embedding_document_template",
+      "type": "behaviour_to_setting",
+      "text": "Which setting customizes text sent for each indexed chunk, optionally including its repository-relative filename and requiring new vectors when changed?",
+      "names_key": false
+    },
+    {
+      "id": "lci.embedding_document_template.q3",
+      "family": "lci.embedding_document_template",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/traverse/chunks.rs::score_chunks` reads `embedding_document_template`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.embedding_query_template.q1",
+      "family": "lci.embedding_query_template",
+      "type": "setting_location",
+      "text": "Where is `embedding_query_template` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.embedding_query_template.q2",
+      "family": "lci.embedding_query_template",
+      "type": "behaviour_to_setting",
+      "text": "Which setting customizes the instruction text sent with a search request to the vector model without rebuilding stored vectors?",
+      "names_key": false
+    },
+    {
+      "id": "lci.embedding_query_template.q3",
+      "family": "lci.embedding_query_template",
+      "type": "setting_to_reader",
+      "text": "What code in `lci-core/src/models.rs::query_text` reads `embedding_query_template`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.fusion.semantic_weight.q1",
+      "family": "lci.fusion.semantic_weight",
+      "type": "setting_location",
+      "text": "Where is `fusion.semantic_weight` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.fusion.semantic_weight.q2",
+      "family": "lci.fusion.semantic_weight",
+      "type": "behaviour_to_setting",
+      "text": "Which setting scales the reciprocal-rank contribution of vector similarity results?",
+      "names_key": false
+    },
+    {
+      "id": "lci.fusion.semantic_weight.q3",
+      "family": "lci.fusion.semantic_weight",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/search.rs::fuse_hits` reads `fusion.semantic_weight`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.freshness.q1",
+      "family": "lci.index.freshness",
+      "type": "setting_location",
+      "text": "Where is `index.freshness` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.freshness.q2",
+      "family": "lci.index.freshness",
+      "type": "behaviour_to_setting",
+      "text": "Which setting chooses whether searches refresh stale snapshots automatically or leave updates to explicit calls or the watcher?",
+      "names_key": false
+    },
+    {
+      "id": "lci.index.freshness.q3",
+      "family": "lci.index.freshness",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/search.rs` reads `index.freshness`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.stale_check_interval_seconds.q1",
+      "family": "lci.index.stale_check_interval_seconds",
+      "type": "setting_location",
+      "text": "Where is `index.stale_check_interval_seconds` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.stale_check_interval_seconds.q2",
+      "family": "lci.index.stale_check_interval_seconds",
+      "type": "behaviour_to_setting",
+      "text": "Which setting controls the minimum time between filesystem staleness checks on repeated searches?",
+      "names_key": false
+    },
+    {
+      "id": "lci.index.stale_check_interval_seconds.q3",
+      "family": "lci.index.stale_check_interval_seconds",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/indexing.rs` reads `index.stale_check_interval_seconds`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.wait_for_existing_job_seconds.q1",
+      "family": "lci.index.wait_for_existing_job_seconds",
+      "type": "setting_location",
+      "text": "Where is `index.wait_for_existing_job_seconds` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.index.wait_for_existing_job_seconds.q2",
+      "family": "lci.index.wait_for_existing_job_seconds",
+      "type": "behaviour_to_setting",
+      "text": "Which setting limits how long a search waits for an ongoing refresh before using the previous snapshot?",
+      "names_key": false
+    },
+    {
+      "id": "lci.index.wait_for_existing_job_seconds.q3",
+      "family": "lci.index.wait_for_existing_job_seconds",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/indexing.rs` reads `index.wait_for_existing_job_seconds`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.readiness_timeout_seconds.q1",
+      "family": "lci.readiness_timeout_seconds",
+      "type": "setting_location",
+      "text": "Where is `readiness_timeout_seconds` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.readiness_timeout_seconds.q2",
+      "family": "lci.readiness_timeout_seconds",
+      "type": "behaviour_to_setting",
+      "text": "Which setting bounds how long dependency probes may take when reporting whether the service is ready?",
+      "names_key": false
+    },
+    {
+      "id": "lci.readiness_timeout_seconds.q3",
+      "family": "lci.readiness_timeout_seconds",
+      "type": "setting_to_reader",
+      "text": "What code in `src/app/readiness.rs::service_status` reads `readiness_timeout_seconds`?",
+      "names_key": true
+    },
+    {
+      "id": "lci.rust_analyzer_trusted.q1",
+      "family": "lci.rust_analyzer_trusted",
+      "type": "setting_location",
+      "text": "Where is `rust_analyzer_trusted` set in the shipped sample configuration?",
+      "names_key": true
+    },
+    {
+      "id": "lci.rust_analyzer_trusted.q2",
+      "family": "lci.rust_analyzer_trusted",
+      "type": "behaviour_to_setting",
+      "text": "Which switch restores the Rust language server execution and network defaults for repositories and dependencies you trust?",
+      "names_key": false
+    },
+    {
+      "id": "lci.rust_analyzer_trusted.q3",
+      "family": "lci.rust_analyzer_trusted",
+      "type": "setting_to_reader",
+      "text": "What code in `lci-core/src/lsp/rust.rs::RustAdapter::new (handoff to adapter state)` reads `rust_analyzer_trusted`?",
+      "names_key": true
+    }
+  ]
+}

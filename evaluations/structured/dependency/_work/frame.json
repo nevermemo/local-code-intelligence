@@ -1,0 +1,906 @@
+{
+ "seed": 20261018,
+ "revisions": {
+  "lci": "579a5bec69309d98c78825654aabe8f03ab64421",
+  "vite": "7a89794331526a67bc9b29047b86957c581c128c",
+  "home-assistant": "bd92409b6ade6e2873cac603104f23e5d9e7ec61"
+ },
+ "min_length": 6,
+ "repos": {
+  "lci": {
+   "tracked_paths": 582,
+   "lockfiles": [
+    "Cargo.lock"
+   ],
+   "manifests": 4,
+   "manifests_unparsed": [],
+   "declarations": 73,
+   "distinct_names": 43,
+   "plain_names": 24,
+   "plain_len_ge_6": 12,
+   "searchable_not_common": 12,
+   "lockfile_word_prefilter": 12,
+   "frame_size": 11,
+   "order": [
+    {
+     "name": "futures",
+     "rg": {
+      "total_lines": 101,
+      "lockfile_lines": 88,
+      "lockfile_lines_in_first_50": 49
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 17,
+       "end_line": 17,
+       "section": "dependencies",
+       "value": "\"0.3\""
+      },
+      {
+       "path": "lci-maps/Cargo.toml",
+       "line": 16,
+       "end_line": 16,
+       "section": "dependencies",
+       "value": "\"0.3\""
+      }
+     ]
+    },
+    {
+     "name": "reqwest",
+     "rg": {
+      "total_lines": 128,
+      "lockfile_lines": 10,
+      "lockfile_lines_in_first_50": 10
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 23,
+       "end_line": 23,
+       "section": "dependencies",
+       "value": "{ version = \"0.13\", default-features = false, features = [\"json\", \"rustls\"] }"
+      },
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 15,
+       "end_line": 15,
+       "section": "dependencies",
+       "value": "{ version = \"0.13\", default-features = false, features = [\"json\", \"rustls\"] }"
+      },
+      {
+       "path": "xtask/Cargo.toml",
+       "line": 18,
+       "end_line": 18,
+       "section": "dependencies",
+       "value": "{ version = \"0.13.5\", default-features = false, features = [\"json\", \"rustls\"] }"
+      }
+     ]
+    },
+    {
+     "name": "lancedb",
+     "rg": {
+      "total_lines": 57,
+      "lockfile_lines": 2,
+      "lockfile_lines_in_first_50": 2
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 22,
+       "end_line": 22,
+       "section": "dependencies",
+       "value": "{ version = \"=0.38.0\", default-features = false, features = [\"remote\"] }"
+      }
+     ]
+    },
+    {
+     "name": "protobuf",
+     "rg": {
+      "total_lines": 25,
+      "lockfile_lines": 5,
+      "lockfile_lines_in_first_50": 5
+     },
+     "declarations": [
+      {
+       "path": "lci-maps/Cargo.toml",
+       "line": 19,
+       "end_line": 19,
+       "section": "dependencies",
+       "value": "\"=3.7.2\""
+      }
+     ]
+    },
+    {
+     "name": "tempfile",
+     "rg": {
+      "total_lines": 216,
+      "lockfile_lines": 10,
+      "lockfile_lines_in_first_50": 10
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 43,
+       "end_line": 43,
+       "section": "dev-dependencies",
+       "value": "\"3\""
+      },
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 52,
+       "end_line": 52,
+       "section": "dev-dependencies",
+       "value": "\"3\""
+      }
+     ]
+    },
+    {
+     "name": "globset",
+     "rg": {
+      "total_lines": 9,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 12,
+       "end_line": 12,
+       "section": "dependencies",
+       "value": "\"0.4\""
+      }
+     ]
+    },
+    {
+     "name": "tracing",
+     "rg": {
+      "total_lines": 156,
+      "lockfile_lines": 38,
+      "lockfile_lines_in_first_50": 10
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 31,
+       "end_line": 31,
+       "section": "dependencies",
+       "value": "\"0.1\""
+      },
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 21,
+       "end_line": 21,
+       "section": "dependencies",
+       "value": "\"0.1\""
+      }
+     ]
+    },
+    {
+     "name": "sysinfo",
+     "rg": {
+      "total_lines": 9,
+      "lockfile_lines": 2,
+      "lockfile_lines_in_first_50": 2
+     },
+     "declarations": [
+      {
+       "path": "xtask/Cargo.toml",
+       "line": 21,
+       "end_line": 21,
+       "section": "dependencies",
+       "value": "\"0.39.6\""
+      }
+     ]
+    },
+    {
+     "name": "schemars",
+     "rg": {
+      "total_lines": 24,
+      "lockfile_lines": 6,
+      "lockfile_lines_in_first_50": 6
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 25,
+       "end_line": 25,
+       "section": "dependencies",
+       "value": "\"1\""
+      }
+     ]
+    },
+    {
+     "name": "serde_json",
+     "rg": {
+      "total_lines": 547,
+      "lockfile_lines": 30,
+      "lockfile_lines_in_first_50": 30
+     },
+     "declarations": [
+      {
+       "path": "Cargo.toml",
+       "line": 27,
+       "end_line": 27,
+       "section": "dependencies",
+       "value": "\"1\""
+      },
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 17,
+       "end_line": 17,
+       "section": "dependencies",
+       "value": "\"1\""
+      },
+      {
+       "path": "lci-maps/Cargo.toml",
+       "line": 21,
+       "end_line": 21,
+       "section": "dependencies",
+       "value": "{ version = \"1\", features = [\"float_roundtrip\"] }"
+      },
+      {
+       "path": "xtask/Cargo.toml",
+       "line": 19,
+       "end_line": 19,
+       "section": "dependencies",
+       "value": "\"1.0.151\""
+      }
+     ]
+    },
+    {
+     "name": "ignore",
+     "rg": {
+      "total_lines": 60,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "lci-core/Cargo.toml",
+       "line": 14,
+       "end_line": 14,
+       "section": "dependencies",
+       "value": "\"0.4\""
+      },
+      {
+       "path": "lci-maps/Cargo.toml",
+       "line": 17,
+       "end_line": 17,
+       "section": "dependencies",
+       "value": "\"0.4\""
+      }
+     ]
+    }
+   ]
+  },
+  "vite": {
+   "tracked_paths": 2861,
+   "lockfiles": [
+    "pnpm-lock.yaml"
+   ],
+   "manifests": 309,
+   "manifests_unparsed": [],
+   "declarations": 492,
+   "distinct_names": 330,
+   "plain_names": 75,
+   "plain_len_ge_6": 44,
+   "searchable_not_common": 44,
+   "lockfile_word_prefilter": 43,
+   "frame_size": 28,
+   "order": [
+    {
+     "name": "lodash",
+     "rg": {
+      "total_lines": 75,
+      "lockfile_lines": 45,
+      "lockfile_lines_in_first_50": 20
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/src/node/__tests__/fixtures/config/siblings/package.json",
+       "line": 6,
+       "end_line": 6,
+       "section": "devDependencies",
+       "value": "^4.17.21"
+      }
+     ]
+    },
+    {
+     "name": "premove",
+     "rg": {
+      "total_lines": 7,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 122,
+       "end_line": 122,
+       "section": "devDependencies",
+       "value": "^4.0.0"
+      }
+     ]
+    },
+    {
+     "name": "nanoid",
+     "rg": {
+      "total_lines": 11,
+      "lockfile_lines": 6,
+      "lockfile_lines_in_first_50": 6
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 112,
+       "end_line": 112,
+       "section": "devDependencies",
+       "value": "^5.1.16"
+      }
+     ]
+    },
+    {
+     "name": "parse5",
+     "rg": {
+      "total_lines": 14,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 115,
+       "end_line": 115,
+       "section": "devDependencies",
+       "value": "^8.0.1"
+      }
+     ]
+    },
+    {
+     "name": "tinyexec",
+     "rg": {
+      "total_lines": 20,
+      "lockfile_lines": 11,
+      "lockfile_lines_in_first_50": 11
+     },
+     "declarations": [
+      {
+       "path": "packages/create-vite/package.json",
+       "line": 40,
+       "end_line": 40,
+       "section": "devDependencies",
+       "value": "^1.3.1"
+      },
+      {
+       "path": "packages/vite/package.json",
+       "line": 132,
+       "end_line": 132,
+       "section": "devDependencies",
+       "value": "^1.3.1"
+      }
+     ]
+    },
+    {
+     "name": "foobar",
+     "rg": {
+      "total_lines": 40,
+      "lockfile_lines": 6,
+      "lockfile_lines_in_first_50": 6
+     },
+     "declarations": [
+      {
+       "path": "playground/optimize-deps/dep-with-optional-peer-dep-cjs/package.json",
+       "line": 7,
+       "end_line": 7,
+       "section": "peerDependencies",
+       "value": "0.0.0"
+      },
+      {
+       "path": "playground/optimize-deps/dep-with-optional-peer-dep-submodule/package.json",
+       "line": 8,
+       "end_line": 8,
+       "section": "peerDependencies",
+       "value": "0.0.0"
+      },
+      {
+       "path": "playground/optimize-deps/dep-with-optional-peer-dep/package.json",
+       "line": 8,
+       "end_line": 8,
+       "section": "peerDependencies",
+       "value": "0.0.0"
+      }
+     ]
+    },
+    {
+     "name": "mrmime",
+     "rg": {
+      "total_lines": 20,
+      "lockfile_lines": 4,
+      "lockfile_lines_in_first_50": 4
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 111,
+       "end_line": 111,
+       "section": "devDependencies",
+       "value": "^2.0.1"
+      }
+     ]
+    },
+    {
+     "name": "artichokie",
+     "rg": {
+      "total_lines": 9,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 92,
+       "end_line": 92,
+       "section": "devDependencies",
+       "value": "^0.4.5"
+      }
+     ]
+    },
+    {
+     "name": "clipboard",
+     "rg": {
+      "total_lines": 18,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "playground/optimize-deps/package.json",
+       "line": 13,
+       "end_line": 13,
+       "section": "dependencies",
+       "value": "^2.0.11"
+      }
+     ]
+    },
+    {
+     "name": "oxlint",
+     "rg": {
+      "total_lines": 14,
+      "lockfile_lines": 2,
+      "lockfile_lines_in_first_50": 2
+     },
+     "declarations": [
+      {
+       "path": "packages/create-vite/template-react-ts/package.json",
+       "line": 21,
+       "end_line": 21,
+       "section": "devDependencies",
+       "value": "^1.87.0"
+      },
+      {
+       "path": "packages/create-vite/template-react/package.json",
+       "line": 20,
+       "end_line": 20,
+       "section": "devDependencies",
+       "value": "^1.87.0"
+      }
+     ]
+    },
+    {
+     "name": "globals",
+     "rg": {
+      "total_lines": 47,
+      "lockfile_lines": 13,
+      "lockfile_lines_in_first_50": 13
+     },
+     "declarations": [
+      {
+       "path": "package.json",
+       "line": 62,
+       "end_line": 62,
+       "section": "devDependencies",
+       "value": "^17.13.0"
+      }
+     ]
+    },
+    {
+     "name": "browserslist",
+     "rg": {
+      "total_lines": 32,
+      "lockfile_lines": 17,
+      "lockfile_lines_in_first_50": 17
+     },
+     "declarations": [
+      {
+       "path": "packages/plugin-legacy/package.json",
+       "line": 43,
+       "end_line": 43,
+       "section": "dependencies",
+       "value": "^4.29.3"
+      }
+     ]
+    },
+    {
+     "name": "tailwindcss",
+     "rg": {
+      "total_lines": 88,
+      "lockfile_lines": 69,
+      "lockfile_lines_in_first_50": 32
+     },
+     "declarations": [
+      {
+       "path": "playground/backend-integration/package.json",
+       "line": 15,
+       "end_line": 15,
+       "section": "devDependencies",
+       "value": "^4.3.3"
+      },
+      {
+       "path": "playground/tailwind-sourcemap/package.json",
+       "line": 14,
+       "end_line": 14,
+       "section": "dependencies",
+       "value": "^4.3.3"
+      },
+      {
+       "path": "playground/tailwind-v3/package.json",
+       "line": 14,
+       "end_line": 14,
+       "section": "dependencies",
+       "value": "^3.4.19"
+      },
+      {
+       "path": "playground/tailwind/package.json",
+       "line": 14,
+       "end_line": 14,
+       "section": "dependencies",
+       "value": "^4.3.3"
+      }
+     ]
+    },
+    {
+     "name": "tinyglobby",
+     "rg": {
+      "total_lines": 42,
+      "lockfile_lines": 11,
+      "lockfile_lines_in_first_50": 11
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 76,
+       "end_line": 76,
+       "section": "dependencies",
+       "value": "^0.2.17"
+      },
+      {
+       "path": "playground/backend-integration/package.json",
+       "line": 16,
+       "end_line": 16,
+       "section": "devDependencies",
+       "value": "^0.2.17"
+      },
+      {
+       "path": "playground/css/package.json",
+       "line": 30,
+       "end_line": 30,
+       "section": "devDependencies",
+       "value": "^0.2.17"
+      },
+      {
+       "path": "playground/hmr/package.json",
+       "line": 13,
+       "end_line": 13,
+       "section": "devDependencies",
+       "value": "^0.2.17"
+      }
+     ]
+    },
+    {
+     "name": "picomatch",
+     "rg": {
+      "total_lines": 53,
+      "lockfile_lines": 27,
+      "lockfile_lines_in_first_50": 24
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 73,
+       "end_line": 73,
+       "section": "dependencies",
+       "value": "^4.0.7"
+      }
+     ]
+    },
+    {
+     "name": "miniflare",
+     "rg": {
+      "total_lines": 6,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "playground/ssr-webworker/package.json",
+       "line": 16,
+       "end_line": 16,
+       "section": "devDependencies",
+       "value": "^4.20260730.0"
+      }
+     ]
+    },
+    {
+     "name": "systemjs",
+     "rg": {
+      "total_lines": 23,
+      "lockfile_lines": 7,
+      "lockfile_lines_in_first_50": 7
+     },
+     "declarations": [
+      {
+       "path": "packages/plugin-legacy/package.json",
+       "line": 48,
+       "end_line": 48,
+       "section": "dependencies",
+       "value": "^6.15.1"
+      }
+     ]
+    },
+    {
+     "name": "tinyspy",
+     "rg": {
+      "total_lines": 6,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/src/node/ssr/runtime/__tests__/package.json",
+       "line": 12,
+       "end_line": 12,
+       "section": "dependencies",
+       "value": "2.2.0"
+      }
+     ]
+    },
+    {
+     "name": "slash3",
+     "rg": {
+      "total_lines": 23,
+      "lockfile_lines": 5,
+      "lockfile_lines_in_first_50": 5
+     },
+     "declarations": [
+      {
+       "path": "playground/external/dep-that-imports/package.json",
+       "line": 6,
+       "end_line": 6,
+       "section": "dependencies",
+       "value": "npm:slash@^3.0.0"
+      },
+      {
+       "path": "playground/external/dep-that-requires/package.json",
+       "line": 6,
+       "end_line": 6,
+       "section": "dependencies",
+       "value": "npm:slash@^3.0.0"
+      },
+      {
+       "path": "playground/external/package.json",
+       "line": 17,
+       "end_line": 17,
+       "section": "devDependencies",
+       "value": "npm:slash@^3.0.0"
+      }
+     ]
+    },
+    {
+     "name": "slash5",
+     "rg": {
+      "total_lines": 20,
+      "lockfile_lines": 5,
+      "lockfile_lines_in_first_50": 5
+     },
+     "declarations": [
+      {
+       "path": "playground/external/dep-that-imports/package.json",
+       "line": 7,
+       "end_line": 7,
+       "section": "dependencies",
+       "value": "npm:slash@^5.1.0"
+      },
+      {
+       "path": "playground/external/dep-that-requires/package.json",
+       "line": 7,
+       "end_line": 7,
+       "section": "dependencies",
+       "value": "npm:slash@^5.1.0"
+      },
+      {
+       "path": "playground/external/package.json",
+       "line": 18,
+       "end_line": 18,
+       "section": "devDependencies",
+       "value": "npm:slash@^5.1.0"
+      }
+     ]
+    },
+    {
+     "name": "sugarss",
+     "rg": {
+      "total_lines": 30,
+      "lockfile_lines": 4,
+      "lockfile_lines_in_first_50": 4
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 145,
+       "end_line": 145,
+       "section": "peerDependencies",
+       "value": "^5.0.0"
+      },
+      {
+       "path": "playground/css-sourcemap/package.json",
+       "line": 18,
+       "end_line": 18,
+       "section": "devDependencies",
+       "value": "^5.0.1"
+      },
+      {
+       "path": "playground/css/package.json",
+       "line": 29,
+       "end_line": 29,
+       "section": "devDependencies",
+       "value": "^5.0.1"
+      }
+     ]
+    },
+    {
+     "name": "fsevents",
+     "rg": {
+      "total_lines": 15,
+      "lockfile_lines": 6,
+      "lockfile_lines_in_first_50": 6
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 189,
+       "end_line": 189,
+       "section": "optionalDependencies",
+       "value": "~2.3.3"
+      }
+     ]
+    },
+    {
+     "name": "phoenix",
+     "rg": {
+      "total_lines": 16,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "playground/optimize-deps/package.json",
+       "line": 58,
+       "end_line": 58,
+       "section": "dependencies",
+       "value": "^1.8.15"
+      }
+     ]
+    },
+    {
+     "name": "vitepress",
+     "rg": {
+      "total_lines": 68,
+      "lockfile_lines": 24,
+      "lockfile_lines_in_first_50": 6
+     },
+     "declarations": [
+      {
+       "path": "docs/package.json",
+       "line": 16,
+       "end_line": 16,
+       "section": "devDependencies",
+       "value": "^2.0.0-alpha.20"
+      }
+     ]
+    },
+    {
+     "name": "autoprefixer",
+     "rg": {
+      "total_lines": 5,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "playground/tailwind-v3/package.json",
+       "line": 13,
+       "end_line": 13,
+       "section": "dependencies",
+       "value": "^10.6.1"
+      }
+     ]
+    },
+    {
+     "name": "tsdown",
+     "rg": {
+      "total_lines": 39,
+      "lockfile_lines": 8,
+      "lockfile_lines_in_first_50": 8
+     },
+     "declarations": [
+      {
+       "path": "packages/create-vite/package.json",
+       "line": 41,
+       "end_line": 41,
+       "section": "devDependencies",
+       "value": "^0.23.0"
+      },
+      {
+       "path": "packages/plugin-legacy/package.json",
+       "line": 57,
+       "end_line": 57,
+       "section": "devDependencies",
+       "value": "^0.23.0"
+      }
+     ]
+    },
+    {
+     "name": "periscopic",
+     "rg": {
+      "total_lines": 8,
+      "lockfile_lines": 3,
+      "lockfile_lines_in_first_50": 3
+     },
+     "declarations": [
+      {
+       "path": "packages/vite/package.json",
+       "line": 117,
+       "end_line": 117,
+       "section": "devDependencies",
+       "value": "^4.0.3"
+      }
+     ]
+    },
+    {
+     "name": "stream",
+     "rg": {
+      "total_lines": 44,
+      "lockfile_lines": 24,
+      "lockfile_lines_in_first_50": 24
+     },
+     "declarations": [
+      {
+       "path": "playground/optimize-deps/dep-cjs-with-external-deps/package.json",
+       "line": 8,
+       "end_line": 8,
+       "section": "dependencies",
+       "value": "file:../dep-esm-dummy-node-builtin"
+      }
+     ]
+    }
+   ]
+  },
+  "home-assistant": {
+   "tracked_paths": 27203,
+   "lockfiles": [
+    "tests/e2e/pnpm-lock.yaml"
+   ],
+   "manifests": 1505,
+   "manifests_unparsed": [],
+   "declarations": 1276,
+   "distinct_names": 1182,
+   "plain_names": 761,
+   "plain_len_ge_6": 670,
+   "searchable_not_common": 670,
+   "lockfile_word_prefilter": 0,
+   "frame_size": 0,
+   "order": []
+  }
+ }
+}

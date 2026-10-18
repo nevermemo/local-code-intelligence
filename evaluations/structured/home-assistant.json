@@ -1,0 +1,472 @@
+{
+  "version": 1,
+  "repo": "home-assistant",
+  "revision": "bd92409b6ade6e2873cac603104f23e5d9e7ec61",
+  "seed": 20261018,
+  "families": [
+    {
+      "id": "home-assistant.blueprint.domain",
+      "split": "dev",
+      "format": "yaml",
+      "key": "blueprint.domain",
+      "assignments": [
+        {
+          "path": "homeassistant/components/automation/blueprints/motion_light.yaml",
+          "line": 4,
+          "end_line": 4,
+          "sha256": "e07ac35fae7270131f118da767b036e7f7776672077691d9fbcd026e5a7e3f9c",
+          "value": "automation",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/blueprint/models.py",
+          "line": 65,
+          "end_line": 78,
+          "sha256": "ad3b1f8ae953af14ca72359ad7a4ab0bcaa53c962ed41b7c249131170908f3eb",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/blueprint/models.py::Blueprint.__init__",
+      "excluded_readers": [],
+      "behaviour": "Declares the reusable configuration type, checked against the integration expected by the loader.",
+      "docs": [
+        {
+          "path": "homeassistant/components/blueprint/models.py",
+          "line": 65,
+          "end_line": 78,
+          "sha256": "ad3b1f8ae953af14ca72359ad7a4ab0bcaa53c962ed41b7c249131170908f3eb"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.blueprint.input.no_motion_wait.default",
+      "split": "heldout",
+      "format": "yaml",
+      "key": "blueprint.input.no_motion_wait.default",
+      "assignments": [
+        {
+          "path": "homeassistant/components/automation/blueprints/motion_light.yaml",
+          "line": 26,
+          "end_line": 26,
+          "sha256": "e07ac35fae7270131f118da767b036e7f7776672077691d9fbcd026e5a7e3f9c",
+          "value": "120",
+          "kind": "default"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/blueprint/models.py",
+          "line": 162,
+          "end_line": 163,
+          "sha256": "ad3b1f8ae953af14ca72359ad7a4ab0bcaa53c962ed41b7c249131170908f3eb",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/blueprint/models.py::BlueprintInputs.inputs_with_default",
+      "excluded_readers": [],
+      "behaviour": "Supplies a declared input fallback when an instance omits that input; this shipped blueprint supplies 120 seconds for its wait duration.",
+      "docs": [
+        {
+          "path": "homeassistant/components/blueprint/models.py",
+          "line": 155,
+          "end_line": 165,
+          "sha256": "ad3b1f8ae953af14ca72359ad7a4ab0bcaa53c962ed41b7c249131170908f3eb"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.climate.target_sensor",
+      "split": "dev",
+      "format": "yaml",
+      "key": "climate.target_sensor",
+      "assignments": [
+        {
+          "path": "tests/components/generic_thermostat/fixtures/configuration.yaml",
+          "line": 5,
+          "end_line": 5,
+          "sha256": "b1b56d9f167af9fbc6214da708fdb6caf8f0e6241463162354a1b96eafa5c90a",
+          "value": "sensor.any",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/generic_thermostat/climate.py",
+          "line": 176,
+          "end_line": 176,
+          "sha256": "e131f75c30e6c3e260bbaf70d9c155bafb8aabe9aabfa6bb69b812673477e1f6",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/generic_thermostat/climate.py::async_setup_platform (handoff to GenericThermostat)",
+      "excluded_readers": [],
+      "behaviour": "Selects the entity whose temperature updates drive thermostat heating control.",
+      "docs": [
+        {
+          "path": "homeassistant/components/generic_thermostat/climate.py",
+          "line": 502,
+          "end_line": 510,
+          "sha256": "e131f75c30e6c3e260bbaf70d9c155bafb8aabe9aabfa6bb69b812673477e1f6"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.command_line.binary_sensor.command_timeout",
+      "split": "heldout",
+      "format": "yaml",
+      "key": "command_line.binary_sensor.command_timeout",
+      "assignments": [
+        {
+          "path": "tests/components/command_line/fixtures/configuration.yaml",
+          "line": 7,
+          "end_line": 7,
+          "sha256": "8c24d34a0c5f0d27d1e2817c0cdf8d7b6571d4fbcd199f8beb44fabba90b0c25",
+          "value": "15",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/command_line/utils.py",
+          "line": 57,
+          "end_line": 58,
+          "sha256": "3745addc6c74650d94f54b527b57ea08c5ff37f824eeb85c8f3c8ea1f9ff7f93",
+          "how": "ast"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/command_line/utils.py::async_check_output_or_log",
+      "excluded_readers": [],
+      "behaviour": "Limits the time allowed for the shell process to complete and produce output.",
+      "docs": [
+        {
+          "path": "homeassistant/components/command_line/utils.py",
+          "line": 49,
+          "end_line": 50,
+          "sha256": "3745addc6c74650d94f54b527b57ea08c5ff37f824eeb85c8f3c8ea1f9ff7f93"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.rest.resource",
+      "split": "dev",
+      "format": "yaml",
+      "key": "rest.resource",
+      "assignments": [
+        {
+          "path": "tests/components/rest/fixtures/configuration_top_level.yaml",
+          "line": 3,
+          "end_line": 3,
+          "sha256": "d4d532e6ef8ab041dfea922bc54f10a56c7bfc8800ec9976ce5e1ead471bc845",
+          "value": "\"http://localhost\"",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/rest/data.py",
+          "line": 155,
+          "end_line": 156,
+          "sha256": "821cc2f095214c30a6a789bc192ef686653c06dcb098ca51a361d2d30a2b4f0c",
+          "how": "ast"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/rest/data.py::RestData.async_update",
+      "excluded_readers": [],
+      "behaviour": "Supplies the URL requested to retrieve REST entity data.",
+      "docs": [
+        {
+          "path": "homeassistant/components/rest/data.py",
+          "line": 72,
+          "end_line": 74,
+          "sha256": "821cc2f095214c30a6a789bc192ef686653c06dcb098ca51a361d2d30a2b4f0c"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.sensor.entities",
+      "split": "dev",
+      "format": "yaml",
+      "key": "sensor.entities",
+      "assignments": [
+        {
+          "path": "tests/components/group/fixtures/sensor_configuration.yaml",
+          "line": 3,
+          "end_line": 6,
+          "sha256": "e9c243925f2ca721474e699d3cbc9dc8fd74e1470bf457434494d8642a1f2346",
+          "value": "- sensor.test_1\n      - sensor.test_2",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/group/sensor.py",
+          "line": 127,
+          "end_line": 127,
+          "sha256": "dddba326dca9ff337f040ff675fa3c303ea5309bb8d5d3e8f0ff6c2ba9c8335b",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/group/sensor.py::async_setup_platform (handoff to SensorGroup)",
+      "excluded_readers": [],
+      "behaviour": "Lists the member entities whose numeric readings are combined into a sensor group.",
+      "docs": [
+        {
+          "path": "homeassistant/components/group/sensor.py",
+          "line": 1,
+          "end_line": 4,
+          "sha256": "dddba326dca9ff337f040ff675fa3c303ea5309bb8d5d3e8f0ff6c2ba9c8335b"
+        },
+        {
+          "path": "homeassistant/components/group/sensor.py",
+          "line": 393,
+          "end_line": 395,
+          "sha256": "dddba326dca9ff337f040ff675fa3c303ea5309bb8d5d3e8f0ff6c2ba9c8335b"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.sensor.filters.precision",
+      "split": "heldout",
+      "format": "yaml",
+      "key": "sensor.filters.precision",
+      "assignments": [
+        {
+          "path": "tests/components/filter/fixtures/configuration.yaml",
+          "line": 11,
+          "end_line": 11,
+          "sha256": "f5495cbb509958cca28410a8df572df98b28d4dd6d707720a2cc0ddd85473f73",
+          "value": "2",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/filter/sensor.py",
+          "line": 430,
+          "end_line": 431,
+          "sha256": "d5441b2115d398179cba1f2504e7dc1e7b6f410e97d5001b468a9ccd5f378152",
+          "how": "ast"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/filter/sensor.py::FilterState.set_precision",
+      "excluded_readers": [],
+      "behaviour": "Rounds the filtered numeric reading to the configured number of decimal places.",
+      "docs": [
+        {
+          "path": "homeassistant/components/filter/sensor.py",
+          "line": 468,
+          "end_line": 470,
+          "sha256": "d5441b2115d398179cba1f2504e7dc1e7b6f410e97d5001b468a9ccd5f378152"
+        }
+      ]
+    },
+    {
+      "id": "home-assistant.sensor.filters.window_size",
+      "split": "heldout",
+      "format": "yaml",
+      "key": "sensor.filters.window_size",
+      "assignments": [
+        {
+          "path": "tests/components/filter/fixtures/configuration.yaml",
+          "line": 7,
+          "end_line": 7,
+          "sha256": "f5495cbb509958cca28410a8df572df98b28d4dd6d707720a2cc0ddd85473f73",
+          "value": "4",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "homeassistant/components/filter/sensor.py",
+          "line": 473,
+          "end_line": 473,
+          "sha256": "d5441b2115d398179cba1f2504e7dc1e7b6f410e97d5001b468a9ccd5f378152",
+          "how": "ast"
+        }
+      ],
+      "readers_scope": "component:homeassistant/components/filter/sensor.py::Filter.__init__",
+      "excluded_readers": [],
+      "behaviour": "Bounds how many previous readings the outlier filter retains in its sliding buffer.",
+      "docs": [
+        {
+          "path": "homeassistant/components/filter/sensor.py",
+          "line": 468,
+          "end_line": 470,
+          "sha256": "d5441b2115d398179cba1f2504e7dc1e7b6f410e97d5001b468a9ccd5f378152"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "home-assistant.blueprint.domain.q1",
+      "family": "home-assistant.blueprint.domain",
+      "type": "setting_location",
+      "text": "Where is `blueprint.domain` set in the shipped motion-light blueprint?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.blueprint.domain.q2",
+      "family": "home-assistant.blueprint.domain",
+      "type": "behaviour_to_setting",
+      "text": "Which metadata field declares the reusable recipe type checked against the integration loading it?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.blueprint.domain.q3",
+      "family": "home-assistant.blueprint.domain",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/blueprint/models.py::Blueprint.__init__` reads `blueprint.domain`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.blueprint.input.no_motion_wait.default.q1",
+      "family": "home-assistant.blueprint.input.no_motion_wait.default",
+      "type": "setting_location",
+      "text": "Where is `blueprint.input.no_motion_wait.default` set in the shipped motion-light blueprint?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.blueprint.input.no_motion_wait.default.q2",
+      "family": "home-assistant.blueprint.input.no_motion_wait.default",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting supplies the declared fallback when a motion-light instance omits its wait duration?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.blueprint.input.no_motion_wait.default.q3",
+      "family": "home-assistant.blueprint.input.no_motion_wait.default",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/blueprint/models.py::BlueprintInputs.inputs_with_default` reads `blueprint.input.no_motion_wait.default`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.climate.target_sensor.q1",
+      "family": "home-assistant.climate.target_sensor",
+      "type": "setting_location",
+      "text": "Where is `climate.target_sensor` set in the generic thermostat YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.climate.target_sensor.q2",
+      "family": "home-assistant.climate.target_sensor",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting chooses the entity whose measured temperature drives heating control?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.climate.target_sensor.q3",
+      "family": "home-assistant.climate.target_sensor",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/generic_thermostat/climate.py::async_setup_platform (handoff to GenericThermostat)` reads `climate.target_sensor`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.command_line.binary_sensor.command_timeout.q1",
+      "family": "home-assistant.command_line.binary_sensor.command_timeout",
+      "type": "setting_location",
+      "text": "Where is `command_line.binary_sensor.command_timeout` set in the shell-backed binary-sensor YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.command_line.binary_sensor.command_timeout.q2",
+      "family": "home-assistant.command_line.binary_sensor.command_timeout",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting limits how long the shell-backed binary entity waits for its process to finish?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.command_line.binary_sensor.command_timeout.q3",
+      "family": "home-assistant.command_line.binary_sensor.command_timeout",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/command_line/utils.py::async_check_output_or_log` reads `command_line.binary_sensor.command_timeout`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.rest.resource.q1",
+      "family": "home-assistant.rest.resource",
+      "type": "setting_location",
+      "text": "Where is `rest.resource` set in the top-level REST YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.rest.resource.q2",
+      "family": "home-assistant.rest.resource",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting supplies the URL polled to retrieve data for HTTP-backed entities?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.rest.resource.q3",
+      "family": "home-assistant.rest.resource",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/rest/data.py::RestData.async_update` reads `rest.resource`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.entities.q1",
+      "family": "home-assistant.sensor.entities",
+      "type": "setting_location",
+      "text": "Where is `sensor.entities` set in the numeric sensor-group YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.entities.q2",
+      "family": "home-assistant.sensor.entities",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting lists the members whose numeric readings are combined into one aggregate value?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.sensor.entities.q3",
+      "family": "home-assistant.sensor.entities",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/group/sensor.py::async_setup_platform (handoff to SensorGroup)` reads `sensor.entities`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.filters.precision.q1",
+      "family": "home-assistant.sensor.filters.precision",
+      "type": "setting_location",
+      "text": "Where is `sensor.filters.precision` set in the low-pass entry of the filter YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.filters.precision.q2",
+      "family": "home-assistant.sensor.filters.precision",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting controls the number of decimal places in the filtered numeric reading?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.sensor.filters.precision.q3",
+      "family": "home-assistant.sensor.filters.precision",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/filter/sensor.py::FilterState.set_precision` reads `sensor.filters.precision`?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.filters.window_size.q1",
+      "family": "home-assistant.sensor.filters.window_size",
+      "type": "setting_location",
+      "text": "Where is `sensor.filters.window_size` set in the outlier entry of the filter YAML test fixture?",
+      "names_key": true
+    },
+    {
+      "id": "home-assistant.sensor.filters.window_size.q2",
+      "family": "home-assistant.sensor.filters.window_size",
+      "type": "behaviour_to_setting",
+      "text": "Which YAML setting limits the number of previous readings retained by the outlier filter?",
+      "names_key": false
+    },
+    {
+      "id": "home-assistant.sensor.filters.window_size.q3",
+      "family": "home-assistant.sensor.filters.window_size",
+      "type": "setting_to_reader",
+      "text": "What code in `homeassistant/components/filter/sensor.py::Filter.__init__` reads `sensor.filters.window_size`?",
+      "names_key": true
+    }
+  ]
+}

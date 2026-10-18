@@ -1,0 +1,242 @@
+{
+  "version": 1,
+  "repo": "lci",
+  "revision": "579a5bec69309d98c78825654aabe8f03ab64421",
+  "seed": 20261018,
+  "families": [
+    {
+      "id": "lci.dep.futures",
+      "stratum": "dependency",
+      "split": "dev",
+      "format": "toml",
+      "key": "futures",
+      "assignments": [
+        {
+          "path": "Cargo.toml",
+          "line": 17,
+          "end_line": 17,
+          "sha256": "f3b5154633aa4c82473478825bd499ed4d7c4690db7d39d5dd1cfde4f1d2588a",
+          "value": "\"0.3\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of futures for the top-level application crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.reqwest",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "reqwest",
+      "assignments": [
+        {
+          "path": "Cargo.toml",
+          "line": 23,
+          "end_line": 23,
+          "sha256": "f3b5154633aa4c82473478825bd499ed4d7c4690db7d39d5dd1cfde4f1d2588a",
+          "value": "{ version = \"0.13\", default-features = false, features = [\"json\", \"rustls\"] }",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of reqwest for the top-level application crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.lancedb",
+      "stratum": "dependency",
+      "split": "dev",
+      "format": "toml",
+      "key": "lancedb",
+      "assignments": [
+        {
+          "path": "Cargo.toml",
+          "line": 22,
+          "end_line": 22,
+          "sha256": "f3b5154633aa4c82473478825bd499ed4d7c4690db7d39d5dd1cfde4f1d2588a",
+          "value": "{ version = \"=0.38.0\", default-features = false, features = [\"remote\"] }",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of lancedb for the top-level application crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.protobuf",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "protobuf",
+      "assignments": [
+        {
+          "path": "lci-maps/Cargo.toml",
+          "line": 19,
+          "end_line": 19,
+          "sha256": "fc9dba97390164537371a9d1671c31d09edf9f6bf666c08f6cc7813221463c83",
+          "value": "\"=3.7.2\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of protobuf for the lci-maps crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.tempfile",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "tempfile",
+      "assignments": [
+        {
+          "path": "Cargo.toml",
+          "line": 43,
+          "end_line": 43,
+          "sha256": "f3b5154633aa4c82473478825bd499ed4d7c4690db7d39d5dd1cfde4f1d2588a",
+          "value": "\"3\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dev-dependencies version of tempfile for the top-level application crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.globset",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "globset",
+      "assignments": [
+        {
+          "path": "lci-core/Cargo.toml",
+          "line": 12,
+          "end_line": 12,
+          "sha256": "6421cdc0af2641f2c6258facab6e80a4b30fc9a96afbea68fc5d9c9a88f61285",
+          "value": "\"0.4\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of globset for the lci-core crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.tracing",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "tracing",
+      "assignments": [
+        {
+          "path": "Cargo.toml",
+          "line": 31,
+          "end_line": 31,
+          "sha256": "f3b5154633aa4c82473478825bd499ed4d7c4690db7d39d5dd1cfde4f1d2588a",
+          "value": "\"0.1\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of tracing for the top-level application crate.",
+      "docs": []
+    },
+    {
+      "id": "lci.dep.sysinfo",
+      "stratum": "dependency",
+      "split": "heldout",
+      "format": "toml",
+      "key": "sysinfo",
+      "assignments": [
+        {
+          "path": "xtask/Cargo.toml",
+          "line": 21,
+          "end_line": 21,
+          "sha256": "d26c72680c7dd8312a271c6615459fae1cec39cebffdf523fd43a72edfd1bea6",
+          "value": "\"0.39.6\"",
+          "kind": "assignment"
+        }
+      ],
+      "readers": [],
+      "readers_scope": "none:package-manager",
+      "excluded_readers": [],
+      "behaviour": "Declares the dependencies version of sysinfo for the xtask crate.",
+      "docs": []
+    }
+  ],
+  "questions": [
+    {
+      "id": "lci.dep.futures.q1",
+      "family": "lci.dep.futures",
+      "type": "setting_location",
+      "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `futures` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.reqwest.q1",
+      "family": "lci.dep.reqwest",
+      "type": "setting_location",
+      "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `reqwest` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.lancedb.q1",
+      "family": "lci.dep.lancedb",
+      "type": "setting_location",
+      "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `lancedb` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.protobuf.q1",
+      "family": "lci.dep.protobuf",
+      "type": "setting_location",
+      "text": "Where does the `lci-maps` crate declare the version requirement of its `protobuf` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.tempfile.q1",
+      "family": "lci.dep.tempfile",
+      "type": "setting_location",
+      "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `tempfile` dev-dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.globset.q1",
+      "family": "lci.dep.globset",
+      "type": "setting_location",
+      "text": "Where does the `lci-core` crate declare the version requirement of its `globset` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.tracing.q1",
+      "family": "lci.dep.tracing",
+      "type": "setting_location",
+      "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `tracing` dependency?",
+      "names_key": true
+    },
+    {
+      "id": "lci.dep.sysinfo.q1",
+      "family": "lci.dep.sysinfo",
+      "type": "setting_location",
+      "text": "Where does the `xtask` crate declare the version requirement of its `sysinfo` dependency?",
+      "names_key": true
+    }
+  ]
+}

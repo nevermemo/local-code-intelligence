@@ -1,0 +1,50 @@
+{
+  "rule": "Walk the frame order; accept a candidate when exactly one manifest is chosen by the stated rule and the question singles it out; stop at 8 accepted. When a package is declared in 2 or 3 manifests, the gold is the manifest whose path sorts first bytewise.",
+  "repos": {
+    "lci": {
+      "skipped": [],
+      "accepted": [
+        {"name": "futures", "path": "Cargo.toml", "role": "top-level application crate",
+         "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `futures` dependency?"},
+        {"name": "reqwest", "path": "Cargo.toml", "role": "top-level application crate",
+         "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `reqwest` dependency?"},
+        {"name": "lancedb", "path": "Cargo.toml", "role": "top-level application crate",
+         "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `lancedb` dependency?"},
+        {"name": "protobuf", "path": "lci-maps/Cargo.toml", "role": "lci-maps crate",
+         "text": "Where does the `lci-maps` crate declare the version requirement of its `protobuf` dependency?"},
+        {"name": "tempfile", "path": "Cargo.toml", "role": "top-level application crate",
+         "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `tempfile` dev-dependency?"},
+        {"name": "globset", "path": "lci-core/Cargo.toml", "role": "lci-core crate",
+         "text": "Where does the `lci-core` crate declare the version requirement of its `globset` dependency?"},
+        {"name": "tracing", "path": "Cargo.toml", "role": "top-level application crate",
+         "text": "Where does the top-level application crate, `local-code-intelligence`, declare the version requirement of its `tracing` dependency?"},
+        {"name": "sysinfo", "path": "xtask/Cargo.toml", "role": "xtask crate",
+         "text": "Where does the `xtask` crate declare the version requirement of its `sysinfo` dependency?"}
+      ]
+    },
+    "vite": {
+      "skipped": [],
+      "accepted": [
+        {"name": "lodash", "path": "packages/vite/src/node/__tests__/fixtures/config/siblings/package.json",
+         "role": "@vite/test-config-sibling test package",
+         "text": "Where does the `@vite/test-config-sibling` test package declare the version range of its `lodash` dev dependency?"},
+        {"name": "premove", "path": "packages/vite/package.json", "role": "vite package",
+         "text": "Where does the `vite` package itself declare the version range of its `premove` dev dependency?"},
+        {"name": "nanoid", "path": "packages/vite/package.json", "role": "vite package",
+         "text": "Where does the `vite` package itself declare the version range of its `nanoid` dev dependency?"},
+        {"name": "parse5", "path": "packages/vite/package.json", "role": "vite package",
+         "text": "Where does the `vite` package itself declare the version range of its `parse5` dev dependency?"},
+        {"name": "tinyexec", "path": "packages/create-vite/package.json", "role": "create-vite package",
+         "text": "Where does the `create-vite` package declare the version range of its `tinyexec` dev dependency?"},
+        {"name": "foobar", "path": "playground/optimize-deps/dep-with-optional-peer-dep-cjs/package.json",
+         "role": "@vitejs/test-dep-with-optional-peer-dep-cjs test package",
+         "text": "Where does the `@vitejs/test-dep-with-optional-peer-dep-cjs` test package declare the version range of its `foobar` peer dependency?"},
+        {"name": "mrmime", "path": "packages/vite/package.json", "role": "vite package",
+         "text": "Where does the `vite` package itself declare the version range of its `mrmime` dev dependency?"},
+        {"name": "artichokie", "path": "packages/vite/package.json", "role": "vite package",
+         "text": "Where does the `vite` package itself declare the version range of its `artichokie` dev dependency?"}
+      ]
+    },
+    "home-assistant": {"skipped": [], "accepted": []}
+  }
+}
