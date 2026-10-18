@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::types::{AggregateReport, QueryReport};
+use super::types::{AggregateReport, QueryReport, snippet_tokens};
 
 /// Default bootstrap seed. Fixed so that two runs of `compare` over the same
 /// reports print the same intervals.
@@ -72,6 +72,12 @@ pub struct PairMetrics {
     pub ndcg_at_10: f64,
     /// `1.0` when the first result matched an expected path.
     pub hit_at_1: f64,
+    /// What the agent reads: the token proxy of the snippets of every
+    /// returned row of both lists (`QueryMetrics::returned_tokens`). A report
+    /// written before the field has it derived from its evidence, so a
+    /// baseline of an older build compares on the same measure.
+    #[serde(default)]
+    pub returned_tokens: f64,
 }
 
 /// One query present and executed in both reports.
@@ -93,7 +99,7 @@ pub struct PairedQuery {
 }
 
 /// One metric compared over a set of pairs.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricComparison {
     /// Mean of the metric over the baseline side of the pairs.
     pub baseline_mean: f64,
@@ -127,6 +133,10 @@ pub struct GroupComparison {
     pub ndcg_at_10: MetricComparison,
     /// hit@1 rate.
     pub hit_at_1: MetricComparison,
+    /// Returned-token proxy per query (see [`PairMetrics::returned_tokens`]);
+    /// a lower candidate mean is cheaper to read.
+    #[serde(default)]
+    pub returned_tokens: MetricComparison,
 }
 
 /// Result of [`compare`].
@@ -304,6 +314,11 @@ fn pair_metrics(report: &QueryReport) -> PairMetrics {
         reciprocal_rank: report.metrics.reciprocal_rank,
         ndcg_at_10: report.metrics.ndcg_at_10,
         hit_at_1: f64::from(u8::from(report.metrics.hit_at_1)),
+        returned_tokens: report
+            .metrics
+            .returned_tokens
+            .unwrap_or_else(|| snippet_tokens(&[&report.evidence, &report.unscored_evidence]))
+            as f64,
     }
 }
 
@@ -321,6 +336,7 @@ fn pair_up(base: &QueryReport, cand: &QueryReport) -> PairedQuery {
             reciprocal_rank: candidate.reciprocal_rank - baseline.reciprocal_rank,
             ndcg_at_10: candidate.ndcg_at_10 - baseline.ndcg_at_10,
             hit_at_1: candidate.hit_at_1 - baseline.hit_at_1,
+            returned_tokens: candidate.returned_tokens - baseline.returned_tokens,
         },
     }
 }
@@ -352,6 +368,7 @@ fn summarize(pairs: &[&PairedQuery], seed: u64, resamples: usize) -> Option<Grou
         mrr: metric(|metrics| metrics.reciprocal_rank),
         ndcg_at_10: metric(|metrics| metrics.ndcg_at_10),
         hit_at_1: metric(|metrics| metrics.hit_at_1),
+        returned_tokens: metric(|metrics| metrics.returned_tokens),
     })
 }
 
@@ -496,6 +513,12 @@ fn render_group(out: &mut String, indent: &str, group: &GroupComparison) {
             },
         );
     }
+    let tokens = &group.returned_tokens;
+    let _ = writeln!(
+        out,
+        "{indent}{:<9}{:>9.1}{:>11.1}{:>9.1}  (returned tokens per query, snippet proxy; lower is cheaper)",
+        "tokens", tokens.baseline_mean, tokens.candidate_mean, tokens.mean_delta,
+    );
     let _ = writeln!(
         out,
         "{indent}reciprocal rank W/L/T: {}/{}/{} over {} pairs",

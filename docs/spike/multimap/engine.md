@@ -33,7 +33,7 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 | --- | --- | --- | --- | --- |
 | `seeds.hybrid` (default) | start nodes | top `seed_k` hits of the hybrid search, mapped to SCIP symbols | PerFile | `src/app/traverse/seeds.rs` (`SeedMap`) |
 | `seeds.scip_names` (default) | start nodes | question words matched to symbol names; stand-in when the hybrid search is unavailable or empty | PerFile | `src/app/traverse/seeds.rs` |
-| `graph.scip` (default) | expansion | the SCIP index (`rust-analyzer scip`, file `scip_index`), read and cached in memory by file stamp | PerFile | `scip_graph.rs` |
+| `graph.scip` (default) | expansion | the SCIP index (`rust-analyzer scip`, file `scip_index`), read and cached in memory by file stamp; with `--root`, also an `implements` edge (kind prior 0.9) from each trait-impl member to its trait method declaration | PerFile | `scip_graph.rs` |
 | `structure.contains` (default) | expansion | containment derived from the SCIP graph; lets a chunk or file start node reach its symbols | PerFile | `contains.rs` |
 | `grep.live` | expansion | a search of the tree's current bytes | Live | `live_grep.rs` |
 | `config.key` | expansion | config keys and the declarations that read them (needs `rg`) | Global | `config_key.rs`, `reads_key.rs` (M1.2) |
@@ -42,6 +42,7 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 | `search.lexical` | expansion | the lexical search from a node's own name | Live | `search_maps.rs` |
 | `search.vector` | expansion | chunks nearest to a node's stored embedding (embedder only for a node with no stored vector) | Global | `search_maps.rs` |
 | `scip.impact` | expansion | declarations that reference a symbol (reverse closure of the SCIP impact index) | PerFile | `scip_impact.rs`, `impact.rs` (M1.4) |
+| `scip.implements` | expansion | the traits a type implements, the types that implement a trait, the members that implement a trait method; read from the `impl .. for ..` headers of the tree and the SCIP reference occurrences (rust-analyzer writes no SCIP relationships); traits and types the index does not define, derives and `macro_rules!` impls give no edge | PerFile | `scip_implements.rs`, `scip_graph.rs` (`derive_impls`) |
 | `lsp.live` | expansion | definition, references and document symbols from a running language server (starts at the first expansion) | Live | `lsp_live.rs` |
 | `exact.closure` | first stage only | declarations that reference the symbol the question names, most references first | n/a | `src/app/traverse/first_stage.rs` |
 | `exact.pickaxe` | first stage only | commits found by `git log -G/-S/--grep` for a history question (20 s timeout per call) | n/a | `exact_history.rs`, `first_stage.rs` |
@@ -236,5 +237,5 @@ C4 replay auditor is ignored in the Full run (CI has no history). Owner decision
 - No exact-literal seed channel: traverse cannot start from an exact string match (a grep-style step); `grep.live` only expands from nodes the walk already has. A building block to add (owner direction, 2026-10-17).
 - No SCIP index in the R1 and external-repository evaluation trees, so `traverse` there falls back to chunks (R1 stage 2 never measured the walk, d333); the frozen tree `bfaff44` has one, and the walk benches in [v2/engine-results.md](v2/engine-results.md) used it. "Which types implement this trait" was never measured (d315); its hypotheses (no SCIP in
   the trees, implementation relationship not ingested, no `textDocument/implementation` request) are unchecked.
-- Docs are not indexed: no Markdown or other prose adapter, no `doc:` nodes in any map (17 supported extensions, none a documentation format).
+- Only Markdown (`.md`) is indexed as documentation: chunks per heading section, no `doc:` nodes in any map; no `.rst`, `.adoc` or `.txt` adapter (18 supported extensions).
 - The hop `kind_prior` table (call 1, containment 0.5) is a guess unless a fitted table is given (`priors`); the System One rung (S8) is a slot with a test double; the pre-merged edge source has no `[traverse]` key.

@@ -611,7 +611,9 @@ const SEED_MAPS: [&str; 2] = ["seeds.hybrid", "seeds.scip_names"];
 fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
     use NodeKind::{Chunk, Commit, ConfigKey, File, Symbol};
     match map {
-        "seeds.scip_names" | "graph.scip" | "scip.impact" | "exact.closure" => Some(&[Symbol]),
+        "seeds.scip_names" | "graph.scip" | "scip.impact" | "scip.implements" | "exact.closure" => {
+            Some(&[Symbol])
+        }
         "exact.pickaxe" => Some(&[Commit]),
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
         "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),

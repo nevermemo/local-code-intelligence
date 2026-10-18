@@ -149,7 +149,7 @@ async fn until_shutdown_signal<T>(
 #[derive(Parser)]
 #[command(
     version,
-    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code retrieval over MCP or plain REST/OpenAPI, with optional language-server navigation for every language (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd)"
+    about = "Standalone local Rust, TypeScript, JavaScript, Python, C#, Go, Java, C, and C++ code and Markdown documentation (opt-in, `[index].prose`) retrieval over MCP or plain REST/OpenAPI, with optional language-server navigation for every code language (rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd)"
 )]
 struct Cli {
     /// Configuration file. Without it `LCI_CONFIG` names one, and without
@@ -410,7 +410,11 @@ struct TraverseArgs {
     /// from a node's own name, to the chunks it finds), search.vector (the
     /// chunks nearest to a node's stored embedding; needs the embedder only
     /// for a node with no stored vector), scip.impact (the declarations
-    /// that reference a symbol, from the SCIP impact index) and lsp.live
+    /// that reference a symbol, from the SCIP impact index), scip.implements
+    /// (types to the traits they implement, traits to their implementing
+    /// types and trait methods to their implementations, from the
+    /// `impl .. for ..` headers of the tree (--root) and the SCIP index's
+    /// reference occurrences; derived and macro impls are absent) and lsp.live
     /// (definition, references and document symbols from a running language
     /// server, with the server paths and lsp_timeout_seconds of the
     /// configuration; the server starts at the first expansion, so a cold
@@ -498,6 +502,14 @@ struct TraverseArgs {
     /// configured `true` off.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     exact_seeds: Option<bool>,
+    /// With `--maps scip.implements`: how the traits and trait methods the
+    /// question's code spans name (`tauri::Manager`, `Runtime::run`) join the
+    /// other start nodes. `replace` keeps only them, `prepend` puts them first,
+    /// `auto` replaces when a path matched with its qualifiers and prepends
+    /// when it matched by the last segment alone. The response's `trait_seeds`
+    /// says how many start nodes they are.
+    #[arg(long, default_value = "auto")]
+    trait_seeds: local_code_intelligence::app::traverse::TraitSeedMode,
     /// Continue the traversal this handle names (it must be under --out, or
     /// under the data directory without it).
     #[arg(long)]
@@ -722,7 +734,7 @@ async fn run_traverse(
         )))),
         _ => None,
     };
-    let report = traverse::run(
+    let report = traverse::run_with_trait_seeds(
         &config.traverse,
         &dirs,
         &Call {
@@ -738,6 +750,7 @@ async fn run_traverse(
             handle: args.handle.as_deref(),
             lsp: Some(&config),
         },
+        args.trait_seeds,
     )
     .await?;
     if let Some(trace) = &report.trace {

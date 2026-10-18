@@ -14,6 +14,10 @@ use crate::node::rust_declarations;
 fn write_multilanguage_tree(root: &Path) {
     let files = [
         (
+            "docs/guide.md",
+            "# Guide\nHow to use the tool.\n\n## Install\n```sh\n# not a heading\ncargo install lci\n```\n\n## Usage\nRun `lci search`.\n",
+        ),
+        (
             "src/lib.rs",
             "//! Crate docs.\n\nuse std::fmt;\n\n/// A point.\n#[derive(Debug)]\npub struct Point { x: i32 }\n\nimpl fmt::Display for Point {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"{}\", self.x)\n    }\n}\n\nmod inner {\n    pub fn helper() -> u8 { 1 }\n}\n\npub trait Shape { fn area(&self) -> f64; }\n\nmacro_rules! twice { ($e:expr) => { $e * 2 }; }\n",
         ),
@@ -94,7 +98,7 @@ fn write_multilanguage_tree(root: &Path) {
 fn assert_hook_matches_chunker(root: &Path, compare_chunker: bool) -> (usize, usize) {
     let mut files = 0;
     let mut chunks = 0;
-    for file in sources(root).unwrap().files {
+    for file in sources(root, true).unwrap().files {
         let path = &file.relative_path;
         let hooked = extract_with_adapter(path, &file.source, file.adapter).unwrap();
         if compare_chunker {
@@ -132,7 +136,7 @@ fn hook_chunks_are_byte_identical_on_a_tree_of_every_language() {
     let identity =
         |adapter: &language::LanguageAdapter| (adapter.identifier(), adapter.cache_version());
     let mut registered: Vec<_> = language::ADAPTERS.iter().map(identity).collect();
-    let mut walked: Vec<_> = sources(temp.path())
+    let mut walked: Vec<_> = sources(temp.path(), true)
         .unwrap()
         .files
         .iter()
@@ -186,7 +190,7 @@ fn hook_keeps_the_scan_order_of_chunks() {
     let scanned = scan(temp.path()).unwrap();
     assert!(!scanned.is_empty());
     let mut hooked: Vec<Chunk> = Vec::new();
-    for file in sources(temp.path()).unwrap().files {
+    for file in sources(temp.path(), true).unwrap().files {
         hooked.extend(
             extract_with_adapter(&file.relative_path, &file.source, file.adapter)
                 .unwrap()
@@ -215,7 +219,7 @@ fn chunks_of_a_tree_of_every_language_match_the_record() {
     write_multilanguage_tree(temp.path());
     let mut today = Vec::new();
     let mut hooked = Vec::new();
-    for file in sources(temp.path()).unwrap().files {
+    for file in sources(temp.path(), true).unwrap().files {
         let path = &file.relative_path;
         today.extend(chunks_with_adapter(path, &file.source, file.adapter).unwrap());
         hooked.extend(

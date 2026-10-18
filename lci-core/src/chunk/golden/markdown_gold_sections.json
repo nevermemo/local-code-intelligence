@@ -1,0 +1,128 @@
+[
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 1,
+    "end_line": 13,
+    "sha256": "4875677cce0eff6506665c672ff8fee4ddd069a1a3a5751974e449bef78ed7ae"
+  },
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 15,
+    "end_line": 42,
+    "sha256": "bc41d184a474249f625084694fa427f30b46e76542baec3a5f0732edc349b70a"
+  },
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 44,
+    "end_line": 70,
+    "sha256": "e1389ed4ed43792c69326e4d78e329f68d280236c1d6dce588d0ad9b7e808dcf"
+  },
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 72,
+    "end_line": 83,
+    "sha256": "8d88ea42ae89f0c9db073ddb0497bcf650e944790cc82a6edbb55187528b9aad"
+  },
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 85,
+    "end_line": 141,
+    "sha256": "456d074e8bdb634fae0ef7ad2a675c63bcc860f2a845da5ab1f5d49fe3ea52b9"
+  },
+  {
+    "fixture": "AGENTS.md.fixture",
+    "start_line": 143,
+    "end_line": 160,
+    "sha256": "101f54ea5105c28911ddbda8b52a772af27e94aa730680687add04c7838f3705"
+  },
+  {
+    "fixture": "CLAUDE.md.fixture",
+    "start_line": 1,
+    "end_line": 5,
+    "sha256": "9b8398c1921863e8739d66c5aaec85440ff4319855c71b11ff824e52fe90f690"
+  },
+  {
+    "fixture": "CLAUDE.md.fixture",
+    "start_line": 7,
+    "end_line": 23,
+    "sha256": "9bc1a5b1d520480bf7205094fa50a6d48fb09b6efb1c796258028b81f9b6d760"
+  },
+  {
+    "fixture": "CLAUDE.md.fixture",
+    "start_line": 25,
+    "end_line": 37,
+    "sha256": "c9fcb14f4b09e00c595c5878768b1aa098c4255fd416d4d001c98c22d62a5c59"
+  },
+  {
+    "fixture": "CLAUDE.md.fixture",
+    "start_line": 39,
+    "end_line": 60,
+    "sha256": "b07afd056b29e6a2621224e387165f1f10f1680a2b4e7bcc20c83bece1f34f03"
+  },
+  {
+    "fixture": "CLAUDE.md.fixture",
+    "start_line": 62,
+    "end_line": 87,
+    "sha256": "cbada18d386f399e05a9f8046fcb5f3502098e4f59a0be47cf50972208a654cc"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 19,
+    "end_line": 31,
+    "sha256": "6e4afd6d48f5d71af3a76d880a2e8ceb600ccef0703808c82c3ebb13d732bf1b"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 41,
+    "end_line": 53,
+    "sha256": "880720db60da4593c27e70ac42a827e530da6fcfb0236ba847a1d6f52ba10f55"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 55,
+    "end_line": 62,
+    "sha256": "02d91d5f6c55be7e388615db82e2bc3ab53c08f87067bb174aaad854827000ae"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 75,
+    "end_line": 83,
+    "sha256": "2198bb424091d0e1622418f16674d3025509f00011b4b5c687d769e269286693"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 85,
+    "end_line": 90,
+    "sha256": "49259c56bb079eac107e6fa7f6705f50ceae5ef6b1e8d4921de946eb2b58d727"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 108,
+    "end_line": 113,
+    "sha256": "e550317afe73b7642461dad05d764930dc91320c4597a2bfba1956939cf45794"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 115,
+    "end_line": 117,
+    "sha256": "e498b0468afadc23cc998ba92e482b02d6337f02839bcdd533fda3d286c1baa3"
+  },
+  {
+    "fixture": "SKILL.md.fixture",
+    "start_line": 119,
+    "end_line": 130,
+    "sha256": "0743f8aeb0b58b8f44e4fa15a1a5bef82d1d1b363cc5da610eaf61bbc90dfcad"
+  },
+  {
+    "fixture": "app_AGENTS.md.fixture",
+    "start_line": 1,
+    "end_line": 6,
+    "sha256": "2ab4cf9386badbe7b413a5a6ff1ed4ac0316eef7fbdce1359a90c55fc813d5ff"
+  },
+  {
+    "fixture": "documentation.instructions.md.fixture",
+    "start_line": 1,
+    "end_line": 12,
+    "sha256": "a6a5995639d6002fa9c364fdd97c9f9633f8df484b1fc898407f9f524da71b8d"
+  }
+]

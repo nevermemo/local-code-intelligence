@@ -7,7 +7,10 @@
 //! `start_line`, `end_line`), `language`, `source_role`, and `code`; the
 //! retrieval metadata (scores, ranks, channels, hashes, absolute path) is
 //! dropped. The envelope keeps `workspace.path`, `search_profile`, the
-//! warning, notes, filters, and the index lifecycle.
+//! warning, notes, filters, and the index lifecycle. When the report carries a
+//! documentation lane, its hits follow `results` under `docs` (the same compact
+//! shape, sharing the response ceiling) and its failure, if any, is
+//! `docs_warning`; both are absent otherwise.
 //!
 //! Two limits shorten `code` and never touch a locator or the order of hits:
 //! at most `max_hit_lines` lines per hit, and a ceiling on the serialized
@@ -47,6 +50,9 @@ struct CompactReport<'a> {
     search_profile: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'a str>,
+    /// The docs lane's own warning, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docs_warning: Option<&'a str>,
     #[serde(skip_serializing_if = "no_notes")]
     notes: &'a [String],
     filters: &'a EffectiveFilterReport,
@@ -55,6 +61,10 @@ struct CompactReport<'a> {
     #[serde(skip_serializing_if = "is_false")]
     response_truncated: bool,
     results: Vec<CompactHit<'a>>,
+    /// The documentation lane, after the code results; present exactly when
+    /// the search report carries one. Its hits share the response ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docs: Option<Vec<CompactHit<'a>>>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +102,12 @@ fn is_false(flag: &bool) -> bool {
 /// closing line per hit).
 pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<String> {
     let ceiling = limits.max_response_chars;
+    // Code results first, then the docs lane's: one list for the ceiling.
+    let docs_hits: &[Hit] = report
+        .docs
+        .as_ref()
+        .map_or(&[], |docs| docs.results.as_slice());
+    let all_hits = || report.results.iter().chain(docs_hits);
     let build = |per_hit_budget: Option<usize>| -> Result<String> {
         let view = CompactReport {
             workspace: CompactWorkspace {
@@ -99,6 +115,10 @@ pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Stri
             },
             search_profile: report.search_profile.as_deref(),
             warning: report.warning.as_deref(),
+            docs_warning: report
+                .docs
+                .as_ref()
+                .and_then(|docs| docs.warning.as_deref()),
             notes: &report.notes,
             filters: &report.filters,
             index: &report.index,
@@ -108,6 +128,12 @@ pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Stri
                 .iter()
                 .map(|hit| compact_hit(hit, limits.max_hit_lines, per_hit_budget))
                 .collect(),
+            docs: report.docs.as_ref().map(|docs| {
+                docs.results
+                    .iter()
+                    .map(|hit| compact_hit(hit, limits.max_hit_lines, per_hit_budget))
+                    .collect()
+            }),
         };
         Ok(serde_json::to_string(&view)?)
     };
@@ -122,17 +148,23 @@ pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Stri
     let floor = build(Some(0))?;
     let floor_chars = serialized_chars(&floor);
     if floor_chars > ceiling {
+        let counted = if docs_hits.is_empty() {
+            format!("{} results", report.results.len())
+        } else {
+            format!(
+                "{} results and {} docs",
+                report.results.len(),
+                docs_hits.len()
+            )
+        };
         bail!(
-            "the compact search result cannot fit compact_max_response_chars ({ceiling}): its locators and metadata alone take {floor_chars} characters for {} results; ask for a lower top_k or narrow the search with languages, include_paths, exclude_paths or source_roles",
-            report.results.len()
+            "the compact search result cannot fit compact_max_response_chars ({ceiling}): its locators and metadata alone take {floor_chars} characters for {counted}; ask for a lower top_k or narrow the search with languages, include_paths, exclude_paths or source_roles",
         );
     }
     // The largest per-hit budget (serialized characters of one hit's code)
     // that still fits: `low` always fits, `high` never does.
     let mut low = 0;
-    let mut high = report
-        .results
-        .iter()
+    let mut high = all_hits()
         .map(|hit| {
             let (code, ..) = excerpt(hit, limits.max_hit_lines, None);
             json_chars(&code) + CLOSING_LINE_RESERVE
@@ -339,6 +371,7 @@ mod tests {
             notes: Vec::new(),
             timings: Timings::default(),
             results,
+            docs: None,
             index: SearchIndexLifecycle {
                 action: IndexAction::Reused,
                 wait_ms: 0.0,
@@ -698,6 +731,103 @@ mod tests {
         assert!(shown.starts_with("word word"), "{shown}");
         assert_eq!(first["excerpt_end_line"], 1);
         assert_eq!(first["code_truncated"], true);
+    }
+
+    fn with_docs(mut base: SearchReport, docs: Vec<Hit>, warning: Option<&str>) -> SearchReport {
+        base.docs = Some(super::super::search::DocsLane {
+            candidate_count: docs.len(),
+            results: docs,
+            reranked: true,
+            warning: warning.map(str::to_owned),
+            timings: Default::default(),
+        });
+        base
+    }
+
+    #[test]
+    fn the_docs_list_follows_the_results_in_the_compact_shape_and_keeps_its_own_warning() {
+        let mut guide = hit("docs/guide.md", 1, "# Guide\ntext\n");
+        guide.chunk.language = "markdown".to_owned();
+        guide.source_role = SourceRole::Documentation;
+        let both = with_docs(
+            report(vec![hit("src/a.rs", 10, "fn a() {}\n")]),
+            vec![guide],
+            Some("Docs reranker unavailable"),
+        );
+        let text = compact_view(&both, limits(40, 16_000)).unwrap();
+        // The docs list comes after the results, its warning before them.
+        assert_key_order(
+            &text,
+            &[
+                "workspace",
+                "search_profile",
+                "docs_warning",
+                "filters",
+                "index",
+                "results",
+                "docs",
+                "relative_file_path",
+            ],
+        );
+        let view = view_of(&both, limits(40, 16_000)).unwrap();
+        assert_eq!(
+            keys(&view),
+            sorted(vec![
+                "workspace",
+                "search_profile",
+                "docs_warning",
+                "filters",
+                "index",
+                "results",
+                "docs"
+            ])
+        );
+        assert_eq!(view["docs"][0]["relative_file_path"], "docs/guide.md");
+        assert_eq!(view["docs"][0]["source_role"], "documentation");
+        assert_eq!(keys(&view["docs"][0]), keys(&results(&view)[0]));
+        assert_eq!(view["results"][0]["relative_file_path"], "src/a.rs");
+
+        // Without a lane, neither key exists.
+        let plain = view_of(
+            &report(vec![hit("src/a.rs", 10, "x\n")]),
+            limits(40, 16_000),
+        )
+        .unwrap();
+        assert!(plain.get("docs").is_none() && plain.get("docs_warning").is_none());
+    }
+
+    #[test]
+    fn docs_hits_share_the_response_ceiling_with_the_code_hits() {
+        let code = numbered_lines(60);
+        let docs: Vec<Hit> = (0..3)
+            .map(|n| {
+                let mut doc = hit(&format!("docs/part_{n}.md"), 1, &code);
+                doc.chunk.language = "markdown".to_owned();
+                doc
+            })
+            .collect();
+        let base = with_docs(
+            report(
+                (0..5)
+                    .map(|n| hit(&format!("src/f_{n}.rs"), 100 + n, &code))
+                    .collect(),
+            ),
+            docs,
+            None,
+        );
+        let whole = view_of(&base, limits(40, 1_000_000)).unwrap();
+        let ceiling = chars_of(&whole) / 2;
+        let view = view_of(&base, limits(40, ceiling)).unwrap();
+        assert!(chars_of(&view) <= ceiling, "{}", chars_of(&view));
+        assert_eq!(view["response_truncated"], true);
+        let docs_list = view["docs"].as_array().unwrap();
+        assert_eq!(docs_list.len(), 3);
+        // The docs are shortened too, not left whole while the code pays.
+        for hit in docs_list {
+            assert_eq!(hit["code_truncated"], true);
+        }
+        let error = view_of(&base, limits(40, 1_000)).unwrap_err().to_string();
+        assert!(error.contains("5 results and 3 docs"), "{error}");
     }
 
     #[test]

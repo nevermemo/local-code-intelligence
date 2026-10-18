@@ -13,7 +13,9 @@ const RECIPE_TOOLS: [&str; 6] = [
 ];
 
 /// A tree with an `index.scip` whose symbols have kinds (the recipes anchor
-/// at declarations): `alpha` references `Foo`, `beta` calls `alpha`.
+/// at declarations): `alpha` references `Foo`, `beta` calls `alpha`, and
+/// `Foo` implements the trait `Speak` (its `say` is the trait method's
+/// implementation).
 #[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
 fn write_recipe_tree(root: &Path) {
     use scip::types::{Document, Occurrence, SymbolInformation, symbol_information::Kind};
@@ -21,6 +23,11 @@ fn write_recipe_tree(root: &Path) {
     std::fs::write(
         root.join("a.rs"),
         "struct Foo;\nfn alpha() { Foo }\nfn beta() { alpha() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.rs"),
+        "trait Speak { fn say(&self); }\nimpl Speak for Foo { fn say(&self) {} }\n",
     )
     .unwrap();
     let symbol = |path: &str| format!("rust-analyzer cargo demo 0.1.0 {path}");
@@ -52,8 +59,28 @@ fn write_recipe_tree(root: &Path) {
         info("a/alpha().", Kind::Function),
         info("a/beta().", Kind::Function),
     ];
+    // A second file, so the trait and the impl are not siblings of `beta`.
+    let mut traits = Document::default();
+    traits.relative_path = "b.rs".to_owned();
+    traits.occurrences = vec![
+        occurrence(&[0, 6, 11], "b/Speak#", 1, &[0, 0, 0, 30]),
+        occurrence(&[0, 17, 20], "b/Speak#say().", 1, &[0, 14, 0, 28]),
+        occurrence(&[1, 5, 10], "b/Speak#", 0, &[]),
+        occurrence(&[1, 15, 18], "a/Foo#", 0, &[]),
+        occurrence(
+            &[1, 24, 27],
+            "b/impl#[Foo][Speak]say().",
+            1,
+            &[1, 21, 1, 37],
+        ),
+    ];
+    traits.symbols = vec![
+        info("b/Speak#", Kind::Trait),
+        info("b/Speak#say().", Kind::Method),
+        info("b/impl#[Foo][Speak]say().", Kind::Method),
+    ];
     let mut message = scip::types::Index::default();
-    message.documents = vec![document];
+    message.documents = vec![document, traits];
     scip::write_message_to_file(root.join("index.scip"), message).unwrap();
 }
 
@@ -106,6 +133,17 @@ fn the_recipe_command_prints_the_answer_without_a_server() {
     let walk: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result_names(&walk, "walk"), ["alpha"], "{walk}");
     assert_eq!(result_names(&walk, "file"), ["file:a.rs"], "{walk}");
+
+    // A trait-impl member is linked to the trait's method declaration by an
+    // `implements` edge, but a path over calls does not cross it.
+    let (ok, stdout, stderr) = run("flow_path", r#"{"from":"Foo::say","to":"Speak::say"}"#);
+    assert!(ok, "{stderr}");
+    let implemented: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(implemented["stop"]["reason"], "empty", "{implemented}");
+    assert!(
+        result_names(&implemented, "path").is_empty(),
+        "{implemented}"
+    );
 
     // An unknown recipe and a stray argument are refused by name.
     let (ok, _, stderr) = run("no_such_recipe", "{}");
@@ -338,4 +376,120 @@ async fn with_the_flags_on_the_recipes_answer_over_mcp_and_rest() {
     token.cancel();
     server.abort();
     models_task.abort();
+}
+
+#[test]
+fn traverse_over_scip_implements_reaches_the_member_from_the_trait_method() {
+    let temp = tempfile::tempdir().unwrap();
+    let tree = temp.path().join("tree");
+    write_recipe_tree(&tree);
+    let run = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command.current_dir(temp.path()).args(args);
+        strip_lci_env(&mut command);
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    // The node ids of the two methods, from a recipe's anchors.
+    let (ok, stdout, stderr) = run(&[
+        "recipe",
+        "flow_path",
+        "--root",
+        tree.to_str().unwrap(),
+        "--args",
+        r#"{"from":"Speak::say","to":"Foo::say"}"#,
+        "--out",
+        temp.path().join("out").to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let anchors: Value = serde_json::from_str(&stdout).unwrap();
+    let declaration = anchors["anchor"]["from"]["resolved"].as_str().unwrap();
+    let member = anchors["anchor"]["to"]["resolved"].as_str().unwrap();
+
+    let (ok, stdout, stderr) = run(&[
+        "traverse",
+        "--scip",
+        tree.join("index.scip").to_str().unwrap(),
+        "--root",
+        tree.to_str().unwrap(),
+        "--seeds",
+        declaration,
+        "--maps",
+        "scip.implements",
+        "--out",
+        temp.path().join("out").to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let walk: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        walk["notes"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("scip.implements: 1 impl headers read (1 with a trait"),
+        "{walk}"
+    );
+    // The member is reached in one hop from the trait method, over the
+    // `implements` edge (the only edge the one enabled map has).
+    let reached = walk["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["node"] == member)
+        .unwrap_or_else(|| panic!("{member} not reached: {walk}"));
+    assert_eq!(reached["depth"], 1, "{walk}");
+    assert_eq!(reached["via"], "scip.implements", "{walk}");
+    assert_eq!(reached["witness"], "compiler", "{walk}");
+}
+
+#[test]
+fn traverse_starts_at_the_trait_method_a_question_names_and_checks_trait_seeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let tree = temp.path().join("tree");
+    write_recipe_tree(&tree);
+    let run = |extra: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command.current_dir(temp.path()).args([
+            "traverse",
+            "--scip",
+            tree.join("index.scip").to_str().unwrap(),
+            "--root",
+            tree.to_str().unwrap(),
+            "--question",
+            "What must change if `Speak::say` changes?",
+            "--maps",
+            "scip.implements",
+            "--out",
+            temp.path().join("out").to_str().unwrap(),
+        ]);
+        command.args(extra);
+        strip_lci_env(&mut command);
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    // The default and both modes start at the declaration and reach the member.
+    for extra in [
+        &[][..],
+        &["--trait-seeds", "replace"],
+        &["--trait-seeds", "prepend"],
+    ] {
+        let (ok, stdout, stderr) = run(extra);
+        assert!(ok, "{extra:?}: {stderr}");
+        let walk: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(walk["seed_source"], "traits", "{extra:?}: {walk}");
+        assert_eq!(walk["trait_seeds"], 1, "{extra:?}: {walk}");
+        assert_eq!(walk["seed_hits"][0]["how"], "trait_method", "{walk}");
+        assert_eq!(walk["results"][1]["via"], "scip.implements", "{walk}");
+    }
+    // A bad value is refused with the choices.
+    let (ok, _, stderr) = run(&["--trait-seeds", "both"]);
+    assert!(!ok);
+    assert!(stderr.contains("auto, replace or prepend"), "{stderr}");
 }

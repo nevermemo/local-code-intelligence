@@ -290,7 +290,7 @@ impl Map for SemanticMap<'_> {
                 );
             }
         };
-        match Store::search(
+        match Store::search_code_lane(
             self.snapshot,
             self.workspace,
             &vector,
@@ -587,8 +587,16 @@ impl App {
             .snapshot(&workspace)
             .await?
             .context("workspace is not indexed")?;
-        let mut universe = Store::chunks(&snapshot, &workspace).await?;
-        universe.retain(|hit| super::hit_matches(&filters, hit));
+        let mut chunks = Store::chunks(&snapshot, &workspace).await?;
+        chunks.retain(|hit| super::hit_matches(&filters, hit));
+        // The production search's code lane: the prose chunks belong to the
+        // docs lane, which has no map, so they are not in the universe.
+        let (universe, prose) = super::split_prose(&filters, chunks);
+        let code_filters = if prose.is_empty() {
+            filters.clone()
+        } else {
+            super::lane_filter(&filters, &universe)
+        };
         let view = SnapshotView::new(
             lci_maps::SnapshotRef {
                 indexed_at: snapshot.indexed_at.clone(),
@@ -603,7 +611,7 @@ impl App {
                 app: self,
                 snapshot: &snapshot,
                 workspace: &workspace,
-                filters: &filters,
+                filters: &code_filters,
                 matching: universe.len(),
                 descriptor: semantic_descriptor(),
             }),

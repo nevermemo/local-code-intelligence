@@ -31,12 +31,16 @@ env:
   RUST_PIN: 1.99.0
 
 jobs:
+  # Windows first during development: the Windows job is the one that must
+  # pass. Linux and macOS run for early warning only and never fail the
+  # workflow; their support is decided closer to a release.
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

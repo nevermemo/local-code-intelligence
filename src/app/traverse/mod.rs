@@ -23,6 +23,14 @@
 //!   symbol names (map `seeds.scip_names`). Used only when the caller asked
 //!   for that map alone, or as the visible fallback when the hybrid search is
 //!   unavailable or finds nothing; the response says why (`seed_fallback`).
+//! * `traits`, `traits+hybrid`, `traits+name_tokens`: with `scip.implements`
+//!   on, a trait path or `Trait::method` path in a code span of the question
+//!   names trait or trait-method nodes, which the walk expands to the
+//!   implementing types and members ([`TraitSeedMode`] says whether they
+//!   replace the other sources' start nodes or go before them). The response
+//!   then carries `trait_seeds`, how many start nodes they are (0 when none
+//!   is named), and each of them a `seed_hits` record with `how` `trait` or
+//!   `trait_method`.
 //!
 //! The mode reads the SCIP index and, for `hybrid`, runs the search over the
 //! workspace's index (which `search_code` also creates when it is missing).
@@ -70,6 +78,7 @@ use lci_maps::{
     probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::SCIP_MAP_ID,
     scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
+    scip_implements::{ImplementsMap, ImplementsOptions, SCIP_IMPLEMENTS_ID},
     search_maps::{
         ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
     },
@@ -98,15 +107,16 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use index::{Loaded, Shared, config_key_map, impact_map, load};
+use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
     add_commits, add_first_stage_only, add_policy, add_sites, chunk_lines, lint_steer,
     no_seeds_response, response_json,
 };
+pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
-use seeds::{SeedMap, Seeds, find_seeds};
+use seeds::{SeedMap, Seeds, add_trait_seed_count, add_trait_seeds, find_seeds};
 
 /// The map that finds the start nodes from the question's words (the
 /// stand-in, `seed_source` `name_tokens`).
@@ -128,14 +138,17 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// `search.vector` (the chunks nearest to a node's stored embedding; one
 /// counted embedding call when none is stored; needs the embedder) and
 /// `scip.impact` (the declarations that reference a symbol, the reverse
-/// closure of the SCIP impact index). `lsp.live` asks a language server for
+/// closure of the SCIP impact index), and `scip.implements` (the traits a type
+/// implements, the types that implement a trait and the members that implement
+/// a trait method, read from the `impl .. for ..` headers of the tree and the
+/// SCIP index). `lsp.live` asks a language server for
 /// definition, references and document symbols (starts the server at the first
 /// expansion; needs its binary). The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 10] = [
+pub const OPT_IN_MAPS: [MapId; 11] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -143,6 +156,7 @@ pub const OPT_IN_MAPS: [MapId; 10] = [
     SEARCH_LEXICAL_ID,
     SEARCH_VECTOR_ID,
     SCIP_IMPACT_ID,
+    SCIP_IMPLEMENTS_ID,
     LSP_LIVE_ID,
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
@@ -451,6 +465,18 @@ fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
 /// unknown handle, a missing index) or the data directory not being writable
 /// for a handle; a failed trace write is a note, not an error.
 pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Result<Report> {
+    run_with_trait_seeds(limits, dirs, call, TraitSeedMode::Auto).await
+}
+
+/// [`run`] with the mode in which the traits and trait methods the question
+/// names join the start nodes (only with `scip.implements` on; see
+/// [`TraitSeedMode`]).
+pub async fn run_with_trait_seeds(
+    limits: &TraverseConfig,
+    dirs: &Dirs,
+    call: &Call<'_>,
+    trait_seed_mode: TraitSeedMode,
+) -> Result<Report> {
     if call.top_k == 0 || call.top_k > MAX_TOP_K {
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
@@ -821,6 +847,46 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             }
         }
     }
+    let mut implements = None;
+    if wants(SCIP_IMPLEMENTS_ID) {
+        match call.scip_root {
+            None => notes.push("scip.implements needs the tree: give --root".to_owned()),
+            Some(root) => {
+                let map = match implements_map(call.scip_index, root, &loaded).await {
+                    Ok(map) => {
+                        let stats = map.stats();
+                        let report = &loaded.scip.graph().report;
+                        notes.push(format!(
+                            "scip.implements: {} impl headers read ({} with a trait, {} external; {} macro and {} other unresolved, {} documents without source), {} type-trait and {} method pairs, {} facts dropped for lack of a node id, cap {} edges per node",
+                            report.impl_headers,
+                            report.impl_resolved,
+                            report.impl_external_trait,
+                            report.impl_unresolved_macro,
+                            report.impl_unresolved_other,
+                            report.impl_no_source,
+                            stats.type_trait,
+                            stats.methods,
+                            stats.dropped,
+                            map.options().cap
+                        ));
+                        map
+                    }
+                    Err(error) => {
+                        notes.push(format!("scip.implements has no edges: {error:#}"));
+                        Arc::new(ImplementsMap::empty(ImplementsOptions::default()))
+                    }
+                };
+                if snapshot.is_none()
+                    && let Some(note) =
+                        add_trait_seeds(&mut found, &map, call.question, trait_seed_mode)
+                {
+                    notes.push(note);
+                }
+                implements = Some(map.clone());
+                register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+            }
+        }
+    }
     // The exact operators are descriptor-only maps; their cards are the first
     // stage, made once per call and not on a continuation.
     if wants(EXACT_CLOSURE_ID) {
@@ -993,6 +1059,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                 let mut response = no_seeds_response(call, &found, notes);
                 add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, warnings);
+                add_trait_seed_count(&mut response, &found);
                 return Ok(Report {
                     response,
                     trace: None,
@@ -1110,6 +1177,9 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
             .as_ref()
             .map(|map| (SEARCH_VECTOR_ID, map.log())),
         impact.as_ref().map(|map| (SCIP_IMPACT_ID, map.log())),
+        implements
+            .as_ref()
+            .map(|map| (SCIP_IMPLEMENTS_ID, map.log())),
     ];
     for (id, log) in costs.into_iter().flatten() {
         if let Some(p50) = log.p50() {
@@ -1132,6 +1202,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         object.insert("exact".into(), json!(exact_report));
     }
     add_policy(&mut response, effective, warnings);
+    add_trait_seed_count(&mut response, &found);
     add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
