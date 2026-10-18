@@ -2487,6 +2487,30 @@ async fn a_trait_path_in_the_question_starts_the_walk_at_the_trait() {
     }
 }
 
+// Without `scip.impact` among the maps the implementing types still get a
+// site: a type is no node of the SCIP graph, and a result nothing locates is
+// dropped by a consumer that needs a place (the trait bench scored Q1 as 0).
+#[tokio::test]
+async fn the_types_scip_implements_reaches_are_located_without_scip_impact() {
+    let tree = trait_tree();
+    let response = trait_run(
+        &tree,
+        "Which types implement `demo::Tr`?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    let results = response["results"].as_array().expect("results");
+    for (id, line) in [(A_ID, 4), (B_ID, 5)] {
+        let card = results
+            .iter()
+            .find(|card| card["node"] == id)
+            .unwrap_or_else(|| panic!("{id} not in {response}"));
+        assert_eq!(card["site"]["path"], "a.rs", "{id}: {response}");
+        assert_eq!(card["site"]["line"], line, "{id}: {response}");
+    }
+}
+
 #[tokio::test]
 async fn a_trait_method_path_starts_the_walk_at_the_declaration() {
     let tree = trait_tree();
