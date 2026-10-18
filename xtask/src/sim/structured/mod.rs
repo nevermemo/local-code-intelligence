@@ -1002,9 +1002,10 @@ fn compare_corpus(root: &Path, options: &GrepOptions, needles: &[String]) -> Cor
         bytes: corpus.bytes(),
     };
     for needle in needles {
-        let far = Instant::now() + options.timeout;
-        let disk = scan(root, needle, options, far);
-        let stored = corpus.scan(needle, far);
+        // Each scan gets its own deadline, so a slow disk scan cannot cut the
+        // corpus scan short.
+        let disk = scan(root, needle, options, Instant::now() + options.timeout);
+        let stored = corpus.scan(needle, Instant::now() + options.timeout);
         report.disk_ms += disk.elapsed_ms;
         report.corpus_ms += stored.elapsed_ms;
         if let Some(why) = scan_difference(&stored, &disk) {
