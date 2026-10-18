@@ -207,11 +207,31 @@ pub fn extract_with_adapter(
     extract(path, source, adapter, true)
 }
 
-/// The one chunker: parses `source`, cuts the tree into chunks, and walks
-/// the declarations only when `with_declarations` asks for them (and the
-/// language has an extractor), so a caller that wants chunks alone pays
-/// for no declaration walk.
+/// The one chunker: picks the adapter's extractor. Code is parsed and cut
+/// along its syntax tree; prose goes through its own splitter and has no
+/// declarations.
 fn extract(
+    path: &str,
+    source: &str,
+    adapter: &language::LanguageAdapter,
+    with_declarations: bool,
+) -> Result<Extraction> {
+    match adapter.extractor() {
+        language::Extractor::TreeSitter { .. } => {
+            extract_tree_sitter(path, source, adapter, with_declarations)
+        }
+        language::Extractor::Prose(language::ProseKind::Markdown) => Ok(Extraction {
+            chunks: markdown::chunks(path, source, adapter.identifier()),
+            declarations: None,
+        }),
+    }
+}
+
+/// The Tree-sitter chunker: parses `source`, cuts the tree into chunks, and
+/// walks the declarations only when `with_declarations` asks for them (and
+/// the language has an extractor), so a caller that wants chunks alone pays
+/// for no declaration walk.
+fn extract_tree_sitter(
     path: &str,
     source: &str,
     adapter: &language::LanguageAdapter,
@@ -283,12 +303,13 @@ struct Sources {
     skipped: Vec<SkippedFile>,
 }
 
-fn sources(root: &Path) -> Result<Sources> {
-    sources_with_read(root, |path| std::fs::read(path))
+fn sources(root: &Path, prose: bool) -> Result<Sources> {
+    sources_with_read(root, prose, |path| std::fs::read(path))
 }
 
 fn sources_with_read(
     root: &Path,
+    prose: bool,
     mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<Sources> {
     let mut files = Vec::new();
@@ -308,6 +329,10 @@ fn sources_with_read(
         let Some(adapter) = language::for_path(entry.path()) else {
             continue;
         };
+        // `[index].prose = false`: prose files are not indexed at all.
+        if !prose && adapter.is_prose() {
+            continue;
+        }
         let path = entry.path().strip_prefix(root)?;
         let relative = path
             .components()
@@ -361,8 +386,15 @@ fn fingerprint_material(file: &SourceFile) -> String {
     )
 }
 
+/// The workspace fingerprint with every registered adapter, prose included.
 pub fn fingerprint(root: &Path) -> Result<String> {
-    let material = sources(root)?
+    fingerprint_with(root, true)
+}
+
+/// The workspace fingerprint; with `prose = false` the files of prose
+/// adapters (Markdown) are left out, as `[index].prose = false` does.
+pub fn fingerprint_with(root: &Path, prose: bool) -> Result<String> {
+    let material = sources(root, prose)?
         .files
         .iter()
         .map(fingerprint_material)
@@ -370,9 +402,23 @@ pub fn fingerprint(root: &Path) -> Result<String> {
     Ok(hash(&material))
 }
 
+/// [`scan_incremental_with`] with every registered adapter, prose included.
 pub fn scan_incremental(
     root: &Path,
     previous: &HashMap<String, crate::manifest::CachedFile>,
+) -> Result<Scan> {
+    scan_incremental_with(root, previous, true)
+}
+
+/// Scans the workspace, reusing `previous` entries whose file is unchanged.
+/// With `prose = false` the files of prose adapters (Markdown) are not
+/// indexed (`[index].prose = false`): they yield no chunks, and a file that
+/// `previous` holds counts as removed, so flipping the switch re-indexes
+/// exactly those files.
+pub fn scan_incremental_with(
+    root: &Path,
+    previous: &HashMap<String, crate::manifest::CachedFile>,
+    prose: bool,
 ) -> Result<Scan> {
     let mut chunks = Vec::new();
     let mut files = HashMap::new();
@@ -381,7 +427,7 @@ pub fn scan_incremental(
     let Sources {
         files: source_files,
         skipped: skipped_files,
-    } = sources(root)?;
+    } = sources(root, prose)?;
     let present: HashSet<_> = source_files
         .iter()
         .map(|file| file.relative_path.as_str())
@@ -444,8 +490,13 @@ pub fn scan(root: &Path) -> Result<Vec<Chunk>> {
     Ok(scan_incremental(root, &HashMap::new())?.chunks)
 }
 
+mod markdown;
+
 #[cfg(test)]
 mod extraction_tests;
+
+#[cfg(test)]
+mod markdown_tests;
 
 #[cfg(test)]
 mod tests {
@@ -953,7 +1004,7 @@ export interface TelemetryLifecycle {
         let previous = scan_incremental(temp.path(), &HashMap::new()).unwrap();
         let mut removed = false;
 
-        let result = sources_with_read(temp.path(), |path| {
+        let result = sources_with_read(temp.path(), true, |path| {
             if path == victim {
                 std::fs::remove_file(path).unwrap();
                 removed = true;
@@ -975,11 +1026,41 @@ export interface TelemetryLifecycle {
     }
 
     #[test]
+    fn prose_files_are_indexed_only_when_asked_and_the_switch_changes_the_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Title\nSome prose.\n").unwrap();
+
+        let without = scan_incremental_with(temp.path(), &HashMap::new(), false).unwrap();
+        assert!(without.files.keys().eq(["lib.rs"]));
+        assert!(without.chunks.iter().all(|c| c.language != "markdown"));
+        let with = scan_incremental_with(temp.path(), &without.files, true).unwrap();
+        assert!(with.files.contains_key("README.md"));
+        assert_eq!((with.parsed_files, with.unchanged_files), (1, 1));
+        assert_ne!(without.fingerprint, with.fingerprint);
+        assert_eq!(
+            fingerprint_with(temp.path(), false).unwrap(),
+            without.fingerprint
+        );
+        assert_eq!(
+            fingerprint_with(temp.path(), true).unwrap(),
+            with.fingerprint
+        );
+        // Switching back drops the prose file and reuses the code file.
+        let back = scan_incremental_with(temp.path(), &with.files, false).unwrap();
+        assert_eq!(
+            (back.removed_files, back.parsed_files, back.unchanged_files),
+            (1, 0, 1)
+        );
+        assert_eq!(back.fingerprint, without.fingerprint);
+    }
+
+    #[test]
     fn scan_fails_on_a_read_error_other_than_a_removed_file() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "fn visible() {}\n").unwrap();
 
-        let result = sources_with_read(temp.path(), |_| {
+        let result = sources_with_read(temp.path(), true, |_| {
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         });
 
@@ -1040,6 +1121,10 @@ export interface TelemetryLifecycle {
             ("runtime.js", "export function run() {}\n"),
             ("view.jsx", "export const View = () => <main />;\n"),
             ("Service.cs", "public sealed class Service {}\n"),
+            ("guide.md", "# Guide\ntext\n"),
+            ("ignored.MD", "# Upper\ntext\n"),
+            ("ignored.markdown", "# Long\ntext\n"),
+            ("ignored.mdx", "# Mdx\ntext\n"),
             ("ignored.RS", "fn uppercase() {}\n"),
             ("ignored.CS", "public sealed class Ignored {}\n"),
             ("ignored.mts", "export const ignored = 1;\n"),
@@ -1061,7 +1146,8 @@ export interface TelemetryLifecycle {
                 "runtime.js",
                 "view.jsx",
                 "ignored.py",
-                "Service.cs"
+                "Service.cs",
+                "guide.md"
             ])
         );
     }

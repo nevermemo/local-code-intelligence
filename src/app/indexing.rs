@@ -271,7 +271,9 @@ impl App {
         // A job ahead of the watcher may already have committed the change.
         // Scan again under the lock: the pre-debounce fingerprint can be old.
         let root = workspace.path.clone();
-        let current = tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await??;
+        let prose = self.config.index.prose;
+        let current =
+            tokio::task::spawn_blocking(move || chunk::fingerprint_with(&root, prose)).await??;
         let persisted = manifest::try_load(&self.config.data_dir, workspace)?;
         if persisted.fingerprint == current {
             return Ok(());
@@ -295,9 +297,11 @@ impl App {
         let prior_manifest = manifest::try_load(&self.config.data_dir, &workspace)?;
         let root = workspace.path.clone();
         let prior_files = prior_manifest.files;
-        let scan =
-            tokio::task::spawn_blocking(move || chunk::scan_incremental(&root, &prior_files))
-                .await??;
+        let prose = self.config.index.prose;
+        let scan = tokio::task::spawn_blocking(move || {
+            chunk::scan_incremental_with(&root, &prior_files, prose)
+        })
+        .await??;
         let chunks = scan.chunks;
         let previous = self.store.snapshot(&workspace).await?;
         let identity = self.config.embedding_identity();
@@ -426,7 +430,9 @@ impl App {
         };
         let current_fingerprint = if due {
             let root = workspace.path.clone();
-            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+            let prose = self.config.index.prose;
+            match tokio::task::spawn_blocking(move || chunk::fingerprint_with(&root, prose)).await?
+            {
                 Ok(fingerprint) => Some(fingerprint),
                 // A file that can't be read (permissions, a file vanishing
                 // mid-walk) must not turn ordinary search into a hard
@@ -543,10 +549,12 @@ impl App {
                 ),
             };
         let root = workspace.path.clone();
+        let prose = self.config.index.prose;
         // An unreadable file makes staleness unknown, not the status call a
         // failure: report the snapshot as stale and say why.
         let (stale, stale_check_error) =
-            match tokio::task::spawn_blocking(move || chunk::fingerprint(&root)).await? {
+            match tokio::task::spawn_blocking(move || chunk::fingerprint_with(&root, prose)).await?
+            {
                 Ok(current_fingerprint) => (
                     snapshot.is_some()
                         && (stored_manifest.fingerprint.is_empty()
@@ -667,11 +675,12 @@ impl App {
                     _ = interval.tick() => {}
                 }
                 let root = watched_workspace.path.clone();
+                let prose = app.config.index.prose;
                 let current = match tokio::task::spawn_blocking(move || {
                     if !root.try_exists()? {
                         return Ok(None);
                     }
-                    chunk::fingerprint(&root).map(Some)
+                    chunk::fingerprint_with(&root, prose).map(Some)
                 })
                 .await
                 {

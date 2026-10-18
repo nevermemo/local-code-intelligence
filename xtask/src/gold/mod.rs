@@ -590,6 +590,11 @@ pub fn to_evaluate(
             Ok(c) => {
                 let mut tags = vec![set.name().to_string()];
                 tags.extend(c.tags);
+                // Instruction gold names rule documents, which the search
+                // returns in its separate `docs` list; score that list.
+                if matches!(set, Set::Instructions) {
+                    tags.push(lci_core::evaluation::EvalLane::DOCS_TAG.to_string());
+                }
                 queries.push(EvalQuery {
                     query: str_of(item, "question").unwrap_or_default().to_string(),
                     workspace: workspace.to_string(),
@@ -649,7 +654,7 @@ fn note_for(set: Set) -> &'static str {
             "expected_paths = gold.files; the commit (the real target) and the as-of cut-off cannot be expressed, and evaluate searches the checked-out tree"
         }
         Set::Instructions => {
-            "expected_paths = rule documents; sections and units are lost, and today's index excludes these documents by construction"
+            "expected_paths = rule documents; sections and units are lost; tagged lane:docs, so the query is scored on the search's separate docs list (Markdown documents only)"
         }
     }
 }

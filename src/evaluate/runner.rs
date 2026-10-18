@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 
+use lci_core::evaluation::EvalLane;
+
 use crate::app::{App, IndexAction, SearchOptions, SearchReport};
+use crate::store::Hit;
 
 use super::definition::validate_definition;
 use super::metrics::aggregate;
@@ -52,11 +55,9 @@ pub fn parse_workspace_mappings(args: &[String]) -> Result<Vec<WorkspaceMapping>
         .collect()
 }
 
-/// Build bounded evidence rows from a search report's hits.
-fn build_evidence(report: &SearchReport) -> Vec<ResultEvidence> {
-    report
-        .results
-        .iter()
+/// Bounded evidence rows for `hits`, ranked from one.
+fn evidence_of(hits: &[Hit]) -> Vec<ResultEvidence> {
+    hits.iter()
         .enumerate()
         .map(|(index, hit)| {
             let chunk = &hit.chunk;
@@ -72,6 +73,32 @@ fn build_evidence(report: &SearchReport) -> Vec<ResultEvidence> {
             }
         })
         .collect()
+}
+
+/// The evidence a query is scored on and the evidence of the search's other
+/// list (counted in the token proxy, not scored), by the query's lane: the
+/// code `results` (the default), the `docs` list, or both in that order.
+fn lane_evidence(
+    lane: EvalLane,
+    report: &SearchReport,
+) -> (Vec<ResultEvidence>, Vec<ResultEvidence>) {
+    let code = evidence_of(&report.results);
+    let docs = report
+        .docs
+        .as_ref()
+        .map_or_else(Vec::new, |docs| evidence_of(&docs.results));
+    match lane {
+        EvalLane::Code => (code, docs),
+        EvalLane::Docs => (docs, code),
+        EvalLane::Union => {
+            let mut rows = code;
+            rows.extend(docs);
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.rank = index + 1;
+            }
+            (rows, Vec::new())
+        }
+    }
 }
 
 /// Switches of one evaluation run that never change what it measures.
@@ -166,14 +193,32 @@ pub async fn run_evaluation_with_options(
             }
         };
 
-        let evidence = build_evidence(&report);
+        let lane = query.lane();
+        let docs_list_len = report.docs.as_ref().map(|docs| docs.results.len());
+        let (evidence, unscored) = lane_evidence(lane, &report);
         let candidates = report.candidates.take();
         let rerank_outcome = report.rerank_outcome.take();
+        // A query scored on the docs lane also answers for its failures: a
+        // docs-lane warning is that query's fallback. A code query does not
+        // (the lane is fail-open and the code list is unaffected).
+        let docs_warning = report.docs.as_ref().and_then(|docs| docs.warning.clone());
+        let warning = match (lane, docs_warning) {
+            (EvalLane::Code, _) | (_, None) => report.warning,
+            (_, Some(docs)) => Some(match report.warning {
+                Some(code) => format!("{code}; {docs}"),
+                None => docs,
+            }),
+        };
+        let reranked = match (lane, report.docs.as_ref()) {
+            (EvalLane::Docs, Some(docs)) => docs.reranked,
+            (EvalLane::Docs, None) => false,
+            _ => report.reranked,
+        };
         let mut query_report = QueryReport::new(
             query.clone(),
             evidence,
-            report.reranked,
-            report.warning,
+            reranked,
+            warning,
             Some(report.filters),
             Some(EvalTimings {
                 query_embedding_ms: report.timings.query_embedding_ms,
@@ -192,6 +237,20 @@ pub async fn run_evaluation_with_options(
             }),
             Some(report.index.wait_ms),
         );
+        if !unscored.is_empty() {
+            query_report = query_report.with_unscored_evidence(unscored);
+        }
+        // The docs list is never longer than `[docs_lane].top_k`, whatever
+        // the query asks for; say so when that, not the index, bounded it.
+        if let (EvalLane::Docs | EvalLane::Union, Some(docs)) = (lane, docs_list_len) {
+            let asked = query.top_k.unwrap_or(app.config.default_top_k);
+            let bound = app.config.docs_lane.top_k;
+            if docs == bound && asked > bound {
+                query_report.notes.push(format!(
+                    "docs list bounded by [docs_lane].top_k = {bound} (query top_k {asked}); a docs arm sets docs_lane.top_k >= the query top_k"
+                ));
+            }
+        }
         if let Some(candidates) = candidates {
             query_report.candidates = candidates;
             query_report.arm = Some(CandidateArm::new(
@@ -202,7 +261,7 @@ pub async fn run_evaluation_with_options(
             // Notes (an LSP channel that hit its budget, say) change what a
             // dumped pool means, so a dump keeps them. Without the flag the
             // report is exactly what it always was and carries none.
-            query_report.notes = report.notes;
+            query_report.notes.extend(report.notes);
         }
         reports.push(query_report);
     }
