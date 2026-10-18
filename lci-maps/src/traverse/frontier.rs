@@ -396,7 +396,8 @@ pub fn hop(
 }
 
 /// [`hop`] for the node being expanded; `trait_seed` is true when it is a
-/// trait or trait method that `add_trait_seeds` made a start node. From such a
+/// start node that is a trait or trait method of `scip.implements` (named by
+/// the question or given by the caller). From such a
 /// node every candidate that `scip.implements` offers (all its edges are
 /// `Implements`), whichever map gave the fused edge its best witness, is
 /// followed, with no gate and no beam, at the `scip.implements` `Implements`

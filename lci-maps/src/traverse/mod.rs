@@ -521,7 +521,8 @@ impl<'s> Traversal<'s> {
     }
 
     /// Marks start nodes as trait seeds (the traits and trait methods the
-    /// question named, `add_trait_seeds`). When one is expanded its
+    /// question named, `add_trait_seeds`, or given start nodes that are
+    /// traits or trait methods of `scip.implements`). When one is expanded its
     /// `scip.implements` edges are all followed and rank first, see
     /// [`frontier::hop_from`]. Not kept in a handle: a continuation prices
     /// every node by [`frontier::hop`].

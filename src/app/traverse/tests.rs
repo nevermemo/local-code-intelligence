@@ -2573,7 +2573,8 @@ async fn a_trait_seed_reaches_every_implementor_past_the_beam() {
         .filter(|id| id.ends_with("/struct"))
         .collect();
     assert_eq!(types.len(), 20, "{response}");
-    // A walk from a given seed is not a trait seed: the beam still cuts it.
+    // A given start node that is the trait is walked the same way, though the
+    // question added no trait seed.
     let given = trait_run_top(
         &tree,
         "q",
@@ -2583,11 +2584,28 @@ async fn a_trait_seed_reaches_every_implementor_past_the_beam() {
         40,
     )
     .await;
-    let cut = reached(&given)
+    assert_eq!(given["trait_seeds"], 0, "{given}");
+    let given_types = reached(&given)
         .into_iter()
         .filter(|id| id.ends_with("/struct"))
         .count();
-    assert_eq!(cut, 16, "{given}");
+    assert_eq!(given_types, 20, "{given}");
+    // A given start node that is no trait is priced as before: the beam cuts
+    // the walk at the trait one hop on.
+    let plain = trait_run_top(
+        &tree,
+        "q",
+        &["sym:rust:a::S00/struct".to_owned()],
+        Some(&WITH_IMPLEMENTS),
+        TraitSeedMode::Auto,
+        40,
+    )
+    .await;
+    let cut = reached(&plain)
+        .into_iter()
+        .filter(|id| id.ends_with("/struct"))
+        .count();
+    assert!(cut < 20, "{plain}");
 }
 
 // Without `scip.impact` among the maps the implementing types still get a

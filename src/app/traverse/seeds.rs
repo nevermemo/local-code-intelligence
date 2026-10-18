@@ -474,6 +474,9 @@ pub(super) struct Seeds {
     /// paths name; `Some` only when the call walks `scip.implements` (0 when
     /// no path named one), so a bench can tell them from fallbacks.
     pub(super) trait_seeds: Option<usize>,
+    /// The given start nodes (`--seeds`) that are traits or trait methods of
+    /// `scip.implements`: walked as trait seeds, not counted in `trait_seeds`.
+    pub(super) given_traits: Vec<NodeId>,
     /// One record per start node: the retrievers that found it and its score.
     pub(super) details: Vec<Value>,
     /// Why the stand-in replaced the hybrid search, if it did.
@@ -487,11 +490,16 @@ pub(super) struct Seeds {
 
 impl Seeds {
     /// The start nodes that are the traits and trait methods the question
-    /// named ([`add_trait_seeds`] puts them first, `trait_seeds` of them); none
-    /// when it added none or the call is a continuation.
+    /// named ([`add_trait_seeds`] puts them first, `trait_seeds` of them), and
+    /// the given ones that are traits or trait methods ([`Self::given_traits`]);
+    /// none on a continuation.
     pub(super) fn trait_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         let count = self.trait_seeds.unwrap_or(0);
-        self.nodes.iter().take(count).map(|seed| seed.node.clone())
+        self.nodes
+            .iter()
+            .take(count)
+            .map(|seed| seed.node.clone())
+            .chain(self.given_traits.iter().cloned())
     }
 }
 
@@ -655,11 +663,13 @@ impl FromStr for TraitSeedMode {
 /// alone. The seeds are not credited to a map (`Seed::map` is `None`, as for
 /// given seeds): no map ranks them, the question's own words named them.
 ///
-/// Sets [`Seeds::trait_seeds`] (0 when nothing was added). Nothing else
-/// changes when the caller gave `--seeds`, when no path names a target, or on
-/// a continuation (which does not look for seeds). The source becomes
-/// `traits`, or `traits+<source>` when the other start nodes stay. Returns
-/// the note the response carries, if seeds were added.
+/// Sets [`Seeds::trait_seeds`] (0 when nothing was added). When the caller
+/// gave `--seeds`, none is added; the given start nodes that are targets of the
+/// map are walked as trait seeds ([`Seeds::given_traits`]). Nothing changes
+/// when no path names a target, or on a continuation (which does not look for
+/// seeds). The source becomes `traits`, or `traits+<source>` when the other
+/// start nodes stay. Returns the note the response carries, if seeds were
+/// added.
 pub(super) fn add_trait_seeds(
     found: &mut Seeds,
     map: &ImplementsMap,
@@ -668,6 +678,12 @@ pub(super) fn add_trait_seeds(
 ) -> Option<String> {
     found.trait_seeds = Some(0);
     if found.source == "given" {
+        found.given_traits = found
+            .nodes
+            .iter()
+            .filter(|seed| map.targets().iter().any(|t| t.node == seed.node))
+            .map(|seed| seed.node.clone())
+            .collect();
         return None;
     }
     let (names, _) = code_names(question);
