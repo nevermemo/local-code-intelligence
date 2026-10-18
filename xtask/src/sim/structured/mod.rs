@@ -428,8 +428,9 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
 
 /// The gold must not be searchable text: its keys and question texts would
 /// then be found by the agent it is meant to score. Refuses a gold dir inside
-/// any tree, a tree that holds `evaluations/structured/*.json` (the layout of
-/// a working tree of this repository: use a clean export), and a tree with a
+/// any tree, a tree that holds `evaluations/structured/*.json` or
+/// `evaluations/structured/dependency/*.json` (the layout of a working tree of
+/// this repository: use a clean export), and a tree with a
 /// byte-for-byte copy (line ends aside) of a gold file at its root, in
 /// `evaluations/` or in `evaluations/structured/`.
 fn check_gold_outside_trees(gold_dir: &Path, trees: &BTreeMap<String, PathBuf>) -> Result<()> {
@@ -448,6 +449,13 @@ fn check_gold_outside_trees(gold_dir: &Path, trees: &BTreeMap<String, PathBuf>) 
         if !json_files(&structured).is_empty() {
             bail!(
                 "--tree {repo} holds evaluations/structured/*.json: the gold's keys and questions would be searched text; use a clean export of the tree"
+            );
+        }
+        // The dependency gold lives one level down in a working tree; any json
+        // there is refused, so a copy of a gold file is too.
+        if !json_files(&structured.join("dependency")).is_empty() {
+            bail!(
+                "--tree {repo} holds evaluations/structured/dependency/*.json: the gold's keys and questions would be searched text; use a clean export of the tree"
             );
         }
         for dir in [tree.to_path_buf(), tree.join("evaluations")] {
@@ -1148,6 +1156,22 @@ mod tests {
         fs::remove_file(tree.join("evaluations/structured/anything.json")).unwrap();
         fs::write(tree.join("evaluations/structured/NOTES.md"), "notes\n").unwrap();
         run().unwrap();
+
+        // Only the dependency json remaining is refused too, and a notes file
+        // there is not json.
+        let dependency = tree.join("evaluations/structured/dependency");
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(dependency.join("NOTES.md"), "notes\n").unwrap();
+        fs::remove_dir_all(out.join("a-none-greedy")).unwrap();
+        run().unwrap();
+        fs::remove_dir_all(out.join("a-none-greedy")).unwrap();
+        fs::write(dependency.join("vite.json"), "{}\n").unwrap();
+        let err = run().unwrap_err();
+        assert!(
+            err.contains("holds evaluations/structured/dependency/*.json"),
+            "{err}"
+        );
+        assert!(!out.join("a-none-greedy").exists());
         cleanup(&[&gold, &tree, &out]);
     }
 

@@ -15,7 +15,10 @@
 //! repeated id (in one run, or in two pairs of one label), rows that disagree
 //! on family, repository, stratum, split or type, or `meta.xtask_sha256` that
 //! is missing or differs between A and B is an error: the arms must be the same
-//! frozen runner on the same questions. Several entries may share a policy
+//! frozen runner on the same questions. So is a run whose `summary.json` does
+//! not record zero `incomplete_scans`, and a `meta.gold_sha256` that is missing
+//! or differs between A and B (and between A and a context run) for a
+//! repository being compared. Several entries may share a policy
 //! label (one per stratum); their pairs are pooled. The stratum of a question
 //! comes from its rows.
 //!
@@ -49,8 +52,8 @@
 //!   excluding zero, or complete-success is at least 10 points higher with
 //!   tokens at most 5% worse and the interval of the success delta excluding
 //!   zero. Both policies must satisfy the same branch (that is the direction
-//!   agreement). A stratum under 10 questions, or a set of policy labels that
-//!   is not exactly {greedy, bfs}, is unresolved. On the config stratum C5 is
+//!   agreement). A policy under 10 questions in the stratum, or a set of policy
+//!   labels that is not exactly {greedy, bfs}, is unresolved. On the config stratum C5 is
 //!   the no-harm test: tokens at most 5% worse.
 //! - C6: charged calls and charged pops each at most 5% worse.
 //!
@@ -132,6 +135,19 @@ pub(crate) fn load_run(dir: &Path) -> Result<Run> {
         .with_context(|| format!("{}: summary.json has no `rows`", dir.display()))?;
     let rows: Vec<ScoreRow> = serde_json::from_value(rows)
         .with_context(|| format!("{}: summary.json `rows` are not score rows", dir.display()))?;
+    // A scan that stopped voids the run (`run` leaves its files in place): a
+    // missing count is as unusable as a nonzero one.
+    match summary.get("incomplete_scans").and_then(Value::as_u64) {
+        Some(0) => {}
+        Some(n) => bail!(
+            "{}: the run has {n} incomplete scans; a voided run cannot be compared",
+            dir.display()
+        ),
+        None => bail!(
+            "{}: summary.json has no `incomplete_scans` count; the run cannot be shown complete",
+            dir.display()
+        ),
+    }
     let text = |key: &str| -> Result<String> {
         summary
             .get(key)
@@ -362,7 +378,15 @@ fn check_context(label: &str, r: &Run, a: &Run) -> Result<()> {
             a.config
         );
     }
-    Ok(())
+    // The repositories both runs scored: R scored them against the same gold.
+    let in_a: BTreeSet<&str> = a.rows.iter().map(|row| row.repo.as_str()).collect();
+    let repos: BTreeSet<&str> = r
+        .rows
+        .iter()
+        .map(|row| row.repo.as_str())
+        .filter(|repo| in_a.contains(repo))
+        .collect();
+    check_gold_hashes(label, "A", a, "R", r, &repos)
 }
 
 fn pair_up(policy: &str, a: &Run, b: &Run, split: &str) -> Result<Vec<Paired>> {
@@ -397,7 +421,42 @@ fn pair_up(policy: &str, a: &Run, b: &Run, split: &str) -> Result<Vec<Paired>> {
             bail!("{policy}: question {id} is in run B but not in run A (missing pair)");
         }
     }
+    let repos: BTreeSet<&str> = out.iter().map(|p| p.a.repo.as_str()).collect();
+    check_gold_hashes(policy, "A", a, "B", b, &repos)?;
     Ok(out)
+}
+
+/// The sha256 of the gold file of `repo`, as the run recorded it in meta.json.
+fn gold_hash<'a>(run: &'a Run, repo: &str) -> Option<&'a str> {
+    run.meta
+        .get("gold_sha256")
+        .and_then(|m| m.get(repo))
+        .and_then(Value::as_str)
+}
+
+/// Both runs must record the hash of each of `repos`' gold files and the
+/// hashes must be equal: a gold edited between the runs scores them
+/// differently.
+fn check_gold_hashes(
+    label: &str,
+    side_x: &str,
+    x: &Run,
+    side_y: &str,
+    y: &Run,
+    repos: &BTreeSet<&str>,
+) -> Result<()> {
+    for &repo in repos {
+        match (gold_hash(x, repo), gold_hash(y, repo)) {
+            (Some(hx), Some(hy)) if hx == hy => {}
+            (Some(hx), Some(hy)) => bail!(
+                "{label}: runs {side_x} and {side_y} scored {repo} against different gold (sha256 {hx} vs {hy}); not comparable"
+            ),
+            _ => bail!(
+                "{label}: meta.json of run {side_x} or {side_y} has no gold_sha256 for {repo}"
+            ),
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ metrics
@@ -849,17 +908,18 @@ fn c5_branches(s: &Stats) -> (bool, bool, String) {
     (fewer, more, detail)
 }
 
-/// The overall C5 verdict on the dependency stratum.
+/// The overall C5 verdict on the dependency stratum; `fewest` is the question
+/// count of the smallest policy (each policy needs its own ten).
 fn c5_dependency(
-    n: usize,
+    fewest: usize,
     branches: &[(bool, bool)],
     mine: &[&ConditionCell],
 ) -> (Verdict, String) {
-    if n < TOO_SMALL {
+    if fewest < TOO_SMALL {
         return (
             Verdict::Unresolved,
             format!(
-                "the dependency half has {n} questions, under {TOO_SMALL}: it cannot meet this condition"
+                "a policy has {fewest} dependency questions, under {TOO_SMALL}: it cannot meet this condition"
             ),
         );
     }
@@ -974,7 +1034,7 @@ fn evaluate(
         if stratum == "dependency" {
             let (fewer, more, detail) = c5_branches(s);
             branches.push((fewer, more));
-            let verdict = if n < TOO_SMALL {
+            let verdict = if s.n < TOO_SMALL {
                 Verdict::Unresolved
             } else {
                 holds_if(fewer || more)
@@ -1032,7 +1092,8 @@ fn evaluate(
                 "no paired questions in this stratum".to_owned(),
             )
         } else if id == "C5" && stratum == "dependency" {
-            c5_dependency(n, &branches, &mine)
+            let fewest = by_policy.values().map(|s| s.n).min().unwrap_or(0);
+            c5_dependency(fewest, &branches, &mine)
         } else {
             (combine(&mine), list(&mine))
         };
@@ -1504,7 +1565,10 @@ mod tests {
     /// the arm and policy.
     fn run_of(arm: &str, skip: &str, policy: &str, rows: Vec<ScoreRow>) -> Run {
         Run {
-            meta: json!({"xtask_sha256": "abc"}),
+            meta: json!({
+                "xtask_sha256": "abc",
+                "gold_sha256": {"lci": "g1", "vite": "g2", "home-assistant": "g3"},
+            }),
             rows,
             dir: format!("{arm}-{skip}-{policy}"),
             arm: arm.to_owned(),
@@ -1865,6 +1929,55 @@ mod tests {
     }
 
     #[test]
+    fn c5_needs_ten_dependency_questions_in_each_policy() {
+        let a = world(4, 6);
+        let b = changed(&a, |r| {
+            if r.stratum == "dependency" {
+                r.score.charged_tokens = 700;
+            }
+        });
+        // Greedy keeps its 12 dependency questions, bfs only 2 of them.
+        let keep = |rows: &[ScoreRow]| -> Vec<ScoreRow> {
+            let (dependency, other): (Vec<_>, Vec<_>) = rows
+                .iter()
+                .cloned()
+                .partition(|r| r.stratum == "dependency");
+            other
+                .into_iter()
+                .chain(dependency.into_iter().take(2))
+                .collect()
+        };
+        let pairs = vec![pair("greedy", &a, &b), pair("bfs", &keep(&a), &keep(&b))];
+        let c = compare_with(&pairs, None, "heldout", 1, 100).unwrap();
+        let cell = |policy: &str| {
+            c.cells
+                .iter()
+                .find(|x| x.id == "C5" && x.stratum == "dependency" && x.policy == policy)
+                .unwrap()
+        };
+        // Each policy is judged on its own n: greedy holds, bfs cannot be read.
+        assert_eq!(
+            (cell("greedy").verdict, cell("greedy").n),
+            (Verdict::Holds, 12)
+        );
+        assert_eq!(
+            (cell("bfs").verdict, cell("bfs").n),
+            (Verdict::Unresolved, 2)
+        );
+        // With the larger policy's count the combined verdict would hold.
+        let dep = c
+            .conditions
+            .iter()
+            .find(|v| v.id == "C5" && v.stratum == "dependency")
+            .unwrap();
+        assert_eq!(dep.verdict, Verdict::Unresolved);
+        assert_eq!(dep.n, 12);
+        assert!(dep.detail.contains("a policy has 2"), "{}", dep.detail);
+        // Both policies at 12 hold, as before.
+        assert_eq!(verdict(&cmp(&a, &b), "C5", "dependency"), Verdict::Holds);
+    }
+
+    #[test]
     fn c5_needs_saved_tokens_or_more_success_in_both_policies() {
         let a = world(4, 6);
         let dep = |tokens: u64| {
@@ -2048,7 +2161,7 @@ mod tests {
         let summary = json!({
             "arm": "b", "grep_skip": "lockfiles", "policy": "bfs", "stratum": "config",
             "config": config_json(), "matcher": {"kind": "live_grep", "max_scan_bytes": 77},
-            "rows": rows, "aggregates": {},
+            "incomplete_scans": 0, "rows": rows, "aggregates": {},
         });
         std::fs::write(
             dir.join("summary.json"),
@@ -2086,6 +2199,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_run(&dir).unwrap().max_scan_bytes, None);
+
+        // A run with an incomplete scan, or none recorded, is refused.
+        let mut voided = summary.clone();
+        voided["incomplete_scans"] = json!(2);
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_string(&voided).unwrap(),
+        )
+        .unwrap();
+        let err = format!("{:#}", load_run(&dir).unwrap_err());
+        assert!(err.contains("2 incomplete scans"), "{err}");
+        voided.as_object_mut().unwrap().remove("incomplete_scans");
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_string(&voided).unwrap(),
+        )
+        .unwrap();
+        let err = format!("{:#}", load_run(&dir).unwrap_err());
+        assert!(err.contains("`incomplete_scans`"), "{err}");
 
         // Each setting is required.
         for key in ["arm", "grep_skip", "policy", "stratum", "config"] {
@@ -2162,6 +2294,65 @@ mod tests {
         let mut cap = ok();
         cap.2.max_scan_bytes = Some(1);
         assert!(refused(&[cap]).contains("different settings"));
+    }
+
+    #[test]
+    fn a_pair_must_have_scored_each_repository_against_the_same_gold() {
+        let a = world(4, 6);
+        let ok = || pair("greedy", &a, &a);
+        compare_with(&[ok()], None, "heldout", 1, 50).unwrap();
+
+        // B's gold file for one repository changed.
+        let mut changed_hash = ok();
+        changed_hash.2.meta["gold_sha256"]["vite"] = json!("edited");
+        let err = refused(&[changed_hash]);
+        assert!(
+            err.contains("different gold") && err.contains("vite"),
+            "{err}"
+        );
+        // The hash missing in either run, absent or null (a gold file `run` could not read).
+        let mut no_map = ok();
+        no_map.1.meta = json!({"xtask_sha256": "abc"});
+        assert!(refused(&[no_map]).contains("no gold_sha256 for"));
+        let mut null_hash = ok();
+        null_hash.2.meta["gold_sha256"]["lci"] = Value::Null;
+        let err = refused(&[null_hash]);
+        assert!(err.contains("no gold_sha256 for lci"), "{err}");
+        let mut no_repo = ok();
+        no_repo.2.meta["gold_sha256"]
+            .as_object_mut()
+            .unwrap()
+            .remove("home-assistant");
+        assert!(refused(&[no_repo]).contains("no gold_sha256 for home-assistant"));
+
+        // A repository the pair does not score is not checked.
+        let lci_only: Vec<ScoreRow> = a.iter().filter(|r| r.repo == "lci").cloned().collect();
+        let mut other_repo = pair("greedy", &lci_only, &lci_only);
+        other_repo.2.meta["gold_sha256"]["vite"] = json!("edited");
+        compare_with(&[other_repo], None, "heldout", 1, 50).unwrap();
+    }
+
+    #[test]
+    fn a_context_run_must_have_scored_against_the_same_gold() {
+        let a = world(4, 6);
+        let compared = |r: Run| {
+            let context = vec![("greedy".to_owned(), r)];
+            compare_with(&both_policies(&a, &a), Some(&context), "heldout", 1, 50)
+                .map_err(|e| e.to_string())
+        };
+        let r_run = || run_of("r", "rg", "greedy", a.clone());
+        compared(r_run()).unwrap();
+        let mut edited = r_run();
+        edited.meta["gold_sha256"]["lci"] = json!("edited");
+        let err = compared(edited).unwrap_err();
+        assert!(
+            err.contains("different gold") && err.contains("lci"),
+            "{err}"
+        );
+        let mut missing = r_run();
+        missing.meta = json!({"xtask_sha256": "abc"});
+        let err = compared(missing).unwrap_err();
+        assert!(err.contains("no gold_sha256 for"), "{err}");
     }
 
     #[test]
