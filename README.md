@@ -1,6 +1,6 @@
 # local-code-intelligence
 
-LCI (local-code-intelligence) is a local code-retrieval service for any Streamable HTTP MCP client, with a plain REST/OpenAPI mirror for clients that do not speak MCP and a CLI over the same application logic. It runs on Windows, macOS and Linux and covers Rust, TypeScript, JavaScript, Python, C#, Go, Java, C and C++.
+LCI (local-code-intelligence) is a local code-retrieval service for any Streamable HTTP MCP client, with a plain REST/OpenAPI mirror for clients that do not speak MCP and a CLI over the same application logic. It is developed and tested on Windows (macOS and Linux builds are not verified during development; CI runs them for early warning only) and covers Rust, TypeScript, JavaScript, Python, C#, Go, Java, C and C++.
 
 - Search combines Tree-sitter syntax chunks, an owned embedded LanceDB index, embeddings from any OpenAI-compatible embedder (the default configuration names `qwen3-embedding-4b`), ripgrep lexical search, optional persistent language-server retrieval for every supported language, Reciprocal Rank Fusion, and fail-open neural reranking.
 - It is meant to work like grep, with ranked chunks, and to extend grep by walking a code graph ("traverse" mode, off by default): a Wikirace on a code graph, where each step picks the next link (call, implementation, test, documentation mention, commit) from compiler-grade edges.
