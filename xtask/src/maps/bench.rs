@@ -22,6 +22,9 @@
 //! `--rescore <dir>` scores the raw outputs of an earlier run again (no
 //! traversal, no CLI) with the adapters as they are now.
 
+mod impl_units;
+
+use self::impl_units::{ImplGrouper, is_impl_header};
 use super::fit_priors::file_salt;
 use super::trend::{self, NCOLS, TrendRow};
 use crate::gold::{self, Answer, Set};
@@ -51,6 +54,8 @@ pub enum SetArg {
     WhereTo,
     History,
     Instructions,
+    /// The trait-implementation set (private; not part of `all`).
+    Traits,
     All,
 }
 
@@ -62,6 +67,7 @@ impl SetArg {
             SetArg::WhereTo => vec![Set::WhereTo],
             SetArg::History => vec![Set::History],
             SetArg::Instructions => vec![Set::Instructions],
+            SetArg::Traits => vec![Set::Traits],
             SetArg::All => vec![
                 Set::Impact,
                 Set::Flow,
@@ -75,17 +81,22 @@ impl SetArg {
 
 #[derive(Args)]
 pub struct BenchArgs {
-    /// Which gold set to run (all = the five, in order).
+    /// Which gold set to run (all = the five frozen ones, in order; traits is
+    /// run on its own).
     #[arg(long, value_enum)]
     set: SetArg,
-    /// Directory holding impact.json, flow.json, where-to.json, history.json
-    /// and instructions.json (private; no default).
+    /// Directory holding impact.json, flow.json, where-to.json, history.json,
+    /// instructions.json and traits.json (private; no default).
     #[arg(long)]
     gold_dir: PathBuf,
     /// The SCIP index of the frozen tree (not needed with --rescore).
     #[arg(long)]
     scip: Option<PathBuf>,
-    /// The frozen tree the index describes (not needed with --rescore).
+    /// The frozen tree the index describes (not needed with --rescore, where it
+    /// is optional). For `--set traits` it is also the source root: Q1 method
+    /// nodes of the SCIP graph carry no impl in their id, so their definition
+    /// sites are read here to count the methods of one impl block as one
+    /// answer. Without it they keep separate answer slots and the report warns.
     #[arg(long)]
     tree: Option<PathBuf>,
     /// Maps to use, comma separated (default: the maps the CLI turns on when
@@ -240,7 +251,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     for set in &sets {
         gold_items.push(select_items(
             *set,
-            gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(*set))))?,
+            gold::prepare(
+                *set,
+                gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(*set))))?,
+            ),
             args.limit,
             holdout.as_ref(),
         ));
@@ -317,6 +331,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         progress: true,
         rescored: false,
         score_k: args.score_k,
+        tree: args.tree.clone(),
     };
     traverser.maps = config.available_maps();
     for (set, items) in sets.into_iter().zip(&gold_items) {
@@ -369,6 +384,7 @@ fn rescore(
         progress: false,
         rescored: true,
         score_k: args.score_k,
+        tree: args.tree.clone(),
     };
     let raw = RawOutputs {
         dir: dir.join("raw"),
@@ -576,6 +592,7 @@ pub fn set_name(set: Set) -> &'static str {
         Set::WhereTo => "where-to",
         Set::History => "history",
         Set::Instructions => "instructions",
+        Set::Traits => "traits",
     }
 }
 
@@ -627,7 +644,7 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
 /// The node kinds from which a set's answers can be made.
 fn needed_kinds(set: Set) -> &'static [NodeKind] {
     match set {
-        Set::Impact | Set::Flow | Set::WhereTo => &[NodeKind::Symbol, NodeKind::File],
+        Set::Impact | Set::Flow | Set::WhereTo | Set::Traits => &[NodeKind::Symbol, NodeKind::File],
         Set::History => &[NodeKind::Commit],
         Set::Instructions => &[NodeKind::DocSection],
     }
@@ -1373,6 +1390,7 @@ pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
         Set::WhereTo => adapt_where_to(item, nodes),
         Set::History => adapt_history(nodes),
         Set::Instructions => adapt_instructions(nodes),
+        Set::Traits => adapt_traits(item, nodes),
     }
 }
 
@@ -1410,6 +1428,85 @@ pub fn adapt_where_to(item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
         return paths_only(nodes);
     }
     function_decls(nodes)
+}
+
+/// The answer unit of a Q1 node: a symbol inside an impl block stands for that
+/// impl, named by its module path and container chain up to the innermost
+/// `impl` header (the node id carries the container, so no span is needed);
+/// any other node stands for itself.
+fn impl_unit(id: &str) -> String {
+    if let Some(NodeId::Symbol(key)) = parsed(id)
+        && let Some(last) = key.container.iter().rposition(|s| is_impl_header(s))
+    {
+        return format!(
+            "{}|{}",
+            key.module_path.join("::"),
+            key.container[..=last].join("/")
+        );
+    }
+    id.to_string()
+}
+
+/// Traits: Q1 ("which types implement") offers every located symbol, because
+/// the scorer credits an impl block or a type declaration. One answer per
+/// distinct impl or type: a method (or other member) node counts as the impl
+/// that contains it, read from the container chain of its node id, and the
+/// duplicates collapse here, before the scorer's budget cut, keeping the best
+/// ranked node's site. Impls of different types at one macro call site have
+/// different headers, so they stay apart. A type node and the methods of its
+/// impl are not merged (the id does not tie them). Q2 and Q3 want an
+/// implementing member, so only functions and methods are offered, each kept.
+/// Each answer carries its node id as `symbol`: the nodes of one macro call
+/// site share a site, and the scorer needs them apart. The trait's own
+/// declaration card is offered like any other; the scorer drops it.
+///
+/// This form reads only the node ids. A SCIP method node (default ids) has no
+/// container in its id, so it stays its own unit here; [`adapt_traits_in`]
+/// places it in its impl block through the source tree.
+pub fn adapt_traits(item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
+    adapt_traits_in(item, nodes, None)
+}
+
+/// The unit of a Q1 node: the impl its id names, else (a method or function
+/// node whose id names none) the impl block its definition site sits in, read
+/// from the evaluated tree's source, else the node itself.
+fn q1_unit(node: &ResultNode, decl: &Decl, grouper: Option<&mut ImplGrouper>) -> String {
+    let unit = impl_unit(&node.id);
+    if unit != node.id || !matches!(decl.kind, SymbolKind::Function | SymbolKind::Method) {
+        return unit;
+    }
+    grouper
+        .and_then(|grouper| grouper.unit(&decl.path, decl.line))
+        .unwrap_or(unit)
+}
+
+/// [`adapt_traits`] with the source-tree grouping of Q1 method nodes whose ids
+/// carry no impl (see [`ImplGrouper`]); without a grouper it is the same.
+fn adapt_traits_in(
+    item: &Value,
+    nodes: &[ResultNode],
+    mut grouper: Option<&mut ImplGrouper>,
+) -> Vec<Value> {
+    let members = matches!(item["set"].as_str(), Some("Q2" | "Q3"));
+    let mut units = BTreeSet::new();
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| {
+                let decl = decl_of(n)?;
+                if members {
+                    if !matches!(decl.kind, SymbolKind::Function | SymbolKind::Method) {
+                        return None;
+                    }
+                } else if !units.insert(q1_unit(n, &decl, grouper.as_deref_mut())) {
+                    return None;
+                }
+                let mut a = decl_answer(&decl);
+                a["symbol"] = json!(n.id);
+                Some(a)
+            })
+            .collect(),
+    )
 }
 
 /// History: commit nodes, by hash.
@@ -1532,6 +1629,17 @@ pub fn item_precision_recall(
                 (m("i2_required_precision@5"), m("i2_required_recall"))
             }
         }
+        Set::Traits => {
+            if item["set"].as_str() == Some("Q2") {
+                // One gold location: recall is the hit in the first ten, and
+                // precision that hit over the scorer's counted answers (at most ten).
+                let counted = m("counted@10");
+                let hit = m("hit@10");
+                (if counted == 0.0 { 0.0 } else { hit / counted }, hit)
+            } else {
+                (m("set_precision"), m("set_recall"))
+            }
+        }
     }
 }
 
@@ -1634,6 +1742,10 @@ pub struct RunConfig {
     pub rescored: bool,
     /// Score only this many of the first answers of each traversal.
     pub score_k: Option<usize>,
+    /// The evaluated tree (`--tree`): the source root that places Q1 method
+    /// nodes in their impl blocks. None: those nodes are not grouped, and the
+    /// report warns.
+    pub tree: Option<PathBuf>,
 }
 
 impl RunConfig {
@@ -1750,6 +1862,7 @@ pub(super) fn headline(set: Set) -> &'static [&'static str] {
         Set::WhereTo => &["reg_hit@3", "reg_mrr", "set_f1"],
         Set::History => &["mrr", "hit@3", "hit@10"],
         Set::Instructions => &["i1_section_f1", "i2_hit@3_primary", "i2_required_recall@5"],
+        Set::Traits => &["set_f1", "recall_explicit", "hit@10", "mrr"],
     }
 }
 
@@ -1865,6 +1978,9 @@ pub fn bench_set(
     }
 
     let mut run = Map::new();
+    // Traits only: places SCIP method nodes (ids without a container) in their
+    // impl blocks through the source tree; one parse per file for the run.
+    let mut grouper = (set == Set::Traits).then(|| ImplGrouper::new(config.tree.as_deref()));
     let mut raw = Vec::new();
     let mut sums = Sums::default();
     let mut skips = Skips::default();
@@ -1906,7 +2022,10 @@ pub fn bench_set(
                         .take(config.score_k.unwrap_or(usize::MAX))
                         .cloned(),
                 );
-                let answers = adapt(set, item, &nodes);
+                let answers = match grouper.as_mut() {
+                    Some(grouper) => adapt_traits_in(item, &nodes, Some(grouper)),
+                    None => adapt(set, item, &nodes),
+                };
                 if traversed.status == "no_seeds" {
                     sums.no_seeds += 1;
                 }
@@ -1971,12 +2090,27 @@ pub fn bench_set(
     let n_scored = scored.len();
     let scored_items: Vec<Value> = scored.iter().map(|(_, item)| (*item).clone()).collect();
     let run_value = Value::Object(run);
-    let report = if n_scored == 0 {
+    let mut report = if n_scored == 0 {
         Value::Null
     } else {
         let parsed_run = gold::parse_run(&run_value.to_string())?;
         gold::score_set(set, &scored_items, &parsed_run, false, false)?
     };
+    let grouping_warnings = grouper
+        .as_ref()
+        .map(ImplGrouper::warnings)
+        .unwrap_or_default();
+    for warning in &grouping_warnings {
+        eprintln!("warning: {warning}");
+    }
+    if !grouping_warnings.is_empty()
+        && let Some(object) = report.as_object_mut()
+    {
+        let warnings = object.entry("warnings").or_insert_with(|| json!([]));
+        if let Some(list) = warnings.as_array_mut() {
+            list.extend(grouping_warnings.iter().map(|w| json!(w)));
+        }
+    }
 
     let mut cells = base_cells(config, set, n_gold);
     cells[3] = n_gold.to_string();
@@ -2067,6 +2201,7 @@ pub fn bench_set(
                 .into(),
         );
     }
+    notes.extend(grouping_warnings);
     notes.push("ans tok = chars/4".into());
     cells[20] = notes.join("; ");
     Ok(SetOutcome {
@@ -2123,6 +2258,7 @@ pub fn write_outputs(dir: &Path, outcome: &SetOutcome) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lci_core::node::{SymbolKey, rust_module_path};
 
     /// A result with no site (the card did not locate it).
     fn node(id: &str) -> ResultNode {
@@ -2230,6 +2366,375 @@ mod tests {
         );
         let file_level = json!({"gold": {"form": "exemplar", "granularity": "file"}});
         assert_eq!(adapt_where_to(&file_level, &nodes).len(), 2);
+    }
+
+    #[test]
+    fn traits_adapter_keeps_nodes_apart_and_members_only_for_q2_and_q3() {
+        let nodes = located_nodes();
+        let q1 = adapt_traits(&json!({"set": "Q1"}), &nodes);
+        assert_eq!(q1.len(), nodes.iter().filter_map(decl_of).count());
+        assert_eq!(q1[0]["path"], "src/app/search.rs");
+        assert_eq!(q1[0]["line"], 12);
+        assert_eq!(q1[0]["symbol"], json!(nodes[0].id));
+        // two nodes at one site stay two answers
+        let twin = located(METHOD, "src/app/search.rs", 12);
+        let both = adapt_traits(&json!({"set": "Q1"}), &[nodes[0].clone(), twin]);
+        assert_eq!(both.len(), 2);
+        assert_ne!(both[0]["symbol"], both[1]["symbol"]);
+        // members only: the type node is left out
+        let members = adapt_traits(&json!({"set": "Q3"}), &nodes);
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().all(|a| a["symbol"].is_string()));
+    }
+
+    #[test]
+    fn traits_q2_precision_uses_only_counted_answers_up_to_ten() {
+        let span =
+            |file: &str, a: u64, b: u64| json!({"file": file, "begin_line": a, "end_line": b});
+        let item = json!({
+            "id": "q2", "set": "Q2",
+            "trait_decl": span("tr.rs", 100, 140),
+            "neutral": [span("neutral.rs", 1, 5)],
+            "cfg_gated": [span("cfg.rs", 1, 5)],
+            "gold": [{"location": span("m.rs", 5, 5)}]
+        });
+        let ignored = vec![
+            json!({"path": "tr.rs", "line": 110}),
+            json!({"path": "neutral.rs", "line": 1}),
+            json!({"path": "cfg.rs", "line": 1}),
+        ];
+        let hit = json!({"path": "m.rs", "line": 5});
+        let mut answers = vec![ignored[0].clone(), hit];
+        for extra in [vec![], ignored.clone()] {
+            answers.extend(extra);
+            let metrics = item_metrics(Set::Traits, &item, &answers).unwrap();
+            assert_eq!(metrics["counted@10"], Some(1.0));
+            assert_eq!(
+                item_precision_recall(Set::Traits, &item, &answers, &metrics),
+                (1.0, 1.0)
+            );
+        }
+        answers.extend((1..=12).map(|line| json!({"path": "miss.rs", "line": line})));
+        let metrics = item_metrics(Set::Traits, &item, &answers).unwrap();
+        assert_eq!(metrics["counted@10"], Some(10.0));
+        assert_eq!(
+            item_precision_recall(Set::Traits, &item, &answers, &metrics),
+            (0.1, 1.0)
+        );
+        let metrics = item_metrics(Set::Traits, &item, &ignored).unwrap();
+        assert_eq!(metrics["counted@10"], Some(0.0));
+        assert_eq!(
+            item_precision_recall(Set::Traits, &item, &ignored, &metrics),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn q1_groups_generic_and_unsafe_impl_members() {
+        for header in [
+            "impl<T> Tr for Foo<T>",
+            "unsafe impl Tr for Foo",
+            "unsafe impl<T> Tr for Foo<T>",
+        ] {
+            let nodes = vec![
+                located(
+                    &format!("sym:rust:app::x::{header}::a/method"),
+                    "src/x.rs",
+                    10,
+                ),
+                located(
+                    &format!("sym:rust:app::x::{header}::b/method"),
+                    "src/x.rs",
+                    11,
+                ),
+                located("sym:rust:app::x::impl Tr for Bar::a/method", "src/x.rs", 20),
+            ];
+            let answers = adapt_traits(&json!({"set": "Q1"}), &nodes);
+            assert_eq!(answers.len(), 2, "{header}");
+            assert_eq!(answers[0]["line"], 10);
+            assert_eq!(answers[1]["line"], 20);
+            for template in ["Q2", "Q3"] {
+                assert_eq!(adapt_traits(&json!({"set": template}), &nodes).len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn a_q1_walk_counts_an_impl_and_its_methods_as_one_answer() {
+        const A1: &str = "sym:rust:app::x::impl Tr for Foo::a/method";
+        const A2: &str = "sym:rust:app::x::impl Tr for Foo::b/method";
+        const B1: &str = "sym:rust:app::x::impl Tr for Bar::a/method";
+        let nodes = vec![
+            located(A1, "src/x.rs", 10),
+            located(A2, "src/x.rs", 11),
+            located(B1, "src/x.rs", 20),
+            located(TYPE, "src/x.rs", 1),
+        ];
+        let q1 = json!({"set": "Q1"});
+        let answers = adapt_traits(&q1, &nodes);
+        // Foo's two methods are one answer (the better ranked), Bar's is another,
+        // the type node stands for itself.
+        let lines: Vec<u64> = answers
+            .iter()
+            .map(|a| a["line"].as_u64().unwrap())
+            .collect();
+        assert_eq!(lines, [10, 20, 1]);
+        // Q3 keeps every member.
+        assert_eq!(adapt_traits(&json!({"set": "Q3"}), &nodes).len(), 3);
+        // One slot, one credit: two gold impls (k = 2); without the collapse the
+        // budget would be spent on Foo's two methods and Bar would be cut.
+        let span = |a: u64, b: u64| json!({"file": "src/x.rs", "begin_line": a, "end_line": b});
+        let item = json!({
+            "id": "q1", "set": "Q1",
+            "gold": [
+                {"impl_id": "i0", "stratum": "explicit", "impl": span(10, 15), "type_decl": null},
+                {"impl_id": "i1", "stratum": "explicit", "impl": span(20, 25), "type_decl": null}
+            ]
+        });
+        let m = item_metrics(Set::Traits, &item, &answers[..2]).unwrap();
+        assert_eq!(m["set_recall"], Some(1.0));
+        assert_eq!(m["set_precision"], Some(1.0));
+    }
+
+    // ---- Q1 grouping of SCIP method nodes through the evaluated tree's source.
+
+    /// `src/x.rs` of the grouping tests; the lines are what the tests cite.
+    const GROUPING_SOURCE: &str = "\
+pub struct Foo;
+pub struct Bar;
+
+impl Foo {
+    pub fn a(&self) {}
+    pub fn b(&self) {}
+}
+
+impl Bar {
+    pub fn a(&self) {}
+}
+
+impl<T> Wrap<T> {
+    pub fn g(&self) {}
+    pub fn h(&self) {}
+}
+
+unsafe impl Send for Foo {
+    fn u1(&self) {}
+    fn u2(&self) {}
+}
+
+pub fn free_one() {}
+pub fn free_two() {}
+";
+
+    /// A temp source tree holding `src/x.rs`, removed on drop.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(name: &str) -> TempTree {
+            let dir = std::env::temp_dir().join(format!(
+                "lci-bench-impl-units-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/x.rs"), GROUPING_SOURCE).unwrap();
+            TempTree(dir)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The id `ScipMap::with_default_ids` gives a node: no container, the
+    /// module path of its file, the bare name, a disambiguator counting equal
+    /// keys.
+    fn scip_id(path: &str, name: &str, kind: SymbolKind, disambiguator: u16) -> String {
+        NodeId::Symbol(SymbolKey {
+            language: "rust".into(),
+            module_path: rust_module_path(path),
+            container: Vec::new(),
+            name: name.into(),
+            kind,
+            disambiguator,
+        })
+        .to_string()
+    }
+
+    fn method(name: &str, disambiguator: u16, line: u64) -> ResultNode {
+        located(
+            &scip_id("src/x.rs", name, SymbolKind::Method, disambiguator),
+            "src/x.rs",
+            line,
+        )
+    }
+
+    fn lines_of(answers: &[Value]) -> Vec<u64> {
+        answers
+            .iter()
+            .map(|a| a["line"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn scip_default_ids_carry_no_impl() {
+        let id = scip_id("src/x.rs", "a", SymbolKind::Method, 0);
+        assert_eq!(id, "sym:rust:x::a/method");
+        assert_eq!(impl_unit(&id), id);
+    }
+
+    #[test]
+    fn q1_groups_scip_method_nodes_by_impl_block_from_source() {
+        let tree = TempTree::new("foo-bar");
+        // Foo.a, Foo.b, Bar.a: ids in the with_default_ids shape (Bar.a is the
+        // second `a`, so disambiguator 1).
+        let nodes = vec![method("a", 0, 5), method("b", 0, 6), method("a", 1, 10)];
+        let q1 = json!({"set": "Q1"});
+        let plain = adapt_traits(&q1, &nodes);
+        assert_eq!(lines_of(&plain), [5, 6, 10], "ids alone cannot group");
+        let mut grouper = ImplGrouper::new(Some(&tree.0));
+        let answers = adapt_traits_in(&q1, &nodes, Some(&mut grouper));
+        assert_eq!(lines_of(&answers), [5, 10]);
+        assert_eq!(grouper.files_seen(), 1, "one parse per file");
+        assert!(grouper.warnings().is_empty());
+        let span = |a: u64, b: u64| json!({"file": "src/x.rs", "begin_line": a, "end_line": b});
+        let item = json!({
+            "id": "q1", "set": "Q1",
+            "gold": [
+                {"impl_id": "i0", "stratum": "explicit", "impl": span(4, 7), "type_decl": null},
+                {"impl_id": "i1", "stratum": "explicit", "impl": span(9, 11), "type_decl": null}
+            ]
+        });
+        let recall = |answers: &[Value]| item_metrics(Set::Traits, &item, &answers[..2]).unwrap()["set_recall"];
+        assert_eq!(recall(&answers), Some(1.0));
+        // Without the grouping, k = 2 is spent on Foo's two methods.
+        assert_eq!(recall(&plain), Some(0.5));
+    }
+
+    #[test]
+    fn q1_source_grouping_handles_generic_unsafe_and_free_functions() {
+        let tree = TempTree::new("kinds");
+        let free = |name: &str, line: u64| {
+            located(
+                &scip_id("src/x.rs", name, SymbolKind::Function, 0),
+                "src/x.rs",
+                line,
+            )
+        };
+        let nodes = vec![
+            // impl<T> Wrap<T>: g and h are one answer.
+            method("g", 0, 14),
+            method("h", 0, 15),
+            // unsafe impl Send for Foo: u1 and u2 are one answer.
+            method("u1", 0, 19),
+            method("u2", 0, 20),
+            // Free functions are not in an impl: each is its own answer.
+            free("free_one", 23),
+            free("free_two", 24),
+            // The same function again is the same node.
+            free("free_one", 23),
+        ];
+        let mut grouper = ImplGrouper::new(Some(&tree.0));
+        let answers = adapt_traits_in(&json!({"set": "Q1"}), &nodes, Some(&mut grouper));
+        assert_eq!(lines_of(&answers), [14, 19, 23, 24]);
+        assert!(grouper.warnings().is_empty());
+        // Q2 and Q3 keep every member node whatever the tree says.
+        let members = adapt_traits_in(&json!({"set": "Q3"}), &nodes, Some(&mut grouper));
+        assert_eq!(members.len(), 6);
+    }
+
+    #[test]
+    fn q1_without_a_tree_keeps_today_s_answers_and_warns() {
+        let nodes = vec![method("a", 0, 5), method("b", 0, 6), method("a", 1, 10)];
+        let mut grouper = ImplGrouper::new(None);
+        let answers = adapt_traits_in(&json!({"set": "Q1"}), &nodes, Some(&mut grouper));
+        assert_eq!(lines_of(&answers), [5, 6, 10]);
+        let warnings = grouper.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no source root"), "{warnings:?}");
+        // A node whose id names its impl needs no tree and no warning.
+        let mut grouper = ImplGrouper::new(None);
+        let named = vec![located(
+            "sym:rust:x::impl Tr for Foo::a/method",
+            "src/x.rs",
+            5,
+        )];
+        adapt_traits_in(&json!({"set": "Q1"}), &named, Some(&mut grouper));
+        assert!(grouper.warnings().is_empty());
+    }
+
+    #[test]
+    fn q1_with_an_unreadable_file_keeps_the_nodes_apart_and_warns() {
+        let tree = TempTree::new("unreadable");
+        let missing = |name: &str, line: u64| {
+            located(
+                &scip_id("src/gone.rs", name, SymbolKind::Method, 0),
+                "src/gone.rs",
+                line,
+            )
+        };
+        let nodes = vec![missing("a", 5), missing("b", 6)];
+        let mut grouper = ImplGrouper::new(Some(&tree.0));
+        let answers = adapt_traits_in(&json!({"set": "Q1"}), &nodes, Some(&mut grouper));
+        assert_eq!(lines_of(&answers), [5, 6]);
+        let warnings = grouper.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("could not be read"), "{warnings:?}");
+    }
+
+    #[test]
+    fn bench_set_groups_traits_q1_through_the_tree_and_reports_the_missing_root() {
+        let tree = TempTree::new("bench-set");
+        let results: Vec<Value> = [("a", 0, 5), ("b", 0, 6), ("a", 1, 10)]
+            .iter()
+            .map(|(name, d, line)| {
+                json!({
+                    "node": scip_id("src/x.rs", name, SymbolKind::Method, *d),
+                    "text": "t",
+                    "site": {"path": "src/x.rs", "line": line, "col": 8},
+                })
+            })
+            .collect();
+        let raw = json!({"status": "complete", "seeds": [], "results": results});
+        let span = |a: u64, b: u64| json!({"file": "src/x.rs", "begin_line": a, "end_line": b});
+        let items = vec![json!({
+            "id": "q1", "set": "Q1", "question": "q", "primary": true,
+            "gold": [
+                {"impl_id": "i0", "stratum": "explicit", "impl": span(4, 7), "type_decl": null},
+                {"impl_id": "i1", "stratum": "explicit", "impl": span(9, 11), "type_decl": null}
+            ]
+        })];
+        let mut answers = BTreeMap::new();
+        answers.insert("q".to_string(), raw);
+        let fixture = Fixture::new(answers);
+
+        let mut cfg = config(&["graph.scip"]);
+        cfg.tree = Some(tree.0.clone());
+        let with_tree = bench_set(Set::Traits, &items, &fixture, &cfg).unwrap();
+        assert_eq!(with_tree.run["q1"].as_array().unwrap().len(), 2);
+        // (The scorer's own no-trait_decl warning may be there; grouping adds none.)
+        assert!(
+            !with_tree.report["warnings"]
+                .to_string()
+                .contains("impl grouping"),
+            "{}",
+            with_tree.report["warnings"]
+        );
+        assert_eq!(with_tree.report["overall"]["metrics"]["set_recall"], 1.0);
+
+        cfg.tree = None;
+        let without = bench_set(Set::Traits, &items, &fixture, &cfg).unwrap();
+        assert_eq!(without.run["q1"].as_array().unwrap().len(), 3);
+        let warnings = without.report["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("no source root")),
+            "{warnings:?}"
+        );
+        assert!(without.row.cells[20].contains("no source root"));
     }
 
     #[test]
@@ -2469,6 +2974,7 @@ mod tests {
             progress: false,
             rescored: false,
             score_k: None,
+            tree: None,
         }
     }
 

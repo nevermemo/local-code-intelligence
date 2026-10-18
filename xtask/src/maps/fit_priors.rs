@@ -194,6 +194,7 @@ fn hit_metrics(set: Set, answer: &Value) -> &'static [&'static str] {
         Set::WhereTo => &["reg_hit@3", "set_precision"],
         Set::History => &["hit@1"],
         Set::Instructions => &["i1_section_precision", "i2_required_precision@5"],
+        Set::Traits => &["set_precision", "hit@1"],
     }
 }
 
