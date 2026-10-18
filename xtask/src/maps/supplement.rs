@@ -58,7 +58,7 @@ fn plan(set: Set) -> Option<Plan> {
                 "H3a and H3b floor near zero by construction, and H1 is circular with the exact pickaxe operator; their rows are printed but not used for decisions.",
             ],
         }),
-        Set::Instructions => None,
+        Set::Instructions | Set::Traits => None,
     }
 }
 
