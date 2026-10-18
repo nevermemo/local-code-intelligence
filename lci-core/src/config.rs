@@ -35,6 +35,13 @@ pub struct IndexConfig {
     /// How long a search waits for a concurrently running refresh job before
     /// falling back to the previous snapshot.
     pub wait_for_existing_job_seconds: u64,
+    /// Index prose files (Markdown). `false` (default): files of prose
+    /// adapters are not indexed at all, so an index and every search result
+    /// are exactly as before the Markdown adapter and the docs lane never
+    /// runs. `true`: they are indexed and the docs lane follows
+    /// `[docs_lane]`. Flipping the switch makes the snapshot stale; the next
+    /// refresh adds or drops exactly the prose files.
+    pub prose: bool,
 }
 
 impl Default for IndexConfig {
@@ -43,6 +50,7 @@ impl Default for IndexConfig {
             freshness: IndexFreshness::OnSearch,
             stale_check_interval_seconds: 10,
             wait_for_existing_job_seconds: 120,
+            prose: false,
         }
     }
 }
@@ -123,6 +131,11 @@ pub struct SearchProfile {
     pub reranker: Option<bool>,
     /// Override of the top-level `rerank_candidate_count`.
     pub rerank_candidate_count: Option<usize>,
+    /// Override of `[docs_lane].top_k` (`0..=10`; `0` runs no docs lane).
+    pub docs_top_k: Option<usize>,
+    /// Override of `[docs_lane].reranker`; `[channels].reranker` and the
+    /// profile's `reranker` do not affect the docs lane.
+    pub docs_reranker: Option<bool>,
     /// Which MCP tools the profile's endpoint lists and dispatches; absent
     /// means [`McpToolList::Full`].
     pub tools: Option<McpToolList>,
@@ -234,6 +247,85 @@ pub struct SearchSettings {
     /// How many fused candidates the reranker orders (and a traced search
     /// marks as shortlisted).
     pub rerank_candidate_count: usize,
+    /// How many documentation chunks the separate `docs` list holds
+    /// (`[docs_lane].top_k`, or the profile's `docs_top_k`); `0` runs no
+    /// docs lane. The lane also needs `[docs_lane].enabled`.
+    pub docs_top_k: usize,
+    /// Whether the docs lane is reranked: `[docs_lane].reranker` (default
+    /// off) unless the profile sets `docs_reranker`.
+    pub docs_reranker: bool,
+}
+
+/// `[docs_lane]`: the separate, small list of documentation chunks
+/// (Markdown, any prose extractor) that `search_code` returns beside its code
+/// `results` when the request names no `source_roles`. The code list is
+/// ranked exactly as if the documentation were not indexed; the docs lane is
+/// fed the prose chunks only and fails open (a failure becomes a
+/// `docs.warning`, never a failure of the search).
+///
+/// The lane's reranker is its own switch, off by default (`reranker` here; a
+/// search profile may override it with `docs_reranker`); `[channels].reranker`
+/// does not affect it. The fusion weights, `rrf_k`, and the per-file cap are
+/// the code lane's. A request that names `source_roles`
+/// gets one list as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocsLaneConfig {
+    /// Run the docs lane. `false`: documentation chunks stay out of the
+    /// default search altogether (they are still reachable with
+    /// `source_roles = ["documentation"]`).
+    pub enabled: bool,
+    /// Most documentation chunks returned (`0..=10`; `0` runs no lane).
+    pub top_k: usize,
+    /// Documentation candidates kept after fusion and sent to the reranker
+    /// (`1..=200`).
+    pub rerank_candidate_count: usize,
+    /// Depth of the docs lane's semantic candidate list (`1..=200`).
+    pub semantic_candidate_count: usize,
+    /// Rerank the docs lane (needs the reranker service). Independent of
+    /// `[channels].reranker`; default off.
+    pub reranker: bool,
+}
+
+impl DocsLaneConfig {
+    /// Largest accepted `top_k`.
+    pub const MAX_TOP_K: usize = 10;
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.top_k <= Self::MAX_TOP_K,
+            "docs_lane.top_k must be 0..={} (got {}); 0 runs no docs lane",
+            Self::MAX_TOP_K,
+            self.top_k
+        );
+        ensure!(
+            (1..=200).contains(&self.rerank_candidate_count),
+            "docs_lane.rerank_candidate_count must be 1..=200 (got {})",
+            self.rerank_candidate_count
+        );
+        ensure!(
+            (1..=200).contains(&self.semantic_candidate_count),
+            "docs_lane.semantic_candidate_count must be 1..=200 (got {})",
+            self.semantic_candidate_count
+        );
+        Ok(())
+    }
+}
+
+impl Default for DocsLaneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_k: 2,
+            rerank_candidate_count: 12,
+            semantic_candidate_count: 20,
+            reranker: false,
+        }
+    }
 }
 
 /// Longest accepted search profile name, in characters.
@@ -473,6 +565,11 @@ pub struct Config {
     /// Per-channel Reciprocal Rank Fusion weights; all `1.0` (plain RRF) by
     /// default. Also `max_chunks_per_file` (default `2`; `0` is unlimited).
     pub fusion: FusionConfig,
+    /// `[docs_lane]`: the separate list of documentation chunks beside the
+    /// code results. Left out of the serialized configuration while it equals
+    /// the default.
+    #[serde(skip_serializing_if = "DocsLaneConfig::is_default")]
+    pub docs_lane: DocsLaneConfig,
     /// Named query-time override sets, `[search_profiles.<name>]`, chosen per
     /// request (see [`SearchProfile`]). None by default; a search that names
     /// no profile ignores them all.
@@ -1321,6 +1418,7 @@ impl Default for Config {
             index: IndexConfig::default(),
             channels: ChannelsConfig::default(),
             fusion: FusionConfig::default(),
+            docs_lane: DocsLaneConfig::default(),
             search_profiles: BTreeMap::new(),
             traverse: TraverseConfig::default(),
             recipes: RecipesConfig::default(),
@@ -1392,6 +1490,7 @@ impl Config {
             FusionConfig::MAX_CHUNKS_PER_FILE_LIMIT,
             self.fusion.max_chunks_per_file
         );
+        self.docs_lane.validate()?;
         self.traverse.validate()?;
         ensure!(
             self.watch_poll_milliseconds > 0 && self.watch_debounce_milliseconds > 0,
@@ -1498,6 +1597,12 @@ impl Config {
                 resolved.rerank_candidate_count
             );
             ensure!(
+                resolved.docs_top_k <= DocsLaneConfig::MAX_TOP_K,
+                "search_profiles.{name}: docs_top_k must be 0..={} (got {})",
+                DocsLaneConfig::MAX_TOP_K,
+                resolved.docs_top_k
+            );
+            ensure!(
                 profile.response == Some(McpResponse::Compact)
                     || (profile.compact_max_hit_lines.is_none()
                         && profile.compact_max_response_chars.is_none()),
@@ -1589,6 +1694,8 @@ impl Config {
             profile: None,
             channels: self.channels,
             rerank_candidate_count: self.rerank_candidate_count,
+            docs_top_k: self.docs_lane.top_k,
+            docs_reranker: self.docs_lane.reranker,
         }
     }
 
@@ -1630,17 +1737,20 @@ impl Config {
 
     /// `overrides` applied over the top-level settings, under `name`.
     fn resolve_search_profile(&self, name: &str, overrides: &SearchProfile) -> SearchSettings {
+        let channels = ChannelsConfig {
+            semantic: overrides.semantic.unwrap_or(self.channels.semantic),
+            lexical: overrides.lexical.unwrap_or(self.channels.lexical),
+            lsp: overrides.lsp.unwrap_or(self.channels.lsp),
+            reranker: overrides.reranker.unwrap_or(self.channels.reranker),
+        };
         SearchSettings {
             profile: Some(name.to_owned()),
-            channels: ChannelsConfig {
-                semantic: overrides.semantic.unwrap_or(self.channels.semantic),
-                lexical: overrides.lexical.unwrap_or(self.channels.lexical),
-                lsp: overrides.lsp.unwrap_or(self.channels.lsp),
-                reranker: overrides.reranker.unwrap_or(self.channels.reranker),
-            },
+            channels,
             rerank_candidate_count: overrides
                 .rerank_candidate_count
                 .unwrap_or(self.rerank_candidate_count),
+            docs_top_k: overrides.docs_top_k.unwrap_or(self.docs_lane.top_k),
+            docs_reranker: overrides.docs_reranker.unwrap_or(self.docs_lane.reranker),
         }
     }
 
@@ -1729,6 +1839,19 @@ mod tests {
     /// the temp path are not interpreted as escape sequences.
     fn base_toml() -> String {
         format!("data_dir = '{}'\n", std::env::temp_dir().display())
+    }
+
+    #[test]
+    fn index_prose_is_off_by_default_and_a_file_can_turn_it_on() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(!config.index.prose);
+        let on: Config =
+            toml::from_str(&format!("{}[index]\nprose = true\n", base_toml())).unwrap();
+        on.validate().unwrap();
+        assert!(on.index.prose);
+        assert!(
+            toml::from_str::<Config>(&format!("{}[index]\nprse = true\n", base_toml())).is_err()
+        );
     }
 
     #[test]
@@ -2353,6 +2476,8 @@ mod tests {
             profile: None,
             channels: ChannelsConfig::default(),
             rerank_candidate_count: 24,
+            docs_top_k: 2,
+            docs_reranker: false,
         };
         assert_eq!(config.search_settings(None).unwrap(), base);
         assert_eq!(config.base_search_settings(), base);
@@ -3602,6 +3727,123 @@ url = \"https://api.example.com/v1\"
         let error = pasted.validate().unwrap_err().to_string();
         assert!(
             error.contains("reranker_api_key_env") && !error.contains("sk-pasted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_docs_lane_defaults_are_two_of_twelve_and_stay_out_of_the_serialized_config() {
+        let config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(
+            config.docs_lane,
+            DocsLaneConfig {
+                enabled: true,
+                top_k: 2,
+                rerank_candidate_count: 12,
+                semantic_candidate_count: 20,
+                reranker: false,
+            }
+        );
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("docs_lane"), "{text}");
+        let settings = config.base_search_settings();
+        assert_eq!((settings.docs_top_k, settings.docs_reranker), (2, false));
+
+        // The docs reranker ignores `[channels].reranker`; a profile may set it.
+        let reloaded: Config = toml::from_str(&format!(
+            "{}[channels]\nreranker = true\n\
+             [docs_lane]\ntop_k = 5\n\
+             [search_profiles.inherit]\n\
+             [search_profiles.split]\nreranker = false\ndocs_reranker = true\ndocs_top_k = 0\n",
+            base_toml()
+        ))
+        .unwrap();
+        reloaded.validate().unwrap();
+        let base = reloaded.base_search_settings();
+        assert_eq!((base.docs_top_k, base.docs_reranker), (5, false));
+        assert!(base.channels.reranker);
+        let inherit = reloaded.search_settings(Some("inherit")).unwrap();
+        assert_eq!((inherit.docs_top_k, inherit.docs_reranker), (5, false));
+        let split = reloaded.search_settings(Some("split")).unwrap();
+        assert_eq!((split.docs_top_k, split.docs_reranker), (0, true));
+        assert!(!split.channels.reranker);
+        let text = toml::to_string(&reloaded).unwrap();
+        assert!(text.contains("[docs_lane]"), "{text}");
+    }
+
+    #[test]
+    fn the_docs_lane_reranker_is_its_own_switch_and_a_profile_override_wins() {
+        let on: Config = toml::from_str(&format!(
+            "{}[channels]\nreranker = false\n\
+             [docs_lane]\nreranker = true\n\
+             [search_profiles.inherit]\n\
+             [search_profiles.off]\ndocs_reranker = false\n\
+             [search_profiles.chan]\nreranker = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.docs_lane.reranker);
+        assert!(on.base_search_settings().docs_reranker);
+        assert!(!on.base_search_settings().channels.reranker);
+        assert!(on.search_settings(Some("inherit")).unwrap().docs_reranker);
+        assert!(!on.search_settings(Some("off")).unwrap().docs_reranker);
+        assert!(on.search_settings(Some("chan")).unwrap().docs_reranker);
+        let text = toml::to_string(&on).unwrap();
+        assert!(text.contains("reranker = true"), "{text}");
+
+        let off: Config = toml::from_str(&format!(
+            "{}[search_profiles.chan]\nreranker = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        off.validate().unwrap();
+        assert!(off.base_search_settings().channels.reranker);
+        assert!(!off.base_search_settings().docs_reranker);
+        assert!(!off.search_settings(Some("chan")).unwrap().docs_reranker);
+    }
+
+    #[test]
+    fn the_docs_lane_ranges_are_checked_and_unknown_keys_rejected() {
+        for (keys, accepted) in [
+            ("top_k = 0", true),
+            ("top_k = 10", true),
+            ("top_k = 11", false),
+            ("rerank_candidate_count = 1", true),
+            ("rerank_candidate_count = 200", true),
+            ("rerank_candidate_count = 0", false),
+            ("rerank_candidate_count = 201", false),
+            ("semantic_candidate_count = 1", true),
+            ("semantic_candidate_count = 200", true),
+            ("semantic_candidate_count = 0", false),
+            ("semantic_candidate_count = 201", false),
+            ("enabled = false", true),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("{}[docs_lane]\n{keys}\n", base_toml())).unwrap();
+            let result = config.validate();
+            // Only the key is printed: CodeQL reads any validate() error as possibly holding a secret.
+            assert_eq!(result.is_ok(), accepted, "{keys}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("docs_lane."), "{keys}");
+            }
+        }
+        assert!(
+            toml::from_str::<Config>(&format!("{}[docs_lane]\ntopk = 3\n", base_toml())).is_err()
+        );
+        // A profile's docs_top_k is checked against the same range.
+        let config: Config = toml::from_str(&format!(
+            "{}[search_profiles.p]\ndocs_top_k = 11\n",
+            base_toml()
+        ))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("search_profiles.p") && error.contains("docs_top_k"),
             "{error}"
         );
     }
