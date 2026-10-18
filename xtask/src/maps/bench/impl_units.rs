@@ -51,6 +51,10 @@ impl FileUnits {
         // consecutive members of one impl share it, and any declaration
         // outside that impl in between starts a new block, so two blocks with
         // one header stay apart when something separates them.
+        // The declaration parser gives no impl start line, so a new header
+        // between two members of the same identity (consecutive blocks with
+        // one header, such as a cfg pair) is found in the source text.
+        let lines: Vec<&str> = source.lines().collect();
         let mut current: Option<(BlockIdentity, usize)> = None;
         for declaration in &declarations {
             let impl_end = declaration
@@ -71,7 +75,14 @@ impl FileUnits {
                 declaration.container[..=last].to_vec(),
             );
             let block = match &current {
-                Some((open, block)) if *open == identity => {
+                Some((open, block))
+                    if *open == identity
+                        && !impl_header_between(
+                            &lines,
+                            blocks[*block].1,
+                            declaration.start_line,
+                        ) =>
+                {
                     blocks[*block].1 = blocks[*block].1.max(declaration.end_line);
                     *block
                 }
@@ -104,6 +115,47 @@ impl FileUnits {
             None => Placement::Elsewhere,
         }
     }
+}
+
+/// Whether an impl header begins on a line after `prev_end` and up to
+/// `next_start` (both one-based; the next member's own line counts because a
+/// header may share it, `impl A { fn a() {} }`; the previous member's last line
+/// does not). Leading attributes and whole-line comments are skipped.
+fn impl_header_between(lines: &[&str], prev_end: u32, next_start: u32) -> bool {
+    let from = prev_end as usize;
+    let to = (next_start as usize).min(lines.len());
+    lines
+        .get(from..to)
+        .is_some_and(|gap| gap.iter().any(|line| starts_impl_header(line)))
+}
+
+fn starts_impl_header(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    while rest.starts_with("#[") {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in rest.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(end) => rest = rest[end..].trim_start(),
+            None => return false,
+        }
+    }
+    if rest.starts_with("//") || rest.starts_with("/*") || rest.starts_with('*') {
+        return false;
+    }
+    is_impl_header(rest)
 }
 
 pub(super) fn is_impl_header(header: &str) -> bool {
@@ -287,6 +339,68 @@ trait Tr {
         assert_eq!(units.place("p.rs", 1), Placement::Elsewhere);
         assert_eq!(units.place("p.rs", 26), Placement::Elsewhere);
         assert_eq!(units.place("p.rs", 3), Placement::Elsewhere);
+    }
+
+    #[test]
+    fn consecutive_cfg_gated_blocks_with_one_header_are_two_units() {
+        let source = "\
+#[cfg(windows)]
+impl Tr for Foo {
+    fn a(&self) {}
+}
+#[cfg(unix)]
+impl Tr for Foo {
+    fn a(&self) {}
+}
+";
+        let units = FileUnits::parse(source).expect("parse");
+        let first = units.place("p.rs", 3);
+        let second = units.place("p.rs", 7);
+        assert!(matches!(first, Placement::Impl(_)));
+        assert!(matches!(second, Placement::Impl(_)));
+        assert_ne!(first, second);
+
+        // Single-line blocks, the header sharing the member's line.
+        let compact = "\
+#[cfg(windows)]
+impl Tr for Foo { fn a(&self) {} }
+#[cfg(unix)]
+impl Tr for Foo { fn a(&self) {} }
+";
+        let units = FileUnits::parse(compact).expect("parse");
+        assert_ne!(units.place("p.rs", 2), units.place("p.rs", 4));
+
+        // An attribute sharing the header's line.
+        let inline_attr = "\
+impl Tr for Foo { fn a(&self) {} }
+#[cfg(unix)] impl Tr for Foo { fn a(&self) {} }
+";
+        let units = FileUnits::parse(inline_attr).expect("parse");
+        assert_ne!(units.place("p.rs", 1), units.place("p.rs", 2));
+    }
+
+    #[test]
+    fn blank_lines_comments_and_attributes_between_members_keep_one_unit() {
+        let source = "\
+impl Foo {
+    fn a(&self) {}
+
+    // impl Foo { not a header }
+    /// impl Foo docs
+    /* impl Foo */
+
+    #[cfg(unix)]
+    fn b(&self) {}
+
+    #[inline]
+    fn c(&self) {}
+}
+";
+        let units = FileUnits::parse(source).expect("parse");
+        let a = units.place("p.rs", 2);
+        assert!(matches!(a, Placement::Impl(_)));
+        assert_eq!(a, units.place("p.rs", 9));
+        assert_eq!(a, units.place("p.rs", 12));
     }
 
     #[test]

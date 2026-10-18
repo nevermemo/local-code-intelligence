@@ -193,8 +193,11 @@ impl: the call site) for Q2 and Q3.
   per run with the repository's declaration parser, and groups the answers by
   (file, impl block), the block identified by the lines its members cover. A
   site outside any impl block (a free function, a trait default method) keeps its
-  own unit. Two blocks with the same header in one file are told apart only when
-  another declaration separates them. Without `--tree`, or for a file that
+  own unit. Two blocks with the same header in one file (for example a
+  `#[cfg(windows)]` and a `#[cfg(unix)]` `impl Tr for Foo`) are told apart when
+  another declaration or another impl header line separates them (the source
+  lines between two members are scanned; attribute and comment lines are
+  skipped). Without `--tree`, or for a file that
   cannot be read or parsed, those nodes keep separate Q1 budget slots and the
   report's `warnings` and the row note say so. Other callers of `adapt` (fit-priors,
   oracle-policy) have no tree and keep the id-only grouping.
