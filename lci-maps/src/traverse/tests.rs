@@ -1228,6 +1228,36 @@ fn a_trait_seed_follows_an_implementor_whose_best_edge_is_a_reference() {
 }
 
 #[test]
+fn a_trait_seed_keeps_its_implementors_first_under_a_learned_table() {
+    // The table prices an implementor at 0.1 and a reference at 1.
+    let text = r#"{"version": 1, "holdout": [], "priors": {"traits":
+        {"scip.implements": {"implements": 0.1}, "graph.scip": {"calls_or_refs": 1.0}}}}"#;
+    let priors = crate::traverse::priors::HopPriors::from_text(text, "traits").unwrap();
+    let ctx = ScoreCtx {
+        query: &[],
+        nodes_seen: 10,
+        priors: &priors,
+    };
+    let implements = ctx.priors.prior(SCIP_IMPLEMENTS_ID, EdgeKind::Implements);
+    assert_eq!(implements, 0.1);
+    // At or below the gate, then above it.
+    for (n, m) in [(1, 3), (5, 20)] {
+        let fused = fuse(trait_edges(n, m));
+        let cands = candidates(&fused);
+        let steps = hop_from(&mut RulesScorer, &ctx, &cands, HopPrice::default(), true);
+        assert!(
+            steps[..n]
+                .iter()
+                .all(|&(i, v)| is_implementor(&fused, i) && v == implements)
+        );
+        let rest: Vec<f64> = steps[n..].iter().map(|s| s.1).collect();
+        assert!(rest.iter().all(|&v| v < implements), "{rest:?}");
+        assert!((rest[0] - implements / (1.0 + n as f64)).abs() < 1e-12);
+        assert!(rest.windows(2).all(|w| w[0] >= w[1]), "{rest:?}");
+    }
+}
+
+#[test]
 fn the_unscored_arm_ignores_the_trait_seed_flag() {
     let fused = fuse(trait_edges(5, 20));
     let cands = candidates(&fused);

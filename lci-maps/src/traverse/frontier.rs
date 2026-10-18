@@ -404,8 +404,11 @@ pub fn hop(
 /// prior and in offer order, ahead of everything else. The other candidates
 /// are priced as [`hop`] prices them, but as the remainder with the `n`
 /// implementors counted before their rank (`prior / (1 + n + rank)` above the
-/// gate, `prior / (1 + n)` at or below it), so no other edge, whatever its
-/// kind prior, gets a hop value as high as an implementor's (the per-map
+/// gate, `prior / (1 + n)` at or below it). When a learned table prices
+/// `Implements` so low that the top of that remainder would still reach the
+/// implementors' value, the remainder is scaled, keeping its order, so its top
+/// is `implements / (1 + n)`. So no other edge, whatever the priors, gets a hop
+/// value as high as an implementor's (unless that prior is 0; the per-map
 /// weights and the frontier reranker apply after this and can reorder them).
 /// With no such candidate, or with `trait_seed` false, the result is that of
 /// [`hop`] on all of them. The unscored arm ignores the flag: it follows every
@@ -428,7 +431,20 @@ pub fn hop_from(
             let mut steps: Vec<(usize, f64)> = own.iter().map(|&i| (i, implements)).collect();
             let left: Vec<Candidate> = rest.iter().map(|&i| cands[i].clone()).collect();
             let priced = price_ranked(scorer, ctx, &left, price, own.len());
-            steps.extend(priced.into_iter().map(|(j, value)| (rest[j], value)));
+            // A learned table can price `Implements` far below the other
+            // kinds: then the remainder is scaled, in order, so its top value
+            // is `implements / (1 + n)`.
+            let top = priced.iter().map(|&(_, value)| value).fold(0.0, f64::max);
+            let scale = if top < implements || top <= 0.0 {
+                1.0
+            } else {
+                implements / ((1.0 + own.len() as f64) * top)
+            };
+            steps.extend(
+                priced
+                    .into_iter()
+                    .map(|(j, value)| (rest[j], value * scale)),
+            );
             return steps;
         }
     }
