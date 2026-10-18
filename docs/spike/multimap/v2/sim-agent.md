@@ -16,6 +16,8 @@ Code: `xtask/src/sim/` (`terms`, `follow`, `sim_loop`, `arms`, `score`).
   (`--lci-top-k`), then the A0 chain. The call prints the snippets (chunk code),
   so the span of each result counts as text read by that one call: it is a
   window for gold hits and `listed_at`, and its identifiers join the frontier.
+  When the documentation lane ran, its prose snippets (`docs.results`) are
+  shown too, after the code results and each lane in its own ranking.
 - **A2, LCI multimap walk.** One `lci traverse --scip ...` call, built by
   `CliTraverser::command` (the call `maps bench` makes; `--maps` unset leaves
   the choice of maps to the CLI), then the A0 chain. The call prints one line
@@ -80,10 +82,14 @@ null when the trace is missing), its status and stop reason.
    one fewer for the read).
 4. **Follow.** Identifiers are the tree-sitter identifier leaves inside the
    text read (any leaf whose node kind ends in `identifier`, through the
-   `lci-core` language adapters; plain words for a file with no adapter).
+   `lci-core` language adapters; plain words for a file with no adapter or a
+   prose adapter such as Markdown, which has no grammar).
    A name is kept when it has at least 4 bytes, is not in `GrepOptions`
    `skip_names` and is not a stop word of `query_terms`. The names of one read
-   are ranked rarest first (fewest files), ties in first-seen order. Following
+   are ranked rarest first (fewest files), ties in first-seen order, and
+   `max_candidates` (30) applies to each read on its own: the opening call, each
+   site read and each of the first reads is a batch of its own, queued in read
+   order under the policy. Following
    a name costs two calls: a grep for it, then a read of its first occurrence
    in text not read yet. A name with no unread occurrence is skipped without a
    call. The rarity used for ranking is an uncharged lookup (it stands for the
@@ -117,7 +123,7 @@ by default). The loop never reads the gold otherwise.
 | `tool_calls`, `tokens_read` | calls made and tokens of all output |
 | `calls_to_gold`, `tokens_to_gold` | call number and cumulative tokens of the first read that hits the gold; null if none |
 | `hit_at_12`, `hit_at_25` | `calls_to_gold` is within 12 / 25 calls |
-| `listed_at` | position (among the files of the first listing the agent was shown) of the first file with a listed line that hits the gold; the listing is the `lci` call of A1 (whole snippet spans) or A2 (site lines), else the A0 search |
+| `listed_at` | position (among the files of the first listing the agent was shown) of the first file with a listed line that hits the gold; the listing is the `lci` call of A1 (whole snippet spans) or A2 (site lines), else the A0 search; an `lci` call that listed nothing leaves it null (the later A0 search does not stand in) |
 
 A read window hits the gold when it overlaps a gold span, or, for an expected
 file that has no span (`gold::expected_files`), when it is a window of that
@@ -134,7 +140,9 @@ on it (tested).
 ## Output
 
 `<out-dir>/<wave>/<set>/` (wave default `sim-<arm>`; use one `--wave` per
-policy and arm) holds the files `maps::baseline::write_arm_run` writes for the
+policy and arm) must lie outside `--tree`: a run dir inside it would be
+scanned by the next grep, so the command refuses it (paths compared after
+resolving symlinks and `..`) before calling any tool. It holds the files `maps::baseline::write_arm_run` writes for the
 other non-walk arms, so `maps compare` pairs any two of them:
 
 - `run.json`: per item, the reading list, one `{path, line}` per distinct
@@ -143,7 +151,9 @@ other non-walk arms, so `maps compare` pairs any two of them:
   `expansions` = tool calls, `model_calls` = 0 and `lci_failure` (1, with null
   metrics, for an item whose `lci` call failed);
 - `raw/<item>.json`: the raw traversal reply of A2, and for any item whose `lci`
-  call failed a note that flags it; `maps compare` reads them for its exclusions;
+  call failed a note that flags it (a rerun into the same dir deletes the raw
+  file of an item that now has no raw reply, so an old failure marker does not
+  outlive the recovery); `maps compare` reads them for its exclusions;
 - `score.json`, `meta.json`: the scorer's report; the arm, the opening's
   settings, `deadline_stops`, `flagged_items` and any skipped items.
 

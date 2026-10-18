@@ -87,7 +87,9 @@ pub fn usable_identifier(name: &str, options: &GrepOptions) -> bool {
 /// Identifier names in the 1-based inclusive line range, in source order
 /// (repeats kept).
 pub fn identifiers_in(path: &str, source: &str, start: u32, end: u32) -> Vec<String> {
+    // A prose adapter (Markdown) has no grammar; it takes the word fallback.
     language::for_path(Path::new(path))
+        .filter(|adapter| !adapter.is_prose())
         .and_then(|adapter| tree_identifiers(adapter, source, start, end))
         .unwrap_or_else(|| word_identifiers(source, start, end))
 }
@@ -189,6 +191,12 @@ mod tests {
         assert_eq!(names, ["second_fn", "inner_call"]);
         let all = identifiers_in("x.rs", source, 1, 3);
         assert_eq!(all, ["first_fn", "second_fn", "inner_call", "third_fn"]);
+    }
+
+    #[test]
+    fn markdown_falls_back_to_words_instead_of_panicking() {
+        let names = identifiers_in("README.md", "# Title\nalpha_branch beta\n", 1, 2);
+        assert_eq!(names, ["Title", "alpha_branch", "beta"]);
     }
 
     #[test]

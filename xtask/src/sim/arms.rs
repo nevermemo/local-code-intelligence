@@ -230,12 +230,15 @@ impl Opener<'_> {
     }
 }
 
-/// A1: the snippets of the results, in rank order. Their spans are the text
-/// the call showed.
+/// A1: the snippets of the results, in rank order: the code results, then the
+/// documentation lane's (`docs.results`, present when that lane ran), each
+/// lane in its own ranking. Their spans are the text the call showed.
 pub fn search_opening(question: &str, value: &Value) -> Opening {
     let mut output = String::new();
     let mut windows = Vec::new();
-    for result in value["results"].as_array().into_iter().flatten() {
+    let code = value["results"].as_array().into_iter().flatten();
+    let docs = value["docs"]["results"].as_array().into_iter().flatten();
+    for result in code.chain(docs) {
         let path = result["relative_file_path"]
             .as_str()
             .or_else(|| result["file_path"].as_str());
@@ -428,6 +431,27 @@ mod tests {
         let empty = search_opening("q", &json!({ "results": [] }));
         assert_eq!(empty.output, "no results\n");
         assert!(empty.windows.is_empty());
+    }
+
+    #[test]
+    fn the_docs_lane_snippets_follow_the_code_results_each_in_rank_order() {
+        let mut reply = search_reply(&[
+            ("src/a.rs", 1, 4, "fn a() {}"),
+            ("src/b.rs", 5, 8, "fn b()"),
+        ]);
+        reply["docs"] = json!({
+            "results": search_reply(&[("docs/z.md", 1, 3, "# z"), ("docs/y.md", 2, 5, "# y")])["results"],
+            "candidate_count": 2,
+        });
+        let opening = search_opening("q", &reply);
+        let paths: Vec<&str> = opening.windows.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs", "docs/z.md", "docs/y.md"]);
+        assert!(opening.output.contains("docs/z.md:1-3\n# z\n"));
+        // Docs alone are an opening, not "no results".
+        let docs_only = json!({ "results": [], "docs": reply["docs"] });
+        let only = search_opening("q", &docs_only);
+        assert_eq!(only.windows.len(), 2);
+        assert!(!only.output.contains("no results"));
     }
 
     #[test]

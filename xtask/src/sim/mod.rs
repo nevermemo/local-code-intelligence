@@ -149,6 +149,7 @@ pub fn run(args: SimArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("sim-{}", args.arm.slug()));
     let dir = args.out_dir.join(slug(&wave)).join(set_name(args.set));
+    reject_run_dir_in_tree(&args.tree, &dir)?;
     let timeout = Duration::from_secs(args.lci_timeout_s);
 
     let (search, traverse);
@@ -259,6 +260,46 @@ pub fn run(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
+/// `path` made absolute with symlinks and `.`/`..` resolved, also when its
+/// last components do not exist yet (the run dir is created later).
+fn resolve_path(path: &Path) -> Result<PathBuf> {
+    let mut existing =
+        std::path::absolute(path).with_context(|| format!("make {} absolute", path.display()))?;
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match existing.components().next_back() {
+            Some(last) => tail.push(last.as_os_str().to_owned()),
+            None => break,
+        }
+        existing.pop();
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .with_context(|| format!("resolve {}", existing.display()))?;
+    for part in tail.into_iter().rev() {
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
+    }
+    Ok(resolved)
+}
+
+/// A run dir inside the frozen tree would be scanned by the next grep (and by
+/// the next arm), so questions and results would change the candidates.
+fn reject_run_dir_in_tree(tree: &Path, dir: &Path) -> Result<()> {
+    let (tree_abs, dir_abs) = (resolve_path(tree)?, resolve_path(dir)?);
+    if dir_abs.starts_with(&tree_abs) {
+        anyhow::bail!(
+            "the run dir {} is inside --tree {}; its files would be scanned as source; use an --out-dir outside the tree",
+            dir_abs.display(),
+            tree_abs.display()
+        );
+    }
+    Ok(())
+}
+
 fn lci_binary(args: &SimArgs) -> Result<PathBuf> {
     match &args.lci {
         Some(path) => Ok(path.clone()),
@@ -347,6 +388,16 @@ fn write_raw(dir: &Path, id: &str, raw: &Value) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
+fn remove_raw(dir: &Path, id: &str) -> Result<()> {
+    let path = dir.join(format!("{}.json", item_slug(id)));
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Writes the run dir `maps compare` reads: `run.json` (the text each item
 /// read, as `{path, line}`), `items.json`, `score.json` and `meta.json` from
 /// `maps::baseline::write_arm_run` (`expansions` = tool calls), then the sim
@@ -433,8 +484,11 @@ fn write_run(
     // The raw reply of each A2 traversal, for the flags compare reads
     // (deadline stop, map and reranker failures).
     for (_, score) in scored {
-        if let Some(raw) = &score.raw {
-            write_raw(&raw_dir, &score.id, raw)?;
+        match &score.raw {
+            Some(raw) => write_raw(&raw_dir, &score.id, raw)?,
+            // A rerun that recovered an item must not leave the earlier
+            // failure marker for compare to read.
+            None => remove_raw(&raw_dir, &score.id)?,
         }
     }
     let pretty = |v: &Value| serde_json::to_string_pretty(v).map(|s| s + "\n");
@@ -871,6 +925,155 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_opening_listed_nothing_so_listed_at_stays_null() {
+        let dir = fork_tree("empty-opening");
+        let empty = search_opening("quartz zephyr", &json!({ "results": [] }));
+        let entry = GoldTarget::new(Vec::new(), ["src/a.rs".to_owned()]);
+        let score = run_after(&dir, &cfg(Policy::Greedy), &entry, &empty);
+        assert_eq!(kinds(&score)[0], "lci-search");
+        // The A0 search that follows lists src/a.rs first and reads it, but
+        // it is not the listing the opening showed.
+        assert!(score.calls_to_gold.is_some());
+        assert_eq!(score.listed_at, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `x.rs` and `y.rs` both hold the question's terms; each names a
+    /// function defined in a file of its own.
+    fn two_reads_tree() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-sim-reads-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let files = [
+            (
+                "src/x.rs",
+                "// quartz zephyr one\nfn entry_x() {\n    first_target_fn();\n}\n",
+            ),
+            (
+                "src/y.rs",
+                "// quartz zephyr two\nfn entry_y() {\n    second_target_fn();\n}\n",
+            ),
+            ("src/z1.rs", "fn first_target_fn() {}\n"),
+            ("src/z2.rs", "fn second_target_fn() {}\n"),
+        ];
+        for (path, text) in files {
+            fs::write(dir.join(path), text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_candidate_limit_and_the_policy_order_apply_per_first_read() {
+        let dir = two_reads_tree();
+        // Two names per read: entry_x and first_target_fn come from x.rs,
+        // entry_y and second_target_fn from y.rs. One batch for both reads
+        // would cut the second file's names away.
+        let followed = |policy| -> Vec<String> {
+            let config = SimConfig {
+                max_candidates: 2,
+                ..cfg(policy)
+            };
+            let score = run_with(&dir, &config, &leaf_file());
+            score
+                .trace
+                .steps
+                .iter()
+                .filter(|s| s.kind == "follow-grep")
+                .map(|s| s.arg.clone())
+                .collect()
+        };
+        // Bfs: the first read's names first. Greedy: the newest read's first.
+        assert_eq!(
+            followed(Policy::Bfs),
+            ["first_target_fn", "second_target_fn"]
+        );
+        assert_eq!(
+            followed(Policy::Greedy),
+            ["second_target_fn", "first_target_fn"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_dir_inside_the_tree_is_refused_by_resolved_path() {
+        let tree = fork_tree("rundir-in-tree");
+        let inside = tree.join("out").join("sim-a0").join("where-to");
+        let err = reject_run_dir_in_tree(&tree, &inside)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside --tree"), "{err}");
+        // The tree itself, and a path that climbs out and back in.
+        assert!(reject_run_dir_in_tree(&tree, &tree).is_err());
+        let wander = tree
+            .join("src")
+            .join("..")
+            .join("new")
+            .join("..")
+            .join("run");
+        assert!(reject_run_dir_in_tree(&tree, &wander).is_err());
+        // Beside the tree, or reached by `..` from inside it, is fine.
+        let beside = PathBuf::from(format!("{}-out", tree.display())).join("a0");
+        assert!(reject_run_dir_in_tree(&tree, &beside).is_ok());
+        let climbs_out = tree.join("..").join("elsewhere");
+        assert!(reject_run_dir_in_tree(&tree, &climbs_out).is_ok());
+        // A tree path with a different spelling of the same dir.
+        let respelled = tree.join("src").join("..");
+        assert!(reject_run_dir_in_tree(&respelled, &inside).is_err());
+        let _ = fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn a_rerun_that_recovered_an_item_drops_its_stale_failure_marker() {
+        let dir = fork_tree("stale-raw");
+        let outside = PathBuf::from(format!("{}-out", dir.display()));
+        let out = outside.join("a2");
+        let config = cfg(Policy::Greedy);
+        let items = [where_to_item("src/alpha_leaf.rs")];
+        let traverse = traverse_stub();
+        let opener = Opener::Traverse {
+            tool: &traverse,
+            settings: json!({}),
+            traces: None,
+        };
+        let failed = || {
+            vec![Skipped {
+                id: "where-to-t1".into(),
+                reason: "stub failure".into(),
+            }]
+        };
+        // First run: the lci call failed, which leaves a map-failure marker.
+        let mut searcher = Searcher::new(&dir);
+        let info = RunInfo {
+            set: Set::WhereTo,
+            arm: Arm::A2,
+            cfg: &config,
+            opener: &opener,
+            searcher: &searcher,
+        };
+        write_run(&out, &info, &[], &failed()).unwrap();
+        let first = crate::maps::compare::load_run(&out, None).unwrap();
+        assert!(first.flags["where-to-t1"].is_some_and(|f| f.any()));
+        // Rerun: the item succeeded, with no raw reply (A0/A1 style).
+        let (scored, _) = simulate(Set::WhereTo, &items, &mut searcher, &config, &Opener::Grep);
+        assert!(scored[0].1.raw.is_none());
+        let grep = Opener::Grep;
+        let info = RunInfo {
+            set: Set::WhereTo,
+            arm: Arm::A0,
+            cfg: &config,
+            opener: &grep,
+            searcher: &searcher,
+        };
+        write_run(&out, &info, &scored, &[]).unwrap();
+        assert!(!out.join("raw").join("where-to-t1.json").exists());
+        let again = crate::maps::compare::load_run(&out, None).unwrap();
+        assert_eq!(again.items["where-to-t1"]["lci_failure"], Some(0.0));
+        assert_eq!(again.flags["where-to-t1"], None);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn a_skipped_item_is_excluded_by_compare_and_not_counted_as_missing() {
         let dir = fork_tree("skipped");
         let outside = PathBuf::from(format!("{}-out", dir.display()));
@@ -942,10 +1145,11 @@ mod tests {
         // 40 lines around line 1, cut to the 3-line file.
         let w = &steps[1].windows[0];
         assert_eq!((w.path.as_str(), w.start, w.end), ("src/alpha.rs", 1, 3));
-        // The site read already covers alpha.rs, so following alpha_branch is
-        // skipped and deep_alpha_leaf is next: traverse, site read, 2 probes,
-        // search, read a.rs, then its grep and read.
-        assert_eq!(a2.calls_to_gold, Some(8));
+        // The opening's site read and the read of a.rs are batches of their
+        // own; greedy follows the newest read first: traverse, site read, 2
+        // probes, search, read a.rs (6), beta_branch (7, 8), deep_beta_leaf
+        // (9, 10), then deep_alpha_leaf from the site read (11, 12).
+        assert_eq!(a2.calls_to_gold, Some(12));
         // The gold in the listed site's file is listed first and read second.
         let alpha = GoldTarget::new(Vec::new(), ["src/alpha.rs".to_owned()]);
         let score = run_after(&dir, &cfg(Policy::Greedy), &alpha, &a2_opening());

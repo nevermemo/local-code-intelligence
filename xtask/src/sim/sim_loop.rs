@@ -271,19 +271,23 @@ type Lines = (u32, u32);
 impl Run<'_> {
     fn go(&mut self, terms: &[String]) -> Result<(), Stop> {
         // The opening call (A1, A2) comes first; its names join the frontier.
-        let mut names = match self.opening {
+        // The names of each read stay apart: one candidate limit and one
+        // batch per read, as for a follow read.
+        let mut reads = match self.opening {
             Some(opening) => self.open(opening)?,
             None => Vec::new(),
         };
         match self.start_chain(terms) {
-            Ok(more) => names.extend(more),
+            Ok(more) => reads.extend(more),
             // The grep chain found nothing, but the opening call showed text:
             // follow the names in it.
-            Err(Stop::NoMatch | Stop::NoTerms) if !names.is_empty() => {}
+            Err(Stop::NoMatch | Stop::NoTerms) if reads.iter().any(|r| !r.is_empty()) => {}
             Err(stop) => return Err(stop),
         }
         let mut frontier = Frontier::new(self.cfg.policy);
-        frontier.push_batch(self.batch(names, 1));
+        for names in reads {
+            frontier.push_batch(self.batch(names, 1));
+        }
 
         // Follow names until the budget or the frontier runs out.
         while let Some(candidate) = frontier.pop() {
@@ -322,8 +326,9 @@ impl Run<'_> {
     }
 
     /// The opening call of A1 or A2, then the reads of its sites; returns the
-    /// identifier names in all the text shown.
-    fn open(&mut self, opening: &Opening) -> Result<Vec<String>, Stop> {
+    /// identifier names in the text shown, one list for the call's own text
+    /// and one for each site read.
+    fn open(&mut self, opening: &Opening) -> Result<Vec<Vec<String>>, Stop> {
         self.charge(
             opening.kind,
             &opening.arg,
@@ -332,7 +337,7 @@ impl Run<'_> {
             opening.windows.clone(),
             opening.listed.clone(),
         )?;
-        let mut names = self.note_read(opening.windows.clone())?;
+        let mut reads = vec![self.note_read(opening.windows.clone())?];
         let mut files = 0;
         for (path, lines) in &opening.reads {
             if files >= self.cfg.read_files {
@@ -352,14 +357,14 @@ impl Run<'_> {
             files += 1;
             let mut windows = self.windows(total, &inside);
             windows.truncate(self.cfg.windows_per_file);
-            names.extend(self.read("site-read", path, &windows, 0)?);
+            reads.push(self.read("site-read", path, &windows, 0)?);
         }
-        Ok(names)
+        Ok(reads)
     }
 
     /// Probe, first search and first reads of the A0 chain; returns the
-    /// identifier names in the text read.
-    fn start_chain(&mut self, terms: &[String]) -> Result<Vec<String>, Stop> {
+    /// identifier names in the text of each read.
+    fn start_chain(&mut self, terms: &[String]) -> Result<Vec<Vec<String>>, Stop> {
         if terms.is_empty() {
             return Err(Stop::NoTerms);
         }
@@ -427,7 +432,7 @@ impl Run<'_> {
             .take(self.cfg.read_files)
             .map(|(path, _, lines)| ((*path).to_owned(), lines.clone()))
             .collect();
-        let mut names: Vec<String> = Vec::new();
+        let mut reads: Vec<Vec<String>> = Vec::new();
         for (path, lines) in to_read {
             let total = self.searcher.text(&path).lines.len() as u32;
             // Text the opening call already showed is not read again; a file
@@ -438,9 +443,9 @@ impl Run<'_> {
             if windows.is_empty() {
                 continue;
             }
-            names.extend(self.read("read", &path, &windows, 0)?);
+            reads.push(self.read("read", &path, &windows, 0)?);
         }
-        Ok(names)
+        Ok(reads)
     }
 
     /// Whether every line of `start..=end` of `path` was already shown.

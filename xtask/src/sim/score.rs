@@ -147,13 +147,13 @@ impl ItemScore {
         });
         let calls_to_gold = first_hit.map(|s| s.call);
         // The first listing the agent was shown: the `lci` call of A1 or A2,
-        // else the A0 search.
+        // else the A0 search. An empty opening listed nothing: its rank stays
+        // null, and the later A0 search does not stand in for it.
         let listed_at = trace
             .steps
             .iter()
-            .filter(|s| matches!(s.kind, "search" | "lci-search" | "lci-traverse"))
+            .find(|s| matches!(s.kind, "search" | "lci-search" | "lci-traverse"))
             .map(listing)
-            .find(|entries| !entries.is_empty())
             .and_then(|entries| {
                 let mut files: Vec<&str> = Vec::new();
                 for (path, _, _) in &entries {
