@@ -77,7 +77,12 @@ def assignment(repo,path,key,kind,fmt):
         if fmt=='json': json.loads(text)  # Deliberately reject JSONC.
         node=yaml.compose(text,Loader=yaml.SafeLoader) # Nodes only: !input tags never execute.
         k,v=descend(node,key.split('.'))
-        end=v.end_mark.line+bool(v.end_mark.column)
+        # A block collection's end mark is the start of the next token (possibly a sibling at
+        # a nonzero column), so take the last line that holds content of the node itself.
+        seg=text[v.start_mark.index:v.end_mark.index].split('\n')
+        keep_comments=isinstance(v,yaml.ScalarNode) and v.style in ('|','>')
+        while len(seg)>1 and (not seg[-1].strip() or (not keep_comments and seg[-1].lstrip().startswith('#'))): seg.pop()
+        end=v.start_mark.line+len(seg)
         result=span(repo,path,k.start_mark.line+1,max(k.start_mark.line+1,end))
         val=text[v.start_mark.index:v.end_mark.index].strip()
     result.update(value=val,kind=kind)

@@ -100,7 +100,7 @@
           "how": "constant"
         }
       ],
-      "readers_scope": "component:homeassistant/components/generic_thermostat/climate.py::async_setup_platform (handoff to GenericThermostat)",
+      "readers_scope": "component:homeassistant/components/generic_thermostat/climate.py::_async_setup_config (handoff to GenericThermostat)",
       "excluded_readers": [],
       "behaviour": "Selects the entity whose temperature updates drive thermostat heating control.",
       "docs": [
@@ -193,7 +193,7 @@
         {
           "path": "tests/components/group/fixtures/sensor_configuration.yaml",
           "line": 3,
-          "end_line": 6,
+          "end_line": 5,
           "sha256": "e9c243925f2ca721474e699d3cbc9dc8fd74e1470bf457434494d8642a1f2346",
           "value": "- sensor.test_1\n      - sensor.test_2",
           "kind": "fixture"
@@ -360,7 +360,7 @@
       "id": "home-assistant.climate.target_sensor.q3",
       "family": "home-assistant.climate.target_sensor",
       "type": "setting_to_reader",
-      "text": "What code in `homeassistant/components/generic_thermostat/climate.py::async_setup_platform (handoff to GenericThermostat)` reads `climate.target_sensor`?",
+      "text": "What code in `homeassistant/components/generic_thermostat/climate.py::_async_setup_config (handoff to GenericThermostat)` reads `climate.target_sensor`?",
       "names_key": true
     },
     {

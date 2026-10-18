@@ -448,11 +448,10 @@ home-assistant:homeassistant/components/group/sensor.py:393-395
 394:         """Query all members and determine the sensor group state."""
 395:         self.calculate_state_attributes(self._get_valid_entities())
 
-home-assistant:tests/components/group/fixtures/sensor_configuration.yaml:3-6
+home-assistant:tests/components/group/fixtures/sensor_configuration.yaml:3-5
 3:     entities:
 4:       - sensor.test_1
 5:       - sensor.test_2
-6:     name: second_test
 
 home-assistant:homeassistant/components/generic_thermostat/climate.py:176-176
 176:     sensor_entity_id: str = config[CONF_SENSOR]

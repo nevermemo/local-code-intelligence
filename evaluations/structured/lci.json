@@ -28,7 +28,7 @@
           "how": "serde"
         }
       ],
-      "readers_scope": "component:src/app/traverse/chunks.rs::score_chunks",
+      "readers_scope": "component:src/app/traverse/chunks.rs::AppChunks::embed",
       "excluded_readers": [],
       "behaviour": "Formats indexed chunks with source and optional path placeholders; changing it changes vector identity.",
       "docs": [
@@ -280,7 +280,7 @@
           "how": "serde"
         }
       ],
-      "readers_scope": "component:lci-core/src/lsp/rust.rs::RustAdapter::new (handoff to adapter state)",
+      "readers_scope": "component:lci-core/src/lsp/rust.rs::RustServer::new (handoff to adapter state)",
       "excluded_readers": [],
       "behaviour": "Restores the language server execution and network defaults for trusted repositories and dependencies.",
       "docs": [
@@ -312,7 +312,7 @@
       "id": "lci.embedding_document_template.q3",
       "family": "lci.embedding_document_template",
       "type": "setting_to_reader",
-      "text": "What code in `src/app/traverse/chunks.rs::score_chunks` reads `embedding_document_template`?",
+      "text": "What code in `src/app/traverse/chunks.rs::AppChunks::embed` reads `embedding_document_template`?",
       "names_key": true
     },
     {
@@ -459,7 +459,7 @@
       "id": "lci.rust_analyzer_trusted.q3",
       "family": "lci.rust_analyzer_trusted",
       "type": "setting_to_reader",
-      "text": "What code in `lci-core/src/lsp/rust.rs::RustAdapter::new (handoff to adapter state)` reads `rust_analyzer_trusted`?",
+      "text": "What code in `lci-core/src/lsp/rust.rs::RustServer::new (handoff to adapter state)` reads `rust_analyzer_trusted`?",
       "names_key": true
     }
   ]

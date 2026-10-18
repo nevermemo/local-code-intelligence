@@ -1,6 +1,6 @@
 # Structured configuration gold: round 2
 
-Eight independent families per repository; 24 families and 72 questions. All splits remain `pending`: the coordinator will run `_work/split.py` (seed 20261018, SplitMix64 Fisher-Yates, first four dev). No Python-random split is used. This is source evidence, not retrieval efficacy evidence.
+Eight independent families per repository; 24 families and 72 questions. Splits are assigned by the builder with the `_work/split.py` algorithm (seed 20261018, family ids sorted bytewise, SplitMix64 Fisher-Yates from the back with j = next() % (i + 1), first four per repository dev, the rest heldout); `_work/split.py --check` agrees. No Python-random split is used. This is source evidence, not retrieval efficacy evidence.
 
 Reproduce with `python -I evaluations/structured/_work/build_gold.py` and arguments `--lci`, `--vite-tree`, `--vite-git`, `--ha-tree`, `--ha-git`, `--rg`. Locations are inputs only; artifacts use repository names and relative paths. Add `--check` to compare all generated artifacts without rewriting. The builder executes the adjacent `families.py` and `finish_gold.py` definitions. Run `python -I evaluations/structured/_work/validate_gold.py` for independent structural checks. PyYAML is already installed; no downloads are performed.
 
@@ -61,13 +61,13 @@ Assignment scope: `config.example.toml` only (assignment). Reader scope: `lci-co
 
 Exact serde field names map TOML through Config and its nested configuration structs. Searched the leaf and qualified field; declarations, defaults, validation and tests are excluded. Only runtime reads in the named component are scored. Traversal formats a chunk using document_text before rescoring it. Index construction and identity checks are outside this reader scope.
 
-Assignment scope: `config.example.toml` only (assignment). Reader scope: `src/app/traverse/chunks.rs::score_chunks`; no repository-wide completeness claim.
+Assignment scope: `config.example.toml` only (assignment). Reader scope: `src/app/traverse/chunks.rs::AppChunks::embed`; no repository-wide completeness claim.
 
 ### lci.rust_analyzer_trusted
 
 Exact serde field names map TOML through Config and its nested configuration structs. Searched the leaf and qualified field; declarations, defaults, validation and tests are excluded. Only runtime reads in the named component are scored. Scope ends at the constructor hand-off to trusted adapter state; downstream initialization options are explained by the mapping witness, not claimed as an additional direct TOML read.
 
-Assignment scope: `config.example.toml` only (assignment). Reader scope: `lci-core/src/lsp/rust.rs::RustAdapter::new (handoff to adapter state)`; no repository-wide completeness claim.
+Assignment scope: `config.example.toml` only (assignment). Reader scope: `lci-core/src/lsp/rust.rs::RustServer::new (handoff to adapter state)`; no repository-wide completeness claim.
 
 ### vite.sideEffects
 
@@ -109,7 +109,7 @@ Assignment scope: `packages/vite/src/node/server/__tests__/fixtures/deno/deno.js
 
 Searched browserField and mapWithBrowserField. resolveDeepImport destructures the map, maps the relative path and handles false by returning an external stub. Scope excludes package entry resolution and the separate relative-import hook. The helper enumerates map entries, not unknown top-level keys.
 
-Assignment scope: `playground/resolve/browser-field/package.json` only (fixture). Reader scope: `packages/vite/src/node/plugins/resolve.ts::resolveDeepImport + mapWithBrowserField`; no repository-wide completeness claim.
+Assignment scope: `playground/resolve/browser-field/package.json` only (fixture). Reader scope: `packages/vite/src/node/plugins/resolve.ts::resolveDeepImport (handoff to mapWithBrowserField)`; no repository-wide completeness claim.
 
 ### vite.imports
 
@@ -163,22 +163,22 @@ Assignment scope: `tests/components/group/fixtures/sensor_configuration.yaml` on
 
 Searched CONF_SENSOR and sensor_entity_id. generic_thermostat/const.py maps target_sensor; setup passes it to GenericThermostat, which subscribes that entity to _async_sensor_changed. Its documented temperature-change callback updates current temperature and controls heating. Scope explicitly ends at the setup hand-off; runtime subscription is retained as mapping evidence.
 
-Assignment scope: `tests/components/generic_thermostat/fixtures/configuration.yaml` only (fixture). Reader scope: `homeassistant/components/generic_thermostat/climate.py::async_setup_platform (handoff to GenericThermostat)`; no repository-wide completeness claim.
+Assignment scope: `tests/components/generic_thermostat/fixtures/configuration.yaml` only (fixture). Reader scope: `homeassistant/components/generic_thermostat/climate.py::_async_setup_config (handoff to GenericThermostat)`; no repository-wide completeness claim.
 
 ## Descriptive lockfile stratum (not a selection rule)
 
-After finalizing the families, ran exactly `rg --no-config -n -w --hidden -g '!.git' --sort path --max-filesize 1M -- <last segment> .` from each tree root. Basenames are exactly PLAN section 2: `package-lock.json`, `npm-shrinkwrap.json`, `composer.lock`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Pipfile.lock`, `poetry.lock`, `uv.lock`, `bun.lock`, `bun.lockb`. Counts are matching output lines, not token occurrences. First 50 means the first 50 output lines of the unfiltered command. Default ignore handling remains in force. These measurements describe whether lockfile removal could move the A/B result; they do not select or reject families. Local generated gold may contribute non-lockfile LCI matches because the command is deliberately unchanged. Counts freeze the inspected working-tree state, not a clean-tree simulation.
+After finalizing the families, ran exactly `rg --no-config -n -w --hidden -g '!.git' --sort path --max-filesize 1M -- <last segment> .` from each tree root. Basenames are exactly PLAN section 2: `package-lock.json`, `npm-shrinkwrap.json`, `composer.lock`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Pipfile.lock`, `poetry.lock`, `uv.lock`, `bun.lock`, `bun.lockb`. Counts are matching output lines, not token occurrences. First 50 means the first 50 output lines of the unfiltered command. Default ignore handling remains in force. These measurements describe whether lockfile removal could move the A/B result; they do not select or reject families. The LCI tree is a clean export of the pinned revision, so these counts exclude the generated gold itself; every tree is the pinned export, and counts depend on the ripgrep version recorded in `_work/verification.json`.
 
 | Family | All matched lines | Lockfile lines | Lockfile lines in first 50 |
 | --- | ---: | ---: | ---: |
-| lci.embedding_document_template | 59 | 0 | 0 |
-| lci.embedding_query_template | 61 | 0 | 0 |
-| lci.fusion.semantic_weight | 78 | 0 | 0 |
-| lci.index.freshness | 218 | 0 | 0 |
-| lci.index.stale_check_interval_seconds | 37 | 0 | 0 |
-| lci.index.wait_for_existing_job_seconds | 27 | 0 | 0 |
-| lci.readiness_timeout_seconds | 31 | 0 | 0 |
-| lci.rust_analyzer_trusted | 34 | 0 | 0 |
+| lci.embedding_document_template | 41 | 0 | 0 |
+| lci.embedding_query_template | 42 | 0 | 0 |
+| lci.fusion.semantic_weight | 58 | 0 | 0 |
+| lci.index.freshness | 197 | 0 | 0 |
+| lci.index.stale_check_interval_seconds | 17 | 0 | 0 |
+| lci.index.wait_for_existing_job_seconds | 8 | 0 | 0 |
+| lci.readiness_timeout_seconds | 13 | 0 | 0 |
+| lci.rust_analyzer_trusted | 15 | 0 | 0 |
 | vite.browser | 501 | 64 | 0 |
 | vite.compilerOptions.experimentalDecorators | 10 | 0 | 0 |
 | vite.compilerOptions.jsxImportSource | 23 | 0 | 0 |

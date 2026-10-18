@@ -223,9 +223,9 @@ preregistration first.
 
 - **Fixed now:** sections 1 to 9 as written, including the lockfile-only scope and the section 2 numbers.
 - **Frozen with the gold (the commit that adds this file):** gold sha256 of the committed (LF) bytes:
-  `evaluations/structured/lci.json` 373bace1e81bfb40a7d8bb8f792a9046e912e073219607da898319ee16bb8b0d,
-  `vite.json` e01c246cd661fe9e187c005f4cb390bf7958c0c8e6b766f5595392d3d1673c41,
-  `home-assistant.json` 3bb56fc826e753e83fa5cc1914ec05235accf8e485e2616e5cd6bf479cddf63f,
+  `evaluations/structured/lci.json` 9753c4c5781041309ea70d67aa235267cda981047567a11fed7cd899b8bc2f96,
+  `vite.json` 963335bba2c34417c1aded1bd6c7a0eda66601ba36728cc615cf12b476a0e7f9,
+  `home-assistant.json` 8b23b361997dff1f27333b471330b86696c8278da953e07eca654bd916b01843,
   `dependency/lci.json` 44f646dca277f1dfe6761c899534836a74249e3f54b70f26813ea5c0f72fa81f,
   `dependency/vite.json` 4af5cd72d48443f15229490418f1e70e6f1f9515a904470d9eee285d2a44d71b.
   The validator passes on both strata against a clean export of the LCI gold revision and the two
@@ -239,7 +239,9 @@ preregistration first.
 
 - The gold was built before this file, so its author knew the families and the split (which came
   from the seeded algorithm, not hand choice). No arm has run. The 2b change exists on its own
-  branch (`feat/live-grep-lockfiles`), unmerged; it merges only if section 7 is met.
+  branch (`feat/live-grep-lockfiles`), unmerged; it merges only if section 7 is met. To keep one
+  frozen runner (section 5), the skip mechanism itself reaches main first with an empty default and a
+  harness switch, so A and B run the same binary; what ships, if section 7 is met, is the default.
 - **Amendment before any run:** the config stratum's descriptive lockfile table (its NOTES.md)
   showed lockfile lines in rg's first 50 matches for one of 24 keys, against 122 of 450 sampled keys
   in slice 2-0 (101 of 150 in Vite). On that gold alone condition 5 could not hold whatever the rule
@@ -247,6 +249,12 @@ preregistration first.
   dependency stratum was added, with its frame fixed in section 4, condition 5 moved to it and the
   config stratum kept as the no-harm test. The first round's gold was also revised after a review
   (near-duplicate families across halves, a four-character key); its families are not the ones above.
+- **Second amendment before any run (pull-request review of the gold):** four reader scopes named a
+  function that does not contain the cited lines (Home Assistant `target_sensor`, LCI
+  `embedding_document_template` and `rust_analyzer_trusted`, Vite `browser`); their scopes and
+  reader questions were corrected. One YAML assignment span (`sensor.entities`) ended a line late and
+  was shortened. The build scripts now assign the seeded split themselves. No family, split or key
+  changed; the config hashes in section 10 are the corrected files.
 - LCI revisions differ across sources: the plan inspected `ec458ac611390b3b616dd90cd3b955949a6bb3d3`,
   slice 2-0 measured the working tree at `a0920ab1c7bbd660e4ddcd18729d9c4ea94a8534`, and the gold
   uses the revision of section 4. Vite and Home Assistant match. Premise counts are not re-measured

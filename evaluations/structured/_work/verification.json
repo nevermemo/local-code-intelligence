@@ -2,54 +2,54 @@
   "python": "3.14.7",
   "yaml": "6.0.3",
   "seed": 20261018,
-  "split": "pending",
-  "rg_version": "ripgrep 15.0.0 (rev 3a612f88b8)",
+  "split": "splitmix64-fisher-yates",
+  "rg_version": "ripgrep 15.2.0 (rev e89fff89ac)",
   "strata": [
     {
       "family": "lci.embedding_document_template",
-      "matched_lines": 59,
+      "matched_lines": 41,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.embedding_query_template",
-      "matched_lines": 61,
+      "matched_lines": 42,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.fusion.semantic_weight",
-      "matched_lines": 78,
+      "matched_lines": 58,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.index.freshness",
-      "matched_lines": 218,
+      "matched_lines": 197,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.index.stale_check_interval_seconds",
-      "matched_lines": 37,
+      "matched_lines": 17,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.index.wait_for_existing_job_seconds",
-      "matched_lines": 27,
+      "matched_lines": 8,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.readiness_timeout_seconds",
-      "matched_lines": 31,
+      "matched_lines": 13,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },
     {
       "family": "lci.rust_analyzer_trusted",
-      "matched_lines": 34,
+      "matched_lines": 15,
       "lockfile_lines": 0,
       "lockfile_lines_first_50": 0
     },

@@ -1,9 +1,15 @@
 """Artifact generation and exact premise-rg descriptive counts; builder context."""
+import importlib.util
+sys.dont_write_bytecode=True  # do not leave a __pycache__ in the artifact directory
 from collections import Counter
+
+_spec=importlib.util.spec_from_file_location('structured_split',OUT/'_work'/'split.py')
+split_mod=importlib.util.module_from_spec(_spec); _spec.loader.exec_module(split_mod)  # one shared SplitMix64 implementation
+assert split_mod.SEED==SEED
 
 header='''# Structured configuration gold: round 2
 
-Eight independent families per repository; 24 families and 72 questions. All splits remain `pending`: the coordinator will run `_work/split.py` (seed 20261018, SplitMix64 Fisher-Yates, first four dev). No Python-random split is used. This is source evidence, not retrieval efficacy evidence.
+Eight independent families per repository; 24 families and 72 questions. Splits are assigned by the builder with the `_work/split.py` algorithm (seed 20261018, family ids sorted bytewise, SplitMix64 Fisher-Yates from the back with j = next() % (i + 1), first four per repository dev, the rest heldout); `_work/split.py --check` agrees. No Python-random split is used. This is source evidence, not retrieval efficacy evidence.
 
 Reproduce with `python -I evaluations/structured/_work/build_gold.py` and arguments `--lci`, `--vite-tree`, `--vite-git`, `--ha-tree`, `--ha-git`, `--rg`. Locations are inputs only; artifacts use repository names and relative paths. Add `--check` to compare all generated artifacts without rewriting. The builder executes the adjacent `families.py` and `finish_gold.py` definitions. Run `python -I evaluations/structured/_work/validate_gold.py` for independent structural checks. PyYAML is already installed; no downloads are performed.
 
@@ -50,6 +56,8 @@ for repo,families in all_families.items():
   for n,(typ,txt,names) in enumerate(prompts,1): questions.append({'id':f['id']+f'.q{n}','family':f['id'],'type':typ,'text':txt,'names_key':names})
  assert max(readers.values())<=2, readers
  if repo=='home-assistant': assert max(Counter(s['path'] for s in used).values())<=2
+ dev=set(split_mod.order([f['id'] for f in families])[:4])
+ for f in families: f['split']='dev' if f['id'] in dev else 'heldout'
  outputs[repo+'.json']=json.dumps({'version':1,'repo':repo,'revision':REVS[repo],'seed':SEED,'families':families,'questions':questions},ensure_ascii=False,indent=2)+'\n'
 
 locknames={'package-lock.json','npm-shrinkwrap.json','composer.lock','Cargo.lock','yarn.lock','pnpm-lock.yaml','Pipfile.lock','poetry.lock','uv.lock','bun.lock','bun.lockb'}
@@ -66,7 +74,7 @@ for repo,families in all_families.items():
   strata.append({'family':f['id'],'matched_lines':len(matches),'lockfile_lines':sum(flags),'lockfile_lines_first_50':sum(flags[:50])})
 table='''\n## Descriptive lockfile stratum (not a selection rule)
 
-After finalizing the families, ran exactly `rg --no-config -n -w --hidden -g '!.git' --sort path --max-filesize 1M -- <last segment> .` from each tree root. Basenames are exactly PLAN section 2: `package-lock.json`, `npm-shrinkwrap.json`, `composer.lock`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Pipfile.lock`, `poetry.lock`, `uv.lock`, `bun.lock`, `bun.lockb`. Counts are matching output lines, not token occurrences. First 50 means the first 50 output lines of the unfiltered command. Default ignore handling remains in force. These measurements describe whether lockfile removal could move the A/B result; they do not select or reject families. Local generated gold may contribute non-lockfile LCI matches because the command is deliberately unchanged. Counts freeze the inspected working-tree state, not a clean-tree simulation.
+After finalizing the families, ran exactly `rg --no-config -n -w --hidden -g '!.git' --sort path --max-filesize 1M -- <last segment> .` from each tree root. Basenames are exactly PLAN section 2: `package-lock.json`, `npm-shrinkwrap.json`, `composer.lock`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Pipfile.lock`, `poetry.lock`, `uv.lock`, `bun.lock`, `bun.lockb`. Counts are matching output lines, not token occurrences. First 50 means the first 50 output lines of the unfiltered command. Default ignore handling remains in force. These measurements describe whether lockfile removal could move the A/B result; they do not select or reject families. The LCI tree is a clean export of the pinned revision, so these counts exclude the generated gold itself; every tree is the pinned export, and counts depend on the ripgrep version recorded in `_work/verification.json`.
 
 | Family | All matched lines | Lockfile lines | Lockfile lines in first 50 |
 | --- | ---: | ---: | ---: |
@@ -74,10 +82,10 @@ After finalizing the families, ran exactly `rg --no-config -n -w --hidden -g '!.
 for s in strata: table+=f"| {s['family']} | {s['matched_lines']} | {s['lockfile_lines']} | {s['lockfile_lines_first_50']} |\n"
 outputs['NOTES.md']=header+'\n'.join(notes)+table
 outputs['_work/witnesses.txt']='\n\n'.join(witnesses)+'\n'
-outputs['_work/verification.json']=json.dumps({'python':sys.version.split()[0],'yaml':yaml.__version__,'seed':SEED,'split':'pending','rg_version':rg_version,'strata':strata,'files':sorted(inventory,key=lambda x:(x['repo'],x['path']))},indent=2)+'\n'
+outputs['_work/verification.json']=json.dumps({'python':sys.version.split()[0],'yaml':yaml.__version__,'seed':SEED,'split':'splitmix64-fisher-yates','rg_version':rg_version,'strata':strata,'files':sorted(inventory,key=lambda x:(x['repo'],x['path']))},indent=2)+'\n'
 for name,text in outputs.items():
  assert not re.search(r'(?<![A-Za-z])[A-Za-z]:[\\/]|/Us[e]rs/|/hom[e]/',text), 'Nonportable artifact: '+name
  dest=OUT/name
  if a.check: assert dest.read_text(encoding='utf-8')==text, 'Reproduction mismatch: '+name
  else: dest.write_text(text,encoding='utf-8',newline='\n')
-print(('Verified' if a.check else 'Wrote')+f': 24 families, 72 questions, all splits pending; {len(inventory)} revision files verified.')
+print(('Verified' if a.check else 'Wrote')+f': 24 families, 72 questions, splits dev/heldout (SplitMix64); {len(inventory)} revision files verified.')

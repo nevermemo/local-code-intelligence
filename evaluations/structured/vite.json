@@ -35,7 +35,7 @@
           "how": "literal"
         }
       ],
-      "readers_scope": "component:packages/vite/src/node/plugins/resolve.ts::resolveDeepImport + mapWithBrowserField",
+      "readers_scope": "component:packages/vite/src/node/plugins/resolve.ts::resolveDeepImport (handoff to mapWithBrowserField)",
       "excluded_readers": [],
       "behaviour": "Remaps package-relative module paths, with false marking a path as external for the client environment.",
       "docs": [
@@ -332,7 +332,7 @@
       "id": "vite.browser.q3",
       "family": "vite.browser",
       "type": "setting_to_reader",
-      "text": "What code in `packages/vite/src/node/plugins/resolve.ts::resolveDeepImport + mapWithBrowserField` reads `browser`?",
+      "text": "What code in `packages/vite/src/node/plugins/resolve.ts::resolveDeepImport (handoff to mapWithBrowserField)` reads `browser`?",
       "names_key": true
     },
     {

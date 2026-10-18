@@ -1,6 +1,9 @@
 ﻿"""Validate schema v1 invariants independently of the gold builder (read-only)."""
-import collections, json, pathlib, re
+import collections, importlib.util, json, pathlib, re, sys
+sys.dont_write_bytecode=True  # keep the machine-path scan below free of .pyc files
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+_spec=importlib.util.spec_from_file_location('structured_split',ROOT/'_work'/'split.py')
+split_mod=importlib.util.module_from_spec(_spec); _spec.loader.exec_module(split_mod)  # the split algorithm xtask also checks
 TYPES={'setting_location','behaviour_to_setting','setting_to_reader'}
 TOP={'version','repo','revision','seed','families','questions'}
 FAMILY={'id','split','format','key','assignments','readers','readers_scope','excluded_readers','behaviour','docs'}
@@ -23,13 +26,14 @@ for repo in ('lci','vite','home-assistant'):
     assert len(data['families'])==8 and len(data['questions'])==24
     families={f['id']:f for f in data['families']}
     assert len(families)==8
-    assert all(f['split']=='pending' for f in families.values())
+    dev=set(split_mod.order(list(families))[:4])
+    assert len(dev)==4 and all(f['split']==('dev' if i in dev else 'heldout') for i,f in families.items()), 'Split differs from the SplitMix64 assignment'
     reader_counts=collections.Counter()
     assignments=[]
     for f in families.values():
         assert set(f)==FAMILY and f['id']==repo+'.'+f['key']
         assert f['id'] not in seen; seen.add(f['id'])
-        assert f['split']=='pending' and len(f['key'].split('.')[-1])>=6
+        assert len(f['key'].split('.')[-1])>=6
         reader_counts.update({s['path'] for s in f['readers']})
         for span in f['assignments']:
             assert all(span['path']!=other['path'] or span['end_line']<other['line'] or other['end_line']<span['line'] for other in assignments)
@@ -75,7 +79,7 @@ for repo in ('lci','vite','home-assistant'):
         assert len(qs)==3 and {q['type'] for q in qs}==TYPES
     assert not re.search(r'(?<![A-Za-z])[A-Za-z]:[\\/]|/Us[e]rs/|/hom[e]/',raw)
     total+=len(data['questions'])
-    print(repo+': 8 families, 24 questions, pending splits; schema and independence valid')
+    print(repo+': 8 families, 24 questions, 4 dev / 4 heldout (SplitMix64); schema and independence valid')
 notes=(ROOT/'NOTES.md').read_text(encoding='utf-8')
 assert not re.search(r'(?<![A-Za-z])[A-Za-z]:[\\/]|/Us[e]rs/|/hom[e]/',notes)
 assert all('### '+fid in notes for fid in seen if not re.search(r'\.q[123]$',fid))

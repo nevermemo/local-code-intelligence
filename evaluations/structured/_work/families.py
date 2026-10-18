@@ -27,12 +27,12 @@ add('lci','embedding_query_template','toml',ex,'assignment',mdl+'::query_text',
  [(mdl,'fill_template(&self.config.embedding_query_template',None,'serde')],[(cfg,484,488)],
  'Formats a search query before embedding, substituting its query placeholder without invalidating stored vectors.',
  'Which setting customizes the instruction text sent with a search request to the vector model without rebuilding stored vectors?',base+' query_text fills the configured template; query then embeds that result.')
-add('lci','embedding_document_template','toml',ex,'assignment','src/app/traverse/chunks.rs::score_chunks',
+add('lci','embedding_document_template','toml',ex,'assignment','src/app/traverse/chunks.rs::AppChunks::embed',
  [('src/app/traverse/chunks.rs','let template = &self.app.config.embedding_document_template;',None,'serde')],[(cfg,489,496)],
  'Formats indexed chunks with source and optional path placeholders; changing it changes vector identity.',
  'Which setting customizes text sent for each indexed chunk, optionally including its repository-relative filename and requiring new vectors when changed?',base+' Traversal formats a chunk using document_text before rescoring it. Index construction and identity checks are outside this reader scope.')
 rust='lci-core/src/lsp/rust.rs'
-add('lci','rust_analyzer_trusted','toml',ex,'assignment',rust+'::RustAdapter::new (handoff to adapter state)',
+add('lci','rust_analyzer_trusted','toml',ex,'assignment',rust+'::RustServer::new (handoff to adapter state)',
  [(rust,'trusted: config.rust_analyzer_trusted,',None,'serde')],[(ex,'# Restore rust-analyzer\'s execution/network defaults only for trusted','# repositories and dependencies. Applies to every workspace this process uses.')],
  'Restores the language server execution and network defaults for trusted repositories and dependencies.',
  'Which switch restores the Rust language server execution and network defaults for repositories and dependencies you trust?',
@@ -62,7 +62,7 @@ for key,ap,read,behavior,q,docs in [
  ('workspace','deno/deno.json',[(root,'if (content.workspace) return true',None,'literal')], 'Marks a Deno configuration directory as the enclosing workspace root during upward root discovery.', 'Which Deno configuration field makes upward project-root discovery stop at a multi-package directory?', [(root,' * Search up for the nearest workspace root','  if (hasWorkspaceDenoJSON(current)) return current')])]:
  add('vite',key,'json','packages/vite/src/node/server/__tests__/fixtures/'+ap,'fixture',root,read,docs,behavior,q,
   'Searched the literal field and read both JSON detection and searchForWorkspaceRoot. JSON.parse -> truthy field test -> upward traversal stop. The consumer tests presence/truthiness; it does not enumerate package members. Other tools interpreting membership are excluded.')
-add('vite','browser','json','playground/resolve/browser-field/package.json','fixture',rs+'::resolveDeepImport + mapWithBrowserField',
+add('vite','browser','json','playground/resolve/browser-field/package.json','fixture',rs+'::resolveDeepImport (handoff to mapWithBrowserField)',
  [(rs,'const { exports: exportsField, browser: browserField } = data',None,'literal'),(rs,'} else if (options.mainFields.includes(\'browser\') && isObject(browserField)) {','      return browserExternalId','literal')],
  [(rs,' * given a relative path in pkg dir,',' * - Returning `false` means this id is explicitly externalized for browser')],
  'Remaps package-relative module paths, with false marking a path as external for the client environment.',
@@ -112,7 +112,7 @@ add('home-assistant','sensor.entities','yaml','tests/components/group/fixtures/s
  'Which YAML setting lists the members whose numeric readings are combined into one aggregate value?',
  'Searched CONF_ENTITIES and followed async_setup_platform -> SensorGroup(entity_ids) -> _entity_ids -> member state aggregation. Scope explicitly ends at the platform constructor hand-off. Config-entry and preview paths are excluded; those have independent inputs. The fixture has one sensor mapping.')
 therm='homeassistant/components/generic_thermostat/climate.py'
-add('home-assistant','climate.target_sensor','yaml','tests/components/generic_thermostat/fixtures/configuration.yaml','fixture',therm+'::async_setup_platform (handoff to GenericThermostat)',
+add('home-assistant','climate.target_sensor','yaml','tests/components/generic_thermostat/fixtures/configuration.yaml','fixture',therm+'::_async_setup_config (handoff to GenericThermostat)',
  [(therm,'    sensor_entity_id: str = config[CONF_SENSOR]',None,'constant')],[(therm,'    async def _async_sensor_changed(self, event: Event[EventStateChangedData]) -> None:',510)],
  'Selects the entity whose temperature updates drive thermostat heating control.',
  'Which YAML setting chooses the entity whose measured temperature drives heating control?',
