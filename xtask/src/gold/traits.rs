@@ -190,15 +190,16 @@ fn context(item: &Value, template: Template, answers: &[Answer]) -> Context {
                 .as_ref()
                 .is_some_and(|(p, l)| spans.iter().any(|s| s.holds(p, *l)))
         };
+        let hits: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| on(&e.credit))
+            .map(|(i, _)| i)
+            .collect();
         classified.push(Ans {
-            hits: entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| on(&e.credit))
-                .map(|(i, _)| i)
-                .collect(),
+            cfg: hits.is_empty() && on(&cfg),
+            hits,
             ignored: on(&ignore),
-            cfg: on(&cfg),
         });
     }
     Context {
@@ -348,10 +349,11 @@ pub fn score_item(item: &Value, answers: &[Answer]) -> ItemScore {
     )];
     if template == Template::Q2 {
         let (rank, counted) = q2_rank_and_count(&ctx);
+        let has_gold = !ctx.entries.is_empty();
         metrics.push(("counted@10", Some(counted as f64)));
-        metrics.push(("hit@1", Some(hit_at_k(rank, 1))));
-        metrics.push(("hit@10", Some(hit_at_k(rank, Q2_CUT))));
-        metrics.push(("mrr", Some(reciprocal_rank(rank, Q2_CUT))));
+        metrics.push(("hit@1", has_gold.then(|| hit_at_k(rank, 1))));
+        metrics.push(("hit@10", has_gold.then(|| hit_at_k(rank, Q2_CUT))));
+        metrics.push(("mrr", has_gold.then(|| reciprocal_rank(rank, Q2_CUT))));
         let kind = str_of(item, "stratum")
             .or_else(|| {
                 arr_of(item, "gold")
@@ -688,6 +690,26 @@ mod tests {
     }
 
     #[test]
+    fn retained_gold_wins_over_a_gated_impls_shared_type_declaration() {
+        let item = json!({
+            "id": "shared", "set": "Q1",
+            "cfg_gated": [span("impls.rs", 20, 25)],
+            "dominant_site": span("elsewhere.rs", 1, 1),
+            "gold": [
+                {"impl_id": "Wrapper<u8>", "impl": span("impls.rs", 10, 15),
+                 "type_decl": span("types.rs", 1, 3)},
+                {"impl_id": "Wrapper<u16>", "impl": span("impls.rs", 20, 25),
+                 "type_decl": span("types.rs", 1, 3)}
+            ]
+        });
+        let s = score_item(&item, &[ans("impls.rs:21"), ans("types.rs:1")]);
+        for name in ["set_f1", "recall_explicit", "explicit_f1", "nodom_f1"] {
+            assert_eq!(metric(&s, name), Some(1.0), "{name}");
+        }
+        assert_eq!(m(&s, "cfg_gated_answers"), 1.0);
+    }
+
+    #[test]
     fn cfg_gated_gold_and_all_its_answer_spans_leave_the_scored_set() {
         for (template, files, credit) in [
             ("Q1", ["b.rs", "t.rs"], "t.rs:1"),
@@ -754,6 +776,18 @@ mod tests {
             "gold": [{"impl_id": "i2", "stratum": "macro", "location": span("m.rs", 5, 5),
                       "impl": span("m.rs", 5, 5)}]
         })
+    }
+
+    #[test]
+    fn q2_rank_metrics_are_undefined_without_retained_gold() {
+        let mut item = q2();
+        item["cfg_gated"] = json!([span("m.rs", 5, 5)]);
+        let s = score_item(&item, &[ans("m.rs:5"), ans("miss.rs:1")]);
+        for name in ["hit@1", "hit@10", "mrr"] {
+            assert_eq!(metric(&s, name), None, "{name}");
+        }
+        assert_eq!(m(&s, "cfg_gated_answers"), 1.0);
+        assert_eq!(m(&s, "counted@10"), 1.0);
     }
 
     #[test]

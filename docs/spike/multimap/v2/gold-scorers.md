@@ -130,6 +130,7 @@ impl: the call site) for Q2 and Q3.
   `location` as the only credit span.
 - *Q2* "where is `Trait::m` implemented for `Type`": the rank of the first
   counted answer on the gold `location`: `hit@1`, `hit@10`, `mrr` (cut 10).
+  These rank metrics are undefined when no gold remains after cfg exclusions.
   `counted@10` is the number of counted answers after exclusions, capped at ten;
   bench precision divides `hit@10` by this count (zero when none are counted).
 - *Matching.* An answer is a located node (`path` and `line`); one without
@@ -145,8 +146,9 @@ impl: the call site) for Q2 and Q3.
   optional `cfg_gated` span (an implementation the gold's build did not compile;
   counted apart as `cfg_gated_answers`, mean per item). Gold whose impl site or
   any credit span overlaps a cfg-gated span is removed from k and the recall
-  denominator; answers on any of its spans are also dropped. Retained gold wins
-  over other ignored spans. The report's `traits` block says how many items carry
+  denominator; answers on its spans are dropped unless they also credit retained
+  gold. Such shared-span hits are not counted as `cfg_gated_answers`. Retained gold
+  wins over other ignored spans. The report's `traits` block says how many items carry
   `trait_decl` and `cfg_gated`: without them nothing is dropped, and the trait declaration card
   counts as a miss. When no item has a `trait_decl`, the scorer warns once on
   stderr and the report has `warnings: ["no trait_decl spans: the trait
@@ -163,10 +165,10 @@ impl: the call site) for Q2 and Q3.
   gold at the item's `dominant_site` and the answers that hit it (own k). The
   site is the macro call site that carries the most Q1 gold in the whole set (at
   least two entries; ties by file and line), written onto every Q1 item by
-  `gold::prepare` (`score` and `maps bench` call it before dropping any item,
+  `gold::prepare` (`score`, `maps bench` and `maps compare` reconstruction call it before dropping any item,
   so the site does not move with the items scored). It is undefined (null) when
   the set has no such site, or when a per-item scorer sees an item that was not
-  prepared (`maps compare` rebuilds item records that way).
+  prepared.
 - *Bench.* `maps bench --set traits` reads `traits.json` (JSON lines allowed)
   in `--gold-dir`. Its adapter offers every located symbol for Q1 and only
   functions and methods for Q2 and Q3, each with its node id as `symbol`; the
@@ -176,15 +178,26 @@ impl: the call site) for Q2 and Q3.
   The plain scorer receives path/line/symbol answers and cannot infer impls:
   it only deduplicates identical answers, so distinct methods of one impl use
   separate budget slots. Every producer must collapse these before scoring;
-  the bench adapter does this with `impl_unit`. In a Q1 walk a method
-  (or other member) node counts as the impl that contains it: the adapter reads
-  that impl from the container chain of the node id (`impl Tr for Foo` plus the
-  module path; no span is needed) and collapses the duplicates before the
-  scorer's budget cut, keeping the best ranked node's site. So an impl node plus
-  two of its method nodes is one answer, one slot, one credit. Impls of
+  the bench adapter uses `impl_unit` when the node id carries an impl container.
+  It reads that impl from the container chain (`impl Tr for Foo`, generic and
+  unsafe forms, plus the module path) and collapses duplicates before the
+  scorer's budget cut, keeping the best ranked node's site. Impls of
   different types at one macro call site have different headers and stay apart,
   one answer per distinct node. A type node and the methods of its impl are not
   merged (the ids do not tie them). Q2 and Q3 keep every member node.
+  `graph.scip`, the method nodes of `scip.implements`, and search hits mapped to
+  SCIP symbols use default ids with empty containers, and their response cards
+  carry only the definition site. For those method and function nodes the
+  adapter reads the evaluated tree's Rust source at the site (`--tree`, which a
+  live run already needs; give it to `--rescore` as well), parses each file once
+  per run with the repository's declaration parser, and groups the answers by
+  (file, impl block), the block identified by the lines its members cover. A
+  site outside any impl block (a free function, a trait default method) keeps its
+  own unit. Two blocks with the same header in one file are told apart only when
+  another declaration separates them. Without `--tree`, or for a file that
+  cannot be read or parsed, those nodes keep separate Q1 budget slots and the
+  report's `warnings` and the row note say so. Other callers of `adapt` (fit-priors,
+  oracle-policy) have no tree and keep the id-only grouping.
 - The overall cell mixes the templates; read `strata.template`. The
   `traits` set is private: the unit tests use tiny inline gold.
 

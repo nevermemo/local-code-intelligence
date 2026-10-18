@@ -832,6 +832,25 @@ not json
     }
 
     #[test]
+    fn traits_q2_means_exclude_items_with_only_cfg_gated_gold() {
+        let location = json!({"file": "a.rs", "begin_line": 1, "end_line": 3});
+        let items = vec![
+            json!({"id": "active", "set": "Q2", "gold": [{"location": location}]}),
+            json!({"id": "gated", "set": "Q2", "cfg_gated": [location],
+                   "gold": [{"location": location}]}),
+        ];
+        let run = parse_run(r#"{"active": ["a.rs:1"], "gated": ["a.rs:1"]}"#).unwrap();
+        let report = score_set(Set::Traits, &items, &run, false, false).unwrap();
+        for cell in [&report["overall"], &report["strata"]["template"]["Q2"]] {
+            assert_eq!(cell["n"], 2);
+            for name in ["hit@1", "hit@10", "mrr"] {
+                assert_eq!(cell["metrics"][name], 1.0, "{name}");
+                assert_eq!(cell["n_defined"][name], 1, "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn traits_report_carries_the_dominant_site_and_the_optional_fields() {
         let span = |f: &str, a: i64, b: i64| json!({"file": f, "begin_line": a, "end_line": b});
         let entry = |id: &str, kind: &str, f: &str| json!({"impl_id": id, "stratum": kind, "impl": span(f, 1, 2), "type_decl": null});
