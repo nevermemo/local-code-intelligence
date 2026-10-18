@@ -444,3 +444,52 @@ fn traverse_over_scip_implements_reaches_the_member_from_the_trait_method() {
     assert_eq!(reached["via"], "scip.implements", "{walk}");
     assert_eq!(reached["witness"], "compiler", "{walk}");
 }
+
+#[test]
+fn traverse_starts_at_the_trait_method_a_question_names_and_checks_trait_seeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let tree = temp.path().join("tree");
+    write_recipe_tree(&tree);
+    let run = |extra: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+        command.current_dir(temp.path()).args([
+            "traverse",
+            "--scip",
+            tree.join("index.scip").to_str().unwrap(),
+            "--root",
+            tree.to_str().unwrap(),
+            "--question",
+            "What must change if `Speak::say` changes?",
+            "--maps",
+            "scip.implements",
+            "--out",
+            temp.path().join("out").to_str().unwrap(),
+        ]);
+        command.args(extra);
+        strip_lci_env(&mut command);
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    // The default and both modes start at the declaration and reach the member.
+    for extra in [
+        &[][..],
+        &["--trait-seeds", "replace"],
+        &["--trait-seeds", "prepend"],
+    ] {
+        let (ok, stdout, stderr) = run(extra);
+        assert!(ok, "{extra:?}: {stderr}");
+        let walk: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(walk["seed_source"], "traits", "{extra:?}: {walk}");
+        assert_eq!(walk["trait_seeds"], 1, "{extra:?}: {walk}");
+        assert_eq!(walk["seed_hits"][0]["how"], "trait_method", "{walk}");
+        assert_eq!(walk["results"][1]["via"], "scip.implements", "{walk}");
+    }
+    // A bad value is refused with the choices.
+    let (ok, _, stderr) = run(&["--trait-seeds", "both"]);
+    assert!(!ok);
+    assert!(stderr.contains("auto, replace or prepend"), "{stderr}");
+}
