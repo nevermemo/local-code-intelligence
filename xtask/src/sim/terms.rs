@@ -1,5 +1,6 @@
 //! Terms and searching for the simulated agent: which query terms it probes,
-//! and a cached grep over the tree built on `lci_maps::live_grep::scan`.
+//! and a cached grep over the tree built on `lci_maps::live_grep::Corpus`
+//! (the tree read once; its scans equal `live_grep::scan`).
 //!
 //! `scan` is case sensitive; an agent greps case-insensitively. A query term
 //! (always lower case) is therefore searched in its spellings (`term`,
@@ -22,7 +23,7 @@ pub fn original_spellings(question: &str) -> HashMap<String, String> {
 }
 
 use super::rg::RgCommand;
-use lci_maps::live_grep::{GrepOptions, LiveMatch, scan};
+use lci_maps::live_grep::{Corpus, GrepOptions, LiveMatch};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -68,6 +69,16 @@ fn spellings(term: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The needles of one search of a query term: its spellings and, when given
+/// and not among them, the token as the question wrote it.
+pub fn term_needles(term: &str, original: Option<&str>) -> Vec<String> {
+    let mut needles = spellings(term);
+    if let Some(original) = original.filter(|o| !o.is_empty() && !needles.iter().any(|n| n == o)) {
+        needles.push(original.to_owned());
+    }
+    needles
 }
 
 /// What one search found: occurrences (exact first, then by path and line;
@@ -127,6 +138,11 @@ pub struct Searcher {
     names: GrepOptions,
     scans: HashMap<String, Rc<Hits>>,
     texts: HashMap<String, Rc<FileText>>,
+    /// The tree read once, loaded by the first search of a `Live` backend
+    /// with the backend's options. An edit to the tree after that is not seen.
+    corpus: Option<Corpus>,
+    /// Milliseconds the corpus load took (0 before it, and for `Rg`).
+    pub corpus_load_ms: f64,
     /// Scans that ended on the deadline or the byte cap, so their results may
     /// depend on the machine (a determinism warning).
     pub incomplete_scans: u32,
@@ -166,6 +182,8 @@ impl Searcher {
             names: scan_options(),
             scans: HashMap::new(),
             texts: HashMap::new(),
+            corpus: None,
+            corpus_load_ms: 0.0,
             incomplete_scans: 0,
             totals: ScanTotals::default(),
             failure: None,
@@ -179,6 +197,11 @@ impl Searcher {
         }
     }
 
+    /// Bytes the corpus read (0 before the first live search, and for `Rg`).
+    pub fn corpus_bytes(&self) -> u64 {
+        self.corpus.as_ref().map_or(0, Corpus::bytes)
+    }
+
     /// Every occurrence of `needle`, exactly as written. Nothing is cut: a
     /// file count (a name's rarity) must not depend on a match cap. The agent
     /// is shown only the first lines of it.
@@ -190,13 +213,7 @@ impl Searcher {
     /// Capitalized and UPPER spellings and, when given, as the question
     /// wrote it (`parseConfig`): one call for the agent.
     pub fn search_term(&mut self, term: &str, original: Option<&str>) -> Rc<Hits> {
-        let mut needles = spellings(term);
-        if let Some(original) =
-            original.filter(|o| !o.is_empty() && !needles.iter().any(|n| n == o))
-        {
-            needles.push(original.to_owned());
-        }
-        self.search_spellings(needles)
+        self.search_spellings(term_needles(term, original))
     }
 
     fn search_spellings(&mut self, needles: Vec<String>) -> Rc<Hits> {
@@ -211,12 +228,15 @@ impl Searcher {
         for spelling in &needles {
             match &self.backend {
                 Backend::Live(options) => {
-                    let result = scan(
-                        &self.root,
-                        spelling,
-                        options,
-                        Instant::now() + SCAN_DEADLINE,
-                    );
+                    // The tree is read once, on the first search; every scan
+                    // after it replays those bytes.
+                    let corpus = self.corpus.get_or_insert_with(|| {
+                        let started = Instant::now();
+                        let corpus = Corpus::load(&self.root, options);
+                        self.corpus_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        corpus
+                    });
+                    let result = corpus.scan(spelling, Instant::now() + SCAN_DEADLINE);
                     if matches!(result.stopped, Some("deadline" | "byte cap")) {
                         self.incomplete_scans += 1;
                     }

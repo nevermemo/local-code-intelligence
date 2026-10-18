@@ -98,7 +98,8 @@ enum Command {
     Sim(sim::SimArgs),
     /// Structured-config measurement on the simulated agent: `run` one arm
     /// over the questions of one stratum and score them, `compare` runs with a
-    /// paired bootstrap, `check-probes` that every question probes its key.
+    /// paired bootstrap, `check-probes` that every question probes its key,
+    /// `check-corpus` that the in-memory scan equals the disk scan.
     /// See docs/spike/multimap/structured-grep-prereg.md.
     SimStructured {
         #[command(subcommand)]

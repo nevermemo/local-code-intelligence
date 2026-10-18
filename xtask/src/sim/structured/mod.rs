@@ -12,6 +12,7 @@
 //!   this binary, `git describe`, UTC times; no host name, no paths).
 //! * `compare`: paired bootstrap of B against A over run dirs.
 //! * `check-probes`: the probe-term fix of the preregistration, checked.
+//! * `check-corpus`: the in-memory scan (`Corpus`) against the disk scan.
 //!
 //! Arms: `a` and `b` are the in-process scan; the grep-skip switch
 //! (`none` or `lockfiles`) is the only thing that differs between them, and
@@ -37,17 +38,19 @@ use super::follow::Policy;
 use super::reject_run_dir_in_tree;
 use super::rg::{ARGS_BEFORE_NEEDLE, RgCommand};
 use super::sim_loop::{SimConfig, run_question};
-use super::terms::{Backend, ScanTotals, Searcher, pick_probe_terms, scan_options};
+use super::terms::{
+    Backend, ScanTotals, Searcher, original_spellings, pick_probe_terms, scan_options, term_needles,
+};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use lci_core::lexical::query_terms;
-use lci_maps::live_grep::LOCKFILES;
+use lci_maps::live_grep::{Corpus, GrepOptions, LOCKFILES, ScanResult, scan};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The bytes one scan walk may read before it stops: far above a tree, so the
 /// cap never binds (a binding cap confounds the arms, see the module docs).
@@ -66,6 +69,10 @@ pub enum StructuredCommand {
     /// Check that every question that names its key probes that key's last
     /// segment as a term (the probe-term fix of the preregistration).
     CheckProbes(ProbeArgs),
+    /// Check that `Corpus::scan` (the tree read once) gives what
+    /// `live_grep::scan` (the tree walked and read again) gives, field for
+    /// field, for the needles the agent derives from the gold's questions.
+    CheckCorpus(CorpusArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -217,11 +224,33 @@ pub struct ProbeArgs {
     probe_terms: usize,
 }
 
+#[derive(Args)]
+pub struct CorpusArgs {
+    /// A checked-out tree, `<repo>=<dir>`; repeat per repository.
+    #[arg(long = "tree", required = true)]
+    trees: Vec<String>,
+    /// The skip list of the scans compared, as in `run`.
+    #[arg(long, value_enum)]
+    grep_skip: GrepSkip,
+    /// Directory of the structured gold files; the needles are those of the
+    /// agent's searches of each question's text (a query term in its
+    /// spellings, and the token as written).
+    #[arg(long)]
+    needles_from_gold: PathBuf,
+    /// Check N needles per tree, evenly spaced in sorted order (default: all).
+    #[arg(long)]
+    sample: Option<usize>,
+    /// The `--max-scan-bytes` of the runs.
+    #[arg(long, default_value_t = DEFAULT_MAX_SCAN_BYTES)]
+    max_scan_bytes: u64,
+}
+
 pub fn run(which: StructuredCommand) -> Result<()> {
     match which {
         StructuredCommand::Run(args) => run_questions(&args),
         StructuredCommand::Compare(args) => compare_runs(&args),
         StructuredCommand::CheckProbes(args) => check_probes(&args),
+        StructuredCommand::CheckCorpus(args) => check_corpus(&args),
     }
 }
 
@@ -245,6 +274,17 @@ struct RgIdentity {
     sha256: String,
 }
 
+/// The options of the in-process scan of arms a and b.
+fn live_options(skip: GrepSkip, max_scan_bytes: u64) -> GrepOptions {
+    let mut options = scan_options();
+    options.max_scan_bytes = max_scan_bytes;
+    options.skip_files = match skip {
+        GrepSkip::Off => Vec::new(),
+        GrepSkip::Lockfiles => LOCKFILES.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    options
+}
+
 impl Matcher {
     /// The skip-list part of the run dir's name.
     fn label(&self) -> &'static str {
@@ -266,15 +306,7 @@ impl Matcher {
             Matcher::Live {
                 skip,
                 max_scan_bytes,
-            } => {
-                let mut options = scan_options();
-                options.max_scan_bytes = *max_scan_bytes;
-                options.skip_files = match skip {
-                    GrepSkip::Off => Vec::new(),
-                    GrepSkip::Lockfiles => LOCKFILES.iter().map(|s| (*s).to_owned()).collect(),
-                };
-                Backend::Live(options)
-            }
+            } => Backend::Live(live_options(*skip, *max_scan_bytes)),
             Matcher::Rg { command, .. } => Backend::Rg(command.clone()),
         }
     }
@@ -606,6 +638,14 @@ fn run_questions(args: &RunArgs) -> Result<()> {
                 );
             }
         }
+        if searcher.corpus_bytes() > 0 {
+            eprintln!(
+                "sim-structured: {} corpus {} bytes loaded in {:.0} ms",
+                repo.repo,
+                searcher.corpus_bytes(),
+                searcher.corpus_load_ms
+            );
+        }
         totals.add(&searcher.totals);
         incomplete += u64::from(searcher.incomplete_scans);
         by_repo.insert(
@@ -874,6 +914,146 @@ fn check_probes(args: &ProbeArgs) -> Result<()> {
             failures.len()
         );
     }
+}
+
+// ------------------------------------------------------------ check-corpus
+
+/// The first field in which two scans differ, `elapsed_ms` aside.
+fn scan_difference(corpus: &ScanResult, disk: &ScanResult) -> Option<String> {
+    if corpus.matches != disk.matches {
+        return Some(format!(
+            "matches: {} from the corpus, {} from disk",
+            corpus.matches.len(),
+            disk.matches.len()
+        ));
+    }
+    let fields = [
+        ("files_read", corpus.files_read, disk.files_read),
+        ("bytes_read", corpus.bytes_read, disk.bytes_read),
+        ("skipped_binary", corpus.skipped_binary, disk.skipped_binary),
+        ("skipped_large", corpus.skipped_large, disk.skipped_large),
+        (
+            "skipped_by_name",
+            corpus.skipped_by_name,
+            disk.skipped_by_name,
+        ),
+    ];
+    for (name, a, b) in fields {
+        if a != b {
+            return Some(format!("{name}: {a} from the corpus, {b} from disk"));
+        }
+    }
+    (corpus.stopped != disk.stopped).then(|| {
+        format!(
+            "stopped: {:?} from the corpus, {:?} from disk",
+            corpus.stopped, disk.stopped
+        )
+    })
+}
+
+/// The needles the agent searches for the questions of `repo`: for each
+/// query term of the text, its spellings and the token as written. Sorted,
+/// each once.
+fn gold_needles(repo: &gold::Repo) -> Vec<String> {
+    let mut needles = BTreeSet::new();
+    for question in &repo.questions {
+        let originals = original_spellings(&question.text);
+        for term in query_terms(&question.text) {
+            needles.extend(term_needles(
+                &term,
+                originals.get(&term).map(String::as_str),
+            ));
+        }
+    }
+    needles.into_iter().collect()
+}
+
+/// `n` of `items` at even spacing, in order; all of them when `n` is `None`
+/// or not below their count.
+fn evenly<T: Clone>(items: &[T], n: Option<usize>) -> Vec<T> {
+    match n {
+        Some(n) if n < items.len() => (0..n).map(|i| items[i * items.len() / n].clone()).collect(),
+        _ => items.to_vec(),
+    }
+}
+
+/// What `check-corpus` found in one tree.
+struct CorpusReport {
+    needles: usize,
+    mismatches: Vec<String>,
+    load_ms: f64,
+    disk_ms: f64,
+    corpus_ms: f64,
+    files: usize,
+    bytes: u64,
+}
+
+/// Loads a corpus of `root` and compares its scan with the disk scan for each needle.
+fn compare_corpus(root: &Path, options: &GrepOptions, needles: &[String]) -> CorpusReport {
+    let started = Instant::now();
+    let corpus = Corpus::load(root, options);
+    let mut report = CorpusReport {
+        needles: needles.len(),
+        mismatches: Vec::new(),
+        load_ms: started.elapsed().as_secs_f64() * 1000.0,
+        disk_ms: 0.0,
+        corpus_ms: 0.0,
+        files: corpus.files(),
+        bytes: corpus.bytes(),
+    };
+    for needle in needles {
+        let far = Instant::now() + options.timeout;
+        let disk = scan(root, needle, options, far);
+        let stored = corpus.scan(needle, far);
+        report.disk_ms += disk.elapsed_ms;
+        report.corpus_ms += stored.elapsed_ms;
+        if let Some(why) = scan_difference(&stored, &disk) {
+            report.mismatches.push(format!("{needle:?}: {why}"));
+        }
+    }
+    let n = needles.len().max(1) as f64;
+    report.disk_ms /= n;
+    report.corpus_ms /= n;
+    report
+}
+
+fn check_corpus(args: &CorpusArgs) -> Result<()> {
+    let trees = parse_trees(&args.trees)?;
+    let repos = gold::load_dir(&args.needles_from_gold)?;
+    let options = live_options(args.grep_skip, args.max_scan_bytes);
+    let mut mismatched = 0;
+    for (repo, tree) in &trees {
+        let Some(gold) = repos.iter().find(|r| &r.repo == repo) else {
+            bail!("no gold file for the repository {repo} in --needles-from-gold");
+        };
+        if !tree.is_dir() {
+            bail!("--tree {repo} is not a directory");
+        }
+        let needles = evenly(&gold_needles(gold), args.sample);
+        let report = compare_corpus(tree, &options, &needles);
+        for why in report.mismatches.iter().take(20) {
+            eprintln!("MISMATCH {repo} {why}");
+        }
+        eprintln!(
+            "check-corpus {repo}: {} needles checked, {} mismatches, corpus {} files {} bytes loaded in {:.0} ms, mean scan {:.2} ms from disk, {:.2} ms from the corpus (--grep-skip {})",
+            report.needles,
+            report.mismatches.len(),
+            report.files,
+            report.bytes,
+            report.load_ms,
+            report.disk_ms,
+            report.corpus_ms,
+            match args.grep_skip {
+                GrepSkip::Off => "none",
+                GrepSkip::Lockfiles => "lockfiles",
+            }
+        );
+        mismatched += report.mismatches.len();
+    }
+    if mismatched > 0 {
+        bail!("check-corpus: {mismatched} scan(s) differ between the corpus and the disk");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1281,6 +1461,72 @@ mod tests {
         })
         .unwrap();
         cleanup(&[&gold, &tree, &out, &gold2, &tree2, &out2]);
+    }
+
+    #[test]
+    fn check_corpus_agrees_on_a_tree_and_names_a_difference() {
+        let (gold, tree, out) = fixture("corpus", "Where is `s.listen` set?");
+        for grep_skip in [GrepSkip::Off, GrepSkip::Lockfiles] {
+            let args = CorpusArgs {
+                trees: vec![format!("r={}", tree.display())],
+                grep_skip,
+                needles_from_gold: gold.clone(),
+                sample: None,
+                max_scan_bytes: DEFAULT_MAX_SCAN_BYTES,
+            };
+            check_corpus(&args).unwrap();
+        }
+        let repos = gold::load_dir(&gold).unwrap();
+        let needles = gold_needles(&repos[0]);
+        assert!(needles.iter().any(|n| n == "listen"), "{needles:?}");
+        assert!(needles.iter().any(|n| n == "Listen") && needles.iter().any(|n| n == "LISTEN"));
+        let options = live_options(GrepSkip::Lockfiles, DEFAULT_MAX_SCAN_BYTES);
+        let report = compare_corpus(&tree, &options, &needles);
+        assert_eq!(
+            (report.needles, report.mismatches.len()),
+            (needles.len(), 0)
+        );
+        assert!(report.files >= 3 && report.bytes > 0);
+        // A tree edited after the corpus was loaded would differ.
+        let corpus = Corpus::load(&tree, &options);
+        fs::write(tree.join("src/extra.rs"), "let listen = 1;\n").unwrap();
+        let far = Instant::now() + options.timeout;
+        let stale = corpus.scan("listen", far);
+        let fresh = scan(&tree, "listen", &options, far);
+        let why = scan_difference(&stale, &fresh).expect("the edit shows");
+        assert!(why.starts_with("matches:"), "{why}");
+        assert_eq!(scan_difference(&fresh, &fresh), None);
+        // The time is the one field that may differ.
+        let mut slower = fresh.clone();
+        slower.elapsed_ms += 1.0;
+        assert_eq!(scan_difference(&slower, &fresh), None);
+        slower.skipped_by_name += 1;
+        assert!(
+            scan_difference(&slower, &fresh)
+                .unwrap()
+                .starts_with("skipped_by_name")
+        );
+        // A repository without a gold file is refused.
+        let missing = CorpusArgs {
+            trees: vec![format!("other={}", tree.display())],
+            grep_skip: GrepSkip::Off,
+            needles_from_gold: gold.clone(),
+            sample: None,
+            max_scan_bytes: DEFAULT_MAX_SCAN_BYTES,
+        };
+        assert!(check_corpus(&missing).is_err());
+        cleanup(&[&gold, &tree, &out]);
+    }
+
+    #[test]
+    fn a_sample_takes_evenly_spaced_items() {
+        let items: Vec<u32> = (0..10).collect();
+        assert_eq!(evenly(&items, None), items);
+        assert_eq!(evenly(&items, Some(10)), items);
+        assert_eq!(evenly(&items, Some(99)), items);
+        assert_eq!(evenly(&items, Some(5)), [0, 2, 4, 6, 8]);
+        assert_eq!(evenly(&items, Some(3)), [0, 3, 6]);
+        assert!(evenly(&items, Some(0)).is_empty());
     }
 
     #[test]

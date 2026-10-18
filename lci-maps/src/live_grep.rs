@@ -190,17 +190,11 @@ fn live_blob(bytes: &[u8]) -> String {
         })
 }
 
-/// Searches the current bytes of the tree at `root` for `needle`. Blocking.
-/// Deterministic for a given tree: the walk is in path order.
-pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant) -> ScanResult {
-    let started = Instant::now();
-    let mut result = ScanResult::default();
-    if needle.is_empty() || options.max_matches == 0 {
-        return result;
-    }
+/// The walk of `scan` and [`Corpus::load`]: one configuration, so the two
+/// cannot see different files.
+fn walker(root: &Path, options: &GrepOptions) -> ignore::Walk {
     let skip_dirs: HashSet<String> = options.skip_dirs.iter().cloned().collect();
-    let skip_files: HashSet<String> = options.skip_files.iter().cloned().collect();
-    let walker = WalkBuilder::new(root)
+    WalkBuilder::new(root)
         .hidden(true)
         .parents(false)
         .git_global(false)
@@ -215,10 +209,69 @@ pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant)
                 || !(entry.file_type().is_some_and(|t| t.is_dir())
                     && skip_dirs.contains(entry.file_name().to_string_lossy().as_ref()))
         })
-        .build();
+        .build()
+}
+
+/// Whether the first [`BINARY_PROBE`] bytes of `bytes` hold a NUL.
+fn has_nul_in_probe(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
+}
+
+/// `path` relative to `root`, `/` separated; `None` outside the root.
+fn relative_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Every occurrence of `needle` in a file's text, pushed to `exact` or `text`
+/// (each kept to `cap`). Nothing happens when the file does not hold the
+/// needle or `path` gives none; `path` is asked only once the needle is found.
+fn collect_matches(
+    content: &str,
+    needle: &str,
+    cap: usize,
+    path: impl FnOnce() -> Option<String>,
+    exact: &mut Vec<LiveMatch>,
+    text: &mut Vec<LiveMatch>,
+) {
+    if !content.contains(needle) {
+        return;
+    }
+    let Some(path) = path() else { return };
+    let blob = live_blob(content.as_bytes());
+    for (line_no, line) in content.split('\n').enumerate() {
+        for (col, _) in line.match_indices(needle) {
+            let raw = line.as_bytes();
+            let before = col == 0 || !is_ident(raw[col - 1]);
+            let after = raw.get(col + needle.len()).is_none_or(|&b| !is_ident(b));
+            let found = LiveMatch {
+                path: path.clone(),
+                line: line_no as u32,
+                col: col as u32,
+                exact: before && after,
+                blob: blob.clone(),
+            };
+            let bucket = if found.exact { &mut *exact } else { &mut *text };
+            if bucket.len() < cap {
+                bucket.push(found);
+            }
+        }
+    }
+}
+
+/// Searches the current bytes of the tree at `root` for `needle`. Blocking.
+/// Deterministic for a given tree: the walk is in path order. [`Corpus`] does
+/// the same over bytes read once.
+pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant) -> ScanResult {
+    let started = Instant::now();
+    let mut result = ScanResult::default();
+    if needle.is_empty() || options.max_matches == 0 {
+        return result;
+    }
+    let skip_files: HashSet<String> = options.skip_files.iter().cloned().collect();
     let cap = options.max_matches;
     let (mut exact, mut text) = (Vec::new(), Vec::new());
-    for entry in walker {
+    for entry in walker(root, options) {
         if Instant::now() >= deadline {
             result.stopped = Some("deadline");
             break;
@@ -245,40 +298,21 @@ pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant)
         };
         result.files_read += 1;
         result.bytes_read += bytes.len() as u64;
-        let Ok(content) = std::str::from_utf8(&bytes) else {
-            result.skipped_binary += 1;
-            continue;
-        };
-        if bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) {
-            result.skipped_binary += 1;
-            continue;
-        }
-        if !content.contains(needle) {
-            continue;
-        }
-        let Ok(relative) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let path = relative.to_string_lossy().replace('\\', "/");
-        let blob = live_blob(&bytes);
-        for (line_no, line) in content.split('\n').enumerate() {
-            for (col, _) in line.match_indices(needle) {
-                let raw = line.as_bytes();
-                let before = col == 0 || !is_ident(raw[col - 1]);
-                let after = raw.get(col + needle.len()).is_none_or(|&b| !is_ident(b));
-                let found = LiveMatch {
-                    path: path.clone(),
-                    line: line_no as u32,
-                    col: col as u32,
-                    exact: before && after,
-                    blob: blob.clone(),
-                };
-                let bucket = if found.exact { &mut exact } else { &mut text };
-                if bucket.len() < cap {
-                    bucket.push(found);
-                }
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(content) if !has_nul_in_probe(&bytes) => content,
+            _ => {
+                result.skipped_binary += 1;
+                continue;
             }
-        }
+        };
+        collect_matches(
+            content,
+            needle,
+            cap,
+            || relative_path(root, entry.path()),
+            &mut exact,
+            &mut text,
+        );
         if exact.len() >= cap {
             result.stopped = Some("match cap");
             break;
@@ -289,6 +323,162 @@ pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant)
     result.matches = exact;
     result.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     result
+}
+
+/// What a [`Corpus`] holds of one file.
+enum Stored {
+    /// Its name is in `skip_files`: counted, never read.
+    ByName,
+    /// Over `max_file_bytes`: counted, never read.
+    Large,
+    /// The read failed: a scan passes over it without counting it.
+    Unread,
+    /// Read, but not UTF-8 or with a NUL in the probe; only the length is kept.
+    Binary(u64),
+    /// Read and searchable.
+    Text(String),
+}
+
+/// One file of the walk.
+struct Record {
+    /// `None` when the entry lies outside the root (a hit in such a file is
+    /// passed over, as `scan` does); never so for a walk from the root.
+    path: Option<String>,
+    /// The size the walk's metadata gave (0 when it gave none).
+    size: u64,
+    stored: Stored,
+}
+
+/// The files of a tree read once, for many scans of the same bytes.
+/// [`Corpus::scan`] gives what [`scan`] gives for the tree as it was at
+/// [`Corpus::load`], every field but `elapsed_ms`, without walking a
+/// directory or reading a file. An edit after the load is not seen.
+pub struct Corpus {
+    options: GrepOptions,
+    records: Vec<Record>,
+    bytes: u64,
+}
+
+impl Corpus {
+    /// Walks `root` as [`scan`] does and reads every file `scan` would read:
+    /// not one whose name is in `options.skip_files` or whose size is above
+    /// `options.max_file_bytes`. `scan` stops at `max_scan_bytes`; the corpus
+    /// reads the whole walk and applies that cap when it scans.
+    pub fn load(root: &Path, options: &GrepOptions) -> Corpus {
+        let skip_files: HashSet<&str> = options.skip_files.iter().map(String::as_str).collect();
+        let mut records = Vec::new();
+        let mut total = 0;
+        for entry in walker(root, options) {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let size = entry.metadata().map_or(0, |m| m.len());
+            let stored = if skip_files.contains(entry.file_name().to_string_lossy().as_ref()) {
+                Stored::ByName
+            } else if size > options.max_file_bytes {
+                Stored::Large
+            } else if let Ok(bytes) = std::fs::read(entry.path()) {
+                let len = bytes.len() as u64;
+                total += len;
+                match String::from_utf8(bytes) {
+                    Ok(content) if !has_nul_in_probe(content.as_bytes()) => Stored::Text(content),
+                    _ => Stored::Binary(len),
+                }
+            } else {
+                Stored::Unread
+            };
+            records.push(Record {
+                path: relative_path(root, entry.path()),
+                size,
+                stored,
+            });
+        }
+        Corpus {
+            options: options.clone(),
+            records,
+            bytes: total,
+        }
+    }
+
+    /// The options the corpus was loaded (and scans) with.
+    pub fn options(&self) -> &GrepOptions {
+        &self.options
+    }
+
+    /// Files in the walk.
+    pub fn files(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Bytes read at load, binary files included (their text is not kept).
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// [`scan`] over the stored files. The deadline is checked once per file,
+    /// not per directory entry, so a deadline that passes during the last
+    /// non-file entries of the walk is not reported.
+    pub fn scan(&self, needle: &str, deadline: Instant) -> ScanResult {
+        let started = Instant::now();
+        let mut result = ScanResult::default();
+        let options = &self.options;
+        if needle.is_empty() || options.max_matches == 0 {
+            return result;
+        }
+        let cap = options.max_matches;
+        let (mut exact, mut text) = (Vec::new(), Vec::new());
+        for record in &self.records {
+            if Instant::now() >= deadline {
+                result.stopped = Some("deadline");
+                break;
+            }
+            match record.stored {
+                Stored::ByName => {
+                    result.skipped_by_name += 1;
+                    continue;
+                }
+                Stored::Large => {
+                    result.skipped_large += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if result.bytes_read + record.size > options.max_scan_bytes {
+                result.stopped = Some("byte cap");
+                break;
+            }
+            let content = match &record.stored {
+                Stored::Text(content) => content,
+                Stored::Binary(len) => {
+                    result.files_read += 1;
+                    result.bytes_read += len;
+                    result.skipped_binary += 1;
+                    continue;
+                }
+                _ => continue,
+            };
+            result.files_read += 1;
+            result.bytes_read += content.len() as u64;
+            collect_matches(
+                content,
+                needle,
+                cap,
+                || record.path.clone(),
+                &mut exact,
+                &mut text,
+            );
+            if exact.len() >= cap {
+                result.stopped = Some("match cap");
+                break;
+            }
+        }
+        exact.append(&mut text);
+        exact.truncate(cap);
+        result.matches = exact;
+        result.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        result
+    }
 }
 
 /// Finds the symbol that encloses a line of a file, if it knows one.

@@ -752,3 +752,239 @@ async fn an_update_asks_a_live_row_again_though_no_snapshot_blob_moved() {
         .await
         .expect("an updated adjacency equals the live source");
 }
+
+// ---------------------------------------------------------------- Corpus
+
+/// Everything `Corpus::scan` must treat as `scan` does, in one tree.
+fn corpus_tree(tag: &str) -> Scratch {
+    let scratch = Scratch::new(tag).unwrap();
+    let root = scratch.path();
+    write(root, ".gitignore", "ignored/\n");
+    write(
+        root,
+        "src/a.rs",
+        "fn needle_z() {}\nlet x = xneedle_zz + needle_z;\n// needle_z_extra\n",
+    );
+    write(root, "src/b.rs", "call(needle_z)\r\nneedle_z\r\n");
+    write(root, "docs/readme.md", "needle_z in prose, Needle_Z too\n");
+    write(root, "Cargo.lock", "needle_z = 1\n");
+    write(root, "sub/package-lock.json", "{\"needle_z\": 1}\n");
+    write(root, "big.txt", &format!("needle_z {}", "x".repeat(400)));
+    write(root, "empty.txt", "");
+    write(root, "many.txt", &"needle_z\n".repeat(20));
+    write(root, "ignored/i.rs", "needle_z\n");
+    write(root, ".hidden/h.rs", "needle_z\n");
+    write(root, "target/t.rs", "needle_z\n");
+    write(root, "node_modules/n.js", "needle_z\n");
+    write(root, "vendor/v.rs", "needle_z\n");
+    write(root, "日本語/main.rs", "// héllo → needle_z\n");
+    // The NUL lies past the probe, so the file is text.
+    write(
+        root,
+        "late_nul.txt",
+        &format!("{}\0 needle_z\n", "a".repeat(BINARY_PROBE + 10)),
+    );
+    std::fs::write(root.join("bin.dat"), b"needle_z\0\0").unwrap();
+    std::fs::write(root.join("latin.txt"), b"needle_z \xff\xfe").unwrap();
+    scratch
+}
+
+/// `Corpus` and `scan` agree on every field but the time.
+fn assert_corpus_equals_scan(root: &Path, options: &GrepOptions, needles: &[&str]) {
+    let corpus = Corpus::load(root, options);
+    for needle in needles {
+        let far = Instant::now() + Duration::from_secs(60);
+        let disk = scan(root, needle, options, far);
+        let stored = corpus.scan(needle, far);
+        let label = format!("needle {needle:?}, options {options:?}");
+        assert_eq!(stored.matches, disk.matches, "matches, {label}");
+        assert_eq!(stored.files_read, disk.files_read, "files_read, {label}");
+        assert_eq!(stored.bytes_read, disk.bytes_read, "bytes_read, {label}");
+        assert_eq!(
+            stored.skipped_binary, disk.skipped_binary,
+            "binary, {label}"
+        );
+        assert_eq!(stored.skipped_large, disk.skipped_large, "large, {label}");
+        assert_eq!(
+            stored.skipped_by_name, disk.skipped_by_name,
+            "name, {label}"
+        );
+        assert_eq!(stored.stopped, disk.stopped, "stopped, {label}");
+    }
+}
+
+const CORPUS_NEEDLES: &[&str] = &[
+    "needle_z",
+    "needle_",
+    "needle_z_extra",
+    "Needle_Z",
+    "NEEDLE_Z",
+    "xneedle_zz",
+    "x",
+    "a",
+    "no_such_token_anywhere",
+    "",
+    "日本語",
+    "héllo",
+];
+
+#[test]
+fn a_corpus_scan_equals_a_disk_scan_over_every_kind_of_file() {
+    let tree = corpus_tree("corpus-equal");
+    let root = tree.path();
+    let lockfiles = LOCKFILES.iter().map(|s| (*s).to_owned()).collect();
+    let variants = [
+        ("defaults", GrepOptions::default()),
+        (
+            "lockfiles skipped",
+            GrepOptions {
+                skip_files: lockfiles,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "large files cut at 200 bytes",
+            GrepOptions {
+                max_file_bytes: 200,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "no match cap",
+            GrepOptions {
+                max_matches: usize::MAX,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "cap of 3",
+            GrepOptions {
+                max_matches: 3,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "cap of 1",
+            GrepOptions {
+                max_matches: 1,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "cap of 0",
+            GrepOptions {
+                max_matches: 0,
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "other skip_dirs",
+            GrepOptions {
+                skip_dirs: vec!["vendor".into(), "docs".into()],
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "no skip_dirs",
+            GrepOptions {
+                skip_dirs: Vec::new(),
+                ..GrepOptions::default()
+            },
+        ),
+        (
+            "named file skipped",
+            GrepOptions {
+                skip_files: vec!["many.txt".into(), "a.rs".into()],
+                ..GrepOptions::default()
+            },
+        ),
+    ];
+    for (name, options) in variants {
+        println!("options: {name}");
+        assert_corpus_equals_scan(root, &options, CORPUS_NEEDLES);
+    }
+}
+
+#[test]
+fn a_corpus_scan_stops_on_the_byte_cap_where_a_disk_scan_does() {
+    let tree = corpus_tree("corpus-bytecap");
+    let root = tree.path();
+    let lockfiles: Vec<String> = LOCKFILES.iter().map(|s| (*s).to_owned()).collect();
+    for max_scan_bytes in [0, 1, 40, 100, 300, 1000, 9000, 20_000, u64::MAX] {
+        for skip_files in [Vec::new(), lockfiles.clone()] {
+            let options = GrepOptions {
+                max_scan_bytes,
+                max_matches: usize::MAX,
+                skip_files,
+                ..GrepOptions::default()
+            };
+            assert_corpus_equals_scan(root, &options, CORPUS_NEEDLES);
+        }
+    }
+    // The cap bites mid-walk, on both sides.
+    let tight = GrepOptions {
+        max_scan_bytes: 100,
+        ..GrepOptions::default()
+    };
+    let far = Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        scan(root, "needle_z", &tight, far).stopped,
+        Some("byte cap")
+    );
+    assert_eq!(
+        Corpus::load(root, &tight).scan("needle_z", far).stopped,
+        Some("byte cap")
+    );
+}
+
+#[test]
+fn a_corpus_counts_what_a_disk_scan_counts() {
+    let tree = corpus_tree("corpus-counts");
+    let options = GrepOptions {
+        max_matches: usize::MAX,
+        max_file_bytes: 200,
+        skip_files: LOCKFILES.iter().map(|s| (*s).to_owned()).collect(),
+        ..GrepOptions::default()
+    };
+    let corpus = Corpus::load(tree.path(), &options);
+    let found = corpus.scan("needle_z", Instant::now() + Duration::from_secs(60));
+    // Cargo.lock and package-lock.json by name; big.txt and late_nul.txt are
+    // over 200 bytes; bin.dat and latin.txt are binary.
+    assert_eq!(found.skipped_by_name, 2);
+    assert_eq!(found.skipped_large, 2);
+    assert_eq!(found.skipped_binary, 2);
+    assert_eq!(found.stopped, None);
+    assert!(found.matches.iter().all(|m| m.path != "Cargo.lock"));
+    assert!(found.files_read >= 2 && found.bytes_read > 0);
+    assert!(corpus.bytes() > 0 && corpus.files() > found.files_read as usize);
+    assert_eq!(corpus.options().max_file_bytes, 200);
+}
+
+#[test]
+fn a_corpus_keeps_the_bytes_of_its_load() {
+    let tree = corpus_tree("corpus-stale");
+    let root = tree.path();
+    let options = GrepOptions::default();
+    let corpus = Corpus::load(root, &options);
+    let far = Instant::now() + Duration::from_secs(60);
+    let before = corpus.scan("needle_z", far);
+    write(root, "src/new.rs", "needle_z\n");
+    std::fs::remove_file(root.join("src/a.rs")).unwrap();
+    assert_eq!(corpus.scan("needle_z", far).matches, before.matches);
+    assert_ne!(
+        scan(root, "needle_z", &options, far).matches,
+        before.matches
+    );
+    // A corpus loaded after the edit agrees with the disk again.
+    assert_corpus_equals_scan(root, &options, &["needle_z"]);
+}
+
+#[test]
+fn a_corpus_scan_past_its_deadline_stops_at_once() {
+    let tree = fixture();
+    let corpus = Corpus::load(tree.path(), &GrepOptions::default());
+    let found = corpus.scan("compute_total", Instant::now());
+    assert_eq!(found.stopped, Some("deadline"));
+    assert!(found.matches.is_empty());
+    assert_eq!(found.files_read, 0);
+}
