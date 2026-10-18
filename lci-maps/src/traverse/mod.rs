@@ -160,7 +160,7 @@ pub mod trace;
 mod tests;
 
 use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
-use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop};
+use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop_from};
 use handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
     RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, StopBudget,
@@ -483,6 +483,9 @@ pub struct Traversal<'s> {
     boost_given: bool,
     /// The most model calls (rerank calls) the traversal may make in all.
     model_calls: Option<u32>,
+    /// The start nodes that are traits or trait methods the question named;
+    /// see [`Traversal::trait_seeds`].
+    trait_seeds: HashSet<NodeId>,
 }
 
 impl<'s> Traversal<'s> {
@@ -513,7 +516,18 @@ impl<'s> Traversal<'s> {
             identity: String::new(),
             boost_given: false,
             model_calls: None,
+            trait_seeds: HashSet::new(),
         }
+    }
+
+    /// Marks start nodes as trait seeds (the traits and trait methods the
+    /// question named, `add_trait_seeds`). When one is expanded its
+    /// `scip.implements` edges are all followed and rank first, see
+    /// [`frontier::hop_from`]. Not kept in a handle: a continuation prices
+    /// every node by [`frontier::hop`].
+    pub fn trait_seeds(mut self, nodes: impl IntoIterator<Item = NodeId>) -> Self {
+        self.trait_seeds = nodes.into_iter().collect();
+        self
     }
 
     /// The most model calls the whole traversal may make (default: no cap).
@@ -1228,7 +1242,7 @@ impl<'s> Run<'s> {
     /// expansion short: true if some of its work was adopted, false if none.
     ///
     /// The order is: ask the maps; price and select every candidate with
-    /// [`hop`]; only then charge. A fresh hop is adopted while the tokens
+    /// [`frontier::hop_from`]; only then charge. A fresh hop is adopted while the tokens
     /// left afford [`TOKENS_PER_EDGE`] for it, so what the beam ranks first is
     /// what the budget buys; a selected hop it cannot afford makes the pop
     /// `truncated`. Charges:
@@ -1359,7 +1373,14 @@ impl<'s> Run<'s> {
             nodes_seen: self.states.len(),
             priors: &self.t.priors,
         };
-        let steps = hop(self.t.scorer.as_mut(), &ctx, &cands, self.t.price);
+        let trait_seed = self.t.trait_seeds.contains(&node);
+        let steps = hop_from(
+            self.t.scorer.as_mut(),
+            &ctx,
+            &cands,
+            self.t.price,
+            trait_seed,
+        );
         let (steps, rerank) = self.rescore(steps, &kept).await;
 
         // Then adopt what the tokens afford, best first.

@@ -6,8 +6,9 @@ use crate::{
     Contribution, Cost, EdgeKind, FreshnessModel, Map, MapDescriptor, MapRequest, MapResponse,
     MapStatus, Registry, SnapshotRef, SnapshotView, SourceLabel,
     edge::{Edge, WitnessClass},
+    scip_implements::SCIP_IMPLEMENTS_ID,
     traverse::{
-        frontier::{BfsScorer, RandomScorer},
+        frontier::{BfsScorer, RandomScorer, hop},
         handler::{Action, Directive},
         rules::RuleList,
         source::{OnTheFly, fuse},
@@ -1054,6 +1055,226 @@ fn hop_pricing_gate_and_beam() {
         HopPrice { gate: 2, beam: 3 },
     );
     assert_eq!(steps, [(0, 1.0), (1, 0.5), (2, 1.0 / 3.0)]);
+}
+
+/// An edge `t -> dst` of `kind`, offered by `map`.
+fn typed_edge(dst: &str, map: MapId, kind: EdgeKind) -> Edge {
+    Edge {
+        kind,
+        ..edge("t", dst, map, WitnessClass::Compiler, 100)
+    }
+}
+
+/// `n` implementors `i00..` of `scip.implements`, then `m` references `r0..`
+/// of `graph.scip`, all out of `t`.
+fn trait_edges(n: usize, m: usize) -> Vec<Edge> {
+    let implementors = (0..n).map(|i| {
+        typed_edge(
+            &format!("i{i:02}"),
+            SCIP_IMPLEMENTS_ID,
+            EdgeKind::Implements,
+        )
+    });
+    let references =
+        (0..m).map(|i| typed_edge(&format!("r{i}"), "graph.scip", EdgeKind::CallsOrRefs));
+    implementors.chain(references).collect()
+}
+
+fn is_implementor(fused: &[FusedEdge], at: usize) -> bool {
+    fused[at].best.kind == EdgeKind::Implements
+}
+
+#[test]
+fn a_trait_seed_follows_every_implementor_past_the_beam() {
+    let fused = fuse(trait_edges(20, 0));
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
+    let implements = ctx.priors.prior(SCIP_IMPLEMENTS_ID, EdgeKind::Implements);
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, HopPrice::default(), true);
+    // No gate and no beam: all 20, in offer order, at the Implements prior.
+    assert_eq!(steps.len(), 20);
+    assert!(steps.iter().all(|&(_, v)| v == implements));
+    assert_eq!(
+        steps.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+        (0..20).collect::<Vec<_>>()
+    );
+    // Any other node is cut at the beam, as before.
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, HopPrice::default(), false);
+    assert_eq!(steps.len(), 16);
+    assert_eq!(
+        steps,
+        hop(&mut RulesScorer, &ctx, &cands, HopPrice::default())
+    );
+}
+
+#[test]
+fn a_trait_seed_ranks_its_implementors_before_the_references() {
+    let fused = fuse(trait_edges(5, 5));
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
+    let implements = ctx.priors.prior(SCIP_IMPLEMENTS_ID, EdgeKind::Implements);
+    let price = HopPrice::default();
+    // Today the references (prior 1) outrank the implementors (0.9).
+    let steps = hop(&mut RulesScorer, &ctx, &cands, price);
+    assert!(!is_implementor(&fused, steps[0].0));
+    // From a trait seed the five implementors come first, all at the prior;
+    // the references are priced as the remainder, behind the five.
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, price, true);
+    assert_eq!(steps.len(), 10);
+    assert!(
+        steps[..5]
+            .iter()
+            .all(|&(i, v)| is_implementor(&fused, i) && v == implements)
+    );
+    let rest: Vec<f64> = steps[5..].iter().map(|s| s.1).collect();
+    assert!(steps[5..].iter().all(|&(i, _)| !is_implementor(&fused, i)));
+    // The five references left are within the gate: the prior over 1 + 5.
+    assert_eq!(rest, [1.0 / 6.0; 5]);
+    assert!(rest.iter().all(|&v| v < implements));
+    // Above the gate the remainder is ranked after the implementors.
+    let fused = fuse(trait_edges(5, 10));
+    let cands = candidates(&fused);
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, price, true);
+    assert_eq!(steps.len(), 15);
+    assert!(steps[..5].iter().all(|&(i, _)| is_implementor(&fused, i)));
+    let rest: Vec<f64> = steps[5..].iter().map(|s| s.1).collect();
+    assert_eq!(
+        rest,
+        (0..10)
+            .map(|r| 1.0 / (6.0 + f64::from(r)))
+            .collect::<Vec<_>>()
+    );
+    // At or below the gate the remainder is the prior over 1 + implementors.
+    let fused = fuse(trait_edges(3, 2));
+    let cands = candidates(&fused);
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, price, true);
+    assert_eq!(steps.len(), 5);
+    assert!(
+        steps[..3]
+            .iter()
+            .all(|&(i, v)| is_implementor(&fused, i) && v == implements)
+    );
+    assert_eq!(steps[3].1, 1.0 / 4.0);
+    assert_eq!(steps[4].1, 1.0 / 4.0);
+}
+
+#[test]
+fn without_a_trait_seed_or_an_implementor_the_pricing_is_unchanged() {
+    let ctx = score_ctx();
+    let price = HopPrice::default();
+    // A node that is not a trait seed: references first by rank, then the
+    // implementors behind them, valued prior / (1 + rank).
+    let fused = fuse(trait_edges(5, 5));
+    let cands = candidates(&fused);
+    let steps = hop(&mut RulesScorer, &ctx, &cands, price);
+    let refs: Vec<usize> = (0..10).filter(|&i| !is_implementor(&fused, i)).collect();
+    let impls: Vec<usize> = (0..10).filter(|&i| is_implementor(&fused, i)).collect();
+    let mut expected: Vec<(usize, f64)> = Vec::new();
+    for (rank, &i) in refs.iter().chain(&impls).enumerate() {
+        let prior = if is_implementor(&fused, i) { 0.9 } else { 1.0 };
+        expected.push((i, prior / (1.0 + rank as f64)));
+    }
+    assert_eq!(steps, expected);
+    assert_eq!(
+        steps,
+        hop_from(&mut RulesScorer, &ctx, &cands, price, false)
+    );
+    // A trait seed with no implementor edge of scip.implements: the same,
+    // also when an Implements edge comes from another map.
+    let mut edges = trait_edges(0, 9);
+    edges.push(typed_edge("other", "scip.impact", EdgeKind::Implements));
+    let fused = fuse(edges);
+    let cands = candidates(&fused);
+    assert_eq!(
+        hop_from(&mut RulesScorer, &ctx, &cands, price, true),
+        hop(&mut RulesScorer, &ctx, &cands, price)
+    );
+    let fused = fuse(trait_edges(0, 3));
+    let cands = candidates(&fused);
+    assert_eq!(
+        hop_from(&mut RulesScorer, &ctx, &cands, price, true),
+        hop(&mut RulesScorer, &ctx, &cands, price)
+    );
+}
+
+#[test]
+fn a_trait_seed_follows_an_implementor_whose_best_edge_is_a_reference() {
+    let ctx = score_ctx();
+    let price = HopPrice::default();
+    let implements = ctx.priors.prior(SCIP_IMPLEMENTS_ID, EdgeKind::Implements);
+    // `i00` is also referenced by `graph.scip`, and that edge wins the fusion.
+    let mut edges = trait_edges(5, 20);
+    edges[0].conf = 90;
+    edges.push(edge("t", "i00", "graph.scip", WitnessClass::Compiler, 100));
+    let fused = fuse(edges);
+    let dual = fused
+        .iter()
+        .position(|f| f.best.dst == node("i00"))
+        .unwrap();
+    assert_eq!(fused[dual].best.map, "graph.scip");
+    let cands = candidates(&fused);
+    let steps = hop_from(&mut RulesScorer, &ctx, &cands, price, true);
+    let offered = |i: usize| fused[i].maps.contains(&SCIP_IMPLEMENTS_ID);
+    // All five implementors first at the prior, the dual one included.
+    assert!(
+        steps[..5]
+            .iter()
+            .all(|&(i, v)| offered(i) && v == implements)
+    );
+    assert!(steps[..5].iter().any(|&(i, _)| i == dual));
+    // The 20 references are cut at the beam: the beam applies to them alone.
+    assert_eq!(steps.len(), 5 + price.beam);
+    assert!(steps[5..].iter().all(|&(i, _)| !offered(i)));
+}
+
+#[test]
+fn the_unscored_arm_ignores_the_trait_seed_flag() {
+    let fused = fuse(trait_edges(5, 20));
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
+    let price = HopPrice::default();
+    let all: Vec<(usize, f64)> = (0..25).map(|i| (i, 1.0)).collect();
+    assert_eq!(hop_from(&mut BfsScorer, &ctx, &cands, price, true), all);
+    assert_eq!(hop_from(&mut BfsScorer, &ctx, &cands, price, false), all);
+}
+
+/// A walk out of `t` over `n` implementors and `m` references.
+async fn walk_from_trait(n: usize, m: usize, trait_seed: bool) -> TraversalResult {
+    let mut implementors = GraphMap::new(SCIP_IMPLEMENTS_ID, &[]).kind(EdgeKind::Implements);
+    implementors.edges = (0..n)
+        .map(|i| ("t".to_owned(), format!("i{i:02}")))
+        .collect();
+    let mut references = GraphMap::new("graph.scip", &[]);
+    references.edges = (0..m).map(|i| ("t".to_owned(), format!("r{i}"))).collect();
+    let reg = registry(vec![implementors, references]);
+    walk(&reg, vec![seed("t")], budget(50), |t| {
+        t.trait_seeds(trait_seed.then(|| node("t")))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_walk_keeps_every_implementor_of_a_trait_seed() {
+    let seeded = walk_from_trait(20, 0, true).await;
+    assert_eq!(seeded.totals.hops, 20);
+    assert_eq!(seeded.status, TraversalStatus::Complete);
+    // The same graph from a start node that is not a trait seed.
+    assert_eq!(walk_from_trait(20, 0, false).await.totals.hops, 16);
+    // The implementors are the first results, ahead of the references.
+    let seeded = walk_from_trait(5, 5, true).await;
+    let first: Vec<String> = seeded
+        .ranked()
+        .iter()
+        .take(5)
+        .map(|&i| seeded.states[i].node.path().unwrap().to_string())
+        .collect();
+    assert!(
+        first.iter().all(|path| path.starts_with("src/i")),
+        "{first:?}"
+    );
+    let plain = walk_from_trait(5, 5, false).await;
+    let top = plain.ranked()[0];
+    assert!(plain.states[top].node.path().unwrap().starts_with("src/r"));
 }
 
 #[test]

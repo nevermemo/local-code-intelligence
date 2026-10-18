@@ -485,6 +485,16 @@ pub(super) struct Seeds {
     pub(super) search_time: Duration,
 }
 
+impl Seeds {
+    /// The start nodes that are the traits and trait methods the question
+    /// named ([`add_trait_seeds`] puts them first, `trait_seeds` of them); none
+    /// when it added none or the call is a continuation.
+    pub(super) fn trait_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let count = self.trait_seeds.unwrap_or(0);
+        self.nodes.iter().take(count).map(|seed| seed.node.clone())
+    }
+}
+
 /// Finds the start nodes: the caller's, else the hybrid search's, else (when
 /// that is unavailable or finds nothing) the name-token stand-in, and the
 /// stand-in alone when it is the only seeds map wanted.
@@ -634,7 +644,11 @@ impl FromStr for TraitSeedMode {
 /// question (`tauri::Manager`, `Runtime::run`) that names a trait or a trait
 /// method declaration of the map ([`ImplementsMap::find`]) starts the walk at
 /// that node, from which the map's edges reach the implementing types or
-/// members. They go in front of the start nodes of the other sources
+/// members. Expanding such a start node follows every one of those
+/// `scip.implements` edges (no gate, no beam) and ranks them ahead of its other
+/// edges ([`lci_maps::traverse::frontier::hop_from`]; [`Seeds::trait_nodes`]
+/// names the nodes), so no implementor is lost to the beam or to a reference
+/// that prices higher. They go in front of the start nodes of the other sources
 /// (`Prepend`) or take their place (`Replace`; `Auto` replaces when a path is
 /// an exact match). Call it only when `scip.implements` is on; a call without
 /// that map never gets here, so its start nodes are those of [`find_seeds`]

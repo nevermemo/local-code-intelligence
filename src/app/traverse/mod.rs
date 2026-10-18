@@ -1103,6 +1103,7 @@ pub async fn run_with_trait_seeds(
             beam: limits.beam,
             ..HopPrice::default()
         })
+        .trait_seeds(found.trait_nodes())
         .expanders(registry.expanding_maps());
     let traversal = match &rescorer {
         Some(rescorer) => traversal.rerank_frontier(rescorer, limits.rerank_floor),
