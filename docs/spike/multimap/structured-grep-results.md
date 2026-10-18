@@ -38,6 +38,15 @@ Vite and Home Assistant are the pinned exports of prereg section 4.
 5. **R arm:** `rg --no-config -n --no-heading --color never -F -w --hidden -g '!.git' --sort path --max-filesize 1M`.
    `-F` is added to the frame command (the needles are identifiers, so it changes nothing but guards regex
    characters). The trees have no `.git`, so rg applies no `.gitignore` while `scan` does.
+6. **A and B scan an in-memory copy of the tree.** A follow-grep that finds nothing new is not charged, so the
+   call budget does not bound the number of scans, and each scan of Home Assistant from disk took about 4 s: the
+   config dev shakedown ran 70 minutes without finishing a question. The runner now walks each tree once into
+   `live_grep::Corpus` (the same walker and filters as `scan`) and replays `scan`'s loop over it; only the speed
+   changes. `sim-structured check-corpus` compared the two on every needle of the gold questions: 1,326 needles
+   over the three trees (config gold, `--grep-skip none`; dependency gold, `--grep-skip lockfiles`), 0 differences
+   in any field but elapsed time; a Home Assistant scan fell from 4,253 ms to 111 ms. The one difference by
+   construction: the corpus checks the scan deadline per file rather than per walk entry, and a run with any
+   deadline stop is void either way. The R arm still runs rg on the tree on disk.
 
 ### Shakedown on the dev half (descriptive, decides nothing)
 
