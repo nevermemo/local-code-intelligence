@@ -75,10 +75,16 @@ struct Span {
 }
 
 impl Span {
+    /// `{file, begin_line, end_line}`, or `{path, start_line, end_line}` as
+    /// the trait-set writer spells the `trait_decl`, `cfg_gated` and `neutral`
+    /// spans (unread, they turned those exemptions off without a warning).
     fn from_value(v: &Value) -> Option<Span> {
-        let begin = v.get("begin_line")?.as_i64()?;
+        let begin = v
+            .get("begin_line")
+            .or_else(|| v.get("start_line"))?
+            .as_i64()?;
         Some(Span {
-            file: norm(str_of(v, "file")?),
+            file: norm(str_of(v, "file").or_else(|| str_of(v, "path"))?),
             begin,
             end: v.get("end_line").and_then(Value::as_i64).unwrap_or(begin),
         })
@@ -406,15 +412,18 @@ pub fn annotate(mut items: Vec<Value>) -> Vec<Value> {
 /// Report additions: which optional gold fields the items carry, so a score
 /// computed without them says so.
 pub fn report_notes(items: &[Value]) -> Value {
-    let with = |key: &str| {
-        items
-            .iter()
-            .filter(|i| i.get(key).is_some_and(|v| !v.is_null() && v != &json!([])))
-            .count()
-    };
+    // Only spans the scorer can read count, so a misspelt span warns.
+    let decl = items
+        .iter()
+        .filter(|i| i.get("trait_decl").and_then(Span::from_value).is_some())
+        .count();
+    let cfg = items
+        .iter()
+        .filter(|i| !spans_of(i, "cfg_gated").is_empty())
+        .count();
     let mut notes = Map::new();
-    notes.insert("items_with_trait_decl".into(), json!(with("trait_decl")));
-    notes.insert("items_with_cfg_gated".into(), json!(with("cfg_gated")));
+    notes.insert("items_with_trait_decl".into(), json!(decl));
+    notes.insert("items_with_cfg_gated".into(), json!(cfg));
     notes.insert(
         "dominant_site".into(),
         items
@@ -561,6 +570,34 @@ mod tests {
         // a path-only answer is returned and matches nothing
         let s = score_item(&item, &[ans("a.rs")]);
         assert_eq!((m(&s, "set_recall"), m(&s, "set_precision")), (0.0, 0.0));
+    }
+
+    // The trait-set writer spells these spans `{path, start_line, end_line}`.
+    #[test]
+    fn exempt_spans_in_the_writers_spelling_are_read() {
+        let written =
+            |path: &str, a: i64, b: i64| json!({"path": path, "start_line": a, "end_line": b});
+        let mut item = q1();
+        item["trait_decl"] = written("tr.rs", 100, 140);
+        item["neutral"] = json!([written("n.rs", 1, 9)]);
+        item["cfg_gated"] = json!([written("linux.rs", 1, 50)]);
+        let s = score_item(
+            &item,
+            &[
+                ans("tr.rs:100"),
+                ans("n.rs:3"),
+                ans("linux.rs:7"),
+                ans("a.rs:12"),
+            ],
+        );
+        assert_eq!(m(&s, "set_precision"), 1.0);
+        assert_eq!(m(&s, "cfg_gated_answers"), 1.0);
+        let notes = report_notes(&[item]);
+        assert_eq!(notes["items_with_trait_decl"], 1);
+        assert_eq!(notes["items_with_cfg_gated"], 1);
+        // a span neither spelling reads does not count as present
+        let notes = report_notes(&[json!({"trait_decl": {"file": "tr.rs"}})]);
+        assert_eq!(notes["items_with_trait_decl"], 0);
     }
 
     #[test]
