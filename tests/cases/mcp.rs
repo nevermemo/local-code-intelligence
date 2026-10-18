@@ -891,25 +891,29 @@ async fn assert_default_endpoints_return_what_the_application_does(profiled: boo
     let by_mcp = mcp_search_code(&client, &base, "/mcp", &session, &workspace).await;
     assert_eq!(without_clocks(by_mcp), expected);
 
-    // REST `search_code`, with no query string and with one that names no
-    // profile.
-    for url in [
-        format!("{base}/v1/search_code"),
-        format!("{base}/v1/search_code?unrelated=1"),
-    ] {
-        let response = client
-            .post(&url)
-            .json(&json!({"workspace_path": workspace, "query": "translator", "top_k": 3}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{url}");
-        let by_rest = response.json::<Value>().await.unwrap();
-        assert_eq!(without_clocks(by_rest), expected, "{url}");
-    }
+    // REST `search_code` with no query string.
+    let body = json!({"workspace_path": workspace, "query": "translator", "top_k": 3});
+    let response = client
+        .post(format!("{base}/v1/search_code"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let by_rest = response.json::<Value>().await.unwrap();
+    assert_eq!(without_clocks(by_rest), expected);
+    // A query parameter that names no profile is refused before any search
+    // (d388; it was ignored before).
+    let response = client
+        .post(format!("{base}/v1/search_code?unrelated=1"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // Each of the four searches reranked once.
-    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), 4);
+    // Each of the three searches reranked once; the refused one did not run.
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), 3);
 
     if !profiled {
         // No profiles, so no endpoint under `/mcp/` and no name to pass.
@@ -2784,6 +2788,7 @@ async fn every_tool_rejects_an_unknown_argument_naming_it() {
 
     let w = json!(workspace);
     let cases = [
+        ("service_status", json!({})),
         ("index_workspace", json!({"workspace_path": w})),
         ("index_status", json!({"workspace_path": w})),
         ("list_indexed_files", json!({"workspace_path": w})),
@@ -2819,13 +2824,45 @@ async fn every_tool_rejects_an_unknown_argument_naming_it() {
             json!({"workspace_path": w, "steps": [{"id": "s1", "op": "pick", "in": {}}]}),
         ),
     ];
-    // The table covers every tool except the one with no arguments.
+    // Even the tool with no arguments must reject extra keys.
     let covered: std::collections::BTreeSet<&str> = cases.iter().map(|(name, _)| *name).collect();
     for name in &listed {
         assert!(
-            covered.contains(name) || *name == "service_status",
+            covered.contains(name),
             "{name} has no unknown-argument case"
         );
+    }
+    for tool in tools["tools"].as_array().unwrap() {
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"], false,
+            "{} must have a closed input schema",
+            tool["name"]
+        );
+    }
+    let openapi = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    for (path, operations) in openapi["paths"].as_object().unwrap() {
+        if let Some(post) = operations.get("post") {
+            assert_eq!(
+                post["requestBody"]["content"]["application/json"]["schema"]["additionalProperties"],
+                false,
+                "{path} must have a closed request schema"
+            );
+        }
+    }
+    for params in [
+        json!({"name": "service_status"}),
+        json!({"name": "service_status", "arguments": {}}),
+    ] {
+        let response = mcp_result(&client, &base, "/mcp", &session, "tools/call", params).await;
+        assert_ne!(response["isError"], true, "{response}");
+        assert!(response["structuredContent"].is_object());
     }
 
     // Unknown keys at the top level, and inside the nested argument objects.
@@ -2881,7 +2918,7 @@ async fn every_tool_rejects_an_unknown_argument_naming_it() {
 
     // The REST bodies share the structs, so they refuse it too (axum answers
     // an unusable JSON body with 422). The `search_profile` query parameter is
-    // a separate struct, left open, and is covered by its own test.
+    // a separate strict struct, covered by its own test.
     let rest = client
         .post(format!("{base}/v1/search_symbols"))
         .json(&json!({"workspace_path": w, "query": "q", "top_kk": 3}))
@@ -2898,6 +2935,175 @@ async fn every_tool_rejects_an_unknown_argument_naming_it() {
 
     // Nothing was created for any of them.
     assert!(!workspace.exists());
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn misspelled_search_arguments_are_rejected_by_mcp_and_rest_before_indexing() {
+    let (temp, config, fake, models_task) = fixture().await;
+    let workspace = temp.path().join("strict-search");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app.clone()).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    for (key, value) in [
+        ("include_path", json!(["src/**"])),
+        ("topk", json!(1)),
+        ("language", json!("rust")),
+    ] {
+        let mut arguments = json!({"workspace_path": workspace, "query": "translator"});
+        arguments[key] = value;
+        let result = mcp_result(
+            &client,
+            &base,
+            "/mcp",
+            &session,
+            "tools/call",
+            json!({"name": "search_code", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{key}: {result}");
+        let expected = format!("unknown field `{key}`");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&expected),
+            "{result}"
+        );
+
+        let response = client
+            .post(format!("{base}/v1/search_code"))
+            .json(&arguments)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = response.text().await.unwrap();
+        assert!(error.contains(&expected), "{error}");
+    }
+
+    assert_eq!(fake.document_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), 0);
+    assert!(!app.status(&workspace).await.unwrap().indexed);
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn rest_search_query_parameters_reject_unknown_and_duplicate_keys() {
+    let (temp, config, fake, models_task) = fixture().await;
+    let workspace = temp.path().join("strict-query");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = Arc::new(App::open(profiled_config(config)).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app.clone()).await;
+    let client = reqwest::Client::new();
+
+    for (query, expected) in [
+        ("include_path=src", "unknown field `include_path`"),
+        ("topk=1", "unknown field `topk`"),
+        ("language=rust", "unknown field `language`"),
+        ("search_profle=fast", "unknown field `search_profle`"),
+        (
+            "search_profile=fast&include_path=src",
+            "unknown field `include_path`",
+        ),
+        (
+            "search_profile=fast&search_profile=deep",
+            "duplicate field `search_profile`",
+        ),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/search_code?{query}"))
+            .json(&json!({"workspace_path": workspace, "query": "translator"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let error = response.text().await.unwrap();
+        assert!(error.contains(expected), "{query}: {error}");
+    }
+
+    assert_eq!(fake.document_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.rerank_requests.load(Ordering::SeqCst), 0);
+    assert!(!app.status(&workspace).await.unwrap().indexed);
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn symbol_query_byte_limit_matches_code_search_over_mcp_and_rest() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    // No real language server is needed to accept a valid symbol query.
+    config.csharp.disabled = true;
+    let workspace = temp.path().join("symbol-query-limit");
+    write(&workspace, "Example.cs", "class Example {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    for query in ["q".repeat(16000), "\u{00e9}".repeat(8000)] {
+        assert_eq!(query.len(), 16000);
+        let arguments = json!({"workspace_path": workspace, "query": query});
+        let accepted = mcp_result(
+            &client,
+            &base,
+            "/mcp",
+            &session,
+            "tools/call",
+            json!({"name": "search_symbols", "arguments": arguments}),
+        )
+        .await;
+        assert_ne!(accepted["isError"], true, "{accepted}");
+        assert!(accepted["structuredContent"]["results"].is_array());
+        let response = client
+            .post(format!("{base}/v1/search_symbols"))
+            .json(&arguments)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.json::<Value>().await.unwrap()["results"].is_array());
+
+        let over_limit = format!("{query}q");
+        assert_eq!(over_limit.len(), 16001);
+        for name in ["search_symbols", "search_code"] {
+            let arguments = json!({"workspace_path": workspace, "query": over_limit});
+            let rejected = mcp_result(
+                &client,
+                &base,
+                "/mcp",
+                &session,
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+            )
+            .await;
+            assert_eq!(rejected["isError"], true, "{name}: {rejected}");
+            assert_eq!(rejected["content"][0]["text"], "query exceeds 16000 bytes");
+            let response = client
+                .post(format!("{base}/v1/{name}"))
+                .json(&arguments)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "query exceeds 16000 bytes"
+            );
+        }
+    }
+
     token.cancel();
     server.abort();
     models_task.abort();

@@ -15,6 +15,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "character": {
                       "description": "Zero-based UTF-16 character offset, as defined by LSP.",
@@ -138,6 +139,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "character": {
                       "description": "Zero-based UTF-16 character offset, as defined by LSP.",
@@ -264,6 +266,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -369,6 +372,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -474,6 +478,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -579,6 +584,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -695,6 +701,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "exclude_paths": {
                       "description": "Repository-relative exclude globs.",
@@ -852,6 +859,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "query": {
                       "type": "string"
@@ -997,6 +1005,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1102,6 +1111,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": false,
                   "properties": {
                     "workspace_path": {
                       "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1212,6 +1222,7 @@
       "description": "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "character": {
             "description": "Zero-based UTF-16 character offset, as defined by LSP.",
@@ -1247,6 +1258,7 @@
       "description": "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "character": {
             "description": "Zero-based UTF-16 character offset, as defined by LSP.",
@@ -1285,6 +1297,7 @@
       "description": "Read persistent index status for a canonical workspace, including chunk count and embedding compatibility.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "workspace_path": {
             "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1302,6 +1315,7 @@
       "description": "Index Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ source and Markdown documentation (opt-in, `[index].prose`) in a local workspace respecting gitignore. Reuses unchanged chunks and embeddings; returns when the persistent index is ready.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "workspace_path": {
             "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1319,6 +1333,7 @@
       "description": "List every file the persistent index currently has cached chunks for, with language and chunk count. Reflects the last successful index_workspace, not a fresh directory scan.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "workspace_path": {
             "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1336,6 +1351,7 @@
       "description": "Search indexed Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ code and Markdown documentation (opt-in, `[index].prose`) using semantic, lexical, and optional language-server LSP retrieval with neural reranking. Optional language, repository-relative include/exclude glob, and source-role filters apply to every channel. Returns role/prior metadata, scores, timings, effective filters, and index lifecycle metadata. When `[index].prose = true` (default false: Markdown is not indexed), documentation chunks (Markdown) are returned in a separate `docs` list (default 2) unless `source_roles` names documentation. A missing index is auto-created on first search.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "exclude_paths": {
             "description": "Repository-relative exclude globs.",
@@ -1405,6 +1421,7 @@
       "description": "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "query": {
             "type": "string"
@@ -1424,7 +1441,8 @@
     {
       "description": "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, and clangd. Missing language servers do not make readiness fail.",
       "inputSchema": {
-        "properties": {},
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "type": "object"
       },
       "name": "service_status"
@@ -1433,6 +1451,7 @@
       "description": "Stop automatic indexing for a watched workspace.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "workspace_path": {
             "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",
@@ -1450,6 +1469,7 @@
       "description": "Watch an indexed workspace for Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ source and Markdown (opt-in, `[index].prose`) changes. Debounces changes and refreshes the persistent index while the server is running.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "workspace_path": {
             "description": "Absolute workspace directory. Canonicalized to a persistent workspace ID.",

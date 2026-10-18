@@ -204,20 +204,6 @@ async fn with_the_flags_off_no_recipe_tool_or_route_exists() {
     models_task.abort();
 }
 
-/// Removes every `"additionalProperties": false` member, at any depth.
-fn strip_additional_properties_false(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if map.get("additionalProperties") == Some(&Value::Bool(false)) {
-                map.remove("additionalProperties");
-            }
-            map.values_mut().for_each(strip_additional_properties_false);
-        }
-        Value::Array(items) => items.iter_mut().for_each(strip_additional_properties_false),
-        _ => {}
-    }
-}
-
 /// What a client sees of a server's surface: the instructions sent at
 /// `initialize`, the tools listed on `/mcp` (by name) and the OpenAPI
 /// document, as one value.
@@ -241,18 +227,13 @@ async fn surface_of(app: Arc<App>) -> Value {
     json!({"instructions": initialized["instructions"], "tools": tools, "openapi": openapi})
 }
 
-/// With both flags off the server's surface is the surface of the commit
-/// before the recipes (b46786e): the same instructions, the same tools with
-/// the same descriptions and schemas, the same OpenAPI document.
-///
-/// A server built without the recipe and compose code paths cannot be
-/// constructed from this tree: the code is compiled in and the flags only
-/// decide whether the routers are merged. So the comparison is against a
-/// golden file taken from the binary of b46786e, produced by `surface_of`
-/// with the default configuration (`tests/golden/surface_flags_off.json`).
-/// Do not re-bless it from this tree; it is the reference, not an output.
+/// Pin the default MCP and REST surface, including closed input schemas.
+/// The baseline is the pre-recipes surface of b46786e plus the recorded
+/// strict-argument changes (d363, d388): with the recipe and compose flags off
+/// the surface must equal it, closed input schemas included, so neither the
+/// flags nor a loss of strictness can change it unnoticed.
 #[tokio::test]
-async fn with_the_flags_off_the_surface_is_that_of_the_commit_before_the_recipes() {
+async fn with_the_flags_off_the_surface_matches_the_strict_argument_golden() {
     let (_temp, config, _fake, models_task) = fixture().await;
     assert!(!config.recipes.enabled && !config.compose.enabled);
     let app = Arc::new(App::open(config).await.unwrap());
@@ -268,15 +249,11 @@ async fn with_the_flags_off_the_surface_is_that_of_the_commit_before_the_recipes
         actual["instructions"], expected["instructions"],
         "server instructions changed"
     );
-    // The one recorded change since b46786e (d363): tool input schemas
-    // and REST bodies deny unknown keys. Strip exactly that marker before
-    // comparing.
-    let mut tools = actual["tools"].clone();
-    strip_additional_properties_false(&mut tools);
-    let mut openapi = actual["openapi"].clone();
-    strip_additional_properties_false(&mut openapi);
-    assert_eq!(tools, expected["tools"], "tools/list changed");
-    assert_eq!(openapi, expected["openapi"], "openapi.json changed");
+    assert_eq!(actual["tools"], expected["tools"], "tools/list changed");
+    assert_eq!(
+        actual["openapi"], expected["openapi"],
+        "openapi.json changed"
+    );
     models_task.abort();
 }
 

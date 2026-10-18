@@ -42,6 +42,10 @@ const SEARCH_FIRST: &str = "run search_code on this workspace first, which build
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct NoArgs {}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceArgs {
     /// Absolute workspace directory. Canonicalized to a persistent workspace ID.
     pub workspace_path: String,
@@ -385,7 +389,7 @@ impl McpServer {
     #[tool(
         description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, and clangd. Missing language servers do not make readiness fail."
     )]
-    async fn service_status(&self) -> CallToolResult {
+    async fn service_status(&self, Parameters(_args): Parameters<NoArgs>) -> CallToolResult {
         result(Ok(self.app.service_status().await))
     }
 }
