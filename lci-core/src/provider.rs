@@ -20,7 +20,7 @@
 
 use crate::{
     endpoint::{ApiKey, Endpoint, validate_api_key_env},
-    models::{MAX_RESPONSE_BODY_BYTES, check_status, read_limited_body},
+    models::{MAX_RESPONSE_BODY_BYTES, check_status_without_body, read_limited_body},
 };
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -457,7 +457,7 @@ impl Provider for OpenAiCompat {
             .map_err(reqwest::Error::without_url)
             .context("system_one request failed")?;
         let bounded = read_limited_body(
-            check_status(response, "system_one", url.as_str(), key.as_ref()).await?,
+            check_status_without_body(response, "system_one")?,
             MAX_RESPONSE_BODY_BYTES,
         )
         .await

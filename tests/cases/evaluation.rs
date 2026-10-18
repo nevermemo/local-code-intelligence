@@ -1809,6 +1809,40 @@ async fn system_one_echoed_keys_never_reach_warnings_or_error_chains() {
         assert!(!warning.contains(SECRET));
     }
     assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 10);
+
+    // A failure body that echoes the key as a JSON string with one character
+    // \u-escaped, which no literal replacement finds. Neither it nor any
+    // other body text may reach the error chain or the warning: only the
+    // status does.
+    let escaped = format!("\\u0073{}", &SECRET[1..]);
+    assert!(!escaped.contains(SECRET));
+    *fake.system_one_response.lock().unwrap() = None;
+    for (status, needle) in [
+        (StatusCode::UNAUTHORIZED, "HTTP status 401"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "HTTP status 500"),
+    ] {
+        *fake.system_one_raw_response.lock().unwrap() = Some((
+            status,
+            format!(r#"{{"error":"{escaped}","detail":"private-body-text"}}"#),
+        ));
+        let error = models.system_one_rank("q", &candidates).await.unwrap_err();
+        let report = traced_search(&app, &workspace).await;
+        assert_eq!(report.rerank_outcome, Some(RerankOutcome::Failed));
+        let warning = report.warning.clone().unwrap();
+        assert!(warning.contains(needle), "{warning}");
+        let mut texts = vec![format!("{error:#}"), format!("{error:?}"), warning];
+        texts.extend(error.chain().map(ToString::to_string));
+        for text in texts {
+            for hidden in [SECRET, &SECRET[1..], escaped.as_str(), "private-body-text"] {
+                assert!(!text.contains(hidden), "{hidden}: {text}");
+            }
+        }
+        let status_error = error
+            .downcast_ref::<lci_core::models::HttpStatusError>()
+            .unwrap();
+        assert!(status_error.body.is_empty(), "{}", status_error.body);
+    }
+    assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 14);
     task.abort();
 }
 
@@ -1838,10 +1872,94 @@ fn evaluation_settings_record_only_the_nondefault_rescorer() {
     assert_eq!(serde_json::from_str::<CandidateArm>(&json).unwrap(), arm);
 }
 
+#[test]
+fn evaluation_settings_tell_system_one_models_and_batch_sizes_apart() {
+    let system_one = |model: &str, batch_size: usize| {
+        let mut config = Config::default();
+        config.rescorer = local_code_intelligence::config::Rescorer::SystemOne;
+        config.system_one = Some(lci_core::provider::SystemOneConfig {
+            provider: lci_core::provider::ProviderKind::SystemOneWire,
+            model: model.into(),
+            batch_size,
+            ..Default::default()
+        });
+        config
+    };
+    let base = CandidateArm::new(&system_one("decider-a", 24), 8);
+    assert_eq!(base.system_one_model.as_deref(), Some("decider-a"));
+    assert_eq!(base.system_one_batch_size, Some(24));
+    let json = serde_json::to_string(&base).unwrap();
+    assert!(json.contains(r#""system_one_model":"decider-a""#), "{json}");
+    assert!(json.contains(r#""system_one_batch_size":24"#), "{json}");
+    assert_eq!(serde_json::from_str::<CandidateArm>(&json).unwrap(), base);
+
+    // Runs that differ only in the model or the batch size are different
+    // arms with different snapshots.
+    for (name, other) in [
+        ("model", CandidateArm::new(&system_one("decider-b", 24), 8)),
+        (
+            "batch size",
+            CandidateArm::new(&system_one("decider-a", 8), 8),
+        ),
+    ] {
+        assert_ne!(other, base, "{name}");
+        assert_ne!(serde_json::to_string(&other).unwrap(), json, "{name}");
+    }
+
+    // The reranker arm records nothing of System One, even with a leftover
+    // `[system_one]` section, and its bytes are those of an older snapshot.
+    let mut reranker = system_one("decider-a", 24);
+    reranker.rescorer = local_code_intelligence::config::Rescorer::Reranker;
+    let arm = CandidateArm::new(&reranker, 8);
+    assert_eq!(
+        (&arm.system_one_model, arm.system_one_batch_size),
+        (&None, None)
+    );
+    assert_eq!(
+        serde_json::to_string(&CandidateArm::new(&reranker, 8)).unwrap(),
+        serde_json::to_string(&CandidateArm::new(&Config::default(), 8)).unwrap()
+    );
+    assert!(!serde_json::to_string(&arm).unwrap().contains("system_one"));
+}
+
 #[tokio::test]
 async fn a_failed_reranker_keeps_its_original_log_message() {
     use std::io::Write;
-    use tracing::instrument::WithSubscriber;
+
+    const CHILD: &str = "LCI_TEST_RERANKER_LOG_CHILD";
+    // The log is captured by a process-wide subscriber, which must be the
+    // only dispatcher the process has ever had. tracing caches, per call
+    // site, whether any subscriber wants it, and while a process has a single
+    // dispatcher that answer is computed from the dispatcher of whichever
+    // thread first reaches the call site. A scoped subscriber therefore loses
+    // the event whenever a concurrent test (the other reranker tests fail the
+    // same way) reaches the `warn!` first on a thread with none, and the
+    // cache is never rebuilt. A child process running only this test, with a
+    // global default set before any call site is reached, has no such race.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "evaluation::a_failed_reranker_keeps_its_original_log_message",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A renamed test would make the child run nothing and pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
 
     #[derive(Clone, Default)]
     struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1856,22 +1974,24 @@ async fn a_failed_reranker_keeps_its_original_log_message() {
         }
     }
 
+    let log = Log::default();
+    let writer = log.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .expect("no other subscriber is set in this child");
+
     let (temp, mut config, fake, task) = fixture().await;
     let workspace = temp.path().join("reranker-log");
     write_system_one_workspace(&workspace);
     config.channels.lsp = false;
     fake.rerank_fails.store(true, Ordering::SeqCst);
     let app = App::open(config).await.unwrap();
-    let log = Log::default();
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let report = traced_search(&app, &workspace)
-        .with_subscriber(subscriber)
-        .await;
+    let report = traced_search(&app, &workspace).await;
     assert_eq!(report.rerank_outcome, Some(RerankOutcome::Failed));
     let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
     assert!(

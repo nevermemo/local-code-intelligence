@@ -34,7 +34,11 @@
 //! off`, and the reranker's scores as dumped (the reranker scores each
 //! (query, document) pair independently, so a candidate's score does not
 //! depend on its neighbours). What is refused, per query and counted: a
-//! reranked window holding a candidate the dump never sent to the reranker.
+//! reranked window holding a candidate the dump never sent to the reranker,
+//! and, for a dump scored by the System One rescorer (which answers a batch
+//! jointly, so a stored probability is not independent of the other
+//! candidates sent with it), a reranked window that is not exactly the
+//! dumped batch in the dumped order (`batch_mismatch`).
 //! What cannot be replayed: a window or channel depth larger than the dump
 //! took, another document budget, reranker, instruction, chunking, or
 //! embedding.
@@ -539,6 +543,29 @@ fn replay_query(
 
     let mut window_tokens: usize = 0;
     if uses_reranker {
+        // The System One service answers a batch jointly, so a stored
+        // probability is only valid for the exact batch it was given: the
+        // same candidates, with the same ids (their order), as the dump sent.
+        if dumped.scores_jointly() {
+            let mut sent: Vec<&CandidateTrace> =
+                rows.iter().filter(|row| row.shortlisted).collect();
+            sent.sort_by_key(|row| row.capped_rank);
+            let same_batch = sent.len() == window.len()
+                && sent
+                    .iter()
+                    .zip(&window)
+                    .all(|(row, item)| std::ptr::eq(*row, item.row));
+            if !same_batch {
+                return Err(refuse(
+                    ReplayRefusal::BatchMismatch,
+                    format!(
+                        "the dumped System One batch held {} candidates in capped order and the replayed window of {} differs in membership or order, so the stored scores do not apply",
+                        sent.len(),
+                        window.len()
+                    ),
+                ));
+            }
+        }
         let mut scores = Vec::with_capacity(window.len());
         for item in &window {
             let Some(score) = item.row.reranker_score else {

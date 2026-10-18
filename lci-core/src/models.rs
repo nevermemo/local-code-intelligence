@@ -329,12 +329,108 @@ fn redact_error_body(body: &str, endpoint: &str) -> String {
     redacted.trim_end().to_owned()
 }
 
-/// Replaces `key`, wherever a server echoed it, in `body`.
-pub(crate) fn redact_secret(body: &str, key: Option<&ApiKey>) -> String {
-    match key {
-        Some(key) => body.replace(key.expose(), "[redacted]"),
-        None => body.to_owned(),
+/// Decodes the JSON string escapes of `text` (`\uXXXX` with surrogate pairs,
+/// `\\`, `\"`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`); anything else, including a
+/// malformed escape, is kept as written.
+fn json_unescape(text: &str) -> String {
+    fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..4 {
+            value = value * 16 + chars.next()?.to_digit(16)?;
+        }
+        Some(value)
     }
+
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let mut ahead = chars.clone();
+                let decoded_char = hex4(&mut ahead).and_then(|first| match first {
+                    0xD800..=0xDBFF => {
+                        if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                            let second = hex4(&mut ahead)?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return None;
+                            }
+                            char::from_u32(0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => char::from_u32(first),
+                });
+                match decoded_char {
+                    Some(value) => {
+                        chars = ahead;
+                        decoded.push(value);
+                    }
+                    None => decoded.push_str("\\u"),
+                }
+            }
+            Some('b') => decoded.push('\u{8}'),
+            Some('f') => decoded.push('\u{c}'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some(escaped @ ('\\' | '"' | '/')) => decoded.push(escaped),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+/// Replaces `key`, wherever a server echoed it, in `body`. A server that
+/// echoes the key as a JSON string may write any of its characters as a
+/// `\uXXXX` escape, which a literal replacement misses; when the body still
+/// holds the key once its escapes are decoded, the whole body is dropped.
+pub(crate) fn redact_secret(body: &str, key: Option<&ApiKey>) -> String {
+    let Some(key) = key.map(ApiKey::expose).filter(|key| !key.is_empty()) else {
+        return body.to_owned();
+    };
+    let replaced = body.replace(key, "[redacted]");
+    // A gateway may wrap an upstream JSON error as a string, escaping it
+    // again, so decode until nothing changes (bounded).
+    let mut decoded = replaced.clone();
+    for _ in 0..4 {
+        let next = json_unescape(&decoded);
+        if next.contains(key) {
+            return "[redacted: the response echoed the credential]".to_owned();
+        }
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    replaced
+}
+
+/// [`check_status`] for a service whose failure bodies are never shown: a
+/// non-success status becomes an [`HttpStatusError`] with the status code and
+/// no body, and the body is not read. A body can echo the credential in a
+/// form no redaction recognises, so the typed System One paths drop it whole.
+pub(crate) fn check_status_without_body(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    Err(anyhow::Error::new(HttpStatusError {
+        status: status.as_u16(),
+        body: String::new(),
+    })
+    .context(format!("{label} HTTP error")))
 }
 
 pub(crate) async fn check_status(
@@ -654,7 +750,8 @@ impl Models {
     /// request. After a refused connection the service is skipped for
     /// [`SYSTEM_ONE_DOWN_WINDOW`] and this returns an error at once; the
     /// caller falls back to fusion order. The API key is read from the
-    /// environment here, per call, and appears in no error.
+    /// environment here, per call, and appears in no error. A non-success
+    /// status is reported by its code alone: the response body is discarded.
     pub async fn system_one_rank(
         &self,
         query: &str,
@@ -709,7 +806,7 @@ impl Models {
                 }
             };
             let bounded = read_limited_body(
-                check_status(response, "system_one", url.as_str(), key.as_ref()).await?,
+                check_status_without_body(response, "system_one")?,
                 MAX_RESPONSE_BODY_BYTES,
             )
             .await
@@ -802,6 +899,8 @@ pub(crate) mod tests {
         Json(&'static str),
         /// Answer HTTP 422 (a state or row limit, as the typed service does).
         Unprocessable,
+        /// Answer with this status and this exact (raw JSON) body.
+        RawError(u16, &'static str),
         /// Read the whole request, then close the connection without
         /// answering: the peer's FIN reaches a client waiting for a response.
         Close,
@@ -952,6 +1051,15 @@ pub(crate) mod tests {
                     String::new(),
                     r#"{"detail":"INPUT_TOO_LONG"}"#.to_owned(),
                 ),
+                Step::RawError(code, body) => {
+                    let status = match code {
+                        401 => "401 Unauthorized",
+                        403 => "403 Forbidden",
+                        500 => "500 Internal Server Error",
+                        other => panic!("the fake has no reason phrase for status {other}"),
+                    };
+                    (status, String::new(), body.to_owned())
+                }
                 Step::Close | Step::Reset => return,
             };
             let response = format!(
@@ -1595,6 +1703,89 @@ pub(crate) mod tests {
             error.contains("[redacted]"),
             "the header was not sent: {error}"
         );
+    }
+
+    fn test_key(secret: &str) -> ApiKey {
+        crate::endpoint::Endpoint {
+            url: "http://127.0.0.1:1/".into(),
+            model: "m".into(),
+            api_key_env: Some("TEST_KEY".into()),
+            allow_remote: true,
+        }
+        .api_key_from(|_| Some(secret.into()))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn redaction_catches_a_key_echoed_with_json_escapes() {
+        const SECRET: &str = "sk-escaped-echo-4f2a\u{1f511}x";
+        let key = test_key(SECRET);
+        // The first character as s, the astral character as a surrogate
+        // pair, both, and an upstream error re-escaped inside a gateway's
+        // JSON string: none contains the key literally.
+        for body in [
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x"}"#,
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x rejected"}"#,
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x"}"#,
+            r#"{"error":"{\"detail\":\"\\u0073k-escaped-echo-4f2a\\ud83d\\udd11x\"}"}"#,
+            "sk-escaped-echo-4f2a\u{1f511}x and \\u0073k-escaped-echo-4f2a\\ud83d\\udd11x",
+        ] {
+            let redacted = redact_secret(body, Some(&key));
+            assert!(
+                !json_unescape(&redacted).contains(SECRET),
+                "{body} -> {redacted}"
+            );
+            assert!(!redacted.contains("escaped-echo"), "{body} -> {redacted}");
+            assert!(redacted.contains("[redacted"), "{body} -> {redacted}");
+        }
+        // A literal echo is still replaced in place; other text is kept.
+        assert_eq!(
+            redact_secret("bad key sk-escaped-echo-4f2a\u{1f511}x!", Some(&key)),
+            "bad key [redacted]!"
+        );
+        assert_eq!(
+            redact_secret(r#"{"detail":"quota soon"}"#, Some(&key)),
+            r#"{"detail":"quota soon"}"#
+        );
+        assert_eq!(redact_secret("no key", None), "no key");
+        // Malformed escapes never panic.
+        for body in [r"\u", r"\ud83d", r"\ud83dA", r"\ud83d\ud83d", r"\u12", "\\"] {
+            assert_eq!(redact_secret(body, Some(&key)), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_one_http_failures_report_only_the_status() {
+        // An escaped echo of a key and ordinary text: neither may reach the
+        // error, whatever redaction would have made of them.
+        const BODY: &str =
+            r#"{"error":"sk-private-key-77aa rejected","detail":"private-body-text"}"#;
+        for status in [401, 500] {
+            let server = FakeModelServer::start(vec![vec![Step::RawError(status, BODY)]]).await;
+            let models = wire_models(server.address, 24);
+            let error = models
+                .system_one_rank("q", &wire_candidates(2))
+                .await
+                .unwrap_err();
+            assert_eq!(server.requests(), 1, "{status}: not retried");
+            let http = error.downcast_ref::<HttpStatusError>().unwrap();
+            assert_eq!(http.status, status);
+            assert!(http.body.is_empty(), "{status}: {}", http.body);
+            let causes: Vec<String> = error.chain().map(ToString::to_string).collect();
+            assert_eq!(
+                causes,
+                [
+                    "system_one HTTP error".to_owned(),
+                    format!("HTTP status {status}")
+                ]
+            );
+            for text in [format!("{error:#}"), format!("{error:?}")] {
+                for needle in ["private", "rejected", "k-private-key", "77aa"] {
+                    assert!(!text.contains(needle), "{status}: {text}");
+                }
+            }
+        }
     }
 
     /// `Models` set to rescore with the typed service at `address`.

@@ -155,6 +155,9 @@ struct FakeModels {
     system_one_last: std::sync::Mutex<Option<Value>>,
     /// Override the typed response to exercise malformed and echoed bodies.
     system_one_response: std::sync::Mutex<Option<(StatusCode, Value)>>,
+    /// Override the typed response with an exact raw body (a status and
+    /// text), for echoes a JSON serializer would not produce.
+    system_one_raw_response: std::sync::Mutex<Option<(StatusCode, String)>>,
     /// When nonzero, every embedding is padded with zeros to this many
     /// dimensions (the default vectors have three), as if the service behind
     /// the same URL and model name started returning another width.
@@ -336,18 +339,28 @@ async fn rerank(
 async fn system_one(
     State(state): State<Arc<FakeModels>>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     state.system_one_requests.fetch_add(1, Ordering::SeqCst);
     *state.system_one_last.lock().unwrap() = Some(body.clone());
+    if let Some((status, raw)) = state.system_one_raw_response.lock().unwrap().clone() {
+        return (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            raw,
+        )
+            .into_response();
+    }
     if let Some((status, body)) = state.system_one_response.lock().unwrap().clone() {
-        return Err((status, Json(body)));
+        return (status, Json(body)).into_response();
     }
     let mode = state.system_one_mode.load(Ordering::SeqCst);
     if mode == SystemOneMode::Fail as usize {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null)));
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null)).into_response();
     }
     if mode == SystemOneMode::TooLong as usize {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(Value::Null)));
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Value::Null)).into_response();
     }
     if mode == SystemOneMode::Hang as usize {
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -368,7 +381,7 @@ async fn system_one(
         let last = answers.keys().next_back().unwrap().clone();
         answers.remove(&last);
     }
-    Ok(Json(json!({"model": "fake-decider-1", "answers": answers})))
+    Json(json!({"model": "fake-decider-1", "answers": answers})).into_response()
 }
 
 async fn fixture() -> (
