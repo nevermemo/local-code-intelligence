@@ -13,8 +13,8 @@ agent, not by wall time ([evaluation.md](evaluation.md)).
 
 - Shipped and described in [engine.md](engine.md): the `Map` trait and registry, NodeId, the traversal engine, the steering ladder with handles, the
   first stage, five recipes and `lci_compose` (off by default), `lci traverse`, and `search_code mode = "traverse"` (off by default).
-- Measured defaults per question type are in `engine.md` ("Walk"); one open item: the MCP default `top_k` 8 gives 18 answers, which nobody measured
-  (roadmap row S1b).
+- Measured defaults per question type are in `engine.md` ("Walk"); the MCP default `top_k` 8 gives 16 answers without `steer` and 8 under
+  `where-to`, measured and kept (d389); routing where-to questions to the preset is roadmap row N100.
 - Not built: the unbuilt parts of [specs/](specs/README.md) (steering ops v1 and `traverse_*` tools, production RunRecord writer, map-card files),
   a System One rung, an exact-literal seed channel, doc-file support, SCIP in the R1 and external-repository evaluation trees ([engine.md](engine.md), "Known gaps").
 - Next steps and priorities live in [../../development/roadmap.md](../../development/roadmap.md); decisions and findings with ids in
