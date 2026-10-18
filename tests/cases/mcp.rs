@@ -7,7 +7,7 @@ async fn http_mcp_initialization_tools_and_health() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -124,7 +124,7 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -389,7 +389,7 @@ async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -504,7 +504,7 @@ pub(super) async fn serve_on_loopback(
     tokio::task::JoinHandle<()>,
 ) {
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -2708,11 +2708,9 @@ async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     config.traverse.enabled = true;
     // A port nothing listens on: the embedder is unreachable.
-    let dead = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
-    config.embedding_url = format!("http://127.0.0.1:{dead}/v1");
+    // Held for the whole test, so no parallel test's listener can take it.
+    let dead = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", dead.port);
     config.embedding_timeout_seconds = 2;
     let workspace = temp.path().join("scip-down");
     write_hybrid_workspace(&workspace);
