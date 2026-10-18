@@ -2392,6 +2392,60 @@ fn trait_tree() -> (tempfile::TempDir, PathBuf) {
     (dir, index)
 }
 
+/// Like [`trait_tree`], with `n` types `S00..` that each implement `Tr`.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn many_impls_tree(n: usize) -> (tempfile::TempDir, PathBuf) {
+    use scip::types::{Document, Occurrence, SymbolInformation, symbol_information::Kind};
+    let dir = tempfile::tempdir().unwrap();
+    let mut text = String::from("pub trait Tr {\n    fn m(&self);\n}\n");
+    for i in 0..n {
+        text.push_str(&format!(
+            "pub struct S{i:02};\nimpl Tr for S{i:02} {{\n    fn m(&self) {{}}\n}}\n"
+        ));
+    }
+    std::fs::write(dir.path().join("a.rs"), text).unwrap();
+    let symbol = |path: &str| format!("rust-analyzer cargo demo 0.1.0 {path}");
+    let occurrence = |range: &[i32], path: &str, roles: i32, enclosing: &[i32]| {
+        let mut o = Occurrence::default();
+        o.range = range.to_vec();
+        o.symbol = symbol(path);
+        o.symbol_roles = roles;
+        o.enclosing_range = enclosing.to_vec();
+        o
+    };
+    let info = |path: &str, kind: Kind| {
+        let mut i = SymbolInformation::default();
+        i.symbol = symbol(path);
+        i.kind = kind.into();
+        i
+    };
+    let mut document = Document::default();
+    document.relative_path = "a.rs".to_owned();
+    document.occurrences = vec![
+        occurrence(&[0, 10, 12], "a/Tr#", 1, &[0, 0, 2, 1]),
+        occurrence(&[1, 7, 8], "a/Tr#m().", 1, &[1, 4, 1, 16]),
+    ];
+    document.symbols = vec![info("a/Tr#", Kind::Trait), info("a/Tr#m().", Kind::Method)];
+    for i in 0..n {
+        let line = 3 + 4 * i as i32;
+        let ty = format!("a/S{i:02}#");
+        let method = format!("a/impl#[S{i:02}][Tr]m().");
+        document.occurrences.extend([
+            occurrence(&[line, 11, 14], &ty, 1, &[line, 0, line, 15]),
+            occurrence(&[line + 1, 5, 7], "a/Tr#", 0, &[]),
+            occurrence(&[line + 1, 12, 15], &ty, 0, &[]),
+            occurrence(&[line + 2, 7, 8], &method, 1, &[line + 2, 4, line + 2, 18]),
+        ]);
+        document.symbols.push(info(&ty, Kind::Struct));
+        document.symbols.push(info(&method, Kind::Method));
+    }
+    let mut message = scip::types::Index::default();
+    message.documents = vec![document];
+    let index = dir.path().join("index.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+    (dir, index)
+}
+
 /// One call over the trait tree.
 async fn trait_run(
     tree: &(tempfile::TempDir, PathBuf),
@@ -2409,6 +2463,17 @@ async fn trait_run_mode(
     maps: Option<&[&str]>,
     mode: TraitSeedMode,
 ) -> Value {
+    trait_run_top(tree, question, seeds, maps, mode, 8).await
+}
+
+async fn trait_run_top(
+    tree: &(tempfile::TempDir, PathBuf),
+    question: &str,
+    seeds: &[String],
+    maps: Option<&[&str]>,
+    mode: TraitSeedMode,
+    top_k: usize,
+) -> Value {
     let maps: Option<Vec<String>> = maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
     let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
     let call = Call {
@@ -2417,7 +2482,7 @@ async fn trait_run_mode(
         question,
         seeds,
         seed_search: None,
-        top_k: 8,
+        top_k,
         maps: maps.as_deref(),
         budget: &budget,
         steer: &steer,
@@ -2485,6 +2550,62 @@ async fn a_trait_path_in_the_question_starts_the_walk_at_the_trait() {
         let again = trait_run(&tree, question, &[], Some(&WITH_IMPLEMENTS)).await;
         assert_eq!(again["seeds"], json!([TRAIT_ID]), "{question}: {again}");
     }
+}
+
+// A trait with more implementors than the beam (16) keeps them all when the
+// question names it: the trait is a trait seed, whose `scip.implements` edges
+// are not cut.
+#[tokio::test]
+async fn a_trait_seed_reaches_every_implementor_past_the_beam() {
+    let tree = many_impls_tree(20);
+    let response = trait_run_top(
+        &tree,
+        "Which types implement `demo::Tr`?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+        TraitSeedMode::Auto,
+        40,
+    )
+    .await;
+    assert_eq!(response["trait_seeds"], 1, "{response}");
+    let types: Vec<String> = reached(&response)
+        .into_iter()
+        .filter(|id| id.ends_with("/struct"))
+        .collect();
+    assert_eq!(types.len(), 20, "{response}");
+    // A given start node that is the trait is walked the same way, though the
+    // question added no trait seed.
+    let given = trait_run_top(
+        &tree,
+        "q",
+        &[TRAIT_ID.to_owned()],
+        Some(&WITH_IMPLEMENTS),
+        TraitSeedMode::Auto,
+        40,
+    )
+    .await;
+    assert_eq!(given["trait_seeds"], 0, "{given}");
+    let given_types = reached(&given)
+        .into_iter()
+        .filter(|id| id.ends_with("/struct"))
+        .count();
+    assert_eq!(given_types, 20, "{given}");
+    // A given start node that is no trait is priced as before: the beam cuts
+    // the walk at the trait one hop on.
+    let plain = trait_run_top(
+        &tree,
+        "q",
+        &["sym:rust:a::S00/struct".to_owned()],
+        Some(&WITH_IMPLEMENTS),
+        TraitSeedMode::Auto,
+        40,
+    )
+    .await;
+    let cut = reached(&plain)
+        .into_iter()
+        .filter(|id| id.ends_with("/struct"))
+        .count();
+    assert!(cut < 20, "{plain}");
 }
 
 // Without `scip.impact` among the maps the implementing types still get a

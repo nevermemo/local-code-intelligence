@@ -14,12 +14,15 @@
 //! [`kind_prior`], so a rank-0 containment edge is worth 0.5 above the gate as
 //! it is below it. An unscored arm follows every edge at 1. The rules scorer sees the edge's witness class, kind, the
 //! fused confidence, the in-degree seen so far, the query overlap and the map
-//! card's cost, so a hop into another map is priced like any other.
+//! card's cost, so a hop into another map is priced like any other. From a
+//! trait start node ([`hop_from`]) the `scip.implements` edges are followed
+//! whole and rank first, the rest are priced as above after them.
 
 pub use crate::walk::{BfsScorer, RandomScorer};
 use crate::{
     EdgeKind,
     edge::{MapCard, WitnessClass},
+    scip_implements::SCIP_IMPLEMENTS_ID,
     traverse::{priors::HopPriors, source::FusedEdge},
     walk::{W_BASE, W_INDEGREE_IDF, W_OVERLAP, tokenize},
 };
@@ -389,14 +392,85 @@ pub fn hop(
     cands: &[Candidate],
     price: HopPrice,
 ) -> Vec<(usize, f64)> {
+    hop_from(scorer, ctx, cands, price, false)
+}
+
+/// [`hop`] for the node being expanded; `trait_seed` is true when it is a
+/// start node that is a trait or trait method of `scip.implements` (named by
+/// the question or given by the caller). From such a
+/// node every candidate that `scip.implements` offers (all its edges are
+/// `Implements`), whichever map gave the fused edge its best witness, is
+/// followed, with no gate and no beam, at the `scip.implements` `Implements`
+/// prior and in offer order, ahead of everything else. The other candidates
+/// are priced as [`hop`] prices them, but as the remainder with the `n`
+/// implementors counted before their rank (`prior / (1 + n + rank)` above the
+/// gate, `prior / (1 + n)` at or below it). When a learned table prices
+/// `Implements` so low that the top of that remainder would still reach the
+/// implementors' value, the remainder is scaled, keeping its order, so its top
+/// is `implements / (1 + n)`. So no other edge, whatever the priors, gets a hop
+/// value as high as an implementor's (unless that prior is 0; the per-map
+/// weights and the frontier reranker apply after this and can reorder them).
+/// With no such candidate, or with `trait_seed` false, the result is that of
+/// [`hop`] on all of them. The unscored arm ignores the flag: it follows every
+/// edge at 1 either way.
+pub fn hop_from(
+    scorer: &mut dyn HopScorer,
+    ctx: &ScoreCtx,
+    cands: &[Candidate],
+    price: HopPrice,
+    trait_seed: bool,
+) -> Vec<(usize, f64)> {
     if scorer.unscored() {
         return (0..cands.len()).map(|i| (i, 1.0)).collect();
+    }
+    if trait_seed {
+        let (own, rest): (Vec<usize>, Vec<usize>) =
+            (0..cands.len()).partition(|&i| cands[i].edge.maps.contains(&SCIP_IMPLEMENTS_ID));
+        if !own.is_empty() {
+            let implements = ctx.priors.prior(SCIP_IMPLEMENTS_ID, EdgeKind::Implements);
+            let mut steps: Vec<(usize, f64)> = own.iter().map(|&i| (i, implements)).collect();
+            let left: Vec<Candidate> = rest.iter().map(|&i| cands[i].clone()).collect();
+            let priced = price_ranked(scorer, ctx, &left, price, own.len());
+            // A learned table can price `Implements` far below the other
+            // kinds: then the remainder is scaled, in order, so its top value
+            // is `implements / (1 + n)`.
+            let top = priced.iter().map(|&(_, value)| value).fold(0.0, f64::max);
+            let scale = if top < implements || top <= 0.0 {
+                1.0
+            } else {
+                implements / ((1.0 + own.len() as f64) * top)
+            };
+            steps.extend(
+                priced
+                    .into_iter()
+                    .map(|(j, value)| (rest[j], value * scale)),
+            );
+            return steps;
+        }
+    }
+    price_ranked(scorer, ctx, cands, price, 0)
+}
+
+/// The gate and the beam over `cands`, with `ahead` edges already ranked in
+/// front of them (0 for [`hop`] itself).
+fn price_ranked(
+    scorer: &mut dyn HopScorer,
+    ctx: &ScoreCtx,
+    cands: &[Candidate],
+    price: HopPrice,
+    ahead: usize,
+) -> Vec<(usize, f64)> {
+    if cands.is_empty() {
+        return Vec::new();
     }
     if cands.len() <= price.gate {
         return cands
             .iter()
             .enumerate()
-            .map(|(i, c)| (i, ctx.priors.prior(c.edge.best.map, c.edge.best.kind)))
+            .map(|(i, c)| {
+                let prior = ctx.priors.prior(c.edge.best.map, c.edge.best.kind);
+                (i, prior / (1.0 + ahead as f64))
+            })
             .collect();
     }
     let scores = scorer.score(ctx, cands);
@@ -410,7 +484,7 @@ pub fn hop(
             let edge = &cands[i].edge.best;
             (
                 i,
-                ctx.priors.prior(edge.map, edge.kind) / (1.0 + rank as f64),
+                ctx.priors.prior(edge.map, edge.kind) / (1.0 + (ahead + rank) as f64),
             )
         })
         .collect()

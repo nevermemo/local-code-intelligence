@@ -474,6 +474,9 @@ pub(super) struct Seeds {
     /// paths name; `Some` only when the call walks `scip.implements` (0 when
     /// no path named one), so a bench can tell them from fallbacks.
     pub(super) trait_seeds: Option<usize>,
+    /// The given start nodes (`--seeds`) that are traits or trait methods of
+    /// `scip.implements`: walked as trait seeds, not counted in `trait_seeds`.
+    pub(super) given_traits: Vec<NodeId>,
     /// One record per start node: the retrievers that found it and its score.
     pub(super) details: Vec<Value>,
     /// Why the stand-in replaced the hybrid search, if it did.
@@ -483,6 +486,21 @@ pub(super) struct Seeds {
     /// deadline does not run while it does: the search is bounded by the
     /// embedding and reranker timeouts, not by `deadline_ms`.
     pub(super) search_time: Duration,
+}
+
+impl Seeds {
+    /// The start nodes that are the traits and trait methods the question
+    /// named ([`add_trait_seeds`] puts them first, `trait_seeds` of them), and
+    /// the given ones that are traits or trait methods ([`Self::given_traits`]);
+    /// none on a continuation.
+    pub(super) fn trait_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let count = self.trait_seeds.unwrap_or(0);
+        self.nodes
+            .iter()
+            .take(count)
+            .map(|seed| seed.node.clone())
+            .chain(self.given_traits.iter().cloned())
+    }
 }
 
 /// Finds the start nodes: the caller's, else the hybrid search's, else (when
@@ -634,18 +652,24 @@ impl FromStr for TraitSeedMode {
 /// question (`tauri::Manager`, `Runtime::run`) that names a trait or a trait
 /// method declaration of the map ([`ImplementsMap::find`]) starts the walk at
 /// that node, from which the map's edges reach the implementing types or
-/// members. They go in front of the start nodes of the other sources
+/// members. Expanding such a start node follows every one of those
+/// `scip.implements` edges (no gate, no beam) and ranks them ahead of its other
+/// edges ([`lci_maps::traverse::frontier::hop_from`]; [`Seeds::trait_nodes`]
+/// names the nodes), so no implementor is lost to the beam or to a reference
+/// that prices higher. They go in front of the start nodes of the other sources
 /// (`Prepend`) or take their place (`Replace`; `Auto` replaces when a path is
 /// an exact match). Call it only when `scip.implements` is on; a call without
 /// that map never gets here, so its start nodes are those of [`find_seeds`]
 /// alone. The seeds are not credited to a map (`Seed::map` is `None`, as for
 /// given seeds): no map ranks them, the question's own words named them.
 ///
-/// Sets [`Seeds::trait_seeds`] (0 when nothing was added). Nothing else
-/// changes when the caller gave `--seeds`, when no path names a target, or on
-/// a continuation (which does not look for seeds). The source becomes
-/// `traits`, or `traits+<source>` when the other start nodes stay. Returns
-/// the note the response carries, if seeds were added.
+/// Sets [`Seeds::trait_seeds`] (0 when nothing was added). When the caller
+/// gave `--seeds`, none is added; the given start nodes that are targets of the
+/// map are walked as trait seeds ([`Seeds::given_traits`]). Nothing changes
+/// when no path names a target, or on a continuation (which does not look for
+/// seeds). The source becomes `traits`, or `traits+<source>` when the other
+/// start nodes stay. Returns the note the response carries, if seeds were
+/// added.
 pub(super) fn add_trait_seeds(
     found: &mut Seeds,
     map: &ImplementsMap,
@@ -654,6 +678,12 @@ pub(super) fn add_trait_seeds(
 ) -> Option<String> {
     found.trait_seeds = Some(0);
     if found.source == "given" {
+        found.given_traits = found
+            .nodes
+            .iter()
+            .filter(|seed| map.targets().iter().any(|t| t.node == seed.node))
+            .map(|seed| seed.node.clone())
+            .collect();
         return None;
     }
     let (names, _) = code_names(question);
