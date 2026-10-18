@@ -112,6 +112,10 @@ pub enum ReplayRefusal {
     /// The replayed rerank window holds a candidate the dumped search never
     /// sent to the reranker, so it has no score.
     UnscoredWindow,
+    /// The query is scored on the docs list (`lane:docs`) or on both lists
+    /// (`lane:union`); a dump holds the code lane's candidates only, so the
+    /// docs list cannot be replayed from it.
+    NonCodeLane,
 }
 
 impl ReplayRefusal {
@@ -123,6 +127,7 @@ impl ReplayRefusal {
             Self::ShortlistMismatch => "shortlist_mismatch",
             Self::RerankNotScored => "rerank_not_scored",
             Self::UnscoredWindow => "unscored_window",
+            Self::NonCodeLane => "non_code_lane",
         }
     }
 }
@@ -297,6 +302,26 @@ pub struct QueryMetrics {
     /// accuracy over the first eight results.
     #[serde(default)]
     pub file_acc_at_10: f64,
+    /// What the agent reads for this query, as a token proxy: the characters
+    /// of the bounded snippets of every returned row of both lists (the
+    /// scored list and [`QueryReport::unscored_evidence`]), divided by four.
+    /// A snippet is at most [`SNIPPET_BUDGET`] bytes, so this is a proxy
+    /// measured the same way on every report that holds evidence, one made
+    /// before the docs lane included (see [`snippet_tokens`]); `None` only in
+    /// a report that predates the field, where `compare` derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_tokens: Option<usize>,
+}
+
+/// The token proxy of the rows of `lists`: the characters of their snippets
+/// divided by four (integer division of the sum over all lists, not per row).
+pub fn snippet_tokens(lists: &[&[ResultEvidence]]) -> usize {
+    lists
+        .iter()
+        .flat_map(|rows| rows.iter())
+        .map(|row| row.snippet.chars().count())
+        .sum::<usize>()
+        / 4
 }
 
 /// Per-query evaluation report: bounded evidence, reported search state,
@@ -314,9 +339,17 @@ pub struct QueryReport {
     /// Explicit per-query reason: why the query succeeded, failed, or was
     /// skipped.
     pub reason: String,
-    /// Bounded evidence for the returned results.
+    /// Bounded evidence for the returned results the query is scored on
+    /// (its lane: the code results by default, see [`EvalQuery::lane`]).
     #[serde(default)]
     pub evidence: Vec<ResultEvidence>,
+    /// Bounded evidence for the other list of the search (the `docs` of a
+    /// code-lane query, the code results of a docs-lane query). It is not
+    /// scored; it is here so [`QueryMetrics::returned_tokens`] counts both
+    /// lists. Empty, and absent from the JSON, when the search had no such
+    /// list or the query is scored on both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unscored_evidence: Vec<ResultEvidence>,
     /// Whether the search report indicated reranking was applied.
     pub reranked: bool,
     /// Warning carried by the search report, if any (e.g. a degraded
@@ -354,9 +387,10 @@ pub struct QueryReport {
     /// The search report's informational notes, for example "LSP still
     /// starting or slow" when the language-server channel hit its budget and
     /// contributed nothing or less than usual. A replay can use them to
-    /// exclude or stratify such queries. Never a fallback. Only
-    /// `evaluate --dump-candidates` fills it, together with `arm`; it is
-    /// empty, and absent from the JSON, otherwise.
+    /// exclude or stratify such queries. Never a fallback. A dump
+    /// (`evaluate --dump-candidates`) fills it together with `arm`; a query
+    /// scored on the docs list adds a note when `[docs_lane].top_k` bounded
+    /// that list. Empty, and absent from the JSON, otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     /// Set by `replay` on a query it refused to score (see
@@ -391,6 +425,7 @@ impl QueryReport {
             outcome,
             reason,
             evidence,
+            unscored_evidence: Vec::new(),
             reranked,
             warning,
             filters,
@@ -406,6 +441,14 @@ impl QueryReport {
         }
     }
 
+    /// Records the search's other list (see [`Self::unscored_evidence`]) and
+    /// counts it in [`QueryMetrics::returned_tokens`]. Scoring is untouched.
+    pub fn with_unscored_evidence(mut self, rows: Vec<ResultEvidence>) -> Self {
+        self.metrics.returned_tokens = Some(snippet_tokens(&[&self.evidence, &rows]));
+        self.unscored_evidence = rows;
+        self
+    }
+
     /// A report for a query skipped because its optional workspace was
     /// missing. Skipped reports carry no evidence and zero metrics, and
     /// are excluded from aggregate denominators.
@@ -416,6 +459,7 @@ impl QueryReport {
             outcome: "skipped".to_owned(),
             reason,
             evidence: Vec::new(),
+            unscored_evidence: Vec::new(),
             reranked: false,
             warning: None,
             filters: None,
@@ -443,6 +487,7 @@ impl QueryReport {
                 recall_at_8: 0.0,
                 file_acc_at_5: 0.0,
                 file_acc_at_10: 0.0,
+                returned_tokens: None,
             },
             candidates: Vec::new(),
             arm: None,
@@ -558,6 +603,10 @@ pub struct AggregateReport {
     /// Mean [`QueryMetrics::file_acc_at_10`] over evaluated queries.
     #[serde(default)]
     pub mean_file_acc_at_10: Option<f64>,
+    /// Mean [`QueryMetrics::returned_tokens`] over evaluated queries that have
+    /// one (a report written before the field has none); `None` when none do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_returned_tokens: Option<f64>,
     /// Median total latency in milliseconds over evaluated queries with
     /// timings; `None` when there are no samples.
     pub median_latency_ms: Option<f64>,

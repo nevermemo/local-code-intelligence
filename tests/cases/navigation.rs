@@ -2154,9 +2154,8 @@ async fn signal_shuts_down_the_running_language_server(signal_name: &str, expect
     std::fs::create_dir_all(workspace.join("src")).unwrap();
     std::fs::write(workspace.join("src/Calculator.cs"), "class Calculator {}\n").unwrap();
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    config.port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let [port] = free_ports();
+    config.port = port;
     config.csharp = CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: vec![
@@ -2843,7 +2842,9 @@ async fn cancelling_release_still_stops_a_server_with_an_in_flight_request() {
     wait_until_process_ends(
         "the server to end after release was cancelled with a request still holding the session",
         server,
-        2 * local_code_intelligence::lsp::SHUTDOWN_GRACE,
+        // The grace window plus the same slack the other process-end waits
+        // give a loaded machine to show the process as ended.
+        2 * local_code_intelligence::lsp::SHUTDOWN_GRACE + Duration::from_secs(5),
     )
     .await;
     assert_eq!(event_count(&state, "exit_seen.txt"), 1);

@@ -23,6 +23,14 @@
 //!   symbol names (map `seeds.scip_names`). Used only when the caller asked
 //!   for that map alone, or as the visible fallback when the hybrid search is
 //!   unavailable or finds nothing; the response says why (`seed_fallback`).
+//! * `traits`, `traits+hybrid`, `traits+name_tokens`: with `scip.implements`
+//!   on, a trait path or `Trait::method` path in a code span of the question
+//!   names trait or trait-method nodes, which the walk expands to the
+//!   implementing types and members ([`TraitSeedMode`] says whether they
+//!   replace the other sources' start nodes or go before them). The response
+//!   then carries `trait_seeds`, how many start nodes they are (0 when none
+//!   is named), and each of them a `seed_hits` record with `how` `trait` or
+//!   `trait_method`.
 //!
 //! The mode reads the SCIP index and, for `hybrid`, runs the search over the
 //! workspace's index (which `search_code` also creates when it is missing).
@@ -106,8 +114,9 @@ use response::{
     add_commits, add_first_stage_only, add_policy, add_sites, chunk_lines, lint_steer,
     no_seeds_response, response_json,
 };
+pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
-use seeds::{SeedMap, Seeds, find_seeds};
+use seeds::{SeedMap, Seeds, add_trait_seed_count, add_trait_seeds, find_seeds};
 
 /// The map that finds the start nodes from the question's words (the
 /// stand-in, `seed_source` `name_tokens`).
@@ -456,6 +465,18 @@ fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
 /// unknown handle, a missing index) or the data directory not being writable
 /// for a handle; a failed trace write is a note, not an error.
 pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Result<Report> {
+    run_with_trait_seeds(limits, dirs, call, TraitSeedMode::Auto).await
+}
+
+/// [`run`] with the mode in which the traits and trait methods the question
+/// names join the start nodes (only with `scip.implements` on; see
+/// [`TraitSeedMode`]).
+pub async fn run_with_trait_seeds(
+    limits: &TraverseConfig,
+    dirs: &Dirs,
+    call: &Call<'_>,
+    trait_seed_mode: TraitSeedMode,
+) -> Result<Report> {
     if call.top_k == 0 || call.top_k > MAX_TOP_K {
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
@@ -855,6 +876,12 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                         Arc::new(ImplementsMap::empty(ImplementsOptions::default()))
                     }
                 };
+                if snapshot.is_none()
+                    && let Some(note) =
+                        add_trait_seeds(&mut found, &map, call.question, trait_seed_mode)
+                {
+                    notes.push(note);
+                }
                 implements = Some(map.clone());
                 register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
             }
@@ -1032,6 +1059,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
                 let mut response = no_seeds_response(call, &found, notes);
                 add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, warnings);
+                add_trait_seed_count(&mut response, &found);
                 return Ok(Report {
                     response,
                     trace: None,
@@ -1174,6 +1202,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
         object.insert("exact".into(), json!(exact_report));
     }
     add_policy(&mut response, effective, warnings);
+    add_trait_seed_count(&mut response, &found);
     add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
     if let Some(history) = &git_history {
         add_commits(&mut response, history);

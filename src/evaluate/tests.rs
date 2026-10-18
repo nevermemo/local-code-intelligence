@@ -3262,3 +3262,140 @@ fn replay_breaks_reranker_ties_by_position_in_the_replayed_window() {
         Some(1)
     );
 }
+
+#[test]
+fn a_query_lane_comes_from_its_tags_with_code_as_the_default() {
+    use lci_core::evaluation::EvalLane;
+
+    let tagged = |tags: &[&str]| compare_query("ws", "q", tags).lane();
+    assert_eq!(tagged(&[]), EvalLane::Code);
+    assert_eq!(tagged(&["impact", "where-to"]), EvalLane::Code);
+    assert_eq!(tagged(&["lane:docs"]), EvalLane::Docs);
+    assert_eq!(tagged(&["lane:union"]), EvalLane::Union);
+    // The docs tag wins over the union tag.
+    assert_eq!(tagged(&["lane:union", "lane:docs"]), EvalLane::Docs);
+}
+
+#[test]
+fn returned_tokens_count_the_snippets_of_the_scored_and_the_unscored_list() {
+    let code = vec![evidence_row(1, "src/a.rs", "source", &"a".repeat(40), None)];
+    let docs = vec![evidence_row(
+        1,
+        "README.md",
+        "documentation",
+        &"b".repeat(84),
+        None,
+    )];
+    let plain = QueryReport::new(
+        query_with(&["src/a.rs"]),
+        code.clone(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(plain.metrics.returned_tokens, Some(10));
+    assert!(plain.unscored_evidence.is_empty());
+
+    let both = plain.clone().with_unscored_evidence(docs.clone());
+    // (40 + 84) / 4: the sum over both lists, then one division.
+    assert_eq!(both.metrics.returned_tokens, Some(31));
+    assert_eq!(both.unscored_evidence, docs);
+    // Scoring is untouched by the unscored list.
+    assert_eq!(both.metrics.hit, plain.metrics.hit);
+    assert_close(both.metrics.reciprocal_rank, plain.metrics.reciprocal_rank);
+
+    // A report without the list serializes as it always did.
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("unscored_evidence").is_none());
+    let skipped = QueryReport::skipped(query_with(&["src/a.rs"]), "optional".to_owned());
+    assert_eq!(skipped.metrics.returned_tokens, None);
+
+    let report = aggregate(&[plain, both, skipped]);
+    assert_close(report.mean_returned_tokens.expect("mean tokens"), 20.5);
+    assert_eq!(aggregate(&[]).mean_returned_tokens, None);
+
+    // An old report has no such fields and still reads.
+    let mut value = serde_json::to_value(&report).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("mean_returned_tokens");
+    for query in value["queries"].as_array_mut().unwrap() {
+        query["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("returned_tokens");
+    }
+    let old: AggregateReport = serde_json::from_value(value).unwrap();
+    assert_eq!(old.mean_returned_tokens, None);
+}
+
+#[test]
+fn compare_reports_the_returned_token_delta_of_the_pairs() {
+    let with_tokens = |text: &str, chars: usize| {
+        let mut report = rr_only(text, 1.0);
+        report.evidence = vec![evidence_row(
+            1,
+            "src/a.rs",
+            "source",
+            &"x".repeat(chars),
+            None,
+        )];
+        report.metrics.returned_tokens = None;
+        report
+    };
+    // The figure is derived from the evidence when a report predates it.
+    let baseline = vec![with_tokens("q1", 40), with_tokens("q2", 80)];
+    let mut candidate = vec![with_tokens("q1", 40), with_tokens("q2", 80)];
+    candidate[1].metrics.returned_tokens = Some(40);
+    let overall = default_compare(&baseline, &candidate).overall.unwrap();
+    assert_close(overall.returned_tokens.baseline_mean, 15.0);
+    assert_close(overall.returned_tokens.candidate_mean, 25.0);
+    assert_close(overall.returned_tokens.mean_delta, 10.0);
+    assert!(
+        default_compare(&baseline, &candidate)
+            .render_summary()
+            .contains("tokens")
+    );
+}
+
+#[test]
+fn replay_refuses_a_query_scored_on_the_docs_or_union_lane() {
+    let arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    let code = dumped_query(
+        "code query",
+        &["b.rs"],
+        &[A1, A20, B1],
+        &arm,
+        RerankOutcome::Scored,
+        500.0,
+    );
+    let tagged = |text: &str, tag: &str| {
+        let mut query = dumped_query(
+            text,
+            &["b.rs"],
+            &[A1, A20, B1],
+            &arm,
+            RerankOutcome::Scored,
+            500.0,
+        );
+        query.query.tags.push(tag.to_owned());
+        query
+    };
+    let source = dump_of(&[
+        code,
+        tagged("docs query", "lane:docs"),
+        tagged("union query", "lane:union"),
+    ]);
+    let out = replayed(&source, ReplayOptions::default());
+    assert_eq!(out.replay.queries.replayed, 1);
+    assert_eq!(out.replay.queries.refused, 2);
+    assert_eq!(
+        out.replay.refused,
+        BTreeMap::from([(ReplayRefusal::NonCodeLane, 2)])
+    );
+    assert_eq!(ReplayRefusal::NonCodeLane.as_str(), "non_code_lane");
+}

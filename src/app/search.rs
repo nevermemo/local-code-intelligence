@@ -48,6 +48,45 @@ pub struct SearchIndexLifecycle {
     pub wait_ms: f64,
 }
 
+/// Stage timings of the docs lane, in milliseconds. The lane shares the
+/// query embedding and the ripgrep pass with the code lane, so those are not
+/// repeated here; `total_ms` is the lane's own work (candidate fetch, fusion,
+/// reranking), not a wall clock of the search.
+#[derive(Debug, Default, Serialize)]
+pub struct DocsTimings {
+    pub lancedb_search_ms: f64,
+    pub lexical_search_ms: f64,
+    pub fusion_ms: f64,
+    pub reranking_ms: f64,
+    pub total_ms: f64,
+}
+
+/// The docs lane after fusion and before its reranker: the candidates in
+/// fused order, cut to `[docs_lane].rerank_candidate_count`.
+struct DocsPool {
+    hits: Vec<Hit>,
+    warning: Option<String>,
+    timings: DocsTimings,
+}
+
+/// The documentation lane of a search: prose chunks (Markdown) ranked on
+/// their own and returned beside the code `results`, so documentation can
+/// never displace code from the code list. See `[docs_lane]`.
+#[derive(Debug, Serialize)]
+pub struct DocsLane {
+    /// At most `docs_top_k` prose chunks, best first.
+    pub results: Vec<Hit>,
+    /// Documentation candidates kept after fusion (the docs reranker's
+    /// window).
+    pub candidate_count: usize,
+    /// Whether the docs reranker ordered `results`.
+    pub reranked: bool,
+    /// A docs-lane failure (its semantic fetch or its reranker). The lane
+    /// fails open: this never fails or warns the search itself.
+    pub warning: Option<String>,
+    pub timings: DocsTimings,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchReport {
     pub workspace: Workspace,
@@ -70,6 +109,15 @@ pub struct SearchReport {
     pub notes: Vec<String>,
     pub timings: Timings,
     pub results: Vec<Hit>,
+    /// The documentation lane. Present, and serialized, exactly when the
+    /// lane ran and the index holds documentation chunks that pass the
+    /// filters: the request named no `source_roles`, the index also holds
+    /// code that passes them, and `[docs_lane]` is on. Absent from every
+    /// other search's JSON, so a search without documentation answers as it
+    /// did before the lane existed. `results` never holds a prose chunk in
+    /// that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs: Option<DocsLane>,
     pub index: SearchIndexLifecycle,
     pub filters: EffectiveFilterReport,
     /// Every candidate of the post-filter fused pool, best first, with the
@@ -446,6 +494,44 @@ fn hit_matches(filters: &EffectiveFilter, hit: &Hit) -> bool {
     )
 }
 
+/// Whether `hit` is a chunk of a prose extractor (Markdown today; `.rst`,
+/// `.adoc`, `.txt` would join). The docs lane is split on the extractor, not on
+/// [`SourceRole::Documentation`]: a Rust file under `docs/` is documentation by
+/// role but code by extractor, and stays in the code list.
+pub(crate) fn is_prose_chunk(hit: &Hit) -> bool {
+    crate::language::is_prose_language(&hit.chunk.language)
+}
+
+/// The chunks of a search split into the code list and the prose (docs lane)
+/// list. The split happens only when the request names no `source_roles` and
+/// at least one code chunk passes the filters; otherwise everything stays in
+/// the first list and the second is empty, which is the search before the docs
+/// lane existed.
+pub(crate) fn split_prose(filters: &EffectiveFilter, chunks: Vec<Hit>) -> (Vec<Hit>, Vec<Hit>) {
+    if filters.source_roles.is_some() || chunks.iter().all(is_prose_chunk) {
+        return (chunks, Vec::new());
+    }
+    let (prose, code): (Vec<Hit>, Vec<Hit>) = chunks.into_iter().partition(is_prose_chunk);
+    (code, prose)
+}
+
+/// `filters` narrowed to the languages that occur in `chunks`: the filter one
+/// lane hands to the semantic search, so that the lane's candidates are
+/// exactly the nearest chunks of its own kind. Everything else (paths, roles)
+/// is as the request had it. A lane that took every chunk keeps `filters`.
+pub(crate) fn lane_filter(filters: &EffectiveFilter, chunks: &[Hit]) -> EffectiveFilter {
+    let mut languages: Vec<String> = chunks
+        .iter()
+        .map(|hit| hit.chunk.language.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    languages.sort();
+    let mut narrowed = filters.clone();
+    narrowed.languages = Some(languages);
+    narrowed
+}
+
 /// Demotes, without removing, the chunks of a file beyond its `max`-th in a
 /// fused order, so that distinct files fill the head of the list first.
 ///
@@ -712,6 +798,7 @@ impl App {
             notes: Vec::new(),
             timings: Timings::default(),
             results: vec![],
+            docs: None,
             index: SearchIndexLifecycle {
                 action: resolution.action,
                 wait_ms: resolution.wait_ms,
@@ -732,6 +819,20 @@ impl App {
             report.timings.total_ms = ms(total);
             return Ok(report);
         }
+        // The docs lane: with no `source_roles` filter and some code in
+        // play, the prose chunks leave the code list, which then ranks
+        // exactly as if they were not indexed (the code lane's candidate
+        // fetch, lexical statistics, and language-server mapping all see the
+        // code chunks alone). Otherwise `all_chunks` is the single list of
+        // old, and `doc_chunks` is empty.
+        let (all_chunks, doc_chunks) = split_prose(&filters, all_chunks);
+        let code_filters = if doc_chunks.is_empty() {
+            filters.clone()
+        } else {
+            lane_filter(&filters, &all_chunks)
+        };
+        let docs_active =
+            !doc_chunks.is_empty() && self.config.docs_lane.enabled && settings.docs_top_k > 0;
         // `[channels]` switches, as a search profile may override them. A
         // deliberately disabled channel is skipped outright: no work, a zero
         // timing, and no "unavailable" warning.
@@ -805,6 +906,8 @@ impl App {
                     .map_or(message.clone(), |w| format!("{w}; {message}")),
             );
         }
+        // The query vector, kept for the docs lane when it will run.
+        let mut docs_vector: Option<Vec<f32>> = None;
         let semantic = match query_result {
             // Disabled: the query was never embedded and the index is not
             // searched; both timings stay zero.
@@ -814,12 +917,15 @@ impl App {
                 let semantic_timer = Instant::now();
                 let hits = match query_vector {
                     Ok(vector) => {
-                        match Store::search(
+                        if docs_active {
+                            docs_vector = Some(vector.clone());
+                        }
+                        match Store::search_code_lane(
                             &snapshot,
                             &report.workspace,
                             &vector,
                             self.config.semantic_candidate_count,
-                            &filters,
+                            &code_filters,
                             all_chunks.len(),
                         )
                         .await
@@ -863,6 +969,8 @@ impl App {
             }
         };
         let mut lexical_hits = Vec::new();
+        // The ripgrep pass the docs lane maps onto its own chunks.
+        let mut docs_lexical: Option<lexical::LexicalSearch> = None;
         if let Some((lexical_matches, lexical_ms)) = lexical_result {
             report.timings.lexical_search_ms = lexical_ms;
             match lexical_matches {
@@ -875,6 +983,9 @@ impl App {
                                 .take()
                                 .map_or(message.clone(), |w| format!("{w}; {message}")),
                         );
+                    }
+                    if docs_active {
+                        docs_lexical = Some(lexical_search.clone());
                     }
                     lexical_hits = Self::map_lexical_matches(
                         &all_chunks,
@@ -895,6 +1006,24 @@ impl App {
         }
         let lsp_hits =
             Self::map_lsp_locations(&all_chunks, lsp_locations, self.config.lsp_candidate_count);
+        // The docs lane's candidates, fused on their own. Cheap, and made
+        // before the code lane can end the search so that a query only the
+        // documentation answers still gets its `docs`.
+        let docs_pool = if docs_active {
+            Some(
+                self.docs_pool(
+                    &snapshot,
+                    &report.workspace,
+                    &filters,
+                    &doc_chunks,
+                    docs_vector.as_deref(),
+                    docs_lexical,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         if semantic.is_empty() && lexical_hits.is_empty() && lsp_hits.is_empty() {
             // With the semantic channel off, an enabled lexical or LSP
             // channel that ran without failing and matched nothing is an
@@ -903,6 +1032,9 @@ impl App {
             // error. With the semantic channel on, an empty result means it
             // failed, because it nearly always returns candidates.
             if filtering_requested || (!channels.semantic && lexical_or_lsp_ran) {
+                if let Some(pool) = docs_pool {
+                    report.docs = Some(self.finish_docs(query, pool, settings).await);
+                }
                 report.timings.total_ms = ms(total);
                 return Ok(report);
             }
@@ -962,29 +1094,41 @@ impl App {
         }
         report.timings.fusion_ms = ms(fusion_timer) - trace_ms;
         report.candidate_count = hits.len();
-        if !hits.is_empty() {
-            if channels.reranker {
-                let timer = Instant::now();
-                let scores = self.rerank_into_report(query, hits, k, &mut report).await;
-                report.timings.reranking_ms = ms(timer);
-                if let Some(traced) = &mut traced {
-                    report.rerank_outcome = Some(match scores {
-                        Some(ranks) => {
-                            record_rerank_scores(traced, &ranks);
-                            RerankOutcome::Scored
-                        }
-                        None => RerankOutcome::Failed,
-                    });
-                }
-            } else {
-                // Deliberately disabled: fusion order, `reranked = false`, no
-                // request, no warning, and a zero reranking time.
-                report.results = hits.into_iter().take(k).collect();
-                if traced.is_some() {
-                    report.rerank_outcome = Some(RerankOutcome::Off);
+        // The docs lane's reranker call runs beside the code lane's; the
+        // two touch nothing in common.
+        let docs_future = async {
+            match docs_pool {
+                Some(pool) => Some(self.finish_docs(query, pool, settings).await),
+                None => None,
+            }
+        };
+        let code_future = async {
+            if !hits.is_empty() {
+                if channels.reranker {
+                    let timer = Instant::now();
+                    let scores = self.rerank_into_report(query, hits, k, &mut report).await;
+                    report.timings.reranking_ms = ms(timer);
+                    if let Some(traced) = &mut traced {
+                        report.rerank_outcome = Some(match scores {
+                            Some(ranks) => {
+                                record_rerank_scores(traced, &ranks);
+                                RerankOutcome::Scored
+                            }
+                            None => RerankOutcome::Failed,
+                        });
+                    }
+                } else {
+                    // Deliberately disabled: fusion order, `reranked = false`, no
+                    // request, no warning, and a zero reranking time.
+                    report.results = hits.into_iter().take(k).collect();
+                    if traced.is_some() {
+                        report.rerank_outcome = Some(RerankOutcome::Off);
+                    }
                 }
             }
-        }
+        };
+        let (docs, ()) = tokio::join!(docs_future, code_future);
+        report.docs = docs;
         report.candidates = traced;
         report.results.retain(|hit| hit_matches(&filters, hit));
         // Like `fusion_ms`, the total leaves out the trace recording, so the
@@ -1431,6 +1575,165 @@ impl App {
         fused.into_values().collect()
     }
 
+    /// The docs lane's candidates: the nearest prose chunks (the same query
+    /// vector, a prose-only filter, `[docs_lane].semantic_candidate_count`
+    /// deep) and the prose chunks the shared ripgrep pass hit, fused with the
+    /// code lane's weights, `rrf_k`, and per-file cap, cut to
+    /// `[docs_lane].rerank_candidate_count`. No language-server channel: a
+    /// prose chunk has no symbols. Never fails: a failure is the returned
+    /// pool's `warning`.
+    async fn docs_pool(
+        &self,
+        snapshot: &Snapshot,
+        workspace: &Workspace,
+        filters: &EffectiveFilter,
+        doc_chunks: &[Hit],
+        query_vector: Option<&[f32]>,
+        lexical_search: Option<lexical::LexicalSearch>,
+    ) -> DocsPool {
+        let started = Instant::now();
+        let docs_config = &self.config.docs_lane;
+        let mut warning: Option<String> = None;
+        let mut warn = |message: String| {
+            warning = Some(
+                warning
+                    .take()
+                    .map_or(message.clone(), |w| format!("{w}; {message}")),
+            );
+        };
+        let mut timings = DocsTimings::default();
+        let doc_filters = lane_filter(filters, doc_chunks);
+        let mut semantic = Vec::new();
+        if let Some(vector) = query_vector {
+            let timer = Instant::now();
+            match Store::search(
+                snapshot,
+                workspace,
+                vector,
+                docs_config.semantic_candidate_count,
+                &doc_filters,
+                doc_chunks.len(),
+            )
+            .await
+            {
+                Ok(found) => {
+                    if let Some(message) = found.cap_warning() {
+                        warn(format!("Docs lane: {message}"));
+                    }
+                    semantic = found.hits;
+                }
+                Err(error) => warn(format!("Docs semantic retrieval unavailable: {error:#}")),
+            }
+            timings.lancedb_search_ms = ms(timer);
+        }
+        let mut lexical_hits = Vec::new();
+        if let Some(search) = lexical_search {
+            let timer = Instant::now();
+            lexical_hits =
+                Self::map_lexical_matches(doc_chunks, search, self.config.lexical_candidate_count);
+            timings.lexical_search_ms = ms(timer);
+        }
+        let timer = Instant::now();
+        let mut hits = Self::fuse_hits(
+            self.config.rrf_k,
+            &self.config.fusion,
+            semantic,
+            lexical_hits,
+            Vec::new(),
+        );
+        hits.retain(|hit| hit_matches(filters, hit));
+        hits.sort_by(fusion_order);
+        let mut hits = cap_chunks_per_file(hits, self.config.fusion.max_chunks_per_file);
+        hits.truncate(docs_config.rerank_candidate_count);
+        timings.fusion_ms = ms(timer);
+        timings.total_ms = ms(started);
+        DocsPool {
+            hits,
+            warning,
+            timings,
+        }
+    }
+
+    /// Turns a docs pool into the report's [`DocsLane`]: the best
+    /// `docs_top_k` of the pool, ordered by the reranker when the settings
+    /// ask for it. Fail-open like every optional stage: a reranker that is
+    /// unreachable or answers malformed data leaves the fusion order and a
+    /// `warning` on the lane, nothing more.
+    async fn finish_docs(
+        &self,
+        query: &str,
+        pool: DocsPool,
+        settings: &SearchSettings,
+    ) -> DocsLane {
+        let started = Instant::now();
+        let DocsPool {
+            hits,
+            mut warning,
+            mut timings,
+        } = pool;
+        let k = settings.docs_top_k;
+        let candidate_count = hits.len();
+        let mut reranked = false;
+        let results = if hits.is_empty() || !settings.docs_reranker {
+            hits.into_iter().take(k).collect()
+        } else {
+            let max_bytes = self.config.rerank_document_max_bytes;
+            let documents: Vec<_> = hits
+                .iter()
+                .map(|hit| rerank_document(hit, max_bytes))
+                .collect();
+            let answer = self
+                .models
+                .rerank(query, &documents)
+                .await
+                .and_then(|ranks| {
+                    // The documents are the only valid indexes; a reranker
+                    // that names another one answered malformed data.
+                    ensure!(
+                        ranks.iter().all(|&(index, _)| index < hits.len()),
+                        "reranker returned an index outside the {} documents sent",
+                        hits.len()
+                    );
+                    Ok(ranks)
+                });
+            match answer {
+                Ok(ranks) => {
+                    reranked = true;
+                    ranks
+                        .iter()
+                        .take(k)
+                        .map(|&(index, score)| {
+                            let mut hit = hits[index].clone();
+                            hit.reranker_score = Some(score);
+                            hit
+                        })
+                        .collect()
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "docs reranker failed; returning fusion-ranked docs");
+                    let message = format!(
+                        "Docs reranker unavailable or invalid response; fusion-ranked docs returned: {error:#}"
+                    );
+                    warning = Some(
+                        warning
+                            .take()
+                            .map_or(message.clone(), |w| format!("{w}; {message}")),
+                    );
+                    hits.into_iter().take(k).collect()
+                }
+            }
+        };
+        timings.reranking_ms = ms(started);
+        timings.total_ms += timings.reranking_ms;
+        DocsLane {
+            results,
+            candidate_count,
+            reranked,
+            warning,
+            timings,
+        }
+    }
+
     /// Reranks fused candidates (with the reranking service, or the typed
     /// System One service when `rescorer = "system_one"`; one attempt per
     /// batch, no fallback from one to the other) and writes the outcome
@@ -1534,6 +1837,80 @@ mod tests {
     const RRF_K: f32 = 60.0;
 
     mod t0;
+
+    fn hit_of(path: &str, language: &str) -> Hit {
+        let role = if language == "markdown" {
+            SourceRole::Documentation
+        } else {
+            SourceRole::Source
+        };
+        let mut hit = hit(path, 1, role);
+        hit.chunk.language = language.to_owned();
+        hit
+    }
+
+    #[test]
+    fn prose_chunks_are_split_off_unless_the_request_names_source_roles() {
+        use crate::filter::{EffectiveFilter, FilterRequest};
+
+        let mixed = || {
+            vec![
+                hit_of("src/a.rs", "rust"),
+                hit_of("README.md", "markdown"),
+                hit_of("src/b.py", "python"),
+            ]
+        };
+        let paths = |hits: &[Hit]| -> Vec<String> {
+            hits.iter()
+                .map(|hit| hit.chunk.relative_file_path.clone())
+                .collect()
+        };
+
+        let open = EffectiveFilter::from_request(&FilterRequest::default()).unwrap();
+        let (code, prose) = super::split_prose(&open, mixed());
+        assert_eq!(paths(&code), ["src/a.rs", "src/b.py"]);
+        assert_eq!(paths(&prose), ["README.md"]);
+
+        // An explicit role filter keeps one list, whatever it names.
+        let named = EffectiveFilter::from_request(&FilterRequest {
+            source_roles: Some(vec!["documentation".to_owned()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let (code, prose) = super::split_prose(&named, mixed());
+        assert_eq!(code.len(), 3);
+        assert!(prose.is_empty());
+
+        // Only prose passes the filters: nothing to protect, one list.
+        let (code, prose) = super::split_prose(&open, vec![hit_of("README.md", "markdown")]);
+        assert_eq!(paths(&code), ["README.md"]);
+        assert!(prose.is_empty());
+
+        // A Rust file under docs/ is documentation by role, code by extractor.
+        let mut rust_doc = hit_of("docs/example.rs", "rust");
+        rust_doc.source_role = SourceRole::Documentation;
+        let (code, prose) =
+            super::split_prose(&open, vec![rust_doc, hit_of("README.md", "markdown")]);
+        assert_eq!(paths(&code), ["docs/example.rs"]);
+        assert_eq!(paths(&prose), ["README.md"]);
+    }
+
+    #[test]
+    fn a_lane_filter_names_the_distinct_languages_of_its_chunks() {
+        use crate::filter::{EffectiveFilter, FilterRequest};
+
+        let open = EffectiveFilter::from_request(&FilterRequest::default()).unwrap();
+        let chunks = vec![
+            hit_of("a.rs", "rust"),
+            hit_of("b.py", "python"),
+            hit_of("c.rs", "rust"),
+        ];
+        let narrowed = super::lane_filter(&open, &chunks);
+        assert_eq!(
+            narrowed.languages,
+            Some(vec!["python".to_owned(), "rust".to_owned()])
+        );
+    }
 
     thread_local! {
         pub(super) static LEXICAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
