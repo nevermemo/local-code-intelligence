@@ -1216,9 +1216,17 @@ fn compare_with(
         runners.extend(a.xtask_hash().map(str::to_owned));
     }
     for (label, r) in context.unwrap_or_default() {
-        let mut under_label = pairs.iter().filter(|(l, _, _)| l == label).peekable();
+        // A label pools one pair per stratum; a context run is shown beside
+        // the pair of its own stratum, whose gold it scored against.
+        let mut under_label = pairs
+            .iter()
+            .filter(|(l, a, _)| l == label && a.stratum == r.stratum)
+            .peekable();
         if under_label.peek().is_none() {
-            bail!("{label}: a context run has no pair under that label");
+            bail!(
+                "{label}: a context run of stratum {} has no pair of that stratum under that label",
+                r.stratum
+            );
         }
         for (_, a, _) in under_label {
             check_context(label, r, a)?;
@@ -2452,7 +2460,59 @@ mod tests {
         let err = compared(r_run("r", "random"), "random")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no pair under that label"), "{err}");
+        assert!(err.contains("no pair of that stratum"), "{err}");
+    }
+
+    #[test]
+    fn a_context_run_is_checked_against_the_pair_of_its_stratum() {
+        // The run: one pair per stratum under each label, the two strata
+        // scored against different gold, and an R run beside each pair.
+        let rows = world(4, 6);
+        let of = |stratum: &str| -> Vec<ScoreRow> {
+            rows.iter()
+                .filter(|r| r.stratum == stratum)
+                .cloned()
+                .collect()
+        };
+        let in_stratum = |mut run: Run, stratum: &str| {
+            run.dir = format!("{}-{stratum}", run.dir);
+            run.stratum = stratum.to_owned();
+            if stratum == "dependency" {
+                run.meta["gold_sha256"] = json!({"lci": "d1", "vite": "d2"});
+            }
+            run
+        };
+        let mut pairs = Vec::new();
+        let mut context = Vec::new();
+        for policy in ["greedy", "bfs"] {
+            for stratum in ["config", "dependency"] {
+                let (label, a, b) = pair(policy, &of(stratum), &of(stratum));
+                pairs.push((label, in_stratum(a, stratum), in_stratum(b, stratum)));
+                let r = run_of("r", "rg", policy, of(stratum));
+                context.push((policy.to_owned(), in_stratum(r, stratum)));
+            }
+        }
+        compare_with(&pairs, Some(&context), "heldout", 1, 50).unwrap();
+        // Each R run still meets the gold check against its own pair.
+        let mut edited = context.clone();
+        edited[1].1.meta["gold_sha256"]["lci"] = json!("edited");
+        let err = compare_with(&pairs, Some(&edited), "heldout", 1, 50)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("different gold") && err.contains("lci"),
+            "{err}"
+        );
+        // A context run of a stratum the label has no pair of is refused.
+        let config_only: Vec<_> = pairs
+            .iter()
+            .filter(|(_, a, _)| a.stratum == "config")
+            .cloned()
+            .collect();
+        let err = compare_with(&config_only, Some(&context), "heldout", 1, 50)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no pair of that stratum"), "{err}");
     }
 
     #[test]
