@@ -1,5 +1,29 @@
 [
   {
+    "relative_file_path": "docs/guide.md",
+    "language": "markdown",
+    "start_line": 1,
+    "end_line": 2,
+    "code": "# Guide\nHow to use the tool.",
+    "content_hash": "89a596171e745f49a5c9004d19e3933827290e34aa2c18ef902642f969c5f445"
+  },
+  {
+    "relative_file_path": "docs/guide.md",
+    "language": "markdown",
+    "start_line": 4,
+    "end_line": 8,
+    "code": "## Install\n```sh\n# not a heading\ncargo install lci\n```",
+    "content_hash": "6ed77fb54edb7ef42c8a5b7f07a5f428b6cdcf458f00bea7c04725f3e90f3117"
+  },
+  {
+    "relative_file_path": "docs/guide.md",
+    "language": "markdown",
+    "start_line": 10,
+    "end_line": 11,
+    "code": "## Usage\nRun `lci search`.",
+    "content_hash": "941adf1bf81283dd56356d5e547ce4035c0172806c34ec681f3aa88e6cad8af4"
+  },
+  {
     "relative_file_path": "native/math.c",
     "language": "c",
     "start_line": 1,

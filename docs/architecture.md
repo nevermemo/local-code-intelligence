@@ -27,7 +27,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 | Module | Crate | Role |
 | --- | --- | --- |
 | `app` | root | `App` is the public facade: coordinates indexing, retrieval, navigation, watching and readiness. Children: `indexing`, `search`, `navigation`, `readiness`, `compact`, `traverse`, `recipes` (see `src/app/AGENTS.md`) |
-| `chunk`, `language` | core | `chunk` scans supported source into Tree-sitter chunks; `language` is the registry of language adapters and their cache versions |
+| `chunk`, `language` | core | `chunk` scans supported files into chunks (Tree-sitter for code, a heading splitter for Markdown); `language` is the registry of language adapters and their cache versions |
 | `store` | root | Embedded LanceDB persistence; the only LanceDB and Arrow code |
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
 | `lexical`, `lsp` | core | Independent, fail-open retrieval channels (ripgrep with BM25 scoring; language-server symbols) |
@@ -68,10 +68,10 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   source file, and a file's cached chunks are reused when `content_hash`, `language` and
   `adapter_version` all match; output is sorted by `(path, start_line)`. The staleness `fingerprint` is SHA-256 over
   `path\0content_hash\0language\0cache_version` of every source file; skipped files are left out.
-- Language registry (`language::ADAPTERS`): 17 extensions (rs, ts, tsx, js, jsx, py, cs, go, java, c, h, cpp, hpp, cc,
-  cxx, hh, hxx) and 11 identifiers (`h` maps to `c`; hpp, cc, cxx, hh and hxx map to `cpp`; the registry never inspects
+- Language registry (`language::ADAPTERS`): 18 extensions (rs, ts, tsx, js, jsx, py, cs, go, java, c, h, cpp, hpp, cc,
+  cxx, hh, hxx, md) and 12 identifiers (`h` maps to `c`; hpp, cc, cxx, hh and hxx map to `cpp`; the registry never inspects
   content to choose a language). Each adapter has its own `cache_version` (for example `rust-chunks-v4`); lookup is
-  `for_extension` and `for_path`. This table is the whole indexed set: Markdown, TOML, YAML, JSON, build files and agent instruction files have no chunks.
+  `for_extension` and `for_path`. This table is the whole indexable set; `.md` files are indexed only with `[index].prose = true`. Each adapter has an extractor kind: Tree-sitter (a grammar plus a syntax description) or prose (`.md`: `chunk::markdown`, a hand-written heading splitter, no grammar and no language server). RST, AsciiDoc, text, TOML, YAML, JSON, build files and agent instruction files have no chunks.
 - Chunk identity: no chunk-id column exists. Fusion keys a chunk by `(relative_file_path, start_line, content_hash)`;
   the vector cache by `content_hash`, or by `content_hash` plus path when the document template contains `{path}`
   (`vector_key`); the fused-order tie-break adds `end_line` (`fusion_order`: score, path, start, end, hash). An edit

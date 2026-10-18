@@ -271,6 +271,26 @@ lexical_weight = 1.0
 lsp_weight = 1.0
 max_chunks_per_file = 2
 
+# The documentation lane (runs only with [index] prose = true; Markdown is not
+# indexed by default). Markdown chunks never enter the code `results` list
+# (when no source_roles filter is given, that list is exactly what an index of
+# the same files without Markdown would return); they are searched on their own
+# and come back in a separate `docs` list of search_code, with a second rerank
+# only when reranker = true below (default off). The lane is fail-open: a failure there only sets
+# docs.warning and never touches the code list. top_k (0..=10) is the length of
+# the docs list; 0 leaves the lane off. rerank_candidate_count (1..=200) is the
+# docs shortlist. semantic_candidate_count is the semantic depth of the docs
+# lane. enabled = false drops the lane (Markdown is then absent from default
+# searches; name source_roles = ["documentation"] to search it). A search profile
+# may override docs_top_k and docs_reranker; [channels].reranker does not
+# affect the docs lane.
+[docs_lane]
+enabled = true
+top_k = 2
+rerank_candidate_count = 12
+semantic_candidate_count = 20
+reranker = false
+
 [index]
 # manual: never refresh automatically; call index_workspace explicitly.
 # on-search: refresh a stale snapshot on the first search that needs it (default for agents).
@@ -282,6 +302,13 @@ stale_check_interval_seconds = 10
 # How long a search waits for a concurrently running refresh job before
 # falling back to the previous snapshot.
 wait_for_existing_job_seconds = 120
+# Index prose files (.md). false (default): they are not indexed at all, so
+# the index and every search result are as before the Markdown adapter and the
+# [docs_lane] below never runs; true: they are indexed and the docs lane
+# applies. Opt-in because the default docs list cost +26-28% returned tokens on
+# the core set. Flipping it makes the snapshot stale; the next refresh adds or
+# drops exactly the .md files.
+prose = false
 
 # The graph-traversal mode of search_code (mode = "traverse"), off by default.
 # While enabled is false, search_code, its schema and the server instructions

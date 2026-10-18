@@ -4,7 +4,7 @@ A language-support claim requires evidence for the affected language:
 
 1. Exact extension discovery and correct rejection of lookalikes or unsupported case variants.
 2. `.gitignore`, nested ignore, hidden-file, symlink, and external-data boundaries through the shared scanner.
-3. Sensible Tree-sitter chunks with exact source and line ranges.
+3. Sensible chunks with exact source and line ranges (Tree-sitter for code; a prose adapter uses its own splitter, e.g. Markdown heading sections). Prose adapters skip item 14 (LSP), d375.
 4. Correct language and source-role metadata.
 5. Initial indexing with real document embeddings in live acceptance.
 6. A zero-work repeat with zero new embeddings.

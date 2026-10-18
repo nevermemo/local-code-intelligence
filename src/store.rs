@@ -376,11 +376,12 @@ impl Store {
     ///
     /// LanceDB cannot express every shared glob/role predicate, so rows are
     /// filtered here after a nearest-row fetch. The first fetch asks for
-    /// `min(limit * 4, 160)` rows. Only when the filter rejected one of them
-    /// and fewer than `min(limit, matching)` passed is the fetch repeated with
-    /// four times as many rows, up to [`MAX_FILTERED_SEMANTIC_ROWS`]; a search
-    /// whose filter rejects nothing (every unfiltered search) runs the first
-    /// fetch alone.
+    /// `min(limit * 4, 160)` rows. While fewer than `min(limit, matching)`
+    /// rows passed and the fetch returned all the rows it asked for, the fetch
+    /// is repeated with four times as many rows, up to
+    /// [`MAX_FILTERED_SEMANTIC_ROWS`]; a search that finds its hits in the
+    /// first fetch (every unfiltered search with `limit` of 40 or less, say)
+    /// runs that fetch alone.
     pub async fn search(
         snapshot: &Snapshot,
         workspace: &Workspace,
@@ -397,10 +398,38 @@ impl Store {
             filters,
             matching,
             MAX_FILTERED_SEMANTIC_ROWS,
+            false,
         )
         .await
     }
 
+    /// [`Self::search`] for the code lane of a mixed index: the rows `filters`
+    /// rejects because they are prose chunks do not count towards
+    /// [`MAX_FILTERED_SEMANTIC_ROWS`], so the search reaches the nearest code
+    /// chunks the way an index without the prose would, and a cap warning
+    /// names only rows a code-only index would also have had to read.
+    pub async fn search_code_lane(
+        snapshot: &Snapshot,
+        workspace: &Workspace,
+        vector: &[f32],
+        limit: usize,
+        filters: &EffectiveFilter,
+        matching: usize,
+    ) -> Result<SemanticHits> {
+        Self::search_within(
+            snapshot,
+            workspace,
+            vector,
+            limit,
+            filters,
+            matching,
+            MAX_FILTERED_SEMANTIC_ROWS,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn search_within(
         snapshot: &Snapshot,
         workspace: &Workspace,
@@ -409,6 +438,7 @@ impl Store {
         filters: &EffectiveFilter,
         matching: usize,
         max_rows: usize,
+        prose_exempt: bool,
     ) -> Result<SemanticHits> {
         ensure!(
             vector.len() == snapshot.dimension,
@@ -426,29 +456,36 @@ impl Store {
                 .await?
                 .try_collect::<Vec<_>>()
                 .await?;
-            let (hits, rows, rejected) = Self::filtered_hits(&batches, workspace, limit, filters)?;
+            let (hits, rows, prose_rejected) =
+                Self::filtered_hits(&batches, workspace, limit, filters)?;
             // `rows < fetch` means the table is exhausted: LanceDB scans every
             // row (no vector index is built), so a fetch returns fewer rows
             // only when there are no more. An approximate index would break
             // this and must revisit it.
-            if hits.len() >= limit.min(matching) || rejected == 0 || rows < fetch {
+            if hits.len() >= limit.min(matching) || rows < fetch {
                 return Ok(SemanticHits {
                     hits,
                     capped_at_rows: None,
                 });
             }
-            if fetch >= max_rows {
+            let allowed = if prose_exempt {
+                max_rows.saturating_add(prose_rejected)
+            } else {
+                max_rows
+            };
+            if fetch >= allowed {
                 return Ok(SemanticHits {
                     hits,
                     capped_at_rows: Some(fetch),
                 });
             }
-            fetch = fetch.saturating_mul(4).min(max_rows);
+            fetch = fetch.saturating_mul(4).min(allowed);
         }
     }
 
     /// The hits among `batches` (nearest first) that pass `filters`, at most
-    /// `limit`, with how many rows were read and how many the filter rejected.
+    /// `limit`, with how many rows were read and how many of the rejected rows
+    /// were prose chunks.
     fn filtered_hits(
         batches: &[RecordBatch],
         workspace: &Workspace,
@@ -456,7 +493,7 @@ impl Store {
         filters: &EffectiveFilter,
     ) -> Result<(Vec<Hit>, usize, usize)> {
         let mut hits = Vec::new();
-        let (mut rows, mut rejected) = (0, 0);
+        let (mut rows, mut prose_rejected) = (0, 0);
         for batch in batches {
             for i in 0..batch.num_rows() {
                 rows += 1;
@@ -467,7 +504,9 @@ impl Store {
                 let language = text("language")?;
                 let source_role = classify_source_role(&path);
                 if !filters.matches(&language, &path, source_role) {
-                    rejected += 1;
+                    if crate::language::is_prose_language(&language) {
+                        prose_rejected += 1;
+                    }
                     continue;
                 }
                 let distance = column::<Float32Array>(batch, "_distance")?.value(i);
@@ -496,11 +535,11 @@ impl Store {
                     source_role_prior: source_role_prior(source_role),
                 });
                 if hits.len() == limit {
-                    return Ok((hits, rows, rejected));
+                    return Ok((hits, rows, prose_rejected));
                 }
             }
         }
-        Ok((hits, rows, rejected))
+        Ok((hits, rows, prose_rejected))
     }
 
     /// The stored vector of the chunk of `path` with `content_hash` that
@@ -934,7 +973,12 @@ mod tests {
             .iter()
             .map(|(path, _)| Chunk {
                 relative_file_path: path.clone(),
-                language: "rust".into(),
+                language: if path.ends_with(".md") {
+                    "markdown"
+                } else {
+                    "rust"
+                }
+                .into(),
                 start_line: 1,
                 end_line: 1,
                 code: format!("fn in_{}() {{}}", path.replace(['/', '.'], "_")),
@@ -1021,10 +1065,18 @@ mod tests {
         let filter = include("wanted/**");
 
         // A cap of 640 rows: 160, then 640, and the one match lies beyond.
-        let capped =
-            Store::search_within(&snapshot, &workspace, &query, 40, &filter, usize::MAX, 640)
-                .await
-                .unwrap();
+        let capped = Store::search_within(
+            &snapshot,
+            &workspace,
+            &query,
+            40,
+            &filter,
+            usize::MAX,
+            640,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(capped.hits.is_empty());
         assert_eq!(capped.capped_at_rows, Some(640));
         assert_eq!(
@@ -1050,6 +1102,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_code_lane_does_not_count_rejected_prose_rows_towards_the_row_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
+        let workspace = workspace_at("/prose-heavy");
+        // 700 prose rows nearer to the query than the 50 code rows.
+        let mut rows: Vec<_> = (0..700)
+            .map(|i| (format!("docs/f{i}.md"), at_angle(i % 300)))
+            .collect();
+        rows.extend((0..50).map(|i| (format!("src/f{i}.rs"), at_angle(400 + i))));
+        commit_rows(&store, &workspace, &rows).await;
+        let snapshot = store.snapshot(&workspace).await.unwrap().unwrap();
+        let query = [1.0, 0.0, 0.0];
+        let code_only = EffectiveFilter::from_request(&crate::filter::FilterRequest {
+            languages: Some(vec!["rust".to_owned()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // The plain search stops at a 640-row cap before the first code row.
+        let plain = Store::search_within(
+            &snapshot, &workspace, &query, 40, &code_only, 50, 640, false,
+        )
+        .await
+        .unwrap();
+        assert!(plain.hits.is_empty());
+        assert_eq!(plain.capped_at_rows, Some(640));
+
+        // The code lane skips the prose it would not have had in a code-only
+        // index: all 40 code hits, and no cap warning.
+        let lane =
+            Store::search_within(&snapshot, &workspace, &query, 40, &code_only, 50, 640, true)
+                .await
+                .unwrap();
+        assert_eq!(lane.hits.len(), 40);
+        assert_eq!(lane.capped_at_rows, None);
+        assert!(lane.hits.iter().all(|hit| hit.chunk.language == "rust"));
+    }
+
+    #[tokio::test]
     async fn a_filtered_fetch_stops_once_every_matching_chunk_is_found() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(&temp.path().join("lancedb")).await.unwrap();
@@ -1067,21 +1158,30 @@ mod tests {
 
         // Knowing one chunk matches, the 640-row fetch that finds it ends the
         // search, though the 640-row cap was reached and 40 hits were asked.
-        let found = Store::search_within(&snapshot, &workspace, &query, 40, &filter, 1, 640)
+        let found = Store::search_within(&snapshot, &workspace, &query, 40, &filter, 1, 640, false)
             .await
             .unwrap();
         assert_eq!(found.hits.len(), 1);
         assert_eq!(found.capped_at_rows, None);
         // Without that count the same search reports the cap.
-        let unknown =
-            Store::search_within(&snapshot, &workspace, &query, 40, &filter, usize::MAX, 640)
-                .await
-                .unwrap();
+        let unknown = Store::search_within(
+            &snapshot,
+            &workspace,
+            &query,
+            40,
+            &filter,
+            usize::MAX,
+            640,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(unknown.hits.len(), 1);
         assert_eq!(unknown.capped_at_rows, Some(640));
     }
 
-    /// What `Store::search` returned before filtered fetches could widen:
+    /// What `Store::search` returned before filtered fetches could widen,
+    /// except that a `limit` above the 160-row first fetch is no longer short:
     /// one fetch of `min(limit * 4, 160)` nearest rows, the first `limit`
     /// kept, as (path, score, rank).
     async fn single_fetch_reference(
@@ -1095,7 +1195,7 @@ mod tests {
             .nearest_to(vector)
             .unwrap()
             .distance_type(DistanceType::Cosine)
-            .limit(limit.saturating_mul(4).min(160))
+            .limit(limit.saturating_mul(4).min(160).max(limit))
             .execute()
             .await
             .unwrap()
@@ -1144,7 +1244,7 @@ mod tests {
             .flat_map(|f| [[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 1.0, 0.0]].map(|q| (f, q)))
         {
             // 41 and above ask for fewer than 4 * limit rows; above 160 the
-            // single fetch returns fewer than `limit` hits.
+            // fetch widens until `limit` hits are found.
             for limit in [1, 10, 40, 41, 100, 160, 161, 200] {
                 let found =
                     Store::search(&snapshot, &workspace, &query, limit, unfiltered, rows.len())

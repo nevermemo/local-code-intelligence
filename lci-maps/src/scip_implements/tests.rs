@@ -45,8 +45,15 @@ impl SourceText for One {
 const SRC: &str = "pub trait Tr {\n    fn m(&self);\n}\npub struct A;\npub struct B;\nimpl Tr for A {\n    fn m(&self) {}\n}\nimpl Tr for B {\n    fn m(&self) {}\n}\nimpl Default for A {}\n";
 
 fn graph() -> ScipGraph {
+    ScipGraph::build(
+        &graph_documents(),
+        Some(&One(SRC.as_bytes().to_vec()) as &dyn SourceText),
+    )
+}
+
+fn graph_documents() -> Vec<RawDocument> {
     let default = "rust-analyzer cargo core 0.0 default/Default#";
-    let docs = vec![RawDocument {
+    vec![RawDocument {
         path: "a.rs".into(),
         occurrences: vec![
             def((0, 10, 0, 12), &sym("a/Tr#"), (0, 0, 2, 1)),
@@ -62,11 +69,7 @@ fn graph() -> ScipGraph {
             reference((11, 5, 11, 12), default),
             reference((11, 17, 11, 18), &sym("a/A#")),
         ],
-    }];
-    ScipGraph::build(
-        &docs,
-        Some(&One(SRC.as_bytes().to_vec()) as &dyn SourceText),
-    )
+    }]
 }
 
 fn id(name: &str, container: &[&str], kind: SymbolKind) -> NodeId {
@@ -299,4 +302,189 @@ fn without_source_the_map_has_no_edges() {
     let missing = DirSource("no-such-dir".into());
     let graph = ScipGraph::build(&docs, Some(&missing));
     assert_eq!(graph.report.impl_no_source, 1);
+}
+
+fn names(paths: &[&str]) -> Vec<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| path.split("::").map(str::to_owned).collect())
+        .collect()
+}
+
+fn found(map: &ImplementsMap, paths: &[&str]) -> Vec<(NodeId, bool)> {
+    found_max(map, paths, 6)
+}
+
+fn found_max(map: &ImplementsMap, paths: &[&str], max: usize) -> Vec<(NodeId, bool)> {
+    map.find(&names(paths), max)
+        .into_iter()
+        .map(|f| (f.target.node.clone(), f.exact))
+        .collect()
+}
+
+#[test]
+fn the_targets_are_the_traits_and_trait_methods_that_have_edges() {
+    let map = map(64);
+    let targets: Vec<_> = map
+        .targets()
+        .iter()
+        .map(|t| (t.node.clone(), t.kind))
+        .collect();
+    // `Default` has no id, the members and types are not targets.
+    assert_eq!(
+        targets,
+        vec![(tr(), TargetKind::Trait), (decl(), TargetKind::Method)]
+    );
+    assert!(
+        ImplementsMap::empty(ImplementsOptions::default())
+            .targets()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_trait_path_names_the_trait_and_a_trait_method_path_the_declaration() {
+    let map = map(64);
+    // The crate name, a module, or both qualify the trait.
+    for path in ["demo::Tr", "a::Tr", "demo::a::Tr"] {
+        assert_eq!(found(&map, &[path]), vec![(tr(), true)], "{path}");
+    }
+    // `Trait::method`, with the crate and module in front or not.
+    for path in ["Tr::m", "a::Tr::m", "demo::Tr::m"] {
+        assert_eq!(found(&map, &[path]), vec![(decl(), true)], "{path}");
+    }
+    // Both written: strict matches, in the order the question gave them.
+    assert_eq!(
+        found(&map, &["demo::Tr", "Tr::m"]),
+        vec![(tr(), true), (decl(), true)]
+    );
+}
+
+#[test]
+fn a_bare_word_or_a_path_of_another_name_names_nothing() {
+    let map = map(64);
+    // One segment is prose; a type, a member and an unknown trait are no target.
+    for path in ["Tr", "m", "demo::A", "demo::Default", "Tr::x"] {
+        assert!(found(&map, &[path]).is_empty(), "{path}");
+    }
+    // The qualifiers must come in the order of the symbol (out of order, the
+    // only trait of that name is still named, loosely).
+    assert_eq!(found(&map, &["a::demo::Tr"]), vec![(tr(), false)]);
+    assert!(map.find(&[], 6).is_empty());
+}
+
+#[test]
+fn a_re_exported_path_names_the_one_target_of_that_name_but_not_a_strict_match() {
+    let map = map(64);
+    // `other` is not on the symbol's path, and only one `Tr` has edges.
+    assert_eq!(found(&map, &["other::Tr"]), vec![(tr(), false)]);
+    // A strict match drops the loose one of the same name.
+    assert_eq!(found(&map, &["other::Tr", "demo::Tr"]), vec![(tr(), true)]);
+}
+
+#[test]
+fn a_method_path_needs_the_trait_that_declares_it() {
+    // `Other::m` has a `m`, but not under a trait named `Other`.
+    assert!(found(&map(64), &["Other::m"]).is_empty());
+}
+
+/// b.rs: a second trait `Tr` with method `m`, implemented by `C`.
+const SRC_B: &str =
+    "pub trait Tr {\n    fn m(&self);\n}\npub struct C;\nimpl Tr for C {\n    fn m(&self) {}\n}\n";
+
+struct Two;
+
+impl SourceText for Two {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        match path {
+            "a.rs" => Some(SRC.as_bytes().to_vec()),
+            "b.rs" => Some(SRC_B.as_bytes().to_vec()),
+            _ => None,
+        }
+    }
+}
+
+fn in_b(name: &str, container: &[&str], kind: SymbolKind) -> NodeId {
+    NodeId::Symbol(SymbolKey {
+        language: "rust".into(),
+        module_path: vec!["b".into()],
+        container: container.iter().map(|c| (*c).to_string()).collect(),
+        name: name.into(),
+        kind,
+        disambiguator: 0,
+    })
+}
+
+fn tr_b() -> NodeId {
+    in_b("Tr", &[], SymbolKind::Trait)
+}
+fn decl_b() -> NodeId {
+    in_b("m", &["Tr"], SymbolKind::Method)
+}
+
+/// Two traits named `Tr` (in modules `a` and `b` of crate `demo`).
+fn twin_map() -> ImplementsMap {
+    let mut docs = graph_documents();
+    docs.push(RawDocument {
+        path: "b.rs".into(),
+        occurrences: vec![
+            def((0, 10, 0, 12), &sym("b/Tr#"), (0, 0, 2, 1)),
+            def((1, 7, 1, 8), &sym("b/Tr#m()."), (1, 4, 1, 16)),
+            def((3, 11, 3, 12), &sym("b/C#"), (3, 0, 3, 13)),
+            reference((4, 5, 4, 7), &sym("b/Tr#")),
+            reference((4, 12, 4, 13), &sym("b/C#")),
+            def((5, 7, 5, 8), &sym("b/impl#[C][Tr]m()."), (5, 4, 5, 18)),
+        ],
+    });
+    let graph = ScipGraph::build(&docs, Some(&Two as &dyn SourceText));
+    let resolve_both = |symbol: &str| match symbol {
+        s if s == sym("b/Tr#") => Some(tr_b()),
+        s if s == sym("b/C#") => Some(in_b("C", &[], SymbolKind::Struct)),
+        s if s == sym("b/Tr#m().") => Some(decl_b()),
+        s if s == sym("b/impl#[C][Tr]m().") => Some(in_b("m", &["C"], SymbolKind::Method)),
+        other => resolve(other),
+    };
+    ImplementsMap::new(&graph, &resolve_both, ImplementsOptions { cap: 64 })
+}
+
+#[test]
+fn two_traits_of_one_name_are_told_apart_by_the_qualifiers_or_ranked() {
+    let map = twin_map();
+    // A qualifier that is on one path picks that trait, strictly.
+    assert_eq!(found(&map, &["b::Tr"]), vec![(tr_b(), true)]);
+    assert_eq!(found(&map, &["demo::a::Tr"]), vec![(tr(), true)]);
+    // `demo` is on both paths: both, strictly, in symbol order.
+    assert_eq!(
+        found(&map, &["demo::Tr"]),
+        vec![(tr(), true), (tr_b(), true)]
+    );
+    // No strict match: every trait of the name, loosely, the best score first
+    // (`a` is on the path of `a::Tr` only).
+    assert_eq!(
+        found(&map, &["x::a::Tr"]),
+        vec![(tr(), false), (tr_b(), false)]
+    );
+    assert_eq!(
+        found(&map, &["x::b::Tr"]),
+        vec![(tr_b(), false), (tr(), false)]
+    );
+    // The cap counts targets.
+    assert_eq!(found_max(&map, &["x::Tr"], 1).len(), 1);
+    assert_eq!(found_max(&map, &["x::Tr"], 6).len(), 2);
+}
+
+#[test]
+fn a_method_path_needs_only_the_trait_segment_and_ranks_the_rest() {
+    let map = twin_map();
+    // Unknown qualifiers in front of `Tr::m` do not matter (both methods).
+    assert_eq!(
+        found(&map, &["bevy::prelude::Tr::m"]),
+        vec![(decl(), true), (decl_b(), true)]
+    );
+    // A qualifier that is on one path keeps only that method.
+    assert_eq!(found(&map, &["b::Tr::m"]), vec![(decl_b(), true)]);
+    assert_eq!(found(&map, &["bevy::a::Tr::m"]), vec![(decl(), true)]);
+    assert_eq!(found_max(&map, &["Tr::m"], 1).len(), 1);
+    // The trait segment itself must match.
+    assert!(found(&map, &["b::Other::m"]).is_empty());
 }

@@ -105,7 +105,7 @@ it; it should be trivial from a code graph. Hypotheses to check: (1) no SCIP in 
 2); (2) the SCIP implementation relationship may not be ingested; (3) the LSP channel may not send `textDocument/implementation`; (4) Rust derive,
 blanket and macro impls. Baseline beyond grep: an LSP-MCP tool (rust-analyzer `textDocument/implementation`, Serena-like). Doc file types come in
 two parts: adapters for prose (.md .rst .adoc .txt) first; structured formats (.json .yaml .toml) start on the grep fallback with size and
-generated-file filters (lockfiles, fixtures). Today: 17 extensions, still no doc formats (README table).
+generated-file filters (lockfiles, fixtures). Today: 18 extensions, of which only `.md` is a doc format (README table).
 
 ## Set portfolio (2026-10-16)
 A premise check of the candidate sets, before further set work. Nothing frozen changed. The dated decisions are in

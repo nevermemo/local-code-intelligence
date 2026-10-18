@@ -7,7 +7,7 @@ async fn http_mcp_initialization_tools_and_health() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -124,7 +124,7 @@ async fn rest_surface_mirrors_the_mcp_tools() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -389,7 +389,7 @@ async fn non_mcp_routes_reject_dns_rebinding_hosts_and_foreign_origins() {
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = Arc::new(App::open(config).await.unwrap());
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -504,7 +504,7 @@ pub(super) async fn serve_on_loopback(
     tokio::task::JoinHandle<()>,
 ) {
     let token = tokio_util::sync::CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = loopback_tokio_listener();
     let bound_port = listener.local_addr().unwrap().port();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = local_code_intelligence::server::router(app, token.clone(), bound_port);
@@ -1378,6 +1378,118 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
     assert_eq!(rest["search_profile"], "compact");
     assert!(rest["timings"].is_object(), "{rest}");
     assert!(rest["results"][0]["fusion_score"].is_number(), "{rest}");
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn markdown_comes_back_in_a_docs_list_beside_the_results_in_the_full_and_compact_shapes() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("mcp-docs");
+    write_presentation_workspace(&workspace);
+    write(
+        &workspace,
+        "README.md",
+        "# Readme\nThe translator overview.\n\n## Layout\ntranslator translator in src.\n",
+    );
+    write(
+        &workspace,
+        "docs/guide.md",
+        "# Guide\nHow to run the translator.\n",
+    );
+    write(&workspace, "docs/more.md", "# More\nA translator note.\n");
+    let app = Arc::new(
+        App::open(presentation_config(config))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (default_session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let (compact_session, _) = mcp_initialize(&client, &base, "/mcp/compact").await;
+
+    // The full report: the old keys plus `docs`, no Markdown in `results`.
+    let full = mcp_search_everything(&client, &base, "/mcp", &default_session, &workspace).await;
+    let full = structured(&full);
+    assert_eq!(
+        object_keys(full),
+        [
+            "candidate_count",
+            "docs",
+            "filters",
+            "index",
+            "query",
+            "reranked",
+            "results",
+            "timings",
+            "warning",
+            "workspace"
+        ],
+        "{full}"
+    );
+    assert!(
+        full["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["language"] != "markdown")
+    );
+    assert_eq!(
+        object_keys(&full["docs"]),
+        [
+            "candidate_count",
+            "reranked",
+            "results",
+            "timings",
+            "warning"
+        ],
+        "{full}"
+    );
+    let docs = full["docs"]["results"].as_array().unwrap();
+    assert_eq!(docs.len(), 2);
+    assert!(docs.iter().all(|hit| hit["language"] == "markdown"));
+
+    // The compact shape lists the docs after the results.
+    let compact_response =
+        mcp_search_everything(&client, &base, "/mcp/compact", &compact_session, &workspace).await;
+    let compact = structured(&compact_response);
+    assert_eq!(
+        object_keys(compact),
+        [
+            "docs",
+            "filters",
+            "index",
+            "results",
+            "search_profile",
+            "workspace"
+        ],
+        "{compact}"
+    );
+    assert_key_order(
+        text_content(&compact_response),
+        &["workspace", "filters", "index", "results", "docs"],
+    );
+    let compact_docs = compact["docs"].as_array().unwrap();
+    assert_eq!(compact_docs.len(), 2);
+    for (compact_hit, full_hit) in compact_docs.iter().zip(docs) {
+        assert_eq!(
+            compact_hit["relative_file_path"],
+            full_hit["relative_file_path"]
+        );
+        assert_eq!(compact_hit["code"], full_hit["code"]);
+        assert_eq!(compact_hit["language"], "markdown");
+    }
+    assert!(
+        compact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["language"] != "markdown")
+    );
 
     token.cancel();
     server.abort();
@@ -2596,11 +2708,9 @@ async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     config.traverse.enabled = true;
     // A port nothing listens on: the embedder is unreachable.
-    let dead = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
-    config.embedding_url = format!("http://127.0.0.1:{dead}/v1");
+    // Held for the whole test, so no parallel test's listener can take it.
+    let dead = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", dead.port);
     config.embedding_timeout_seconds = 2;
     let workspace = temp.path().join("scip-down");
     write_hybrid_workspace(&workspace);
