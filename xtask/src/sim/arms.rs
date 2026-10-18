@@ -237,7 +237,13 @@ pub fn search_opening(question: &str, value: &Value) -> Opening {
     let mut output = String::new();
     let mut windows = Vec::new();
     let code = value["results"].as_array().into_iter().flatten();
-    let docs = value["docs"]["results"].as_array().into_iter().flatten();
+    // The full report keeps the lane under `docs.results`; the compact view
+    // (a search profile) makes `docs` the list itself.
+    let docs_list = match &value["docs"] {
+        Value::Array(list) => Some(list),
+        lane => lane["results"].as_array(),
+    };
+    let docs = docs_list.into_iter().flatten();
     for result in code.chain(docs) {
         let path = result["relative_file_path"]
             .as_str()
@@ -272,8 +278,19 @@ pub fn search_opening(question: &str, value: &Value) -> Opening {
         listed: Vec::new(),
         windows,
         reads: Vec::new(),
+        // A docs-lane failure fails open in `lci`: the code results stand, so it
+        // is a note on the item (`sim.json` `tool`, `meta.json`), not a skip.
+        info: docs_warning(value).map(|warning| json!({ "docs_warning": warning })),
         ..Opening::default()
     }
+}
+
+/// The docs lane's own failure, from the full report (`docs.warning`) or the
+/// compact view (`docs_warning`).
+fn docs_warning(value: &Value) -> Option<&str> {
+    value["docs"]["warning"]
+        .as_str()
+        .or_else(|| value["docs_warning"].as_str())
 }
 
 /// A2: one line per result; the sites (a result without one is only a line
@@ -408,6 +425,38 @@ mod tests {
     use super::stubs::*;
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn a_docs_lane_warning_is_a_note_on_the_opening_not_a_failure() {
+        let mut reply = search_reply(&[("src/a.rs", 1, 4, "fn a() {}")]);
+        assert_eq!(search_opening("q", &reply).info, None);
+        // The full report: `docs.warning`, the lane's own failure.
+        reply["docs"] = json!({ "results": [], "warning": "Docs reranker unavailable" });
+        let full = search_opening("q", &reply);
+        assert_eq!(
+            full.info,
+            Some(json!({ "docs_warning": "Docs reranker unavailable" }))
+        );
+        assert_eq!(full.windows.len(), 1);
+        // The compact view: `docs` is the list, `docs_warning` the failure.
+        let compact = json!({
+            "results": reply["results"],
+            "docs": [{ "relative_file_path": "docs/g.md", "start_line": 1, "end_line": 2, "code": "# g" }],
+            "docs_warning": "lane down",
+        });
+        let opening = search_opening("q", &compact);
+        assert_eq!(opening.info, Some(json!({ "docs_warning": "lane down" })));
+        assert_eq!(opening.windows.len(), 2);
+        let search = StubSearch {
+            reply: Ok(reply),
+            calls: Cell::new(0),
+        };
+        let opener = Opener::Search {
+            tool: &search,
+            settings: json!({}),
+        };
+        assert!(opener.open("t", "q").unwrap().is_some());
+    }
 
     #[test]
     fn a_search_reply_becomes_windows_over_the_snippet_spans() {

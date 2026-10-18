@@ -251,6 +251,19 @@ pub fn run(args: SimArgs) -> Result<()> {
             first.reason
         );
     }
+    let docs_warned = scored
+        .iter()
+        .filter(|(_, s)| {
+            s.tool
+                .as_ref()
+                .is_some_and(|t| t["docs_warning"].is_string())
+        })
+        .count();
+    if docs_warned > 0 {
+        eprintln!(
+            "warning: the docs lane failed on {docs_warned} items (see `docs_lane_warnings` in meta.json); they ran on their code results"
+        );
+    }
     if searcher.incomplete_scans > 0 {
         eprintln!(
             "warning: {} scans stopped on a deadline or byte cap; the run may not repeat",
@@ -260,18 +273,40 @@ pub fn run(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
+/// `path` with `.` and `..` applied by name only.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// `path` made absolute with symlinks and `.`/`..` resolved, also when its
 /// last components do not exist yet (the run dir is created later).
 fn resolve_path(path: &Path) -> Result<PathBuf> {
-    let mut existing =
+    let absolute =
         std::path::absolute(path).with_context(|| format!("make {} absolute", path.display()))?;
+    let existing_start = absolute.clone();
+    let mut existing = absolute;
     let mut tail = Vec::new();
     while !existing.exists() {
-        match existing.components().next_back() {
-            Some(last) => tail.push(last.as_os_str().to_owned()),
-            None => break,
+        let last = existing
+            .components()
+            .next_back()
+            .map(|c| c.as_os_str().to_owned());
+        if !existing.pop() {
+            // Not even the root exists (a drive that is not there): nothing
+            // to resolve, so the lexical form is the answer.
+            return Ok(lexical(&existing_start));
         }
-        existing.pop();
+        tail.extend(last);
     }
     let mut resolved = existing
         .canonicalize()
@@ -438,6 +473,14 @@ fn write_run(
         "skipped_lci_failures": skipped
             .iter()
             .map(|s| json!({ "id": s.id, "reason": s.reason }))
+            .collect::<Vec<_>>(),
+        // A1: the docs lane failed open; the item ran on its code results.
+        "docs_lane_warnings": scored
+            .iter()
+            .filter_map(|(_, score)| {
+                let warning = score.tool.as_ref()?["docs_warning"].as_str()?;
+                Some(json!({ "id": score.id, "warning": warning }))
+            })
             .collect::<Vec<_>>(),
         "deadline_stops": flags.iter().filter(|f| f.deadline).count(),
         "flagged_items": flags.iter().filter(|f| f.any()).count(),
@@ -968,13 +1011,14 @@ mod tests {
         // Two names per read: entry_x and first_target_fn come from x.rs,
         // entry_y and second_target_fn from y.rs. One batch for both reads
         // would cut the second file's names away.
-        let followed = |policy| -> Vec<String> {
+        let followed = |policy, opening: Option<&Opening>| -> Vec<String> {
             let config = SimConfig {
                 max_candidates: 2,
                 ..cfg(policy)
             };
-            let score = run_with(&dir, &config, &leaf_file());
-            score
+            let mut searcher = Searcher::new(&dir);
+            let trace = run_question(&mut searcher, &config, "quartz zephyr", None, opening);
+            ItemScore::from_trace("t", trace, &leaf_file())
                 .trace
                 .steps
                 .iter()
@@ -982,15 +1026,32 @@ mod tests {
                 .map(|s| s.arg.clone())
                 .collect()
         };
-        // Bfs: the first read's names first. Greedy: the newest read's first.
-        assert_eq!(
-            followed(Policy::Bfs),
-            ["first_target_fn", "second_target_fn"]
+        // A0: the chain's first reads in read order, whatever the policy.
+        for policy in [Policy::Bfs, Policy::Greedy] {
+            assert_eq!(
+                followed(policy, None),
+                ["first_target_fn", "second_target_fn"],
+                "{policy:?}"
+            );
+        }
+        // Behind an opening each arm follows its own evidence first, under
+        // both policies: A1's snippet of y.rs, or A2's site read of y.rs,
+        // comes before the chain's read of x.rs.
+        let a1 = search_opening(
+            "quartz zephyr",
+            &search_reply(&[("src/y.rs", 1, 4, "fn entry_y() {")]),
         );
-        assert_eq!(
-            followed(Policy::Greedy),
-            ["second_target_fn", "first_target_fn"]
-        );
+        let a2 = sites_opening(&[("src/y.rs", 1)]);
+        for opening in [&a1, &a2] {
+            for policy in [Policy::Bfs, Policy::Greedy] {
+                assert_eq!(
+                    followed(policy, Some(opening)),
+                    ["second_target_fn", "first_target_fn"],
+                    "{} {policy:?}",
+                    opening.kind
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1020,6 +1081,84 @@ mod tests {
         let respelled = tree.join("src").join("..");
         assert!(reject_run_dir_in_tree(&respelled, &inside).is_err());
         let _ = fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn a_path_whose_root_does_not_exist_resolves_without_hanging() {
+        // A drive that is not there (Windows), or a missing top-level dir.
+        let missing = if cfg!(windows) {
+            PathBuf::from(r"Q:\xtask-no-such-drive\out\..\run")
+        } else {
+            PathBuf::from("/xtask-no-such-top-level-dir/out/../run")
+        };
+        if cfg!(windows) && Path::new("Q:\\").exists() {
+            return; // that drive exists here
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let tree = fork_tree("missing-root");
+        let probe = missing.clone();
+        let probe_tree = tree.clone();
+        std::thread::spawn(move || {
+            let resolved = resolve_path(&probe).map(|p| p.to_string_lossy().into_owned());
+            let verdict = reject_run_dir_in_tree(&probe_tree, &probe).is_ok();
+            let _ = send.send((resolved, verdict));
+        });
+        let (resolved, outside_tree) = receive
+            .recv_timeout(Duration::from_secs(20))
+            .expect("resolve_path must return for a missing root");
+        let resolved = resolved.unwrap();
+        assert!(
+            resolved.ends_with("run") && !resolved.contains(".."),
+            "{resolved}"
+        );
+        assert!(outside_tree);
+        let _ = fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn a_docs_lane_warning_reaches_the_run_files_and_does_not_flag_the_item() {
+        let dir = fork_tree("docs-warning");
+        let outside = PathBuf::from(format!("{}-out", dir.display()));
+        let config = cfg(Policy::Greedy);
+        let items = [where_to_item("src/alpha_leaf.rs")];
+        let mut reply = search_reply(&[("src/a.rs", 1, 6, "// quartz zephyr entry")]);
+        reply["docs"] = json!({ "results": [], "warning": "Docs reranker unavailable" });
+        let search = StubSearch {
+            reply: Ok(reply),
+            calls: Cell::new(0),
+        };
+        let opener = Opener::Search {
+            tool: &search,
+            settings: json!({}),
+        };
+        let mut searcher = Searcher::new(&dir);
+        let (scored, skipped) = simulate(Set::WhereTo, &items, &mut searcher, &config, &opener);
+        let info = RunInfo {
+            set: Set::WhereTo,
+            arm: Arm::A1,
+            cfg: &config,
+            opener: &opener,
+            searcher: &searcher,
+        };
+        write_run(&outside, &info, &scored, &skipped).unwrap();
+        let read = |name: &str| -> Value {
+            serde_json::from_str(&fs::read_to_string(outside.join(name)).unwrap()).unwrap()
+        };
+        let meta = read("meta.json");
+        assert_eq!(
+            meta["docs_lane_warnings"],
+            json!([{ "id": "where-to-t1", "warning": "Docs reranker unavailable" }])
+        );
+        assert_eq!(meta["skipped_lci_failures"], json!([]));
+        assert_eq!(
+            read("sim.json")["items"][0]["tool"]["docs_warning"],
+            "Docs reranker unavailable"
+        );
+        let data = crate::maps::compare::load_run(&outside, None).unwrap();
+        assert_eq!(data.items["where-to-t1"]["lci_failure"], Some(0.0));
+        assert_eq!(data.flags["where-to-t1"], None);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1145,11 +1284,15 @@ mod tests {
         // 40 lines around line 1, cut to the 3-line file.
         let w = &steps[1].windows[0];
         assert_eq!((w.path.as_str(), w.start, w.end), ("src/alpha.rs", 1, 3));
-        // The opening's site read and the read of a.rs are batches of their
-        // own; greedy follows the newest read first: traverse, site read, 2
-        // probes, search, read a.rs (6), beta_branch (7, 8), deep_beta_leaf
-        // (9, 10), then deep_alpha_leaf from the site read (11, 12).
-        assert_eq!(a2.calls_to_gold, Some(12));
+        // The site read's batch is followed before the chain's read of a.rs:
+        // traverse (1), site read (2), 2 probes (3, 4), search (5), read a.rs
+        // (6); alpha_branch is covered by the site read and a.rs, so the next
+        // name is deep_alpha_leaf: grep (7), read (8). That is A0's 8 on this
+        // fixture (the A2 call and the site read replace A0's alpha_branch
+        // grep and read).
+        assert_eq!(a2.calls_to_gold, Some(8));
+        let a0 = run_with(&dir, &cfg(Policy::Greedy), &leaf_file());
+        assert!(a2.calls_to_gold <= a0.calls_to_gold);
         // The gold in the listed site's file is listed first and read second.
         let alpha = GoldTarget::new(Vec::new(), ["src/alpha.rs".to_owned()]);
         let score = run_after(&dir, &cfg(Policy::Greedy), &alpha, &a2_opening());

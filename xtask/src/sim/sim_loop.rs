@@ -284,9 +284,22 @@ impl Run<'_> {
             Err(Stop::NoMatch | Stop::NoTerms) if reads.iter().any(|r| !r.is_empty()) => {}
             Err(stop) => return Err(stop),
         }
+        // Each arm explores its own evidence first: the batches are in
+        // priority order (the opening, its site reads, then the chain's
+        // reads), and a name is kept by the first batch that has it. Greedy
+        // pushes to the front, so it pushes in reverse and the opening ends
+        // on top; bfs pushes in order. Either way the first read is the
+        // opening's, and the policies part ways only on later reads.
+        let mut batches: Vec<Vec<Candidate>> = reads
+            .into_iter()
+            .map(|names| self.batch(names, 1))
+            .collect();
+        if self.cfg.policy == Policy::Greedy {
+            batches.reverse();
+        }
         let mut frontier = Frontier::new(self.cfg.policy);
-        for names in reads {
-            frontier.push_batch(self.batch(names, 1));
+        for batch in batches {
+            frontier.push_batch(batch);
         }
 
         // Follow names until the budget or the frontier runs out.

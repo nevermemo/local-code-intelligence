@@ -17,7 +17,11 @@ Code: `xtask/src/sim/` (`terms`, `follow`, `sim_loop`, `arms`, `score`).
   so the span of each result counts as text read by that one call: it is a
   window for gold hits and `listed_at`, and its identifiers join the frontier.
   When the documentation lane ran, its prose snippets (`docs.results`) are
-  shown too, after the code results and each lane in its own ranking.
+  shown too, after the code results and each lane in its own ranking. A docs-lane
+  failure (`docs.warning`, or `docs_warning` in the compact view) fails open
+  in `lci` and does not skip the item: it is recorded as `tool.docs_warning` in
+  `sim.json` and under `docs_lane_warnings` in `meta.json`, with a warning on
+  stderr.
 - **A2, LCI multimap walk.** One `lci traverse --scip ...` call, built by
   `CliTraverser::command` (the call `maps bench` makes; `--maps` unset leaves
   the choice of maps to the CLI), then the A0 chain. The call prints one line
@@ -88,8 +92,8 @@ null when the trace is missing), its status and stop reason.
    `skip_names` and is not a stop word of `query_terms`. The names of one read
    are ranked rarest first (fewest files), ties in first-seen order, and
    `max_candidates` (30) applies to each read on its own: the opening call, each
-   site read and each of the first reads is a batch of its own, queued in read
-   order under the policy. Following
+   site read and each of the first reads is a batch of its own, queued in the
+   priority order of "Policies" below. Following
    a name costs two calls: a grep for it, then a read of its first occurrence
    in text not read yet. A name with no unread occurrence is skipped without a
    call. The rarity used for ranking is an uncharged lookup (it stands for the
@@ -105,6 +109,19 @@ in the frontier:
   is next (depth-first).
 - **bfs**: behind everything pending, so names are followed in the order they
   were found.
+
+The first batches (those of the first reads) are queued so that each arm
+explores its own evidence first, under both policies. Their priority order is
+the opening call's text (A1 snippets; A2 has none of its own), then the site
+reads (A2), then the chain's initial reads in read order. A name is kept by
+the first batch that holds it. Bfs pushes the batches in that order; greedy
+pushes them in reverse, so the opening's batch ends on top and pops first.
+Either way the first names followed are the opening's, then the site reads',
+then the chain's, and the policies part ways only on the batches of later
+(follow) reads. Without an opening (A0) the order is the chain's reads in read
+order. (An earlier version queued the batches in read order, which under
+greedy put the chain's reads on top of the opening's evidence and made A2 on
+the fork fixture need 12 calls to A0's 8.)
 
 ## Budgets and tokens
 
@@ -156,6 +173,13 @@ other non-walk arms, so `maps compare` pairs any two of them:
   outlive the recovery); `maps compare` reads them for its exclusions;
 - `score.json`, `meta.json`: the scorer's report; the arm, the opening's
   settings, `deadline_stops`, `flagged_items` and any skipped items.
+
+`maps compare` keys on the ids in `items.json`, which each run writes afresh,
+and reads `raw/<item>.json` only for those ids. A `raw/` file of an item that a
+rerun left out (a smaller `--limit`, a filtered set) into the same directory
+therefore survives on disk but is never read; only an item that is in the run
+and has no raw reply gets its file removed. Use a fresh `--wave` rather than
+a directory with older items in it.
 
 The scorer's own metrics are a by-product: the reading list is not an answer
 set, and impact and flow gold are declaration lines that a window start rarely
