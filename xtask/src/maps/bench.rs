@@ -1596,10 +1596,10 @@ pub fn item_precision_recall(
         Set::Traits => {
             if item["set"].as_str() == Some("Q2") {
                 // One gold location: recall is the hit in the first ten, and
-                // precision that hit over the answers read (at most ten).
-                let read = answers.len().min(10);
+                // precision that hit over the scorer's counted answers (at most ten).
+                let counted = m("counted@10");
                 let hit = m("hit@10");
-                (if read == 0 { 0.0 } else { hit / read as f64 }, hit)
+                (if counted == 0.0 { 0.0 } else { hit / counted }, hit)
             } else {
                 (m("set_precision"), m("set_recall"))
             }
@@ -2322,6 +2322,48 @@ mod tests {
         let members = adapt_traits(&json!({"set": "Q3"}), &nodes);
         assert_eq!(members.len(), 3);
         assert!(members.iter().all(|a| a["symbol"].is_string()));
+    }
+
+    #[test]
+    fn traits_q2_precision_uses_only_counted_answers_up_to_ten() {
+        let span =
+            |file: &str, a: u64, b: u64| json!({"file": file, "begin_line": a, "end_line": b});
+        let item = json!({
+            "id": "q2", "set": "Q2",
+            "trait_decl": span("tr.rs", 100, 140),
+            "neutral": [span("neutral.rs", 1, 5)],
+            "cfg_gated": [span("cfg.rs", 1, 5)],
+            "gold": [{"location": span("m.rs", 5, 5)}]
+        });
+        let ignored = vec![
+            json!({"path": "tr.rs", "line": 110}),
+            json!({"path": "neutral.rs", "line": 1}),
+            json!({"path": "cfg.rs", "line": 1}),
+        ];
+        let hit = json!({"path": "m.rs", "line": 5});
+        let mut answers = vec![ignored[0].clone(), hit];
+        for extra in [vec![], ignored.clone()] {
+            answers.extend(extra);
+            let metrics = item_metrics(Set::Traits, &item, &answers).unwrap();
+            assert_eq!(metrics["counted@10"], Some(1.0));
+            assert_eq!(
+                item_precision_recall(Set::Traits, &item, &answers, &metrics),
+                (1.0, 1.0)
+            );
+        }
+        answers.extend((1..=12).map(|line| json!({"path": "miss.rs", "line": line})));
+        let metrics = item_metrics(Set::Traits, &item, &answers).unwrap();
+        assert_eq!(metrics["counted@10"], Some(10.0));
+        assert_eq!(
+            item_precision_recall(Set::Traits, &item, &answers, &metrics),
+            (0.1, 1.0)
+        );
+        let metrics = item_metrics(Set::Traits, &item, &ignored).unwrap();
+        assert_eq!(metrics["counted@10"], Some(0.0));
+        assert_eq!(
+            item_precision_recall(Set::Traits, &item, &ignored, &metrics),
+            (0.0, 0.0)
+        );
     }
 
     #[test]

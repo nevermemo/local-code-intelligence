@@ -130,6 +130,8 @@ impl: the call site) for Q2 and Q3.
   `location` as the only credit span.
 - *Q2* "where is `Trait::m` implemented for `Type`": the rank of the first
   counted answer on the gold `location`: `hit@1`, `hit@10`, `mrr` (cut 10).
+  `counted@10` is the number of counted answers after exclusions, capped at ten;
+  bench precision divides `hit@10` by this count (zero when none are counted).
 - *Matching.* An answer is a located node (`path` and `line`); one without
   either is returned but matches nothing. Answers are distinct by path, line,
   `symbol` and `name`, so the nodes of one macro call site stay apart (put the
@@ -141,9 +143,11 @@ impl: the call site) for Q2 and Q3.
   trait's own declaration (the item's optional `trait_decl` span, which should
   cover its method declarations), on an optional `neutral` span, or on an
   optional `cfg_gated` span (an implementation the gold's build did not compile;
-  counted apart as `cfg_gated_answers`, mean per item). Gold wins where a span is
-  both. The report's `traits` block says how many items carry `trait_decl` and
-  `cfg_gated`: without them nothing is dropped, and the trait declaration card
+  counted apart as `cfg_gated_answers`, mean per item). Gold whose impl site or
+  any credit span overlaps a cfg-gated span is removed from k and the recall
+  denominator; answers on any of its spans are also dropped. Retained gold wins
+  over other ignored spans. The report's `traits` block says how many items carry
+  `trait_decl` and `cfg_gated`: without them nothing is dropped, and the trait declaration card
   counts as a miss. When no item has a `trait_decl`, the scorer warns once on
   stderr and the report has `warnings: ["no trait_decl spans: the trait
   declaration card counts as a miss"]`.
@@ -168,7 +172,11 @@ impl: the call site) for Q2 and Q3.
   functions and methods for Q2 and Q3, each with its node id as `symbol`; the
   trait declaration card is offered like any other and dropped by the scorer.
   The row shows `set_f1`, `recall_explicit`, `hit@10`, `mrr`.
-- *Q1 answer unit.* One answer per distinct impl or type. In a Q1 walk a method
+- *Q1 answer unit.* Producers must supply one answer per distinct impl or type.
+  The plain scorer receives path/line/symbol answers and cannot infer impls:
+  it only deduplicates identical answers, so distinct methods of one impl use
+  separate budget slots. Every producer must collapse these before scoring;
+  the bench adapter does this with `impl_unit`. In a Q1 walk a method
   (or other member) node counts as the impl that contains it: the adapter reads
   that impl from the container chain of the node id (`impl Tr for Foo` plus the
   module path; no span is needed) and collapses the duplicates before the

@@ -25,7 +25,8 @@
 //!   trait's own declaration (`trait_decl`, which also covers the declarations
 //!   of its methods) or on a `neutral` span; an answer on a `cfg_gated` span
 //!   (an implementation the gold's build did not compile; counted apart as
-//!   `cfg_gated_answers`). A span that is also gold counts as gold.
+//!   `cfg_gated_answers`). Gold overlapping cfg-gated spans is removed, along
+//!   with its answers. Retained gold wins over other ignored spans.
 //! * Per-kind view of the same matching: `recall_explicit`, `recall_blanket`,
 //!   `recall_macro`, `recall_derive` (defined where the item has gold of that
 //!   kind). Restricted views, each with its own k and with answers on the
@@ -157,7 +158,17 @@ fn context(item: &Value, template: Template, answers: &[Answer]) -> Context {
     let entries = entries_of(item, template);
     let mut ignore = spans_of(item, "neutral");
     ignore.extend(item.get("trait_decl").and_then(Span::from_value));
-    let cfg = spans_of(item, "cfg_gated");
+    let mut cfg = spans_of(item, "cfg_gated");
+    let (entries, gated): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|e| {
+        !e.site.iter().chain(&e.credit).any(|s| {
+            cfg.iter()
+                .any(|c| s.file == c.file && s.begin <= c.end && c.begin <= s.end)
+        })
+    });
+    for e in gated {
+        cfg.extend(e.site);
+        cfg.extend(e.credit);
+    }
     let mut seen = BTreeSet::new();
     let mut classified = Vec::new();
     for a in answers {
@@ -227,10 +238,13 @@ fn counted_answers<'a>(ctx: &'a Context, retained: &[bool]) -> Vec<&'a Ans> {
     ctx.answers
         .iter()
         .filter(|a| {
+            if a.cfg {
+                return false;
+            }
             if a.hits.iter().any(|e| retained[*e]) {
                 return true;
             }
-            a.hits.is_empty() && !a.ignored && !a.cfg
+            a.hits.is_empty() && !a.ignored
         })
         .collect()
 }
@@ -274,12 +288,14 @@ fn evaluate(ctx: &Context, retained: &[bool]) -> Outcome {
     }
 }
 
-fn q2_rank(ctx: &Context) -> Option<usize> {
+fn q2_rank_and_count(ctx: &Context) -> (Option<usize>, usize) {
     let all = vec![true; ctx.entries.len()];
-    counted_answers(ctx, &all)
+    let counted = counted_answers(ctx, &all);
+    let rank = counted
         .iter()
         .position(|a| !a.hits.is_empty())
-        .map(|i| i + 1)
+        .map(|i| i + 1);
+    (rank, counted.len().min(Q2_CUT))
 }
 
 fn set_metrics(ctx: &Context, metrics: &mut Vec<(&'static str, Option<f64>)>) {
@@ -318,6 +334,10 @@ fn set_metrics(ctx: &Context, metrics: &mut Vec<(&'static str, Option<f64>)>) {
     metrics.extend([("nodom_precision", p), ("nodom_recall", r), ("nodom_f1", f)]);
 }
 
+/// Q1 answers must already be one per impl or type. The bench adapter's
+/// `impl_unit` collapses members of an impl; other producers must do the same.
+/// Plain path/line/symbol answers do not identify their containing impl, so
+/// this scorer only deduplicates identical answers and does not collapse members.
 pub fn score_item(item: &Value, answers: &[Answer]) -> ItemScore {
     let template = Template::of(item);
     let ctx = context(item, template, answers);
@@ -327,7 +347,8 @@ pub fn score_item(item: &Value, answers: &[Answer]) -> ItemScore {
         str_of(item, "set").unwrap_or("unknown").to_string(),
     )];
     if template == Template::Q2 {
-        let rank = q2_rank(&ctx);
+        let (rank, counted) = q2_rank_and_count(&ctx);
+        metrics.push(("counted@10", Some(counted as f64)));
         metrics.push(("hit@1", Some(hit_at_k(rank, 1))));
         metrics.push(("hit@10", Some(hit_at_k(rank, Q2_CUT))));
         metrics.push(("mrr", Some(reciprocal_rank(rank, Q2_CUT))));
@@ -342,11 +363,7 @@ pub fn score_item(item: &Value, answers: &[Answer]) -> ItemScore {
     } else {
         set_metrics(&ctx, &mut metrics);
     }
-    let cfg = ctx
-        .answers
-        .iter()
-        .filter(|a| a.hits.is_empty() && a.cfg)
-        .count();
+    let cfg = ctx.answers.iter().filter(|a| a.cfg).count();
     metrics.push(("cfg_gated_answers", Some(cfg as f64)));
     ItemScore { metrics, dims }
 }
@@ -507,6 +524,26 @@ mod tests {
     }
 
     #[test]
+    fn plain_q1_counts_two_methods_of_one_impl_as_two_answers() {
+        let item = json!({"id": "q1", "set": "Q1", "gold": [
+            {"impl": span("a.rs", 1, 5)},
+            {"impl": span("b.rs", 1, 5)}
+        ]});
+        // Producers must collapse these members before scoring: k = 2 cuts B.
+        let s = score_item(
+            &item,
+            &[
+                at("a.rs", 2, "first"),
+                at("a.rs", 3, "second"),
+                ans("b.rs:1"),
+            ],
+        );
+        assert_eq!(m(&s, "set_precision"), 0.5);
+        assert_eq!(m(&s, "set_recall"), 0.5);
+        assert_eq!(m(&s, "set_f1"), 0.5);
+    }
+
+    #[test]
     fn q1_misses_lower_precision_and_the_budget_cuts_the_tail() {
         let item = q1();
         let s = score_item(&item, &[ans("a.rs:99"), ans("a.rs:11")]);
@@ -648,6 +685,49 @@ mod tests {
         let plain = score_item(&q1(), &[ans("linux.rs:9"), ans("a.rs:12")]);
         assert_eq!(m(&plain, "set_precision"), 0.5);
         assert_eq!(m(&plain, "cfg_gated_answers"), 0.0);
+    }
+
+    #[test]
+    fn cfg_gated_gold_and_all_its_answer_spans_leave_the_scored_set() {
+        for (template, files, credit) in [
+            ("Q1", ["b.rs", "t.rs"], "t.rs:1"),
+            ("Q3", ["b.rs", "member.rs"], "member.rs:1"),
+        ] {
+            for file in files {
+                let item = json!({
+                    "id": "cfg", "set": template,
+                    "cfg_gated": [span(file, 1, 5)],
+                    "dominant_site": span("elsewhere.rs", 1, 5),
+                    "gold": [
+                        {"impl": span("a.rs", 1, 5), "location": span("a.rs", 1, 5)},
+                        {"impl": span("b.rs", 1, 5), "type_decl": span("t.rs", 1, 5),
+                         "location": span("member.rs", 1, 5)}
+                    ]
+                });
+                // Q1 credits impl/type; Q3 credits location, but also checks the impl site.
+                for answers in [
+                    vec![ans("a.rs:1")],
+                    vec![ans("b.rs:1"), ans(credit), ans("a.rs:1")],
+                ] {
+                    let s = score_item(&item, &answers);
+                    for name in [
+                        "set_precision",
+                        "set_recall",
+                        "set_f1",
+                        "recall_explicit",
+                        "explicit_precision",
+                        "explicit_recall",
+                        "explicit_f1",
+                        "nodom_precision",
+                        "nodom_recall",
+                        "nodom_f1",
+                    ] {
+                        assert_eq!(m(&s, name), 1.0, "{template} {file} {name}");
+                    }
+                    assert_eq!(m(&s, "cfg_gated_answers"), (answers.len() - 1) as f64);
+                }
+            }
+        }
     }
 
     #[test]
