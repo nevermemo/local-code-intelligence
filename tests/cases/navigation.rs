@@ -1410,15 +1410,17 @@ async fn a_server_that_answers_with_a_malformed_error_is_replaced_once() {
 async fn a_discarded_server_is_asked_to_shut_down() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
-    config.lsp_timeout_seconds = 2;
-    // Every `workspace/symbol` after the priming one stalls for 2.8 s: past
-    // the 2 s timeout, so the call fails, yet inside the 2 s the discard's
+    // 4 s, not 2: the same bound covers writing `initialize` to a server that
+    // is still starting, which took over 2 s under a parallel build.
+    config.lsp_timeout_seconds = 4;
+    // Every `workspace/symbol` after the priming one stalls for 5.6 s: past
+    // the 4 s timeout, so the call fails, yet inside the 4 s the discard's
     // shutdown waits for an answer, so the stalled server wakes up, reads the
     // `shutdown` and `exit` queued behind its request, and ends.
     config
         .csharp
         .args
-        .extend(fake_args(&["--symbol-delay-ms", "2800"]));
+        .extend(fake_args(&["--symbol-delay-ms", "5600"]));
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
@@ -1437,7 +1439,7 @@ async fn a_discarded_server_is_asked_to_shut_down() {
     );
     wait_until(
         "the discarded server to be shut down",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         async || {
             event_count(&state, "shutdown_seen.txt") >= 1
                 && event_count(&state, "exit_seen.txt") >= 1

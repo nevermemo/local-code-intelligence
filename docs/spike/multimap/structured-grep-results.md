@@ -73,9 +73,11 @@ run, so a C6 result can be read against it.
 
 ## 2. Held-out result
 
-Every arm ran on the frozen runner with the frozen gold, with no incomplete scan; `compare` on the A/B pairs
-(both strata pooled under each policy label) gives the verdict. R is context only and is added below once its
-lanes finish.
+Every A and B arm ran on the frozen runner with the frozen gold, with no incomplete scan; `compare` on the A/B
+pairs (both strata pooled under each policy label) gives the verdict. R is context only: its dependency lanes
+finished, and its config lanes were stopped unfinished (18 to 36 minutes a question on Home Assistant,
+where one rg call takes about 8 s), so R context covers the dependency stratum only. Adding it
+leaves every verdict line unchanged.
 
 **Verdict: the rule is not met. Condition 5 fails, so the patch (2b, lockfiles skipped by default) is dropped and
 item 2 is recorded as unfinished** (prereg section 7). No threshold was retuned.
@@ -96,6 +98,12 @@ Token intervals are of the mean paired delta B - A per question (10,000 family r
 stratum neither branch of C5 can hold: B saves 3.1% under greedy and costs 2.3% under breadth-first, both
 intervals include zero, and both arms complete none of the 12 questions, so the success branch has nothing to
 gain from.
+
+R context on the dependency stratum (n 12, means per question): greedy A 13,111 tokens, B 12,704, R 12,503, with
+complete success 0 of 12 in all three; breadth-first A 14,695, B 15,031, R 14,629, with R completing 1 of 12 (A and
+B none). Calls and pops are within one of each other across the three arms. Plain rg sits with A and B: neither
+the lockfile skip nor swapping the scanner for rg changes what the simulated agent spends on this stratum by more
+than a few percent.
 
 ### Sanity check: why B saved no tokens
 
