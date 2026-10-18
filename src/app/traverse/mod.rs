@@ -848,6 +848,7 @@ pub async fn run_with_trait_seeds(
         }
     }
     let mut implements = None;
+    let mut site_impact = None;
     if wants(SCIP_IMPLEMENTS_ID) {
         match call.scip_root {
             None => notes.push("scip.implements needs the tree: give --root".to_owned()),
@@ -869,6 +870,18 @@ pub async fn run_with_trait_seeds(
                             stats.dropped,
                             map.options().cap
                         ));
+                        // The types and traits it reaches are `scip.impact`
+                        // nodes, and only that map locates them; it is built
+                        // already (cached by the stamp), so sites come
+                        // without walking its edges.
+                        if impact.is_none() {
+                            match impact_map(call.scip_index, root, &loaded).await {
+                                Ok(sites) => site_impact = Some(sites),
+                                Err(error) => notes.push(format!(
+                                    "scip.implements: its types and traits have no site: {error:#}"
+                                )),
+                            }
+                        }
                         map
                     }
                     Err(error) => {
@@ -1203,7 +1216,12 @@ pub async fn run_with_trait_seeds(
     }
     add_policy(&mut response, effective, warnings);
     add_trait_seed_count(&mut response, &found);
-    add_sites(&mut response, &loaded, impact.as_deref(), &found.details);
+    add_sites(
+        &mut response,
+        &loaded,
+        impact.as_deref().or(site_impact.as_deref()),
+        &found.details,
+    );
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
     }
