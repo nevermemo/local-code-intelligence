@@ -5,7 +5,8 @@ frozen tree and scores how soon the chain reads the gold. It uses no model and
 no network, and two runs of one configuration produce the same bytes. It is a
 proxy for an agent, not an agent: it measures how a rule-following reader
 spends calls and tokens, and results are reported only as differences between
-arms on the same items (`maps compare`), never as absolute numbers.
+arms on the same items (`maps compare`), never as absolute numbers. Its proxies are uncalibrated
+(`sim-calibration.md`, d390): the judged subset neither passed nor killed them at n 48.
 
 Code: `xtask/src/sim/` (`terms`, `follow`, `sim_loop`, `arms`, `score`).
 
@@ -98,7 +99,7 @@ null when the trace is missing), its status and stop reason.
    in text not read yet. A name with no unread occurrence is skipped without a
    call. The rarity used for ranking is an uncharged lookup (it stands for the
    agent's judgement that a name looks specific); the grep that follows is the
-   charged call. This is a modelling choice to calibrate in 7c.
+   charged call. This is a modelling choice to calibrate (uncalibrated: `sim-calibration.md`, d390).
 
 ## Policies
 
@@ -221,3 +222,7 @@ misses, and never alone.
   default, as the A0 first reads) and the traversal returns at most
   `--lci-top-k` results; sites beyond that are shown in the listing but not
   read. This cap is a modelling choice, like the others, to calibrate.
+- The proxies are uncalibrated (`sim-calibration.md`, d390): a judged subset of 48
+  items gave pooled tau-b 0.228 and Spearman 0.253, between the pass and kill bars.
+  The "to calibrate" choices above (the `read_files` cap, the uncharged rarity, the
+  40-line window) stay as they are until a new pre-registered slice.
