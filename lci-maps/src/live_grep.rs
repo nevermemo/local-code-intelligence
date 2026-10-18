@@ -29,10 +29,13 @@
 //! first 8 KiB are skipped, the scan stops at `max_scan_bytes` or at the
 //! earlier of the call's budget deadline and `timeout`. A scan that stops
 //! early is reported as a partial answer by `query` (`expand` has no status
-//! and returns what it found). Names shorter than `min_name_len` and a
-//! stoplist of ubiquitous names (`new`, `default`, ...) produce no edges:
-//! they would only return the cap's worth of noise. Which `max_matches`
-//! occurrences are kept is a cap in walk (path) order, not a rank.
+//! and returns what it found). Files whose name is exactly one of
+//! `skip_files` are never read and take no match slot; the list is empty by
+//! default, and a caller opts in to skipping package-manager lockfiles with
+//! [`LOCKFILES`]. Names shorter than `min_name_len` and a stoplist of
+//! ubiquitous names (`new`, `default`, ...) produce no edges: they would
+//! only return the cap's worth of noise. Which `max_matches` occurrences are
+//! kept is a cap in walk (path) order, not a rank.
 //!
 //! # Freshness
 //!
@@ -80,6 +83,24 @@ const COMMON_NAMES: &[&str] = &[
     "item", "node", "text", "value", "values", "error", "result", "state", "config", "output",
 ];
 
+/// Package-manager lockfiles: generated, often large, and full of package
+/// names that match an identifier without saying anything about the code.
+/// Exact names only; there is no `*lock*` rule. Not applied by default: a
+/// caller opts in with `skip_files: LOCKFILES.iter().map(..).collect()`.
+pub const LOCKFILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "composer.lock",
+    "Cargo.lock",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "bun.lock",
+    "bun.lockb",
+];
+
 #[derive(Debug, Clone)]
 pub struct GrepOptions {
     /// Most occurrences one call keeps (exact ones first).
@@ -97,6 +118,9 @@ pub struct GrepOptions {
     /// Directory names the walk never enters, besides what ignore files and
     /// hidden directories already exclude.
     pub skip_dirs: Vec<String>,
+    /// File names (the whole name, not a pattern) the walk never reads.
+    /// Empty by default; see [`LOCKFILES`].
+    pub skip_files: Vec<String>,
 }
 
 impl Default for GrepOptions {
@@ -109,6 +133,7 @@ impl Default for GrepOptions {
             min_name_len: 4,
             skip_names: COMMON_NAMES.iter().map(|s| (*s).to_owned()).collect(),
             skip_dirs: vec!["target".into(), "node_modules".into()],
+            skip_files: Vec::new(),
         }
     }
 }
@@ -137,6 +162,8 @@ pub struct ScanResult {
     pub bytes_read: u64,
     pub skipped_binary: u64,
     pub skipped_large: u64,
+    /// Files not read because their name is in `skip_files`.
+    pub skipped_by_name: u64,
     /// Why the scan ended before the walk did, if it did.
     pub stopped: Option<&'static str>,
     pub elapsed_ms: f64,
@@ -172,6 +199,7 @@ pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant)
         return result;
     }
     let skip_dirs: HashSet<String> = options.skip_dirs.iter().cloned().collect();
+    let skip_files: HashSet<String> = options.skip_files.iter().cloned().collect();
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .parents(false)
@@ -197,6 +225,10 @@ pub fn scan(root: &Path, needle: &str, options: &GrepOptions, deadline: Instant)
         }
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if skip_files.contains(entry.file_name().to_string_lossy().as_ref()) {
+            result.skipped_by_name += 1;
             continue;
         }
         let size = entry.metadata().map_or(0, |m| m.len());

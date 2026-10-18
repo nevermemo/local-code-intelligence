@@ -8,12 +8,17 @@
 //! * `sim_loop`: the loop, the budgets and the trace.
 //! * `arms`: the opening call of A1 and A2.
 //! * `score`: gold matching and the per-item scores.
+//! * `rg`: an external ripgrep as the matcher behind `terms` (the R arm).
+//! * `structured`: `sim-structured`, the structured-config measurement that
+//!   reuses the loop, the searcher and the trace.
 
 mod arms;
-mod follow;
+pub(crate) mod follow;
+pub(crate) mod rg;
 mod score;
-mod sim_loop;
-mod terms;
+pub(crate) mod sim_loop;
+pub mod structured;
+pub(crate) mod terms;
 
 use crate::gold::{self, Set};
 use crate::maps::baseline::write_arm_run;
@@ -323,7 +328,7 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
 
 /// A run dir inside the frozen tree would be scanned by the next grep (and by
 /// the next arm), so questions and results would change the candidates.
-fn reject_run_dir_in_tree(tree: &Path, dir: &Path) -> Result<()> {
+pub(crate) fn reject_run_dir_in_tree(tree: &Path, dir: &Path) -> Result<()> {
     let (tree_abs, dir_abs) = (resolve_path(tree)?, resolve_path(dir)?);
     if dir_abs.starts_with(&tree_abs) {
         anyhow::bail!(

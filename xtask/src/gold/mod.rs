@@ -12,7 +12,7 @@ mod history;
 mod impact;
 mod instructions;
 pub mod metrics;
-mod structured;
+pub(crate) mod structured;
 mod traits;
 mod where_to;
 

@@ -225,7 +225,7 @@ fn is_hex(s: &str, len: usize) -> bool {
 }
 
 /// Why `path` is not a repo-relative `/` path, if it is not.
-fn unsafe_path(path: &str) -> Option<&'static str> {
+pub(crate) fn unsafe_path(path: &str) -> Option<&'static str> {
     let bytes = path.as_bytes();
     if path.is_empty() {
         Some("empty path")

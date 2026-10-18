@@ -310,6 +310,189 @@ fn the_match_cap_keeps_exact_matches_first_and_stops_the_walk() {
     assert_eq!(found.stopped, None);
 }
 
+/// The default options with the lockfile rule switched on.
+fn lockfile_options() -> GrepOptions {
+    GrepOptions {
+        skip_files: LOCKFILES.iter().map(|s| (*s).to_owned()).collect(),
+        ..GrepOptions::default()
+    }
+}
+
+fn scan_now(root: &Path, needle: &str, options: &GrepOptions) -> ScanResult {
+    scan(
+        root,
+        needle,
+        options,
+        Instant::now() + Duration::from_secs(10),
+    )
+}
+
+#[test]
+fn no_file_is_skipped_by_name_unless_the_caller_asks() {
+    assert!(GrepOptions::default().skip_files.is_empty());
+    assert_eq!(LOCKFILES.len(), 11);
+    let scratch = Scratch::new("live-grep-default-names").unwrap();
+    let root = scratch.path();
+    write(root, "Cargo.lock", "needle_z\n");
+    write(root, "app/package-lock.json", "needle_z\n");
+    let found = scan_now(root, "needle_z", &GrepOptions::default());
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, ["Cargo.lock", "app/package-lock.json"]);
+    assert_eq!((found.files_read, found.skipped_by_name), (2, 0));
+}
+
+#[test]
+fn a_lockfile_is_never_read_and_takes_no_match_slot() {
+    let scratch = Scratch::new("live-grep-lockfile").unwrap();
+    let root = scratch.path();
+    // Both lockfiles sort before src/, so without the rule they would fill
+    // the cap and the walk would stop before the real use.
+    write(root, "Cargo.lock", &"name = \"needle_z\"\n".repeat(10));
+    write(
+        root,
+        "app/package-lock.json",
+        &"\"needle_z\": {}\n".repeat(10),
+    );
+    // Only the exact name is skipped.
+    write(root, "app/Cargo.lock.md", "needle_z\n");
+    write(root, "src/a.rs", "use needle_z;\n");
+    let options = GrepOptions {
+        max_matches: 4,
+        ..lockfile_options()
+    };
+    let found = scan_now(root, "needle_z", &options);
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, ["app/Cargo.lock.md", "src/a.rs"]);
+    assert_eq!((found.files_read, found.skipped_by_name), (2, 2));
+    assert_eq!(found.stopped, None);
+    // With the list emptied the lockfiles are read again and take the cap.
+    let all = GrepOptions {
+        skip_files: Vec::new(),
+        ..options
+    };
+    let found = scan_now(root, "needle_z", &all);
+    assert_eq!(found.matches.len(), 4);
+    assert!(found.matches.iter().all(|m| m.path == "Cargo.lock"));
+    assert_eq!(found.skipped_by_name, 0);
+    assert_eq!(found.stopped, Some("match cap"));
+}
+
+#[test]
+fn every_lockfile_name_is_skipped_at_the_root_and_nested() {
+    let scratch = Scratch::new("live-grep-all-lockfiles").unwrap();
+    let root = scratch.path();
+    for name in LOCKFILES {
+        write(root, name, "needle_z\n");
+        write(root, &format!("packages/deep/{name}"), "needle_z\n");
+    }
+    write(root, "src/a.rs", "use needle_z;\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, ["src/a.rs"]);
+    assert_eq!(found.skipped_by_name, 2 * LOCKFILES.len() as u64);
+    assert_eq!(found.files_read, 1);
+    assert_eq!(found.stopped, None);
+}
+
+#[test]
+fn authored_configs_beside_a_lockfile_are_still_scanned() {
+    let scratch = Scratch::new("live-grep-configs").unwrap();
+    let root = scratch.path();
+    write(root, "js/package.json", "{ \"needle_z\": \"1\" }\n");
+    write(root, "js/package-lock.json", "{ \"needle_z\": {} }\n");
+    write(root, "py/pyproject.toml", "needle_z = \"1\"\n");
+    write(root, "py/uv.lock", "name = \"needle_z\"\n");
+    write(root, "rs/Cargo.toml", "needle_z = \"1\"\n");
+    write(root, "rs/Cargo.lock", "name = \"needle_z\"\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["js/package.json", "py/pyproject.toml", "rs/Cargo.toml"]
+    );
+    assert_eq!((found.files_read, found.skipped_by_name), (3, 3));
+}
+
+#[test]
+fn a_name_that_differs_in_case_is_not_a_lockfile() {
+    let scratch = Scratch::new("live-grep-lockfile-case").unwrap();
+    let root = scratch.path();
+    write(root, "cargo.lock", "needle_z\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, ["cargo.lock"]);
+    assert_eq!((found.files_read, found.skipped_by_name), (1, 0));
+}
+
+#[test]
+fn a_directory_named_like_a_lockfile_is_still_walked() {
+    let scratch = Scratch::new("live-grep-lockfile-dir").unwrap();
+    let root = scratch.path();
+    write(root, "uv.lock/inner.txt", "needle_z\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, ["uv.lock/inner.txt"]);
+    assert_eq!((found.files_read, found.skipped_by_name), (1, 0));
+}
+
+#[test]
+fn a_skipped_lockfile_adds_nothing_to_files_read_or_bytes_read() {
+    let scratch = Scratch::new("live-grep-lockfile-bytes").unwrap();
+    let root = scratch.path();
+    let source = "use needle_z;\n";
+    // Few matches, so the default match cap does not end the scan in the lockfile.
+    let lock = "name = \"needle_z\"\n".repeat(3);
+    write(root, "Cargo.lock", &lock);
+    write(root, "src/a.rs", source);
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    assert_eq!(found.files_read, 1);
+    assert_eq!(found.bytes_read, source.len() as u64);
+    assert_eq!(found.skipped_by_name, 1);
+    // Skipped for the name, not counted as large or binary.
+    assert_eq!((found.skipped_large, found.skipped_binary), (0, 0));
+    let found = scan_now(root, "needle_z", &GrepOptions::default());
+    assert_eq!(found.files_read, 2);
+    assert_eq!(found.bytes_read, (source.len() + lock.len()) as u64);
+    assert_eq!(found.skipped_by_name, 0);
+}
+
+#[test]
+fn a_crlf_file_gives_the_same_positions_as_an_lf_file() {
+    let scratch = Scratch::new("live-grep-crlf").unwrap();
+    let root = scratch.path();
+    // The needle ends each line, so the `\r` is the character after it.
+    write(root, "crlf.txt", "let a = needle_z\r\nlet b = needle_z\r\n");
+    write(root, "lf.txt", "let a = needle_z\nlet b = needle_z\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let positions = |path: &str| -> Vec<(u32, u32, bool)> {
+        found
+            .matches
+            .iter()
+            .filter(|m| m.path == path)
+            .map(|m| (m.line, m.col, m.exact))
+            .collect()
+    };
+    assert_eq!(positions("lf.txt"), [(0, 8, true), (1, 8, true)]);
+    assert_eq!(positions("crlf.txt"), positions("lf.txt"));
+}
+
+#[test]
+fn unicode_paths_and_content_around_a_skipped_lockfile_keep_their_columns() {
+    let scratch = Scratch::new("live-grep-unicode").unwrap();
+    let root = scratch.path();
+    write(root, "日本語/Cargo.lock", "名前 = \"needle_z\"\n");
+    // Byte column: `// héllo → ` is 14 bytes (é is 2, → is 3).
+    write(root, "日本語/main.rs", "// héllo → needle_z\n");
+    let found = scan_now(root, "needle_z", &lockfile_options());
+    let rows: Vec<_> = found
+        .matches
+        .iter()
+        .map(|m| (m.path.as_str(), m.line, m.col, m.exact))
+        .collect();
+    assert_eq!(rows, [("日本語/main.rs", 0, 14, true)]);
+    assert_eq!((found.files_read, found.skipped_by_name), (1, 1));
+}
+
 #[test]
 fn a_passed_deadline_stops_the_scan_and_says_so() {
     let tree = fixture();
