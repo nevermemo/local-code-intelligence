@@ -2888,11 +2888,13 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-priming");
     config.lsp_search_budget_ms = 200;
-    config = with_fake_csharp_server(config, &state, &["--first-symbol-delay-ms", "2000"], 10);
+    config = with_fake_csharp_server(config, &state, &["--first-symbol-delay-ms", "8000"], 20);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
-    // The server starts at once; its priming request takes 2 s.
+    // The server starts at once; its priming request takes 8 s, longer than
+    // both early searches together at their 3 s ceiling, so neither can see a
+    // primed server even under load.
     for attempt in 0..2 {
         let early = app
             .search(&workspace, "Calculator", Some(10))
@@ -2905,7 +2907,7 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             "search {attempt} ran during priming"
         );
         assert!(
-            early.timings.lsp_search_ms < 1200.0,
+            early.timings.lsp_search_ms < 3000.0,
             "search {attempt} waited {} ms for priming instead of its 200 ms budget",
             early.timings.lsp_search_ms
         );
