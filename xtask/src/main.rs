@@ -8,6 +8,7 @@ mod live_acceptance;
 mod maps;
 mod mine;
 mod setup;
+mod sim;
 mod test;
 
 use anyhow::Result;
@@ -89,6 +90,12 @@ enum Command {
         #[command(subcommand)]
         which: maps::MapsCommand,
     },
+    /// Simulated agent: a deterministic, model-free loop of greps and reads
+    /// over a frozen tree, scored against a gold set (calls and tokens to the
+    /// gold). Arm A0 is grep-only; A1 and A2 put one `lci search` or
+    /// `lci traverse --scip` call in front of the same chain. See
+    /// docs/spike/multimap/v2/sim-agent.md.
+    Sim(sim::SimArgs),
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
@@ -293,6 +300,7 @@ async fn main() -> Result<()> {
         },
         Command::Gold { which } => gold::run(which),
         Command::Maps { which } => maps::run(which),
+        Command::Sim(args) => sim::run(args),
         Command::MineQueries {
             repo,
             key,
