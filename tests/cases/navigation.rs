@@ -697,7 +697,9 @@ async fn a_server_that_answers_with_a_result_after_the_stuck_span_keeps_its_sess
 /// its third (about 2 s), so none of them returns. The first answers of five
 /// calls are about 1 s apart: the span passes the 2 s limit during the fourth
 /// call at the latest (the first one only starts the server), and some later
-/// call finds the session stuck.
+/// call finds the session stuck. On a loaded machine the start takes longer and
+/// the span can pass the limit only during the last call, so the calls go on
+/// (up to 30) until one has started the replacement, rather than a fixed six.
 #[tokio::test]
 async fn cancelled_calls_still_count_toward_the_stuck_span() {
     let temp = tempfile::tempdir().unwrap();
@@ -710,13 +712,16 @@ async fn cancelled_calls_still_count_toward_the_stuck_span() {
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
-    for _ in 0..6 {
+    let mut calls = 0;
+    while state_count_so_far(&state, "spawn_count.txt") < 2 {
+        assert!(calls < 30, "no call replaced the stuck session in {calls} calls");
         let outcome = tokio::time::timeout(
             Duration::from_millis(1000),
             manager.symbols(&adapter, &workspace, "Calculator"),
         )
         .await;
         assert!(outcome.is_err(), "the call must be cancelled, not answered");
+        calls += 1;
     }
     wait_until(
         "the stuck server to be shut down",
