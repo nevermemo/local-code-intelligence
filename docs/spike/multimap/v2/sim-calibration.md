@@ -116,7 +116,7 @@ Per-set tau-b: where-to 0.784 [0.320, 1.000], impact 0.816 [0.816, 1.000], flow 
 impact worst) were not met in tau, S2 or the set order; they are reported, not acted on.
 
 S3, descriptive (lower-is-better proxies sign-flipped; hit-only proxies on items where both configurations hit; `hit_at_25`
-is a 25-call list read against the 12-call judgement): pooled tau-b / Spearman against `judge_file_recall`:
+is a 25-call list read against the 12-call judgement; `calls_to_gold` is the full 25-call run's value, so its 94 pairs also count 8 sheets that reach gold only at calls 13 to 25, while `tokens_to_gold` and `listed_at` use hits within 12 calls): pooled tau-b / Spearman against `judge_file_recall`:
 `hit_at_25` 0.379 [0.201, 0.743] / 0.251 [0.008, 0.482] (240 pairs); `calls_to_gold` 0.551 [0.328, 0.795] / 0.438
 [0.175, 0.670] (94); `tokens_to_gold` 0.722 [0.222, 0.944] / 0.323 [-0.032, 0.627] (90); `listed_at` 0.873 [0.109, 0.909] /
 0.463 [-0.057, 0.809] (76). `answerable` against `judge_file_recall`: Spearman 0.471 (n 147). Spearman among pairs
