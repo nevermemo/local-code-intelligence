@@ -177,9 +177,11 @@ other non-walk arms, so `maps compare` pairs any two of them:
 `maps compare` keys on the ids in `items.json`, which each run writes afresh,
 and reads `raw/<item>.json` only for those ids. A `raw/` file of an item that a
 rerun left out (a smaller `--limit`, a filtered set) into the same directory
-therefore survives on disk but is never read; only an item that is in the run
-and has no raw reply gets its file removed. Use a fresh `--wave` rather than
-a directory with older items in it.
+therefore survives on disk and `maps compare` never reads it; only an item that
+is in the run and has no raw reply gets its file removed. Other tools read
+`raw/` wholesale (`maps fit-priors`, the tie-break fit, the oracle), so they
+would see it: use a fresh `--wave` rather than a directory with older items in
+it.
 
 The scorer's own metrics are a by-product: the reading list is not an answer
 set, and impact and flow gold are declaration lines that a window start rarely

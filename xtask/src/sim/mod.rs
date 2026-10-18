@@ -1056,6 +1056,47 @@ mod tests {
     }
 
     #[test]
+    fn names_differing_only_in_case_take_one_candidate_slot() {
+        let dir = std::env::temp_dir().join(format!("xtask-sim-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let files = [
+            (
+                "src/x.rs",
+                "// quartz zephyr\nfn entry_x() {\n    Target_fn();\n    target_fn();\n    other_fn();\n}\n",
+            ),
+            ("src/t1.rs", "fn Target_fn() {}\n"),
+            ("src/t2.rs", "fn target_fn() {}\n"),
+            ("src/o.rs", "fn other_fn() {}\n"),
+        ];
+        for (path, text) in files {
+            fs::write(dir.join(path), text).unwrap();
+        }
+        let config = SimConfig {
+            max_candidates: 3,
+            ..cfg(Policy::Bfs)
+        };
+        let mut searcher = Searcher::new(&dir);
+        let trace = run_question(&mut searcher, &config, "quartz zephyr", None, None);
+        let followed: Vec<String> = ItemScore::from_trace("t", trace, &leaf_file())
+            .trace
+            .steps
+            .iter()
+            .filter(|s| s.kind == "follow-grep")
+            .map(|s| s.arg.to_lowercase())
+            .collect();
+        // Before the fix Target_fn and target_fn took two of the three slots
+        // and cut other_fn away.
+        assert!(followed.iter().any(|n| n == "other_fn"), "{followed:?}");
+        assert_eq!(
+            followed.iter().filter(|n| *n == "target_fn").count(),
+            1,
+            "{followed:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_dir_inside_the_tree_is_refused_by_resolved_path() {
         let tree = fork_tree("rundir-in-tree");
         let inside = tree.join("out").join("sim-a0").join("where-to");

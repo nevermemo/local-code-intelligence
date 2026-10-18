@@ -591,9 +591,12 @@ impl Run<'_> {
     fn batch(&mut self, names: Vec<String>, depth: u32) -> Vec<Candidate> {
         let mut fresh: Vec<String> = Vec::new();
         for name in names {
+            let key = name.to_lowercase();
+            // `seen` is case-insensitive, so `fresh` is too: `Foo` and `foo`
+            // in one read take one candidate slot, not two.
             if usable_identifier(&name, self.searcher.options())
-                && !self.seen.contains(&name.to_lowercase())
-                && !fresh.contains(&name)
+                && !self.seen.contains(&key)
+                && !fresh.iter().any(|f| f.to_lowercase() == key)
             {
                 fresh.push(name);
             }
