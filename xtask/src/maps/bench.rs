@@ -51,6 +51,8 @@ pub enum SetArg {
     WhereTo,
     History,
     Instructions,
+    /// The trait-implementation set (private; not part of `all`).
+    Traits,
     All,
 }
 
@@ -62,6 +64,7 @@ impl SetArg {
             SetArg::WhereTo => vec![Set::WhereTo],
             SetArg::History => vec![Set::History],
             SetArg::Instructions => vec![Set::Instructions],
+            SetArg::Traits => vec![Set::Traits],
             SetArg::All => vec![
                 Set::Impact,
                 Set::Flow,
@@ -75,11 +78,12 @@ impl SetArg {
 
 #[derive(Args)]
 pub struct BenchArgs {
-    /// Which gold set to run (all = the five, in order).
+    /// Which gold set to run (all = the five frozen ones, in order; traits is
+    /// run on its own).
     #[arg(long, value_enum)]
     set: SetArg,
-    /// Directory holding impact.json, flow.json, where-to.json, history.json
-    /// and instructions.json (private; no default).
+    /// Directory holding impact.json, flow.json, where-to.json, history.json,
+    /// instructions.json and traits.json (private; no default).
     #[arg(long)]
     gold_dir: PathBuf,
     /// The SCIP index of the frozen tree (not needed with --rescore).
@@ -240,7 +244,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     for set in &sets {
         gold_items.push(select_items(
             *set,
-            gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(*set))))?,
+            gold::prepare(
+                *set,
+                gold::load_gold(&args.gold_dir.join(format!("{}.json", set_name(*set))))?,
+            ),
             args.limit,
             holdout.as_ref(),
         ));
@@ -576,6 +583,7 @@ pub fn set_name(set: Set) -> &'static str {
         Set::WhereTo => "where-to",
         Set::History => "history",
         Set::Instructions => "instructions",
+        Set::Traits => "traits",
     }
 }
 
@@ -627,7 +635,7 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
 /// The node kinds from which a set's answers can be made.
 fn needed_kinds(set: Set) -> &'static [NodeKind] {
     match set {
-        Set::Impact | Set::Flow | Set::WhereTo => &[NodeKind::Symbol, NodeKind::File],
+        Set::Impact | Set::Flow | Set::WhereTo | Set::Traits => &[NodeKind::Symbol, NodeKind::File],
         Set::History => &[NodeKind::Commit],
         Set::Instructions => &[NodeKind::DocSection],
     }
@@ -1373,6 +1381,7 @@ pub fn adapt(set: Set, item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
         Set::WhereTo => adapt_where_to(item, nodes),
         Set::History => adapt_history(nodes),
         Set::Instructions => adapt_instructions(nodes),
+        Set::Traits => adapt_traits(item, nodes),
     }
 }
 
@@ -1410,6 +1419,58 @@ pub fn adapt_where_to(item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
         return paths_only(nodes);
     }
     function_decls(nodes)
+}
+
+/// The answer unit of a Q1 node: a symbol inside an impl block stands for that
+/// impl, named by its module path and container chain up to the innermost
+/// `impl` header (the node id carries the container, so no span is needed);
+/// any other node stands for itself.
+fn impl_unit(id: &str) -> String {
+    if let Some(NodeId::Symbol(key)) = parsed(id)
+        && let Some(last) = key.container.iter().rposition(|s| s.starts_with("impl "))
+    {
+        return format!(
+            "{}|{}",
+            key.module_path.join("::"),
+            key.container[..=last].join("/")
+        );
+    }
+    id.to_string()
+}
+
+/// Traits: Q1 ("which types implement") offers every located symbol, because
+/// the scorer credits an impl block or a type declaration. One answer per
+/// distinct impl or type: a method (or other member) node counts as the impl
+/// that contains it, read from the container chain of its node id, and the
+/// duplicates collapse here, before the scorer's budget cut, keeping the best
+/// ranked node's site. Impls of different types at one macro call site have
+/// different headers, so they stay apart. A type node and the methods of its
+/// impl are not merged (the id does not tie them). Q2 and Q3 want an
+/// implementing member, so only functions and methods are offered, each kept.
+/// Each answer carries its node id as `symbol`: the nodes of one macro call
+/// site share a site, and the scorer needs them apart. The trait's own
+/// declaration card is offered like any other; the scorer drops it.
+pub fn adapt_traits(item: &Value, nodes: &[ResultNode]) -> Vec<Value> {
+    let members = matches!(item["set"].as_str(), Some("Q2" | "Q3"));
+    let mut units = BTreeSet::new();
+    dedup(
+        nodes
+            .iter()
+            .filter_map(|n| {
+                let decl = decl_of(n)?;
+                if members {
+                    if !matches!(decl.kind, SymbolKind::Function | SymbolKind::Method) {
+                        return None;
+                    }
+                } else if !units.insert(impl_unit(&n.id)) {
+                    return None;
+                }
+                let mut a = decl_answer(&decl);
+                a["symbol"] = json!(n.id);
+                Some(a)
+            })
+            .collect(),
+    )
 }
 
 /// History: commit nodes, by hash.
@@ -1530,6 +1591,17 @@ pub fn item_precision_recall(
                 (m("i1_section_precision"), m("i1_section_recall"))
             } else {
                 (m("i2_required_precision@5"), m("i2_required_recall"))
+            }
+        }
+        Set::Traits => {
+            if item["set"].as_str() == Some("Q2") {
+                // One gold location: recall is the hit in the first ten, and
+                // precision that hit over the answers read (at most ten).
+                let read = answers.len().min(10);
+                let hit = m("hit@10");
+                (if read == 0 { 0.0 } else { hit / read as f64 }, hit)
+            } else {
+                (m("set_precision"), m("set_recall"))
             }
         }
     }
@@ -1750,6 +1822,7 @@ pub(super) fn headline(set: Set) -> &'static [&'static str] {
         Set::WhereTo => &["reg_hit@3", "reg_mrr", "set_f1"],
         Set::History => &["mrr", "hit@3", "hit@10"],
         Set::Instructions => &["i1_section_f1", "i2_hit@3_primary", "i2_required_recall@5"],
+        Set::Traits => &["set_f1", "recall_explicit", "hit@10", "mrr"],
     }
 }
 
@@ -2230,6 +2303,62 @@ mod tests {
         );
         let file_level = json!({"gold": {"form": "exemplar", "granularity": "file"}});
         assert_eq!(adapt_where_to(&file_level, &nodes).len(), 2);
+    }
+
+    #[test]
+    fn traits_adapter_keeps_nodes_apart_and_members_only_for_q2_and_q3() {
+        let nodes = located_nodes();
+        let q1 = adapt_traits(&json!({"set": "Q1"}), &nodes);
+        assert_eq!(q1.len(), nodes.iter().filter_map(decl_of).count());
+        assert_eq!(q1[0]["path"], "src/app/search.rs");
+        assert_eq!(q1[0]["line"], 12);
+        assert_eq!(q1[0]["symbol"], json!(nodes[0].id));
+        // two nodes at one site stay two answers
+        let twin = located(METHOD, "src/app/search.rs", 12);
+        let both = adapt_traits(&json!({"set": "Q1"}), &[nodes[0].clone(), twin]);
+        assert_eq!(both.len(), 2);
+        assert_ne!(both[0]["symbol"], both[1]["symbol"]);
+        // members only: the type node is left out
+        let members = adapt_traits(&json!({"set": "Q3"}), &nodes);
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().all(|a| a["symbol"].is_string()));
+    }
+
+    #[test]
+    fn a_q1_walk_counts_an_impl_and_its_methods_as_one_answer() {
+        const A1: &str = "sym:rust:app::x::impl Tr for Foo::a/method";
+        const A2: &str = "sym:rust:app::x::impl Tr for Foo::b/method";
+        const B1: &str = "sym:rust:app::x::impl Tr for Bar::a/method";
+        let nodes = vec![
+            located(A1, "src/x.rs", 10),
+            located(A2, "src/x.rs", 11),
+            located(B1, "src/x.rs", 20),
+            located(TYPE, "src/x.rs", 1),
+        ];
+        let q1 = json!({"set": "Q1"});
+        let answers = adapt_traits(&q1, &nodes);
+        // Foo's two methods are one answer (the better ranked), Bar's is another,
+        // the type node stands for itself.
+        let lines: Vec<u64> = answers
+            .iter()
+            .map(|a| a["line"].as_u64().unwrap())
+            .collect();
+        assert_eq!(lines, [10, 20, 1]);
+        // Q3 keeps every member.
+        assert_eq!(adapt_traits(&json!({"set": "Q3"}), &nodes).len(), 3);
+        // One slot, one credit: two gold impls (k = 2); without the collapse the
+        // budget would be spent on Foo's two methods and Bar would be cut.
+        let span = |a: u64, b: u64| json!({"file": "src/x.rs", "begin_line": a, "end_line": b});
+        let item = json!({
+            "id": "q1", "set": "Q1",
+            "gold": [
+                {"impl_id": "i0", "stratum": "explicit", "impl": span(10, 15), "type_decl": null},
+                {"impl_id": "i1", "stratum": "explicit", "impl": span(20, 25), "type_decl": null}
+            ]
+        });
+        let m = item_metrics(Set::Traits, &item, &answers[..2]).unwrap();
+        assert_eq!(m["set_recall"], Some(1.0));
+        assert_eq!(m["set_precision"], Some(1.0));
     }
 
     #[test]
