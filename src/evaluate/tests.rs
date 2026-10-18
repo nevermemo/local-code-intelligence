@@ -1915,6 +1915,9 @@ fn dump_arm(window: usize, k: usize, cap: u32, mode: RerankMode) -> CandidateArm
         k,
         embedding_identity: "test-embedding".to_owned(),
         reranker_model: "test-reranker".to_owned(),
+        rescorer: None,
+        system_one_model: None,
+        system_one_batch_size: None,
         rerank_mode: mode,
     }
 }
@@ -3397,4 +3400,137 @@ fn replay_refuses_a_query_scored_on_the_docs_or_union_lane() {
         BTreeMap::from([(ReplayRefusal::NonCodeLane, 2)])
     );
     assert_eq!(ReplayRefusal::NonCodeLane.as_str(), "non_code_lane");
+}
+
+/// A dump taken under the System One rescorer: window 4, cap 2, so the batch
+/// it sent held A1, A20, B1, C1 in that order.
+fn system_one_dump() -> AggregateReport {
+    let mut arm = dump_arm(4, 3, 2, RerankMode::Replace);
+    arm.rescorer = Some("system_one".to_owned());
+    arm.system_one_model = Some("decider".to_owned());
+    arm.system_one_batch_size = Some(24);
+    dump_of(&[dumped_query(
+        "system one",
+        &["b.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Scored,
+        900.0,
+    )])
+}
+
+#[test]
+fn replay_refuses_a_scored_system_one_dump_whose_batch_changes() {
+    let source = system_one_dump();
+    assert_eq!(places(&source.queries[0]), ["b.rs:1", "a.rs:20", "c.rs:1"]);
+
+    // The dumped context, named or not, is still replayable.
+    for options in [
+        ReplayOptions::default(),
+        ReplayOptions {
+            window: Some(4),
+            cap: Some(2),
+            ..ReplayOptions::default()
+        },
+    ] {
+        let out = replayed(&source, options);
+        assert_eq!(out.replay.queries.refused, 0);
+        assert_eq!(out.report.queries[0].evidence, source.queries[0].evidence);
+    }
+    // The reranker being off needs no scores, so any window replays.
+    let off = replayed(
+        &source,
+        ReplayOptions {
+            window: Some(2),
+            rerank_mode: Some(RerankMode::Off),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(off.replay.queries.refused, 0);
+
+    // A reduced window, another cap, and a reweighted fusion each change the
+    // candidates sent or their ids; the stored probabilities no longer apply.
+    for (name, options) in [
+        (
+            "reduced window",
+            ReplayOptions {
+                window: Some(3),
+                ..ReplayOptions::default()
+            },
+        ),
+        (
+            "another cap",
+            ReplayOptions {
+                cap: Some(0),
+                ..ReplayOptions::default()
+            },
+        ),
+        (
+            "reweighted fusion",
+            ReplayOptions {
+                lexical_weight: Some(20.0),
+                ..ReplayOptions::default()
+            },
+        ),
+    ] {
+        let out = replayed(&source, options);
+        assert_eq!(
+            out.replay.refused,
+            BTreeMap::from([(ReplayRefusal::BatchMismatch, 1)]),
+            "{name}"
+        );
+        let refused = &out.report.queries[0];
+        assert!(refused.skipped && refused.evidence.is_empty(), "{name}");
+        assert_eq!(
+            refused.replay_refusal,
+            Some(ReplayRefusal::BatchMismatch),
+            "{name}"
+        );
+        assert!(
+            refused.reason.contains("batch"),
+            "{name}: {}",
+            refused.reason
+        );
+    }
+    assert_eq!(ReplayRefusal::BatchMismatch.as_str(), "batch_mismatch");
+
+    // The independent reranker keeps replaying a reduced window.
+    let reranker = replayed(
+        &full_dump(),
+        ReplayOptions {
+            window: Some(3),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(reranker.replay.queries.refused, 0);
+}
+
+#[test]
+fn replay_refuses_a_system_one_batch_with_the_same_members_in_another_order() {
+    let mut arm = dump_arm(6, 6, 0, RerankMode::Replace);
+    arm.rescorer = Some("system_one".to_owned());
+    let source = dump_of(&[dumped_query(
+        "whole pool",
+        &["a.rs"],
+        &SIX,
+        &arm,
+        RerankOutcome::Scored,
+        900.0,
+    )]);
+    let same = replayed(&source, ReplayOptions::default());
+    assert_eq!(same.replay.queries.refused, 0);
+    assert_eq!(same.report.queries[0].evidence, source.queries[0].evidence);
+    // Every row is still in the window, but D1 is now the first candidate: its
+    // id and every other candidate's id change.
+    let reweighted = replayed(
+        &source,
+        ReplayOptions {
+            lexical_weight: Some(20.0),
+            ..ReplayOptions::default()
+        },
+    );
+    assert_eq!(
+        reweighted.replay.refused,
+        BTreeMap::from([(ReplayRefusal::BatchMismatch, 1)])
+    );
 }

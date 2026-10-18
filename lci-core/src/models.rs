@@ -1,6 +1,7 @@
 use crate::{
-    config::{Config, fill_template},
+    config::{Config, Rescorer, fill_template},
     endpoint::ApiKey,
+    provider::{ProviderKind, WireCandidate, parse_wire_scores, wire_request},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -28,6 +29,9 @@ pub struct Models {
     /// Shared by every clone: remembers that the reranker refused a
     /// connection so searches stop paying for it (see [`ConnectBreaker`]).
     reranker_breaker: Arc<ConnectBreaker>,
+    /// The same for the `system_one_wire` rescorer (see
+    /// [`Models::system_one_rank`]).
+    system_one_breaker: Arc<ConnectBreaker>,
     /// The sleep before the first retry under [`RetryPolicy::Retry`]; it
     /// doubles for each further one. A field so the tests need not wait a
     /// real second.
@@ -97,6 +101,10 @@ enum RetryPolicy {
 /// within half a minute; long enough that a reranker that is down costs a
 /// search nothing instead of one failed connection attempt.
 const RERANKER_DOWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long [`Models::system_one_rank`] skips the typed rescorer after it
+/// refused a connection (the same 30 s as the reranker's window).
+const SYSTEM_ONE_DOWN_WINDOW: Duration = Duration::from_secs(30);
 
 /// A tiny in-memory circuit breaker: after [`ConnectBreaker::trip`], callers
 /// that check [`ConnectBreaker::remaining`] are told to skip the service until
@@ -321,12 +329,108 @@ fn redact_error_body(body: &str, endpoint: &str) -> String {
     redacted.trim_end().to_owned()
 }
 
-/// Replaces `key`, wherever a server echoed it, in `body`.
-pub(crate) fn redact_secret(body: &str, key: Option<&ApiKey>) -> String {
-    match key {
-        Some(key) => body.replace(key.expose(), "[redacted]"),
-        None => body.to_owned(),
+/// Decodes the JSON string escapes of `text` (`\uXXXX` with surrogate pairs,
+/// `\\`, `\"`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`); anything else, including a
+/// malformed escape, is kept as written.
+fn json_unescape(text: &str) -> String {
+    fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..4 {
+            value = value * 16 + chars.next()?.to_digit(16)?;
+        }
+        Some(value)
     }
+
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let mut ahead = chars.clone();
+                let decoded_char = hex4(&mut ahead).and_then(|first| match first {
+                    0xD800..=0xDBFF => {
+                        if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                            let second = hex4(&mut ahead)?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return None;
+                            }
+                            char::from_u32(0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => char::from_u32(first),
+                });
+                match decoded_char {
+                    Some(value) => {
+                        chars = ahead;
+                        decoded.push(value);
+                    }
+                    None => decoded.push_str("\\u"),
+                }
+            }
+            Some('b') => decoded.push('\u{8}'),
+            Some('f') => decoded.push('\u{c}'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some(escaped @ ('\\' | '"' | '/')) => decoded.push(escaped),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+/// Replaces `key`, wherever a server echoed it, in `body`. A server that
+/// echoes the key as a JSON string may write any of its characters as a
+/// `\uXXXX` escape, which a literal replacement misses; when the body still
+/// holds the key once its escapes are decoded, the whole body is dropped.
+pub(crate) fn redact_secret(body: &str, key: Option<&ApiKey>) -> String {
+    let Some(key) = key.map(ApiKey::expose).filter(|key| !key.is_empty()) else {
+        return body.to_owned();
+    };
+    let replaced = body.replace(key, "[redacted]");
+    // A gateway may wrap an upstream JSON error as a string, escaping it
+    // again, so decode until nothing changes (bounded).
+    let mut decoded = replaced.clone();
+    for _ in 0..4 {
+        let next = json_unescape(&decoded);
+        if next.contains(key) {
+            return "[redacted: the response echoed the credential]".to_owned();
+        }
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    replaced
+}
+
+/// [`check_status`] for a service whose failure bodies are never shown: a
+/// non-success status becomes an [`HttpStatusError`] with the status code and
+/// no body, and the body is not read. A body can echo the credential in a
+/// form no redaction recognises, so the typed System One paths drop it whole.
+pub(crate) fn check_status_without_body(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    Err(anyhow::Error::new(HttpStatusError {
+        status: status.as_u16(),
+        body: String::new(),
+    })
+    .context(format!("{label} HTTP error")))
 }
 
 pub(crate) async fn check_status(
@@ -376,6 +480,14 @@ impl Models {
                 tracing::warn!("{warning}");
             }
         }
+        if config.rescorer == Rescorer::SystemOne
+            && let Some(system_one) = &config.system_one
+            && let Some(warning) = system_one
+                .endpoint()
+                .cleartext_key_warning("system_one.url")
+        {
+            tracing::warn!("{warning}");
+        }
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -383,6 +495,7 @@ impl Models {
                 .build()?,
             config: config.clone(),
             reranker_breaker: Arc::new(ConnectBreaker::new(RERANKER_DOWN_WINDOW)),
+            system_one_breaker: Arc::new(ConnectBreaker::new(SYSTEM_ONE_DOWN_WINDOW)),
             initial_backoff: INITIAL_BACKOFF,
             observed_dimension: Arc::default(),
         })
@@ -626,6 +739,87 @@ impl Models {
         ranks.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         Ok(ranks)
     }
+
+    /// Scores `candidates` for `query` with the typed `system_one_wire`
+    /// service (`rescorer = "system_one"`); best first, as `(index,
+    /// probability)`, ties in the candidates' order (the fusion order).
+    ///
+    /// A shortlist longer than `system_one.batch_size` goes in several
+    /// sequential requests; any one failing fails the whole call, so a
+    /// partial answer never reorders anything. Query-time, so one attempt per
+    /// request. After a refused connection the service is skipped for
+    /// [`SYSTEM_ONE_DOWN_WINDOW`] and this returns an error at once; the
+    /// caller falls back to fusion order. The API key is read from the
+    /// environment here, per call, and appears in no error. A non-success
+    /// status is reported by its code alone: the response body is discarded.
+    pub async fn system_one_rank(
+        &self,
+        query: &str,
+        candidates: &[WireCandidate],
+    ) -> Result<Vec<(usize, f32)>> {
+        let system_one = self
+            .config
+            .system_one
+            .as_ref()
+            .filter(|s| s.provider == ProviderKind::SystemOneWire)
+            .context(
+                "system_one rescoring needs [system_one] with provider = \"system_one_wire\"",
+            )?;
+        system_one.validate()?;
+        ensure!(
+            !candidates.is_empty(),
+            "system_one has no candidates to score"
+        );
+        if let Some(remaining) = self.system_one_breaker.remaining(Instant::now()) {
+            bail!(
+                "system_one skipped as recently unreachable (next attempt in about {}s)",
+                remaining.as_secs() + 1
+            );
+        }
+        let url = system_one.wire_url()?;
+        let key = system_one.endpoint().api_key()?;
+        let timeout = Duration::from_millis(system_one.timeout_ms);
+        let total = candidates.len();
+        let mut ranks = Vec::with_capacity(total);
+        for start in (0..total).step_by(system_one.batch_size) {
+            let range = start..(start + system_one.batch_size).min(total);
+            let body = wire_request(&system_one.model, query, candidates, range.clone());
+            let response = match self
+                .send_with_retry("system_one", RetryPolicy::FailFast, || {
+                    with_bearer(
+                        self.client.post(url.clone()).timeout(timeout).json(&body),
+                        key.as_ref(),
+                    )
+                })
+                .await
+            {
+                Ok(response) => {
+                    // The service answered (even with an error status).
+                    self.system_one_breaker.clear();
+                    response
+                }
+                Err(error) => {
+                    if is_connect_error(&error) {
+                        self.system_one_breaker.trip(Instant::now());
+                    }
+                    return Err(error);
+                }
+            };
+            let bounded = read_limited_body(
+                check_status_without_body(response, "system_one")?,
+                MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .context("invalid system_one response")?;
+            ensure!(
+                !bounded.truncated,
+                "system_one response body exceeds {MAX_RESPONSE_BODY_BYTES} byte limit"
+            );
+            ranks.extend(parse_wire_scores(&bounded.bytes, range, total)?);
+        }
+        ranks.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(ranks)
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +895,12 @@ pub(crate) mod tests {
         OversizedRerank,
         /// Redirect the request to another fake server.
         Redirect(SocketAddr),
+        /// Answer HTTP 200 with this JSON body.
+        Json(&'static str),
+        /// Answer HTTP 422 (a state or row limit, as the typed service does).
+        Unprocessable,
+        /// Answer with this status and this exact (raw JSON) body.
+        RawError(u16, &'static str),
         /// Read the whole request, then close the connection without
         /// answering: the peer's FIN reaches a client waiting for a response.
         Close,
@@ -845,6 +1045,21 @@ pub(crate) mod tests {
                     String::new(),
                     format!("{value}\nrejected {target}; userinfo: {value}"),
                 ),
+                Step::Json(body) => ("200 OK", String::new(), body.to_owned()),
+                Step::Unprocessable => (
+                    "422 Unprocessable Entity",
+                    String::new(),
+                    r#"{"detail":"INPUT_TOO_LONG"}"#.to_owned(),
+                ),
+                Step::RawError(code, body) => {
+                    let status = match code {
+                        401 => "401 Unauthorized",
+                        403 => "403 Forbidden",
+                        500 => "500 Internal Server Error",
+                        other => panic!("the fake has no reason phrase for status {other}"),
+                    };
+                    (status, String::new(), body.to_owned())
+                }
                 Step::Close | Step::Reset => return,
             };
             let response = format!(
@@ -1488,5 +1703,268 @@ pub(crate) mod tests {
             error.contains("[redacted]"),
             "the header was not sent: {error}"
         );
+    }
+
+    fn test_key(secret: &str) -> ApiKey {
+        crate::endpoint::Endpoint {
+            url: "http://127.0.0.1:1/".into(),
+            model: "m".into(),
+            api_key_env: Some("TEST_KEY".into()),
+            allow_remote: true,
+        }
+        .api_key_from(|_| Some(secret.into()))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn redaction_catches_a_key_echoed_with_json_escapes() {
+        const SECRET: &str = "sk-escaped-echo-4f2a\u{1f511}x";
+        let key = test_key(SECRET);
+        // The first character as s, the astral character as a surrogate
+        // pair, both, and an upstream error re-escaped inside a gateway's
+        // JSON string: none contains the key literally.
+        for body in [
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x"}"#,
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x rejected"}"#,
+            r#"{"detail":"sk-escaped-echo-4f2a🔑x"}"#,
+            r#"{"error":"{\"detail\":\"\\u0073k-escaped-echo-4f2a\\ud83d\\udd11x\"}"}"#,
+            "sk-escaped-echo-4f2a\u{1f511}x and \\u0073k-escaped-echo-4f2a\\ud83d\\udd11x",
+        ] {
+            let redacted = redact_secret(body, Some(&key));
+            assert!(
+                !json_unescape(&redacted).contains(SECRET),
+                "{body} -> {redacted}"
+            );
+            assert!(!redacted.contains("escaped-echo"), "{body} -> {redacted}");
+            assert!(redacted.contains("[redacted"), "{body} -> {redacted}");
+        }
+        // A literal echo is still replaced in place; other text is kept.
+        assert_eq!(
+            redact_secret("bad key sk-escaped-echo-4f2a\u{1f511}x!", Some(&key)),
+            "bad key [redacted]!"
+        );
+        assert_eq!(
+            redact_secret(r#"{"detail":"quota soon"}"#, Some(&key)),
+            r#"{"detail":"quota soon"}"#
+        );
+        assert_eq!(redact_secret("no key", None), "no key");
+        // Malformed escapes never panic.
+        for body in [r"\u", r"\ud83d", r"\ud83dA", r"\ud83d\ud83d", r"\u12", "\\"] {
+            assert_eq!(redact_secret(body, Some(&key)), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_one_http_failures_report_only_the_status() {
+        // An escaped echo of a key and ordinary text: neither may reach the
+        // error, whatever redaction would have made of them.
+        const BODY: &str =
+            r#"{"error":"sk-private-key-77aa rejected","detail":"private-body-text"}"#;
+        for status in [401, 500] {
+            let server = FakeModelServer::start(vec![vec![Step::RawError(status, BODY)]]).await;
+            let models = wire_models(server.address, 24);
+            let error = models
+                .system_one_rank("q", &wire_candidates(2))
+                .await
+                .unwrap_err();
+            assert_eq!(server.requests(), 1, "{status}: not retried");
+            let http = error.downcast_ref::<HttpStatusError>().unwrap();
+            assert_eq!(http.status, status);
+            assert!(http.body.is_empty(), "{status}: {}", http.body);
+            let causes: Vec<String> = error.chain().map(ToString::to_string).collect();
+            assert_eq!(
+                causes,
+                [
+                    "system_one HTTP error".to_owned(),
+                    format!("HTTP status {status}")
+                ]
+            );
+            for text in [format!("{error:#}"), format!("{error:?}")] {
+                for needle in ["private", "rejected", "k-private-key", "77aa"] {
+                    assert!(!text.contains(needle), "{status}: {text}");
+                }
+            }
+        }
+    }
+
+    /// `Models` set to rescore with the typed service at `address`.
+    fn wire_models(address: impl std::fmt::Display, batch_size: usize) -> Models {
+        let config = Config {
+            rescorer: Rescorer::SystemOne,
+            system_one: Some(crate::provider::SystemOneConfig {
+                provider: ProviderKind::SystemOneWire,
+                url: format!("http://{address}"),
+                model: "decider".into(),
+                timeout_ms: 5_000,
+                batch_size,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        Models::new(&config).unwrap()
+    }
+
+    fn wire_candidates(count: usize) -> Vec<WireCandidate> {
+        (0..count)
+            .map(|i| WireCandidate::new(&format!("f{i}.rs"), 1, "doc"))
+            .collect()
+    }
+
+    /// An answer for candidates c01..c05 where c04 is the likeliest, c02 and
+    /// c05 tie, and c01 is the least likely.
+    const FIVE_ANSWERS: &str = r#"{"model":"decider-1","answers":{
+        "q_c01":{"noul":0.1},"q_c02":{"noul":0.5},"q_c03":{"noul":0.3},
+        "q_c04":{"noul":0.9},"q_c05":{"noul":0.5}}}"#;
+
+    #[tokio::test]
+    async fn system_one_scores_order_the_shortlist_in_batches_with_ties_in_fusion_order() {
+        // Three requests of two, two and one candidate; the same body answers
+        // all three because each batch reads only its own ids.
+        let server = FakeModelServer::start(vec![vec![Step::Json(FIVE_ANSWERS); 3]]).await;
+        let models = wire_models(server.address, 2);
+        let ranks = models
+            .system_one_rank("where is it", &wire_candidates(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            ranks,
+            [(3, 0.9), (1, 0.5), (4, 0.5), (2, 0.3), (0, 0.1)],
+            "best first; the 0.5 tie keeps the earlier candidate first"
+        );
+        assert_eq!(server.requests(), 3);
+        assert!(
+            server
+                .request_targets()
+                .iter()
+                .all(|target| target.starts_with("POST /v1/systemone ")),
+            "{:?}",
+            server.request_targets()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_one_failures_are_errors_and_only_a_refused_connection_trips_the_breaker() {
+        for (name, step, needle) in [
+            ("server error", Step::ServerError, "HTTP status 500"),
+            ("row limit", Step::Unprocessable, "HTTP status 422"),
+            (
+                "missing candidate",
+                Step::Json(r#"{"answers":{"q_c01":{"noul":0.1},"q_c02":{"noul":0.2}}}"#),
+                "no answer for c03",
+            ),
+            (
+                "not a probability",
+                Step::Json(
+                    r#"{"answers":{"q_c01":{"noul":0.1},"q_c02":{"noul":7},"q_c03":{"noul":0.2}}}"#,
+                ),
+                "outside 0..=1",
+            ),
+            (
+                "malformed",
+                Step::Json(r#"{"results":[]}"#),
+                "invalid system_one wire response",
+            ),
+        ] {
+            let server = FakeModelServer::start(vec![vec![step; 2]]).await;
+            let models = wire_models(server.address, 24);
+            let candidates = wire_candidates(3);
+            for attempt in 1..=2 {
+                let error = models.system_one_rank("q", &candidates).await.unwrap_err();
+                let text = format!("{error:#}");
+                assert!(text.contains(needle), "{name}: {text}");
+                assert!(!text.contains("recently unreachable"), "{name}: {text}");
+                assert_eq!(
+                    server.requests(),
+                    attempt,
+                    "{name}: the service is asked again"
+                );
+            }
+        }
+
+        let closed = closed_local_address();
+        let models = wire_models(&closed, 24);
+        let candidates = wire_candidates(2);
+        let first = models.system_one_rank("q", &candidates).await.unwrap_err();
+        assert!(is_connect_error(&first), "{first:#}");
+        let started = Instant::now();
+        let skipped = models.system_one_rank("q", &candidates).await.unwrap_err();
+        assert!(
+            format!("{skipped:#}").contains("recently unreachable"),
+            "{skipped:#}"
+        );
+        assert!(!is_connect_error(&skipped), "{skipped:#}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn system_one_needs_its_key_variable_and_never_shows_a_value() {
+        let server = FakeModelServer::start(vec![vec![Step::Json(FIVE_ANSWERS)]]).await;
+        let mut models = wire_models(server.address, 24);
+        models.config.system_one.as_mut().unwrap().api_key_env =
+            Some("LCI_TEST_SYSTEM_ONE_KEY_NOT_SET".into());
+        let error = models
+            .system_one_rank("q", &wire_candidates(5))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("LCI_TEST_SYSTEM_ONE_KEY_NOT_SET"), "{text}");
+        assert_eq!(server.requests(), 0, "no request without the key");
+
+        // Without the wire provider the rung refuses instead of guessing.
+        let plain = Models::new(&Config::default()).unwrap();
+        let error = plain
+            .system_one_rank("q", &wire_candidates(1))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("system_one_wire"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_one_validates_unvalidated_configs_before_sending() {
+        for (url, needle) in [
+            ("http://192.0.2.1:9", "system_one.allow_remote"),
+            ("ftp://192.0.2.1:9", "must use HTTP(S)"),
+        ] {
+            let config = Config {
+                rescorer: Rescorer::SystemOne,
+                system_one: Some(crate::provider::SystemOneConfig {
+                    provider: ProviderKind::SystemOneWire,
+                    url: url.into(),
+                    allow_remote: false,
+                    timeout_ms: 5_000,
+                    ..Default::default()
+                }),
+                ..Config::default()
+            };
+            let models = Models::new(&config).unwrap();
+            let started = Instant::now();
+            let error = models
+                .system_one_rank("q", &wire_candidates(1))
+                .await
+                .unwrap_err();
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(error.to_string().contains(needle), "{error:#}");
+            assert!(!error.chain().any(|cause| cause.is::<reqwest::Error>()));
+        }
+    }
+
+    #[tokio::test]
+    async fn system_one_signed_zero_scores_keep_fusion_order() {
+        let server = FakeModelServer::start(vec![vec![Step::Json(
+            r#"{"answers":{"q_c01":{"noul":-0.0},"q_c02":{"noul":0.0}}}"#,
+        )]])
+        .await;
+        let ranks = wire_models(server.address, 24)
+            .system_one_rank("q", &wire_candidates(2))
+            .await
+            .unwrap();
+        assert_eq!(ranks, [(0, 0.0), (1, 0.0)]);
+        assert!(ranks.iter().all(|(_, score)| score.is_sign_positive()));
+        assert_eq!(server.requests(), 1);
     }
 }
