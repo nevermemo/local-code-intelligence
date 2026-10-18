@@ -5,7 +5,7 @@ use super::*;
 use lci_maps::{
     config_key::ConfigKeyOptions,
     impact::{Decl, chain_of},
-    scip_graph::{RawDocument, RawOccurrence, ScipGraph},
+    scip_graph::{RawDocument, RawOccurrence, ScipGraph, SourceText},
     scip_impact::ImpactOptions,
 };
 use scip::types::symbol_information::Kind;
@@ -128,7 +128,16 @@ fn sources_of(
     kinds: &HashMap<String, Kind>,
     edges: &[reads_key::Edge],
 ) -> Sources {
-    let scip = Arc::new(ScipMap::with_default_ids(ScipGraph::build(&docs, None)));
+    sources_with(docs, kinds, edges, None)
+}
+
+fn sources_with(
+    docs: Vec<RawDocument>,
+    kinds: &HashMap<String, Kind>,
+    edges: &[reads_key::Edge],
+    text: Option<&dyn SourceText>,
+) -> Sources {
+    let scip = Arc::new(ScipMap::with_default_ids(ScipGraph::build(&docs, text)));
     let ix = ImpactIndex::build(docs, kinds, None);
     let node = |symbol: &str| {
         scip.graph()
@@ -989,4 +998,73 @@ async fn recipes_run_over_an_index_file_and_the_walk_goes_through_the_traversal(
         .ask(json!({"flow_from": {"entry": "Foo"}}), false)
         .await;
     assert_eq!(typed["stop"]["reason"], "empty");
+}
+
+/// `src/c.rs`: `trait Speak { fn say }`, `struct Dog`, `impl Speak for Dog`.
+struct TraitSource;
+
+impl SourceText for TraitSource {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        (path == "src/c.rs").then(|| {
+            b"trait Speak { fn say(&self); }\nstruct Dog;\nimpl Speak for Dog { fn say(&self) {} }\n"
+                .to_vec()
+        })
+    }
+}
+
+fn trait_sources() -> Sources {
+    let (speak, decl, dog, member) = (
+        sym("c/Speak#"),
+        sym("c/Speak#say()."),
+        sym("c/Dog#"),
+        sym("c/impl#[Dog][Speak]say()."),
+    );
+    let docs = vec![RawDocument {
+        path: "src/c.rs".into(),
+        occurrences: vec![
+            occ((0, 6, 0, 11), &speak, 1, Some((0, 0, 0, 30))),
+            occ((0, 17, 0, 20), &decl, 1, Some((0, 14, 0, 28))),
+            occ((1, 7, 1, 10), &dog, 1, Some((1, 0, 1, 11))),
+            occ((2, 5, 2, 10), &speak, 0, None),
+            occ((2, 15, 2, 18), &dog, 0, None),
+            occ((2, 24, 2, 27), &member, 1, Some((2, 21, 2, 37))),
+        ],
+    }];
+    let kinds = [
+        ("c/Speak#", Kind::Trait),
+        ("c/Speak#say().", Kind::Method),
+        ("c/Dog#", Kind::Struct),
+        ("c/impl#[Dog][Speak]say().", Kind::Method),
+    ]
+    .into_iter()
+    .map(|(symbol, kind)| (sym(symbol), kind))
+    .collect();
+    sources_with(docs, &kinds, &[], Some(&TraitSource))
+}
+
+#[tokio::test]
+async fn recipes_over_calls_do_not_follow_a_trait_implementation() {
+    let sources = trait_sources();
+    // The graph holds the link from the member to the declaration ...
+    let graph = sources.scip.graph();
+    let member = graph.node_index(&sym("c/impl#[Dog][Speak]say().")).unwrap();
+    assert!(
+        graph.out[member]
+            .iter()
+            .any(|e| e.kind == lci_maps::scip_graph::GraphEdgeKind::Implements)
+    );
+    // ... but a callee walk does not take it, and no path crosses it.
+    let callees = compose_of(json!([
+        {"id": "a", "op": "graph.scip", "in": {"symbols": "Dog::say", "depth": 3}},
+    ]));
+    let answer = compose::run(&sources, &callees, started()).await.unwrap();
+    assert!(names(&answer, "a").is_empty(), "{answer}");
+    let answer = flow_path(
+        &sources,
+        &path_args("Dog::say", "Speak::say", None),
+        started(),
+    )
+    .unwrap();
+    assert_eq!(answer["stop"]["reason"], "empty", "{answer}");
+    assert!(names(&answer, "path").is_empty(), "{answer}");
 }

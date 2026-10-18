@@ -1385,6 +1385,118 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
 }
 
 #[tokio::test]
+async fn markdown_comes_back_in_a_docs_list_beside_the_results_in_the_full_and_compact_shapes() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("mcp-docs");
+    write_presentation_workspace(&workspace);
+    write(
+        &workspace,
+        "README.md",
+        "# Readme\nThe translator overview.\n\n## Layout\ntranslator translator in src.\n",
+    );
+    write(
+        &workspace,
+        "docs/guide.md",
+        "# Guide\nHow to run the translator.\n",
+    );
+    write(&workspace, "docs/more.md", "# More\nA translator note.\n");
+    let app = Arc::new(
+        App::open(presentation_config(config))
+            .await
+            .unwrap()
+            .with_candidate_dump(None),
+    );
+    app.index(&workspace).await.unwrap();
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (default_session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let (compact_session, _) = mcp_initialize(&client, &base, "/mcp/compact").await;
+
+    // The full report: the old keys plus `docs`, no Markdown in `results`.
+    let full = mcp_search_everything(&client, &base, "/mcp", &default_session, &workspace).await;
+    let full = structured(&full);
+    assert_eq!(
+        object_keys(full),
+        [
+            "candidate_count",
+            "docs",
+            "filters",
+            "index",
+            "query",
+            "reranked",
+            "results",
+            "timings",
+            "warning",
+            "workspace"
+        ],
+        "{full}"
+    );
+    assert!(
+        full["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["language"] != "markdown")
+    );
+    assert_eq!(
+        object_keys(&full["docs"]),
+        [
+            "candidate_count",
+            "reranked",
+            "results",
+            "timings",
+            "warning"
+        ],
+        "{full}"
+    );
+    let docs = full["docs"]["results"].as_array().unwrap();
+    assert_eq!(docs.len(), 2);
+    assert!(docs.iter().all(|hit| hit["language"] == "markdown"));
+
+    // The compact shape lists the docs after the results.
+    let compact_response =
+        mcp_search_everything(&client, &base, "/mcp/compact", &compact_session, &workspace).await;
+    let compact = structured(&compact_response);
+    assert_eq!(
+        object_keys(compact),
+        [
+            "docs",
+            "filters",
+            "index",
+            "results",
+            "search_profile",
+            "workspace"
+        ],
+        "{compact}"
+    );
+    assert_key_order(
+        text_content(&compact_response),
+        &["workspace", "filters", "index", "results", "docs"],
+    );
+    let compact_docs = compact["docs"].as_array().unwrap();
+    assert_eq!(compact_docs.len(), 2);
+    for (compact_hit, full_hit) in compact_docs.iter().zip(docs) {
+        assert_eq!(
+            compact_hit["relative_file_path"],
+            full_hit["relative_file_path"]
+        );
+        assert_eq!(compact_hit["code"], full_hit["code"]);
+        assert_eq!(compact_hit["language"], "markdown");
+    }
+    assert!(
+        compact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["language"] != "markdown")
+    );
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
 async fn the_compact_response_ceiling_shortens_code_but_keeps_every_locator_or_fails_with_advice() {
     let (temp, config, _fake, models_task) = fixture().await;
     let workspace = temp.path().join("mcp-ceiling");

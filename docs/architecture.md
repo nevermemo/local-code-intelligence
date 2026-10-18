@@ -71,7 +71,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
 - Language registry (`language::ADAPTERS`): 18 extensions (rs, ts, tsx, js, jsx, py, cs, go, java, c, h, cpp, hpp, cc,
   cxx, hh, hxx, md) and 12 identifiers (`h` maps to `c`; hpp, cc, cxx, hh and hxx map to `cpp`; the registry never inspects
   content to choose a language). Each adapter has its own `cache_version` (for example `rust-chunks-v4`); lookup is
-  `for_extension` and `for_path`. This table is the whole indexed set. Each adapter has an extractor kind: Tree-sitter (a grammar plus a syntax description) or prose (`.md`: `chunk::markdown`, a hand-written heading splitter, no grammar and no language server). RST, AsciiDoc, text, TOML, YAML, JSON, build files and agent instruction files have no chunks.
+  `for_extension` and `for_path`. This table is the whole indexable set; `.md` files are indexed only with `[index].prose = true`. Each adapter has an extractor kind: Tree-sitter (a grammar plus a syntax description) or prose (`.md`: `chunk::markdown`, a hand-written heading splitter, no grammar and no language server). RST, AsciiDoc, text, TOML, YAML, JSON, build files and agent instruction files have no chunks.
 - Chunk identity: no chunk-id column exists. Fusion keys a chunk by `(relative_file_path, start_line, content_hash)`;
   the vector cache by `content_hash`, or by `content_hash` plus path when the document template contains `{path}`
   (`vector_key`); the fused-order tie-break adds `end_line` (`fusion_order`: score, path, start, end, hash). An edit

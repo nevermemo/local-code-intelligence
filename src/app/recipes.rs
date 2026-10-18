@@ -70,7 +70,7 @@ use lci_maps::{
     edge::Edge,
     impact::{Chain, ImpactIndex, code_names},
     reads_key,
-    scip_graph::ScipMap,
+    scip_graph::{GraphEdgeKind, ScipMap},
     scip_impact::ImpactMap,
 };
 use schemars::JsonSchema;
@@ -1077,6 +1077,15 @@ fn impact_rings(sources: &Sources, args: &ImpactRingsArgs, started: Instant) -> 
     Ok(finish(recipe, anchor, run, stop, started, None))
 }
 
+/// The edges of `graph` a recipe over calls follows: the calls, references and
+/// containment edges, never `Implements` (a trait-impl link is not a call).
+fn followed(
+    edges: &[lci_maps::scip_graph::Edge],
+) -> impl Iterator<Item = &lci_maps::scip_graph::Edge> {
+    edges
+        .iter()
+        .filter(|e| matches!(e.kind, GraphEdgeKind::CallsOrRefs | GraphEdgeKind::Contains))
+}
 // ----------------------------------------------------------------- flow_path
 
 /// Distances from `start` along `adjacent`, at most `max` hops, and the
@@ -1156,7 +1165,7 @@ fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result
 
     let at = Instant::now();
     let (forward, pops) = distances(from, max_depth, &|n| {
-        graph.out[n].iter().map(|e| e.to).collect()
+        followed(&graph.out[n]).map(|e| e.to).collect()
     });
     run.calls += pops;
     run.step(
@@ -1171,7 +1180,7 @@ fn flow_path(sources: &Sources, args: &FlowPathArgs, started: Instant) -> Result
     let at = Instant::now();
     let mut reverse_edges: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
     for (caller, edges) in graph.out.iter().enumerate() {
-        for edge in edges {
+        for edge in followed(edges) {
             reverse_edges[edge.to].push(caller);
         }
     }
