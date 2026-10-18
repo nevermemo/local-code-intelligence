@@ -1,0 +1,486 @@
+{
+  "version": 1,
+  "repo": "vite",
+  "revision": "7a89794331526a67bc9b29047b86957c581c128c",
+  "seed": 20261018,
+  "families": [
+    {
+      "id": "vite.browser",
+      "split": "dev",
+      "format": "json",
+      "key": "browser",
+      "assignments": [
+        {
+          "path": "playground/resolve/browser-field/package.json",
+          "line": 7,
+          "end_line": 18,
+          "sha256": "f565ae101085c615eb353f6c23f58697746b6f8c1eb460efb0b2153fe502520d",
+          "value": "{\n    \"./out/cjs.node.js\": \"./out/esm.browser.js\",\n    \"./no-ext\": \"./out/esm.browser.js\",\n    \"./ext.js\": \"./out/esm.browser.js\",\n    \"./ext-index/index.js\": \"./out/esm.browser.js\",\n    \"./no-ext-index\": \"./out/esm.browser.js\",\n    \"./bare-import\": \"./bare-import.js\",\n    \"./not-browser.js\": false,\n    \"./multiple.dot.path.js\": false,\n    \"jsdom\": false,\n    \"@vitejs/test-resolve-browser-field-bare-import-fail\": \"@vitejs/test-resolve-browser-field-bare-import-success\"\n  }",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/plugins/resolve.ts",
+          "line": 1067,
+          "end_line": 1067,
+          "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb",
+          "how": "literal"
+        },
+        {
+          "path": "packages/vite/src/node/plugins/resolve.ts",
+          "line": 1096,
+          "end_line": 1104,
+          "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb",
+          "how": "literal"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/plugins/resolve.ts::resolveDeepImport (handoff to mapWithBrowserField)",
+      "excluded_readers": [],
+      "behaviour": "Remaps package-relative module paths, with false marking a path as external for the client environment.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/plugins/resolve.ts",
+          "line": 1125,
+          "end_line": 1130,
+          "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb"
+        }
+      ]
+    },
+    {
+      "id": "vite.compilerOptions.experimentalDecorators",
+      "split": "heldout",
+      "format": "json",
+      "key": "compilerOptions.experimentalDecorators",
+      "assignments": [
+        {
+          "path": "packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/decorator-metadata/tsconfig.json",
+          "line": 3,
+          "end_line": 3,
+          "sha256": "d697ad5ef675b592cd690acf25e65108ce30caa5a3938240e66443dd30940411",
+          "value": "true",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/plugins/esbuild.ts",
+          "line": 160,
+          "end_line": 165,
+          "sha256": "911e953651b7aeeb848fb6059fc05b444f0d398da456af04d70dd2813b7f9b76",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/plugins/esbuild.ts::transformWithEsbuild (handoff to esbuild)",
+      "excluded_readers": [],
+      "behaviour": "Enables legacy parameter annotation transformation in the compatibility compiler.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/plugins/esbuild.ts",
+          "line": 256,
+          "end_line": 267,
+          "sha256": "911e953651b7aeeb848fb6059fc05b444f0d398da456af04d70dd2813b7f9b76"
+        }
+      ]
+    },
+    {
+      "id": "vite.compilerOptions.jsxImportSource",
+      "split": "dev",
+      "format": "json",
+      "key": "compilerOptions.jsxImportSource",
+      "assignments": [
+        {
+          "path": "packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/jsx-react-jsx/tsconfig.json",
+          "line": 5,
+          "end_line": 5,
+          "sha256": "e7d232fda13f477e201239faf6916d719f2b3d95001113a4283a8aecf37e7f1b",
+          "value": "\"baz\"",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/plugins/esbuild.ts",
+          "line": 160,
+          "end_line": 165,
+          "sha256": "911e953651b7aeeb848fb6059fc05b444f0d398da456af04d70dd2813b7f9b76",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/plugins/esbuild.ts::transformWithEsbuild (handoff to esbuild)",
+      "excluded_readers": [],
+      "behaviour": "Supplies the provider for automatic JSX runtime helpers, unless direct transform options override it.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/plugins/esbuild.ts",
+          "line": 185,
+          "end_line": 192,
+          "sha256": "911e953651b7aeeb848fb6059fc05b444f0d398da456af04d70dd2813b7f9b76"
+        },
+        {
+          "path": "docs/guide/features.md",
+          "line": 110,
+          "end_line": 118,
+          "sha256": "8d819b6a9f3a793c08f3081eb05e363580b29bb215d58ab0b7b93bfe264e7fc0"
+        }
+      ]
+    },
+    {
+      "id": "vite.exports",
+      "split": "heldout",
+      "format": "json",
+      "key": "exports",
+      "assignments": [
+        {
+          "path": "playground/resolve/exports-legacy-fallback/package.json",
+          "line": 5,
+          "end_line": 11,
+          "sha256": "2ddfe0a1ee1d85ce9e4d5e45c1f761562755438d7435345b3bed84c868db1b3e",
+          "value": "{\n    \"./dir\": {\n      \"import\": \"./dir/index.mjs\",\n      \"require\": \"./dir/index.js\"\n    },\n    \".\": \"index.js\"\n  }",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/optimizer/resolve.ts",
+          "line": 59,
+          "end_line": 59,
+          "sha256": "2c9373956a4ef3248f8f636d0d324b1f832ed4f1077623928f3f6498d48ea9a8",
+          "how": "literal"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/optimizer/resolve.ts::expandGlobIds",
+      "excluded_readers": [],
+      "behaviour": "Provides the allowed package entry paths over which dependency-optimization include globs are expanded.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/optimizer/resolve.ts",
+          "line": 61,
+          "end_line": 62,
+          "sha256": "2c9373956a4ef3248f8f636d0d324b1f832ed4f1077623928f3f6498d48ea9a8"
+        }
+      ]
+    },
+    {
+      "id": "vite.imports",
+      "split": "dev",
+      "format": "json",
+      "key": "imports",
+      "assignments": [
+        {
+          "path": "playground/resolve/package.json",
+          "line": 12,
+          "end_line": 22,
+          "sha256": "5f824fa788f8559540693bdd9b092a7126816dadad82430f0ae452890f8f1683",
+          "value": "{\n    \"#top-level\": \"./imports-path/top-level.js\",\n    \"#same-level\": \"./imports-path/same-level.js\",\n    \"#nested/path.js\": \"./imports-path/nested-path.js\",\n    \"#star/*\": \"./imports-path/star/*\",\n    \"#slash/\": \"./imports-path/slash/\",\n    \"#other-pkg-slash/\": \"@vitejs/test-resolve-imports-pkg/nest/\",\n    \"#query\": \"./imports-path/query.json\",\n    \"#dot-prefixed\": \"./imports-path/.dot-prefixed/index.js\",\n    \"#/*\": \"./imports-path/root-slash/*\"\n  }",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/plugins/resolve.ts",
+          "line": 512,
+          "end_line": 516,
+          "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb",
+          "how": "constant"
+        },
+        {
+          "path": "packages/vite/src/node/plugins/resolve.ts",
+          "line": 1050,
+          "end_line": 1051,
+          "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb",
+          "how": "constant"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/plugins/resolve.ts::resolveSubpathImports + resolveExportsOrImports (handoff to resolve.exports)",
+      "excluded_readers": [],
+      "behaviour": "Remaps package-internal specifiers through the manifest mapping; the resolver hands the map and active conditions to its resolution library.",
+      "docs": [
+        {
+          "path": "docs/config/shared-options.md",
+          "line": 658,
+          "end_line": 658,
+          "sha256": "8081e6b75660b49d2536c23c2d58a6cc12930f1e1e4b02c20e34b32601688230"
+        }
+      ]
+    },
+    {
+      "id": "vite.sideEffects",
+      "split": "dev",
+      "format": "json",
+      "key": "sideEffects",
+      "assignments": [
+        {
+          "path": "playground/html/side-effects/package.json",
+          "line": 5,
+          "end_line": 5,
+          "sha256": "748a915c513f0b0f98a3153f7ba83560050def3b47463e4ae191f96d280b798b",
+          "value": "false",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/packages.ts",
+          "line": 201,
+          "end_line": 228,
+          "sha256": "6563cc7314120ea15c25a68731c4f1e6e3172325ec97255344d92fada81586f9",
+          "how": "literal"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/packages.ts::loadPackageData",
+      "excluded_readers": [],
+      "behaviour": "Builds a predicate indicating which package files must be retained for effects; false allows unused files to be discarded.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/packages.ts",
+          "line": 201,
+          "end_line": 228,
+          "sha256": "6563cc7314120ea15c25a68731c4f1e6e3172325ec97255344d92fada81586f9"
+        }
+      ]
+    },
+    {
+      "id": "vite.workspace",
+      "split": "heldout",
+      "format": "json",
+      "key": "workspace",
+      "assignments": [
+        {
+          "path": "packages/vite/src/node/server/__tests__/fixtures/deno/deno.json",
+          "line": 2,
+          "end_line": 2,
+          "sha256": "8901b94f9aa5ffc3ee11e7582b4a2b3a4aecbc4bce27d98e9ec3a571c4faef6b",
+          "value": "[\"nested\"]",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/server/searchRoot.ts",
+          "line": 47,
+          "end_line": 47,
+          "sha256": "268985d5ba5eb2cc8e3dc98bfaecfd554560766306824046008c88afc011b8a6",
+          "how": "literal"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/server/searchRoot.ts",
+      "excluded_readers": [],
+      "behaviour": "Marks a Deno configuration directory as the enclosing workspace root during upward root discovery.",
+      "docs": [
+        {
+          "path": "packages/vite/src/node/server/searchRoot.ts",
+          "line": 82,
+          "end_line": 90,
+          "sha256": "268985d5ba5eb2cc8e3dc98bfaecfd554560766306824046008c88afc011b8a6"
+        }
+      ]
+    },
+    {
+      "id": "vite.workspaces",
+      "split": "heldout",
+      "format": "json",
+      "key": "workspaces",
+      "assignments": [
+        {
+          "path": "packages/vite/src/node/server/__tests__/fixtures/yarn/package.json",
+          "line": 3,
+          "end_line": 5,
+          "sha256": "0ab3d0512cc399fb59835d9246c6d2681a7392c378504a6ec3dbc4e2adcbb43d",
+          "value": "[\n    \"nested\"\n  ]",
+          "kind": "fixture"
+        }
+      ],
+      "readers": [
+        {
+          "path": "packages/vite/src/node/server/searchRoot.ts",
+          "line": 32,
+          "end_line": 32,
+          "sha256": "268985d5ba5eb2cc8e3dc98bfaecfd554560766306824046008c88afc011b8a6",
+          "how": "literal"
+        }
+      ],
+      "readers_scope": "component:packages/vite/src/node/server/searchRoot.ts",
+      "excluded_readers": [],
+      "behaviour": "Marks a package directory as the enclosing workspace root for file-serving boundary discovery.",
+      "docs": [
+        {
+          "path": "docs/config/server-options.md",
+          "line": 394,
+          "end_line": 399,
+          "sha256": "7105368fa565a16e1bb99e8c8f58372101c3a98a1cec9453749bd5fefc7f2e6c"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "vite.browser.q1",
+      "family": "vite.browser",
+      "type": "setting_location",
+      "text": "Where is `browser` set in the client-path-mapping resolution playground package?",
+      "names_key": true
+    },
+    {
+      "id": "vite.browser.q2",
+      "family": "vite.browser",
+      "type": "behaviour_to_setting",
+      "text": "Which manifest field replaces package-relative module paths for client builds and can disable individual modules with false?",
+      "names_key": false
+    },
+    {
+      "id": "vite.browser.q3",
+      "family": "vite.browser",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/plugins/resolve.ts::resolveDeepImport (handoff to mapWithBrowserField)` reads `browser`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.compilerOptions.experimentalDecorators.q1",
+      "family": "vite.compilerOptions.experimentalDecorators",
+      "type": "setting_location",
+      "text": "Where is `compilerOptions.experimentalDecorators` set in the Oxc decorator-metadata fixture?",
+      "names_key": true
+    },
+    {
+      "id": "vite.compilerOptions.experimentalDecorators.q2",
+      "family": "vite.compilerOptions.experimentalDecorators",
+      "type": "behaviour_to_setting",
+      "text": "Which TypeScript switch does the compatibility compiler recommend when it rejects legacy parameter annotations?",
+      "names_key": false
+    },
+    {
+      "id": "vite.compilerOptions.experimentalDecorators.q3",
+      "family": "vite.compilerOptions.experimentalDecorators",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/plugins/esbuild.ts::transformWithEsbuild (handoff to esbuild)` reads `compilerOptions.experimentalDecorators`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.compilerOptions.jsxImportSource.q1",
+      "family": "vite.compilerOptions.jsxImportSource",
+      "type": "setting_location",
+      "text": "Where is `compilerOptions.jsxImportSource` set in the Oxc react-jsx fixture?",
+      "names_key": true
+    },
+    {
+      "id": "vite.compilerOptions.jsxImportSource.q2",
+      "family": "vite.compilerOptions.jsxImportSource",
+      "type": "behaviour_to_setting",
+      "text": "Which TypeScript setting selects the library providing automatic element-construction helpers unless a direct transform option overrides it?",
+      "names_key": false
+    },
+    {
+      "id": "vite.compilerOptions.jsxImportSource.q3",
+      "family": "vite.compilerOptions.jsxImportSource",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/plugins/esbuild.ts::transformWithEsbuild (handoff to esbuild)` reads `compilerOptions.jsxImportSource`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.exports.q1",
+      "family": "vite.exports",
+      "type": "setting_location",
+      "text": "Where is `exports` set in the legacy-entry-fallback resolution playground package?",
+      "names_key": true
+    },
+    {
+      "id": "vite.exports.q2",
+      "family": "vite.exports",
+      "type": "behaviour_to_setting",
+      "text": "Which manifest field supplies allowed package entry paths when the dependency optimizer expands a wildcard inclusion?",
+      "names_key": false
+    },
+    {
+      "id": "vite.exports.q3",
+      "family": "vite.exports",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/optimizer/resolve.ts::expandGlobIds` reads `exports`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.imports.q1",
+      "family": "vite.imports",
+      "type": "setting_location",
+      "text": "Where is `imports` set in the main resolution playground manifest?",
+      "names_key": true
+    },
+    {
+      "id": "vite.imports.q2",
+      "family": "vite.imports",
+      "type": "behaviour_to_setting",
+      "text": "Which manifest field remaps package-internal hash-prefixed module specifiers?",
+      "names_key": false
+    },
+    {
+      "id": "vite.imports.q3",
+      "family": "vite.imports",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/plugins/resolve.ts::resolveSubpathImports + resolveExportsOrImports (handoff to resolve.exports)` reads `imports`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.sideEffects.q1",
+      "family": "vite.sideEffects",
+      "type": "setting_location",
+      "text": "Where is `sideEffects` set in the HTML side-effects playground package?",
+      "names_key": true
+    },
+    {
+      "id": "vite.sideEffects.q2",
+      "family": "vite.sideEffects",
+      "type": "behaviour_to_setting",
+      "text": "Which manifest field marks files as safe to discard when unused, optionally selecting exceptions with glob patterns?",
+      "names_key": false
+    },
+    {
+      "id": "vite.sideEffects.q3",
+      "family": "vite.sideEffects",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/packages.ts::loadPackageData` reads `sideEffects`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.workspace.q1",
+      "family": "vite.workspace",
+      "type": "setting_location",
+      "text": "Where is `workspace` set in the Deno root-discovery fixture?",
+      "names_key": true
+    },
+    {
+      "id": "vite.workspace.q2",
+      "family": "vite.workspace",
+      "type": "behaviour_to_setting",
+      "text": "Which Deno configuration field makes upward project-root discovery stop at a multi-package directory?",
+      "names_key": false
+    },
+    {
+      "id": "vite.workspace.q3",
+      "family": "vite.workspace",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/server/searchRoot.ts` reads `workspace`?",
+      "names_key": true
+    },
+    {
+      "id": "vite.workspaces.q1",
+      "family": "vite.workspaces",
+      "type": "setting_location",
+      "text": "Where is `workspaces` set in the Yarn root-discovery fixture?",
+      "names_key": true
+    },
+    {
+      "id": "vite.workspaces.q2",
+      "family": "vite.workspaces",
+      "type": "behaviour_to_setting",
+      "text": "Which manifest field makes a multi-package project directory the root used to determine the development server file-serving boundary?",
+      "names_key": false
+    },
+    {
+      "id": "vite.workspaces.q3",
+      "family": "vite.workspaces",
+      "type": "setting_to_reader",
+      "text": "What code in `packages/vite/src/node/server/searchRoot.ts` reads `workspaces`?",
+      "names_key": true
+    }
+  ]
+}

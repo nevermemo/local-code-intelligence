@@ -1,0 +1,1476 @@
+lci:src/app/search.rs:1267-1267
+1267:             let (action, warning) = match self.config.index.freshness {
+
+lci:lci-core/src/config.rs:11-24
+11: /// Controls when a search request may trigger an automatic incremental
+12: /// refresh of a workspace's index. `on-search` is the default for coding
+13: /// agents: freshness is checked lazily on the first retrieval that needs it,
+14: /// throttled by `stale_check_interval_seconds`. `watch` defers refresh to the
+15: /// background watcher started by `watch_workspace` instead of checking on
+16: /// every search, which suits long-running editor sessions. `manual` never
+17: /// refreshes automatically; callers must call `index_workspace` explicitly.
+18: #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+19: #[serde(rename_all = "kebab-case")]
+20: pub enum IndexFreshness {
+21:     Manual,
+22:     #[default]
+23:     OnSearch,
+24:     Watch,
+
+lci:config.example.toml:306-306
+306: freshness = "on-search"
+
+lci:src/app/indexing.rs:424-424
+424:                 std::time::Duration::from_secs(self.config.index.stale_check_interval_seconds);
+
+lci:lci-core/src/config.rs:31-34
+31:     /// Minimum interval between filesystem staleness checks for a workspace
+32:     /// under `on-search` freshness, so repeated searches in the same
+33:     /// unchanged workspace reuse the current snapshot instead of rescanning.
+34:     pub stale_check_interval_seconds: u64,
+
+lci:config.example.toml:309-309
+309: stale_check_interval_seconds = 10
+
+lci:src/app/indexing.rs:467-467
+467:                     std::time::Duration::from_secs(self.config.index.wait_for_existing_job_seconds);
+
+lci:lci-core/src/config.rs:35-37
+35:     /// How long a search waits for a concurrently running refresh job before
+36:     /// falling back to the previous snapshot.
+37:     pub wait_for_existing_job_seconds: u64,
+
+lci:config.example.toml:312-312
+312: wait_for_existing_job_seconds = 120
+
+lci:src/app/search.rs:1560-1560
+1560:             hit.fusion_score += weights.semantic_weight / (rrf_k + rank as f32);
+
+lci:lci-core/src/config.rs:389-390
+389:     /// Weight of the semantic (vector) channel's reciprocal-rank contribution.
+390:     pub semantic_weight: f32,
+
+lci:config.example.toml:277-277
+277: semantic_weight = 1.0
+
+lci:src/app/readiness.rs:99-99
+99:         let timeout = std::time::Duration::from_secs(self.config.readiness_timeout_seconds);
+
+lci:config.example.toml:77-77
+77: # Bounded timeout for /ready and service_status dependency probes (1-30 seconds).
+
+lci:config.example.toml:78-78
+78: readiness_timeout_seconds = 5
+
+lci:lci-core/src/models.rs:648-648
+648:         fill_template(&self.config.embedding_query_template, &[("query", query)])
+
+lci:lci-core/src/config.rs:484-488
+484:     /// Text embedded for a search query, with `{query}` replaced by the query
+485:     /// (required). Embedding models differ in the prompt format they expect
+486:     /// (an instruction prefix, a task label), so this is configurable.
+487:     /// Query-side only: changing it never invalidates an existing index.
+488:     pub embedding_query_template: String,
+
+lci:config.example.toml:48-48
+48: embedding_query_template = "Instruct: Given a code search query, retrieve relevant code passages that answer the query\nQuery: {query}"
+
+lci:src/app/traverse/chunks.rs:178-178
+178:         let template = &self.app.config.embedding_document_template;
+
+lci:lci-core/src/config.rs:489-496
+489:     /// Text embedded for each indexed chunk, with `{code}` replaced by the
+490:     /// chunk's source (required) and `{path}` by its repository-relative file
+491:     /// path (optional). The default embeds the bare code. Changing it
+492:     /// changes `embedding_identity`, so every chunk is re-embedded on the next
+493:     /// index or search. Without `{path}` a vector depends only on the chunk's
+494:     /// code, and identical code is embedded once and reused wherever it
+495:     /// appears. With `{path}` it depends on the file too, so identical code in
+496:     /// different files, or a file moved to a new path, is embedded per path.
+
+lci:config.example.toml:60-60
+60: embedding_document_template = "{code}"
+
+lci:lci-core/src/lsp/rust.rs:32-32
+32:             trusted: config.rust_analyzer_trusted,
+
+lci:config.example.toml:93-94
+93: # Restore rust-analyzer's execution/network defaults only for trusted
+94: # repositories and dependencies. Applies to every workspace this process uses.
+
+lci:config.example.toml:95-95
+95: rust_analyzer_trusted = false
+
+vite:packages/vite/src/node/packages.ts:201-228
+201:   const { sideEffects } = data
+202:   let hasSideEffects: (id: string) => boolean | null
+203:   if (typeof sideEffects === 'boolean') {
+204:     hasSideEffects = () => sideEffects
+205:   } else if (Array.isArray(sideEffects)) {
+206:     if (sideEffects.length <= 0) {
+207:       // createFilter always returns true if `includes` is an empty array
+208:       // but here we want it to always return false
+209:       hasSideEffects = () => false
+210:     } else {
+211:       const finalPackageSideEffects = sideEffects.map((sideEffect) => {
+212:         /*
+213:          * The array accepts simple glob patterns to the relevant files... Patterns like *.css, which do not include a /, will be treated like **\/*.css.
+214:          * https://webpack.js.org/guides/tree-shaking/
+215:          * https://github.com/vitejs/vite/pull/11807
+216:          */
+217:         if (sideEffect.includes('/')) {
+218:           return sideEffect
+219:         }
+220:         return `**/${sideEffect}`
+221:       })
+222: 
+223:       hasSideEffects = createFilter(finalPackageSideEffects, null, {
+224:         resolve: pkgDir,
+225:       })
+226:     }
+227:   } else {
+228:     hasSideEffects = () => null
+
+vite:packages/vite/src/node/packages.ts:201-228
+201:   const { sideEffects } = data
+202:   let hasSideEffects: (id: string) => boolean | null
+203:   if (typeof sideEffects === 'boolean') {
+204:     hasSideEffects = () => sideEffects
+205:   } else if (Array.isArray(sideEffects)) {
+206:     if (sideEffects.length <= 0) {
+207:       // createFilter always returns true if `includes` is an empty array
+208:       // but here we want it to always return false
+209:       hasSideEffects = () => false
+210:     } else {
+211:       const finalPackageSideEffects = sideEffects.map((sideEffect) => {
+212:         /*
+213:          * The array accepts simple glob patterns to the relevant files... Patterns like *.css, which do not include a /, will be treated like **\/*.css.
+214:          * https://webpack.js.org/guides/tree-shaking/
+215:          * https://github.com/vitejs/vite/pull/11807
+216:          */
+217:         if (sideEffect.includes('/')) {
+218:           return sideEffect
+219:         }
+220:         return `**/${sideEffect}`
+221:       })
+222: 
+223:       hasSideEffects = createFilter(finalPackageSideEffects, null, {
+224:         resolve: pkgDir,
+225:       })
+226:     }
+227:   } else {
+228:     hasSideEffects = () => null
+
+vite:playground/html/side-effects/package.json:5-5
+5:   "sideEffects": false
+
+vite:packages/vite/src/node/optimizer/resolve.ts:59-59
+59:   const exports = pkgData.data.exports
+
+vite:packages/vite/src/node/optimizer/resolve.ts:61-62
+61:   // if package has exports field, get all possible export paths and apply
+62:   // glob on them with picomatch
+
+vite:playground/resolve/exports-legacy-fallback/package.json:5-11
+5:   "exports": {
+6:     "./dir": {
+7:       "import": "./dir/index.mjs",
+8:       "require": "./dir/index.js"
+9:     },
+10:     ".": "index.js"
+11:   }
+
+vite:packages/vite/src/node/plugins/esbuild.ts:160-165
+160: 
+161:         for (const field of meaningfulFields) {
+162:           if (field in loadedCompilerOptions) {
+163:             // @ts-expect-error TypeScript can't tell they are of the same type
+164:             compilerOptionsForFile[field] = loadedCompilerOptions[field]
+165:           }
+
+vite:packages/vite/src/node/plugins/esbuild.ts:256-267
+256:     // patch error information
+257:     if (e.errors) {
+258:       e.frame = ''
+259:       e.errors.forEach((m: EsbuildMessage) => {
+260:         if (
+261:           m.text === 'Experimental decorators are not currently enabled' ||
+262:           m.text ===
+263:             'Parameter decorators only work when experimental decorators are enabled'
+264:         ) {
+265:           m.text +=
+266:             '. Vite 5 now uses esbuild 0.18 and you need to enable them by adding "experimentalDecorators": true in your "tsconfig.json" file.'
+267:         }
+
+vite:packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/decorator-metadata/tsconfig.json:3-3
+3:     "experimentalDecorators": true,
+
+vite:packages/vite/src/node/plugins/esbuild.ts:160-165
+160: 
+161:         for (const field of meaningfulFields) {
+162:           if (field in loadedCompilerOptions) {
+163:             // @ts-expect-error TypeScript can't tell they are of the same type
+164:             compilerOptionsForFile[field] = loadedCompilerOptions[field]
+165:           }
+
+vite:packages/vite/src/node/plugins/esbuild.ts:185-192
+185:     // esbuild uses tsconfig fields when both the normal options and tsconfig was set
+186:     // but we want to prioritize the normal options
+187:     if (options) {
+188:       if (options.jsx) compilerOptions.jsx = undefined
+189:       if (options.jsxFactory) compilerOptions.jsxFactory = undefined
+190:       if (options.jsxFragment) compilerOptions.jsxFragmentFactory = undefined
+191:       if (options.jsxImportSource) compilerOptions.jsxImportSource = undefined
+192:     }
+
+vite:docs/guide/features.md:110-118
+110: - [`extends`](https://www.typescriptlang.org/tsconfig#extends)
+111: - [`importsNotUsedAsValues`](https://www.typescriptlang.org/tsconfig#importsNotUsedAsValues)
+112: - [`preserveValueImports`](https://www.typescriptlang.org/tsconfig#preserveValueImports)
+113: - [`verbatimModuleSyntax`](https://www.typescriptlang.org/tsconfig#verbatimModuleSyntax)
+114: - [`jsx`](https://www.typescriptlang.org/tsconfig#jsx)
+115: - [`jsxFactory`](https://www.typescriptlang.org/tsconfig#jsxFactory)
+116: - [`jsxFragmentFactory`](https://www.typescriptlang.org/tsconfig#jsxFragmentFactory)
+117: - [`jsxImportSource`](https://www.typescriptlang.org/tsconfig#jsxImportSource)
+118: - [`experimentalDecorators`](https://www.typescriptlang.org/tsconfig#experimentalDecorators)
+
+vite:packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/jsx-react-jsx/tsconfig.json:5-5
+5:     "jsxImportSource": "baz"
+
+vite:packages/vite/src/node/server/searchRoot.ts:32-32
+32:     return !!content.workspaces
+
+vite:docs/config/server-options.md:394-399
+394: Vite will search for the root of the potential workspace and use it as default. A valid workspace met the following conditions, otherwise will fall back to the [project root](/guide/#index-html-and-project-root).
+395: 
+396: - contains `workspaces` field in `package.json`
+397: - contains one of the following file
+398:   - `lerna.json`
+399:   - `pnpm-workspace.yaml`
+
+vite:packages/vite/src/node/server/__tests__/fixtures/yarn/package.json:3-5
+3:   "workspaces": [
+4:     "nested"
+5:   ]
+
+vite:packages/vite/src/node/server/searchRoot.ts:47-47
+47:       if (content.workspace) return true
+
+vite:packages/vite/src/node/server/searchRoot.ts:82-90
+82:  * Search up for the nearest workspace root
+83:  */
+84: export function searchForWorkspaceRoot(
+85:   current: string,
+86:   root: string = searchForPackageRoot(current),
+87: ): string {
+88:   if (hasRootFile(current)) return current
+89:   if (hasWorkspacePackageJSON(current)) return current
+90:   if (hasWorkspaceDenoJSON(current)) return current
+
+vite:packages/vite/src/node/server/__tests__/fixtures/deno/deno.json:2-2
+2:   "workspace": ["nested"]
+
+vite:packages/vite/src/node/plugins/resolve.ts:1067-1067
+1067:   const { exports: exportsField, browser: browserField } = data
+
+vite:packages/vite/src/node/plugins/resolve.ts:1096-1104
+1096:   } else if (options.mainFields.includes('browser') && isObject(browserField)) {
+1097:     // resolve without postfix (see #7098)
+1098:     const { file, postfix } = splitFileAndPostfix(relativeId)
+1099:     const mapped = mapWithBrowserField(file, browserField)
+1100:     if (mapped) {
+1101:       relativeId = mapped + postfix
+1102:     } else if (mapped === false) {
+1103:       setResolvedCache(id, browserExternalId, options)
+1104:       return browserExternalId
+
+vite:packages/vite/src/node/plugins/resolve.ts:1125-1130
+1125:  * given a relative path in pkg dir,
+1126:  * return a relative path in pkg dir,
+1127:  * mapped with the "map" object
+1128:  *
+1129:  * - Returning `undefined` means there is no browser mapping for this id
+1130:  * - Returning `false` means this id is explicitly externalized for browser
+
+vite:playground/resolve/browser-field/package.json:7-18
+7:   "browser": {
+8:     "./out/cjs.node.js": "./out/esm.browser.js",
+9:     "./no-ext": "./out/esm.browser.js",
+10:     "./ext.js": "./out/esm.browser.js",
+11:     "./ext-index/index.js": "./out/esm.browser.js",
+12:     "./no-ext-index": "./out/esm.browser.js",
+13:     "./bare-import": "./bare-import.js",
+14:     "./not-browser.js": false,
+15:     "./multiple.dot.path.js": false,
+16:     "jsdom": false,
+17:     "@vitejs/test-resolve-browser-field-bare-import-fail": "@vitejs/test-resolve-browser-field-bare-import-success"
+18:   },
+
+vite:packages/vite/src/node/plugins/resolve.ts:512-516
+512:   let importsPath = resolveExportsOrImports(
+513:     pkgData.data,
+514:     idWithoutPostfix,
+515:     options,
+516:     'imports',
+
+vite:packages/vite/src/node/plugins/resolve.ts:1050-1051
+1050:   const fn = type === 'imports' ? imports : exports
+1051:   const result = fn(pkg, key, { conditions, unsafe: true })
+
+vite:docs/config/shared-options.md:658-658
+658: If the goal is to remap imports, prefer [`resolve.alias`](#resolve-alias) or the `imports` and `exports` fields in `package.json` instead of selecting a tsconfig solely for [`compilerOptions.paths`](https://www.typescriptlang.org/tsconfig/#paths). Use this option only when automatic discovery cannot identify the intended configuration.
+
+vite:playground/resolve/package.json:12-22
+12:   "imports": {
+13:     "#top-level": "./imports-path/top-level.js",
+14:     "#same-level": "./imports-path/same-level.js",
+15:     "#nested/path.js": "./imports-path/nested-path.js",
+16:     "#star/*": "./imports-path/star/*",
+17:     "#slash/": "./imports-path/slash/",
+18:     "#other-pkg-slash/": "@vitejs/test-resolve-imports-pkg/nest/",
+19:     "#query": "./imports-path/query.json",
+20:     "#dot-prefixed": "./imports-path/.dot-prefixed/index.js",
+21:     "#/*": "./imports-path/root-slash/*"
+22:   },
+
+home-assistant:homeassistant/components/command_line/utils.py:57-58
+57:         async with asyncio.timeout(timeout):
+58:             stdout, _ = await proc.communicate()
+
+home-assistant:homeassistant/components/command_line/utils.py:49-50
+49: async def async_check_output_or_log(command: str, timeout: int) -> str | None:
+50:     """Run a shell command with a timeout and return the output."""
+
+home-assistant:tests/components/command_line/fixtures/configuration.yaml:7-7
+7:       "command_timeout": 15
+
+home-assistant:homeassistant/components/blueprint/models.py:65-78
+65:         # In future, we will treat this as "incorrect" and allow to recover from this
+66:         data_domain = data[CONF_BLUEPRINT][CONF_DOMAIN]
+67:         if expected_domain is not None and data_domain != expected_domain:
+68:             raise InvalidBlueprint(
+69:                 expected_domain,
+70:                 path or self.name,
+71:                 data,
+72:                 (
+73:                     f"Found incorrect blueprint type {data_domain}, expected"
+74:                     f" {expected_domain}"
+75:                 ),
+76:             )
+77: 
+78:         self.domain = data_domain
+
+home-assistant:homeassistant/components/blueprint/models.py:65-78
+65:         # In future, we will treat this as "incorrect" and allow to recover from this
+66:         data_domain = data[CONF_BLUEPRINT][CONF_DOMAIN]
+67:         if expected_domain is not None and data_domain != expected_domain:
+68:             raise InvalidBlueprint(
+69:                 expected_domain,
+70:                 path or self.name,
+71:                 data,
+72:                 (
+73:                     f"Found incorrect blueprint type {data_domain}, expected"
+74:                     f" {expected_domain}"
+75:                 ),
+76:             )
+77: 
+78:         self.domain = data_domain
+
+home-assistant:homeassistant/components/automation/blueprints/motion_light.yaml:4-4
+4:   domain: automation
+
+home-assistant:homeassistant/components/blueprint/models.py:162-163
+162:             if isinstance(blueprint_input, dict) and CONF_DEFAULT in blueprint_input:
+163:                 inputs_with_default[inp] = blueprint_input[CONF_DEFAULT]
+
+home-assistant:homeassistant/components/blueprint/models.py:155-165
+155:         """Return the inputs and fallback to defaults."""
+156:         no_input = set(self.blueprint.inputs) - set(self.inputs)
+157: 
+158:         inputs_with_default = dict(self.inputs)
+159: 
+160:         for inp in no_input:
+161:             blueprint_input = self.blueprint.inputs[inp]
+162:             if isinstance(blueprint_input, dict) and CONF_DEFAULT in blueprint_input:
+163:                 inputs_with_default[inp] = blueprint_input[CONF_DEFAULT]
+164: 
+165:         return inputs_with_default
+
+home-assistant:homeassistant/components/automation/blueprints/motion_light.yaml:26-26
+26:       default: 120
+
+home-assistant:homeassistant/components/filter/sensor.py:473-473
+473:             self.states: deque[FilterState] = deque(maxlen=window_size)
+
+home-assistant:homeassistant/components/filter/sensor.py:468-470
+468:         :param window_size: size of the sliding window that holds previous values
+469:         :param precision: round filtered value to precision value
+470:         :param entity: used for debugging only
+
+home-assistant:tests/components/filter/fixtures/configuration.yaml:7-7
+7:         window_size: 4
+
+home-assistant:homeassistant/components/filter/sensor.py:430-431
+430:             value = round(float(self.state), precision)
+431:             self.state = int(value) if precision == 0 else value
+
+home-assistant:homeassistant/components/filter/sensor.py:468-470
+468:         :param window_size: size of the sliding window that holds previous values
+469:         :param precision: round filtered value to precision value
+470:         :param entity: used for debugging only
+
+home-assistant:tests/components/filter/fixtures/configuration.yaml:11-11
+11:         precision: 2
+
+home-assistant:homeassistant/components/rest/data.py:155-156
+155:             async with self._session.request(
+156:                 self._method, self._resource, **request_kwargs
+
+home-assistant:homeassistant/components/rest/data.py:72-74
+72:     def url(self) -> str:
+73:         """Get url."""
+74:         return self._resource
+
+home-assistant:tests/components/rest/fixtures/configuration_top_level.yaml:3-3
+3:     resource: "http://localhost"
+
+home-assistant:homeassistant/components/group/sensor.py:127-127
+127:                 config[CONF_ENTITIES],
+
+home-assistant:homeassistant/components/group/sensor.py:1-4
+1: """Platform allowing several sensors to be grouped into one sensor.
+2: 
+3: Provides numeric combinations.
+4: """
+
+home-assistant:homeassistant/components/group/sensor.py:393-395
+393:     def async_update_group_state(self) -> None:
+394:         """Query all members and determine the sensor group state."""
+395:         self.calculate_state_attributes(self._get_valid_entities())
+
+home-assistant:tests/components/group/fixtures/sensor_configuration.yaml:3-5
+3:     entities:
+4:       - sensor.test_1
+5:       - sensor.test_2
+
+home-assistant:homeassistant/components/generic_thermostat/climate.py:176-176
+176:     sensor_entity_id: str = config[CONF_SENSOR]
+
+home-assistant:homeassistant/components/generic_thermostat/climate.py:502-510
+502:     async def _async_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
+503:         """Handle temperature changes."""
+504:         new_state = event.data["new_state"]
+505:         if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+506:             return
+507: 
+508:         self.async_set_context(event.context)
+509:         self._async_update_temp(new_state)
+510:         await self._async_control_heating()
+
+home-assistant:tests/components/generic_thermostat/fixtures/configuration.yaml:5-5
+5:     target_sensor: sensor.any
+
+lci:lci-core/src/config.rs:27-44
+27: #[derive(Debug, Clone, Serialize, Deserialize)]
+28: #[serde(default, deny_unknown_fields)]
+29: pub struct IndexConfig {
+30:     pub freshness: IndexFreshness,
+31:     /// Minimum interval between filesystem staleness checks for a workspace
+32:     /// under `on-search` freshness, so repeated searches in the same
+33:     /// unchanged workspace reuse the current snapshot instead of rescanning.
+34:     pub stale_check_interval_seconds: u64,
+35:     /// How long a search waits for a concurrently running refresh job before
+36:     /// falling back to the previous snapshot.
+37:     pub wait_for_existing_job_seconds: u64,
+38:     /// Index prose files (Markdown). `false` (default): files of prose
+39:     /// adapters are not indexed at all, so an index and every search result
+40:     /// are exactly as before the Markdown adapter and the docs lane never
+41:     /// runs. `true`: they are indexed and the docs lane follows
+42:     /// `[docs_lane]`. Flipping the switch makes the snapshot stale; the next
+43:     /// refresh adds or drops exactly the prose files.
+44:     pub prose: bool,
+
+lci:lci-core/src/config.rs:386-394
+386: #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+387: #[serde(default, deny_unknown_fields)]
+388: pub struct FusionConfig {
+389:     /// Weight of the semantic (vector) channel's reciprocal-rank contribution.
+390:     pub semantic_weight: f32,
+391:     /// Weight of the lexical (ripgrep) channel's reciprocal-rank contribution.
+392:     pub lexical_weight: f32,
+393:     /// Weight of the language-server channel's reciprocal-rank contribution.
+394:     pub lsp_weight: f32,
+
+lci:lci-core/src/config.rs:481-500
+481:     pub port: u16,
+482:     pub default_top_k: usize,
+483:     pub embedding_batch_size: usize,
+484:     /// Text embedded for a search query, with `{query}` replaced by the query
+485:     /// (required). Embedding models differ in the prompt format they expect
+486:     /// (an instruction prefix, a task label), so this is configurable.
+487:     /// Query-side only: changing it never invalidates an existing index.
+488:     pub embedding_query_template: String,
+489:     /// Text embedded for each indexed chunk, with `{code}` replaced by the
+490:     /// chunk's source (required) and `{path}` by its repository-relative file
+491:     /// path (optional). The default embeds the bare code. Changing it
+492:     /// changes `embedding_identity`, so every chunk is re-embedded on the next
+493:     /// index or search. Without `{path}` a vector depends only on the chunk's
+494:     /// code, and identical code is embedded once and reused wherever it
+495:     /// appears. With `{path}` it depends on the file too, so identical code in
+496:     /// different files, or a file moved to a new path, is embedded per path.
+497:     pub embedding_document_template: String,
+498:     pub embedding_timeout_seconds: u64,
+499:     pub reranker_timeout_seconds: u64,
+500:     pub readiness_timeout_seconds: u64,
+
+lci:lci-core/src/config.rs:519-524
+519:     pub watch_debounce_milliseconds: u64,
+520:     pub rust_analyzer_path: String,
+521:     /// Restore rust-analyzer's execution/network defaults. Only enable when
+522:     /// every repository this process accesses and its dependencies are trusted.
+523:     pub rust_analyzer_trusted: bool,
+524:     /// Seconds one request to a language server may go without any sign of
+
+lci:src/app/search.rs:1085-1095
+1085:             bail!(
+1086:                 "every enabled retrieval channel failed or returned no candidates ({})",
+1087:                 detail.join("; ")
+1088:             );
+1089:         }
+1090:         let fusion_timer = Instant::now();
+1091:         let mut hits = Self::fuse_hits(
+1092:             self.config.rrf_k,
+1093:             &self.config.fusion,
+1094:             semantic,
+1095:             lexical_hits,
+
+lci:src/app/search.rs:1542-1561
+1542:     /// Combines the three retrieval channels with weighted Reciprocal Rank
+1543:     /// Fusion, keyed by file path, start line, and content hash so the same
+1544:     /// chunk reached through multiple channels contributes once with a summed
+1545:     /// score. A channel contributes `weight / (rrf_k + rank)`; weights of
+1546:     /// `1.0` are plain RRF, which is the configured default (the default's
+1547:     /// per-file cap is applied later and does not enter the score). The
+1548:     /// source-role prior is added last and is never scaled by a weight. The
+1549:     /// result is in no particular order.
+1550:     fn fuse_hits(
+1551:         rrf_k: f32,
+1552:         weights: &FusionConfig,
+1553:         semantic: Vec<Hit>,
+1554:         lexical_hits: Vec<Hit>,
+1555:         lsp_hits: Vec<Hit>,
+1556:     ) -> Vec<Hit> {
+1557:         let mut fused = HashMap::<(String, u32, String), Hit>::new();
+1558:         for mut hit in semantic {
+1559:             let rank = hit.semantic_rank.unwrap();
+1560:             hit.fusion_score += weights.semantic_weight / (rrf_k + rank as f32);
+1561:             fused.insert(
+
+lci:lci-core/src/lsp/rust.rs:19-45
+19: 
+20: #[derive(Debug, Clone)]
+21: pub struct RustServer {
+22:     path: String,
+23:     timeout: Duration,
+24:     trusted: bool,
+25: }
+26: 
+27: impl RustServer {
+28:     pub fn new(config: &Config) -> Self {
+29:         Self {
+30:             path: config.rust_analyzer_path.clone(),
+31:             timeout: Duration::from_secs(config.lsp_timeout_seconds),
+32:             trusted: config.rust_analyzer_trusted,
+33:         }
+34:     }
+35: }
+36: 
+37: #[async_trait]
+38: impl LspAdapter for RustServer {
+39:     fn provider(&self) -> &'static str {
+40:         "rust-analyzer"
+41:     }
+42: 
+43:     fn languages(&self) -> &'static [&'static str] {
+44:         &[LANGUAGE_IDENTIFIER]
+45:     }
+
+lci:lci-core/src/lsp/rust.rs:65-140
+65:             label: "rust-analyzer".into(),
+66:         })
+67:     }
+68: 
+69:     fn environment(&self) -> Vec<(String, String)> {
+70:         if self.trusted {
+71:             return Vec::new();
+72:         }
+73:         [
+74:             ("CARGO_NET_OFFLINE", "true"),
+75:             ("RUSTC_WRAPPER", ""),
+76:             ("RUSTC_WORKSPACE_WRAPPER", ""),
+77:             ("CARGO_BUILD_RUSTC_WRAPPER", ""),
+78:             ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", ""),
+79:         ]
+80:         .into_iter()
+81:         .map(|(key, value)| (key.to_owned(), value.to_owned()))
+82:         .collect()
+83:     }
+84: 
+85:     fn initialize_params(&self, root: &Path) -> Option<Value> {
+86:         let root_uri = reqwest::Url::from_directory_path(root).ok()?.to_string();
+87:         let mut options = json!({
+88:             "workspace":{"symbol":{"search":{"scope":"workspace","kind":"all_symbols","limit":256}}}
+89:         });
+90:         if !self.trusted {
+91:             let environment: serde_json::Map<String, Value> = self
+92:                 .environment()
+93:                 .into_iter()
+94:                 .map(|(key, value)| (key, Value::String(value)))
+95:                 .collect();
+96:             options["cargo"] = json!({
+97:                 "buildScripts": {"enable": false, "overrideCommand": null},
+98:                 "extraEnv": &environment
+99:             });
+100:             options["procMacro"] = json!({"enable": false});
+101:             options["checkOnSave"] = json!(false);
+102:             options["check"] = json!({"overrideCommand": null, "extraEnv": &environment});
+103:         }
+104:         Some(json!({
+105:             "processId": std::process::id(), "rootUri": &root_uri,
+106:             "capabilities": {"workspace":{"symbol":{"resolveSupport":{"properties":["location.range"]}}},"experimental":{"serverStatusNotification":true}},
+107:             "workspaceFolders":[{"uri":&root_uri,"name":root.file_name().and_then(|v|v.to_str()).unwrap_or("workspace")}],
+108:             "initializationOptions": options
+109:         }))
+110:     }
+111: 
+112:     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+113:         Box::new(|msg: &Value| {
+114:             msg.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
+115:                 && msg["params"]["quiescent"].as_bool() == Some(true)
+116:         })
+117:     }
+118: 
+119:     fn is_loading_error(&self, error: &RpcError, ready: bool) -> bool {
+120:         // While it loads the workspace, rust-analyzer answers a request for a
+121:         // file it has not seen yet with an internal error, "file not found:
+122:         // <path>" (observed on `textDocument/definition` right after the
+123:         // readiness wait expired). Once it has reported quiescence the same
+124:         // text means the file really is unknown to it.
+125:         !ready && error.code == RpcError::INTERNAL_ERROR && error.message.contains("file not found")
+126:     }
+127: 
+128:     async fn after_initialized(&self, rpc: &JsonRpcClient) -> Result<()> {
+129:         if !rpc.is_ready() {
+130:             // Some rust-analyzer builds do not emit serverStatus even when
+131:             // the capability is advertised. Give crate discovery a bounded
+132:             // head start, then rely on normal request timeouts and restart
+133:             // recovery.
+134:             //
+135:             // This runs inside the session's detached start, never on a
+136:             // search's own future: a search waits for it only up to its
+137:             // `lsp_search_budget_ms`, and the wait carries on afterwards.
+138:             let readiness_wait = self.timeout.min(Duration::from_secs(10));
+139:             let started = Instant::now();
+140:             if rpc.wait_ready(readiness_wait).await {
+
+vite:packages/vite/src/node/plugins/esbuild.ts:129-173
+129:     // these fields would affect the compilation result
+130:     // https://esbuild.github.io/content-types/#tsconfig-json
+131:     const meaningfulFields: Array<keyof TSCompilerOptions> = [
+132:       'alwaysStrict',
+133:       'experimentalDecorators',
+134:       'importsNotUsedAsValues',
+135:       'jsx',
+136:       'jsxFactory',
+137:       'jsxFragmentFactory',
+138:       'jsxImportSource',
+139:       'preserveValueImports',
+140:       'target',
+141:       'useDefineForClassFields',
+142:       'verbatimModuleSyntax',
+143:     ]
+144:     const compilerOptionsForFile: TSCompilerOptions = {}
+145:     if (loader === 'ts' || loader === 'tsx') {
+146:       const result = resolveTsconfig(
+147:         filename,
+148:         getTSConfigResolutionCache(config),
+149:       )
+150:       if (result) {
+151:         const { tsconfig: loadedTsconfig, tsconfigFilePaths } = result
+152:         // tsconfig could be out of root, make sure it is watched on dev
+153:         if (watcher && config) {
+154:           for (const tsconfigFile of tsconfigFilePaths) {
+155:             ensureWatchedFile(watcher, tsconfigFile, config.root)
+156:           }
+157:         }
+158: 
+159:         const loadedCompilerOptions = loadedTsconfig.compilerOptions ?? {}
+160: 
+161:         for (const field of meaningfulFields) {
+162:           if (field in loadedCompilerOptions) {
+163:             // @ts-expect-error TypeScript can't tell they are of the same type
+164:             compilerOptionsForFile[field] = loadedCompilerOptions[field]
+165:           }
+166:         }
+167:       }
+168:     }
+169: 
+170:     const compilerOptions = {
+171:       ...compilerOptionsForFile,
+172:       ...tsconfigRaw?.compilerOptions,
+173:     }
+
+vite:packages/vite/src/node/plugins/esbuild.ts:185-207
+185:     // esbuild uses tsconfig fields when both the normal options and tsconfig was set
+186:     // but we want to prioritize the normal options
+187:     if (options) {
+188:       if (options.jsx) compilerOptions.jsx = undefined
+189:       if (options.jsxFactory) compilerOptions.jsxFactory = undefined
+190:       if (options.jsxFragment) compilerOptions.jsxFragmentFactory = undefined
+191:       if (options.jsxImportSource) compilerOptions.jsxImportSource = undefined
+192:     }
+193: 
+194:     tsconfigRaw = {
+195:       ...tsconfigRaw,
+196:       compilerOptions,
+197:     }
+198:   }
+199: 
+200:   const resolvedOptions: EsbuildTransformOptions = {
+201:     sourcemap: true,
+202:     // ensure source file name contains full query
+203:     sourcefile: filename,
+204:     ...options,
+205:     loader,
+206:     tsconfigRaw,
+207:   }
+
+vite:packages/vite/src/node/plugins/esbuild.ts:210-220
+210:   // object and esbuild throws an error for extra fields
+211:   // @ts-expect-error include exists in ESBuildOptions
+212:   delete resolvedOptions.include
+213:   // @ts-expect-error exclude exists in ESBuildOptions
+214:   delete resolvedOptions.exclude
+215:   // @ts-expect-error jsxInject exists in ESBuildOptions
+216:   delete resolvedOptions.jsxInject
+217: 
+218:   let transform: typeof import('esbuild').transform
+219:   try {
+220:     transform = (await importEsbuild()).transform
+
+vite:packages/vite/src/node/server/searchRoot.ts:23-54
+23: // npm: https://docs.npmjs.com/cli/v7/using-npm/workspaces#installing-workspaces
+24: // yarn: https://classic.yarnpkg.com/en/docs/workspaces/#toc-how-to-use-it
+25: function hasWorkspacePackageJSON(root: string): boolean {
+26:   const path = join(root, 'package.json')
+27:   if (!isFileReadable(path)) {
+28:     return false
+29:   }
+30:   try {
+31:     const content = JSON.parse(fs.readFileSync(path, 'utf-8')) || {}
+32:     return !!content.workspaces
+33:   } catch {
+34:     return false
+35:   }
+36: }
+37: 
+38: // https://docs.deno.com/runtime/fundamentals/workspaces/
+39: function hasWorkspaceDenoJSON(root: string): boolean {
+40:   for (const name of ['deno.json', 'deno.jsonc']) {
+41:     const path = join(root, name)
+42:     if (!isFileReadable(path)) {
+43:       continue
+44:     }
+45:     try {
+46:       const content = JSON.parse(fs.readFileSync(path, 'utf-8')) || {}
+47:       if (content.workspace) return true
+48:     } catch {
+49:       // deno.jsonc is only detected when it is also valid JSON. Full
+50:       // JSONC parsing would require an additional parser.
+51:     }
+52:   }
+53:   return false
+54: }
+
+vite:packages/vite/src/node/server/searchRoot.ts:81-97
+81: /**
+82:  * Search up for the nearest workspace root
+83:  */
+84: export function searchForWorkspaceRoot(
+85:   current: string,
+86:   root: string = searchForPackageRoot(current),
+87: ): string {
+88:   if (hasRootFile(current)) return current
+89:   if (hasWorkspacePackageJSON(current)) return current
+90:   if (hasWorkspaceDenoJSON(current)) return current
+91: 
+92:   const dir = dirname(current)
+93:   // reach the fs root
+94:   if (!dir || dir === current) return root
+95: 
+96:   return searchForWorkspaceRoot(dir, root)
+97: }
+
+vite:packages/vite/src/node/plugins/resolve.ts:1036-1055
+1036:   key: string,
+1037:   options: Pick<
+1038:     InternalResolveOptions,
+1039:     'conditions' | 'externalConditions' | 'isProduction' | 'isRequire'
+1040:   >,
+1041:   type: 'imports' | 'exports',
+1042:   externalize?: boolean,
+1043: ) {
+1044:   const conditions = getConditions(
+1045:     externalize ? options.externalConditions : options.conditions,
+1046:     options.isProduction,
+1047:     options.isRequire,
+1048:   )
+1049: 
+1050:   const fn = type === 'imports' ? imports : exports
+1051:   const result = fn(pkg, key, { conditions, unsafe: true })
+1052:   return result ? result[0] : undefined
+1053: }
+1054: 
+1055: function resolveDeepImport(
+
+vite:packages/vite/src/node/optimizer/resolve.ts:44-75
+44:  * Expand the glob syntax in `optimizeDeps.include` to proper import paths
+45:  */
+46: export function expandGlobIds(id: string, config: ResolvedConfig): string[] {
+47:   const pkgName = getNpmPackageName(id)
+48:   if (!pkgName) return []
+49: 
+50:   const pkgData = resolvePackageData(
+51:     pkgName,
+52:     config.root,
+53:     config.resolve.preserveSymlinks,
+54:     config.packageCache,
+55:   )
+56:   if (!pkgData) return []
+57: 
+58:   const pattern = '.' + id.slice(pkgName.length)
+59:   const exports = pkgData.data.exports
+60: 
+61:   // if package has exports field, get all possible export paths and apply
+62:   // glob on them with picomatch
+63:   if (exports) {
+64:     if (typeof exports === 'string' || Array.isArray(exports)) {
+65:       return [pkgName]
+66:     }
+67: 
+68:     const possibleExportPaths: string[] = []
+69:     for (const key in exports) {
+70:       if (key[0] === '.') {
+71:         if (key.includes('*')) {
+72:           // "./glob/*": {
+73:           //   "browser": "./dist/glob/*-browser/*.js", <-- get this one
+74:           //   "default": "./dist/glob/*/*.js"
+75:           // }
+
+home-assistant:homeassistant/components/command_line/const.py:20-24
+20: CONF_COMMAND_TIMEOUT = "command_timeout"
+21: CONF_JSON_ATTRIBUTES = "json_attributes"
+22: CONF_JSON_ATTRIBUTES_PATH = "json_attributes_path"
+23: DEFAULT_TIMEOUT = 15
+24: DOMAIN = "command_line"
+
+home-assistant:homeassistant/components/command_line/binary_sensor.py:49-72
+49:         create_platform_yaml_not_supported_issue(hass, BINARY_SENSOR_DOMAIN)
+50:         return
+51: 
+52:     binary_sensor_config = discovery_info
+53:     command: str = binary_sensor_config[CONF_COMMAND]
+54:     payload_off: str = binary_sensor_config[CONF_PAYLOAD_OFF]
+55:     payload_on: str = binary_sensor_config[CONF_PAYLOAD_ON]
+56:     command_timeout: int = binary_sensor_config[CONF_COMMAND_TIMEOUT]
+57:     scan_interval: timedelta = binary_sensor_config.get(
+58:         CONF_SCAN_INTERVAL, SCAN_INTERVAL
+59:     )
+60:     value_template: ValueTemplate | None = binary_sensor_config.get(CONF_VALUE_TEMPLATE)
+61: 
+62:     data = CommandSensorData(hass, command, command_timeout)
+63: 
+64:     trigger_entity_config = {
+65:         CONF_NAME: Template(binary_sensor_config.get(CONF_NAME, DEFAULT_NAME), hass),
+66:         **{
+67:             k: v for k, v in binary_sensor_config.items() if k in TRIGGER_ENTITY_OPTIONS
+68:         },
+69:     }
+70: 
+71:     async_add_entities(
+72:         [
+
+home-assistant:homeassistant/components/command_line/sensor.py:205-219
+205: class CommandSensorData:
+206:     """The class for handling the data retrieval."""
+207: 
+208:     def __init__(self, hass: HomeAssistant, command: str, command_timeout: int) -> None:
+209:         """Initialize the data object."""
+210:         self.value: str | None = None
+211:         self.hass = hass
+212:         self.command = command
+213:         self.timeout = command_timeout
+214: 
+215:     async def async_update(self) -> None:
+216:         """Get the latest data with a shell command."""
+217:         if not (command := render_template_args(self.hass, self.command)):
+218:             return
+219:         self.value = await async_check_output_or_log(command, self.timeout)
+
+home-assistant:homeassistant/components/blueprint/models.py:96-105
+96:     def inputs(self) -> dict[str, Any]:
+97:         """Return flattened blueprint inputs."""
+98:         inputs = {}
+99:         for key, value in self.data[CONF_BLUEPRINT][CONF_INPUT].items():
+100:             if value and CONF_INPUT in value:
+101:                 inputs.update(dict(value[CONF_INPUT]))
+102:             else:
+103:                 inputs[key] = value
+104:         return inputs
+105: 
+
+home-assistant:homeassistant/components/blueprint/const.py:5-12
+5: CONF_BLUEPRINT = "blueprint"
+6: CONF_USE_BLUEPRINT = "use_blueprint"
+7: CONF_INPUT = "input"
+8: CONF_SOURCE_URL = "source_url"
+9: CONF_HOMEASSISTANT = "homeassistant"
+10: CONF_MIN_VERSION = "min_version"
+11: CONF_AUTHOR = "author"
+12: CONF_COLLAPSED = "collapsed"
+
+home-assistant:homeassistant/const.py:117-117
+117: CONF_DEFAULT: Final = "default"
+
+home-assistant:homeassistant/const.py:130-130
+130: CONF_DOMAIN: Final = "domain"
+
+home-assistant:homeassistant/const.py:178-183
+178: CONF_MODE: Final = "mode"
+179: CONF_MODEL: Final = "model"
+180: CONF_MODEL_ID: Final = "model_id"
+181: CONF_MONITORED_CONDITIONS: Final = "monitored_conditions"
+182: CONF_MONITORED_VARIABLES: Final = "monitored_variables"
+183: CONF_NAME: Final = "name"
+
+home-assistant:homeassistant/components/filter/const.py:1-36
+1: """The filter component constants."""
+2: 
+3: from homeassistant.const import Platform
+4: 
+5: DOMAIN = "filter"
+6: PLATFORMS = [Platform.SENSOR]
+7: 
+8: CONF_INDEX = "index"
+9: 
+10: FILTER_NAME_RANGE = "range"
+11: FILTER_NAME_LOWPASS = "lowpass"
+12: FILTER_NAME_OUTLIER = "outlier"
+13: FILTER_NAME_THROTTLE = "throttle"
+14: FILTER_NAME_TIME_THROTTLE = "time_throttle"
+15: FILTER_NAME_TIME_SMA = "time_simple_moving_average"
+16: 
+17: CONF_FILTERS = "filters"
+18: CONF_FILTER_NAME = "filter"
+19: CONF_FILTER_WINDOW_SIZE = "window_size"
+20: CONF_FILTER_PRECISION = "precision"
+21: CONF_FILTER_RADIUS = "radius"
+22: CONF_FILTER_TIME_CONSTANT = "time_constant"
+23: CONF_FILTER_LOWER_BOUND = "lower_bound"
+24: CONF_FILTER_UPPER_BOUND = "upper_bound"
+25: CONF_TIME_SMA_TYPE = "type"
+26: 
+27: TIME_SMA_LAST = "last"
+28: 
+29: WINDOW_SIZE_UNIT_NUMBER_EVENTS = 1
+30: WINDOW_SIZE_UNIT_TIME = 2
+31: 
+32: DEFAULT_NAME = "Filtered sensor"
+33: DEFAULT_WINDOW_SIZE = 1
+34: DEFAULT_PRECISION = 2
+35: DEFAULT_FILTER_RADIUS = 2.0
+36: DEFAULT_FILTER_TIME_CONSTANT = 10
+
+home-assistant:homeassistant/components/filter/sensor.py:60-110
+60:     CONF_FILTER_UPPER_BOUND,
+61:     CONF_FILTER_WINDOW_SIZE,
+62:     CONF_FILTERS,
+63:     CONF_TIME_SMA_TYPE,
+64:     DEFAULT_FILTER_RADIUS,
+65:     DEFAULT_FILTER_TIME_CONSTANT,
+66:     DEFAULT_PRECISION,
+67:     DEFAULT_WINDOW_SIZE,
+68:     DOMAIN,
+69:     FILTER_NAME_LOWPASS,
+70:     FILTER_NAME_OUTLIER,
+71:     FILTER_NAME_RANGE,
+72:     FILTER_NAME_THROTTLE,
+73:     FILTER_NAME_TIME_SMA,
+74:     FILTER_NAME_TIME_THROTTLE,
+75:     PLATFORMS,
+76:     TIME_SMA_LAST,
+77:     WINDOW_SIZE_UNIT_NUMBER_EVENTS,
+78:     WINDOW_SIZE_UNIT_TIME,
+79: )
+80: 
+81: _LOGGER = logging.getLogger(__name__)
+82: 
+83: FILTERS: Registry[str, type[Filter]] = Registry()
+84: 
+85: ICON = "mdi:chart-line-variant"
+86: 
+87: FILTER_SCHEMA = vol.Schema({vol.Optional(CONF_FILTER_PRECISION): vol.Coerce(int)})
+88: 
+89: FILTER_OUTLIER_SCHEMA = FILTER_SCHEMA.extend(
+90:     {
+91:         vol.Required(CONF_FILTER_NAME): FILTER_NAME_OUTLIER,
+92:         vol.Optional(CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE): vol.Coerce(
+93:             int
+94:         ),
+95:         vol.Optional(CONF_FILTER_RADIUS, default=DEFAULT_FILTER_RADIUS): vol.Coerce(
+96:             float
+97:         ),
+98:     }
+99: )
+100: 
+101: FILTER_LOWPASS_SCHEMA = FILTER_SCHEMA.extend(
+102:     {
+103:         vol.Required(CONF_FILTER_NAME): FILTER_NAME_LOWPASS,
+104:         vol.Optional(CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE): vol.Coerce(
+105:             int
+106:         ),
+107:         vol.Optional(
+108:             CONF_FILTER_TIME_CONSTANT, default=DEFAULT_FILTER_TIME_CONSTANT
+109:         ): vol.Coerce(int),
+110:     }
+
+home-assistant:homeassistant/components/filter/sensor.py:140-190
+140: )
+141: 
+142: FILTER_TIME_THROTTLE_SCHEMA = FILTER_SCHEMA.extend(
+143:     {
+144:         vol.Required(CONF_FILTER_NAME): FILTER_NAME_TIME_THROTTLE,
+145:         vol.Required(CONF_FILTER_WINDOW_SIZE): vol.All(
+146:             cv.time_period, cv.positive_timedelta
+147:         ),
+148:     }
+149: )
+150: 
+151: PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
+152:     {
+153:         vol.Required(CONF_ENTITY_ID): vol.Any(
+154:             cv.entity_domain(SENSOR_DOMAIN),
+155:             cv.entity_domain(BINARY_SENSOR_DOMAIN),
+156:             cv.entity_domain(INPUT_NUMBER_DOMAIN),
+157:         ),
+158:         vol.Optional(CONF_NAME): cv.string,
+159:         vol.Optional(CONF_UNIQUE_ID): cv.string,
+160:         vol.Required(CONF_FILTERS): vol.All(
+161:             cv.ensure_list,
+162:             [
+163:                 vol.Any(
+164:                     FILTER_OUTLIER_SCHEMA,
+165:                     FILTER_LOWPASS_SCHEMA,
+166:                     FILTER_TIME_SMA_SCHEMA,
+167:                     FILTER_THROTTLE_SCHEMA,
+168:                     FILTER_TIME_THROTTLE_SCHEMA,
+169:                     FILTER_RANGE_SCHEMA,
+170:                 )
+171:             ],
+172:         ),
+173:     }
+174: )
+175: 
+176: 
+177: async def async_setup_platform(
+178:     hass: HomeAssistant,
+179:     config: ConfigType,
+180:     async_add_entities: AddEntitiesCallback,
+181:     discovery_info: DiscoveryInfoType | None = None,
+182: ) -> None:
+183:     """Set up the template sensors."""
+184: 
+185:     await async_setup_reload_service(hass, DOMAIN, PLATFORMS)
+186: 
+187:     name: str | None = config.get(CONF_NAME)
+188:     unique_id: str | None = config.get(CONF_UNIQUE_ID)
+189:     entity_id: str = config[CONF_ENTITY_ID]
+190: 
+
+home-assistant:homeassistant/components/filter/sensor.py:456-523
+456: class Filter:
+457:     """Filter skeleton."""
+458: 
+459:     def __init__(
+460:         self,
+461:         name: str,
+462:         window_size: int | timedelta,
+463:         entity: str,
+464:         precision: int | None,
+465:     ) -> None:
+466:         """Initialize common attributes.
+467: 
+468:         :param window_size: size of the sliding window that holds previous values
+469:         :param precision: round filtered value to precision value
+470:         :param entity: used for debugging only
+471:         """
+472:         if isinstance(window_size, int):
+473:             self.states: deque[FilterState] = deque(maxlen=window_size)
+474:             self.window_unit = WINDOW_SIZE_UNIT_NUMBER_EVENTS
+475:         else:
+476:             self.states = deque(maxlen=0)
+477:             self.window_unit = WINDOW_SIZE_UNIT_TIME
+478:         self.filter_precision = precision
+479:         self._name = name
+480:         self._entity = entity
+481:         self._skip_processing = False
+482:         self._window_size = window_size
+483:         self._store_raw = False
+484:         self._only_numbers = True
+485: 
+486:     @property
+487:     def window_size(self) -> int | timedelta:
+488:         """Return window size."""
+489:         return self._window_size
+490: 
+491:     @property
+492:     def name(self) -> str:
+493:         """Return filter name."""
+494:         return self._name
+495: 
+496:     @property
+497:     def skip_processing(self) -> bool:
+498:         """Return whether the current filter_state should be skipped."""
+499:         return self._skip_processing
+500: 
+501:     def reset(self) -> None:
+502:         """Reset filter."""
+503:         self.states.clear()
+504: 
+505:     def _filter_state(self, new_state: FilterState) -> FilterState:
+506:         """Implement filter."""
+507:         raise NotImplementedError
+508: 
+509:     def filter_state(self, new_state: _State) -> _State:
+510:         """Implement a common interface for filters."""
+511:         fstate = FilterState(new_state)
+512:         if self._only_numbers and not isinstance(fstate.state, Number):
+513:             raise ValueError(f"State <{fstate.state}> is not a Number")
+514: 
+515:         filtered = self._filter_state(fstate)
+516:         filtered.set_precision(self.filter_precision)
+517: 
+518:         if self._store_raw:
+519:             self.states.append(copy(FilterState(new_state)))
+520:         else:
+521:             self.states.append(copy(filtered))
+522:         new_state.state = filtered.state
+523:         return new_state
+
+home-assistant:homeassistant/components/filter/sensor.py:638-653
+638: class LowPassFilter(Filter, SensorEntity):
+639:     """BASIC Low Pass Filter."""
+640: 
+641:     def __init__(
+642:         self,
+643:         *,
+644:         window_size: int,
+645:         entity: str,
+646:         time_constant: int,
+647:         precision: int = DEFAULT_PRECISION,
+648:     ) -> None:
+649:         """Initialize Filter."""
+650:         super().__init__(
+651:             FILTER_NAME_LOWPASS, window_size, precision=precision, entity=entity
+652:         )
+653:         self._time_constant = time_constant
+
+home-assistant:homeassistant/components/rest/__init__.py:189-232
+189: def create_rest_data_from_config(hass: HomeAssistant, config: ConfigType) -> RestData:
+190:     """Create RestData from config."""
+191:     resource: str | None = config.get(CONF_RESOURCE)
+192:     resource_template: template.Template | None = config.get(CONF_RESOURCE_TEMPLATE)
+193:     method: str = config[CONF_METHOD]
+194:     payload: str | None = config.get(CONF_PAYLOAD)
+195:     payload_template: template.Template | None = config.get(CONF_PAYLOAD_TEMPLATE)
+196:     verify_ssl: bool = config[CONF_VERIFY_SSL]
+197:     ssl_cipher_list: str = config.get(CONF_SSL_CIPHER_LIST, DEFAULT_SSL_CIPHER_LIST)
+198:     username: str | None = config.get(CONF_USERNAME)
+199:     password: str | None = config.get(CONF_PASSWORD)
+200:     headers: dict[str, str] | None = config.get(CONF_HEADERS)
+201:     params: dict[str, str] | None = config.get(CONF_PARAMS)
+202:     timeout: int = config[CONF_TIMEOUT]
+203:     encoding: str = config[CONF_ENCODING]
+204:     if resource_template is not None:
+205:         resource = resource_template.async_render(parse_result=False)
+206: 
+207:     if payload_template is not None:
+208:         payload = payload_template.async_render(parse_result=False)
+209: 
+210:     if not resource:
+211:         raise HomeAssistantError("Resource not set for RestData")
+212: 
+213:     auth: aiohttp.DigestAuthMiddleware | tuple[str, str] | None = None
+214:     if username and password:
+215:         if config.get(CONF_AUTHENTICATION) == HTTP_DIGEST_AUTHENTICATION:
+216:             auth = aiohttp.DigestAuthMiddleware(username, password)
+217:         else:
+218:             auth = (username, password)
+219: 
+220:     return RestData(
+221:         hass,
+222:         method,
+223:         resource,
+224:         encoding,
+225:         auth,
+226:         headers,
+227:         params,
+228:         payload,
+229:         verify_ssl,
+230:         ssl_cipher_list,
+231:         timeout,
+232:     )
+
+home-assistant:homeassistant/components/rest/data.py:26-49
+26: 
+27:     def __init__(
+28:         self,
+29:         hass: HomeAssistant,
+30:         method: str,
+31:         resource: str,
+32:         encoding: str,
+33:         auth: aiohttp.DigestAuthMiddleware | tuple[str, str] | None,
+34:         headers: dict[str, str] | None,
+35:         params: dict[str, str] | None,
+36:         data: str | None,
+37:         verify_ssl: bool,
+38:         ssl_cipher_list: str,
+39:         timeout: int = DEFAULT_TIMEOUT,
+40:     ) -> None:
+41:         """Initialize the data object."""
+42:         self._hass = hass
+43:         self._method = method
+44:         self._resource = resource
+45:         self._encoding = encoding
+46:         self._force_use_set_encoding = False
+47: 
+48:         # Convert an auth tuple to a basic Authorization header if needed
+49:         self._basic_auth: str | None = None
+
+home-assistant:homeassistant/components/group/sensor.py:100-129
+100:         ),
+101:         vol.Required(CONF_TYPE): vol.All(cv.string, vol.In(SENSOR_TYPES.values())),
+102:         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+103:         vol.Optional(CONF_UNIQUE_ID): cv.string,
+104:         vol.Optional(CONF_IGNORE_NON_NUMERIC, default=False): cv.boolean,
+105:         vol.Optional(CONF_UNIT_OF_MEASUREMENT): str,
+106:         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+107:         vol.Optional(CONF_STATE_CLASS): STATE_CLASSES_SCHEMA,
+108:     }
+109: )
+110: 
+111: _LOGGER = logging.getLogger(__name__)
+112: 
+113: 
+114: async def async_setup_platform(
+115:     hass: HomeAssistant,
+116:     config: ConfigType,
+117:     async_add_entities: AddEntitiesCallback,
+118:     discovery_info: DiscoveryInfoType | None = None,
+119: ) -> None:
+120:     """Set up the Switch Group platform."""
+121:     async_add_entities(
+122:         [
+123:             SensorGroup(
+124:                 hass,
+125:                 config.get(CONF_UNIQUE_ID),
+126:                 config[CONF_NAME],
+127:                 config[CONF_ENTITIES],
+128:                 config[CONF_IGNORE_NON_NUMERIC],
+129:                 config[CONF_TYPE],
+
+home-assistant:homeassistant/components/group/sensor.py:190-230
+190:         return False
+191:     return True
+192: 
+193: 
+194: def calc_min(
+195:     sensor_values: list[tuple[str, float, State]],
+196: ) -> tuple[dict[str, str | None], float | None]:
+197:     """Calculate min value."""
+198:     val: float | None = None
+199:     entity_id: str | None = None
+200:     for sensor_id, sensor_value, _ in sensor_values:
+201:         if val is None or val > sensor_value:
+202:             entity_id, val = sensor_id, sensor_value
+203: 
+204:     attributes = {ATTR_MIN_ENTITY_ID: entity_id}
+205:     if TYPE_CHECKING:
+206:         assert val is not None
+207:     return attributes, val
+208: 
+209: 
+210: def calc_max(
+211:     sensor_values: list[tuple[str, float, State]],
+212: ) -> tuple[dict[str, str | None], float | None]:
+213:     """Calculate max value."""
+214:     val: float | None = None
+215:     entity_id: str | None = None
+216:     for sensor_id, sensor_value, _ in sensor_values:
+217:         if val is None or val < sensor_value:
+218:             entity_id, val = sensor_id, sensor_value
+219: 
+220:     attributes = {ATTR_MAX_ENTITY_ID: entity_id}
+221:     if TYPE_CHECKING:
+222:         assert val is not None
+223:     return attributes, val
+224: 
+225: 
+226: def calc_mean(
+227:     sensor_values: list[tuple[str, float, State]],
+228: ) -> tuple[dict[str, str | None], float | None]:
+229:     """Calculate mean value."""
+230:     result = (sensor_value for _, sensor_value, _ in sensor_values)
+
+home-assistant:homeassistant/components/generic_thermostat/const.py:1-39
+1: """Constants for the Generic Thermostat helper."""
+2: 
+3: from homeassistant.components.climate import (
+4:     PRESET_ACTIVITY,
+5:     PRESET_AWAY,
+6:     PRESET_COMFORT,
+7:     PRESET_ECO,
+8:     PRESET_HOME,
+9:     PRESET_SLEEP,
+10: )
+11: from homeassistant.const import Platform
+12: 
+13: DOMAIN = "generic_thermostat"
+14: 
+15: PLATFORMS = [Platform.CLIMATE]
+16: 
+17: CONF_AC_MODE = "ac_mode"
+18: CONF_COLD_TOLERANCE = "cold_tolerance"
+19: CONF_HEATER = "heater"
+20: CONF_HOT_TOLERANCE = "hot_tolerance"
+21: CONF_MAX_TEMP = "max_temp"
+22: CONF_MIN_DUR = "min_cycle_duration"
+23: CONF_MAX_DUR = "max_cycle_duration"
+24: CONF_DUR_COOLDOWN = "cycle_cooldown"
+25: CONF_MIN_TEMP = "min_temp"
+26: CONF_PRESETS = {
+27:     p: f"{p}_temp"
+28:     for p in (
+29:         PRESET_AWAY,
+30:         PRESET_COMFORT,
+31:         PRESET_ECO,
+32:         PRESET_HOME,
+33:         PRESET_SLEEP,
+34:         PRESET_ACTIVITY,
+35:     )
+36: }
+37: CONF_SENSOR = "target_sensor"
+38: CONF_KEEP_ALIVE = "keep_alive"
+39: DEFAULT_TOLERANCE = 0.3
+
+home-assistant:homeassistant/components/generic_thermostat/climate.py:140-205
+140: ) -> None:
+141:     """Initialize config entry."""
+142:     await _async_setup_config(
+143:         hass,
+144:         PLATFORM_SCHEMA_COMMON(dict(config_entry.options)),
+145:         config_entry.entry_id,
+146:         async_add_entities,
+147:         device=async_entity_id_to_device(hass, config_entry.options[CONF_HEATER]),
+148:     )
+149: 
+150: 
+151: async def async_setup_platform(
+152:     hass: HomeAssistant,
+153:     config: ConfigType,
+154:     async_add_entities: AddEntitiesCallback,
+155:     discovery_info: DiscoveryInfoType | None = None,
+156: ) -> None:
+157:     """Set up the generic thermostat platform."""
+158: 
+159:     await async_setup_reload_service(hass, DOMAIN, PLATFORMS)
+160:     await _async_setup_config(
+161:         hass, config, config.get(CONF_UNIQUE_ID), async_add_entities
+162:     )
+163: 
+164: 
+165: async def _async_setup_config(
+166:     hass: HomeAssistant,
+167:     config: Mapping[str, Any],
+168:     unique_id: str | None,
+169:     async_add_entities: AddEntitiesCallback | AddConfigEntryEntitiesCallback,
+170:     device: AnyDeviceEntry | None = None,
+171: ) -> None:
+172:     """Set up the generic thermostat platform."""
+173: 
+174:     name: str = config[CONF_NAME]
+175:     heater_entity_id: str = config[CONF_HEATER]
+176:     sensor_entity_id: str = config[CONF_SENSOR]
+177:     min_temp: float | None = config.get(CONF_MIN_TEMP)
+178:     max_temp: float | None = config.get(CONF_MAX_TEMP)
+179:     target_temp: float | None = config.get(CONF_TARGET_TEMP)
+180:     ac_mode: bool | None = config.get(CONF_AC_MODE)
+181:     min_cycle_duration: timedelta | None = config.get(CONF_MIN_DUR)
+182:     max_cycle_duration: timedelta | None = config.get(CONF_MAX_DUR)
+183:     cycle_cooldown: timedelta | None = config.get(CONF_DUR_COOLDOWN)
+184:     cold_tolerance: float = config[CONF_COLD_TOLERANCE]
+185:     hot_tolerance: float = config[CONF_HOT_TOLERANCE]
+186:     keep_alive: timedelta | None = config.get(CONF_KEEP_ALIVE)
+187:     initial_hvac_mode: HVACMode | None = config.get(CONF_INITIAL_HVAC_MODE)
+188:     presets: dict[str, float] = {
+189:         key: config[value] for key, value in CONF_PRESETS.items() if value in config
+190:     }
+191:     precision: float | None = config.get(CONF_PRECISION)
+192:     target_temperature_step: float | None = config.get(CONF_TEMP_STEP)
+193:     unit = hass.config.units.temperature_unit
+194: 
+195:     async_add_entities(
+196:         [
+197:             GenericThermostat(
+198:                 name=name,
+199:                 heater_entity_id=heater_entity_id,
+200:                 sensor_entity_id=sensor_entity_id,
+201:                 min_temp=min_temp,
+202:                 max_temp=max_temp,
+203:                 target_temp=target_temp,
+204:                 ac_mode=ac_mode,
+205:                 min_cycle_duration=min_cycle_duration,
+
+home-assistant:homeassistant/components/generic_thermostat/climate.py:255-270
+255:         self.sensor_entity_id = sensor_entity_id
+256:         self.device_entry = device
+257:         self.ac_mode = ac_mode
+258:         self.min_cycle_duration = min_cycle_duration or timedelta()
+259:         self.max_cycle_duration = max_cycle_duration
+260:         self.cycle_cooldown = cycle_cooldown or timedelta()
+261:         self._cold_tolerance = cold_tolerance
+262:         # Subtract the cooldown so it doesn't impact startup
+263:         self._last_toggled_time = dt_util.utcnow() - self.cycle_cooldown
+264:         self._cycle_callback: CALLBACK_TYPE | None = None
+265:         self._check_callback: CALLBACK_TYPE | None = None
+266:         # Context ID used to detect our own toggles
+267:         self._last_context_id: str | None = None
+268:         self._hot_tolerance = hot_tolerance
+269:         self._keep_alive = keep_alive
+270:         self._hvac_mode = initial_hvac_mode
+
+home-assistant:homeassistant/components/generic_thermostat/climate.py:299-312
+299: 
+300:     @override
+301:     async def async_added_to_hass(self) -> None:
+302:         """Run when entity about to be added."""
+303:         await super().async_added_to_hass()
+304: 
+305:         # Add listener
+306:         self.async_on_remove(
+307:             async_track_state_change_event(
+308:                 self.hass, [self.sensor_entity_id], self._async_sensor_changed
+309:             )
+310:         )
+311:         self.async_on_remove(
+312:             async_track_state_change_event(

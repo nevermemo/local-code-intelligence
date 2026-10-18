@@ -1,0 +1,463 @@
+{
+  "python": "3.14.7",
+  "yaml": "6.0.3",
+  "seed": 20261018,
+  "split": "splitmix64-fisher-yates",
+  "rg_version": "ripgrep 15.2.0 (rev e89fff89ac)",
+  "strata": [
+    {
+      "family": "lci.embedding_document_template",
+      "matched_lines": 41,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.embedding_query_template",
+      "matched_lines": 42,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.fusion.semantic_weight",
+      "matched_lines": 58,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.index.freshness",
+      "matched_lines": 197,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.index.stale_check_interval_seconds",
+      "matched_lines": 17,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.index.wait_for_existing_job_seconds",
+      "matched_lines": 8,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.readiness_timeout_seconds",
+      "matched_lines": 13,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "lci.rust_analyzer_trusted",
+      "matched_lines": 15,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.browser",
+      "matched_lines": 501,
+      "lockfile_lines": 64,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.compilerOptions.experimentalDecorators",
+      "matched_lines": 10,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.compilerOptions.jsxImportSource",
+      "matched_lines": 23,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.exports",
+      "matched_lines": 798,
+      "lockfile_lines": 133,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.imports",
+      "matched_lines": 621,
+      "lockfile_lines": 18,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.sideEffects",
+      "matched_lines": 19,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "vite.workspace",
+      "matched_lines": 68,
+      "lockfile_lines": 24,
+      "lockfile_lines_first_50": 8
+    },
+    {
+      "family": "vite.workspaces",
+      "matched_lines": 9,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.blueprint.domain",
+      "matched_lines": 35534,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.blueprint.input.no_motion_wait.default",
+      "matched_lines": 15716,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.climate.target_sensor",
+      "matched_lines": 83,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.command_line.binary_sensor.command_timeout",
+      "matched_lines": 22,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.rest.resource",
+      "matched_lines": 761,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.sensor.entities",
+      "matched_lines": 12116,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.sensor.filters.precision",
+      "matched_lines": 537,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    },
+    {
+      "family": "home-assistant.sensor.filters.window_size",
+      "matched_lines": 66,
+      "lockfile_lines": 0,
+      "lockfile_lines_first_50": 0
+    }
+  ],
+  "files": [
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/automation/blueprints/motion_light.yaml",
+      "git_blob": "11900708b19a23e627ad46e20a58621be56bfc7e",
+      "sha256": "e07ac35fae7270131f118da767b036e7f7776672077691d9fbcd026e5a7e3f9c",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/blueprint/const.py",
+      "git_blob": "ccbcd7a9d8084ede330f665baac385bca94dfc7b",
+      "sha256": "f1679a16350f6cc34f45001727127864bd08214689894aafbcd6babd21645fe5",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/blueprint/models.py",
+      "git_blob": "3af1acfa0147c09fa7811c3d6695335a56a7a23e",
+      "sha256": "ad3b1f8ae953af14ca72359ad7a4ab0bcaa53c962ed41b7c249131170908f3eb",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/command_line/binary_sensor.py",
+      "git_blob": "d88cd4a887f5603520b354316e9546679ac441be",
+      "sha256": "4cf6193326a04ec3ed62c51597f1c77c358ad71be36028b50c5c9af9a9d07efc",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/command_line/const.py",
+      "git_blob": "22f070310dc0b7c9e444d119b1982b7b471d3693",
+      "sha256": "c391dc4770f6d92ce8027f1a54ae0571b91ef805875a0c64dc412d76d8290984",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/command_line/sensor.py",
+      "git_blob": "f48b5ad5813b21d66f8121fdbc1f9e7f61267716",
+      "sha256": "2e66664c5d6983f11f1444e48ea246dbeb21e3f7d1fc03f4fcbaf314a9eff21b",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/command_line/utils.py",
+      "git_blob": "1c9de6b55c485186bc0475b8bfc40a3442d4ad8f",
+      "sha256": "3745addc6c74650d94f54b527b57ea08c5ff37f824eeb85c8f3c8ea1f9ff7f93",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/filter/const.py",
+      "git_blob": "92d2498528efc82bf790fbe8bc8cdda146efb58a",
+      "sha256": "66dc28d00fe73d0c538a4466a0f89d7ccae94773edeacbc421b67a9e999d57d4",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/filter/sensor.py",
+      "git_blob": "f968847249836bff973fca7166fa8ef0ef73a2f1",
+      "sha256": "d5441b2115d398179cba1f2504e7dc1e7b6f410e97d5001b468a9ccd5f378152",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/generic_thermostat/climate.py",
+      "git_blob": "4f50a4d7df3f236906f6d54dc0dc18a67bba294b",
+      "sha256": "e131f75c30e6c3e260bbaf70d9c155bafb8aabe9aabfa6bb69b812673477e1f6",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/generic_thermostat/const.py",
+      "git_blob": "902efc6c347c61f00b3938aae10c4c051d779388",
+      "sha256": "0cbf0d49cab2556b361ab00141a49b2956b0ce607b20f3d72e3be3180675250d",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/group/sensor.py",
+      "git_blob": "134af6b9953bf3e2c413f991253698a94f996dde",
+      "sha256": "dddba326dca9ff337f040ff675fa3c303ea5309bb8d5d3e8f0ff6c2ba9c8335b",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/rest/__init__.py",
+      "git_blob": "af64d496c6ce1236010f5487337837289289143a",
+      "sha256": "1ab212a1db3551394be19003ba0dd80c274e81f216933443b0868821fe377f6a",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/components/rest/data.py",
+      "git_blob": "824e54f137ad55518a7b687ab1d83e06c5eff5de",
+      "sha256": "821cc2f095214c30a6a789bc192ef686653c06dcb098ca51a361d2d30a2b4f0c",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "homeassistant/const.py",
+      "git_blob": "51a72bcdd067fc389e5db352fb1d293646f32938",
+      "sha256": "8057f6a4e8224f1d48c21e11773347ce6645b0e7632b9f3dcad28ddb975823cb",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "tests/components/command_line/fixtures/configuration.yaml",
+      "git_blob": "43e6f641966f11b420261d9e5959deee5c5184fb",
+      "sha256": "8c24d34a0c5f0d27d1e2817c0cdf8d7b6571d4fbcd199f8beb44fabba90b0c25",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "tests/components/filter/fixtures/configuration.yaml",
+      "git_blob": "c29c504b2ee79cb4ba3c24304da7307d6f6145fb",
+      "sha256": "f5495cbb509958cca28410a8df572df98b28d4dd6d707720a2cc0ddd85473f73",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "tests/components/generic_thermostat/fixtures/configuration.yaml",
+      "git_blob": "48b5ee2ed7b57312c2f1fce3416854e76c3257df",
+      "sha256": "b1b56d9f167af9fbc6214da708fdb6caf8f0e6241463162354a1b96eafa5c90a",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "tests/components/group/fixtures/sensor_configuration.yaml",
+      "git_blob": "1415124f275f97a80e80d71e4543edd5e4ec28d7",
+      "sha256": "e9c243925f2ca721474e699d3cbc9dc8fd74e1470bf457434494d8642a1f2346",
+      "export_check": "exact"
+    },
+    {
+      "repo": "home-assistant",
+      "path": "tests/components/rest/fixtures/configuration_top_level.yaml",
+      "git_blob": "b141dd0b176afa50676f62d7a181544189258f86",
+      "sha256": "d4d532e6ef8ab041dfea922bc54f10a56c7bfc8800ec9976ce5e1ead471bc845",
+      "export_check": "exact"
+    },
+    {
+      "repo": "lci",
+      "path": "config.example.toml",
+      "git_blob": "28a9029911f7125b935304ec4ac8c1a37275bd07",
+      "sha256": "f9c9fe2bf513dce628838ffe448f1c9013b7bedee48172c890ea66560f9329d9",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "lci-core/src/config.rs",
+      "git_blob": "6a6f6b0710167618358e784036efe48fa8658b71",
+      "sha256": "5483fe0e7d78004d384e2ae569498bfde9b727a0a4e3be82bf5cd77d48a582f6",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "lci-core/src/lsp/rust.rs",
+      "git_blob": "bb506d6bac8a95e58c1f57769d85ee832906dc90",
+      "sha256": "0ef2510dcc37cd7d229a1f3c05ad80a49cd83b3316e449976ba728c80dd78ff7",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "lci-core/src/models.rs",
+      "git_blob": "a36bb16a0153ccce80fd32d02d48c0c3b6bd716a",
+      "sha256": "cb9360e8fe35b1b6c3f42b476088ceac58a7f7121d67663b2d12254b027854a9",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "src/app/indexing.rs",
+      "git_blob": "9fb5cf09cb807693a22f8483ed6df71447627289",
+      "sha256": "6adfce4c731551e4a00d27e6ee7ac805b99494a2963e4027fb0fa3fdfad3fe5e",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "src/app/readiness.rs",
+      "git_blob": "d5d9670d8c65a7947acf16f7b5f96935e4d20829",
+      "sha256": "cc0e0c9c4149f8fe64f894420c8047577199873aa8c08ebfd88f2a12a336d166",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "src/app/search.rs",
+      "git_blob": "085a4ea76a45ad9483de511bf1b37ae88652965b",
+      "sha256": "1c42c3064afe36532af4caca8a8967d3393962345d44519f91dac7804806ffa6",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "lci",
+      "path": "src/app/traverse/chunks.rs",
+      "git_blob": "c120ffdc95abf9c6c7a322a14c3ccc262b7c5e12",
+      "sha256": "f5ca892d2522e54ba969d90fc169211d78c130cb31443ee8296ec2c2d5dfcba3",
+      "export_check": "line-ending-normalized"
+    },
+    {
+      "repo": "vite",
+      "path": "docs/config/server-options.md",
+      "git_blob": "3144f8aa8c4ad20a5022160a039a07105cb00558",
+      "sha256": "7105368fa565a16e1bb99e8c8f58372101c3a98a1cec9453749bd5fefc7f2e6c",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "docs/config/shared-options.md",
+      "git_blob": "d6aa0017401a278fe84ec1a081b70b606e765a7f",
+      "sha256": "8081e6b75660b49d2536c23c2d58a6cc12930f1e1e4b02c20e34b32601688230",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "docs/guide/features.md",
+      "git_blob": "ababdef81c8cabcdace1979ca34bafb84fc2be55",
+      "sha256": "8d819b6a9f3a793c08f3081eb05e363580b29bb215d58ab0b7b93bfe264e7fc0",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/decorator-metadata/tsconfig.json",
+      "git_blob": "6dacb8cc2c548f067efd752ee93b7cdafb476b6a",
+      "sha256": "d697ad5ef675b592cd690acf25e65108ce30caa5a3938240e66443dd30940411",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/__tests__/plugins/fixtures/oxc-tsconfigs/jsx-react-jsx/tsconfig.json",
+      "git_blob": "a6377dd1adcf1ba2b397cf011193b3e9a49eede8",
+      "sha256": "e7d232fda13f477e201239faf6916d719f2b3d95001113a4283a8aecf37e7f1b",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/optimizer/resolve.ts",
+      "git_blob": "8bba088ec85d614f36c205a78e1b845c439dfb3e",
+      "sha256": "2c9373956a4ef3248f8f636d0d324b1f832ed4f1077623928f3f6498d48ea9a8",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/packages.ts",
+      "git_blob": "457aea0a07b544c88bba146372c7f707445b7658",
+      "sha256": "6563cc7314120ea15c25a68731c4f1e6e3172325ec97255344d92fada81586f9",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/plugins/esbuild.ts",
+      "git_blob": "b9a4b562fef3d3d220b49d2c96f71e80fe312828",
+      "sha256": "911e953651b7aeeb848fb6059fc05b444f0d398da456af04d70dd2813b7f9b76",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/plugins/resolve.ts",
+      "git_blob": "5d9c11b92435c26cae170a660941f2ec69592036",
+      "sha256": "401f6fa84c7040d618c7e3dd91f66bc91221ed84fb33f6499593f6557f6351fb",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/server/__tests__/fixtures/deno/deno.json",
+      "git_blob": "bcf5e926672de5eabe8f3445ad3e34f2813442c0",
+      "sha256": "8901b94f9aa5ffc3ee11e7582b4a2b3a4aecbc4bce27d98e9ec3a571c4faef6b",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/server/__tests__/fixtures/yarn/package.json",
+      "git_blob": "ac514d81ca831ec41b2e976d39690526f2ec3fd6",
+      "sha256": "0ab3d0512cc399fb59835d9246c6d2681a7392c378504a6ec3dbc4e2adcbb43d",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "packages/vite/src/node/server/searchRoot.ts",
+      "git_blob": "f72a6fccb720f549b1b612dce4b93176b950a1cb",
+      "sha256": "268985d5ba5eb2cc8e3dc98bfaecfd554560766306824046008c88afc011b8a6",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "playground/html/side-effects/package.json",
+      "git_blob": "72a1449164f79bf7c77663b633a75fe92a5141a7",
+      "sha256": "748a915c513f0b0f98a3153f7ba83560050def3b47463e4ae191f96d280b798b",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "playground/resolve/browser-field/package.json",
+      "git_blob": "76b67bbaf75ddf5553cd4525bb72312b9cc45188",
+      "sha256": "f565ae101085c615eb353f6c23f58697746b6f8c1eb460efb0b2153fe502520d",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "playground/resolve/exports-legacy-fallback/package.json",
+      "git_blob": "6fc775cf65dfc1a79f13fcd7d22b93240a1baa07",
+      "sha256": "2ddfe0a1ee1d85ce9e4d5e45c1f761562755438d7435345b3bed84c868db1b3e",
+      "export_check": "exact"
+    },
+    {
+      "repo": "vite",
+      "path": "playground/resolve/package.json",
+      "git_blob": "a166420a690953d08b69cf62abf33b47b3cdf016",
+      "sha256": "5f824fa788f8559540693bdd9b092a7126816dadad82430f0ae452890f8f1683",
+      "export_check": "exact"
+    }
+  ]
+}

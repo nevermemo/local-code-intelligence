@@ -1,6 +1,7 @@
 //! `cargo xtask gold`: scorers for the five local gold sets (impact, flow,
 //! where-to, history, instructions) and the trait-implementation set
-//! (traits), a shipped-baseline reproducer and a converter to the
+//! (traits), a validator for the structured-config set (structured), a
+//! shipped-baseline reproducer and a converter to the
 //! `lci evaluate` definition format. The gold files live
 //! outside the repository; nothing here embeds or names their contents.
 //! See `docs/spike/multimap/v2/gold-scorers.md` for the run schema and the
@@ -11,6 +12,7 @@ mod history;
 mod impact;
 mod instructions;
 pub mod metrics;
+mod structured;
 mod traits;
 mod where_to;
 
@@ -112,6 +114,21 @@ pub enum GoldCommand {
         #[arg(long, default_value_t = 10)]
         top_k: usize,
     },
+    /// Validate the structured-config gold files `<gold-dir>/<repo>.json`:
+    /// schema, counts, spans against the checked-out trees, key leaks, the
+    /// seeded dev/heldout split and portability. Exits non-zero on any
+    /// failure. See the `structured` module for the split algorithm.
+    ValidateStructured {
+        /// Directory holding one `<repo>.json` per repository.
+        #[arg(long)]
+        gold_dir: PathBuf,
+        /// Checkout of a repository as `<repo>=<dir>`; repeat per repository.
+        #[arg(long = "tree", value_name = "REPO=DIR")]
+        tree: Vec<String>,
+        /// Write the report JSON here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 pub fn run(command: GoldCommand) -> Result<()> {
@@ -153,6 +170,11 @@ pub fn run(command: GoldCommand) -> Result<()> {
             eprintln!("{summary}");
             Ok(())
         }
+        GoldCommand::ValidateStructured {
+            gold_dir,
+            tree,
+            out,
+        } => structured::run(&gold_dir, &tree, out.as_deref()),
     }
 }
 
