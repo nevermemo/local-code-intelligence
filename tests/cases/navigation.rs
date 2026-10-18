@@ -714,7 +714,10 @@ async fn cancelled_calls_still_count_toward_the_stuck_span() {
 
     let mut calls = 0;
     while state_count_so_far(&state, "spawn_count.txt") < 2 {
-        assert!(calls < 30, "no call replaced the stuck session in {calls} calls");
+        assert!(
+            calls < 30,
+            "no call replaced the stuck session in {calls} calls"
+        );
         let outcome = tokio::time::timeout(
             Duration::from_millis(1000),
             manager.symbols(&adapter, &workspace, "Calculator"),
