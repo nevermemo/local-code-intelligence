@@ -6,6 +6,7 @@ use crate::filter::GlobPattern;
 use super::types::{
     AggregateReport, EvalQuery, EvalTimings, IndexLifecycleAction, LatencyPercentiles,
     QueryMetrics, QueryReport, RerankerState, ResultEvidence, StageLatency, TagAggregate,
+    snippet_tokens,
 };
 // ---------------------------------------------------------------------------
 // Pure metrics
@@ -164,6 +165,7 @@ pub fn query_metrics(
         recall_at_8: recall_at_k(&gold, evidence, 8),
         file_acc_at_5: file_acc_at_k(&gold, evidence, 5),
         file_acc_at_10: file_acc_at_k(&gold, evidence, 10),
+        returned_tokens: Some(snippet_tokens(&[evidence])),
     }
 }
 
@@ -456,6 +458,7 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
         mean_recall_at_8: mean_metric(&executed, |metrics| metrics.recall_at_8),
         mean_file_acc_at_5: mean_metric(&executed, |metrics| metrics.file_acc_at_5),
         mean_file_acc_at_10: mean_metric(&executed, |metrics| metrics.file_acc_at_10),
+        mean_returned_tokens: mean_returned_tokens(&executed),
         median_latency_ms,
         p95_latency_ms,
         stage_latency: stages,
@@ -540,6 +543,18 @@ fn mean_metric(executed: &[&QueryReport], value: impl Fn(&QueryMetrics) -> f64) 
             .sum::<f64>()
             / executed.len() as f64
     })
+}
+
+/// Mean token proxy over the executed queries that carry one; `None` when
+/// none do. A query without the figure (a report written before it existed)
+/// is left out of the mean, not counted as zero.
+fn mean_returned_tokens(executed: &[&QueryReport]) -> Option<f64> {
+    let tokens: Vec<f64> = executed
+        .iter()
+        .filter_map(|report| report.metrics.returned_tokens)
+        .map(|tokens| tokens as f64)
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.iter().sum::<f64>() / tokens.len() as f64)
 }
 
 /// Median, nearest-rank p95, maximum and sample count of a non-empty series.

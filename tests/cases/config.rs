@@ -113,22 +113,9 @@ impl Sandbox {
 
 /// A loopback listener on an ephemeral port that never blocks `accept`.
 fn listener() -> TcpListener {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = loopback_listener();
     listener.set_nonblocking(true).unwrap();
     listener
-}
-
-/// Ports nothing is listening on, all distinct: they are held together until
-/// every one is chosen.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: Vec<TcpListener> = (0..N)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let mut ports = [0; N];
-    for (port, listener) in ports.iter_mut().zip(&held) {
-        *port = listener.local_addr().unwrap().port();
-    }
-    ports
 }
 
 fn stderr(output: &Output) -> String {
@@ -1444,7 +1431,7 @@ async fn init_follows_no_redirect_from_a_service_it_asks() {
         let target_url = target_url.clone();
         async move { axum::response::Redirect::temporary(&target_url) }
     });
-    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = loopback_tokio_listener();
     let address = service.local_addr().unwrap();
     let _task = tokio::spawn(async move {
         axum::serve(service, router).await.unwrap();
@@ -1480,7 +1467,7 @@ async fn init_cannot_be_made_to_write_a_setting_by_what_a_service_lists() {
             ]}))
         }),
     );
-    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = loopback_tokio_listener();
     let address = service.local_addr().unwrap();
     let _task = tokio::spawn(async move {
         axum::serve(service, router).await.unwrap();
@@ -1534,7 +1521,7 @@ fn init_checks_the_port_by_binding_and_never_writes_it() {
 
     // In use, with --no-probe: reported, and the holder is not contacted.
     // The holder binds first, so the port is never released in between.
-    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let holder = loopback_listener();
     holder.set_nonblocking(true).unwrap();
     let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
     let output = init.run(&["init", "--no-probe", "--json"]);
@@ -1556,7 +1543,7 @@ fn init_checks_the_port_by_binding_and_never_writes_it() {
 async fn init_tells_a_running_lci_from_another_process_on_the_port() {
     // An LCI answering `/health`. Each holder binds before the box names its
     // port, so the port is never released in between.
-    let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let holder = loopback_tokio_listener();
     let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
     let router = Router::new().route(
         "/health",
@@ -1587,7 +1574,7 @@ async fn init_tells_a_running_lci_from_another_process_on_the_port() {
         Router::new(),
         Router::new().route("/health", get(|| async { Json(json!({"status": "ok"})) })),
     ] {
-        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let holder = loopback_tokio_listener();
         let init = InitBox::on_port(holder.local_addr().unwrap().port(), "");
         let task = tokio::spawn(async move {
             axum::serve(holder, router).await.unwrap();

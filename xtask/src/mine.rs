@@ -48,7 +48,7 @@ use lci_core::evaluation::{EvaluationFile, validate_definition};
 /// `extensions_match_the_language_registry` test fails when the two drift apart.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "cs", "go", "java", "c", "h", "cpp", "hpp", "cc", "cxx",
-    "hh", "hxx",
+    "hh", "hxx", "md",
 ];
 
 /// Commits touching more supported files than this are bulk changes (moves,
@@ -759,7 +759,7 @@ fn mine_commit(
     }
 
     // Every change that is not gold is drift away from the gold, including
-    // the unsupported files (documentation, lockfiles) the file cap ignores.
+    // the unsupported files (lockfiles, TOML and the like) the file cap ignores.
     let (mut gold_churn, mut drift_churn) = (0, 0);
     for change in &commit.changes {
         let churn = change_churn(&commit.lines, change);
@@ -1342,10 +1342,10 @@ mod tests {
 
     #[test]
     fn skips_commits_without_supported_source_files() {
-        let tree = head(&["README.md", "src/a.rs"]);
+        let tree = head(&["README.rst", "src/a.rs"]);
         for changes in [
             vec![],
-            vec![('M', "README.md"), ('M', "docs/guide.md")],
+            vec![('M', "README.rst"), ('M', "docs/guide.txt")],
             // Lockfiles, vendored, generated and build-output paths do not
             // count even though their extension is supported.
             vec![('M', "Cargo.lock"), ('M', "package-lock.json")],
@@ -1392,8 +1392,24 @@ mod tests {
         );
         // Unsupported files do not count toward the cap.
         let mut mixed = changes(10);
-        mixed.extend([('M', "a.md"), ('M', "b.toml")]);
+        mixed.extend([('M', "a.rst"), ('M', "b.toml")]);
         assert!(mine_commit(&commit(subject, "", &mixed), &tree).is_ok());
+    }
+
+    #[test]
+    fn a_markdown_only_commit_is_mined_with_the_markdown_file_as_gold() {
+        let tree = head(&["README.md", "docs/guide.md", "src/a.rs"]);
+        let mined = mine_commit(
+            &commit(
+                "Document the install steps",
+                "",
+                &[('M', "README.md"), ('M', "docs/guide.md")],
+            ),
+            &tree,
+        )
+        .unwrap();
+        let paths: Vec<&str> = mined.expected_paths.iter().map(String::as_str).collect();
+        assert_eq!(paths, ["README.md", "docs/guide.md"]);
     }
 
     #[test]
@@ -2188,11 +2204,14 @@ mod tests {
             "src/c.cxx",
             "src/d.hh",
             "src/e.hxx",
+            "README.md",
+            "docs/guide.md",
         ] {
             assert!(is_eligible_path(path), "{path}");
         }
         for path in [
-            "README.md",
+            "README.MD",
+            "notes.markdown",
             "Cargo.toml",
             "Makefile",
             ".rs",

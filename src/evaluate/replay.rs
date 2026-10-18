@@ -1022,6 +1022,15 @@ fn handle(query: &QueryReport, arm: &ReplayArm, model: &CostModel) -> Handled {
             ))
         };
     };
+    let lane = query.query.lane();
+    if lane != lci_core::evaluation::EvalLane::Code {
+        return Handled::Refused(refuse(
+            ReplayRefusal::NonCodeLane,
+            format!(
+                "the query is scored on the {lane:?} lane and a dump holds code candidates only"
+            ),
+        ));
+    }
     match replay_query(query, query_arm, arm) {
         Ok(replayed) => {
             let timings = query.timings.map(|measured| {
