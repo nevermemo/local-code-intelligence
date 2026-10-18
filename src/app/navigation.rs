@@ -71,6 +71,7 @@ impl App {
 
     pub async fn symbols(&self, path: &Path, query: &str) -> Result<NavigationReport> {
         ensure!(!query.trim().is_empty(), "query must not be empty");
+        ensure!(query.len() <= 16000, "query exceeds 16000 bytes");
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
         let snapshot = self
             .store

@@ -124,6 +124,7 @@ async fn find_references(
 /// [`SearchArgs`] as the MCP tool's; the profile is a query parameter so that
 /// the body, like the MCP tool's arguments, is unchanged.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchQuery {
     /// A configured `[search_profiles.<name>]`; absent is the default search.
     /// An unknown name fails the request with an error that lists the
