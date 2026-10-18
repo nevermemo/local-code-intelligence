@@ -1,6 +1,7 @@
 //! `cargo xtask gold`: scorers for the five local gold sets (impact, flow,
-//! where-to, history, instructions), a shipped-baseline reproducer and a
-//! converter to the `lci evaluate` definition format. The gold files live
+//! where-to, history, instructions) and the trait-implementation set
+//! (traits), a shipped-baseline reproducer and a converter to the
+//! `lci evaluate` definition format. The gold files live
 //! outside the repository; nothing here embeds or names their contents.
 //! See `docs/spike/multimap/v2/gold-scorers.md` for the run schema and the
 //! metric definitions.
@@ -10,6 +11,7 @@ mod history;
 mod impact;
 mod instructions;
 pub mod metrics;
+mod traits;
 mod where_to;
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +28,7 @@ pub enum Set {
     WhereTo,
     History,
     Instructions,
+    Traits,
 }
 
 impl Set {
@@ -36,6 +39,7 @@ impl Set {
             Set::WhereTo => "where-to",
             Set::History => "history",
             Set::Instructions => "instructions",
+            Set::Traits => "traits",
         }
     }
 }
@@ -172,11 +176,30 @@ fn emit(value: &Value, out: Option<&Path>) -> Result<()> {
 
 // ------------------------------------------------------------------ loading
 
+/// A gold file is a JSON array of items. A file of one JSON item per line (the
+/// `traits` question files are) is read as well: when the text is not one JSON
+/// value, or the extension is `.jsonl`, every non-empty line is an item.
 pub fn load_gold(path: &Path) -> Result<Vec<Value>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read gold file {}", path.display()))?;
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("gold file {} is not valid JSON", path.display()))?;
+    let lines = || -> Result<Value> {
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array)
+            .map_err(Into::into)
+    };
+    let value: Value = if path.extension().is_some_and(|e| e == "jsonl") {
+        lines().with_context(|| format!("gold file {} is not valid JSON lines", path.display()))?
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => lines()
+                .map_err(|_| error)
+                .with_context(|| format!("gold file {} is not valid JSON", path.display()))?,
+        }
+    };
     let Value::Array(items) = value else {
         bail!("gold file {} must be a JSON array of items", path.display());
     };
@@ -186,6 +209,16 @@ pub fn load_gold(path: &Path) -> Result<Vec<Value>> {
         }
     }
     Ok(items)
+}
+
+/// The items of a set as the scorers and the bench want them. Only `traits`
+/// changes: its Q1 items get the set's dominant macro call site, which needs the
+/// whole gold (see `traits::annotate`). Call it before any item is dropped.
+pub fn prepare(set: Set, items: Vec<Value>) -> Vec<Value> {
+    match set {
+        Set::Traits => traits::annotate(items),
+        _ => items,
+    }
 }
 
 /// Run file: item id -> ranked answers.
@@ -444,6 +477,7 @@ fn score_item(set: Set, item: &Value, answers: &[Answer], opts: &Options) -> Ite
         Set::WhereTo => where_to::score_item(item, answers, opts),
         Set::History => history::score_item(item, answers),
         Set::Instructions => instructions::score_item(item, answers),
+        Set::Traits => traits::score_item(item, answers),
     }
 }
 
@@ -455,6 +489,8 @@ fn is_scored(set: Set, item: &Value) -> bool {
     }
 }
 
+const TRAITS_NO_DECL: &str = "no trait_decl spans: the trait declaration card counts as a miss";
+
 pub fn score_set(
     set: Set,
     items: &[Value],
@@ -463,6 +499,13 @@ pub fn score_set(
     strict: bool,
 ) -> Result<Value> {
     let opts = Options { strict };
+    let prepared;
+    let items = if set == Set::Traits {
+        prepared = prepare(set, items.to_vec());
+        prepared.as_slice()
+    } else {
+        items
+    };
     let ids: std::collections::BTreeSet<&str> = items
         .iter()
         .filter_map(|i| i.get("id").and_then(Value::as_str))
@@ -489,7 +532,7 @@ pub fn score_set(
         aggregate.add(&score_item(set, item, answers, &opts));
     }
     let (overall, strata) = aggregate.to_json();
-    Ok(json!({
+    let mut report = json!({
         "set": set.name(),
         "gold_items": items.len(),
         "excluded_from_population": excluded,
@@ -500,7 +543,18 @@ pub fn score_set(
         "strict": strict,
         "overall": overall,
         "strata": strata,
-    }))
+    });
+    if set == Set::Traits {
+        let notes = traits::report_notes(items);
+        if notes["items_with_trait_decl"] == 0 {
+            // once per process: the bench scores item by item
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!("warning: {TRAITS_NO_DECL}"));
+            report["warnings"] = json!([TRAITS_NO_DECL]);
+        }
+        report["traits"] = notes;
+    }
+    Ok(report)
 }
 
 // --------------------------------------------------------------- baselines
@@ -526,7 +580,7 @@ pub fn baseline(set: Set, items: &[Value], kind: BaselineKind) -> Result<(Value,
         Set::Impact => impact::stored_grep_baseline(items),
         Set::History => history::baseline(items, kind),
         Set::Instructions => instructions::baseline(items),
-        Set::Flow | Set::WhereTo => bail!(
+        Set::Flow | Set::WhereTo | Set::Traits => bail!(
             "the {} gold ships no baseline field; use --kind oracle for a scorer self-check",
             set.name()
         ),
@@ -540,6 +594,7 @@ fn oracle_answers(set: Set, item: &Value) -> Vec<Value> {
         Set::WhereTo => where_to::oracle(item),
         Set::History => history::oracle(item),
         Set::Instructions => instructions::oracle(item),
+        Set::Traits => traits::oracle(item),
     }
 }
 
@@ -566,6 +621,7 @@ pub fn expected_files(set: Set, item: &Value) -> Result<Vec<String>, &'static st
         Set::WhereTo => where_to::to_query(item),
         Set::History => history::to_query(item),
         Set::Instructions => instructions::to_query(item),
+        Set::Traits => traits::to_query(item),
     };
     converted.map(|c| c.expected).map_err(|Dropped(why)| why)
 }
@@ -585,6 +641,7 @@ pub fn to_evaluate(
             Set::WhereTo => where_to::to_query(item),
             Set::History => history::to_query(item),
             Set::Instructions => instructions::to_query(item),
+            Set::Traits => traits::to_query(item),
         };
         match converted {
             Ok(c) => {
@@ -655,6 +712,9 @@ fn note_for(set: Set) -> &'static str {
         }
         Set::Instructions => {
             "expected_paths = rule documents; sections and units are lost; tagged lane:docs, so the query is scored on the search's separate docs list (Markdown documents only)"
+        }
+        Set::Traits => {
+            "expected_paths = files of the impl blocks and implementing type declarations (Q1) or of the member locations (Q2, Q3); spans, kinds, the budget and the trait declaration are lost"
         }
     }
 }
@@ -732,6 +792,96 @@ mod tests {
         let partial = score_set(Set::History, &items, &run, true, false).unwrap();
         assert_eq!(partial["scored_items"], 0);
         assert_eq!(partial["items_missing_from_run"], 1);
+    }
+
+    #[test]
+    fn gold_files_may_be_json_lines() {
+        let dir = std::env::temp_dir().join(format!("lci-gold-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = dir.join("traits.json");
+        std::fs::write(
+            &lines,
+            "{\"id\": \"a\"}
+
+{\"id\": \"b\"}
+",
+        )
+        .unwrap();
+        assert_eq!(load_gold(&lines).unwrap().len(), 2);
+        let array = dir.join("array.json");
+        std::fs::write(&array, "[{\"id\": \"a\"}]").unwrap();
+        assert_eq!(load_gold(&array).unwrap().len(), 1);
+        let one = dir.join("one.jsonl");
+        std::fs::write(
+            &one,
+            "{\"id\": \"a\"}
+",
+        )
+        .unwrap();
+        assert_eq!(load_gold(&one).unwrap().len(), 1);
+        let bad = dir.join("bad.json");
+        std::fs::write(
+            &bad,
+            "{\"id\": \"a\"}
+not json
+",
+        )
+        .unwrap();
+        assert!(load_gold(&bad).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn traits_q2_means_exclude_items_with_only_cfg_gated_gold() {
+        let location = json!({"file": "a.rs", "begin_line": 1, "end_line": 3});
+        let items = vec![
+            json!({"id": "active", "set": "Q2", "gold": [{"location": location}]}),
+            json!({"id": "gated", "set": "Q2", "cfg_gated": [location],
+                   "gold": [{"location": location}]}),
+        ];
+        let run = parse_run(r#"{"active": ["a.rs:1"], "gated": ["a.rs:1"]}"#).unwrap();
+        let report = score_set(Set::Traits, &items, &run, false, false).unwrap();
+        for cell in [&report["overall"], &report["strata"]["template"]["Q2"]] {
+            assert_eq!(cell["n"], 2);
+            for name in ["hit@1", "hit@10", "mrr"] {
+                assert_eq!(cell["metrics"][name], 1.0, "{name}");
+                assert_eq!(cell["n_defined"][name], 1, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn traits_report_carries_the_dominant_site_and_the_optional_fields() {
+        let span = |f: &str, a: i64, b: i64| json!({"file": f, "begin_line": a, "end_line": b});
+        let entry = |id: &str, kind: &str, f: &str| json!({"impl_id": id, "stratum": kind, "impl": span(f, 1, 2), "type_decl": null});
+        let items = vec![json!({
+            "id": "q1", "set": "Q1", "trait_decl": span("tr.rs", 9, 30),
+            "gold": [entry("i0", "macro", "m.rs"), entry("i1", "macro", "m.rs"), entry("i2", "explicit", "e.rs")]
+        })];
+        let run = parse_run(
+            r#"{"q1": [{"path": "m.rs", "line": 1, "symbol": "n0"}, "e.rs:1", "tr.rs:10"]}"#,
+        )
+        .unwrap();
+        let report = score_set(Set::Traits, &items, &run, false, false).unwrap();
+        assert_eq!(report["set"], "traits");
+        assert_eq!(report["strata"]["template"]["Q1"]["n"], 1);
+        assert_eq!(report["traits"]["dominant_site"]["file"], "m.rs");
+        assert_eq!(report["traits"]["items_with_trait_decl"], 1);
+        assert_eq!(report["traits"]["items_with_cfg_gated"], 0);
+        assert!(report.get("warnings").is_none());
+        // no trait_decl anywhere: the report says the declaration card counts as a miss
+        let mut bare = items.clone();
+        bare[0].as_object_mut().unwrap().remove("trait_decl");
+        let report = score_set(Set::Traits, &bare, &run, false, false).unwrap();
+        assert_eq!(report["warnings"], json!([TRAITS_NO_DECL]));
+        // the dominant site's two gold entries leave one: k = 1, found by "e.rs:1"
+        assert_eq!(report["overall"]["metrics"]["nodom_recall"], 1.0);
+        // the oracle run scores 1.0
+        let (oracle, _) = baseline(Set::Traits, &items, BaselineKind::Oracle).unwrap();
+        let run = parse_run(&oracle.to_string()).unwrap();
+        let report = score_set(Set::Traits, &items, &run, false, false).unwrap();
+        assert_eq!(report["overall"]["metrics"]["set_f1"], 1.0);
+        assert!(baseline(Set::Traits, &items, BaselineKind::Shipped).is_err());
     }
 
     #[test]

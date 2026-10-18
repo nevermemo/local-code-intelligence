@@ -1,18 +1,21 @@
 # Gold scorers (`cargo xtask gold`)
 
 Scorers for five local gold sets: `impact`, `flow`, `where-to`, `history` and
-`instructions`. The gold files are not part of this repository; every command
+`instructions`, and a sixth, `traits` (added 2026-10-18, scored on its own and
+not part of `maps bench --set all`). The gold files are not part of this repository; every command
 takes them with `--gold <path>`. Nothing here embeds gold content, and the unit
 tests use small synthetic items.
 
 ```
-cargo xtask gold score       --set <impact|flow|where-to|history|instructions> --gold <path> --run <path> [--out <path>] [--partial] [--strict]
+cargo xtask gold score       --set <impact|flow|where-to|history|instructions|traits> --gold <path> --run <path> [--out <path>] [--partial] [--strict]
 cargo xtask gold baseline    --set <set> --gold <path> [--kind shipped|oracle|constant] [--out <path>]
 cargo xtask gold to-evaluate --set <set> --gold <path> --out <path> [--workspace self] [--top-k 10]
 ```
 
-Gold file: a JSON array of items, each with a string `id`. A scorer reads only
-the fields named below; extra fields are ignored.
+Gold file: a JSON array of items, each with a string `id`. A file with one JSON
+item per line (the `traits` question files are) is read as well: it is taken as
+lines when its extension is `.jsonl` or when the text is not one JSON value. A
+scorer reads only the fields named below; extra fields are ignored.
 
 ## Run file
 
@@ -110,6 +113,97 @@ sections whose scope is `path`. I2: `i2_hit@3_primary`, `i2_hit@3_core`
 `i2_required_precision@5`, `i2_decoy_in_top3`. A path-only answer is the whole
 document.
 
+**traits** (strata `template` = Q1, Q2, Q3; Q2 also `kind`). The items are the
+questions of the trait-implementation set, one record per question with its
+gold (`set` names the template). Gold entries carry `stratum`
+(explicit, blanket, macro or derive) and spans `{file, begin_line, end_line}`:
+`impl` (the impl block; a macro impl: the call site, as the gold records it) and
+`type_decl` (null for a blanket impl) for Q1, `location` (the member; a macro
+impl: the call site) for Q2 and Q3.
+
+- *Q1* "which types implement `path::Trait`": an answer credits an
+  implementation when its line falls on the impl span or on the type declaration
+  span (either credits). Budget k = number of gold implementations: the first k
+  counted answers are scored (the scorer cuts, so an arm may return more).
+  `set_precision`, `set_recall`, `set_f1`.
+- *Q3* "what must change if `Trait::m` changes": the same, with the member
+  `location` as the only credit span.
+- *Q2* "where is `Trait::m` implemented for `Type`": the rank of the first
+  counted answer on the gold `location`: `hit@1`, `hit@10`, `mrr` (cut 10).
+  These rank metrics are undefined when no gold remains after cfg exclusions.
+  `counted@10` is the number of counted answers after exclusions, capped at ten;
+  bench precision divides `hit@10` by this count (zero when none are counted).
+- *Matching.* An answer is a located node (`path` and `line`); one without
+  either is returned but matches nothing. Answers are distinct by path, line,
+  `symbol` and `name`, so the nodes of one macro call site stay apart (put the
+  node id in `symbol`). One answer credits at most one gold implementation and
+  each implementation is credited once (maximum matching): a call site that
+  stands for N implementations needs N distinct answers. Precision is matched
+  answers over counted answers; an empty answer scores 0.
+- *Neither hit nor miss*, and not charged to the budget: an answer on the
+  trait's own declaration (the item's optional `trait_decl` span, which should
+  cover its method declarations), on an optional `neutral` span, or on an
+  optional `cfg_gated` span (an implementation the gold's build did not compile;
+  counted apart as `cfg_gated_answers`, mean per item). Gold whose impl site or
+  any credit span overlaps a cfg-gated span is removed from k and the recall
+  denominator; answers on its spans are dropped unless they also credit retained
+  gold. Such shared-span hits are not counted as `cfg_gated_answers`. Retained gold
+  wins over other ignored spans. The report's `traits` block says how many items carry
+  `trait_decl` and `cfg_gated`: without them nothing is dropped, and the trait declaration card
+  counts as a miss. When no item has a `trait_decl`, the scorer warns once on
+  stderr and the report has `warnings: ["no trait_decl spans: the trait
+  declaration card counts as a miss"]`.
+- *Per kind.* `recall_explicit`, `recall_blanket`, `recall_macro`,
+  `recall_derive` come from the same matching and are defined where the item has
+  gold of that kind (`n_defined` says how many). **The kill rule's explicit-stratum
+  recall is `recall_explicit`**: one matching over all the gold at k = number of
+  gold implementations, recall over the explicit gold; it is also the bench
+  headline column. `explicit_precision/recall/f1` are descriptive: they score the
+  explicit gold alone (its own k; answers on the other kinds' gold are dropped as
+  neutral). Precision has no kind: an answer is not typed.
+- *Without the dominant macro call site.* `nodom_precision/recall/f1` drop the
+  gold at the item's `dominant_site` and the answers that hit it (own k). The
+  site is the macro call site that carries the most Q1 gold in the whole set (at
+  least two entries; ties by file and line), written onto every Q1 item by
+  `gold::prepare` (`score`, `maps bench` and `maps compare` reconstruction call it before dropping any item,
+  so the site does not move with the items scored). It is undefined (null) when
+  the set has no such site, or when a per-item scorer sees an item that was not
+  prepared.
+- *Bench.* `maps bench --set traits` reads `traits.json` (JSON lines allowed)
+  in `--gold-dir`. Its adapter offers every located symbol for Q1 and only
+  functions and methods for Q2 and Q3, each with its node id as `symbol`; the
+  trait declaration card is offered like any other and dropped by the scorer.
+  The row shows `set_f1`, `recall_explicit`, `hit@10`, `mrr`.
+- *Q1 answer unit.* Producers must supply one answer per distinct impl or type.
+  The plain scorer receives path/line/symbol answers and cannot infer impls:
+  it only deduplicates identical answers, so distinct methods of one impl use
+  separate budget slots. Every producer must collapse these before scoring;
+  the bench adapter uses `impl_unit` when the node id carries an impl container.
+  It reads that impl from the container chain (`impl Tr for Foo`, generic and
+  unsafe forms, plus the module path) and collapses duplicates before the
+  scorer's budget cut, keeping the best ranked node's site. Impls of
+  different types at one macro call site have different headers and stay apart,
+  one answer per distinct node. A type node and the methods of its impl are not
+  merged (the ids do not tie them). Q2 and Q3 keep every member node.
+  `graph.scip`, the method nodes of `scip.implements`, and search hits mapped to
+  SCIP symbols use default ids with empty containers, and their response cards
+  carry only the definition site. For those method and function nodes the
+  adapter reads the evaluated tree's Rust source at the site (`--tree`, which a
+  live run already needs; give it to `--rescore` as well), parses each file once
+  per run with the repository's declaration parser, and groups the answers by
+  (file, impl block), the block identified by the lines its members cover. A
+  site outside any impl block (a free function, a trait default method) keeps its
+  own unit. Two blocks with the same header in one file (for example a
+  `#[cfg(windows)]` and a `#[cfg(unix)]` `impl Tr for Foo`) are told apart when
+  another declaration or another impl header line separates them (the source
+  lines between two members are scanned; attribute and comment lines are
+  skipped). Without `--tree`, or for a file that
+  cannot be read or parsed, those nodes keep separate Q1 budget slots and the
+  report's `warnings` and the row note say so. Other callers of `adapt` (fit-priors,
+  oracle-policy) have no tree and keep the id-only grouping.
+- The overall cell mixes the templates; read `strata.template`. The
+  `traits` set is private: the unit tests use tiny inline gold.
+
 ## Baselines
 
 `baseline --kind shipped` (the default) rebuilds what the gold file itself can
@@ -127,7 +221,7 @@ reproduce:
   occur in some I1 gold. Recall equals the real root-only system's; precision is
   an upper bound. The I2 lexical baseline needs the rule corpus and is not
   rebuilt (score with `--partial`).
-- `flow` and `where-to` ship no baseline; use a run from your own system.
+- `flow`, `where-to` and `traits` ship no baseline; use a run from your own system.
 
 `baseline --kind oracle` answers every item with its own gold. Scoring it must
 give 1.0 on every primary metric; it is a self-check of the scorer and of the
@@ -148,6 +242,7 @@ summary of dropped items goes to stderr. The format is file-level, so:
 | where-to | expected files, exemplar member files or convention implementation files; decoys as `disfavored_paths` | spans, neutral sites, precision |
 | history | `gold.files` plus `accept.alt_files` | the commit (the real target) and the as-of cut-off; evaluate searches the checked-out tree, so a file that no longer exists cannot be found |
 | instructions | rule documents (I1) or the primary units' documents (I2, other required documents as `preferred_paths`) | sections and units; these documents are outside the default index, so a score of 0 is expected for today's index |
+| traits | files of the impl blocks and implementing type declarations (Q1) or of the member locations (Q2, Q3) | spans, kinds, the budget, the trait declaration |
 
 Queries run against the workspace key given with `--workspace` (default
 `self`); the evaluated tree must be the one the gold was built on for the

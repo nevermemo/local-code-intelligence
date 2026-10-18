@@ -104,7 +104,10 @@ pub fn load_run(dir: &Path, gold_dir: Option<&Path>) -> Result<RunData> {
             .map_err(|_| anyhow::anyhow!("cannot tell the set from the run dir name {name:?}"))?;
         data.set = bench::set_name(set).to_owned();
         let run = read_json(&dir.join("run.json"))?;
-        let gold_items = gold::load_gold(&gold_dir.join(format!("{}.json", data.set)))?;
+        let gold_items = gold::prepare(
+            set,
+            gold::load_gold(&gold_dir.join(format!("{}.json", data.set)))?,
+        );
         for item in &gold_items {
             let Some(id) = item["id"].as_str() else {
                 continue;
@@ -513,6 +516,53 @@ mod tests {
         std::fs::remove_file(dir.join("items.json")).unwrap();
         assert!(load_run(&dir, None).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuilt_traits_records_use_the_whole_sets_dominant_site() {
+        let root =
+            std::env::temp_dir().join(format!("xtask-compare-traits-{}", std::process::id()));
+        let dir = root.join("traits");
+        let gold_dir = root.join("gold");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&gold_dir).unwrap();
+        let entries = |file: &str, n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| {
+                    json!({"impl_id": format!("{file}-{i}"), "stratum": "macro",
+                        "impl": {"file": file, "begin_line": 1, "end_line": 1}})
+                })
+                .collect()
+        };
+        let items = vec![
+            json!({"id": "a", "set": "Q1", "gold": entries("a.rs", 3)}),
+            json!({"id": "b", "set": "Q1", "gold": entries("b.rs", 2)}),
+        ];
+        let run = json!({
+            "a": [{"path": "a.rs", "line": 1, "symbol": "a0"}],
+            "b": [{"path": "b.rs", "line": 1, "symbol": "b0"}]
+        });
+        std::fs::write(gold_dir.join("traits.json"), json!(items).to_string()).unwrap();
+        let prepared = gold::prepare(Set::Traits, items);
+        assert_eq!(prepared[1]["dominant_site"]["file"], "a.rs");
+        let (_, _, expected) = bench::item_record(
+            Set::Traits,
+            &prepared[1],
+            run["b"].as_array().unwrap(),
+            None,
+        )
+        .unwrap();
+        // The dominant site's item may be missing from the run: preparation
+        // still uses all gold, just as bench does before skipping items.
+        for subset in [run.clone(), json!({"b": run["b"]})] {
+            std::fs::write(dir.join("run.json"), subset.to_string()).unwrap();
+            let data = load_run(&dir, Some(&gold_dir)).unwrap();
+            for name in ["nodom_precision", "nodom_recall", "nodom_f1"] {
+                assert_eq!(data.items["b"][name], expected[name].as_f64(), "{name}");
+            }
+            assert_eq!(data.items["b"]["nodom_recall"], Some(0.5));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
