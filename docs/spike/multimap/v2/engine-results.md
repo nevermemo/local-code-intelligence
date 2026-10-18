@@ -636,7 +636,7 @@ values in the preset files `src/app/traverse/presets/*.json`, both restated in `
 "Walk off" means the first stage alone answers: the call takes one pop (so the response still has a handle a caller may
 continue) and the walk's cards are not returned; the bench arm F-first20 ran the same way (`max_pops = 1`, walk cards dropped).
 "Answers" for the where-to rule is the number of cards a call asks for, `first_k + top_k` (N0's 20 is 10 + 10); over MCP the
-default `top_k` is 8 (18 answers), a point nobody measured: the threshold sits at the measured point (20 answers), so a where-to call over MCP with the default `top_k` does not walk, and gets its walk from `top_k` 10. Whether the default `top_k` or the threshold should move is open. A `[traverse.policies.<name>]` table overrides any of the
+default `top_k` is 8 (18 answers), a point measured later in d389 (16 answers without `steer`, default kept): the threshold sits at the measured point (20 answers), so a where-to call over MCP with the default `top_k` does not walk, and gets its walk from `top_k` 10. Whether the default `top_k` or the threshold should move is open. A `[traverse.policies.<name>]` table overrides any of the
 built-in values; `lci traverse --first-k` wins over the policy's own value. The recipes pin the first stage off, so
 `flow_from` still reads the walk's own cards.
 

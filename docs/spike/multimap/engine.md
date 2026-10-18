@@ -141,8 +141,8 @@ Presets per question type (`src/app/traverse/presets/{explore,flow,history,impac
 | `where-to` | walk when `first_k + top_k >= 20` | +.069 at 20, +.012 (n.s.) at 10 |
 | `explore` or no policy | `[traverse]` keys alone: first stage, then the walk | unchanged |
 
-"Walk off" means one pop (the response still has a handle) and the walk's cards are not returned. "Answers" = cards asked for, `first_k + top_k`. Over MCP the default `top_k` is 8, so 18 answers, a point nobody
-measured; where-to does not walk over MCP with the default `top_k` and gets its walk from `top_k` 10. Whether the default `top_k` or the threshold moves is open (roadmap row S1b). A `[traverse.policies.<name>]`
+"Walk off" means one pop (the response still has a handle) and the walk's cards are not returned. "Answers" = cards asked for, `first_k + top_k`. Over MCP the default `top_k` is 8: 16 answers without `steer` (8 seeds and 8
+walk) and 8 under `where-to`, which does not walk with the default `top_k` and gets its walk from `top_k` 10. Measured in d389: the default and the threshold stay; routing where-to questions to the preset is roadmap row N100. A `[traverse.policies.<name>]`
 table overrides any built-in value; `lci traverse --first-k` wins over the policy's. Recipes pin the first stage off. Defaults `first_stage = append`, `answer_seeds = true`, `exact_seeds = true` come from N0
 (exact_seeds neutral). Verification and reading rules: [v2/engine-results.md](v2/engine-results.md), "Shipped defaults" and "Reading rules". Bench deltas on flow and impact predict answer quality for a card reader
 (pv2: Spearman +0.699, [+0.596, +0.784], 181 items); a where-to or impact gain still needs an agent arm: [results.md](results.md).
