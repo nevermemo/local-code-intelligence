@@ -21,6 +21,7 @@ pub fn original_spellings(question: &str) -> HashMap<String, String> {
     out
 }
 
+use super::rg::RgCommand;
 use lci_maps::live_grep::{GrepOptions, LiveMatch, scan};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,16 +78,73 @@ pub struct Hits {
     pub files: Vec<String>,
 }
 
+/// What finds the occurrences: `live_grep::scan` in this process, or an
+/// external `rg` run in the tree root (the R arm of `sim-structured`).
+pub enum Backend {
+    Live(GrepOptions),
+    Rg(RgCommand),
+}
+
+/// What the scans of one [`Searcher`] did, summed over its calls. A cached
+/// search is not scanned again, so the totals count each distinct search once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanTotals {
+    /// Scans run (one per spelling searched).
+    pub scans: u64,
+    /// Files the walk left out by name (`GrepOptions::skip_files`).
+    pub skipped_by_name: u64,
+    pub files_read: u64,
+    pub bytes_read: u64,
+    /// Scans that stopped before the walk ended, for any reason.
+    pub stopped: u64,
+    /// Bytes and lines of `rg` standard output (the R arm only).
+    pub rg_stdout_bytes: u64,
+    pub rg_stdout_lines: u64,
+    /// Of those, lines that were not `path:line:text` and were dropped.
+    pub rg_ignored_lines: u64,
+}
+
+impl ScanTotals {
+    pub fn add(&mut self, other: &ScanTotals) {
+        self.scans += other.scans;
+        self.skipped_by_name += other.skipped_by_name;
+        self.files_read += other.files_read;
+        self.bytes_read += other.bytes_read;
+        self.stopped += other.stopped;
+        self.rg_stdout_bytes += other.rg_stdout_bytes;
+        self.rg_stdout_lines += other.rg_stdout_lines;
+        self.rg_ignored_lines += other.rg_ignored_lines;
+    }
+}
+
 /// A grep over a tree with caches for results and file text. The caches only
 /// save work; they never change a result.
 pub struct Searcher {
     root: PathBuf,
-    options: GrepOptions,
+    backend: Backend,
+    /// Where the name filter (`usable_identifier`) reads its limits when the
+    /// backend is not `Live`; the defaults, as `Searcher::new` has them.
+    names: GrepOptions,
     scans: HashMap<String, Rc<Hits>>,
     texts: HashMap<String, Rc<FileText>>,
     /// Scans that ended on the deadline or the byte cap, so their results may
     /// depend on the machine (a determinism warning).
     pub incomplete_scans: u32,
+    pub totals: ScanTotals,
+    /// The first error of an external backend (`rg` failed to run or exited
+    /// with a status other than 0 or 1). Set, every later search returns
+    /// nothing and the caller must discard the run.
+    pub failure: Option<String>,
+}
+
+/// The options `Searcher::new` scans with: no match cap, the generous
+/// deadline, everything else the library default.
+pub fn scan_options() -> GrepOptions {
+    GrepOptions {
+        max_matches: SCAN_MATCHES,
+        timeout: SCAN_DEADLINE,
+        ..GrepOptions::default()
+    }
 }
 
 /// A file read once: the source and its lines (no `\r`, no final empty line).
@@ -98,22 +156,27 @@ pub struct FileText {
 
 impl Searcher {
     pub fn new(root: &Path) -> Self {
-        let options = GrepOptions {
-            max_matches: SCAN_MATCHES,
-            timeout: SCAN_DEADLINE,
-            ..GrepOptions::default()
-        };
+        Self::with(root, Backend::Live(scan_options()))
+    }
+
+    pub fn with(root: &Path, backend: Backend) -> Self {
         Self {
             root: root.to_path_buf(),
-            options,
+            backend,
+            names: scan_options(),
             scans: HashMap::new(),
             texts: HashMap::new(),
             incomplete_scans: 0,
+            totals: ScanTotals::default(),
+            failure: None,
         }
     }
 
     pub fn options(&self) -> &GrepOptions {
-        &self.options
+        match &self.backend {
+            Backend::Live(options) => options,
+            Backend::Rg(_) => &self.names,
+        }
     }
 
     /// Every occurrence of `needle`, exactly as written. Nothing is cut: a
@@ -141,18 +204,45 @@ impl Searcher {
         if let Some(hits) = self.scans.get(&key) {
             return Rc::clone(hits);
         }
+        if self.failure.is_some() {
+            return Rc::new(Hits::default());
+        }
         let mut matches: Vec<LiveMatch> = Vec::new();
         for spelling in &needles {
-            let result = scan(
-                &self.root,
-                spelling,
-                &self.options,
-                Instant::now() + SCAN_DEADLINE,
-            );
-            if matches!(result.stopped, Some("deadline" | "byte cap")) {
-                self.incomplete_scans += 1;
+            match &self.backend {
+                Backend::Live(options) => {
+                    let result = scan(
+                        &self.root,
+                        spelling,
+                        options,
+                        Instant::now() + SCAN_DEADLINE,
+                    );
+                    if matches!(result.stopped, Some("deadline" | "byte cap")) {
+                        self.incomplete_scans += 1;
+                    }
+                    let totals = &mut self.totals;
+                    totals.scans += 1;
+                    totals.skipped_by_name += result.skipped_by_name;
+                    totals.files_read += result.files_read;
+                    totals.bytes_read += result.bytes_read;
+                    totals.stopped += u64::from(result.stopped.is_some());
+                    matches.extend(result.matches);
+                }
+                Backend::Rg(rg) => match rg.search(&self.root, spelling) {
+                    Ok(found) => {
+                        self.totals.scans += 1;
+                        self.totals.rg_stdout_bytes += found.stdout_bytes;
+                        self.totals.rg_stdout_lines += found.stdout_lines;
+                        self.totals.rg_ignored_lines += found.ignored_lines;
+                        matches.extend(found.matches);
+                    }
+                    Err(error) => {
+                        // Not cached: the run is void, and says why.
+                        self.failure = Some(format!("{error:#}"));
+                        return Rc::new(Hits::default());
+                    }
+                },
             }
-            matches.extend(result.matches);
         }
         matches.sort_by(|a, b| {
             (!a.exact, &a.path, a.line, a.col).cmp(&(!b.exact, &b.path, b.line, b.col))
@@ -254,6 +344,42 @@ mod tests {
         assert_eq!(originals["parseconfig"], "parseConfig");
         let hits = searcher.search_term("parseconfig", Some(&originals["parseconfig"]));
         assert_eq!(hits.files, ["a.rs"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_totals_add_up_and_a_skipped_file_is_counted_not_read() {
+        let dir = temp_tree(
+            "totals",
+            &[
+                ("a.rs", "fn x() { hotname(); }\n".into()),
+                ("Cargo.lock", "name = \"other\"\n".into()),
+            ],
+        );
+        let mut plain = Searcher::new(&dir);
+        let plain_hits = plain.search("hotname");
+        assert_eq!(plain_hits.files, ["a.rs"]);
+        assert_eq!(plain.totals.scans, 1);
+        assert_eq!(plain.totals.files_read, 2);
+        assert_eq!(plain.totals.skipped_by_name, 0);
+        // A cached search is not scanned again.
+        plain.search("hotname");
+        assert_eq!(plain.totals.scans, 1);
+
+        let options = GrepOptions {
+            skip_files: lci_maps::live_grep::LOCKFILES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ..scan_options()
+        };
+        let mut skipping = Searcher::with(&dir, Backend::Live(options));
+        let hits = skipping.search("hotname");
+        assert_eq!(hits.matches, plain_hits.matches);
+        assert_eq!(skipping.totals.skipped_by_name, 1);
+        assert_eq!(skipping.totals.files_read, 1);
+        assert!(skipping.totals.bytes_read < plain.totals.bytes_read);
+        assert_eq!(skipping.incomplete_scans, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

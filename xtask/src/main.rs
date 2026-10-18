@@ -96,6 +96,14 @@ enum Command {
     /// `lci traverse --scip` call in front of the same chain. See
     /// docs/spike/multimap/v2/sim-agent.md.
     Sim(sim::SimArgs),
+    /// Structured-config measurement on the simulated agent: `run` one arm
+    /// over the questions of one stratum and score them, `compare` runs with a
+    /// paired bootstrap, `check-probes` that every question probes its key.
+    /// See docs/spike/multimap/structured-grep-prereg.md.
+    SimStructured {
+        #[command(subcommand)]
+        which: sim::structured::StructuredCommand,
+    },
     /// Mine an evaluation definition from a repository's git history: each
     /// qualifying commit message becomes a query and the supported source
     /// files it touched that still exist at HEAD become its expected paths.
@@ -301,6 +309,7 @@ async fn main() -> Result<()> {
         Command::Gold { which } => gold::run(which),
         Command::Maps { which } => maps::run(which),
         Command::Sim(args) => sim::run(args),
+        Command::SimStructured { which } => sim::structured::run(which),
         Command::MineQueries {
             repo,
             key,

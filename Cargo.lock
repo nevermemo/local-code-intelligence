@@ -6794,6 +6794,7 @@ dependencies = [
  "pulldown-cmark",
  "reqwest 0.13.5",
  "scip",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "sysinfo",
