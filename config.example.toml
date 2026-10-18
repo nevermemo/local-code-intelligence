@@ -66,6 +66,14 @@ embedding_document_template = "{code}"
 # embedding_document_template = "{code}"
 embedding_timeout_seconds = 120
 reranker_timeout_seconds = 120
+# Which service orders the fused shortlist while [channels].reranker is on:
+# "reranker" (the reranking service above, the default) or "system_one" (the
+# typed [system_one] service, provider = "system_one_wire": batched requests, one
+# yes/no question per candidate, the probabilities as scores). "system_one"
+# needs the [system_one] section at the end of this file. If the typed service
+# fails (timeout, error status, malformed or partial answer) the search returns
+# the fusion order with one warning; the reranker is not the fallback.
+rescorer = "reranker"
 # Bounded timeout for /ready and service_status dependency probes (1-30 seconds).
 readiness_timeout_seconds = 5
 ripgrep_path = "rg"
@@ -483,18 +491,25 @@ flow_judge = false
 enabled = false
 
 # [system_one] is the slot for a small model planned to steer a traversal (the
-# configuration and provider client exist; no traversal rung calls it yet). Off
-# when the section is absent. Uncomment the whole block, header included; it is
-# last in this file because a table header ends the table before it.
+# configuration and provider client exist; no traversal rung calls it yet) and
+# the typed service behind `rescorer = "system_one"`. Off when the section is
+# absent. Uncomment the whole block, header included; it is last in this file
+# because a table header ends the table before it.
 # [system_one]
-# provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only)
+# provider = "openai_compat"   # or "mock" (replays recorded pairs, tests only) or "system_one_wire"
 # url = "http://127.0.0.1:8080/v1"   # base URL; /chat/completions or /completions is appended
 # model = "your-model-name"
 # api = "chat"                 # "chat" or "completion"
-# timeout_ms = 30000           # 100 to 600000; one attempt, no retry
+# timeout_ms = 30000           # 100 to 600000; per batch request, one attempt, no retry
 # api_key_env = "SYSTEM_ONE_API_KEY"
 # allow_remote = false         # a non-loopback host in url is refused unless true
 # replay_file = "pairs.json"   # provider = "mock" only
+# For rescorer = "system_one" set provider = "system_one_wire" and: url = the service root
+# (POST <url>/v1/systemone; a trailing /v1 is not doubled, e.g. "http://127.0.0.1:11435"),
+# model = the typed model's name, api_key_env = the variable holding the key (read per
+# request, never logged); a non-loopback url needs allow_remote = true; port 8765 is refused.
+# batch_size = 24              # 1 to 200; the most candidates per request (smaller for small-context models)
+# Worst case before fail-open: (number of batches) x timeout_ms.
 # [system_one.capabilities]
 # constraint = "json_schema"   # "gbnf" (llama.cpp grammar), "json_schema" or "none"
 # logprobs = false             # the server returns top log-probabilities

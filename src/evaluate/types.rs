@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{CandidateTrace, RerankOutcome};
-use crate::config::{ChannelsConfig, Config, FusionConfig};
+use crate::config::{ChannelsConfig, Config, FusionConfig, Rescorer};
 use crate::filter::EffectiveFilterReport;
 
 use super::metrics::query_metrics;
@@ -116,6 +116,11 @@ pub enum ReplayRefusal {
     /// (`lane:union`); a dump holds the code lane's candidates only, so the
     /// docs list cannot be replayed from it.
     NonCodeLane,
+    /// The dump was scored by the System One rescorer, which answers one
+    /// batch jointly (a stored probability depends on the other candidates
+    /// sent with it), and the replayed window is not exactly the batch the
+    /// dump sent: its membership, candidate ids, or order differ.
+    BatchMismatch,
 }
 
 impl ReplayRefusal {
@@ -128,6 +133,7 @@ impl ReplayRefusal {
             Self::RerankNotScored => "rerank_not_scored",
             Self::UnscoredWindow => "unscored_window",
             Self::NonCodeLane => "non_code_lane",
+            Self::BatchMismatch => "batch_mismatch",
         }
     }
 }
@@ -163,13 +169,37 @@ pub struct CandidateArm {
     pub embedding_identity: String,
     /// Reranker model name sent with every request.
     pub reranker_model: String,
+    /// Non-default service that scored this arm's shortlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescorer: Option<String>,
+    /// Model name sent to the System One rescorer; present exactly for that
+    /// rescorer (`reranker_model` then names a service that was not asked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_one_model: Option<String>,
+    /// Most candidates the System One rescorer was sent per request; present
+    /// exactly for that rescorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_one_batch_size: Option<usize>,
     /// How the reranker's output ordered the dumped results.
     pub rerank_mode: RerankMode,
 }
 
+/// The `rescorer` value of an arm scored by the System One service.
+pub const SYSTEM_ONE_RESCORER: &str = "system_one";
+
 impl CandidateArm {
+    /// Whether this arm's rescorer scores the shortlist as one joint batch
+    /// state, so a stored score depends on the other candidates sent with it.
+    pub fn scores_jointly(&self) -> bool {
+        self.rescorer.as_deref() == Some(SYSTEM_ONE_RESCORER)
+    }
+
     /// The arm `config` produces for a query whose result window is `k`.
     pub fn new(config: &Config, k: usize) -> Self {
+        let system_one = match config.rescorer {
+            Rescorer::Reranker => None,
+            Rescorer::SystemOne => config.system_one.as_ref(),
+        };
         Self {
             rrf_k: config.rrf_k,
             fusion: config.fusion,
@@ -182,6 +212,12 @@ impl CandidateArm {
             k,
             embedding_identity: config.embedding_identity(),
             reranker_model: config.reranker_model.clone(),
+            rescorer: match config.rescorer {
+                Rescorer::Reranker => None,
+                Rescorer::SystemOne => Some(SYSTEM_ONE_RESCORER.to_owned()),
+            },
+            system_one_model: system_one.map(|system_one| system_one.model.clone()),
+            system_one_batch_size: system_one.map(|system_one| system_one.batch_size),
             rerank_mode: if config.channels.reranker {
                 RerankMode::Replace
             } else {

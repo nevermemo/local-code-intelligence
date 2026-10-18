@@ -11,7 +11,7 @@ mod channel_maps;
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
-    config::{ChannelsConfig, FusionConfig, IndexFreshness, SearchSettings},
+    config::{ChannelsConfig, FusionConfig, IndexFreshness, Rescorer, SearchSettings},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest, SourceRole},
     lexical,
     lsp::adapter::LspAdapter,
@@ -19,6 +19,7 @@ use crate::{
     workspace::Workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
+use lci_core::provider::WireCandidate;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -362,9 +363,10 @@ pub struct CandidateTrace {
     pub rerank_rank: Option<usize>,
     /// The reranker's score; `None` unless `rerank_rank` is set.
     pub reranker_score: Option<f32>,
-    /// Bytes of the document the reranker is given for this candidate (the
-    /// path, a newline, then the head of the code cut to
-    /// `rerank_document_max_bytes`); `Some` for every shortlisted candidate
+    /// Bytes of the document the selected rescorer is given for this candidate
+    /// (the path, a newline, then the head of the code cut to
+    /// `rerank_document_max_bytes`; for the System One rescorer that document
+    /// cut again to its snippet limit); `Some` for every shortlisted candidate
     /// and `None` for the others. Recorded even when the reranker was off or
     /// failed, where nothing (or nothing usable) came back.
     pub document_bytes: Option<usize>,
@@ -387,6 +389,26 @@ fn rerank_document(hit: &Hit, max_bytes: usize) -> String {
     )
 }
 
+/// The candidate the System One rescorer is sent for `hit`: its snippet is the
+/// head of [`rerank_document`] cut again to `WIRE_SNIPPET_CHARS` characters.
+/// Shared by the request and the candidate trace so the trace sizes what is
+/// actually transmitted.
+fn wire_candidate(hit: &Hit, max_bytes: usize) -> WireCandidate {
+    WireCandidate::new(
+        &hit.chunk.relative_file_path,
+        hit.chunk.start_line,
+        &rerank_document(hit, max_bytes),
+    )
+}
+
+/// Bytes of the document the selected `rescorer` is given for `hit`.
+fn rescorer_document_bytes(rescorer: Rescorer, hit: &Hit, max_bytes: usize) -> usize {
+    match rescorer {
+        Rescorer::Reranker => rerank_document(hit, max_bytes).len(),
+        Rescorer::SystemOne => wire_candidate(hit, max_bytes).snippet.len(),
+    }
+}
+
 fn fusion_order(a: &Hit, b: &Hit) -> Ordering {
     b.fusion_score
         .total_cmp(&a.fusion_score)
@@ -399,14 +421,16 @@ fn fusion_order(a: &Hit, b: &Hit) -> Ordering {
 /// Records the fused pool before it is capped and cut, in fused order.
 /// `hits` is the pool exactly as the cap receives it; `max_per_file`,
 /// `shortlist`, and `max_bytes` are the cap, `rerank_candidate_count`, and
-/// `rerank_document_max_bytes` the search then applies. Reranker fields are
+/// `rerank_document_max_bytes` the search then applies; `rescorer` selects
+/// whose document the sizes describe. Reranker fields are
 /// left empty (see [`record_rerank_scores`]). Observes only: the cap runs on
 /// positions here, with the same function the search applies to the hits.
-fn trace_candidates(
+fn trace_candidates_for(
     hits: &[Hit],
     max_per_file: u32,
     shortlist: usize,
     max_bytes: usize,
+    rescorer: Rescorer,
 ) -> Vec<CandidateTrace> {
     let positions: Vec<(usize, &str)> = hits
         .iter()
@@ -425,7 +449,8 @@ fn trace_candidates(
         .enumerate()
         .map(|(index, (hit, capped_rank))| {
             let shortlisted = capped_rank <= shortlist;
-            let document_bytes = shortlisted.then(|| rerank_document(hit, max_bytes).len());
+            let document_bytes =
+                shortlisted.then(|| rescorer_document_bytes(rescorer, hit, max_bytes));
             CandidateTrace {
                 relative_file_path: hit.chunk.relative_file_path.clone(),
                 language: hit.chunk.language.clone(),
@@ -452,6 +477,17 @@ fn trace_candidates(
             }
         })
         .collect()
+}
+
+/// [`trace_candidates_for`] with the reranking service's documents.
+#[cfg(test)]
+fn trace_candidates(
+    hits: &[Hit],
+    max_per_file: u32,
+    shortlist: usize,
+    max_bytes: usize,
+) -> Vec<CandidateTrace> {
+    trace_candidates_for(hits, max_per_file, shortlist, max_bytes, Rescorer::Reranker)
 }
 
 /// Copies the reranker's answer onto the traced candidates. `ranks` is the
@@ -1072,11 +1108,12 @@ impl App {
         let mut trace_ms = 0.0;
         let mut traced = options.trace_candidates.then(|| {
             let timer = Instant::now();
-            let rows = trace_candidates(
+            let rows = trace_candidates_for(
                 &hits,
                 self.config.fusion.max_chunks_per_file,
                 settings.rerank_candidate_count,
                 self.config.rerank_document_max_bytes,
+                self.config.rescorer,
             );
             trace_ms = ms(timer);
             rows
@@ -1733,8 +1770,10 @@ impl App {
         }
     }
 
-    /// Reranks fused candidates and writes the outcome (reranked results, or
-    /// a fail-open fallback to fusion-ranked results with a warning) into
+    /// Reranks fused candidates (with the reranking service, or the typed
+    /// System One service when `rescorer = "system_one"`; one attempt per
+    /// batch, no fallback from one to the other) and writes the outcome
+    /// (reranked results, or a fail-open fallback to fusion-ranked results with a warning) into
     /// `report`. Returns the reranker's full answer, as (index in `hits`,
     /// score) pairs best first, when it scored the candidates, and `None`
     /// after a fallback.
@@ -1746,11 +1785,26 @@ impl App {
         report: &mut SearchReport,
     ) -> Option<Vec<(usize, f32)>> {
         let max_bytes = self.config.rerank_document_max_bytes;
-        let documents: Vec<_> = hits
-            .iter()
-            .map(|hit| rerank_document(hit, max_bytes))
-            .collect();
-        match self.models.rerank(query, &documents).await {
+        let (label, outcome) = match self.config.rescorer {
+            Rescorer::Reranker => {
+                let documents: Vec<_> = hits
+                    .iter()
+                    .map(|hit| rerank_document(hit, max_bytes))
+                    .collect();
+                ("Reranker", self.models.rerank(query, &documents).await)
+            }
+            Rescorer::SystemOne => {
+                let candidates: Vec<_> = hits
+                    .iter()
+                    .map(|hit| wire_candidate(hit, max_bytes))
+                    .collect();
+                (
+                    "System One rescorer",
+                    self.models.system_one_rank(query, &candidates).await,
+                )
+            }
+        };
+        match outcome {
             Ok(ranks) => {
                 report.reranked = true;
                 report.results = ranks
@@ -1765,11 +1819,18 @@ impl App {
                 Some(ranks)
             }
             Err(error) => {
-                tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
+                match self.config.rescorer {
+                    Rescorer::Reranker => {
+                        tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
+                    }
+                    Rescorer::SystemOne => {
+                        tracing::warn!(%error, "System One rescorer failed; returning fusion-ranked results");
+                    }
+                }
                 // Append: earlier warnings (a refresh fallback, an
                 // unavailable channel) must survive a reranker failure.
                 let message = format!(
-                    "Reranker unavailable or invalid response; fusion-ranked results returned: {error:#}"
+                    "{label} unavailable or invalid response; fusion-ranked results returned: {error:#}"
                 );
                 report.warning = Some(
                     report
@@ -1795,10 +1856,11 @@ mod tests {
     use super::{
         App, CandidateTrace, RerankOutcome, candidate_dump_path, cap_chunks_per_file, fusion_order,
         head_within, pool_cut_note, record_rerank_scores, rerank_document, trace_candidates,
+        trace_candidates_for, wire_candidate,
     };
     use crate::{
         chunk::Chunk,
-        config::FusionConfig,
+        config::{FusionConfig, Rescorer},
         filter::SourceRole,
         store::{Hit, source_role_prior},
     };
@@ -2657,6 +2719,40 @@ mod tests {
         assert_eq!(rerank_document(&hits[0], 8), "a.rs\nfn at_1(");
         // The snippet is the bounded evidence, not the reranker document.
         assert_eq!(cut[0].snippet, hits[0].chunk.code);
+    }
+
+    #[test]
+    fn the_system_one_trace_sizes_the_snippet_that_is_transmitted() {
+        use lci_core::provider::WIRE_SNIPPET_CHARS;
+
+        let mut hits = fused_order(&INTERLEAVED);
+        hits[0].chunk.code = "x".repeat(4096);
+        // A multibyte chunk: 3-byte characters, cut by characters not bytes.
+        hits[1].chunk.code = "\u{20ac}".repeat(1600);
+        // A document budget above the multibyte chunk's size, so the snippet
+        // limit is what cuts it (4096 would cut it first).
+        let rows = trace_candidates_for(&hits, 2, 4, 8192, Rescorer::SystemOne);
+
+        let reranker_rows = trace_candidates_for(&hits, 2, 4, 8192, Rescorer::Reranker);
+        assert_eq!(
+            reranker_rows[0].document_bytes,
+            Some("a.rs\n".len() + 4096),
+            "the reranker is sent the long document"
+        );
+
+        // The snippet is the first 1500 characters of `path\ncode`.
+        assert_eq!(rows[0].document_bytes, Some(WIRE_SNIPPET_CHARS));
+        assert_eq!(rows[0].est_tokens, Some(WIRE_SNIPPET_CHARS / 4));
+        // The default 4096-byte budget: a full chunk is sent as 1500 bytes.
+        let default_budget = trace_candidates_for(&hits, 2, 4, 4096, Rescorer::SystemOne);
+        assert_eq!(default_budget[0].document_bytes, Some(WIRE_SNIPPET_CHARS));
+        let multibyte = wire_candidate(&hits[1], 8192).snippet;
+        assert_eq!(multibyte.chars().count(), WIRE_SNIPPET_CHARS);
+        assert!(multibyte.len() > WIRE_SNIPPET_CHARS);
+        assert_eq!(rows[1].document_bytes, Some(multibyte.len()));
+        // A short chunk is sent whole, as before.
+        assert_eq!(rows[2].document_bytes, reranker_rows[2].document_bytes);
+        assert!(rows[4..].iter().all(|row| row.document_bytes.is_none()));
     }
 
     #[test]
