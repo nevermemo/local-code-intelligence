@@ -2334,3 +2334,390 @@ async fn the_beam_decides_how_many_of_a_nodes_edges_the_walk_follows() {
     assert_eq!(hops(TraverseConfig::default().beam).await, 16);
     assert_eq!(hops(64).await, 21);
 }
+
+// ---- trait paths in the question seed the scip.implements walk ----------
+
+/// A tree whose index holds the trait `Tr` (method `m`) in `a.rs`, the types
+/// `A` and `B`, and `impl Tr for A`, `impl Tr for B`.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn trait_tree() -> (tempfile::TempDir, PathBuf) {
+    use scip::types::{Document, Occurrence, SymbolInformation, symbol_information::Kind};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "pub trait Tr {\n    fn m(&self);\n}\npub struct A;\npub struct B;\nimpl Tr for A {\n    fn m(&self) {}\n}\nimpl Tr for B {\n    fn m(&self) {}\n}\n",
+    )
+    .unwrap();
+    let symbol = |path: &str| format!("rust-analyzer cargo demo 0.1.0 {path}");
+    let occurrence = |range: &[i32], path: &str, roles: i32, enclosing: &[i32]| {
+        let mut o = Occurrence::default();
+        o.range = range.to_vec();
+        o.symbol = symbol(path);
+        o.symbol_roles = roles;
+        o.enclosing_range = enclosing.to_vec();
+        o
+    };
+    let info = |path: &str, kind: Kind| {
+        let mut i = SymbolInformation::default();
+        i.symbol = symbol(path);
+        i.kind = kind.into();
+        i
+    };
+    let mut document = Document::default();
+    document.relative_path = "a.rs".to_owned();
+    document.occurrences = vec![
+        occurrence(&[0, 10, 12], "a/Tr#", 1, &[0, 0, 2, 1]),
+        occurrence(&[1, 7, 8], "a/Tr#m().", 1, &[1, 4, 1, 16]),
+        occurrence(&[3, 11, 12], "a/A#", 1, &[3, 0, 3, 13]),
+        occurrence(&[4, 11, 12], "a/B#", 1, &[4, 0, 4, 13]),
+        occurrence(&[5, 5, 7], "a/Tr#", 0, &[]),
+        occurrence(&[5, 12, 13], "a/A#", 0, &[]),
+        occurrence(&[6, 7, 8], "a/impl#[A][Tr]m().", 1, &[6, 4, 6, 18]),
+        occurrence(&[8, 5, 7], "a/Tr#", 0, &[]),
+        occurrence(&[8, 12, 13], "a/B#", 0, &[]),
+        occurrence(&[9, 7, 8], "a/impl#[B][Tr]m().", 1, &[9, 4, 9, 18]),
+    ];
+    document.symbols = vec![
+        info("a/Tr#", Kind::Trait),
+        info("a/Tr#m().", Kind::Method),
+        info("a/A#", Kind::Struct),
+        info("a/B#", Kind::Struct),
+        info("a/impl#[A][Tr]m().", Kind::Method),
+        info("a/impl#[B][Tr]m().", Kind::Method),
+    ];
+    let mut message = scip::types::Index::default();
+    message.documents = vec![document];
+    let index = dir.path().join("index.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+    (dir, index)
+}
+
+/// One call over the trait tree.
+async fn trait_run(
+    tree: &(tempfile::TempDir, PathBuf),
+    question: &str,
+    seeds: &[String],
+    maps: Option<&[&str]>,
+) -> Value {
+    trait_run_mode(tree, question, seeds, maps, TraitSeedMode::Auto).await
+}
+
+async fn trait_run_mode(
+    tree: &(tempfile::TempDir, PathBuf),
+    question: &str,
+    seeds: &[String],
+    maps: Option<&[&str]>,
+    mode: TraitSeedMode,
+) -> Value {
+    let maps: Option<Vec<String>> = maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: &tree.1,
+        scip_root: Some(tree.0.path()),
+        question,
+        seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: maps.as_deref(),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+    };
+    run_with_trait_seeds(&limits(), &Dirs::under(tree.0.path()), &call, mode)
+        .await
+        .unwrap()
+        .response
+}
+
+fn reached(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no results in {response}"))
+        .iter()
+        .map(|card| card["node"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+const WITH_IMPLEMENTS: [&str; 2] = ["graph.scip", "scip.implements"];
+
+// The ids as `scip.impact` (trait, types) and `graph.scip` (methods) make them
+// from the file `a.rs`; `graph.scip` keeps no container, so the declaration
+// and the two members share a name and are told apart by the `~n` counter.
+const TRAIT_ID: &str = "sym:rust:a::Tr/trait";
+const DECL_ID: &str = "sym:rust:a::m/method";
+const A_ID: &str = "sym:rust:a::A/struct";
+const B_ID: &str = "sym:rust:a::B/struct";
+
+#[tokio::test]
+async fn a_trait_path_in_the_question_starts_the_walk_at_the_trait() {
+    let tree = trait_tree();
+    let response = trait_run(
+        &tree,
+        "Which types implement `demo::Tr`?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    assert_eq!(response["seeds"], json!([TRAIT_ID]), "{response}");
+    assert_eq!(response["seed_source"], "traits", "{response}");
+    assert_eq!(response["trait_seeds"], 1, "{response}");
+    assert_eq!(response["seed_hits"][0]["how"], "trait", "{response}");
+    assert_eq!(
+        response["seed_hits"][0]["written"], "demo::Tr",
+        "{response}"
+    );
+    // One hop over the Implements edges reaches both implementing types.
+    let nodes = reached(&response);
+    assert!(
+        nodes.contains(&A_ID.to_owned()) && nodes.contains(&B_ID.to_owned()),
+        "{response}"
+    );
+    assert!(
+        notes_of(&response).contains("1 start nodes are the traits and trait methods"),
+        "{response}"
+    );
+    // The module path alone (`a::Tr`) and `crate::` in front name it too.
+    for question in [
+        "Which types implement `a::Tr`?",
+        "implementors of `crate::a::Tr`",
+    ] {
+        let again = trait_run(&tree, question, &[], Some(&WITH_IMPLEMENTS)).await;
+        assert_eq!(again["seeds"], json!([TRAIT_ID]), "{question}: {again}");
+    }
+}
+
+#[tokio::test]
+async fn a_trait_method_path_starts_the_walk_at_the_declaration() {
+    let tree = trait_tree();
+    let response = trait_run(
+        &tree,
+        "What must change if `Tr::m` changes?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    assert_eq!(response["seeds"], json!([DECL_ID]), "{response}");
+    assert_eq!(
+        response["seed_hits"][0]["how"], "trait_method",
+        "{response}"
+    );
+    let members = reached(&response);
+    assert_eq!(members.len(), 2, "{response}");
+    for member in ["1", "2"] {
+        let id = format!("sym:rust:a::m/method~{member}");
+        assert!(members.contains(&id), "{id} not in {response}");
+    }
+}
+
+#[tokio::test]
+async fn the_ids_the_implements_map_emits_are_accepted_as_seeds() {
+    let tree = trait_tree();
+    let walk = trait_run(
+        &tree,
+        "Which types implement `demo::Tr`?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    let methods = trait_run(
+        &tree,
+        "What must change if `Tr::m` changes?",
+        &[],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    // Every id the map reached (a trait's types, a declaration's members) and
+    // the two it starts from parses, is canonical, and starts a walk.
+    let mut ids = reached(&walk);
+    ids.extend(reached(&methods));
+    ids.push(TRAIT_ID.to_owned());
+    ids.push(DECL_ID.to_owned());
+    assert!(ids.len() == 6, "{ids:?}");
+    for id in ids {
+        let parsed = id.parse::<NodeId>().unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(parsed.to_string(), id);
+        let given = trait_run(
+            &tree,
+            "q",
+            std::slice::from_ref(&id),
+            Some(&WITH_IMPLEMENTS),
+        )
+        .await;
+        assert_eq!(given["seeds"], json!([id]), "{given}");
+        assert_eq!(given["seed_source"], "given", "{given}");
+    }
+    // A type seed walks back to its trait.
+    let from_type = trait_run(&tree, "q", &[A_ID.to_owned()], Some(&WITH_IMPLEMENTS)).await;
+    assert!(
+        reached(&from_type).contains(&TRAIT_ID.to_owned()),
+        "{from_type}"
+    );
+}
+
+#[tokio::test]
+async fn given_seeds_win_over_a_trait_path_in_the_question() {
+    let tree = trait_tree();
+    let response = trait_run(
+        &tree,
+        "Which types implement `demo::Tr`?",
+        &[A_ID.to_owned()],
+        Some(&WITH_IMPLEMENTS),
+    )
+    .await;
+    assert_eq!(response["seeds"], json!([A_ID]), "{response}");
+    assert_eq!(response["seed_source"], "given", "{response}");
+}
+
+#[tokio::test]
+async fn without_scip_implements_a_trait_path_changes_nothing() {
+    let tree = trait_tree();
+    let question = "Which types implement `demo::Tr`?";
+    // The default maps and the stand-in alone, with the question's path.
+    let stand_in = ["graph.scip", SEEDS_MAP];
+    let loaded = load(&tree.1, Some(tree.0.path())).await.unwrap();
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: &tree.1,
+        scip_root: Some(tree.0.path()),
+        question,
+        seeds: &[],
+        seed_search: None,
+        top_k: 8,
+        maps: None,
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+    };
+    let plain = find_seeds(&limits(), &call, &loaded, &[SEEDS_MAP, SCIP_MAP_ID])
+        .await
+        .unwrap();
+    let expected: Vec<String> = plain.nodes.iter().map(|s| s.node.to_string()).collect();
+    for maps in [None, Some(&stand_in[..])] {
+        let response = trait_run(&tree, question, &[], maps).await;
+        assert_eq!(response["seeds"], json!(expected), "{response}");
+        assert_ne!(response["seed_source"], "traits", "{response}");
+        assert!(
+            !notes_of(&response).contains("the traits and trait methods"),
+            "{response}"
+        );
+        let nodes = reached(&response);
+        assert!(
+            !nodes.contains(&TRAIT_ID.to_owned()) && !nodes.contains(&A_ID.to_owned()),
+            "{response}"
+        );
+        // No trait record, no field of the opt-in map, no map of it.
+        for hit in response["seed_hits"].as_array().into_iter().flatten() {
+            assert!(
+                hit["how"] != "trait" && hit["how"] != "trait_method",
+                "{response}"
+            );
+        }
+        assert!(response.get("trait_seeds").is_none(), "{response}");
+        let ids: Vec<&Value> = response["effective_policy"]["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|map| &map["id"])
+            .collect();
+        assert!(!ids.contains(&&json!("scip.implements")), "{response}");
+    }
+    // With the map on, a question that names no trait seeds exactly as before.
+    for question in [
+        "Which types implement Tr?",
+        "Which types implement `demo::Nope`?",
+        "What does `Tr` do?",
+    ] {
+        let base = trait_run(&tree, question, &[], Some(&stand_in)).await;
+        let with = trait_run(
+            &tree,
+            question,
+            &[],
+            Some(&["graph.scip", SEEDS_MAP, "scip.implements"]),
+        )
+        .await;
+        assert_eq!(with["seeds"], base["seeds"], "{question}");
+        assert_eq!(with["seed_source"], base["seed_source"], "{question}");
+        assert_eq!(with["seed_hits"], base["seed_hits"], "{question}");
+        // The map is on and nothing was named: the count says 0.
+        assert_eq!(with["trait_seeds"], 0, "{question}");
+    }
+}
+
+fn seed_ids(response: &Value) -> Vec<String> {
+    response["seeds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no seeds in {response}"))
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The stand-in seeds (the question's words match method names) and a trait
+/// path both seed the call: each mode orders them its own way.
+#[tokio::test]
+async fn trait_seeds_and_the_stand_in_seeds_combine_per_mode() {
+    let tree = trait_tree();
+    let words = ["graph.scip", SEEDS_MAP, "scip.implements"];
+    let stand_in = ["graph.scip", SEEDS_MAP];
+    // An exact path (`demo::Tr`) and a re-exported one (`other::Tr`).
+    for (question, exact) in [
+        ("Which types A and B implement `demo::Tr`?", true),
+        ("Which types A and B implement `other::Tr`?", false),
+    ] {
+        let plain = trait_run(&tree, question, &[], Some(&stand_in)).await;
+        let others: Vec<String> = seed_ids(&plain)
+            .into_iter()
+            .filter(|id| id != TRAIT_ID)
+            .collect();
+        // The words match the method nodes `graph.scip` holds (the members of A, B).
+        assert!(others.len() >= 2, "{plain}");
+        assert_eq!(plain["seed_source"], "name_tokens", "{plain}");
+        assert!(plain.get("trait_seeds").is_none(), "{plain}");
+        let mut prepended = vec![TRAIT_ID.to_owned()];
+        prepended.extend(others.clone());
+        for (mode, order, source) in [
+            (
+                TraitSeedMode::Auto,
+                if exact {
+                    vec![TRAIT_ID.to_owned()]
+                } else {
+                    prepended.clone()
+                },
+                if exact {
+                    "traits"
+                } else {
+                    "traits+name_tokens"
+                },
+            ),
+            (TraitSeedMode::Replace, vec![TRAIT_ID.to_owned()], "traits"),
+            (
+                TraitSeedMode::Prepend,
+                prepended.clone(),
+                "traits+name_tokens",
+            ),
+        ] {
+            let response = trait_run_mode(&tree, question, &[], Some(&words), mode).await;
+            let label = format!("{question} {mode:?}: {response}");
+            assert_eq!(seed_ids(&response), order, "{label}");
+            assert_eq!(response["seed_source"], source, "{label}");
+            // The trait is there once, and the count says how many are traits.
+            let ids = seed_ids(&response);
+            let unique: HashSet<&String> = ids.iter().collect();
+            assert_eq!(unique.len(), ids.len(), "{label}");
+            assert_eq!(response["trait_seeds"], 1, "{label}");
+            // One record per start node, in the same order; the trait's first.
+            let hits = response["seed_hits"].as_array().unwrap();
+            assert_eq!(hits.len(), ids.len(), "{label}");
+            for (hit, id) in hits.iter().zip(&ids) {
+                assert_eq!(hit["node"], *id, "{label}");
+            }
+            assert_eq!(hits[0]["how"], "trait", "{label}");
+            assert_eq!(hits[0]["score"], u32::from(exact), "{label}");
+            for hit in &hits[1..] {
+                assert_eq!(hit["how"], "name", "{label}");
+            }
+        }
+    }
+}
