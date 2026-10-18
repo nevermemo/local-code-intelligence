@@ -3826,9 +3826,10 @@ url = \"https://api.example.com/v1\"
             let config: Config =
                 toml::from_str(&format!("{}[docs_lane]\n{keys}\n", base_toml())).unwrap();
             let result = config.validate();
-            assert_eq!(result.is_ok(), accepted, "{keys}: {result:?}");
+            // Only the key is printed: CodeQL reads any validate() error as possibly holding a secret.
+            assert_eq!(result.is_ok(), accepted, "{keys}");
             if let Err(error) = result {
-                assert!(error.to_string().contains("docs_lane."), "{keys}: {error}");
+                assert!(error.to_string().contains("docs_lane."), "{keys}");
             }
         }
         assert!(
