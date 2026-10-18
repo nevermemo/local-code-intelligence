@@ -8,8 +8,14 @@ use anyhow::{Context, Result, anyhow};
 use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
     Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse, MapStatus,
-    SnapshotView, SourceLabel, contains::CONTAINS_MAP_ID, scip_graph::ScipMap,
-    search_maps::ChunkSearch, traverse::Seed, walk::tokenize,
+    SnapshotView, SourceLabel,
+    contains::CONTAINS_MAP_ID,
+    impact::code_names,
+    scip_graph::ScipMap,
+    scip_implements::{ImplementsMap, SCIP_IMPLEMENTS_ID, TargetKind},
+    search_maps::ChunkSearch,
+    traverse::Seed,
+    walk::tokenize,
 };
 use serde_json::{Value, json};
 use std::{
@@ -457,8 +463,17 @@ fn parse_seeds(seeds: &[String]) -> Result<Vec<NodeId>> {
 #[derive(Default)]
 pub(super) struct Seeds {
     pub(super) nodes: Vec<Seed>,
-    /// `given`, `hybrid` or `name_tokens`; empty on a continuation.
+    /// Where the start nodes came from: `given`, `hybrid`, `name_tokens`,
+    /// `traits` (the traits and trait methods the question's paths name, with
+    /// `scip.implements` on), `traits+hybrid`, `traits+name_tokens` or
+    /// `traits+exact` (those, with the other source's nodes after them),
+    /// `exact` (the first stage's cards, set by `run`) or `none`; empty on a
+    /// continuation.
     pub(super) source: &'static str,
+    /// How many start nodes are the traits and trait methods the question's
+    /// paths name; `Some` only when the call walks `scip.implements` (0 when
+    /// no path named one), so a bench can tell them from fallbacks.
+    pub(super) trait_seeds: Option<usize>,
     /// One record per start node: the retrievers that found it and its score.
     pub(super) details: Vec<Value>,
     /// Why the stand-in replaced the hybrid search, if it did.
@@ -578,4 +593,157 @@ pub(super) async fn find_seeds(
         found.source = "none";
     }
     Ok(found)
+}
+
+/// Most start nodes the trait paths of one question give.
+const MAX_TRAIT_SEEDS: usize = 6;
+
+/// How the traits and trait methods a question names join the start nodes of
+/// the other sources (the hybrid search or the stand-in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TraitSeedMode {
+    /// `Replace` when at least one start node is an exact match (the
+    /// qualifiers of the written path are on the symbol's path), `Prepend`
+    /// when the paths matched by their last segment alone.
+    #[default]
+    Auto,
+    /// The trait start nodes are the only ones from the question's own
+    /// sources (the first stage may still add its cards after them).
+    Replace,
+    /// The trait start nodes go first, the other sources' nodes after them.
+    Prepend,
+}
+
+impl FromStr for TraitSeedMode {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        match text {
+            "auto" => Ok(Self::Auto),
+            "replace" => Ok(Self::Replace),
+            "prepend" => Ok(Self::Prepend),
+            other => Err(anyhow!(
+                "trait seeds mode {other:?}: use auto, replace or prepend"
+            )),
+        }
+    }
+}
+
+/// Puts the traits and trait methods the question names among the start
+/// nodes, when the call walks `scip.implements`: a path in a code span of the
+/// question (`tauri::Manager`, `Runtime::run`) that names a trait or a trait
+/// method declaration of the map ([`ImplementsMap::find`]) starts the walk at
+/// that node, from which the map's edges reach the implementing types or
+/// members. They go in front of the start nodes of the other sources
+/// (`Prepend`) or take their place (`Replace`; `Auto` replaces when a path is
+/// an exact match). Call it only when `scip.implements` is on; a call without
+/// that map never gets here, so its start nodes are those of [`find_seeds`]
+/// alone. The seeds are not credited to a map (`Seed::map` is `None`, as for
+/// given seeds): no map ranks them, the question's own words named them.
+///
+/// Sets [`Seeds::trait_seeds`] (0 when nothing was added). Nothing else
+/// changes when the caller gave `--seeds`, when no path names a target, or on
+/// a continuation (which does not look for seeds). The source becomes
+/// `traits`, or `traits+<source>` when the other start nodes stay. Returns
+/// the note the response carries, if seeds were added.
+pub(super) fn add_trait_seeds(
+    found: &mut Seeds,
+    map: &ImplementsMap,
+    question: &str,
+    mode: TraitSeedMode,
+) -> Option<String> {
+    found.trait_seeds = Some(0);
+    if found.source == "given" {
+        return None;
+    }
+    let (names, _) = code_names(question);
+    let named: Vec<_> = map
+        .find(&names, MAX_TRAIT_SEEDS)
+        .into_iter()
+        .take(MAX_TRAIT_SEEDS)
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    let exact = named.iter().filter(|hit| hit.exact).count();
+    let replace = match mode {
+        TraitSeedMode::Replace => true,
+        TraitSeedMode::Prepend => false,
+        TraitSeedMode::Auto => exact > 0,
+    };
+    let mut nodes: Vec<Seed> = Vec::new();
+    let mut details: Vec<Value> = Vec::new();
+    for hit in &named {
+        nodes.push(Seed {
+            node: hit.target.node.clone(),
+            map: None,
+        });
+        details.push(json!({
+            "node": hit.target.node.to_string(),
+            "kind": "symbol",
+            "how": match hit.target.kind {
+                TargetKind::Trait => "trait",
+                TargetKind::Method => "trait_method",
+            },
+            "written": hit.path,
+            "retrievers": [SCIP_IMPLEMENTS_ID],
+            "score": u32::from(hit.exact),
+            "score_kind": if hit.exact { "path_match" } else { "name_match_only" },
+        }));
+    }
+    let count = named.len();
+    let loose = count - exact;
+    let before = found.source;
+    let other = found.nodes.len();
+    let what = if replace {
+        found.nodes.clear();
+        found.details.clear();
+        found.source = "traits";
+        if other == 0 {
+            "no other source gave start nodes".to_owned()
+        } else {
+            format!("they replace the {other} start nodes of seed_source {before}")
+        }
+    } else {
+        let aligned = found.details.len() == found.nodes.len();
+        let taken: HashSet<NodeId> = nodes.iter().map(|seed| seed.node.clone()).collect();
+        for (i, seed) in std::mem::take(&mut found.nodes).into_iter().enumerate() {
+            if taken.contains(&seed.node) {
+                continue;
+            }
+            if aligned {
+                details.push(found.details[i].clone());
+            }
+            nodes.push(seed);
+        }
+        if !aligned {
+            details.append(&mut found.details);
+        }
+        found.source = match before {
+            "hybrid" => "traits+hybrid",
+            "name_tokens" => "traits+name_tokens",
+            "exact" => "traits+exact",
+            _ => "traits",
+        };
+        if other == 0 {
+            "no other source gave start nodes".to_owned()
+        } else {
+            format!("the {other} start nodes of seed_source {before} follow them")
+        }
+    };
+    found.nodes = nodes;
+    found.details = details;
+    found.trait_seeds = Some(count);
+    Some(format!(
+        "{count} start nodes are the traits and trait methods the question's paths name ({loose} of them by the last segment alone); {what}; {SCIP_IMPLEMENTS_ID} follows their edges to the implementing types and members"
+    ))
+}
+
+/// Adds `trait_seeds` (how many start nodes are the traits and trait methods
+/// the question named) to a response of a call that walks `scip.implements`;
+/// a call without it has no such field.
+pub(super) fn add_trait_seed_count(response: &mut Value, found: &Seeds) {
+    if let (Some(count), Some(object)) = (found.trait_seeds, response.as_object_mut()) {
+        object.insert("trait_seeds".into(), json!(count));
+    }
 }

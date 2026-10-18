@@ -3429,10 +3429,11 @@ async fn answers_gathered_before_the_budget_ran_out_are_kept() {
     let workspace = temp.path().join("channels-partial");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-partial");
-    // Four terms make four symbol queries of 500 ms each: the first ones fit
-    // the budget (together with the server's start), all four cannot.
-    config.lsp_search_budget_ms = 1800;
-    config = with_fake_csharp_server(config, &state, &["--symbol-delay-ms", "500"], 10);
+    // Four terms make four symbol queries of 2500 ms each: the first fits the
+    // budget together with the server's start (up to 3.5 s, which a loaded
+    // machine needs), all four (10 s) cannot.
+    config.lsp_search_budget_ms = 6000;
+    config = with_fake_csharp_server(config, &state, &["--symbol-delay-ms", "2500"], 10);
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
