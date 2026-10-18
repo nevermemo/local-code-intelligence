@@ -1,0 +1,302 @@
+//! `scip.implements`: the three edge shapes, their ids and sites, the facts
+//! dropped for lack of a node id, the cap, and fail-open on unknown nodes.
+
+use super::*;
+use crate::{
+    SnapshotRef,
+    kit_c3::check_expand,
+    scip_graph::{DirSource, Range, RawDocument, RawOccurrence, SourceText},
+};
+use lci_core::node::{SymbolKey, SymbolKind};
+use std::time::Duration;
+
+fn sym(path: &str) -> String {
+    format!("rust-analyzer cargo demo 0.1.0 {path}")
+}
+
+fn def(range: Range, symbol: &str, enclosing: Range) -> RawOccurrence {
+    RawOccurrence {
+        range,
+        symbol: symbol.to_string(),
+        roles: 1,
+        enclosing: Some(enclosing),
+    }
+}
+
+fn reference(range: Range, symbol: &str) -> RawOccurrence {
+    RawOccurrence {
+        range,
+        symbol: symbol.to_string(),
+        roles: 0,
+        enclosing: None,
+    }
+}
+
+struct One(Vec<u8>);
+
+impl SourceText for One {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        (path == "a.rs").then(|| self.0.clone())
+    }
+}
+
+/// a.rs: trait `Tr` with method `m`, structs `A` and `B`, `impl Tr for A`,
+/// `impl Tr for B`, and `impl Default for A` (a trait the index lacks).
+const SRC: &str = "pub trait Tr {\n    fn m(&self);\n}\npub struct A;\npub struct B;\nimpl Tr for A {\n    fn m(&self) {}\n}\nimpl Tr for B {\n    fn m(&self) {}\n}\nimpl Default for A {}\n";
+
+fn graph() -> ScipGraph {
+    let default = "rust-analyzer cargo core 0.0 default/Default#";
+    let docs = vec![RawDocument {
+        path: "a.rs".into(),
+        occurrences: vec![
+            def((0, 10, 0, 12), &sym("a/Tr#"), (0, 0, 2, 1)),
+            def((1, 7, 1, 8), &sym("a/Tr#m()."), (1, 4, 1, 16)),
+            def((3, 11, 3, 12), &sym("a/A#"), (3, 0, 3, 13)),
+            def((4, 11, 4, 12), &sym("a/B#"), (4, 0, 4, 13)),
+            reference((5, 5, 5, 7), &sym("a/Tr#")),
+            reference((5, 12, 5, 13), &sym("a/A#")),
+            def((6, 7, 6, 8), &sym("a/impl#[A][Tr]m()."), (6, 4, 6, 18)),
+            reference((8, 5, 8, 7), &sym("a/Tr#")),
+            reference((8, 12, 8, 13), &sym("a/B#")),
+            def((9, 7, 9, 8), &sym("a/impl#[B][Tr]m()."), (9, 4, 9, 18)),
+            reference((11, 5, 11, 12), default),
+            reference((11, 17, 11, 18), &sym("a/A#")),
+        ],
+    }];
+    ScipGraph::build(
+        &docs,
+        Some(&One(SRC.as_bytes().to_vec()) as &dyn SourceText),
+    )
+}
+
+fn id(name: &str, container: &[&str], kind: SymbolKind) -> NodeId {
+    NodeId::Symbol(SymbolKey {
+        language: "rust".into(),
+        module_path: vec!["a".into()],
+        container: container.iter().map(|c| (*c).to_string()).collect(),
+        name: name.into(),
+        kind,
+        disambiguator: 0,
+    })
+}
+
+fn tr() -> NodeId {
+    id("Tr", &[], SymbolKind::Trait)
+}
+fn a() -> NodeId {
+    id("A", &[], SymbolKind::Struct)
+}
+fn b() -> NodeId {
+    id("B", &[], SymbolKind::Struct)
+}
+fn decl() -> NodeId {
+    id("m", &["Tr"], SymbolKind::Method)
+}
+fn member_a() -> NodeId {
+    id("m", &["A"], SymbolKind::Method)
+}
+fn member_b() -> NodeId {
+    id("m", &["B"], SymbolKind::Method)
+}
+
+/// The ids the other maps would give; the external `Default` has none.
+fn resolve(symbol: &str) -> Option<NodeId> {
+    match symbol {
+        s if s == sym("a/Tr#") => Some(tr()),
+        s if s == sym("a/A#") => Some(a()),
+        s if s == sym("a/B#") => Some(b()),
+        s if s == sym("a/Tr#m().") => Some(decl()),
+        s if s == sym("a/impl#[A][Tr]m().") => Some(member_a()),
+        s if s == sym("a/impl#[B][Tr]m().") => Some(member_b()),
+        _ => None,
+    }
+}
+
+fn map(cap: usize) -> ImplementsMap {
+    ImplementsMap::new(&graph(), &resolve, ImplementsOptions { cap })
+}
+
+fn budget() -> Budget {
+    Budget {
+        deadline: Instant::now() + Duration::from_secs(10),
+        max_external_calls: u32::MAX,
+        max_nodes_touched: u64::MAX,
+    }
+}
+
+fn view() -> SnapshotView<'static> {
+    SnapshotView::new(SnapshotRef::default(), Vec::new())
+}
+
+async fn expand(map: &ImplementsMap, node: &NodeId) -> Vec<Edge> {
+    check_expand(map, node, Duration::from_secs(10), &view())
+        .await
+        .expect("C7")
+}
+
+fn site_of(edge: &Edge) -> (&str, u32, u32) {
+    let site = edge.site.as_ref().unwrap();
+    (&site.path, site.line, site.col)
+}
+
+#[tokio::test]
+async fn a_type_reaches_its_traits_and_a_trait_its_types() {
+    let map = map(64);
+    let from_a = expand(&map, &a()).await;
+    // `Default` has no id: only `Tr` is offered.
+    assert_eq!(from_a.len(), 1);
+    assert_eq!(from_a[0].dst, tr());
+    assert_eq!(site_of(&from_a[0]), ("a.rs", 5, 5));
+    let from_tr = expand(&map, &tr()).await;
+    let dsts: Vec<_> = from_tr.iter().map(|e| e.dst.clone()).collect();
+    assert_eq!(dsts.len(), 2);
+    assert!(dsts.contains(&a()) && dsts.contains(&b()));
+    for edge in from_a.iter().chain(&from_tr) {
+        assert_eq!(edge.kind, EdgeKind::Implements);
+        assert_eq!(edge.map, SCIP_IMPLEMENTS_ID);
+        assert_eq!(edge.witness, WitnessClass::Compiler);
+        assert_eq!(edge.conf, CONF_MAX);
+        assert!(edge.site.as_ref().unwrap().blob.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_trait_method_reaches_the_members_that_implement_it() {
+    let map = map(64);
+    let edges = expand(&map, &decl()).await;
+    let dsts: Vec<_> = edges.iter().map(|e| e.dst.clone()).collect();
+    assert_eq!(dsts.len(), 2);
+    assert!(dsts.contains(&member_a()) && dsts.contains(&member_b()));
+    assert!(edges.iter().all(|e| e.src == decl()));
+    let to_a = edges.iter().find(|e| e.dst == member_a()).unwrap();
+    assert_eq!(site_of(to_a), ("a.rs", 5, 5));
+    // The member side is `graph.scip`'s: no edge leaves a member here.
+    assert!(expand(&map, &member_a()).await.is_empty());
+}
+
+#[test]
+fn the_stats_count_pairs_and_the_facts_without_an_id() {
+    let stats = map(64).stats();
+    assert_eq!(
+        stats,
+        ImplementsStats {
+            facts: 3,
+            type_trait: 2,
+            methods: 2,
+            dropped: 1
+        }
+    );
+    assert_eq!(
+        map(64).describe().freshness,
+        FreshnessModel::PerFile,
+        "read once, like graph.scip"
+    );
+}
+
+#[tokio::test]
+async fn the_cap_keeps_a_prefix_and_query_says_what_it_left_out() {
+    let map = map(1);
+    let node = tr();
+    assert_eq!(expand(&map, &node).await.len(), 1);
+    let seeds = [(node, 1.0)];
+    let params = serde_json::Value::Null;
+    let response = map
+        .query(
+            &MapRequest {
+                text: None,
+                seeds: &seeds,
+                limit: 10,
+                budget: budget(),
+                params: &params,
+                as_of: None,
+            },
+            &view(),
+        )
+        .await;
+    assert_eq!(response.hits.len(), 1);
+    assert!(matches!(
+        &response.status,
+        MapStatus::Partial { note: Some(note), .. } if note.contains("1 more")
+    ));
+    assert_eq!(response.hits[0].evidence[0].edge, EdgeKind::Implements);
+}
+
+#[tokio::test]
+async fn query_agrees_with_expand_when_nothing_is_capped() {
+    let map = map(64);
+    let seeds = [(tr(), 1.0)];
+    let params = serde_json::Value::Null;
+    let response = map
+        .query(
+            &MapRequest {
+                text: None,
+                seeds: &seeds,
+                limit: 10,
+                budget: budget(),
+                params: &params,
+                as_of: None,
+            },
+            &view(),
+        )
+        .await;
+    assert_eq!(response.status, MapStatus::Ok);
+    let hits: Vec<_> = response.hits.iter().map(|h| h.node.clone()).collect();
+    let edges: Vec<_> = expand(&map, &tr())
+        .await
+        .into_iter()
+        .map(|e| e.dst)
+        .collect();
+    assert_eq!(hits, edges);
+}
+
+#[tokio::test]
+async fn unknown_nodes_and_an_empty_map_give_no_edges() {
+    let map = map(64);
+    for node in [
+        id("nowhere", &[], SymbolKind::Struct),
+        NodeId::file("a.rs").unwrap(),
+    ] {
+        assert!(map.expand(&node, budget(), &view()).await.edges.is_empty());
+    }
+    let empty = ImplementsMap::empty(ImplementsOptions::default());
+    assert_eq!(empty.stats(), ImplementsStats::default());
+    assert!(
+        empty
+            .expand(&tr(), budget(), &view())
+            .await
+            .edges
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_card_is_dependent_and_good_for_impact_and_flow() {
+    let map = map(64);
+    assert!(map.card().expand_p50_ms.is_none());
+    for _ in 0..3 {
+        map.edges_of(&tr());
+    }
+    let card = map.card();
+    assert!(card.expand_p50_ms.is_some());
+    assert!(card.dependent);
+    assert_eq!(card.coverage, vec![NodeKind::Symbol]);
+    assert_eq!(
+        card.good_for,
+        vec![QuestionType::Impact, QuestionType::Flow]
+    );
+}
+
+#[test]
+fn without_source_the_map_has_no_edges() {
+    let docs = vec![RawDocument {
+        path: "a.rs".into(),
+        occurrences: vec![reference((5, 5, 5, 7), &sym("a/Tr#"))],
+    }];
+    let graph = ScipGraph::build(&docs, None);
+    let map = ImplementsMap::new(&graph, &resolve, ImplementsOptions::default());
+    assert_eq!(map.stats(), ImplementsStats::default());
+    // `DirSource` on a missing directory behaves the same.
+    let missing = DirSource("no-such-dir".into());
+    let graph = ScipGraph::build(&docs, Some(&missing));
+    assert_eq!(graph.report.impl_no_source, 1);
+}
