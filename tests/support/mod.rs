@@ -83,10 +83,34 @@ struct FakeModels {
     rerank_requests: AtomicUsize,
     /// Longest single document (in bytes) any rerank request has carried.
     max_rerank_document_bytes: AtomicUsize,
+    /// `POST /v1/systemone` (the typed rescorer): requests served, what the
+    /// next ones do (a [`SystemOneMode`] as `usize`) and the latest body.
+    system_one_requests: AtomicUsize,
+    system_one_mode: AtomicUsize,
+    system_one_last: std::sync::Mutex<Option<Value>>,
+    /// Override the typed response to exercise malformed and echoed bodies.
+    system_one_response: std::sync::Mutex<Option<(StatusCode, Value)>>,
     /// When nonzero, every embedding is padded with zeros to this many
     /// dimensions (the default vectors have three), as if the service behind
     /// the same URL and model name started returning another width.
     embedding_width: AtomicUsize,
+}
+
+/// What the fake typed service does with a request.
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum SystemOneMode {
+    /// Answers every question: `unrelated_helper` 0.9, `translator` 0.2,
+    /// anything else 0.1.
+    Answer,
+    /// HTTP 503.
+    Fail,
+    /// Answers every question but the last.
+    Partial,
+    /// Accepts the request and never answers in time.
+    Hang,
+    /// HTTP 422, the typed service's row or state limit.
+    TooLong,
 }
 
 fn evaluation_query() -> EvalQuery {
@@ -244,6 +268,44 @@ async fn rerank(
     Ok(Json(json!({"results":results})))
 }
 
+async fn system_one(
+    State(state): State<Arc<FakeModels>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state.system_one_requests.fetch_add(1, Ordering::SeqCst);
+    *state.system_one_last.lock().unwrap() = Some(body.clone());
+    if let Some((status, body)) = state.system_one_response.lock().unwrap().clone() {
+        return Err((status, Json(body)));
+    }
+    let mode = state.system_one_mode.load(Ordering::SeqCst);
+    if mode == SystemOneMode::Fail as usize {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null)));
+    }
+    if mode == SystemOneMode::TooLong as usize {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(Value::Null)));
+    }
+    if mode == SystemOneMode::Hang as usize {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+    let mut answers = serde_json::Map::new();
+    for (id, candidate) in body["state"]["candidates"].as_object().unwrap() {
+        let snippet = candidate["snippet"].as_str().unwrap();
+        let probability = if snippet.contains("unrelated_helper") {
+            0.9
+        } else if snippet.contains("translator") {
+            0.2
+        } else {
+            0.1
+        };
+        answers.insert(format!("q_{id}"), json!({"noul": probability}));
+    }
+    if mode == SystemOneMode::Partial as usize {
+        let last = answers.keys().next_back().unwrap().clone();
+        answers.remove(&last);
+    }
+    Ok(Json(json!({"model": "fake-decider-1", "answers": answers})))
+}
+
 async fn fixture() -> (
     tempfile::TempDir,
     Config,
@@ -257,6 +319,7 @@ async fn fixture() -> (
         .route("/v1/models", get(models))
         .route("/v1/embeddings", post(embed))
         .route("/rerank", get(model_endpoint).post(rerank))
+        .route("/v1/systemone", post(system_one))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

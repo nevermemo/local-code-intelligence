@@ -47,6 +47,25 @@ impl Default for IndexConfig {
     }
 }
 
+/// Which service rescores the fused shortlist when `[channels].reranker` is
+/// on (`rescorer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rescorer {
+    /// The reranking service (`reranker_url`): one score per document.
+    #[default]
+    Reranker,
+    /// The typed `[system_one]` service (`provider = "system_one_wire"`):
+    /// one yes/no question per candidate, answered as a probability.
+    SystemOne,
+}
+
+impl Rescorer {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Query-time switches for the retrieval channels and the reranker, so a
 /// search can run as a controlled ablation (for example the grep-only
 /// baseline: `semantic = false`, `lsp = false`, `reranker = false`). They are
@@ -500,6 +519,12 @@ pub struct Config {
     /// server, a hosted provider or another machine). Off when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_one: Option<SystemOneConfig>,
+    /// Which service orders the shortlist when `[channels].reranker` is on:
+    /// `"reranker"` (the default) or `"system_one"`, which needs
+    /// `[system_one]` with `provider = "system_one_wire"`. Left out of the
+    /// serialized configuration while it is the default.
+    #[serde(skip_serializing_if = "Rescorer::is_default")]
+    pub rescorer: Rescorer,
 }
 
 /// How a traversal ranks its results (`[traverse] fusion`).
@@ -1326,6 +1351,7 @@ impl Default for Config {
             recipes: RecipesConfig::default(),
             compose: ComposeConfig::default(),
             system_one: None,
+            rescorer: Rescorer::default(),
         }
     }
 }
@@ -1578,6 +1604,15 @@ impl Config {
         validate_api_key_env("reranker_api_key_env", self.reranker_api_key_env.as_deref())?;
         if let Some(system_one) = &self.system_one {
             system_one.validate()?;
+        }
+        if self.rescorer == Rescorer::SystemOne {
+            let Some(system_one) = &self.system_one else {
+                bail!("rescorer = \"system_one\" needs a [system_one] section");
+            };
+            ensure!(
+                system_one.provider == crate::provider::ProviderKind::SystemOneWire,
+                "rescorer = \"system_one\" needs system_one.provider = \"system_one_wire\""
+            );
         }
         Ok(())
     }
@@ -3604,5 +3639,69 @@ url = \"https://api.example.com/v1\"
             error.contains("reranker_api_key_env") && !error.contains("sk-pasted"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_rescorer_defaults_to_the_reranker_and_system_one_needs_its_section() {
+        let off: Config = toml::from_str(&base_toml()).unwrap();
+        assert_eq!(off.rescorer, Rescorer::Reranker);
+        assert!(
+            off.channels.reranker,
+            "[channels].reranker keeps its meaning"
+        );
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(
+            json.get("rescorer").is_none(),
+            "the default is not serialized"
+        );
+
+        let wire = "[system_one]\nprovider = \"system_one_wire\"\nurl = \"http://127.0.0.1:11435\"\nmodel = \"decider\"\ntimeout_ms = 10000\nbatch_size = 8\n";
+        let on: Config =
+            toml::from_str(&format!("{}rescorer = \"system_one\"\n{wire}", base_toml())).unwrap();
+        on.validate().unwrap();
+        assert_eq!(on.rescorer, Rescorer::SystemOne);
+        assert_eq!(on.system_one.as_ref().unwrap().batch_size, 8);
+        assert_eq!(serde_json::to_value(&on).unwrap()["rescorer"], "system_one");
+        // A wire section alone changes nothing: the rescorer stays the reranker.
+        let section_only: Config = toml::from_str(&format!("{}{wire}", base_toml())).unwrap();
+        section_only.validate().unwrap();
+        assert_eq!(section_only.rescorer, Rescorer::Reranker);
+
+        for (name, toml_text, needle) in [
+            (
+                "no section",
+                format!("{}rescorer = \"system_one\"\n", base_toml()),
+                "needs a [system_one] section",
+            ),
+            (
+                "wrong provider",
+                format!(
+                    "{}rescorer = \"system_one\"\n[system_one]\nmodel = \"m\"\n",
+                    base_toml()
+                ),
+                "system_one_wire",
+            ),
+            (
+                "remote without allow_remote",
+                format!(
+                    "{}rescorer = \"system_one\"\n[system_one]\nprovider = \"system_one_wire\"\nurl = \"https://wire.example.com\"\n",
+                    base_toml()
+                ),
+                "system_one.allow_remote",
+            ),
+            (
+                "generation port",
+                format!(
+                    "{}rescorer = \"system_one\"\n[system_one]\nprovider = \"system_one_wire\"\nurl = \"http://127.0.0.1:8765\"\n",
+                    base_toml()
+                ),
+                "8765",
+            ),
+        ] {
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(needle), "{name}: {error}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{}rescorer = \"jev\"\n", base_toml())).is_err());
     }
 }

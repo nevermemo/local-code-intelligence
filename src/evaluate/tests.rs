@@ -1915,6 +1915,7 @@ fn dump_arm(window: usize, k: usize, cap: u32, mode: RerankMode) -> CandidateArm
         k,
         embedding_identity: "test-embedding".to_owned(),
         reranker_model: "test-reranker".to_owned(),
+        rescorer: None,
         rerank_mode: mode,
     }
 }

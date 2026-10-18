@@ -11,7 +11,7 @@ mod channel_maps;
 
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
-    config::{ChannelsConfig, FusionConfig, IndexFreshness, SearchSettings},
+    config::{ChannelsConfig, FusionConfig, IndexFreshness, Rescorer, SearchSettings},
     filter::{EffectiveFilter, EffectiveFilterReport, FilterRequest, SourceRole},
     lexical,
     lsp::adapter::LspAdapter,
@@ -19,6 +19,7 @@ use crate::{
     workspace::Workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
+use lci_core::provider::WireCandidate;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -1430,8 +1431,10 @@ impl App {
         fused.into_values().collect()
     }
 
-    /// Reranks fused candidates and writes the outcome (reranked results, or
-    /// a fail-open fallback to fusion-ranked results with a warning) into
+    /// Reranks fused candidates (with the reranking service, or the typed
+    /// System One service when `rescorer = "system_one"`; one attempt per
+    /// batch, no fallback from one to the other) and writes the outcome
+    /// (reranked results, or a fail-open fallback to fusion-ranked results with a warning) into
     /// `report`. Returns the reranker's full answer, as (index in `hits`,
     /// score) pairs best first, when it scored the candidates, and `None`
     /// after a fallback.
@@ -1447,7 +1450,27 @@ impl App {
             .iter()
             .map(|hit| rerank_document(hit, max_bytes))
             .collect();
-        match self.models.rerank(query, &documents).await {
+        let (label, outcome) = match self.config.rescorer {
+            Rescorer::Reranker => ("Reranker", self.models.rerank(query, &documents).await),
+            Rescorer::SystemOne => {
+                let candidates: Vec<_> = hits
+                    .iter()
+                    .zip(&documents)
+                    .map(|(hit, document)| {
+                        WireCandidate::new(
+                            &hit.chunk.relative_file_path,
+                            hit.chunk.start_line,
+                            document,
+                        )
+                    })
+                    .collect();
+                (
+                    "System One rescorer",
+                    self.models.system_one_rank(query, &candidates).await,
+                )
+            }
+        };
+        match outcome {
             Ok(ranks) => {
                 report.reranked = true;
                 report.results = ranks
@@ -1462,11 +1485,18 @@ impl App {
                 Some(ranks)
             }
             Err(error) => {
-                tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
+                match self.config.rescorer {
+                    Rescorer::Reranker => {
+                        tracing::warn!(%error, "reranker failed; returning fusion-ranked results");
+                    }
+                    Rescorer::SystemOne => {
+                        tracing::warn!(%error, "System One rescorer failed; returning fusion-ranked results");
+                    }
+                }
                 // Append: earlier warnings (a refresh fallback, an
                 // unavailable channel) must survive a reranker failure.
                 let message = format!(
-                    "Reranker unavailable or invalid response; fusion-ranked results returned: {error:#}"
+                    "{label} unavailable or invalid response; fusion-ranked results returned: {error:#}"
                 );
                 report.warning = Some(
                     report

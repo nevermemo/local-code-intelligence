@@ -1500,3 +1500,384 @@ async fn the_replay_subcommand_runs_offline_and_its_report_pairs_with_compare() 
     }
     task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// The System One rescorer (`rescorer = "system_one"`)
+// ---------------------------------------------------------------------------
+
+/// `config` with the typed rescorer on, pointed at the fake service of
+/// [`fixture`] (its `/v1/systemone` route), and no language server.
+fn system_one_config(mut config: Config, timeout_ms: u64) -> Config {
+    config.channels.lsp = false;
+    config.rescorer = local_code_intelligence::config::Rescorer::SystemOne;
+    config.system_one = Some(lci_core::provider::SystemOneConfig {
+        provider: lci_core::provider::ProviderKind::SystemOneWire,
+        url: config.embedding_url.clone(),
+        model: "decider".into(),
+        timeout_ms,
+        ..Default::default()
+    });
+    config
+}
+
+fn write_system_one_workspace(root: &Path) {
+    write(root, "src/translator.rs", "fn translator() {}\n");
+    write(root, "src/other.rs", "fn unrelated_helper() {}\n");
+}
+
+async fn traced_search(app: &App, workspace: &Path) -> SearchReport {
+    app.search_with_options(
+        workspace,
+        "translator",
+        Some(2),
+        FilterRequest::default(),
+        SearchOptions {
+            trace_candidates: true,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn result_paths(report: &SearchReport) -> Vec<&str> {
+    report
+        .results
+        .iter()
+        .map(|hit| hit.chunk.relative_file_path.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_system_one_rescorer_reorders_the_shortlist_and_the_reranker_is_not_asked() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("system-one");
+    write_system_one_workspace(&workspace);
+
+    // The reranker puts the translator first.
+    let reranker_app = App::open(config.clone()).await.unwrap();
+    let reranked = traced_search(&reranker_app, &workspace).await;
+    assert_eq!(result_paths(&reranked)[0], "src/translator.rs");
+    assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 0);
+    let reranker_requests = fake.rerank_requests.load(Ordering::SeqCst);
+    assert!(reranker_requests > 0);
+    drop(reranker_app);
+
+    // The typed service prefers the other file: one request, its order,
+    // probabilities as scores, and no reranker request.
+    let app = App::open(system_one_config(config, 5_000)).await.unwrap();
+    let report = traced_search(&app, &workspace).await;
+    assert!(report.reranked, "{:?}", report.warning);
+    assert_eq!(report.warning, None);
+    assert_eq!(report.rerank_outcome, Some(RerankOutcome::Scored));
+    assert_eq!(
+        result_paths(&report),
+        ["src/other.rs", "src/translator.rs"],
+        "the typed order replaces fusion order"
+    );
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|hit| hit.reranker_score)
+            .collect::<Vec<_>>(),
+        [Some(0.9), Some(0.2)]
+    );
+    let rows = report.candidates.as_ref().unwrap();
+    assert!(
+        rows.iter()
+            .filter(|row| row.shortlisted)
+            .all(|row| row.rerank_rank.is_some() && row.reranker_score.is_some())
+    );
+    assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst),
+        reranker_requests
+    );
+
+    // The wire request: model, the question, one candidate and one fixed
+    // `noul` question per shortlisted chunk, snippet = path, newline, code.
+    let body = fake.system_one_last.lock().unwrap().clone().unwrap();
+    assert_eq!(body["model"], "decider");
+    assert_eq!(body["state"]["question"], "translator");
+    let candidates = body["state"]["candidates"].as_object().unwrap();
+    let questions = body["questions"].as_object().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(questions.len(), 2);
+    for (id, candidate) in candidates {
+        let path = candidate["path"].as_str().unwrap();
+        assert!(
+            candidate["snippet"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{path}\n")),
+            "{candidate}"
+        );
+        assert_eq!(candidate["line"], 1);
+        assert_eq!(
+            questions[&format!("q_{id}")],
+            json!({
+                "type": "noul",
+                "instructions": format!("`candidates.{id}` is code the question is about or the place a change for it goes"),
+            })
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_failing_system_one_rescorer_falls_back_to_fusion_order_with_one_warning() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("system-one-failing");
+    write_system_one_workspace(&workspace);
+
+    // Fusion order is what the same search returns with no rescorer at all.
+    let mut off_config = config.clone();
+    off_config.channels.lsp = false;
+    off_config.channels.reranker = false;
+    let off = traced_search(&App::open(off_config).await.unwrap(), &workspace).await;
+    assert_eq!(off.rerank_outcome, Some(RerankOutcome::Off));
+    let fusion_order: Vec<String> = result_paths(&off).into_iter().map(str::to_owned).collect();
+
+    let app = App::open(system_one_config(config, 400)).await.unwrap();
+    let reranker_requests = fake.rerank_requests.load(Ordering::SeqCst);
+    let mut asked = 0;
+    for (name, mode) in [
+        ("http error", SystemOneMode::Fail),
+        ("row limit", SystemOneMode::TooLong),
+        ("partial answer", SystemOneMode::Partial),
+        ("timeout", SystemOneMode::Hang),
+    ] {
+        fake.system_one_mode.store(mode as usize, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let report = traced_search(&app, &workspace).await;
+        asked += 1;
+        assert!(started.elapsed() < Duration::from_secs(10), "{name}");
+        assert!(!report.reranked, "{name}");
+        assert_eq!(report.rerank_outcome, Some(RerankOutcome::Failed), "{name}");
+        assert_eq!(result_paths(&report), fusion_order, "{name}");
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|hit| hit.reranker_score.is_none()),
+            "{name}"
+        );
+        let warning = report.warning.as_deref().unwrap();
+        assert_eq!(
+            warning
+                .matches("System One rescorer unavailable or invalid response")
+                .count(),
+            1,
+            "{name}: {warning}"
+        );
+        assert!(
+            warning.contains("fusion-ranked results returned"),
+            "{name}: {warning}"
+        );
+        assert_eq!(
+            fake.system_one_requests.load(Ordering::SeqCst),
+            asked,
+            "{name}: exactly one request per search, no retry"
+        );
+    }
+
+    // An error status means the service is reachable, so the next search asks
+    // it again and uses its answer.
+    fake.system_one_mode
+        .store(SystemOneMode::Answer as usize, Ordering::SeqCst);
+    let recovered = traced_search(&app, &workspace).await;
+    assert_eq!(recovered.rerank_outcome, Some(RerankOutcome::Scored));
+    assert_eq!(result_paths(&recovered)[0], "src/other.rs");
+    // The reranker is never the fallback of the typed rescorer.
+    assert_eq!(
+        fake.rerank_requests.load(Ordering::SeqCst),
+        reranker_requests
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unreachable_system_one_service_is_skipped_for_the_window() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("system-one-down");
+    write_system_one_workspace(&workspace);
+    // Nothing listens on the closed port; the other models stay on the fake.
+    let closed = ClosedPort::new();
+    let mut config = system_one_config(config, 5_000);
+    config.system_one.as_mut().unwrap().url = format!("http://127.0.0.1:{}", closed.port);
+    let app = App::open(config).await.unwrap();
+    let first = traced_search(&app, &workspace).await;
+    assert_eq!(first.rerank_outcome, Some(RerankOutcome::Failed));
+    assert!(
+        !first
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("recently unreachable")
+    );
+    let second = traced_search(&app, &workspace).await;
+    assert_eq!(second.rerank_outcome, Some(RerankOutcome::Failed));
+    assert!(
+        second
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("recently unreachable"),
+        "{:?}",
+        second.warning
+    );
+    assert_eq!(result_paths(&first), result_paths(&second));
+    assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn system_one_echoed_keys_never_reach_warnings_or_error_chains() {
+    const KEY_ENV: &str = "LCI_TEST_SYSTEM_ONE_ECHO_KEY";
+    const SECRET: &str = "sk-system-one-echo-9d8251e6";
+    // Set the environment only in a child, never in the threaded test process.
+    if std::env::var(KEY_ENV).as_deref() != Ok(SECRET) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "evaluation::system_one_echoed_keys_never_reach_warnings_or_error_chains",
+                "--nocapture",
+            ])
+            .env(KEY_ENV, SECRET)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("system-one-secret");
+    write_system_one_workspace(&workspace);
+    let mut config = system_one_config(config, 5_000);
+    config.system_one.as_mut().unwrap().api_key_env = Some(KEY_ENV.into());
+    let models = local_code_intelligence::models::Models::new(&config).unwrap();
+    let app = App::open(config).await.unwrap();
+    let candidates = [lci_core::provider::WireCandidate::new(
+        "a.rs",
+        1,
+        "fn a() {}",
+    )];
+    for (status, body, needle) in [
+        (
+            StatusCode::OK,
+            json!({"answers": SECRET}),
+            "answers must be an object",
+        ),
+        (
+            StatusCode::OK,
+            json!({"answers": {"q_c01": SECRET}}),
+            "q_c01 must be an object",
+        ),
+        (
+            StatusCode::OK,
+            json!({"answers": {"q_c01": {"noul": SECRET}}}),
+            "q_c01.noul must be a number",
+        ),
+        (
+            StatusCode::UNAUTHORIZED,
+            json!({"detail": SECRET}),
+            "HTTP status 401",
+        ),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"detail": SECRET}),
+            "HTTP status 500",
+        ),
+    ] {
+        *fake.system_one_response.lock().unwrap() = Some((status, body));
+        let error = models.system_one_rank("q", &candidates).await.unwrap_err();
+        assert!(format!("{error:#}").contains(needle), "{error:#}");
+        assert!(!format!("{error:?}").contains(SECRET));
+        for cause in error.chain() {
+            assert!(!cause.to_string().contains(SECRET));
+        }
+        let report = traced_search(&app, &workspace).await;
+        assert_eq!(report.rerank_outcome, Some(RerankOutcome::Failed));
+        let warning = report.warning.as_deref().unwrap();
+        assert!(warning.contains(needle), "{warning}");
+        assert!(!warning.contains(SECRET));
+    }
+    assert_eq!(fake.system_one_requests.load(Ordering::SeqCst), 10);
+    task.abort();
+}
+
+#[test]
+fn evaluation_settings_record_only_the_nondefault_rescorer() {
+    let mut config = Config::default();
+    // The old snapshot's field order and bytes must survive a round trip.
+    let old = format!(
+        r#"{{"rrf_k":60.0,"fusion":{},"rerank_candidate_count":24,"rerank_document_max_bytes":4096,"semantic_candidate_count":40,"lexical_candidate_count":40,"lsp_candidate_count":40,"channels":{},"k":8,"embedding_identity":{},"reranker_model":"qwen3-reranker-4b","rerank_mode":"replace"}}"#,
+        serde_json::to_string(&config.fusion).unwrap(),
+        serde_json::to_string(&config.channels).unwrap(),
+        serde_json::to_string(&config.embedding_identity()).unwrap(),
+    );
+    let loaded: CandidateArm = serde_json::from_str(&old).unwrap();
+    assert_eq!(loaded.rescorer, None);
+    assert_eq!(serde_json::to_string(&loaded).unwrap(), old);
+    assert_eq!(
+        serde_json::to_string(&CandidateArm::new(&config, 8)).unwrap(),
+        old
+    );
+
+    config.rescorer = local_code_intelligence::config::Rescorer::SystemOne;
+    let arm = CandidateArm::new(&config, 8);
+    assert_eq!(arm.rescorer.as_deref(), Some("system_one"));
+    let json = serde_json::to_string(&arm).unwrap();
+    assert!(json.contains(r#""rescorer":"system_one""#));
+    assert_eq!(serde_json::from_str::<CandidateArm>(&json).unwrap(), arm);
+}
+
+#[tokio::test]
+async fn a_failed_reranker_keeps_its_original_log_message() {
+    use std::io::Write;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (temp, mut config, fake, task) = fixture().await;
+    let workspace = temp.path().join("reranker-log");
+    write_system_one_workspace(&workspace);
+    config.channels.lsp = false;
+    fake.rerank_fails.store(true, Ordering::SeqCst);
+    let app = App::open(config).await.unwrap();
+    let log = Log::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let report = traced_search(&app, &workspace)
+        .with_subscriber(subscriber)
+        .await;
+    assert_eq!(report.rerank_outcome, Some(RerankOutcome::Failed));
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("reranker failed; returning fusion-ranked results"),
+        "{text}"
+    );
+    assert!(!text.contains("Reranker failed;"), "{text}");
+    task.abort();
+}

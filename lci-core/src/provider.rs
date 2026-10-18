@@ -4,7 +4,7 @@
 //! when the server offers them, and a record of who answered: provider name,
 //! model id and capability profile.
 //!
-//! Two providers exist:
+//! Three providers exist:
 //!
 //! * `openai_compat` posts to `<url>/chat/completions` or
 //!   `<url>/completions` of any server that speaks that API (llama.cpp,
@@ -12,11 +12,11 @@
 //!   remote. A non-loopback host is refused unless `allow_remote` is set.
 //! * `mock` replays recorded request/response pairs from a JSON file, so
 //!   tests never touch a network.
-//!
-//! TODO(hosted_typed): typed providers (a client for one hosted service's own
-//! typed API, such as the Jev pilot client) are not implemented. They would
-//! be a third [`Provider`] that answers the typed query itself instead of
-//! constrained text.
+//! * `system_one_wire` speaks the typed-question wire format: one
+//!   `POST <url>/v1/systemone` with `{model, state, questions}` and an answer
+//!   per question. It is not a [`Provider`] (it returns no text); the
+//!   rescorer (`rescorer = "system_one"`) uses it through
+//!   `Models::system_one_rank`, and the request and response types are here.
 
 use crate::{
     endpoint::{ApiKey, Endpoint, validate_api_key_env},
@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     path::Path,
     time::{Duration, Instant},
 };
@@ -116,6 +117,8 @@ pub trait Provider: Send + Sync {
 pub enum ProviderKind {
     OpenaiCompat,
     Mock,
+    /// `POST <url>/v1/systemone` with typed questions (see [`WireRequest`]).
+    SystemOneWire,
 }
 
 /// Which OpenAI endpoint an `openai_compat` server is asked.
@@ -147,6 +150,16 @@ pub struct SystemOneConfig {
     /// The recorded request/response pairs a `mock` provider replays.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_file: Option<String>,
+    /// `system_one_wire` only: the most candidates one request carries. A
+    /// shortlist longer than this is sent in several sequential requests
+    /// (for a model with a small context window); the default carries a whole
+    /// default shortlist in one.
+    #[serde(skip_serializing_if = "is_default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn is_default_batch_size(value: &usize) -> bool {
+    *value == 24
 }
 
 impl Default for SystemOneConfig {
@@ -161,12 +174,14 @@ impl Default for SystemOneConfig {
             api: ApiKind::Chat,
             capabilities: Capabilities::default(),
             replay_file: None,
+            batch_size: 24,
         }
     }
 }
 
 impl SystemOneConfig {
     pub const TIMEOUT_MS_RANGE: std::ops::RangeInclusive<u64> = 100..=600_000;
+    pub const BATCH_SIZE_RANGE: std::ops::RangeInclusive<usize> = 1..=200;
 
     pub fn endpoint(&self) -> Endpoint {
         Endpoint {
@@ -190,6 +205,13 @@ impl SystemOneConfig {
             Self::TIMEOUT_MS_RANGE.end(),
             self.timeout_ms
         );
+        ensure!(
+            Self::BATCH_SIZE_RANGE.contains(&self.batch_size),
+            "system_one.batch_size must be {}..={} (got {})",
+            Self::BATCH_SIZE_RANGE.start(),
+            Self::BATCH_SIZE_RANGE.end(),
+            self.batch_size
+        );
         validate_api_key_env("system_one.api_key_env", self.api_key_env.as_deref())?;
         match self.provider {
             ProviderKind::Mock => ensure!(
@@ -198,7 +220,7 @@ impl SystemOneConfig {
                     .is_some_and(|f| !f.trim().is_empty()),
                 "system_one.replay_file must name the recorded pairs when provider = \"mock\""
             ),
-            ProviderKind::OpenaiCompat => {
+            ProviderKind::OpenaiCompat | ProviderKind::SystemOneWire => {
                 ensure!(
                     self.replay_file.is_none(),
                     "system_one.replay_file applies only to provider = \"mock\""
@@ -209,6 +231,12 @@ impl SystemOneConfig {
                     matches!(url.scheme(), "http" | "https"),
                     "system_one.url must use HTTP(S)"
                 );
+                if self.provider == ProviderKind::SystemOneWire {
+                    ensure!(
+                        url.query().is_none() && url.fragment().is_none(),
+                        "system_one.url must not contain a query string or fragment for system_one_wire"
+                    );
+                }
                 ensure!(
                     url.port_or_known_default() != Some(crate::config::GENERATION_MODEL_PORT),
                     "`system_one.url` uses port {}, which is reserved for the generation model; LCI never contacts it; choose another port",
@@ -224,6 +252,9 @@ impl SystemOneConfig {
     pub fn build(&self) -> Result<Box<dyn Provider>> {
         self.validate()?;
         Ok(match self.provider {
+            ProviderKind::SystemOneWire => bail!(
+                "system_one.provider = \"system_one_wire\" answers typed questions for `rescorer = \"system_one\"`; it is not a completion provider"
+            ),
             ProviderKind::OpenaiCompat => Box::new(OpenAiCompat::new(self)?),
             ProviderKind::Mock => Box::new(MockProvider::from_file(
                 Path::new(self.replay_file.as_deref().unwrap_or_default()),
@@ -446,6 +477,159 @@ impl Provider for OpenAiCompat {
             capabilities: self.capabilities,
             latency: started.elapsed(),
         })
+    }
+}
+
+// ------------------------------------------------------------------ system_one_wire
+
+/// The path appended to `system_one.url` (a trailing `/v1` of the URL is not
+/// doubled).
+pub const WIRE_PATH: &str = "v1/systemone";
+
+/// The most characters of a candidate's document one request carries.
+pub const WIRE_SNIPPET_CHARS: usize = 1500;
+
+/// The fixed text of the question asked about candidate `id`.
+pub fn wire_question_text(id: &str) -> String {
+    format!("`candidates.{id}` is code the question is about or the place a change for it goes")
+}
+
+/// The id of candidate number `index` (0-based): `c01`, `c02`, ...; three
+/// digits once a shortlist passes 99.
+pub fn wire_candidate_id(index: usize, total: usize) -> String {
+    let width = if total > 99 { 3 } else { 2 };
+    format!("c{:0width$}", index + 1)
+}
+
+/// One candidate of a request's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireCandidate {
+    pub path: String,
+    pub line: u32,
+    pub snippet: String,
+}
+
+impl WireCandidate {
+    /// `document` is the reranker's document for the chunk (path, newline,
+    /// code); the snippet is its first [`WIRE_SNIPPET_CHARS`] characters.
+    pub fn new(path: &str, line: u32, document: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            line,
+            snippet: document.chars().take(WIRE_SNIPPET_CHARS).collect(),
+        }
+    }
+}
+
+/// `state` of a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireState<'a> {
+    pub question: &'a str,
+    pub candidates: BTreeMap<String, &'a WireCandidate>,
+}
+
+/// One `noul` question: a yes/no whose answer is a probability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireQuestion {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub instructions: String,
+}
+
+/// The body of `POST <url>/v1/systemone`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireRequest<'a> {
+    pub model: &'a str,
+    pub state: WireState<'a>,
+    pub questions: BTreeMap<String, WireQuestion>,
+}
+
+/// The request for `candidates[range]` of a shortlist of `total`: the
+/// candidates keep their global ids (a second batch starts at `c25`), and
+/// each gets the question `q_<id>`. Pure.
+pub fn wire_request<'a>(
+    model: &'a str,
+    query: &'a str,
+    candidates: &'a [WireCandidate],
+    range: std::ops::Range<usize>,
+) -> WireRequest<'a> {
+    let total = candidates.len();
+    let mut state = BTreeMap::new();
+    let mut questions = BTreeMap::new();
+    for index in range {
+        let id = wire_candidate_id(index, total);
+        questions.insert(
+            format!("q_{id}"),
+            WireQuestion {
+                kind: "noul",
+                instructions: wire_question_text(&id),
+            },
+        );
+        state.insert(id, &candidates[index]);
+    }
+    WireRequest {
+        model,
+        state: WireState {
+            question: query,
+            candidates: state,
+        },
+        questions,
+    }
+}
+
+/// Reads the probability of each candidate `indices` (of a shortlist of
+/// `total`) from a response body: `answers.q_<id>.noul`, a number in
+/// `[0, 1]`. A missing answer, a non-number or a value outside the range is an
+/// error, so a partial answer never reorders anything. Pure.
+pub fn parse_wire_scores(
+    bytes: &[u8],
+    indices: std::ops::Range<usize>,
+    total: usize,
+) -> Result<Vec<(usize, f32)>> {
+    // Serde type errors can quote response values. Keep neither their text
+    // nor their source in the error chain exposed by a search warning.
+    let reply: Value = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("invalid system_one wire response: invalid JSON"))?;
+    let answers = reply
+        .get("answers")
+        .context("invalid system_one wire response: missing answers field")?
+        .as_object()
+        .context("invalid system_one wire response: answers must be an object")?;
+    indices
+        .map(|index| {
+            let id = wire_candidate_id(index, total);
+            let answer = answers
+                .get(&format!("q_{id}"))
+                .with_context(|| format!("system_one wire response has no answer for {id}"))?;
+            let answer = answer
+                .as_object()
+                .with_context(|| format!("system_one wire response: q_{id} must be an object"))?;
+            let value = answer
+                .get("noul")
+                .with_context(|| format!("system_one wire response: q_{id} is missing noul"))?
+                .as_f64()
+                .with_context(|| {
+                    format!("system_one wire response: q_{id}.noul must be a number")
+                })?;
+            ensure!(
+                (0.0..=1.0).contains(&value),
+                "system_one wire response gives {id} a probability outside 0..=1"
+            );
+            // total_cmp distinguishes signed zeros; equal probabilities
+            // must instead keep the candidates' fusion order.
+            Ok((index, if value == 0.0 { 0.0 } else { value as f32 }))
+        })
+        .collect()
+}
+
+impl SystemOneConfig {
+    /// The URL `system_one_wire` posts to: `url` (a trailing `/v1` and
+    /// trailing slashes dropped) followed by [`WIRE_PATH`].
+    pub fn wire_url(&self) -> Result<reqwest::Url> {
+        let mut endpoint = self.endpoint();
+        let trimmed = endpoint.url.trim_end_matches('/');
+        endpoint.url = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned();
+        endpoint.join(WIRE_PATH)
     }
 }
 
@@ -704,6 +888,204 @@ mod tests {
             toml::from_str("provider = \"mock\"\nreplay_file = \"r.json\"").unwrap();
         assert_eq!(parsed.provider, ProviderKind::Mock);
         assert!(toml::from_str::<SystemOneConfig>("apikey = \"x\"").is_err());
+    }
+
+    #[test]
+    fn the_wire_request_has_the_fixed_shape_and_wording() {
+        let candidates = vec![
+            WireCandidate::new("a.rs", 7, &format!("a.rs\n{}", "é".repeat(2000))),
+            WireCandidate::new("b.rs", 1, "b.rs\nfn b() {}"),
+        ];
+        assert_eq!(
+            candidates[0].snippet.chars().count(),
+            WIRE_SNIPPET_CHARS,
+            "the snippet is cut by characters"
+        );
+        let body =
+            serde_json::to_value(wire_request("m", "where is b", &candidates, 0..2)).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "model": "m",
+                "state": {
+                    "question": "where is b",
+                    "candidates": {
+                        "c01": {"path": "a.rs", "line": 7, "snippet": candidates[0].snippet},
+                        "c02": {"path": "b.rs", "line": 1, "snippet": "b.rs\nfn b() {}"},
+                    },
+                },
+                "questions": {
+                    "q_c01": {"type": "noul", "instructions": "`candidates.c01` is code the question is about or the place a change for it goes"},
+                    "q_c02": {"type": "noul", "instructions": "`candidates.c02` is code the question is about or the place a change for it goes"},
+                },
+            })
+        );
+        // A later batch keeps the global ids; a long shortlist uses three digits.
+        let rest = wire_request("m", "q", &candidates, 1..2);
+        assert_eq!(rest.state.candidates.keys().collect::<Vec<_>>(), ["c02"]);
+        assert_eq!(wire_candidate_id(0, 100), "c001");
+        assert_eq!(wire_candidate_id(23, 24), "c24");
+    }
+
+    #[test]
+    fn wire_answers_are_read_by_question_and_partial_ones_are_refused() {
+        let ok = br#"{"model":"jev-1","answers":{"q_c01":{"noul":0.25},"q_c02":{"noul":1},"q_c03":{"noul":0.0},"extra":{"noul":3}}}"#;
+        assert_eq!(
+            parse_wire_scores(ok, 0..3, 3).unwrap(),
+            [(0, 0.25), (1, 1.0), (2, 0.0)]
+        );
+        // Only the batch's own ids are read.
+        assert_eq!(parse_wire_scores(ok, 1..2, 3).unwrap(), [(1, 1.0)]);
+        for (name, body) in [
+            (
+                "missing",
+                br#"{"answers":{"q_c01":{"noul":0.5}}}"#.as_slice(),
+            ),
+            (
+                "not a number",
+                br#"{"answers":{"q_c01":{"noul":"yes"},"q_c02":{"noul":0.5}}}"#,
+            ),
+            (
+                "null",
+                br#"{"answers":{"q_c01":{"noul":null},"q_c02":{"noul":0.5}}}"#,
+            ),
+            (
+                "above one",
+                br#"{"answers":{"q_c01":{"noul":1.5},"q_c02":{"noul":0.5}}}"#,
+            ),
+            (
+                "negative",
+                br#"{"answers":{"q_c01":{"noul":-0.1},"q_c02":{"noul":0.5}}}"#,
+            ),
+            (
+                "wrong key",
+                br#"{"answers":{"q_c01":{"score":0.5},"q_c02":{"noul":0.5}}}"#,
+            ),
+            ("no answers", br#"{"model":"m"}"#),
+            ("not json", b"nope"),
+        ] {
+            assert!(parse_wire_scores(body, 0..2, 2).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_wire_provider_is_validated_like_a_remote_endpoint() {
+        let wire = SystemOneConfig {
+            provider: ProviderKind::SystemOneWire,
+            url: "https://wire.example.com".into(),
+            model: "m".into(),
+            api_key_env: Some("EXAMPLE_API_KEY".into()),
+            ..SystemOneConfig::default()
+        };
+        let error = wire.validate().unwrap_err().to_string();
+        assert!(error.contains("system_one.allow_remote"), "{error}");
+        let remote = SystemOneConfig {
+            allow_remote: true,
+            ..wire.clone()
+        };
+        remote.validate().unwrap();
+        assert_eq!(
+            remote.wire_url().unwrap().as_str(),
+            "https://wire.example.com/v1/systemone"
+        );
+        for url in [
+            "http://127.0.0.1:11435",
+            "http://127.0.0.1:11435/",
+            "http://127.0.0.1:11435/v1",
+        ] {
+            let local = SystemOneConfig {
+                url: url.into(),
+                ..SystemOneConfig::default()
+            };
+            assert_eq!(
+                local.wire_url().unwrap().as_str(),
+                "http://127.0.0.1:11435/v1/systemone",
+                "{url}"
+            );
+        }
+        for invalid in [
+            SystemOneConfig {
+                url: "http://127.0.0.1:8765".into(),
+                allow_remote: true,
+                ..wire.clone()
+            },
+            SystemOneConfig {
+                batch_size: 0,
+                ..remote.clone()
+            },
+            SystemOneConfig {
+                batch_size: 201,
+                ..remote.clone()
+            },
+            SystemOneConfig {
+                replay_file: Some("r.json".into()),
+                ..remote.clone()
+            },
+            SystemOneConfig {
+                model: String::new(),
+                ..remote.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+        // It answers typed questions, not text, so it builds no `Provider`.
+        let error = remote.build().err().unwrap().to_string();
+        assert!(error.contains("rescorer"), "{error}");
+        let parsed: SystemOneConfig = toml::from_str(
+            "provider = \"system_one_wire\"\nurl = \"http://127.0.0.1:11435\"\nbatch_size = 8",
+        )
+        .unwrap();
+        assert_eq!(
+            (parsed.provider, parsed.batch_size),
+            (ProviderKind::SystemOneWire, 8)
+        );
+        assert_eq!(SystemOneConfig::default().batch_size, 24);
+    }
+
+    #[test]
+    fn wire_endpoint_guards_reject_unsafe_or_ambiguous_urls_without_sending() {
+        for (url, needle) in [
+            ("http://127.0.0.1:8765", "reserved for the generation model"),
+            ("http://192.0.2.1:9", "system_one.allow_remote"),
+            ("ftp://127.0.0.1:11435", "must use HTTP(S)"),
+            ("http://127.0.0.1:11435?token=x", "query string or fragment"),
+            ("http://127.0.0.1:11435#part", "query string or fragment"),
+            ("http://127.0.0.1:11435?", "query string or fragment"),
+            ("http://127.0.0.1:11435#", "query string or fragment"),
+        ] {
+            // Only the shared, pure validation function sees these URLs.
+            let config = SystemOneConfig {
+                provider: ProviderKind::SystemOneWire,
+                url: url.into(),
+                ..SystemOneConfig::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_wire_json_never_retains_response_values_in_its_error() {
+        let error =
+            parse_wire_scores(br#"{"answers":"private-response",broken}"#, 0..1, 1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid system_one wire response: invalid JSON"
+        );
+        assert!(!format!("{error:?}").contains("private-response"));
+        assert_eq!(error.chain().count(), 1);
+    }
+
+    #[test]
+    fn the_default_batch_size_preserves_existing_system_one_serialization() {
+        let old = r#"{"provider":"openai_compat","url":"http://127.0.0.1:8080/v1","model":"qwen3-4b","allow_remote":false,"timeout_ms":30000,"api":"chat","capabilities":{"constraint":"json_schema","logprobs":false,"batch":false}}"#;
+        let mut config: SystemOneConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(config.batch_size, 24);
+        assert_eq!(serde_json::to_string(&config).unwrap(), old);
+        assert!(!toml::to_string(&config).unwrap().contains("batch_size"));
+        config.batch_size = 8;
+        assert_eq!(serde_json::to_value(&config).unwrap()["batch_size"], 8);
+        assert!(toml::to_string(&config).unwrap().contains("batch_size = 8"));
     }
 
     #[tokio::test]

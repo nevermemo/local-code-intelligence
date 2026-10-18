@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{CandidateTrace, RerankOutcome};
-use crate::config::{ChannelsConfig, Config, FusionConfig};
+use crate::config::{ChannelsConfig, Config, FusionConfig, Rescorer};
 use crate::filter::EffectiveFilterReport;
 
 use super::metrics::query_metrics;
@@ -158,6 +158,9 @@ pub struct CandidateArm {
     pub embedding_identity: String,
     /// Reranker model name sent with every request.
     pub reranker_model: String,
+    /// Non-default service that scored this arm's shortlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescorer: Option<String>,
     /// How the reranker's output ordered the dumped results.
     pub rerank_mode: RerankMode,
 }
@@ -177,6 +180,10 @@ impl CandidateArm {
             k,
             embedding_identity: config.embedding_identity(),
             reranker_model: config.reranker_model.clone(),
+            rescorer: match config.rescorer {
+                Rescorer::Reranker => None,
+                Rescorer::SystemOne => Some("system_one".to_owned()),
+            },
             rerank_mode: if config.channels.reranker {
                 RerankMode::Replace
             } else {
