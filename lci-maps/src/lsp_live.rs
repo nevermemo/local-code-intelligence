@@ -23,9 +23,10 @@
 //!   `scip.implements` (from the interface or trait member to the members that
 //!   implement it), one edge per destination, the symbol itself left out. It is
 //!   asked only at a node with a place, which until types and traits have one
-//!   means a function or method: an interface member, not the interface. A
-//!   server that cannot answer it costs the edges of the other two requests
-//!   nothing (the error is kept in [`LspLive::last_error`]).
+//!   means a function or method: an interface member, not the interface. An
+//!   error reply from the implementation request costs the other edges nothing
+//!   (the error is kept in [`LspLive::last_error`]); a hang still trips the
+//!   call's deadline and clears them all.
 //! * file (or chunk, standing for its file) -> the symbols
 //!   `textDocument/documentSymbol` lists whose name the index also defines,
 //!   kind [`EdgeKind::Contains`]. Members the index has no node for (fields,
@@ -505,7 +506,7 @@ impl LspLive {
                                 ));
                             }
                         }
-                        Err(error) => self.fail(error),
+                        Err(error) => self.fail(format!("textDocument/implementation: {error}")),
                     }
                 }
             }
@@ -530,7 +531,8 @@ impl LspLive {
 
     /// The edges leaving `node`, sorted and capped, with the cost of the call.
     /// A call that ran out of time or failed has no edges and says why in
-    /// [`Self::last_error`].
+    /// [`Self::last_error`]; an error reply from the implementation request
+    /// alone is recorded there too but keeps the node's other edges.
     async fn collect(&self, node: &NodeId, budget: Budget) -> Expanded {
         let started = Instant::now();
         let deadline = budget.deadline.min(started + CALL_TIMEOUT);

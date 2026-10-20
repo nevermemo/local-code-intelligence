@@ -5274,7 +5274,7 @@ fn shapes_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
-    config.lsp_timeout_seconds = 10;
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     write(&workspace.path, "src/Shapes.cs", SHAPES_CS);
     let index = shapes_scip_index(temp);
@@ -5382,7 +5382,7 @@ fn lsp_live_hops(report: &local_code_intelligence::app::traverse::Report) -> Vec
 /// the third external call, and reaches the places the server answers; with
 /// it off (the default) the same walk asks none and pays two.
 #[tokio::test]
-async fn lsp_live_implementation_edges_equal_the_servers_answer() {
+async fn lsp_live_implementations_ask_once_and_pay_the_third_call() {
     use local_code_intelligence::config::{LspProfile, RunProfileConfig};
     let profile = |implementations| RunProfileConfig {
         lsp: LspProfile {
@@ -5451,6 +5451,18 @@ async fn lsp_live_implementation_edges_equal_the_servers_answer() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shapes_fixture(&temp);
     let report = traverse_area(&config, &workspace, &index, &profile(false)).await;
+    // The hops are the same: the fake's `definition` names the same places and
+    // `CallsOrRefs` wins the tie. The request count and `external_calls` are
+    // what tell the two runs apart.
+    assert_eq!(
+        lsp_live_hops(&report),
+        [
+            "sym:rust:Shapes.cs::Area/method~1",
+            "sym:rust:Shapes.cs::Area/method~2"
+        ],
+        "{}",
+        report.response
+    );
     assert_eq!(report.response["totals"]["external_calls"], 2);
     assert_eq!(requests_of(&state, "textDocument/definition"), 1);
     assert_eq!(requests_of(&state, "textDocument/references"), 1);

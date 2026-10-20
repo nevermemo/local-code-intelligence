@@ -1347,7 +1347,7 @@ pub async fn run_with_trait_seeds(
         }
     }
     if let Some(error) = lsp_live.as_ref().and_then(|map| map.last_error()) {
-        notes.push(format!("lsp.live gave no edges for a node: {error}"));
+        notes.push(format!("lsp.live reported an error for a node: {error}"));
     }
     // What the new maps cost per call, measured in this run (the p50 ring the
     // map cards report).

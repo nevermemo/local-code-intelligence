@@ -339,7 +339,11 @@ async fn an_implementation_error_keeps_the_other_edges() {
     assert_eq!(requests.load(Ordering::SeqCst), 3);
     assert_eq!(found.cost.external_calls, 3);
     let error = map.last_error().expect("the failure is recorded");
-    assert!(error.contains("no implementation provider"), "{error}");
+    assert!(
+        error.starts_with("textDocument/implementation: ")
+            && error.contains("no implementation provider"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
