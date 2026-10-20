@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2a-1 (freshness harness), K7b-1 (shared LSP sessions), K8a planning; K2b after K2a-1. Rewrite this line at every push.
+In flight: K2b (verify on read), K7b-1 (shared LSP sessions); K8a after K7b-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K2a | Partly done: the per-map freshness label `[run_profile.traverse] map_freshness` (d410); the harness remains. Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
 | **M2** | **Language servers as the source of truth** | | | |
 | K7b | Shared LSP sessions across traverse calls (server lifetime), a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |

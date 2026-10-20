@@ -24,6 +24,7 @@ pub enum Suite {
     Readiness,
     Mcp,
     Watching,
+    Freshness,
     Lsp,
     Full,
 }
@@ -143,6 +144,7 @@ pub fn run(suite: Suite) -> Result<()> {
         Suite::Readiness => invoke_focused(&["test", "--test", "integration", "readiness::"]),
         Suite::Mcp => invoke_focused(&["test", "--test", "integration", "mcp::"]),
         Suite::Watching => invoke_focused(&["test", "--test", "integration", "watching::"]),
+        Suite::Freshness => invoke_focused(&["test", "--test", "integration", "freshness::"]),
         Suite::Lsp => {
             invoke_focused(&["test", "--workspace", "--lib", "lsp::"])?;
             invoke_focused(&["test", "--test", "integration", "navigation::"])

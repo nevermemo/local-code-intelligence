@@ -62,6 +62,7 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
 | Watched refresh | `cargo xtask test --suite Watching` |
+| Map freshness against an edited tree (every traverse map and search channel; the gap list) | `cargo xtask test --suite Freshness` |
 | LSP/navigation behavior | `cargo xtask test --suite Lsp` (or `cargo test -p lci-core --lib lsp::` for adapter-only logic) |
 
 The unit-test suites (`Unit`, `Chunk`, `Filter`, and the unit halves of
