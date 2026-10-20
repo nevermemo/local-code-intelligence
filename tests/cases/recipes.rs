@@ -94,11 +94,26 @@ fn result_names(answer: &Value, group: &str) -> Vec<String> {
         .collect()
 }
 
+/// The run-profile hash `config --json` reports in `cwd` with no
+/// configuration file, the one `recipe` and `traverse` stamp there.
+fn cli_profile_hash(cwd: &Path) -> String {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
+    command.current_dir(cwd).args(["config", "--json"]);
+    strip_lci_env(&mut command);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hash = report["derived"]["run_profile_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 64, "{report}");
+    hash.to_owned()
+}
+
 #[test]
 fn the_recipe_command_prints_the_answer_without_a_server() {
     let temp = tempfile::tempdir().unwrap();
     let tree = temp.path().join("tree");
     write_recipe_tree(&tree);
+    let hash = cli_profile_hash(temp.path());
     let run = |name: &str, args: &str| {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
         command
@@ -122,6 +137,7 @@ fn the_recipe_command_prints_the_answer_without_a_server() {
     assert_eq!(result_names(&rings, "ring_1"), ["alpha"], "{rings}");
     assert_eq!(result_names(&rings, "ring_2"), ["beta"], "{rings}");
     assert_eq!(rings["stop"]["reason"], "complete", "{rings}");
+    assert_eq!(rings["profile_hash"], hash, "{rings}");
 
     let (ok, stdout, stderr) = run("flow_path", r#"{"from":"beta","to":"alpha"}"#);
     assert!(ok, "{stderr}");
@@ -402,6 +418,11 @@ fn traverse_over_scip_implements_reaches_the_member_from_the_trait_method() {
     ]);
     assert!(ok, "{stderr}");
     let walk: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        walk["profile_hash"],
+        cli_profile_hash(temp.path()),
+        "{walk}"
+    );
     assert!(
         walk["notes"][0]
             .as_str()
