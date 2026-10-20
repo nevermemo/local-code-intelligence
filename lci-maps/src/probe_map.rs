@@ -395,6 +395,9 @@ pub struct ProbeConfig {
     pub timeout: Duration,
 }
 
+/// How often a probe that waits for the gate tries it again.
+const GATE_POLL: Duration = Duration::from_millis(5);
+
 /// `LCI_PROBE_SCRATCH_DIR` and `LCI_PROBE_TARGET_DIR` override the scratch
 /// checkout and the target directory.
 pub const ENV_SCRATCH: &str = "LCI_PROBE_SCRATCH_DIR";
@@ -505,7 +508,9 @@ impl ProbeMap {
         }
     }
 
-    /// The error of the last probe that failed or ran out of time.
+    /// The problem of the last probe that finished (`None` when it ran
+    /// cleanly). A response reports its own calls' problems, not this one, so
+    /// concurrent queries do not mark each other.
     pub fn last_error(&self) -> Option<String> {
         lock(&self.inner.last_error).clone()
     }
@@ -517,15 +522,24 @@ impl ProbeMap {
 
     /// The edges of `node` for every configured patch, synchronously.
     pub fn edges_blocking(&self, node: &NodeId, timeout: Duration) -> Vec<Edge> {
-        self.inner.edges_for(node, timeout).edges
+        self.inner.edges_for(node, timeout).0.edges
     }
 
     /// The edges for a unified diff the caller made (paths relative to the
     /// tree root, `a/` and `b/` prefixes), applied in the scratch checkout
     /// with `git apply`.
     pub fn probe_diff(&self, node: &NodeId, diff: &str, timeout: Duration) -> Vec<Edge> {
-        self.inner.probe(node, Patch::Diff(diff), timeout).edges
+        self.inner
+            .probe(node, Patch::Diff(diff), timeout)
+            .expanded
+            .edges
     }
+}
+
+/// One probe's answer and, when it did not run cleanly, what went wrong.
+struct Probed {
+    expanded: Expanded,
+    problem: Option<String>,
 }
 
 enum Patch<'a> {
@@ -558,14 +572,17 @@ impl Drop for Restore {
 
 impl Inner {
     /// The edges of every configured patch, and the cost of all the checks
-    /// that ran.
-    fn edges_for(&self, node: &NodeId, timeout: Duration) -> Expanded {
+    /// that ran, with the last problem any of them had.
+    fn edges_for(&self, node: &NodeId, timeout: Duration) -> (Expanded, Option<String>) {
         let started = Instant::now();
         let mut best: HashMap<NodeId, Edge> = HashMap::new();
         let mut cost = Cost::default();
+        let mut problem = None;
         for kind in &self.config.kinds {
             let left = timeout.saturating_sub(started.elapsed());
             let probed = self.probe(node, Patch::Fixed(*kind), left);
+            problem = probed.problem.or(problem);
+            let probed = probed.expanded;
             cost.external_calls = cost
                 .external_calls
                 .saturating_add(probed.cost.external_calls);
@@ -589,12 +606,36 @@ impl Inner {
         timings.push(elapsed);
         cost.elapsed_ms = elapsed;
         cost.nodes_touched = edges.len() as u64;
-        Expanded::new(edges, cost)
+        (Expanded::new(edges, cost), problem)
     }
 
-    fn fail(&self, message: String) -> Expanded {
-        *lock(&self.last_error) = Some(message);
-        Expanded::default()
+    /// Takes the gate, waiting until `deadline` (the end of the query's
+    /// budget). A plain `lock` would park this blocking-pool thread for as
+    /// long as the holder's whole `cargo check`, long after the query's
+    /// deadline dropped its wait. `None` when the gate stayed busy.
+    fn wait_for_gate(&self, deadline: Instant) -> Option<std::sync::MutexGuard<'_, ()>> {
+        loop {
+            match self.gate.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            std::thread::sleep(left.min(GATE_POLL));
+        }
+    }
+
+    fn fail(&self, message: String) -> Probed {
+        *lock(&self.last_error) = Some(message.clone());
+        Probed {
+            expanded: Expanded::default(),
+            problem: Some(message),
+        }
     }
 
     /// The innermost graph node whose lines hold the 0-based `line` of `file`.
@@ -608,14 +649,31 @@ impl Inner {
             .min_by_key(|&i| (nodes[i].span.1 - nodes[i].span.0, i))
     }
 
-    fn probe(&self, node: &NodeId, patch: Patch<'_>, timeout: Duration) -> Expanded {
+    fn probe(&self, node: &NodeId, patch: Patch<'_>, timeout: Duration) -> Probed {
         let Some(&index) = self.node_index.get(node) else {
-            return Expanded::default();
+            return Probed {
+                expanded: Expanded::default(),
+                problem: None,
+            };
         };
         let graph = self.scip.graph();
         let unit = &graph.nodes[index];
         let rel = unit.file.replace('\\', "/");
-        let _gate = lock(&self.gate);
+        let deadline = Instant::now() + timeout;
+        let Some(_gate) = self.wait_for_gate(deadline) else {
+            return self.fail(format!(
+                "another probe held the scratch checkout for the whole budget ({} ms); this one did not run",
+                timeout.as_millis()
+            ));
+        };
+        // The wait spent part of the budget: what is left is all a copy and a
+        // cargo run may have.
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return self.fail(format!(
+                "the budget ({} ms) ran out before the scratch checkout was free; this probe did not run",
+                timeout.as_millis()
+            ));
+        }
         let started = Instant::now();
         let scratch = &self.config.scratch;
         let (copied, sync_error) = match sync_scratch(&self.config.root, scratch) {
@@ -659,12 +717,19 @@ impl Inner {
             }
         };
 
+        // Spent on the gate and the copy: cargo gets what is left.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return self.fail(format!(
+                "the budget ({} ms) ran out while the scratch checkout was prepared; cargo did not run",
+                timeout.as_millis()
+            ));
+        }
+        let cargo_timeout = left.min(self.config.timeout);
         let cargo_started = Instant::now();
-        let output = self.cargo.check(
-            scratch,
-            &self.config.target_dir,
-            timeout.min(self.config.timeout),
-        );
+        let output = self
+            .cargo
+            .check(scratch, &self.config.target_dir, cargo_timeout);
         let cargo_ms = cargo_started.elapsed().as_secs_f64() * 1000.0;
         drop(restore);
 
@@ -711,7 +776,7 @@ impl Inner {
         if output.timed_out {
             problems.push(format!(
                 "cargo check ({label}) timed out after {} s; the sites parsed so far are returned",
-                timeout.min(self.config.timeout).as_secs()
+                cargo_timeout.as_secs()
             ));
         } else if output.success.is_none() {
             problems.push(format!(
@@ -724,9 +789,9 @@ impl Inner {
                 output.stderr.lines().next().unwrap_or("no message")
             ));
         }
-        if let Some(problem) = problems.pop() {
-            *lock(&self.last_error) = Some(problem);
-        }
+        let problem = problems.pop();
+        // A clean probe clears the last problem: it is not a sticky mark.
+        *lock(&self.last_error) = problem.clone();
         lock(&self.runs).push(ProbeRun {
             patch: label,
             sites: parsed.sites.len(),
@@ -738,7 +803,10 @@ impl Inner {
             cargo_ms,
             files_copied: copied,
         });
-        Expanded::new(edges, cost)
+        Probed {
+            expanded: Expanded::new(edges, cost),
+            problem,
+        }
     }
 }
 
@@ -886,12 +954,14 @@ impl Map for ProbeMap {
         let started = Instant::now();
         let mut edges = Vec::new();
         let mut external_calls = 0u32;
+        let mut problem = None;
         for (seed, _) in request.seeds {
             let timeout = request
                 .budget
                 .deadline
                 .saturating_duration_since(Instant::now());
-            let expanded = self.expand_blocking(seed.clone(), timeout).await;
+            let (expanded, seed_problem) = self.expand_blocking(seed.clone(), timeout).await;
+            problem = seed_problem.or(problem);
             external_calls = external_calls.saturating_add(expanded.cost.external_calls);
             edges.extend(expanded.edges);
         }
@@ -901,7 +971,7 @@ impl Map for ProbeMap {
         edges.truncate(request.limit);
         let mut response = MapResponse::empty(&self.descriptor, view, MapStatus::Ok);
         response.freshness.observed = Observed::LiveTree;
-        if let Some(problem) = self.last_error() {
+        if let Some(problem) = problem {
             response.status = MapStatus::Partial {
                 note: None,
                 warning: Some(problem),
@@ -938,7 +1008,7 @@ impl Map for ProbeMap {
             return Expanded::default();
         }
         let timeout = budget.deadline.saturating_duration_since(Instant::now());
-        self.expand_blocking(node.clone(), timeout).await
+        self.expand_blocking(node.clone(), timeout).await.0
     }
 
     fn card(&self) -> MapCard {
@@ -962,7 +1032,7 @@ impl Map for ProbeMap {
 }
 
 impl ProbeMap {
-    async fn expand_blocking(&self, node: NodeId, timeout: Duration) -> Expanded {
+    async fn expand_blocking(&self, node: NodeId, timeout: Duration) -> (Expanded, Option<String>) {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.edges_for(&node, timeout))
             .await

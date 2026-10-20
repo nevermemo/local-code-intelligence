@@ -235,7 +235,7 @@ fn an_error_site_in_a_unit_becomes_an_edge_to_that_unit() {
     let canned = Canned::new(|dir| vec![error_at(dir, "src/lib.rs", 3, 27)]);
     let map = fixture.map(&canned);
     let helper = node_named(&map.inner.scip, "helper");
-    let found = map.inner.edges_for(&helper, WAIT);
+    let found = map.inner.edges_for(&helper, WAIT).0;
     let (edges, cost) = (found.edges, found.cost);
     assert_eq!(edges.len(), 1, "{edges:?}");
     let edge = &edges[0];
@@ -329,6 +329,91 @@ fn a_timed_out_cargo_returns_what_it_printed_and_says_so() {
     assert!(map.last_error().unwrap().contains("timed out"));
     assert!(map.runs()[0].timed_out);
     assert_eq!(fixture.scratch_lib(), LIB);
+}
+
+/// A cargo that stops inside `check` until the test lets it go, and says
+/// when it got there.
+struct Parked {
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    calls: AtomicUsize,
+}
+
+impl CargoRunner for Parked {
+    fn check(&self, _dir: &Path, _target: &Path, _timeout: Duration) -> CargoOutput {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        lock(&self.entered).send(()).unwrap();
+        // Returns at once when the test has dropped its sender.
+        let _ = lock(&self.release).recv();
+        CargoOutput {
+            stdout: r#"{"reason":"build-finished","success":true}"#.into(),
+            stderr: String::new(),
+            timed_out: false,
+            success: Some(true),
+        }
+    }
+}
+
+struct SharedParked(Arc<Parked>);
+
+impl CargoRunner for SharedParked {
+    fn check(&self, dir: &Path, target: &Path, timeout: Duration) -> CargoOutput {
+        self.0.check(dir, target, timeout)
+    }
+}
+
+#[test]
+fn a_probe_that_cannot_get_the_gate_in_its_budget_gives_up_instead_of_parking_a_thread() {
+    let fixture = Fixture::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let parked = Arc::new(Parked {
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+        calls: AtomicUsize::new(0),
+    });
+    let map = Arc::new(ProbeMap::with_cargo(
+        scip(),
+        fixture.config.clone(),
+        Box::new(SharedParked(parked.clone())),
+    ));
+    let helper = node_named(&map.inner.scip, "helper");
+
+    // The first probe holds the gate inside its (parked) cargo run.
+    let first = {
+        let (map, helper) = (map.clone(), helper.clone());
+        std::thread::spawn(move || map.edges_blocking(&helper, WAIT))
+    };
+    entered_rx
+        .recv_timeout(WAIT)
+        .expect("the first probe never reached cargo");
+
+    // The second has a short budget. It must return when the budget ends,
+    // not when the first probe's cargo run does.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let second = {
+        let (map, helper) = (map.clone(), helper.clone());
+        std::thread::spawn(move || {
+            let edges = map.edges_blocking(&helper, Duration::from_millis(100));
+            done_tx.send(edges).unwrap();
+        })
+    };
+    let returned = done_rx.recv_timeout(Duration::from_secs(10));
+    let error = map.last_error();
+    let second_calls = parked.calls.load(Ordering::SeqCst);
+
+    // Let everything finish before asserting, so a failure cannot hang.
+    drop(release_tx);
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let edges = returned.expect("the second probe stayed parked on the gate past its budget");
+    assert!(edges.is_empty());
+    assert_eq!(second_calls, 1, "the second probe must not have run cargo");
+    assert!(
+        error.is_some_and(|e| e.contains("another probe")),
+        "the map must record the gate timeout as its last error"
+    );
 }
 
 #[test]
@@ -449,6 +534,118 @@ async fn expand_and_query_go_through_the_blocking_probe() {
         response.hits[0].evidence[0].detail.as_deref(),
         Some("src/lib.rs:3")
     );
+}
+
+/// A cargo that records the timeout each run was given.
+struct Timed {
+    timeouts: Mutex<Vec<Duration>>,
+}
+
+struct SharedTimed(Arc<Timed>);
+
+impl CargoRunner for SharedTimed {
+    fn check(&self, _dir: &Path, _target: &Path, timeout: Duration) -> CargoOutput {
+        lock(&self.0.timeouts).push(timeout);
+        CargoOutput {
+            stdout: r#"{"reason":"build-finished","success":true}"#.into(),
+            stderr: String::new(),
+            timed_out: false,
+            success: Some(true),
+        }
+    }
+}
+
+#[test]
+fn a_probe_that_spent_its_budget_on_the_gate_does_not_copy_or_run_cargo() {
+    let fixture = Fixture::new();
+    let canned = Canned::new(|_| Vec::new());
+    let map = fixture.map(&canned);
+    let helper = node_named(&map.inner.scip, "helper");
+
+    // No budget at all, and the gate is free: nothing may run.
+    let edges = map.edges_blocking(&helper, Duration::ZERO);
+    assert!(edges.is_empty());
+    assert_eq!(canned.calls.load(Ordering::SeqCst), 0);
+    assert!(!fixture.config.scratch.exists(), "the tree was copied");
+    assert!(map.last_error().unwrap().contains("budget"));
+}
+
+#[test]
+fn cargo_gets_only_the_budget_the_gate_wait_left() {
+    let fixture = Fixture::new();
+    let timed = Arc::new(Timed {
+        timeouts: Mutex::new(Vec::new()),
+    });
+    let map = Arc::new(ProbeMap::with_cargo(
+        scip(),
+        fixture.config.clone(),
+        Box::new(SharedTimed(timed.clone())),
+    ));
+    let helper = node_named(&map.inner.scip, "helper");
+
+    // Another probe holds the gate for the first 2 s of this one's budget. The
+    // hold starts only once the probe thread runs, and the 1 s margin covers a
+    // loaded machine delaying the probe between that signal and its deadline.
+    let budget = Duration::from_millis(5000);
+    let held = lock(&map.inner.gate);
+    let (started, running) = std::sync::mpsc::channel();
+    let probe = {
+        let (map, helper) = (map.clone(), helper.clone());
+        std::thread::spawn(move || {
+            started.send(()).unwrap();
+            map.edges_blocking(&helper, budget)
+        })
+    };
+    running.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(2000));
+    drop(held);
+    probe.join().unwrap();
+
+    let timeouts = lock(&timed.timeouts).clone();
+    assert_eq!(timeouts.len(), 1, "the probe should have run cargo once");
+    assert!(
+        timeouts[0] < Duration::from_millis(4000),
+        "cargo was given {:?} of a {budget:?} budget after it waited about 2 s for the gate",
+        timeouts[0]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_probe_does_not_mark_the_next_response_partial() {
+    let fixture = Fixture::new();
+    let canned = Canned::new(|dir| vec![error_at(dir, "src/lib.rs", 3, 27)]);
+    let map = fixture.map(&canned);
+    let helper = node_named(&map.inner.scip, "helper");
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let seeds = [(helper.clone(), 1.0)];
+    let params = serde_json::Value::Null;
+    let ask = |deadline: Instant| {
+        let request = MapRequest {
+            text: None,
+            seeds: &seeds,
+            limit: 10,
+            budget: Budget {
+                deadline,
+                max_external_calls: u32::MAX,
+                max_nodes_touched: u64::MAX,
+            },
+            params: &params,
+            as_of: None,
+        };
+        let (map, view) = (&map, &view);
+        async move { map.query(&request, view).await }
+    };
+
+    // No budget: the probe does not run and the response says so.
+    let starved = ask(Instant::now()).await;
+    assert!(matches!(starved.status, MapStatus::Partial { .. }));
+    assert!(starved.hits.is_empty());
+
+    // The next call has its budget and runs cleanly: no leftover warning.
+    let fed = ask(Instant::now() + WAIT).await;
+    assert_eq!(fed.status, MapStatus::Ok);
+    assert_eq!(fed.hits.len(), 1);
+    assert_eq!(map.last_error(), None);
 }
 
 // ---------------------------------------------------------------- scratch

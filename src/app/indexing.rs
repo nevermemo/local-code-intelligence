@@ -272,9 +272,21 @@ impl App {
         result
     }
 
-    async fn index_if_stale(&self, workspace: &Workspace) -> Result<()> {
+    /// The watcher's refresh pass. `unwatch` cancels `cancellation` and returns
+    /// at once, so a pass still waiting for the workspace write lock (behind a
+    /// long index job) must give up instead of committing after the workspace
+    /// was reported unwatched. A pass that already holds the lock runs to its end.
+    async fn index_if_stale(
+        &self,
+        workspace: &Workspace,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         let coordination = self.lock(&workspace.id).await;
-        let _write = coordination.lock.write().await;
+        let _write = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(()),
+            write = coordination.lock.write() => write,
+        };
         // A job ahead of the watcher may already have committed the change.
         // Scan again under the lock: the pre-debounce fingerprint can be old.
         let root = workspace.path.clone();
@@ -740,6 +752,7 @@ impl App {
             interval.tick().await;
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancellation.cancelled() => break,
                     _ = interval.tick() => {}
                 }
@@ -772,10 +785,11 @@ impl App {
                     continue;
                 }
                 tokio::select! {
+                    biased;
                     _ = cancellation.cancelled() => break,
                     _ = tokio::time::sleep(debounce) => {}
                 }
-                if let Err(error) = app.index_if_stale(&watched_workspace).await {
+                if let Err(error) = app.index_if_stale(&watched_workspace, &cancellation).await {
                     tracing::warn!(workspace_id = %watched_workspace.id, error = %format!("{error:#}"), "automatic reindex failed; previous index retained");
                 }
             }
