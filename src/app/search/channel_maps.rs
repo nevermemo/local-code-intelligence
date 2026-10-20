@@ -549,6 +549,13 @@ pub(super) struct LegacySetup<'s, 'a> {
     pub universe: &'s [Hit],
     pub snapshot: &'s Snapshot,
     pub workspace: &'s Workspace,
+    /// The `[channels]` switches the run uses: the configured ones, with the
+    /// semantic channel off on a vectorless snapshot, as `search_once`
+    /// adjusts them.
+    pub channels: crate::config::ChannelsConfig,
+    /// Whether the run turned the semantic channel off for that reason, so
+    /// that it raises the production search's warning.
+    pub vectorless: bool,
 }
 
 impl App {
@@ -604,9 +611,17 @@ impl App {
             },
             universe.iter().map(|hit| &hit.chunk).collect(),
         );
+        // A vectorless snapshot (built while the embedding service was
+        // unreachable) turns the semantic channel off, as in `search_once`:
+        // the query is not embedded and no vector read is tried.
+        let mut channels = self.config.channels;
+        let vectorless = channels.semantic && snapshot.vectors_missing;
+        if vectorless {
+            channels.semantic = false;
+        }
         let registry = legacy_registry(
             &self.config,
-            self.config.channels,
+            channels,
             Box::new(SemanticMap {
                 app: self,
                 snapshot: &snapshot,
@@ -637,6 +652,8 @@ impl App {
             universe: &universe,
             snapshot: &snapshot,
             workspace: &workspace,
+            channels,
+            vectorless,
         };
         let prepared = before(&setup);
         let run = registry.run(Some(query), LEGACY_RUN_BUDGET, &view).await;
@@ -667,10 +684,12 @@ fn map_fusion(setup: &LegacySetup<'_, '_>, run: &lci_maps::Run) -> MapFusion {
         .collect();
     MapFusion {
         rows,
-        warnings: run
-            .warnings()
+        // The production search raises the vectorless warning first.
+        warnings: setup
+            .vectorless
+            .then(|| super::VECTORLESS_WARNING.to_owned())
             .into_iter()
-            .map(|(_, w)| w.to_owned())
+            .chain(run.warnings().into_iter().map(|(_, w)| w.to_owned()))
             .collect(),
         notes: run.notes().into_iter().map(|(_, n)| n.to_owned()).collect(),
     }

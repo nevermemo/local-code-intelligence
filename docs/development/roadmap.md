@@ -114,7 +114,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 
-M0 filler, any time a build slot is free: K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404); K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410).
+M0 filler, any time a build slot is free: K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410); K0a follow-ups review: a breaker-open embedder skip in traverse `search.vector` still counts one external call (`AppChunks::embedding_skipped` could return the models' `embedder_skipped()`), and the `EXTERNAL_CALLS` doc in src/app/traverse/mod.rs says no map makes any (d416).
 
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).

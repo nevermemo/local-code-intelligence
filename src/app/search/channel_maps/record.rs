@@ -207,7 +207,7 @@ impl App {
         let config = &self.config;
         let profile = record::profile_stamp(config)
             .map_err(|error| format!("the run profile stamp cannot be made: {error}"))?;
-        let channels = config.channels;
+        let channels = setup.channels;
         let fusion = &config.fusion;
         let map = |descriptor: MapDescriptor, weight: f32, limit: Option<usize>, enabled| {
             let mut entry = JsonMap::new();

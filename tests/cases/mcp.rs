@@ -2926,6 +2926,11 @@ async fn search_vector_skips_without_embedding_on_a_vectorless_index() {
         note.contains("the index has no vectors") && note.contains("fail-open"),
         "{note}"
     );
+    // The skipped embedding is not an external call.
+    assert_eq!(
+        answer["totals"]["external_calls"], 0,
+        "search.vector counted a call it did not make: {answer}"
+    );
 
     token.cancel();
     server.abort();

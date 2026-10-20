@@ -127,6 +127,10 @@ impl<'a> AppChunks<'a> {
     }
 }
 
+/// Why a vectorless index is never embedded against.
+const NO_VECTORS: &str =
+    "the index has no vectors (the embedding service was unreachable when it was built)";
+
 #[lci_maps::async_trait]
 impl ChunkSearch for AppChunks<'_> {
     async fn lexical(&self, query: &str, limit: usize) -> Result<Vec<ChunkHit>, String> {
@@ -172,15 +176,22 @@ impl ChunkSearch for AppChunks<'_> {
         .map_err(|error| format!("{error:#}"))
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+    async fn embedding_skipped(&self) -> Result<Option<String>, String> {
         // A vectorless index (built while the embedder was down) has no
-        // vector lane to query, so embed nothing: the map records this
-        // reason and the walk goes on without it.
+        // vector lane to query, so the map embeds nothing, counts no call and
+        // records this reason; the walk goes on without it.
+        Ok(self
+            .state()
+            .await?
+            .snapshot
+            .vectors_missing
+            .then(|| NO_VECTORS.to_owned()))
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        // The backstop of `embedding_skipped`.
         if self.state().await?.snapshot.vectors_missing {
-            return Err(
-                "the index has no vectors (the embedding service was unreachable when it was built)"
-                    .to_owned(),
-            );
+            return Err(NO_VECTORS.to_owned());
         }
         // The text goes through the document template, as an indexed chunk's
         // does (an empty path: the text is not a file's chunk).
