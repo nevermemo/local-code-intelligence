@@ -80,7 +80,7 @@ Data: the 40 parsed `search_code` calls of the D-forced and D-cue arms (27 + 13)
   is the shortlist size, not a count of hidden results, so it must not be used as "N results omitted".
 - `bounded_snippet` (`src/store.rs`) cuts by bytes although its constant says characters (N26); reuse its char-boundary walk,
   not its 400-byte budget.
-- Kill rules proposed for the A/B arms: compact is dropped if median result characters fall by less than 15%, total tokens
+- Thresholds once proposed as kill rules for the A/B arms (retired by d396; inputs to the cycle 2 screening design): compact is dropped if median result characters fall by less than 15%, total tokens
   do not fall, or mean F1 falls by more than 0.02; the cap is dropped if total tokens improve by less than 5% over compact
   alone, F1 falls by more than 0.03, or follow-up reads erase the saving.
 
