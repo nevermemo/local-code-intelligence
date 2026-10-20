@@ -28,6 +28,24 @@ pub struct RunProfileConfig {
     pub scip: ScipProfile,
     /// `[run_profile.lsp]`: how `lsp.live` gets its language servers.
     pub lsp: LspProfile,
+    /// `[run_profile.freshness]`: whether an answer is checked against the tree.
+    pub freshness: RunProfileFreshness,
+}
+
+/// `[run_profile.freshness]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileFreshness {
+    /// Check what a call cites against the working tree by content hash
+    /// ("verify on read"). `false` (the default): every answer is as without
+    /// the key. `true`: a traverse call with `[run_profile.traverse]
+    /// map_freshness` also on labels the maps that read the index snapshot or
+    /// place by the index and adds `file_changed` to each card; a search
+    /// reports a `freshness` block and `file_changed` per hit. It reads and
+    /// labels; it never refreshes the index and never changes
+    /// `[index].freshness`. It costs one read of the tree's source files per
+    /// call. See the README "Verify on read".
+    pub verify_on_read: bool,
 }
 
 /// What a traversal does with the SCIP index (`[run_profile.scip] mode`).
@@ -479,6 +497,7 @@ mod tests {
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config.run_profile.lsp.sessions = LspSessions::Shared;
+        config.run_profile.freshness.verify_on_read = true;
         config
     }
 
@@ -533,7 +552,7 @@ mod tests {
         assert!(
             base.canonical
                 .contains(
-                    r#""run_profile":{"lsp":{"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
+                    r#""run_profile":{"freshness":{"verify_on_read":false},"lsp":{"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
                 )
         );
         let mut claim = Config::default();
@@ -622,6 +641,53 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn verify_on_read_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.freshness.verify_on_read);
+        let text = format!(
+            "{}[run_profile.freshness]\nverify_on_read = true\n",
+            base_toml()
+        );
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.freshness.verify_on_read);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["freshness"]["verify_on_read"],
+            true
+        );
+        // It changes what a traverse answer and a search report hold, so it
+        // changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(
+            off.value["run_profile"]["freshness"]["verify_on_read"],
+            false
+        );
+        assert_eq!(on.value["run_profile"]["freshness"]["verify_on_read"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.freshness.verify_on_read")
+        );
+        assert_ne!(off.hash, on.hash);
+        for bad in [
+            "[run_profile.freshness]\nverify_on_read = \"yes\"\n",
+            "[run_profile.freshness]\nfoo = 1\n",
+            "[run_profile]\nverify_on_read = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        // The misplaced key is rejected by name.
+        let error = toml::from_str::<Config>(&format!(
+            "{}[run_profile]\nverify_on_read = true\n",
+            base_toml()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("verify_on_read"), "{error}");
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -679,7 +745,7 @@ mode = \"sometimes\"
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "7ba4de4746690a60f09e958f21522e8e0d7d748ed7837da51b1b40223cf7a218",
+            "f058a6c4e9931ec3837637f9972bd4dfa334371b3158effa756ea0cd1781030c",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -699,6 +765,7 @@ mode = \"sometimes\"
             "run_profile.traverse.map_freshness",
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",
+            "run_profile.freshness.verify_on_read",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -804,9 +871,10 @@ mode = \"sometimes\"
         // K2a-2: c10fe368... before `[run_profile.traverse] map_freshness`.
         // K20a: 854c4164... before `[run_profile.scip] mode` added its leaf.
         // K7b-1: e4cab053... before `[run_profile.lsp] sessions`.
+        // K2b: 7c5a1ce8... before `[run_profile.freshness] verify_on_read`.
         assert_eq!(
             Config::default().run_profile().hash,
-            "7c5a1ce880f62c278a0948d3c60edcdb3d7dd6cae2e869428a2514384298f0c3"
+            "47ed48e63a8d6feb2329e8ce4cfb57d923f50cc1066df34540396a2dd23be471"
         );
     }
 }

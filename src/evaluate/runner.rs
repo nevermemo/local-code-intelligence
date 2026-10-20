@@ -174,7 +174,7 @@ pub async fn run_evaluation_with_options(
             trace_candidates: options.dump_candidates,
         };
         let mut report = match app
-            .search_with_options(
+            .search_with_options_unverified(
                 workspace_path,
                 &query.query,
                 query.top_k,

@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: S1 (one feature set for every test suite, nextest in Full; speed-up lane, owner priority); then K2b (verify on read), K7b-2, K9a, K8a. Rewrite this line at every push.
+In flight: K7b-2 (outline cache), K9a (implementation edges), K8a next; off-milestone (owner): test speed, K36, K14a, plans for K9b, K10a, K28, K29. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -59,8 +59,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
-| **M1** | **Profile, freshness harness, no-service path** | | | |
-| K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
+| **M1** | **Profile, freshness harness, no-service path**: done 2026-10-20 (K2b, d420) | | | |
 | **M2** | **Language servers as the source of truth** | | | |
 | K7b | Partly done: shared LSP sessions across traverse calls, `[run_profile.lsp] sessions` (d414). Remaining: a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
 | K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
@@ -127,7 +126,7 @@ rounds. M is not measured yet. Update this table at each milestone end with the 
 
 | Milestone | Slices left (by size) | Sequential hours | Measured | Note |
 | --- | --- | --- | --- | --- |
-| M1 | K0a part 2, K7a, K2a (M), K2b (S-M), K23a, K35a (XS), K34a | ~12 | - | five lanes in parallel since 2026-10-20 |
+| M1 | K0a part 2, K7a, K2a (M), K2b (S-M), K23a, K35a (XS), K34a | ~12 | ~20 h wall (roadmap merge 03:49Z to K2b), with K7b-1, K7b-2 and K9a of M2 and a 2.5 h speed-up lane in parallel | five lanes in parallel since 2026-10-20 |
 | M2 | 6 M, 1 S-M, 4 S | ~30 | - | K7b, K8a and K7c build on each other |
 | M3 | 1 M, 1 S-M, 11 S, 1 XS | ~23 | - | mostly independent slices |
 | M4 | 8 M, 16 S, 4 XS | ~54 | - | most uncertain: Codanna on tree-sitter 0.26, typescript-go, marksman, live server checks, external gold |
@@ -181,6 +180,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N96 | Re-check the error-to-commit premise (item 5) with full clones and the error text of linked GitHub issues, under a new pre-registered rule (d377) | ready | M | - |
 | N99 | System-1 rescoring rung: a decision model orders the reranker's 24-candidate shortlist, the seam where N98 (killed) showed the reranker's value (d382). Gate K0 passed on a hosted System One prototype arm (d383); slice 2 (the opt-in rescorer rung, with status-only HTTP errors, transmitted trace sizes and a joint-batch replay guard) merged as PR 88 and the default is unchanged; K1 passed (slice 3, d385); slice 4 failed bar S (d387): the local 4B decider loses on flow and mined search and needs about 19 GB of VRAM, so the reranker stays the default and the rung stays opt-in. The hosted model is never shipped | done (local rung killed, d387) | M | - |
 | N100 | Where-to routing: an un-steered `traverse` call on a where-to question returns 16 answers (8 seeds and 8 walk) where the `where-to` preset returns the 8 first-stage answers, with set_f1 +0.015 [+0.005, +0.026] and 42% fewer answer tokens; cut to 8 the two are identical, so the gain is the shorter list (d389). Whether to route such questions to the preset (question-type detection, or a fact in the tool description under the facts-only rule) needs its own pre-registered test. Detection (b) was killed at B0 (R 0.339 against the 0.70 bar, d391) | partly done: detection killed (d391); the description fact (a) is parked until a tier-3 run is approved | S | - |
+| N101 | The 5 s readiness probe of `lsp.live` (`PROBE_TIMEOUT`, the server `--version` call in `ManagerBackend::open`) times out under machine load and fails a walk before the server is asked anything; seen in K9a's runs. Decide a configurable or wider deadline and test it under load | ready | XS | - |
 | N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Earlier items outside cycle 1, row 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.

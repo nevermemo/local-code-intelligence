@@ -393,6 +393,8 @@ mod tests {
                 .report(),
             candidates: None,
             rerank_outcome: None,
+            freshness: None,
+            channel_outcomes: Default::default(),
         }
     }
 

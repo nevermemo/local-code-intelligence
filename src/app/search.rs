@@ -9,6 +9,7 @@
 #[cfg(any(test, feature = "map-equivalence"))]
 mod channel_maps;
 
+use super::traverse::seeds::{is_source_path, snapshot_differing};
 use super::{App, IndexAction, WorkspaceCoordination, ms};
 use crate::{
     config::{ChannelsConfig, FusionConfig, IndexFreshness, Rescorer, SearchSettings},
@@ -31,8 +32,28 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+thread_local! {
+    /// How many `verify_on_read` scans of the tree this thread has started.
+    static VERIFY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of `freshness` scans of the tree (`[run_profile.freshness]
+/// verify_on_read`) started on this thread: for tests that a caller which
+/// discards the block does not pay for it. It counts only on the thread that
+/// polls the search, so a test that reads it needs a current-thread runtime
+/// and a search that is not spawned onto another thread; elsewhere it counts
+/// nothing and a test would pass without checking. Not part of the API.
+#[doc(hidden)]
+pub fn verify_scans_on_this_thread() -> usize {
+    VERIFY_SCANS.with(std::cell::Cell::get)
+}
+
 /// The search warning on a snapshot committed without vectors.
 const VECTORLESS_WARNING: &str = "Semantic retrieval unavailable: the index has no vectors (the embedding service was unreachable when it was built)";
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct Timings {
@@ -40,6 +61,10 @@ pub struct Timings {
     pub lancedb_search_ms: f64,
     pub lexical_search_ms: f64,
     pub lsp_search_ms: f64,
+    /// The `freshness` block of `[run_profile.freshness] verify_on_read`;
+    /// absent from the JSON when it did not run.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub verify_ms: f64,
     pub fusion_ms: f64,
     pub reranking_ms: f64,
     pub total_ms: f64,
@@ -135,6 +160,143 @@ pub struct SearchReport {
     /// [`Self::candidates`] is, because only a replay needs it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank_outcome: Option<RerankOutcome>,
+    /// How the answer compares with the tree: present exactly with
+    /// `[run_profile.freshness] verify_on_read` (see [`SearchFreshness`]);
+    /// absent from every other search's JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<SearchFreshness>,
+    /// What each retrieval channel did in this search, for `freshness`.
+    #[serde(skip)]
+    pub(crate) channel_outcomes: ChannelOutcomes,
+}
+
+/// What a retrieval channel did in one search.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelOutcome {
+    /// Off, or not reached (no adapter applied, no vectors).
+    #[default]
+    NotRun,
+    /// It ran and failed (the search carries a warning for it).
+    Failed,
+    /// It ran and returned its answer, possibly an empty one.
+    Answered,
+}
+
+/// The outcome of each channel `freshness` reports.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ChannelOutcomes {
+    semantic: ChannelOutcome,
+    lexical: ChannelOutcome,
+    lsp: ChannelOutcome,
+}
+
+/// `[run_profile.freshness] verify_on_read`: how the answer of one search
+/// compares with the tree by content hash. It reads and labels; the search
+/// never refreshes the index because of it.
+#[derive(Debug, Serialize)]
+pub struct SearchFreshness {
+    /// The index snapshot (its manifest) against the tree's source files.
+    pub snapshot: SnapshotFreshness,
+    /// The channels that ran, by the id of their map.
+    pub channels: Vec<ChannelFreshness>,
+    /// One entry per result, in order.
+    pub hits: Vec<HitFreshness>,
+}
+
+/// The index snapshot against the tree: `lag` counts the source files that
+/// differ (changed, added, removed); `null` when it was not compared.
+#[derive(Debug, Serialize)]
+pub struct SnapshotFreshness {
+    pub stale: bool,
+    pub lag: Option<u32>,
+}
+
+/// What one channel answered from. `vec.chunk.code` and `lexical` read the
+/// snapshot, so they carry its lag; `lsp.symbols` answers the language
+/// server's view of the tree (`observed: session`), which is not compared
+/// (`stale` and `lag` are `null`).
+#[derive(Debug, Serialize)]
+pub struct ChannelFreshness {
+    pub id: &'static str,
+    pub observed: &'static str,
+    pub stale: Option<bool>,
+    pub lag: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
+}
+
+/// Whether the file of one result differs now from the snapshot's: `true`,
+/// `false`, or `null` for a hit only the language server returned, or when
+/// the tree was not compared.
+#[derive(Debug, Serialize)]
+pub struct HitFreshness {
+    pub path: String,
+    pub file_changed: Option<bool>,
+}
+
+/// The `channels` of a search's `freshness` block. Only the channels that ran
+/// are listed (one that was off or not reached is not), and one that failed
+/// says so instead of a lag: it answered nothing.
+fn channel_freshness(outcomes: ChannelOutcomes, lag: Option<u32>) -> Vec<ChannelFreshness> {
+    const FAILED: &str = "failed; see warning";
+    let by_snapshot = |id: &'static str, outcome: ChannelOutcome| match outcome {
+        ChannelOutcome::NotRun => None,
+        ChannelOutcome::Failed => Some(ChannelFreshness {
+            id,
+            observed: "snapshot",
+            stale: None,
+            lag: None,
+            note: Some(FAILED),
+        }),
+        ChannelOutcome::Answered => Some(ChannelFreshness {
+            id,
+            observed: "snapshot",
+            stale: lag.map(|lag| lag > 0),
+            lag,
+            note: None,
+        }),
+    };
+    let session = match outcomes.lsp {
+        ChannelOutcome::NotRun => None,
+        ChannelOutcome::Failed => Some(FAILED),
+        ChannelOutcome::Answered => {
+            Some("answers the server's view of the tree, which is not compared")
+        }
+    };
+    [
+        by_snapshot("vec.chunk.code", outcomes.semantic),
+        by_snapshot("lexical", outcomes.lexical),
+        session.map(|note| ChannelFreshness {
+            id: "lsp.symbols",
+            observed: "session",
+            stale: None,
+            lag: None,
+            note: Some(note),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The snapshot's and the tree's content hashes by path, for
+/// [`App::verify_on_read`].
+struct Compared {
+    snapshot: HashMap<String, String>,
+    tree: HashMap<String, String>,
+}
+
+impl Compared {
+    /// Whether the file now differs from the snapshot's copy; `None` when
+    /// neither side has a source file of that path.
+    fn file_changed(&self, path: &str) -> Option<bool> {
+        match (self.snapshot.get(path), self.tree.get(path)) {
+            (Some(then), Some(now)) => Some(then != now),
+            (None, Some(_)) => Some(true),
+            (Some(_), None) => is_source_path(path).then_some(true),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Switches of one search that observe it without changing what it returns.
@@ -730,8 +892,42 @@ impl App {
         options: SearchOptions,
     ) -> Result<SearchReport> {
         let settings = self.config.base_search_settings();
-        self.search_configured(path, query, top_k, filter_request, options, &settings)
-            .await
+        let verify = self.config.run_profile.freshness.verify_on_read;
+        self.search_configured(
+            path,
+            query,
+            top_k,
+            filter_request,
+            options,
+            &settings,
+            verify,
+        )
+        .await
+    }
+
+    /// [`Self::search_with_options`] without the `freshness` block of
+    /// `[run_profile.freshness] verify_on_read`: for callers inside the crate
+    /// that discard it (the evaluation runner), so they do not pay its scan of
+    /// the tree.
+    pub(crate) async fn search_with_options_unverified(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        options: SearchOptions,
+    ) -> Result<SearchReport> {
+        let settings = self.config.base_search_settings();
+        self.search_configured(
+            path,
+            query,
+            top_k,
+            filter_request,
+            options,
+            &settings,
+            false,
+        )
+        .await
     }
 
     /// [`Self::search_with_filters`] run with the named
@@ -753,6 +949,7 @@ impl App {
         profile: Option<&str>,
     ) -> Result<SearchReport> {
         let settings = self.config.search_settings(profile)?;
+        let verify = self.config.run_profile.freshness.verify_on_read;
         self.search_configured(
             path,
             query,
@@ -760,8 +957,110 @@ impl App {
             filter_request,
             SearchOptions::default(),
             &settings,
+            verify,
         )
         .await
+    }
+
+    /// [`Self::search_in_profile`] without the `freshness` block: the start
+    /// nodes of a traversal run this search and discard the block, and the
+    /// traversal reads the tree once itself, so it must not scan it again.
+    pub(crate) async fn search_in_profile_unverified(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        profile: Option<&str>,
+    ) -> Result<SearchReport> {
+        let settings = self.config.search_settings(profile)?;
+        self.search_configured(
+            path,
+            query,
+            top_k,
+            filter_request,
+            SearchOptions::default(),
+            &settings,
+            false,
+        )
+        .await
+    }
+
+    /// The `freshness` block of a search (`[run_profile.freshness]
+    /// verify_on_read`), read after the search: the manifest of the snapshot
+    /// the search ran on against the tree's source files, one scan of the tree
+    /// with the manifest as the cache (only changed files are parsed). A
+    /// failure to compare leaves the lags and `file_changed` null and says so
+    /// in `notes`. A refresh of the snapshot between the search and this read
+    /// (`[index].freshness = "watch"`) is not seen: the block then looks as
+    /// current as the new snapshot.
+    async fn verify_on_read(&self, report: &mut SearchReport) -> SearchFreshness {
+        VERIFY_SCANS.with(|count| count.set(count.get() + 1));
+        let data_dir = self.config.data_dir.clone();
+        let workspace = report.workspace.clone();
+        let compared = tokio::task::spawn_blocking(move || -> Result<Compared> {
+            let manifest = crate::manifest::try_load(&data_dir, &workspace)?;
+            let scan =
+                lci_core::chunk::scan_incremental_with(&workspace.path, &manifest.files, false)?;
+            let hashes = |files: HashMap<String, crate::manifest::CachedFile>| {
+                files
+                    .into_iter()
+                    .map(|(path, file)| (path, file.content_hash))
+                    .collect()
+            };
+            Ok(Compared {
+                snapshot: hashes(manifest.files),
+                tree: hashes(scan.files),
+            })
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|compared| compared);
+        let compared = match compared {
+            Ok(compared) => Some(compared),
+            Err(error) => {
+                report.notes.push(format!(
+                    "verify_on_read: the tree could not be compared with the index snapshot: {error:#}"
+                ));
+                None
+            }
+        };
+        let lag = compared.as_ref().map(|compared| {
+            let tree: HashMap<&str, &str> = compared
+                .tree
+                .iter()
+                .map(|(path, hash)| (path.as_str(), hash.as_str()))
+                .collect();
+            snapshot_differing(&compared.snapshot, &tree)
+        });
+        let listed = channel_freshness(report.channel_outcomes, lag);
+        let hits = report
+            .results
+            .iter()
+            .map(|hit| {
+                let path = hit.chunk.relative_file_path.replace('\\', "/");
+                // A hit no snapshot channel returned (only the language
+                // server, or no channel named) is not placed by the snapshot,
+                // so there is nothing to compare it with.
+                let from_snapshot = hit
+                    .retrieval_channels
+                    .iter()
+                    .any(|channel| channel != "lsp");
+                let file_changed = match (&compared, from_snapshot) {
+                    (Some(compared), true) => compared.file_changed(&path),
+                    _ => None,
+                };
+                HitFreshness { path, file_changed }
+            })
+            .collect();
+        SearchFreshness {
+            snapshot: SnapshotFreshness {
+                stale: lag.is_some_and(|lag| lag > 0),
+                lag,
+            },
+            channels: listed,
+            hits,
+        }
     }
 
     /// The search behind [`Self::search_with_options`] and
@@ -769,7 +1068,33 @@ impl App {
     /// query-time switches and the rerank window). Appends the candidate dump
     /// line when this `App` has a dump, as [`Self::search_with_options`]
     /// describes.
+    #[allow(clippy::too_many_arguments)]
     async fn search_configured(
+        &self,
+        path: &Path,
+        query: &str,
+        top_k: Option<usize>,
+        filter_request: FilterRequest,
+        options: SearchOptions,
+        settings: &SearchSettings,
+        verify: bool,
+    ) -> Result<SearchReport> {
+        let mut report = self
+            .search_dumped(path, query, top_k, filter_request, options, settings)
+            .await?;
+        // `[run_profile.freshness] verify_on_read`: read after the search (and
+        // after the candidate dump, which does not carry it).
+        if verify {
+            let started = Instant::now();
+            report.freshness = Some(self.verify_on_read(&mut report).await);
+            report.timings.verify_ms = ms(started);
+        }
+        Ok(report)
+    }
+
+    /// [`Self::search_configured`] without the freshness block: the search and
+    /// its candidate dump.
+    async fn search_dumped(
         &self,
         path: &Path,
         query: &str,
@@ -846,6 +1171,8 @@ impl App {
             // never reached the reranker.
             candidates: options.trace_candidates.then(Vec::new),
             rerank_outcome: options.trace_candidates.then_some(RerankOutcome::NotRun),
+            freshness: None,
+            channel_outcomes: ChannelOutcomes::default(),
         };
         if snapshot.table.count_rows(None).await? == 0 {
             report.timings.total_ms = ms(total);
@@ -942,6 +1269,13 @@ impl App {
         let mut lexical_or_lsp_ran = channels.lsp
             && !applicable_adapters.is_empty()
             && lsp_failures.len() < applicable_adapters.len();
+        report.channel_outcomes.lsp = if !channels.lsp || applicable_adapters.is_empty() {
+            ChannelOutcome::NotRun
+        } else if lexical_or_lsp_ran {
+            ChannelOutcome::Answered
+        } else {
+            ChannelOutcome::Failed
+        };
         if !lsp_result.over_budget.is_empty() {
             // Not a warning: nothing failed, the server is just not ready
             // yet. A warning would also count the search as a fallback.
@@ -989,9 +1323,11 @@ impl App {
                                             format!("{w}; {message}")
                                         }));
                                 }
+                                report.channel_outcomes.semantic = ChannelOutcome::Answered;
                                 found.hits
                             }
                             Err(error) => {
+                                report.channel_outcomes.semantic = ChannelOutcome::Failed;
                                 let message = format!("Semantic retrieval unavailable: {error:#}");
                                 report.warning = Some(
                                     report
@@ -1004,6 +1340,7 @@ impl App {
                         }
                     }
                     Err(error) => {
+                        report.channel_outcomes.semantic = ChannelOutcome::Failed;
                         let message = format!(
                             "Query embedding unavailable; results from the other enabled channels used: {error:#}"
                         );
@@ -1028,6 +1365,7 @@ impl App {
             match lexical_matches {
                 Ok(mut lexical_search) => {
                     lexical_or_lsp_ran = true;
+                    report.channel_outcomes.lexical = ChannelOutcome::Answered;
                     if let Some(message) = lexical_search.warning.take() {
                         report.warning = Some(
                             report
@@ -1046,6 +1384,7 @@ impl App {
                     );
                 }
                 Err(error) => {
+                    report.channel_outcomes.lexical = ChannelOutcome::Failed;
                     let message = format!("Lexical retrieval unavailable: {error:#}");
                     report.warning = Some(
                         report
@@ -2911,5 +3250,156 @@ mod tests {
             .unwrap(),
             r#"["scored","failed","off","not_run"]"#
         );
+    }
+
+    fn report_without_freshness() -> super::SearchReport {
+        super::SearchReport {
+            workspace: crate::workspace::Workspace {
+                id: "ws_0123456789abcdef".to_owned(),
+                path: "/workspace".into(),
+            },
+            query: "q".to_owned(),
+            search_profile: None,
+            candidate_count: 0,
+            reranked: false,
+            warning: None,
+            notes: Vec::new(),
+            timings: super::Timings::default(),
+            results: Vec::new(),
+            docs: None,
+            index: super::SearchIndexLifecycle {
+                action: crate::app::IndexAction::Reused,
+                wait_ms: 0.0,
+            },
+            filters: crate::filter::EffectiveFilter::from_request(
+                &crate::filter::FilterRequest::default(),
+            )
+            .unwrap()
+            .report(),
+            candidates: None,
+            rerank_outcome: None,
+            freshness: None,
+            channel_outcomes: super::ChannelOutcomes::default(),
+        }
+    }
+
+    #[test]
+    fn a_channel_that_failed_or_did_not_run_has_no_snapshot_lag() {
+        use super::ChannelOutcome::{Answered, Failed, NotRun};
+        let listed = super::channel_freshness(
+            super::ChannelOutcomes {
+                semantic: Failed,
+                lexical: Answered,
+                lsp: NotRun,
+            },
+            Some(2),
+        );
+        let ids: Vec<_> = listed.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, ["vec.chunk.code", "lexical"], "{listed:?}");
+        // Failed: attempted, answered nothing, so no lag and a note.
+        assert_eq!(listed[0].lag, None);
+        assert_eq!(listed[0].stale, None);
+        assert!(listed[0].note.is_some_and(|note| note.contains("failed")));
+        // Answered: the snapshot's lag.
+        assert_eq!((listed[1].stale, listed[1].lag), (Some(true), Some(2)));
+        assert_eq!(listed[1].note, None);
+        // The session channel: failed says so; answered carries the old note.
+        let session = |outcome| {
+            let listed = super::channel_freshness(
+                super::ChannelOutcomes {
+                    lsp: outcome,
+                    ..super::ChannelOutcomes::default()
+                },
+                Some(0),
+            );
+            listed.into_iter().next()
+        };
+        assert!(session(NotRun).is_none());
+        let failed = session(Failed).unwrap();
+        assert_eq!((failed.id, failed.observed), ("lsp.symbols", "session"));
+        assert!(failed.note.is_some_and(|note| note.contains("failed")));
+        assert!(
+            session(Answered)
+                .unwrap()
+                .note
+                .is_some_and(|note| note.contains("not compared"))
+        );
+    }
+
+    #[test]
+    fn the_report_has_no_freshness_block_with_the_key_off() {
+        let report = report_without_freshness();
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("freshness").is_none(), "{json}");
+    }
+
+    #[test]
+    fn the_freshness_block_names_the_snapshot_the_channels_and_the_hits() {
+        let mut report = report_without_freshness();
+        report.freshness = Some(super::SearchFreshness {
+            snapshot: super::SnapshotFreshness {
+                stale: true,
+                lag: Some(3),
+            },
+            channels: vec![
+                super::ChannelFreshness {
+                    id: "lexical",
+                    observed: "snapshot",
+                    stale: Some(true),
+                    lag: Some(3),
+                    note: None,
+                },
+                super::ChannelFreshness {
+                    id: "lsp.symbols",
+                    observed: "session",
+                    stale: None,
+                    lag: None,
+                    note: Some("not compared"),
+                },
+            ],
+            hits: vec![super::HitFreshness {
+                path: "a.rs".to_owned(),
+                file_changed: None,
+            }],
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["freshness"],
+            serde_json::json!({
+                "snapshot": {"stale": true, "lag": 3},
+                "channels": [
+                    {"id": "lexical", "observed": "snapshot", "stale": true, "lag": 3},
+                    {"id": "lsp.symbols", "observed": "session", "stale": null, "lag": null,
+                     "note": "not compared"},
+                ],
+                "hits": [{"path": "a.rs", "file_changed": null}],
+            })
+        );
+    }
+
+    #[test]
+    fn a_hit_changed_when_its_file_differs_from_the_snapshots_copy() {
+        let pairs = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(path, hash)| ((*path).to_owned(), (*hash).to_owned()))
+                .collect()
+        };
+        let compared = super::Compared {
+            snapshot: pairs(&[
+                ("a.rs", "1"),
+                ("b.rs", "1"),
+                ("gone.rs", "1"),
+                ("README.md", "1"),
+            ]),
+            tree: pairs(&[("a.rs", "2"), ("b.rs", "1"), ("new.rs", "1")]),
+        };
+        assert_eq!(compared.file_changed("a.rs"), Some(true));
+        assert_eq!(compared.file_changed("b.rs"), Some(false));
+        assert_eq!(compared.file_changed("new.rs"), Some(true));
+        assert_eq!(compared.file_changed("gone.rs"), Some(true));
+        // A prose file the tree scan leaves out is not compared.
+        assert_eq!(compared.file_changed("README.md"), None);
+        assert_eq!(compared.file_changed("unknown.rs"), None);
     }
 }

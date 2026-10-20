@@ -548,6 +548,29 @@ mode = "authoritative"
 [run_profile.lsp]
 sessions = "per_call"
 
+# [run_profile.freshness]: verify on read. verify_on_read = false (default): every
+# answer is as without the key. true checks what a traverse answer cites against
+# the working tree by content hash; it needs [run_profile.traverse] map_freshness
+# too (it reuses that key's one read of the tree), reads and labels, and never
+# refreshes the index or changes [index].freshness. seeds.hybrid, search.lexical
+# and search.vector get a `maps` entry whose lag counts the source files that
+# differ between the index snapshot's manifest and the tree. grep.live and
+# lsp.live keep observed "live" but say places = "index" and carry the SCIP
+# index's lag (what they read is current; where they put it is the index's).
+# Every card gets file_changed: true, false, or null when no reference applies (a
+# commit, a file that is not a source file); true also covers a file that was
+# newer than the index file when its stamp was first seen (no baseline hash).
+# A search report (JSON) gets a `freshness` block: the snapshot's lag, the lag of
+# the vector and lexical channels that ran, and file_changed per hit; lsp.symbols
+# is reported as a session answer that is not compared. It is read after the
+# search, so a snapshot refresh in between is not seen. This needs no other key
+# and costs one read of the tree's source files per search a caller asks for
+# (timings.verify_ms); a traversal's seed searches and the evaluation runner do
+# not pay it.
+# Part of the run-profile hash.
+[run_profile.freshness]
+verify_on_read = false
+
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
 # the typed service behind `rescorer = "system_one"`. Off when the section is
