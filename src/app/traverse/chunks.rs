@@ -173,6 +173,15 @@ impl ChunkSearch for AppChunks<'_> {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        // A vectorless index (built while the embedder was down) has no
+        // vector lane to query, so embed nothing: the map records this
+        // reason and the walk goes on without it.
+        if self.state().await?.snapshot.vectors_missing {
+            return Err(
+                "the index has no vectors (the embedding service was unreachable when it was built)"
+                    .to_owned(),
+            );
+        }
         // The text goes through the document template, as an indexed chunk's
         // does (an empty path: the text is not a file's chunk).
         let template = &self.app.config.embedding_document_template;

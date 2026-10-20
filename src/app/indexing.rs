@@ -450,11 +450,21 @@ impl App {
     /// describing why. `identity_changed` is precomputed by the caller from
     /// the snapshot already in hand, so an embedding configuration change is
     /// always detected even when the filesystem staleness check is throttled.
+    /// `vectors_missing` (the snapshot in hand was indexed without vectors,
+    /// K0a) is a third trigger: when the throttled check is due (which still
+    /// runs its fingerprint walk), the index is run again to embed the
+    /// chunks. The repair is skipped without re-indexing while the embedder
+    /// connect breaker is open (a refused connection within its window) and
+    /// for `EMBEDDER_DOWN_WINDOW` after a repair that ended still vectorless
+    /// or failed (`last_failed_repair`). A repair that finds the service
+    /// still down commits the same vectorless snapshot and reports `Reused`;
+    /// the search warns about the missing vectors itself.
     pub(super) async fn refresh_stale_snapshot(
         &self,
         workspace: &Workspace,
         coordination: &WorkspaceCoordination,
         identity_changed: bool,
+        vectors_missing: bool,
     ) -> Result<(IndexAction, Option<String>)> {
         let due = {
             let mut last = coordination.last_stale_check.lock().await;
@@ -492,14 +502,35 @@ impl App {
             let stored = manifest::load(&self.config.data_dir, workspace);
             stored.fingerprint.is_empty() || stored.fingerprint != *current
         });
-        if !file_stale && !identity_changed {
+        let repair = vectors_missing
+            && due
+            && self.models.embedder_skipped().is_none()
+            && coordination
+                .last_failed_repair
+                .lock()
+                .await
+                .is_none_or(|failed| failed.elapsed() >= models::EMBEDDER_DOWN_WINDOW);
+        let repair_only = repair && !file_stale && !identity_changed;
+        if !file_stale && !identity_changed && !repair {
             return Ok((IndexAction::Reused, None));
         }
-        match coordination.lock.try_write() {
-            Ok(_write) => match self.index_locked(workspace.clone()).await {
+        let run = || async {
+            match self.index_locked(workspace.clone()).await {
+                Ok(report) if repair_only && report.vectors_missing => {
+                    *coordination.last_failed_repair.lock().await = Some(Instant::now());
+                    Ok((IndexAction::Reused, None))
+                }
                 Ok(_) => Ok((IndexAction::RefreshedIncrementally, None)),
-                Err(error) => Self::stale_refresh_fallback(identity_changed, error),
-            },
+                Err(error) => {
+                    if repair_only {
+                        *coordination.last_failed_repair.lock().await = Some(Instant::now());
+                    }
+                    Self::stale_refresh_fallback(identity_changed, error)
+                }
+            }
+        };
+        match coordination.lock.try_write() {
+            Ok(_write) => run().await,
             Err(_) => {
                 let wait =
                     std::time::Duration::from_secs(self.config.index.wait_for_existing_job_seconds);
@@ -507,6 +538,8 @@ impl App {
                     Ok(_write) => {
                         // The previous holder may already have refreshed the
                         // snapshot; re-check before refreshing again.
+                        // (A vectorless snapshot is not re-checked: the lock
+                        // holder just attempted the repair.)
                         let still_stale = self
                             .store
                             .snapshot(workspace)
@@ -519,10 +552,7 @@ impl App {
                         if !still_stale {
                             Ok((IndexAction::WaitedForExistingJob, None))
                         } else {
-                            match self.index_locked(workspace.clone()).await {
-                                Ok(_) => Ok((IndexAction::RefreshedIncrementally, None)),
-                                Err(error) => Self::stale_refresh_fallback(identity_changed, error),
-                            }
+                            run().await
                         }
                     }
                     Err(_elapsed) => {

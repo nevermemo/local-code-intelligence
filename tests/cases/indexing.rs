@@ -663,6 +663,219 @@ async fn a_failed_initial_embedding_indexes_without_vectors_and_the_next_index_r
     task.abort();
 }
 
+/// K0a, part 2: a vectorless index is repaired by the next search under
+/// `on-search` freshness once the embedder answers again, and not under
+/// `manual`, which never refreshes from a search.
+#[tokio::test]
+async fn a_vectorless_index_is_embedded_on_the_next_search_once_the_service_answers() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("repair");
+    write(&workspace, "lib.rs", "fn translator() {}\nfn other() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let first = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let repaired = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    let repair_time = started.elapsed();
+    eprintln!("repair search took {repair_time:?}");
+    assert_eq!(
+        serde_json::to_value(&repaired).unwrap()["index"]["action"],
+        "refreshed_incrementally"
+    );
+    assert!(
+        repaired.results[0]
+            .retrieval_channels
+            .contains(&"semantic".to_string()),
+        "{:?}",
+        repaired.results[0].retrieval_channels
+    );
+    assert!(repaired.warning.is_none(), "{:?}", repaired.warning);
+    let status = app.status(&workspace).await.unwrap();
+    assert!(!status.vectors_missing);
+    assert!(status.embedding_dimension.is_some());
+    assert!(fake.documents.load(Ordering::SeqCst) > documents);
+
+    // Repaired: the next search reuses the snapshot and embeds nothing.
+    let documents = fake.documents.load(Ordering::SeqCst);
+    let again = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&again).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert_eq!(fake.documents.load(Ordering::SeqCst), documents);
+    task.abort();
+}
+
+/// A repair that finds the service still failing (an HTTP 503 does not trip the
+/// connect breaker) is not tried again by every search: the next one inside
+/// the window sends no embedding request.
+#[tokio::test]
+async fn a_failed_repair_is_not_retried_by_the_next_search_inside_the_window() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.stale_check_interval_seconds = 0;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("repair-throttle");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}
+",
+    );
+    let app = App::open(config).await.unwrap();
+
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+
+    // The first search after the index tries the repair and is answered 503.
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let tried = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&tried).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(
+        fake.embed_requests.load(Ordering::SeqCst) > requests,
+        "the repair was tried"
+    );
+
+    // The second one, inside the window, sends nothing: neither a repair nor
+    // a query embedding.
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let second = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&second).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(
+        second
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("the index has no vectors")
+    );
+    assert_eq!(fake.embed_requests.load(Ordering::SeqCst), requests);
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_vectorless_index_is_not_repaired_by_a_search_under_manual_freshness() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Manual;
+    config.index.stale_check_interval_seconds = 0;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("manual-repair");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+
+    // The service answers again, but a search under `manual` never indexes.
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let second = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&second).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(
+        second
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("the index has no vectors")
+    );
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "neither a refresh nor a query embedding"
+    );
+
+    // The explicit index run fills the vectors in.
+    let repaired = app.index(&workspace).await.unwrap();
+    assert!(!repaired.vectors_missing);
+    assert!(!app.status(&workspace).await.unwrap().vectors_missing);
+    task.abort();
+}
+
+/// The first index against a refused port pays the connection attempts and
+/// their backoff; with the connect breaker open the next index run makes one
+/// attempt without backoff and the next search skips the repair, both still
+/// without vectors.
+#[tokio::test]
+async fn a_refused_embedder_connection_is_not_retried_within_the_breaker_window() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let closed = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", closed.port);
+    config.index.stale_check_interval_seconds = 0;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("breaker");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    // The index run retries a refused connection with 1 s and 2 s backoff, so
+    // this one takes at least three seconds on any platform.
+    let started = std::time::Instant::now();
+    let first = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    let first_time = started.elapsed();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(first_time >= Duration::from_secs(3), "{first_time:?}");
+
+    // Inside the window the index run makes one attempt (refused connects
+    // cost about 2 s on Windows and nothing elsewhere) and sleeps no
+    // backoff, so it takes well under half the first run's time.
+    let started = std::time::Instant::now();
+    let report = app.index(&workspace).await.unwrap();
+    let index_time = started.elapsed();
+    eprintln!("first {first_time:?}, breaker-open index {index_time:?}");
+    assert!(report.vectors_missing && report.embedded_chunks == 0);
+    assert!(
+        index_time < first_time / 2,
+        "{index_time:?} vs {first_time:?}"
+    );
+
+    // The repair attempt of a search is skipped without re-indexing.
+    let started = std::time::Instant::now();
+    let again = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    let search_time = started.elapsed();
+    eprintln!("breaker-open search {search_time:?}");
+    assert_eq!(
+        serde_json::to_value(&again).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(
+        again
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("the index has no vectors")
+    );
+    assert!(
+        search_time < first_time / 2,
+        "{search_time:?} vs {first_time:?}"
+    );
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+    task.abort();
+}
+
 /// A fresh workspace whose embedder port refuses connections is indexed
 /// without vectors; the search answers from lexical and says why.
 #[tokio::test]

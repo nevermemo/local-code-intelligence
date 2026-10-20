@@ -32,6 +32,9 @@ pub struct Models {
     /// The same for the `system_one_wire` rescorer (see
     /// [`Models::system_one_rank`]).
     system_one_breaker: Arc<ConnectBreaker>,
+    /// The same for the embedding service, for index-time and query-time
+    /// embedding alike (see [`Models::embed`]).
+    embedder_breaker: Arc<ConnectBreaker>,
     /// The sleep before the first retry under [`RetryPolicy::Retry`]; it
     /// doubles for each further one. A field so the tests need not wait a
     /// real second.
@@ -105,6 +108,34 @@ const RERANKER_DOWN_WINDOW: Duration = Duration::from_secs(30);
 /// How long [`Models::system_one_rank`] skips the typed rescorer after it
 /// refused a connection (the same 30 s as the reranker's window).
 const SYSTEM_ONE_DOWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long the embedder connect breaker stays open after the embedding
+/// service refused a connection (the same 30 s as the reranker). Within it a
+/// query embedding is skipped at once, and an index-time embedding makes one
+/// probe attempt without retries or backoff (an index run otherwise makes
+/// three attempts with a backoff between them, about 9 s on Windows). Short,
+/// so a service that was merely starting is used again within half a minute.
+pub const EMBEDDER_DOWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// A query-time embedding call was skipped without a connection attempt
+/// because the embedding service refused one within [`EMBEDDER_DOWN_WINDOW`].
+/// [`is_service_unavailable`] recognises it.
+#[derive(Debug)]
+struct EmbedderSkipped {
+    retry_in_secs: u64,
+}
+
+impl std::fmt::Display for EmbedderSkipped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "embedding service skipped as recently unreachable (next attempt in about {}s)",
+            self.retry_in_secs
+        )
+    }
+}
+
+impl std::error::Error for EmbedderSkipped {}
 
 /// A tiny in-memory circuit breaker: after [`ConnectBreaker::trip`], callers
 /// that check [`ConnectBreaker::remaining`] are told to skip the service until
@@ -193,16 +224,19 @@ fn is_connection_dropped(error: &reqwest::Error) -> bool {
 /// Whether `error` says the service was not available rather than that the
 /// request or the service's answer was wrong: it could not be reached
 /// ([`is_connect_error`]), the request timed out, the connection was closed or
-/// reset under it ([`is_connection_dropped`]), or it answered with an HTTP 5xx
-/// status. An HTTP 4xx, a malformed or mismatched response and a bad vector
-/// are not availability errors.
+/// reset under it ([`is_connection_dropped`]), it answered with an HTTP 5xx
+/// status, or the embedding call was skipped because the service had just
+/// refused a connection ([`EmbedderSkipped`]). An HTTP 4xx, a malformed or
+/// mismatched response and a bad vector are not availability errors.
 pub fn is_service_unavailable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-            error.is_connect() || error.is_timeout() || is_connection_dropped(error)
-        }) || cause
-            .downcast_ref::<HttpStatusError>()
-            .is_some_and(|error| error.status >= 500)
+        cause.is::<EmbedderSkipped>()
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                error.is_connect() || error.is_timeout() || is_connection_dropped(error)
+            })
+            || cause
+                .downcast_ref::<HttpStatusError>()
+                .is_some_and(|error| error.status >= 500)
     })
 }
 
@@ -512,6 +546,7 @@ impl Models {
             config: config.clone(),
             reranker_breaker: Arc::new(ConnectBreaker::new(RERANKER_DOWN_WINDOW)),
             system_one_breaker: Arc::new(ConnectBreaker::new(SYSTEM_ONE_DOWN_WINDOW)),
+            embedder_breaker: Arc::new(ConnectBreaker::new(EMBEDDER_DOWN_WINDOW)),
             initial_backoff: INITIAL_BACKOFF,
             observed_dimension: Arc::default(),
         })
@@ -525,6 +560,14 @@ impl Models {
             dimension => Some(dimension),
         }
     }
+    /// The time left in which embedding is skipped because the service just
+    /// refused a connection (see [`EMBEDDER_DOWN_WINDOW`]), or `None` when an
+    /// embedding call would try the service. For a caller that would otherwise
+    /// do work only to have its embedding call skipped.
+    pub fn embedder_skipped(&self) -> Option<Duration> {
+        self.embedder_breaker.remaining(Instant::now())
+    }
+
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
@@ -570,7 +613,13 @@ impl Models {
     }
 
     /// Embeds documents for indexing, retrying connection errors, timeouts,
-    /// and dropped connections (see [`RetryPolicy`]).
+    /// and dropped connections (see [`RetryPolicy`]). Any refused connection
+    /// opens the embedder breaker for [`EMBEDDER_DOWN_WINDOW`]; while it is
+    /// open this makes one attempt without retries or backoff (a probe, so a
+    /// service that just restarted is used by the next index run), and a
+    /// failed probe re-arms the window. [`Models::query`] and
+    /// [`Models::embed_once`] skip at once instead, with an error
+    /// [`is_service_unavailable`] recognises.
     pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_with(inputs, RetryPolicy::Retry).await
     }
@@ -583,6 +632,17 @@ impl Models {
 
     async fn embed_with(&self, inputs: &[String], policy: RetryPolicy) -> Result<Vec<Vec<f32>>> {
         ensure!(!inputs.is_empty(), "embedding input is empty");
+        let mut policy = policy;
+        if let Some(remaining) = self.embedder_breaker.remaining(Instant::now()) {
+            if policy == RetryPolicy::FailFast {
+                return Err(EmbedderSkipped {
+                    retry_in_secs: remaining.as_secs() + 1,
+                }
+                .into());
+            }
+            // Half-open for index runs: one attempt, no backoff.
+            policy = RetryPolicy::FailFast;
+        }
         let mut url = reqwest::Url::parse(&self.config.embedding_url)
             .context("invalid embedding service URL")?;
         ensure!(
@@ -601,14 +661,31 @@ impl Models {
         });
         let timeout = Duration::from_secs(self.config.embedding_timeout_seconds);
         let key = self.config.embedder_endpoint().api_key()?;
-        let response = self
+        let response = match self
             .send_with_retry("embedding service", policy, || {
                 with_bearer(
                     self.client.post(url.clone()).timeout(timeout).json(&body),
                     key.as_ref(),
                 )
             })
-            .await?;
+            .await
+        {
+            Ok(response) => {
+                // The service answered (even with an error status), so it
+                // is reachable.
+                self.embedder_breaker.clear();
+                response
+            }
+            Err(error) => {
+                // Only a refused connection (once the attempts `policy`
+                // allows have failed) trips it or re-arms its window; a
+                // timeout or a dropped connection does not.
+                if is_connect_error(&error) {
+                    self.embedder_breaker.trip(Instant::now());
+                }
+                return Err(error);
+            }
+        };
         let bounded = read_limited_body(
             check_status(response, "embedding service", url.as_str(), key.as_ref()).await?,
             MAX_RESPONSE_BODY_BYTES,
@@ -1626,6 +1703,66 @@ pub(crate) mod tests {
         // After the window the next call tries the reranker again.
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let probed = models.rerank("query", &documents).await.unwrap_err();
+        assert!(is_connect_error(&probed), "{probed:#}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_embedding_connection_skips_queries_and_lets_index_runs_probe_once() {
+        let closed = closed_local_address();
+        let config = Config {
+            embedding_url: format!("http://{closed}/v1"),
+            ..Config::default()
+        };
+        let mut models = Models::new(&config).unwrap();
+        models.initial_backoff = Duration::from_millis(10);
+        models.embedder_breaker = Arc::new(ConnectBreaker::new(Duration::from_secs(2)));
+        let documents = vec!["fn a() {}".to_owned()];
+        assert!(models.embedder_skipped().is_none());
+
+        // The first call really tries the service, with its retries.
+        let first = models.embed(&documents).await.unwrap_err();
+        assert!(is_connect_error(&first), "{first:#}");
+        assert!(is_service_unavailable(&first), "{first:#}");
+        assert!(models.embedder_skipped().is_some());
+
+        // Within the window a query embedding does not connect: it fails at
+        // once with an availability error that is not a connect error itself.
+        for skipped in [
+            models.embed_once(&documents).await.unwrap_err(),
+            models.query("query").await.unwrap_err(),
+        ] {
+            assert!(
+                format!("{skipped:#}").contains("recently unreachable"),
+                "{skipped:#}"
+            );
+            assert!(!is_connect_error(&skipped), "{skipped:#}");
+            assert!(is_service_unavailable(&skipped), "{skipped:#}");
+        }
+
+        // An index-time embedding makes one probe attempt: it connects (and
+        // is refused), without the retries and the backoff a closed breaker
+        // allows (a retrying call would sleep 20 s and then 40 s; a refused
+        // connect itself takes up to about 2 s on Windows).
+        models.initial_backoff = Duration::from_secs(20);
+        let started = Instant::now();
+        let probed = models.embed(&documents).await.unwrap_err();
+        assert!(is_connect_error(&probed), "{probed:#}");
+        assert!(
+            !format!("{probed:#}").contains("recently unreachable"),
+            "{probed:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            models.embedder_skipped().is_some(),
+            "a failed probe re-arms"
+        );
+
+        // After the window the next call tries the service again, with its
+        // retries.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(models.embedder_skipped().is_none());
+        models.initial_backoff = Duration::from_millis(10);
+        let probed = models.embed(&documents).await.unwrap_err();
         assert!(is_connect_error(&probed), "{probed:#}");
     }
 

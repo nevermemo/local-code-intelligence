@@ -42,6 +42,11 @@ struct WorkspaceCoordination {
     /// so repeated searches within `stale_check_interval_seconds` skip the
     /// scan and reuse the current snapshot.
     last_stale_check: Mutex<Option<Instant>>,
+    /// When the last repair-only refresh of a vectorless snapshot ended still
+    /// vectorless (or failed), so a search does not run another one inside
+    /// `EMBEDDER_DOWN_WINDOW` while the embedder keeps failing (an HTTP 5xx
+    /// does not trip the connect breaker).
+    last_failed_repair: Mutex<Option<Instant>>,
 }
 
 pub struct App {

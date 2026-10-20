@@ -1283,8 +1283,15 @@ impl App {
                 .is_some_and(|s| s.identity != self.config.embedding_identity());
             let (action, warning) = match self.config.index.freshness {
                 IndexFreshness::OnSearch => {
-                    self.refresh_stale_snapshot(workspace, coordination, identity_changed)
-                        .await?
+                    let vectors_missing =
+                        initial_snapshot.as_ref().is_some_and(|s| s.vectors_missing);
+                    self.refresh_stale_snapshot(
+                        workspace,
+                        coordination,
+                        identity_changed,
+                        vectors_missing,
+                    )
+                    .await?
                 }
                 IndexFreshness::Manual | IndexFreshness::Watch => {
                     ensure!(
