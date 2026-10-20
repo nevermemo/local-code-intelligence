@@ -187,6 +187,14 @@ fn a_plain_file_resolves_to_file_and_default_sources_without_touching_anything()
             .unwrap()
             .contains("qwen3-embedding-4b")
     );
+    let profile_hash = derived["run_profile_hash"].as_str().unwrap();
+    assert_eq!(profile_hash.len(), 64, "{profile_hash}");
+    assert!(
+        profile_hash
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "{profile_hash}"
+    );
     // The test process's `LCI_*` variables are stripped, so the dump is off.
     assert_eq!(
         report["environment"]["other"]["LCI_CANDIDATE_DUMP"],

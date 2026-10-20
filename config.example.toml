@@ -490,6 +490,11 @@ flow_judge = false
 [compose]
 enabled = false
 
+# [run_profile] has no keys yet; an unknown key is an error. `lci config --json`
+# prints derived.run_profile_hash, the hash of the result-affecting settings;
+# README `[run_profile]` lists what is left out.
+[run_profile]
+
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
 # the typed service behind `rescorer = "system_one"`. Off when the section is
