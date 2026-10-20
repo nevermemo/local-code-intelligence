@@ -22,7 +22,7 @@ Gold files are private (outside the repository) except the two seed sets below. 
 | masked region (R1) | 146 kept (dev 58, test 88) | frozen; stage 2 done |
 | seed questions | 28 | public, `eval-seed.json` |
 | bug localisation | 34 | public, `gold-bugloc.json` |
-| trait-dispatch / co-change | not built / parked | see Set portfolio |
+| trait-dispatch / co-change | trait-dispatch not built (the trait-implementation set ran, d392) / co-change parked | see Set portfolio |
 
 ## Frozen tree rule
 The gold of the first four sets was derived on commit `bfaff44`; the local tag `eval/bfaff44` names it and benches run against a worktree of it
