@@ -20,8 +20,9 @@ pub use schema::Schema;
 
 use crate::{
     Contribution, Cost, EdgeKind, FreshnessModel, Fused, MapCall, MapStatus, Observed, Run,
-    SnapshotView,
+    SnapshotView, traverse::trace::hash16,
 };
+use lci_core::config::Config;
 use serde_json::{Map as JsonMap, Value, json};
 use std::{
     fs::{File, OpenOptions},
@@ -61,6 +62,31 @@ pub fn schema() -> Result<&'static Schema, String> {
 /// Checks one line against the schema.
 pub fn validate_line(line: &Value) -> Result<(), String> {
     schema()?.validate(line)
+}
+
+/// The `profile` object of a `run` line (run-record.md 3.1): the hash and
+/// key names of the resolved run profile, the embedding identity's hash, and
+/// the hashes of the traverse priors and tie-break files (`null` when unset).
+/// A configured file that cannot be read is an error, so a record never
+/// claims a file it did not hash. A relative path is read from the working
+/// directory, as a traversal reads it.
+pub fn profile_stamp(config: &Config) -> io::Result<Value> {
+    let file_hash = |path: &Option<String>| -> io::Result<Value> {
+        let Some(path) = path else {
+            return Ok(Value::Null);
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| io::Error::new(error.kind(), format!("{path}: {error}")))?;
+        Ok(json!(hash16(text.as_bytes())))
+    };
+    let profile = config.run_profile();
+    Ok(json!({
+        "hash": profile.hash,
+        "keys": profile.keys,
+        "embedding_identity_sha256": lci_core::workspace::hash(&config.embedding_identity()),
+        "priors_hash": file_hash(&config.traverse.priors)?,
+        "tie_break_hash": file_hash(&config.traverse.tie_break)?,
+    }))
 }
 
 /// Crockford's base32 alphabet, as ULIDs use it.

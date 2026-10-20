@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: none. Next: K1b (milestone M1; K1a landed, d398). Rewrite this line at every push.
+In flight: none. Next: K1c (milestone M1; K1b landed, d399). Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K1b | RunRecord stamp: additive required `run.profile {hash, keys}` on runrecord-0 (pre-freeze; the rename stays an S4 step) | Schema test; writer refuses lines without it | S | - |
 | K1c | Inventory every MCP, REST and CLI result shape; each carries the profile hash | One test per shape | S-M | - |
 | K0a | No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
 | K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |

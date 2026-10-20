@@ -183,7 +183,7 @@ runs called a recipe tool off-shape, +11.6% input tokens); recipes stay opt-in (
 ## RunRecord and traces
 
 Schema `lci.runrecord/0` (`lci-maps/src/run_record.rs`, schema file `specs/runrecord-0.schema.json`; hand-written checker): a spike-feature writer and an offline harness are built, no production writer
-([specs/run-record.md](specs/run-record.md)). The traversal writes its own trace, JSONL at `<data_dir>/traces/<name>.jsonl` (`trace.rs`): no wall-clock values (equal inputs give byte-identical files), hashes are the
+([specs/run-record.md](specs/run-record.md)); every `run` line carries a `profile` stamp (run-profile hash and key names, embedding-identity hash, hashes of the traverse priors and tie-break files). The traversal writes its own trace, JSONL at `<data_dir>/traces/<name>.jsonl` (`trace.rs`): no wall-clock values (equal inputs give byte-identical files), hashes are the
 first 16 hex digits of SHA-256. Events: `start`, `expand`, `hop`, `relax`, `alt_path`, `stop` (reason and all triggers that held, hash of the checkpoint), `steer` (`rung`, `handler`, `confidence`, `actions`,
 `outcome` `applied`, `uncertain` or `returned`; cites `inputs_hash`), `return` (`escalated`, `handler_stop`, `budget`), `bound`, `resume` (names the handle), `end` (totals). `--out` writes `traces/`
 and `handles/` under another directory.
