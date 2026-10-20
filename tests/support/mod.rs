@@ -132,6 +132,8 @@ impl ClosedPort {
 struct FakeModels {
     documents: AtomicUsize,
     document_requests: AtomicUsize,
+    /// Every request to `POST /v1/embeddings`, served or failed.
+    embed_requests: AtomicUsize,
     queries: AtomicUsize,
     embed_delay_milliseconds: AtomicUsize,
     hold_documents: AtomicBool,
@@ -213,6 +215,7 @@ async fn embed(
     State(state): State<Arc<FakeModels>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    state.embed_requests.fetch_add(1, Ordering::SeqCst);
     if state.embed_fails.load(Ordering::SeqCst) {
         return Err((StatusCode::SERVICE_UNAVAILABLE, String::new()));
     }

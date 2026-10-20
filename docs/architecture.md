@@ -122,7 +122,10 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   are not fused, return raw `Location`s and need an index containing the file's language.
 - **Model clients** (`lci-core` `models`): `embed` POSTs to `<embedding_url>/embeddings` and validates count, index,
   finiteness, non-zero vectors and one dimension; indexing retries up to 3 attempts (`MAX_ATTEMPTS`) with doubling
-  backoff, `query` makes one attempt. `rerank` makes one attempt and returns `(index, score)` best first; after a
+  backoff, `query` makes one attempt. Any refused connection trips a breaker for 30 s (`EMBEDDER_DOWN_WINDOW`): `query` and `embed_once` then skip at once
+  with an error `is_service_unavailable` accepts, and index-time `embed` makes one probe attempt without retries or
+  backoff (a failed probe re-arms the window, an answer closes the breaker). An HTTP 5xx does not trip it.
+  `rerank` makes one attempt and returns `(index, score)` best first; after a
   refused connection a breaker skips the reranker for 30 s (`RERANKER_DOWN_WINDOW`). Batches the service rejects as
   oversized are retried one input at a time with prefixes halved down to 512 bytes.
 
@@ -132,7 +135,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
 cross-process OS lock on `<data_dir>/index.lock`; (2) `manifest::try_load`, then `chunk::scan_incremental` on a blocking
 thread; (3) open the previous snapshot, and when its identity matches, load `cached_vectors` and embed only the missing
 keys (deduplicated, in batches of `embedding_batch_size`); cached vectors of another width than the service returns now
-are embedded again; (4) `Store::replace`, then `manifest::save`; (5) return an `IndexReport` (counts, lossy, truncated
+are embedded again; (4) `Store::replace`, then `manifest::save` (when embedding fails with an availability error per `models::is_service_unavailable` and the vector cache is empty under an unchanged identity, `Store::replace_vectorless` commits one placeholder vector per chunk and table metadata `vectors = "missing"` instead: `Snapshot.vectors_missing`, `embedding_dimension` null in `Status`, no vector read served); (5) return an `IndexReport` (counts, lossy, truncated
 and skipped files, timing). `WorkspaceCoordination` holds the per-workspace `RwLock`, the `flight_error` shared by
 concurrent first-index waiters, and the `last_stale_check` throttle. A search does not hold a lock while it reads: it
 works on a pinned snapshot.
@@ -143,7 +146,8 @@ Freshness is `[index].freshness` (`IndexFreshness`), resolved per search in `res
 | --- | --- | --- |
 | No snapshot | Index now, or wait for the job that holds the write lock; a failed automatic flight shares its error | `created` / `waited_for_existing_job` |
 | `on-search` (default) | `refresh_stale_snapshot`: re-fingerprints at most every `stale_check_interval_seconds` (10); if stale, tries the write lock and refreshes incrementally; otherwise waits up to `wait_for_existing_job_seconds` (120) and re-checks. A failure keeps the old snapshot and warns | `reused` / `refreshed_incrementally` / `waited_for_existing_job` |
-| `manual`, `watch` | Never refresh from a search | `reused` |
+| `on-search`, vectorless snapshot (`vectors_missing`) | A third refresh trigger in `refresh_stale_snapshot`, gated by the same throttle (the fingerprint walk still runs) and fallback; skipped without re-indexing while the embedder connect breaker is open and for `EMBEDDER_DOWN_WINDOW` after a repair that ended still vectorless or failed (`WorkspaceCoordination.last_failed_repair`). A repair that finds the service still down keeps the vectorless snapshot; the search then warns that the index has no vectors | `refreshed_incrementally` / `reused` |
+| `manual`, `watch` | Never refresh from a search, a vectorless snapshot included (filled by `index_workspace` or the watcher) | `reused` |
 | Embedding identity changed, `on-search` | Treated as stale even when the check is throttled; re-embeds through `index_locked` and searches the new snapshot. If recovery fails, or the wait for another job times out, the search fails with a hard error (`stale_refresh_fallback`) | `refreshed_incrementally` / `waited_for_existing_job` / error |
 | Embedding identity changed, `manual` or `watch` | Rejected: "embedding configuration changed; reindex workspace" | error |
 

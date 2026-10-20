@@ -2782,6 +2782,81 @@ async fn traverse_answers_with_the_embedder_down_on_a_fresh_workspace() {
 }
 
 #[tokio::test]
+async fn search_vector_skips_without_embedding_on_a_vectorless_index() {
+    let (temp, mut config, fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    config.traverse.first_stage = lci_core::config::TraverseFirstStage::Off;
+    config.traverse.answer_seeds = false;
+    config.traverse.exact_seeds = false;
+    // A search never refreshes under `manual`, so the index stays vectorless
+    // after the service is back.
+    config.index.freshness = lci_core::config::IndexFreshness::Manual;
+    config.traverse.policies.insert(
+        "flow".into(),
+        lci_core::config::TraversePolicy {
+            extra_maps: Some(vec!["search.vector".into()]),
+            ..Default::default()
+        },
+    );
+    let workspace = temp.path().join("scip-vectorless");
+    write_hybrid_workspace(&workspace);
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let call = || {
+        mcp_search_call(
+            &client,
+            &base,
+            &session,
+            json!({
+                "workspace_path":workspace,"query":"translator","top_k":20,
+                "mode":"traverse","steer":{"policy":"flow"},
+            }),
+        )
+    };
+
+    // The first call indexes the fresh workspace while the embedder answers
+    // 503: it has no vectors.
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let first = call().await;
+    assert_ne!(first["isError"], true, "{first}");
+
+    // The embedder is back, so an embedding request would be served: the map
+    // must send none.
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let answer = call().await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    let answer = answer["structuredContent"].clone();
+    assert_eq!(answer["status"], "complete", "{answer}");
+    assert!(
+        !answer["results"].as_array().unwrap().is_empty(),
+        "{answer}"
+    );
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "search.vector embedded on a vectorless index: {answer}"
+    );
+    let note = answer["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|note| note.as_str())
+        .find(|note| note.starts_with("search.vector:"))
+        .unwrap_or_else(|| panic!("no search.vector note: {answer}"));
+    assert!(
+        note.contains("the index has no vectors") && note.contains("fail-open"),
+        "{note}"
+    );
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
 async fn traverse_says_so_when_every_search_channel_is_off_and_the_stand_in_seeds_it() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     config.traverse.enabled = true;

@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K0a (no-service path; part 1 landed, d402; next the repair trigger with an embedder breaker). Rewrite this line at every push.
+In flight: K7a (fake LSP documents mode), K2a-2 (per-map freshness key), K23a (claim groups), K35a and K34a (dependency policy, cargo-deny); K2a-1 after K7a. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K0a | Partly done: a fresh workspace indexes without vectors when the embedding service is unavailable (d402); the repair on search when the service returns, the `search.vector` fail-open in traverse and the docs remain. No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
 | K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |
 | K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
@@ -121,7 +120,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 
-M0 filler, any time a build slot is free: N19, N24, N20 (c, d).
+M0 filler, any time a build slot is free: N19, N24, N20 (c, d); K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404).
 
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
