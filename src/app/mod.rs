@@ -46,6 +46,10 @@ struct WorkspaceCoordination {
 
 pub struct App {
     pub config: Config,
+    /// `config.run_profile().hash`, computed once: the configuration does not
+    /// change after [`Self::open`]. Every result the service returns carries
+    /// it (see [`stamp`]).
+    profile_hash: String,
     store: Store,
     models: Models,
     workspace_locks: Mutex<HashMap<String, Arc<WorkspaceCoordination>>>,
@@ -66,8 +70,10 @@ impl App {
         let store = Store::open(&config.data_dir.join("lancedb")).await?;
         let models = Models::new(&config)?;
         let analyzer = lsp::Manager::new(&config);
+        let profile_hash = config.run_profile().hash;
         Ok(Self {
             config,
+            profile_hash,
             store,
             models,
             workspace_locks: Mutex::new(HashMap::new()),
@@ -89,6 +95,12 @@ impl App {
         self
     }
 
+    /// The run-profile hash of this process's configuration (64 lowercase hex
+    /// characters), the value of the `profile_hash` key of every result.
+    pub fn profile_hash(&self) -> &str {
+        &self.profile_hash
+    }
+
     async fn lock(&self, id: &str) -> Arc<WorkspaceCoordination> {
         self.workspace_locks
             .lock()
@@ -96,6 +108,18 @@ impl App {
             .entry(id.into())
             .or_default()
             .clone()
+    }
+}
+
+/// Adds `"profile_hash": hash` to a result: only when `value` is an object and
+/// has no such key yet, so a result that already carries one (the compact
+/// search result writes its own, last) is left as it is. The one place MCP,
+/// REST and the CLI stamp results; errors are never passed through it.
+pub fn stamp(value: &mut serde_json::Value, hash: &str) {
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("profile_hash")
+            .or_insert_with(|| serde_json::Value::String(hash.to_owned()));
     }
 }
 

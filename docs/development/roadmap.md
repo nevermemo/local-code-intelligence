@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: none. Next: K1c (milestone M1; K1b landed, d399). Rewrite this line at every push.
+In flight: K1c (CLI outputs remain; MCP and REST landed, d400). Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K1c | Inventory every MCP, REST and CLI result shape; each carries the profile hash | One test per shape | S-M | - |
+| K1c | Partly done: MCP and REST results carry the hash (d400); the CLI outputs remain. Inventory every MCP, REST and CLI result shape; each carries the profile hash | One test per shape | S-M | - |
 | K0a | No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
 | K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |
 | K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |

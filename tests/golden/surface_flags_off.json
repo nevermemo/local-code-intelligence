@@ -56,6 +56,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -183,6 +193,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -289,6 +309,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -395,6 +425,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -501,6 +541,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -607,6 +657,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -776,6 +836,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -885,6 +955,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -970,6 +1050,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -1028,6 +1118,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
@@ -1134,6 +1234,16 @@
                 "application/json": {
                   "schema": {
                     "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+                    "properties": {
+                      "profile_hash": {
+                        "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash).",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile_hash"
+                    ],
                     "type": "object"
                   }
                 }
