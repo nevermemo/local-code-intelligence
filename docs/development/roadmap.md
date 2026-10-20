@@ -126,6 +126,26 @@ M0 filler, any time a build slot is free: N19, N24, N20 (c, d).
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
 
+### Cycle 1 time estimate
+
+Agent wall time per slice, for the whole loop (plan, implement, Full gate, review, PR, CI): XS 0.5 h, S 1.5 h, S-M
+2.5 h, M 3.5 h. Measured on 2026-10-20 for S slices only (K1a, K1b, K1c in two parts: 1 to 1.5 h each, one at a
+time; the Full gate takes about 25 min and CI about 20 min); K0a part 1 (S-M) took about 3.5 h with two review
+rounds. M is not measured yet. Update this table at each milestone end with the measured hours.
+
+| Milestone | Slices left (by size) | Sequential hours | Measured | Note |
+| --- | --- | --- | --- | --- |
+| M1 | K0a part 2, K7a, K2a (M), K2b (S-M), K23a, K35a (XS), K34a | ~12 | - | five lanes in parallel since 2026-10-20 |
+| M2 | 6 M, 1 S-M, 4 S | ~30 | - | K7b, K8a and K7c build on each other |
+| M3 | 1 M, 1 S-M, 11 S, 1 XS | ~23 | - | mostly independent slices |
+| M4 | 8 M, 16 S, 4 XS | ~54 | - | most uncertain: Codanna on tree-sitter 0.26, typescript-go, marksman, live server checks, external gold |
+| Total | 55 slices | ~119 | - | |
+
+Parallel lanes (separate worktrees, up to three cargo builds gated on free RAM) are expected to give a 2 to 2.5x
+speed-up, limited by dependencies, by merges into `main` one at a time and by the build slots: about 48 to 60 h of
+wall time, so cycle 1 ends around 2026-10-22 to 2026-10-23. Risks that move it: M slices needing two review rounds
+(about +30% on M2 and M4), and M4's external tools on Windows.
+
 ## Earlier items outside cycle 1
 
 | # | Item | Status | Notes |
