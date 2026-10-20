@@ -5,7 +5,7 @@ use super::seeds::map_hits;
 use super::*;
 use crate::models::Models;
 use lci_core::{
-    config::{TraversePolicy, TraverseRerankScores},
+    config::{TraversePolicy, TraverseRerankScores, profile::ScipMode},
     models::HttpStatusError,
     node::NodeKind,
 };
@@ -2335,7 +2335,9 @@ fn crowded_tree(users: u32) -> (tempfile::TempDir, PathBuf) {
 #[tokio::test]
 async fn the_beam_decides_how_many_of_a_nodes_edges_the_walk_follows() {
     let (dir, index) = crowded_tree(21);
-    let loaded = load(&index, Some(dir.path())).await.unwrap();
+    let loaded = load(&index, Some(dir.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
     let target = loaded
         .scip
         .node_id(
@@ -2781,7 +2783,9 @@ async fn without_scip_implements_a_trait_path_changes_nothing() {
     let question = "Which types implement `demo::Tr`?";
     // The default maps and the stand-in alone, with the question's path.
     let stand_in = ["graph.scip", SEEDS_MAP];
-    let loaded = load(&tree.1, Some(tree.0.path())).await.unwrap();
+    let loaded = load(&tree.1, Some(tree.0.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
     let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
     let call = Call {
         scip_index: &tree.1,
@@ -3269,4 +3273,237 @@ async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() 
         .await
         .unwrap();
     assert_eq!(lag, None);
+}
+
+// ---- `[run_profile.scip] mode` (slice K20a) ---------------------------
+
+/// The wire form of a one-document SCIP index (`scip.proto`: Index.documents
+/// = 2, Document.relative_path = 1 and .occurrences = 2, Occurrence.range = 1,
+/// .symbol = 2, .symbol_roles = 3, .enclosing_range = 7): one function per
+/// line, calling the functions after its name. The root crate has no
+/// protobuf writer.
+fn scip_file_bytes(functions: &[(&str, &[&str])]) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    fn field(tag: u64, payload: &[u8], out: &mut Vec<u8>) {
+        varint(tag << 3 | 2, out);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+    fn ints(tag: u64, values: &[u64], out: &mut Vec<u8>) {
+        let mut packed = Vec::new();
+        values.iter().for_each(|v| varint(*v, &mut packed));
+        field(tag, &packed, out);
+    }
+    let occurrence = |range: [u64; 4], name: &str, roles: u64, enclosing: Option<[u64; 4]>| {
+        let mut out = Vec::new();
+        ints(1, &range, &mut out);
+        field(
+            2,
+            format!("rust-analyzer cargo demo 0.1.0 m/{name}().").as_bytes(),
+            &mut out,
+        );
+        if roles != 0 {
+            varint(3 << 3, &mut out);
+            varint(roles, &mut out);
+        }
+        if let Some(enclosing) = enclosing {
+            ints(7, &enclosing, &mut out);
+        }
+        out
+    };
+    let mut document = Vec::new();
+    field(1, b"src/m.rs", &mut document);
+    for (line, (name, callees)) in functions.iter().enumerate() {
+        let line = line as u64;
+        let definition = occurrence([line, 3, line, 6], name, 1, Some([line, 0, line, 200]));
+        field(2, &definition, &mut document);
+        for (i, callee) in callees.iter().enumerate() {
+            let col = 10 + 5 * i as u64;
+            field(
+                2,
+                &occurrence([line, col, line, col + 4], callee, 0, None),
+                &mut document,
+            );
+        }
+    }
+    let mut index = Vec::new();
+    field(2, &document, &mut index);
+    index
+}
+
+/// A tree with an `index.scip` for `alpha` calling `beta` and `gamma`, and
+/// the id of `alpha` to start from.
+struct ScipFileTree {
+    dir: tempfile::TempDir,
+    index: PathBuf,
+    seed: String,
+}
+
+impl ScipFileTree {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index.scip");
+        std::fs::write(
+            &index,
+            scip_file_bytes(&[("alpha", &["beta", "gamma"]), ("beta", &[]), ("gamma", &[])]),
+        )
+        .unwrap();
+        let loaded = load(&index, Some(dir.path()), ScipMode::Authoritative)
+            .await
+            .unwrap();
+        let alpha = loaded
+            .scip
+            .graph()
+            .node_index("rust-analyzer cargo demo 0.1.0 m/alpha().")
+            .expect("alpha is in the fixture index");
+        let seed = loaded.scip.node_id(alpha).to_string();
+        Self { dir, index, seed }
+    }
+
+    async fn run(
+        &self,
+        mode: ScipMode,
+        maps: &[&str],
+        handle: Option<&str>,
+        pops: u32,
+    ) -> Result<Value> {
+        let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+        let (budget, steer) = (
+            BudgetArgs {
+                pops: Some(pops),
+                ..BudgetArgs::default()
+            },
+            SteerArgs::default(),
+        );
+        let seeds = [self.seed.clone()];
+        let call = Call {
+            scip_index: &self.index,
+            scip_root: Some(self.dir.path()),
+            question: "q",
+            seeds: &seeds,
+            seed_search: None,
+            top_k: 8,
+            maps: Some(&maps),
+            budget: &budget,
+            steer: &steer,
+            handle,
+            lsp: None,
+        };
+        let mut profile = RunProfileConfig::default();
+        profile.scip.mode = mode;
+        Ok(
+            run(&limits(), &profile, &Dirs::under(self.dir.path()), &call)
+                .await?
+                .response,
+        )
+    }
+}
+
+/// The ids of the cards the walk reached.
+fn reached_ids(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|card| card["node"].as_str().expect("node").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_scip_built_maps_are_empty_and_say_so_under_scip_mode_off() {
+    let tree = ScipFileTree::new().await;
+    let maps = [
+        "graph.scip",
+        "structure.contains",
+        SCIP_IMPACT_ID,
+        SCIP_IMPLEMENTS_ID,
+        CONFIG_KEY_MAP_ID,
+        EXACT_CLOSURE_ID,
+    ];
+    // Authoritative: the graph is read and the walk reaches what `alpha`
+    // calls.
+    let on = tree
+        .run(ScipMode::Authoritative, &maps, None, 20)
+        .await
+        .unwrap();
+    let reached = reached_ids(&on);
+    for callee in ["beta", "gamma"] {
+        assert!(
+            reached.iter().any(|id| id.contains(callee)),
+            "{callee}: {on}"
+        );
+    }
+    assert!(
+        on["totals"]["per_map"]["graph.scip"]["expands"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{on}"
+    );
+    assert!(!on["notes"].to_string().contains("scip.mode"), "{on}");
+
+    // Off: nothing reaches anything, and every map names the mode.
+    let off = tree.run(ScipMode::Off, &maps, None, 20).await.unwrap();
+    assert_eq!(reached_ids(&off), Vec::<String>::new(), "{off}");
+    // The maps are asked (one expansion of the seed each) and return no
+    // edge: no hop was made.
+    assert_eq!(off["totals"]["hops"], 0, "{off}");
+    assert!(on["totals"]["hops"].as_u64().unwrap() > 0, "{on}");
+    assert_eq!(off["exact"][0]["map"], EXACT_CLOSURE_ID, "{off}");
+    assert_eq!(off["exact"][0]["answered"], false, "{off}");
+    let notes: Vec<String> = off["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .map(|note| note.as_str().unwrap().to_owned())
+        .collect();
+    // Each map has a note of its own that names the mode; structure.contains
+    // shares the one of graph.scip (the graph both read).
+    for id in maps {
+        let own = if id == "structure.contains" {
+            "graph.scip"
+        } else {
+            id
+        };
+        assert!(
+            notes.iter().any(|note| note.starts_with(own)
+                && note.contains(id)
+                && note.contains("scip.mode = off")),
+            "no note for {id} names the mode in {notes:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_handle_made_with_a_graph_does_not_resume_under_scip_mode_off() {
+    let tree = ScipFileTree::new().await;
+    let first = tree
+        .run(ScipMode::Authoritative, &["graph.scip"], None, 1)
+        .await
+        .unwrap();
+    let handle = handle_of(&first);
+    // The same mode resumes.
+    tree.run(ScipMode::Authoritative, &["graph.scip"], Some(&handle), 1)
+        .await
+        .unwrap();
+    // No graph is another identity, as another index is.
+    let error = tree
+        .run(ScipMode::Off, &["graph.scip"], Some(&handle), 1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("belongs to another workspace or index"),
+        "{error}"
+    );
 }

@@ -3,13 +3,13 @@
 
 use super::seeds::NameSeeds;
 use anyhow::{Context, Result, anyhow};
-use lci_core::node::NodeId;
+use lci_core::{config::profile::ScipMode, node::NodeId};
 use lci_maps::{
     Budget, Map, MapDescriptor, MapRequest, MapResponse, SnapshotView,
     config_key::{ConfigKeyMap, ConfigKeyOptions},
     contains::ContainsMap,
     impact::{Decl, ImpactIndex},
-    scip_graph::{DirSource, ScipMap, SourceText},
+    scip_graph::{DirSource, ScipGraph, ScipMap, SourceText},
     scip_impact::{ImpactMap, ImpactOptions},
     scip_implements::{ImplementsMap, ImplementsOptions},
 };
@@ -31,6 +31,13 @@ pub(super) struct Loaded {
     /// The graph nodes of each file (path as the index writes it, `/`
     /// separated), in graph order.
     pub(super) by_file: HashMap<String, Vec<usize>>,
+    /// `Some(mode)` when no index is read (`[run_profile.scip] mode` `off`, or
+    /// `cache` with no readable file): the graph is empty, and the maps built
+    /// from the index file have nothing to read. `None` for a loaded index
+    /// whatever the mode it was loaded under.
+    pub(super) absent: Option<ScipMode>,
+    /// What the call tells about an absent index.
+    pub(super) note: Option<String>,
 }
 
 impl Loaded {
@@ -50,7 +57,30 @@ impl Loaded {
             names: Arc::new(names),
             contains,
             by_file,
+            absent: None,
+            note: None,
         }
+    }
+
+    /// No index: an empty graph, stamp `(None, 0)` (so a handle made with a
+    /// graph does not resume on it), and the note that says why.
+    pub(super) fn empty(mode: ScipMode, note: String) -> Self {
+        Self {
+            absent: Some(mode),
+            note: Some(note),
+            ..Self::new((None, 0), ScipMap::with_default_ids(ScipGraph::empty()))
+        }
+    }
+
+    /// The error of a map that is built from the index file.
+    fn bail_if_absent(&self) -> Result<()> {
+        if let Some(mode) = self.absent {
+            return Err(anyhow!(
+                "no SCIP index is read (scip.mode = {})",
+                mode.as_str()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -61,13 +91,35 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(Default::default)
 }
 
-pub(super) async fn load(index: &Path, root: Option<&Path>) -> Result<Arc<Loaded>> {
-    let meta = std::fs::metadata(index).with_context(|| {
-        format!(
-            "no SCIP index at {}; write one with `rust-analyzer scip` in the workspace or set traverse.scip_index",
-            index.display()
-        )
-    })?;
+/// Loads the index at `index` as `mode` says: `off` never touches the path;
+/// `cache` takes a missing or unreadable file as an empty graph with a note;
+/// `authoritative` fails on both.
+pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> Result<Arc<Loaded>> {
+    if mode == ScipMode::Off {
+        return Ok(Arc::new(Loaded::empty(
+            mode,
+            "graph.scip: empty (scip.mode = off): the SCIP-built maps (structure.contains, scip.impact, scip.implements, config.key, exact.closure) have nothing to read; grep.live places its results by file only (no SCIP spans); lsp.live gives no edges (no place table)".to_owned(),
+        )));
+    }
+    let none_read = |why: &str| {
+        Arc::new(Loaded::empty(
+            mode,
+            format!(
+                "graph.scip: no SCIP index read at {} (scip.mode = cache): the SCIP-built maps are empty; grep.live places its results by file only (no SCIP spans); lsp.live gives no edges (no place table){why}",
+                index.display()
+            ),
+        ))
+    };
+    let meta = match std::fs::metadata(index) {
+        Ok(meta) => meta,
+        Err(_) if mode == ScipMode::Cache => return Ok(none_read("")),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "no SCIP index at {}; write one with `rust-analyzer scip` in the workspace or set traverse.scip_index",
+                index.display()
+            )));
+        }
+    };
     let stamp = (meta.modified().ok(), meta.len());
     let key = (index.to_path_buf(), root.map(Path::to_path_buf));
     if let Some(found) = cache()
@@ -79,7 +131,7 @@ pub(super) async fn load(index: &Path, root: Option<&Path>) -> Result<Arc<Loaded
         return Ok(found.clone());
     }
     let (path, root_dir) = (index.to_path_buf(), root.map(Path::to_path_buf));
-    let loaded = tokio::task::spawn_blocking(move || -> Result<Loaded> {
+    let built = tokio::task::spawn_blocking(move || -> Result<Loaded> {
         let source = root_dir.map(DirSource);
         let graph = lci_maps::scip_graph::ScipGraph::load(
             &path,
@@ -89,7 +141,14 @@ pub(super) async fn load(index: &Path, root: Option<&Path>) -> Result<Arc<Loaded
         Ok(Loaded::new(stamp, ScipMap::with_default_ids(graph)))
     })
     .await
-    .context("load the SCIP index")??;
+    .context("load the SCIP index")?;
+    let loaded = match built {
+        Ok(loaded) => loaded,
+        Err(error) if mode == ScipMode::Cache => {
+            return Ok(none_read(&format!("; unreadable: {error:#}")));
+        }
+        Err(error) => return Err(error),
+    };
     let loaded = Arc::new(loaded);
     cache()
         .lock()
@@ -141,6 +200,7 @@ pub(super) async fn config_key_map(
     root: &Path,
     loaded: &Loaded,
 ) -> Result<Arc<ConfigKeyMap>> {
+    loaded.bail_if_absent()?;
     static CACHE: OnceLock<StampCache<ConfigKeyMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(map) = cache.get(index, root, loaded.stamp) {
@@ -172,6 +232,7 @@ pub(super) async fn impact_map(
     root: &Path,
     loaded: &Loaded,
 ) -> Result<Arc<ImpactMap>> {
+    loaded.bail_if_absent()?;
     static CACHE: OnceLock<StampCache<ImpactMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(map) = cache.get(index, root, loaded.stamp) {
@@ -204,6 +265,7 @@ pub(super) async fn implements_map(
     root: &Path,
     loaded: &Loaded,
 ) -> Result<Arc<ImplementsMap>> {
+    loaded.bail_if_absent()?;
     static CACHE: OnceLock<StampCache<ImplementsMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(map) = cache.get(index, root, loaded.stamp) {
@@ -235,8 +297,11 @@ pub(crate) struct OpenedIndex {
 }
 
 /// Opens (or takes from the cache) the maps of `index` over `root`.
-pub(crate) async fn open_index(index: &Path, root: &Path) -> Result<OpenedIndex> {
-    let loaded = load(index, Some(root)).await?;
+/// `mode` is the run profile's `[run_profile.scip] mode`: under `off`, or `cache`
+/// with no readable file, no index is read and this fails.
+pub(crate) async fn open_index(index: &Path, root: &Path, mode: ScipMode) -> Result<OpenedIndex> {
+    let loaded = load(index, Some(root), mode).await?;
+    loaded.bail_if_absent()?;
     let impact = impact_map(index, root, &loaded).await?;
     Ok(OpenedIndex {
         scip: loaded.scip.clone(),
@@ -246,8 +311,12 @@ pub(crate) async fn open_index(index: &Path, root: &Path) -> Result<OpenedIndex>
 
 /// The `config.key` map of `index` over `root` (built once per index stamp; it
 /// runs the key extractor, which needs `rg` on `PATH`).
-pub(crate) async fn open_config_key(index: &Path, root: &Path) -> Result<Arc<ConfigKeyMap>> {
-    let loaded = load(index, Some(root)).await?;
+pub(crate) async fn open_config_key(
+    index: &Path,
+    root: &Path,
+    mode: ScipMode,
+) -> Result<Arc<ConfigKeyMap>> {
+    let loaded = load(index, Some(root), mode).await?;
     config_key_map(index, root, &loaded).await
 }
 

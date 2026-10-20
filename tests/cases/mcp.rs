@@ -3776,3 +3776,159 @@ async fn every_openapi_route_result_carries_the_profile_hash() {
     server.abort();
     models_task.abort();
 }
+
+// ---- `[run_profile.scip] mode` (slice K20a) ----
+
+/// An MCP server over the fake models whose `[run_profile.scip] mode` is
+/// `mode`, with the walk alone (no first stage), and the workspace
+/// `scip-mode` under its temporary directory.
+struct ScipModeServer {
+    workspace: std::path::PathBuf,
+    base: String,
+    session: String,
+    client: reqwest::Client,
+    stop: (
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ),
+    _temp: tempfile::TempDir,
+}
+
+impl ScipModeServer {
+    async fn start(mode: lci_core::config::profile::ScipMode) -> Self {
+        let (temp, mut config, _fake, models_task) = fixture().await;
+        config.traverse.enabled = true;
+        config.traverse.first_stage = lci_core::config::TraverseFirstStage::Off;
+        config.traverse.answer_seeds = false;
+        config.traverse.exact_seeds = false;
+        // One seed (the best hit), so the walk has a callee left to reach.
+        config.traverse.seed_k = 1;
+        config.run_profile.scip.mode = mode;
+        let workspace = temp.path().join("scip-mode");
+        let app = Arc::new(App::open(config).await.unwrap());
+        let (base, token, server) = serve_on_loopback(app).await;
+        let client = reqwest::Client::new();
+        let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+        Self {
+            workspace,
+            base,
+            session,
+            client,
+            stop: (token, server, models_task),
+            _temp: temp,
+        }
+    }
+
+    /// The whole `result` of one `mode = "traverse"` call about
+    /// "translator".
+    async fn traverse(&self) -> Value {
+        mcp_search_call(
+            &self.client,
+            &self.base,
+            &self.session,
+            json!({"workspace_path":self.workspace,"query":"translator","top_k":20,"mode":"traverse"}),
+        )
+        .await
+    }
+
+    fn stop(self) {
+        self.stop.0.cancel();
+        self.stop.1.abort();
+        self.stop.2.abort();
+    }
+}
+
+fn notes_text(answer: &Value) -> String {
+    answer["notes"].to_string()
+}
+
+#[tokio::test]
+async fn traverse_answers_without_reading_a_corrupt_scip_index_under_scip_mode_off() {
+    use lci_core::config::profile::ScipMode;
+    // Authoritative: the unreadable index fails the call, naming the file.
+    let strict = ScipModeServer::start(ScipMode::Authoritative).await;
+    write_hybrid_workspace(&strict.workspace);
+    std::fs::write(strict.workspace.join("index.scip"), [0xff_u8; 32]).unwrap();
+    let refused = strict.traverse().await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("index.scip"), "{text}");
+    strict.stop();
+
+    // Off: the path is never read, so the same workspace answers.
+    let off = ScipModeServer::start(ScipMode::Off).await;
+    write_hybrid_workspace(&off.workspace);
+    std::fs::write(off.workspace.join("index.scip"), [0xff_u8; 32]).unwrap();
+    let answer = off.traverse().await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    let answer = answer["structuredContent"].clone();
+    assert_eq!(answer["mode"], "traverse", "{answer}");
+    assert_eq!(answer["seed_source"], "hybrid", "{answer}");
+    let hits = answer["seed_hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{answer}");
+    for hit in hits {
+        assert_eq!(hit["kind"], "chunk", "{hit}");
+    }
+    assert!(notes_text(&answer).contains("scip.mode = off"), "{answer}");
+    off.stop();
+}
+
+#[tokio::test]
+async fn scip_mode_cache_answers_without_the_file_and_walks_it_once_it_exists() {
+    use lci_core::config::profile::ScipMode;
+    let server = ScipModeServer::start(ScipMode::Cache).await;
+    write_hybrid_workspace(&server.workspace);
+    std::fs::remove_file(server.workspace.join("index.scip")).unwrap();
+
+    // No file: the call answers, and the notes say the index was not read.
+    let without = server.traverse().await;
+    assert_ne!(without["isError"], true, "{without}");
+    let without = without["structuredContent"].clone();
+    assert!(
+        notes_text(&without).contains("(scip.mode = cache)"),
+        "{without}"
+    );
+    // Without the graph the search hits stay chunks.
+    let kinds = |answer: &Value| -> Vec<String> {
+        answer["seed_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["kind"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let chunks = kinds(&without);
+    assert!(
+        !chunks.is_empty() && chunks.iter().all(|kind| kind == "chunk"),
+        "{without}"
+    );
+
+    // The file appears: the next call walks the graph from the seeds.
+    write_hybrid_workspace(&server.workspace);
+    let with = server.traverse().await;
+    assert_ne!(with["isError"], true, "{with}");
+    let with = with["structuredContent"].clone();
+    assert!(!notes_text(&with).contains("scip.mode = cache"), "{with}");
+    // With it the hits are mapped to the graph's symbols and the graph is
+    // walked from them.
+    let symbols = kinds(&with);
+    assert!(
+        !symbols.is_empty() && symbols.iter().all(|kind| kind == "symbol"),
+        "{with}"
+    );
+    assert!(
+        with["totals"]["per_map"]["graph.scip"]["expands"]
+            .as_u64()
+            .is_some_and(|calls| calls > 0),
+        "{with}"
+    );
+    assert!(
+        with["results"].as_array().unwrap().iter().any(|card| {
+            card["via"] == "graph.scip"
+                && card["node"].as_str().unwrap().contains("translator_helper")
+        }),
+        "a symbol reached through graph.scip: {with}"
+    );
+    server.stop();
+}

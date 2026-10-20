@@ -453,10 +453,17 @@ fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
     let nanos = modified
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_nanos());
-    let index = format!(
-        "{}|{len}|{nanos}",
-        canonical(call.scip_index).to_string_lossy()
-    );
+    // Under off the index is not looked at either: the path as given. Cache
+    // already checked the path, so a handle resumes with any spelling of it.
+    let path = if matches!(
+        loaded.absent,
+        Some(lci_core::config::profile::ScipMode::Off)
+    ) {
+        call.scip_index.to_path_buf()
+    } else {
+        canonical(call.scip_index)
+    };
+    let index = format!("{}|{len}|{nanos}", path.to_string_lossy());
     format!(
         "w{}.i{}",
         trace::hash16(workspace.as_bytes()),
@@ -469,7 +476,8 @@ fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
 /// for a handle; a failed trace write is a note, not an error.
 ///
 /// `profile` is `[run_profile]`: its `walk` keys set how the walk groups
-/// evidence (see [`Grouping`]).
+/// evidence (see [`Grouping`]); its `scip.mode` says whether the SCIP index
+/// is required, a cache or never read.
 pub async fn run(
     limits: &TraverseConfig,
     profile: &RunProfileConfig,
@@ -625,7 +633,10 @@ pub async fn run_with_trait_seeds(
         None => None,
     };
 
-    let loaded = load(call.scip_index, call.scip_root).await?;
+    let loaded = load(call.scip_index, call.scip_root, profile.scip.mode).await?;
+    if let Some(note) = &loaded.note {
+        notes.push(note.clone());
+    }
     // `[run_profile.traverse] map_freshness` (from the run profile of the call):
     // the tree against the index file (see [`freshness`]), read once per call
     // and before the maps built from the tree are built.
@@ -636,10 +647,15 @@ pub async fn run_with_trait_seeds(
             Some(root) => match freshness::tree_lag(call.scip_index, root, loaded.stamp).await {
                 Ok(Some(lag)) => Some(lag),
                 Ok(None) => {
-                    notes.push(
+                    notes.push(if let Some(mode) = loaded.absent {
+                        format!(
+                            "map_freshness: no SCIP index is read (scip.mode = {}); the tree was not compared with it",
+                            mode.as_str()
+                        )
+                    } else {
                         "map_freshness: the index file has no modified time; the tree was not compared with it"
-                            .to_owned(),
-                    );
+                            .to_owned()
+                    });
                     None
                 }
                 Err(error) => {
@@ -1422,4 +1438,4 @@ pub async fn search(
 }
 
 /// Text for the server instructions when the mode is on.
-pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode needs an index.scip in the workspace, and the search that finds the start nodes uses the same index and model services as the normal mode.";
+pub const INSTRUCTIONS: &str = " search_code also takes mode=\"traverse\": instead of a ranked list it walks the code graph (SCIP index: callers, callees, references) from the symbols that the hybrid search for the query finds (the search of the normal mode, then mapped to the index; a stand-in that matches symbol names takes over only if the search is unavailable or finds nothing, and seed_source says which), under a budget, and returns the start nodes (the first stage) and then the reached nodes, each card with its origin, with the trace totals. steer.rules is an array of {when, then} rules (prune, expand, boost, map on/off, stop, emit) applied at each stop; a stop no rule decides, or an exhausted budget, returns a handle and a checkpoint, and the next call carries the handle and steer.actions. The mode needs an index.scip in the workspace unless [run_profile.scip] mode is cache or off, and the search that finds the start nodes uses the same index and model services as the normal mode.";

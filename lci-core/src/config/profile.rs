@@ -24,6 +24,58 @@ pub struct RunProfileConfig {
     pub traverse: RunProfileTraverse,
     /// `[run_profile.walk]`: how a traversal counts evidence.
     pub walk: WalkProfile,
+    /// `[run_profile.scip]`: how a traversal treats the SCIP index.
+    pub scip: ScipProfile,
+}
+
+/// What a traversal does with the SCIP index (`[run_profile.scip] mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScipMode {
+    /// The index is required and read; a missing or unreadable file is an
+    /// error. Today's behaviour.
+    #[default]
+    Authoritative,
+    /// The index is a cache: a missing or unreadable file gives an empty SCIP
+    /// graph and a note; a readable one is loaded as under `authoritative`.
+    Cache,
+    /// The index path is never touched; the SCIP graph and every map built
+    /// from the index are empty.
+    Off,
+}
+
+impl ScipMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::Cache => "cache",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for ScipMode {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "authoritative" => Ok(Self::Authoritative),
+            "cache" => Ok(Self::Cache),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "mode must be \"authoritative\", \"cache\" or \"off\" (got {other:?})"
+            )),
+        }
+    }
+}
+
+/// `[run_profile.scip]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScipProfile {
+    /// `"authoritative"` (default, the index is required), `"cache"` (read it
+    /// when it is there) or `"off"` (never read it).
+    pub mode: ScipMode,
 }
 
 /// `[run_profile.traverse]`.
@@ -373,6 +425,7 @@ mod tests {
         config.rescorer = crate::config::Rescorer::SystemOne;
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
+        config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config
     }
 
@@ -427,7 +480,7 @@ mod tests {
         assert!(
             base.canonical
                 .contains(
-                    r#""run_profile":{"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
+                    r#""run_profile":{"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
                 )
         );
         let mut claim = Config::default();
@@ -451,6 +504,68 @@ mod tests {
         ] {
             assert!(base.keys.iter().any(|k| k == key), "{key}");
         }
+    }
+
+    #[test]
+    fn scip_mode_changes_the_profile_hash() {
+        let base = Config::default().run_profile();
+        assert!(
+            base.canonical
+                .contains(r#""scip":{"mode":"authoritative"}"#)
+        );
+        let hashes: Vec<String> = [ScipMode::Authoritative, ScipMode::Cache, ScipMode::Off]
+            .into_iter()
+            .map(|mode| {
+                let mut config = Config::default();
+                config.run_profile.scip.mode = mode;
+                config.run_profile().hash
+            })
+            .collect();
+        assert_eq!(hashes[0], base.hash);
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[0], hashes[2]);
+        assert_ne!(hashes[1], hashes[2]);
+        assert!(base.keys.iter().any(|key| key == "run_profile.scip.mode"));
+        // The file reads the key.
+        let read: Config = toml::from_str(&format!(
+            "{}[run_profile.scip]
+mode = \"off\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        read.validate().unwrap();
+        assert_eq!(read.run_profile.scip.mode, ScipMode::Off);
+        assert_eq!("cache".parse::<ScipMode>(), Ok(ScipMode::Cache));
+    }
+
+    #[test]
+    fn scip_mode_refuses_an_unknown_value() {
+        for bad in [
+            "mode = \"Off\"",
+            "mode = \"\"",
+            "mode = \"on\"",
+            "mode = true",
+            "nope = 1",
+        ] {
+            let text = format!(
+                "{}[run_profile.scip]
+{bad}
+",
+                base_toml()
+            );
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        let error = toml::from_str::<Config>(&format!(
+            "{}[run_profile.scip]
+mode = \"sometimes\"
+",
+            base_toml()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("sometimes"), "{error}");
+        assert!("sometimes".parse::<ScipMode>().is_err());
     }
 
     #[test]
@@ -511,7 +626,7 @@ mod tests {
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "9a1e65516b6e863c3cdb15aa8762eb265d3d0a9473c94d6c59c98db721547514",
+            "195065ed32394b9055ad9bc5644ef7ca5e5a587a6e2473a778e0699db2664f67",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -529,6 +644,7 @@ mod tests {
             "run_profile.walk.groups",
             "run_profile.walk.grep_corroboration",
             "run_profile.traverse.map_freshness",
+            "run_profile.scip.mode",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -594,9 +710,10 @@ mod tests {
         // K23a: a489865d... before `[run_profile.walk]` (`groups`,
         // `grep_corroboration`) gave the section its two leaves.
         // K2a-2: c10fe368... before `[run_profile.traverse] map_freshness`.
+        // K20a: 854c4164... before `[run_profile.scip] mode` added its leaf.
         assert_eq!(
             Config::default().run_profile().hash,
-            "854c41649c271f59b76ab7e903ff3a55f5b65da888e35a87fa76a77a34e8cc46"
+            "e4cab053b94a84d8d42e1c019f4ad3b3db9246a56ddfe20583ce06319f20a7a8"
         );
     }
 }

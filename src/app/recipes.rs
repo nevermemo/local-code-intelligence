@@ -333,14 +333,15 @@ pub async fn run(ctx: &Ctx<'_>, request: &Request) -> Result<Value> {
 }
 
 async fn open_sources(ctx: &Ctx<'_>, want_keys: bool) -> Result<Sources> {
-    let OpenedIndex { scip, impact } = traverse::open_index(ctx.scip_index, ctx.root).await?;
+    let OpenedIndex { scip, impact } =
+        traverse::open_index(ctx.scip_index, ctx.root, ctx.profile.scip.mode).await?;
     let (keys, key_ids) = if want_keys {
         let path = ctx.root.join(KEY_FILE);
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!("the config recipes read the keys of {KEY_FILE} in the workspace")
         })?;
         let key_ids = key_ids_of(&text);
-        let map = traverse::open_config_key(ctx.scip_index, ctx.root)
+        let map = traverse::open_config_key(ctx.scip_index, ctx.root, ctx.profile.scip.mode)
             .await
             .context("config.key (needs `rg` on PATH)")?;
         (Some(map), key_ids)
