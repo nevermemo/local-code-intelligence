@@ -299,7 +299,7 @@ async fn rest_release_workspace_stops_the_language_servers_of_that_workspace() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["released", "workspace"]);
+    assert_eq!(keys, ["profile_hash", "released", "workspace"]);
     assert_eq!(lsp_event_count(&state, "shutdown_seen.txt"), 1);
     assert_eq!(lsp_event_count(&state, "exit_seen.txt"), 1);
 
@@ -647,6 +647,7 @@ fn has_the_unprofiled_report_keys(report: &Value) -> bool {
         "candidate_count",
         "filters",
         "index",
+        "profile_hash",
         "query",
         "reranked",
         "results",
@@ -882,7 +883,9 @@ async fn assert_default_endpoints_return_what_the_application_does(profiled: boo
         .unwrap();
     assert!(expected.reranked, "{:?}", expected.warning);
     assert!(expected.warning.is_none(), "{:?}", expected.warning);
-    let expected = serde_json::to_value(&expected).unwrap();
+    let mut expected = serde_json::to_value(&expected).unwrap();
+    // The wire result is the report plus the profile hash, and nothing else.
+    local_code_intelligence::app::stamp(&mut expected, app.profile_hash());
     assert!(has_the_unprofiled_report_keys(&expected), "{expected}");
     let expected = without_clocks(expected);
 
@@ -1251,7 +1254,14 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
     let compact = structured(&compact_response);
     assert_eq!(
         object_keys(compact),
-        ["filters", "index", "results", "search_profile", "workspace"],
+        [
+            "filters",
+            "index",
+            "profile_hash",
+            "results",
+            "search_profile",
+            "workspace"
+        ],
         "{compact}"
     );
     // The text of the response keeps the key order the code writes: the
@@ -1271,7 +1281,15 @@ async fn a_compact_profile_endpoint_serves_locators_and_code_in_the_order_of_the
             "language",
             "source_role",
             "code",
+            "profile_hash",
         ],
+    );
+    assert!(
+        compact_text.ends_with(&format!(
+            ",\"profile_hash\":\"{}\"}}",
+            compact["profile_hash"].as_str().unwrap()
+        )),
+        "{compact_text}"
     );
     let truncated_hit = &compact_text[compact_text
         .find("\"relative_file_path\":\"src/long.rs\"")
@@ -1426,6 +1444,7 @@ async fn markdown_comes_back_in_a_docs_list_beside_the_results_in_the_full_and_c
             "docs",
             "filters",
             "index",
+            "profile_hash",
             "query",
             "reranked",
             "results",
@@ -1467,6 +1486,7 @@ async fn markdown_comes_back_in_a_docs_list_beside_the_results_in_the_full_and_c
             "docs",
             "filters",
             "index",
+            "profile_hash",
             "results",
             "search_profile",
             "workspace"
@@ -1475,7 +1495,14 @@ async fn markdown_comes_back_in_a_docs_list_beside_the_results_in_the_full_and_c
     );
     assert_key_order(
         text_content(&compact_response),
-        &["workspace", "filters", "index", "results", "docs"],
+        &[
+            "workspace",
+            "filters",
+            "index",
+            "results",
+            "docs",
+            "profile_hash",
+        ],
     );
     let compact_docs = compact["docs"].as_array().unwrap();
     assert_eq!(compact_docs.len(), 2);
@@ -3103,6 +3130,443 @@ async fn symbol_query_byte_limit_matches_code_search_over_mcp_and_rest() {
             );
         }
     }
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// The run-profile hash on every result: `"profile_hash"`, the
+// `Config::run_profile().hash` of the server's configuration, stamped where
+// MCP and REST build a result so that a new tool or route cannot ship without
+// it. Errors are never stamped.
+// ---------------------------------------------------------------------------
+
+/// The sixteen tools of a server with the recipes, compose and traverse on.
+const STAMPED_TOOLS: [&str; 16] = [
+    "config_neighbours",
+    "config_readers",
+    "find_definition",
+    "find_references",
+    "flow_from",
+    "flow_path",
+    "impact_rings",
+    "index_status",
+    "index_workspace",
+    "lci_compose",
+    "list_indexed_files",
+    "search_code",
+    "search_symbols",
+    "service_status",
+    "unwatch_workspace",
+    "watch_workspace",
+];
+
+/// A config with every optional tool on and a fake language server per
+/// language, each in the one mode its tool needs: C# answers `find_definition`,
+/// Python `find_references`, TypeScript `search_symbols`. The `compact` profile
+/// serves `search_code` in the compact shape.
+fn stamped_config(mut config: Config, state: &Path) -> Config {
+    use local_code_intelligence::config::{
+        CSharpLspConfig, McpResponse, PythonLspConfig, SearchProfile, TypeScriptLspConfig,
+    };
+    config.channels.lsp = false;
+    config.traverse.enabled = true;
+    config.recipes.enabled = true;
+    config.compose.enabled = true;
+    config.lsp_timeout_seconds = 5;
+    let args = |mode: &str, name: &str, primary: &str, secondary: &str| {
+        vec![
+            "--mode".to_owned(),
+            mode.to_owned(),
+            "--state".to_owned(),
+            state.join(name).to_string_lossy().into_owned(),
+            "--primary-file".to_owned(),
+            primary.to_owned(),
+            "--secondary-file".to_owned(),
+            secondary.to_owned(),
+        ]
+    };
+    config.csharp = CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: args(
+            "definition",
+            "csharp",
+            "src/Calculator.cs",
+            "src/CallSite.cs",
+        ),
+        disabled: false,
+    };
+    config.python = PythonLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: args(
+            "references",
+            "python",
+            "src/Calculator.py",
+            "src/CallSite.py",
+        ),
+        disabled: false,
+    };
+    config.typescript = TypeScriptLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: args(
+            "workspace-symbols",
+            "typescript",
+            "src/Calculator.ts",
+            "src/CallSite.ts",
+        ),
+        disabled: false,
+    };
+    config.search_profiles.insert(
+        "compact".to_owned(),
+        SearchProfile {
+            response: Some(McpResponse::Compact),
+            ..SearchProfile::default()
+        },
+    );
+    config
+}
+
+/// The workspace the tools are called on: the recipe tree (Rust sources and
+/// their `index.scip`) plus a C#, a Python and a TypeScript file pair for the
+/// fake language servers.
+fn write_stamped_workspace(root: &Path) {
+    super::recipes::write_recipe_tree(root);
+    // The key file the config recipes read.
+    write(root, "config.example.toml", "port = 8768\n");
+    write_csharp_workspace(root);
+    write(
+        root,
+        "src/Calculator.py",
+        "class Calculator:\n    def add(self, a, b):\n        return a + b\n",
+    );
+    write(
+        root,
+        "src/CallSite.py",
+        "from .Calculator import Calculator\n\ndef run(value):\n    return value.add(1, 2)\n",
+    );
+    write(
+        root,
+        "src/Calculator.ts",
+        "export class Calculator {\n  add(a: number, b: number): number {\n    return a + b;\n  }\n}\n",
+    );
+    write(
+        root,
+        "src/CallSite.ts",
+        "import { Calculator } from './Calculator';\nexport const run = (value: Calculator) => value.add(1, 2);\n",
+    );
+}
+
+/// The arguments of a valid call of each REST operation or MCP tool on
+/// `workspace`; `None` for a name that has none, which fails the test that asks.
+fn stamped_arguments(name: &str, workspace: &Path) -> Option<Value> {
+    Some(match name {
+        "index_workspace" | "index_status" | "list_indexed_files" | "watch_workspace"
+        | "unwatch_workspace" | "release_workspace" => json!({"workspace_path":workspace}),
+        "search_symbols" => json!({"workspace_path":workspace,"query":"Calculator"}),
+        "find_definition" => json!({
+            "workspace_path":workspace,"relative_file_path":"src/CallSite.cs",
+            "line":2,"character":72,
+        }),
+        "find_references" => json!({
+            "workspace_path":workspace,"relative_file_path":"src/Calculator.py",
+            "line":1,"character":10,"include_declaration":true,
+        }),
+        "search_code" => json!({"workspace_path":workspace,"query":"Foo alpha beta"}),
+        "service_status" => json!({}),
+        "config_readers" => json!({"workspace_path":workspace,"key":"port"}),
+        "impact_rings" => json!({"workspace_path":workspace,"symbol":"Foo"}),
+        "flow_path" => json!({"workspace_path":workspace,"from":"beta","to":"alpha"}),
+        "flow_from" => json!({"workspace_path":workspace,"entry":"beta","k":5}),
+        "config_neighbours" => json!({"workspace_path":workspace,"symbol":"alpha"}),
+        "lci_compose" => json!({"workspace_path":workspace,"steps":[
+            {"id":"s1","op":"seeds.scip_names","in":{"names":["Foo"]}},
+            {"id":"s2","op":"exact.closure","in":{"symbols":"$s1.symbols"}},
+        ]}),
+        _ => return None,
+    })
+}
+
+/// `response` (a `tools/call` response) is a success that carries `hash` in
+/// its structured content and in its text; returns the structured result.
+fn assert_stamped<'a>(what: &str, response: &'a Value, hash: &str) -> &'a Value {
+    assert_ne!(response["result"]["isError"], true, "{what}: {response}");
+    let result = structured(response);
+    assert_eq!(result["profile_hash"], hash, "{what}: {result}");
+    assert!(text_content(response).contains(hash), "{what}: {response}");
+    result
+}
+
+#[tokio::test]
+async fn every_tool_result_carries_the_profile_hash() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("stamped");
+    write_stamped_workspace(&workspace);
+    let scip_only = temp.path().join("stamped-traverse");
+    write_scip_workspace(&scip_only);
+    let app = Arc::new(
+        App::open(stamped_config(config, &temp.path().join("lsp-state")))
+            .await
+            .unwrap(),
+    );
+    let hash = app.config.run_profile().hash;
+    assert_eq!(hash.len(), 64);
+    assert_eq!(app.profile_hash(), hash);
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    // A new tool fails here until it has arguments in `stamped_arguments`.
+    let tools = mcp_result(&client, &base, "/mcp", &session, "tools/list", json!({})).await;
+    assert_eq!(tool_names(&tools), STAMPED_TOOLS);
+
+    // Order matters: index before status and files, watch before unwatch.
+    let mut called = Vec::new();
+    for name in [
+        "index_workspace",
+        "index_status",
+        "list_indexed_files",
+        "search_symbols",
+        "find_definition",
+        "find_references",
+        "search_code",
+        "watch_workspace",
+        "unwatch_workspace",
+        "service_status",
+        "config_readers",
+        "impact_rings",
+        "flow_path",
+        "flow_from",
+        "config_neighbours",
+        "lci_compose",
+    ] {
+        let arguments = stamped_arguments(name, &workspace)
+            .unwrap_or_else(|| panic!("no arguments for the tool {name}"));
+        let response = mcp_call(&client, &base, "/mcp", &session, name, arguments).await;
+        assert_stamped(name, &response, &hash);
+        called.push(name);
+    }
+    called.sort_unstable();
+    assert_eq!(called, STAMPED_TOOLS);
+
+    // The traversal: a plain answer, an answer that stops at a checkpoint with
+    // a handle, the continuation of that handle, and one with no seeds.
+    let traverse = |arguments: Value| {
+        let mut full = json!({"workspace_path":scip_only,"mode":"traverse"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        full
+    };
+    let question = "how does search rank hits";
+    let plain = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &session,
+        "search_code",
+        traverse(json!({"query":question,"top_k":20})),
+    )
+    .await;
+    assert_eq!(
+        assert_stamped("traverse", &plain, &hash)["status"],
+        "complete"
+    );
+    let stopped = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &session,
+        "search_code",
+        traverse(json!({
+            "query":question,
+            "steer":{
+                "rules":[{"when":{"path_glob":"tests/**"},"then":"prune"}],
+                "stop_every":2,"max_stops":4,
+            },
+        })),
+    )
+    .await;
+    let stopped = assert_stamped("traverse checkpoint", &stopped, &hash);
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    assert!(stopped["checkpoint"].is_object(), "{stopped}");
+    let handle = stopped["handle"].as_str().unwrap();
+    let finished = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &session,
+        "search_code",
+        traverse(json!({
+            "query":question,"handle":handle,
+            "steer":{"actions":[{"action":{"budget":{"pops":20}}}],"max_stops":0,"rules":[]},
+        })),
+    )
+    .await;
+    assert_eq!(
+        assert_stamped("traverse handle", &finished, &hash)["status"],
+        "complete"
+    );
+    let nothing = mcp_call(
+        &client,
+        &base,
+        "/mcp",
+        &session,
+        "search_code",
+        traverse(json!({"query":"zebra xylophone"})),
+    )
+    .await;
+    assert_eq!(
+        assert_stamped("traverse no_seeds", &nothing, &hash)["status"],
+        "no_seeds"
+    );
+
+    // The compact endpoint writes the key itself, last, once.
+    let (compact_session, _) = mcp_initialize(&client, &base, "/mcp/compact").await;
+    let compact = mcp_call(
+        &client,
+        &base,
+        "/mcp/compact",
+        &compact_session,
+        "search_code",
+        stamped_arguments("search_code", &workspace).unwrap(),
+    )
+    .await;
+    assert_stamped("compact", &compact, &hash);
+    let text = text_content(&compact);
+    let tail = format!(",\"profile_hash\":\"{hash}\"}}");
+    assert!(text.ends_with(&tail), "{text}");
+    assert_eq!(text.matches("profile_hash").count(), 1, "{text}");
+    // The key costs 82 bytes in a result (the closing brace is not its own).
+    assert_eq!(tail.len() - 1, 82);
+
+    // An error is never stamped, in the structured content or in the text.
+    for (name, arguments) in [
+        ("index_status", json!({"workspace_path":"   "})),
+        (
+            "search_code",
+            json!({"workspace_path":scip_only,"query":"x","mode":"traverse","handle":"hdeadbeefdeadbeef"}),
+        ),
+        (
+            "search_code",
+            json!({"workspace_path":workspace,"query":"x","top_k":0}),
+        ),
+    ] {
+        let response = mcp_call(&client, &base, "/mcp", &session, name, arguments).await;
+        assert_eq!(response["result"]["isError"], true, "{name}: {response}");
+        assert!(!response.to_string().contains("profile_hash"), "{response}");
+    }
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn every_openapi_route_result_carries_the_profile_hash() {
+    let (temp, config, _fake, models_task) = fixture().await;
+    let workspace = temp.path().join("stamped-rest");
+    write_stamped_workspace(&workspace);
+    let app = Arc::new(
+        App::open(stamped_config(config, &temp.path().join("lsp-state")))
+            .await
+            .unwrap(),
+    );
+    let hash = app.config.run_profile().hash;
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let openapi = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+
+    // The schema of a success says what the routes do.
+    let schema = &openapi["paths"]["/v1/index_status"]["post"]["responses"]["200"]["content"]["application/json"]
+        ["schema"];
+    assert_eq!(schema["required"], json!(["profile_hash"]), "{schema}");
+    assert_eq!(
+        schema["properties"]["profile_hash"]["pattern"], "^[0-9a-f]{64}$",
+        "{schema}"
+    );
+
+    // Order matters: index before status and files, watch before unwatch,
+    // release last.
+    let order = [
+        "index_workspace",
+        "index_status",
+        "list_indexed_files",
+        "search_symbols",
+        "find_definition",
+        "find_references",
+        "search_code",
+        "watch_workspace",
+        "unwatch_workspace",
+        "service_status",
+        "release_workspace",
+    ];
+    let mut routes: Vec<(String, String, String)> = Vec::new();
+    for (path, item) in openapi["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            routes.push((
+                path.clone(),
+                method.clone(),
+                operation["operationId"].as_str().unwrap().to_owned(),
+            ));
+        }
+    }
+    // A route that is not a tool of the MCP list or `release_workspace` fails
+    // here until it is added to this test.
+    let position = |operation: &str| {
+        order
+            .iter()
+            .position(|name| *name == operation)
+            .or_else(|| {
+                STAMPED_TOOLS
+                    .iter()
+                    .position(|name| *name == operation)
+                    .map(|n| n + order.len())
+            })
+            .unwrap_or_else(|| panic!("route {operation} is not in the stamped test"))
+    };
+    routes.sort_by_key(|(_, _, operation)| position(operation));
+    assert_eq!(routes.len(), STAMPED_TOOLS.len() + 1, "{routes:?}");
+    for (path, method, operation) in &routes {
+        let request = match method.as_str() {
+            "get" => client.get(format!("{base}{path}")),
+            "post" => client.post(format!("{base}{path}")).json(
+                &stamped_arguments(operation, &workspace)
+                    .unwrap_or_else(|| panic!("no arguments for the route {operation}")),
+            ),
+            other => panic!("{path}: method {other}"),
+        };
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["profile_hash"], hash.as_str(), "{path}: {body}");
+    }
+
+    // Liveness and readiness are not results of the profile.
+    for path in ["/health", "/ready"] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert!(body.get("profile_hash").is_none(), "{path}: {body}");
+    }
+
+    // An error is never stamped.
+    let failed = client
+        .post(format!("{base}/v1/index_status"))
+        .json(&json!({"workspace_path": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let failed: Value = failed.json().await.unwrap();
+    assert!(failed["error"].is_string() && failed.get("profile_hash").is_none());
 
     token.cancel();
     server.abort();

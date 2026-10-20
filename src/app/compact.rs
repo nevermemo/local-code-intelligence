@@ -10,7 +10,8 @@
 //! warning, notes, filters, and the index lifecycle. When the report carries a
 //! documentation lane, its hits follow `results` under `docs` (the same compact
 //! shape, sharing the response ceiling) and its failure, if any, is
-//! `docs_warning`; both are absent otherwise.
+//! `docs_warning`; both are absent otherwise. The last key is `profile_hash`,
+//! the run-profile hash of the server's configuration.
 //!
 //! Two limits shorten `code` and never touch a locator or the order of hits:
 //! at most `max_hit_lines` lines per hit, and a ceiling on the serialized
@@ -65,6 +66,9 @@ struct CompactReport<'a> {
     /// the search report carries one. Its hits share the response ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
     docs: Option<Vec<CompactHit<'a>>>,
+    /// The run-profile hash of the server's configuration; always the last
+    /// key, so the text ends with it.
+    profile_hash: &'a str,
 }
 
 #[derive(Serialize)]
@@ -97,10 +101,14 @@ fn is_false(flag: &bool) -> bool {
 }
 
 /// `report` as the compact result, as JSON text whose keys are in the order of
-/// the module documentation. Fails only when the ceiling cannot hold the
-/// mandatory metadata of the results (every locator, the envelope, and a
-/// closing line per hit).
-pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<String> {
+/// the module documentation, ending with `profile_hash`. Fails only when the
+/// ceiling cannot hold the mandatory metadata of the results (every locator,
+/// the envelope, the hash, and a closing line per hit).
+pub fn compact_view(
+    report: &SearchReport,
+    limits: CompactLimits,
+    profile_hash: &str,
+) -> Result<String> {
     let ceiling = limits.max_response_chars;
     // Code results first, then the docs lane's: one list for the ceiling.
     let docs_hits: &[Hit] = report
@@ -134,6 +142,7 @@ pub fn compact_view(report: &SearchReport, limits: CompactLimits) -> Result<Stri
                     .map(|hit| compact_hit(hit, limits.max_hit_lines, per_hit_budget))
                     .collect()
             }),
+            profile_hash,
         };
         Ok(serde_json::to_string(&view)?)
     };
@@ -331,6 +340,9 @@ mod tests {
     };
     use serde_json::Value;
 
+    /// A run-profile hash: 64 lowercase hex characters.
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn hit(path: &str, start_line: u32, code: &str) -> Hit {
         let lines = code.split_inclusive('\n').count().max(1) as u32;
         Hit {
@@ -418,7 +430,7 @@ mod tests {
     /// reorder: use it for values and for the SET of keys, never for their
     /// order (that is what [`assert_key_order`] is for).
     fn view_of(report: &SearchReport, limits: CompactLimits) -> Result<Value> {
-        Ok(serde_json::from_str(&compact_view(report, limits)?)?)
+        Ok(serde_json::from_str(&compact_view(report, limits, HASH)?)?)
     }
 
     fn chars_of(view: &Value) -> usize {
@@ -460,7 +472,7 @@ mod tests {
     fn a_compact_result_keeps_the_locators_and_code_and_drops_the_retrieval_metadata() {
         let code = "fn short() {\n    1\n}\n";
         let one = report(vec![hit("src/a.rs", 10, code)]);
-        let text = compact_view(&one, limits(40, 16_000)).unwrap();
+        let text = compact_view(&one, limits(40, 16_000), HASH).unwrap();
         let view = view_of(&one, limits(40, 16_000)).unwrap();
         assert_eq!(
             keys(&view),
@@ -469,7 +481,8 @@ mod tests {
                 "search_profile",
                 "filters",
                 "index",
-                "results"
+                "results",
+                "profile_hash"
             ])
         );
         // The order of the keys in the text does not depend on how
@@ -489,6 +502,7 @@ mod tests {
                 "language",
                 "source_role",
                 "code",
+                "profile_hash",
             ],
         );
         assert!(
@@ -537,9 +551,44 @@ mod tests {
         let view = view_of(&none, limits(40, 16_000)).unwrap();
         assert_eq!(
             keys(&view),
-            sorted(vec!["workspace", "filters", "index", "results"])
+            sorted(vec![
+                "workspace",
+                "filters",
+                "index",
+                "results",
+                "profile_hash"
+            ])
         );
         assert!(results(&view).is_empty());
+    }
+
+    #[test]
+    fn the_compact_text_ends_with_the_profile_hash() {
+        let text = compact_view(
+            &report(vec![hit("src/a.rs", 1, "x\n")]),
+            limits(40, 16_000),
+            HASH,
+        )
+        .unwrap();
+        assert!(
+            text.ends_with(&format!(",\"profile_hash\":\"{HASH}\"}}")),
+            "{text}"
+        );
+        // With a docs lane and a squeezed ceiling it is still the last key.
+        let both = with_docs(
+            report(vec![hit("src/a.rs", 1, &numbered_lines(60))]),
+            vec![hit("docs/a.md", 1, &numbered_lines(60))],
+            None,
+        );
+        let whole = chars_of(&view_of(&both, limits(40, 100_000)).unwrap());
+        let text = compact_view(&both, limits(40, whole * 3 / 4), HASH).unwrap();
+        assert!(text.contains("\"response_truncated\":true"), "{text}");
+        assert!(
+            text.ends_with(&format!(",\"profile_hash\":\"{HASH}\"}}")),
+            "{text}"
+        );
+        assert_eq!(text.matches("\"profile_hash\"").count(), 1);
+        assert_eq!(HASH.len(), 64);
     }
 
     #[test]
@@ -754,7 +803,7 @@ mod tests {
             vec![guide],
             Some("Docs reranker unavailable"),
         );
-        let text = compact_view(&both, limits(40, 16_000)).unwrap();
+        let text = compact_view(&both, limits(40, 16_000), HASH).unwrap();
         // The docs list comes after the results, its warning before them.
         assert_key_order(
             &text,
@@ -767,6 +816,7 @@ mod tests {
                 "results",
                 "docs",
                 "relative_file_path",
+                "profile_hash",
             ],
         );
         let view = view_of(&both, limits(40, 16_000)).unwrap();
@@ -779,7 +829,8 @@ mod tests {
                 "filters",
                 "index",
                 "results",
-                "docs"
+                "docs",
+                "profile_hash"
             ])
         );
         assert_eq!(view["docs"][0]["relative_file_path"], "docs/guide.md");

@@ -8,7 +8,7 @@
 //! below can never drift from what a request actually accepts.
 
 use crate::{
-    app::{App, recipes},
+    app::{App, recipes, stamp},
     config::Config,
     server::{PositionArgs, ReferencesArgs, SearchArgs, SymbolArgs, WorkspaceArgs},
 };
@@ -23,9 +23,15 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc};
 
-fn respond<T: Serialize>(value: anyhow::Result<T>) -> (StatusCode, Json<Value>) {
+/// A route's answer: the serialized `value` stamped with the run-profile hash
+/// of `app` (see [`stamp`]), or, for an error, a 500 with `{"error"}` and no
+/// stamp. Every route of this module answers through here.
+fn respond<T: Serialize>(app: &App, value: anyhow::Result<T>) -> (StatusCode, Json<Value>) {
     match value.and_then(|v| Ok(serde_json::to_value(v)?)) {
-        Ok(value) => (StatusCode::OK, Json(value)),
+        Ok(mut value) => {
+            stamp(&mut value, app.profile_hash());
+            (StatusCode::OK, Json(value))
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("{error:#}")})),
@@ -37,35 +43,38 @@ async fn index_workspace(
     State(app): State<Arc<App>>,
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
-    respond(app.index(Path::new(&args.workspace_path)).await)
+    respond(&app, app.index(Path::new(&args.workspace_path)).await)
 }
 
 async fn index_status(
     State(app): State<Arc<App>>,
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
-    respond(app.status(Path::new(&args.workspace_path)).await)
+    respond(&app, app.status(Path::new(&args.workspace_path)).await)
 }
 
 async fn list_indexed_files(
     State(app): State<Arc<App>>,
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
-    respond(app.indexed_files(Path::new(&args.workspace_path)).await)
+    respond(
+        &app,
+        app.indexed_files(Path::new(&args.workspace_path)).await,
+    )
 }
 
 async fn watch_workspace(
     State(app): State<Arc<App>>,
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
-    respond(app.watch(Path::new(&args.workspace_path)).await)
+    respond(&app, app.watch(Path::new(&args.workspace_path)).await)
 }
 
 async fn unwatch_workspace(
     State(app): State<Arc<App>>,
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
-    respond(app.unwatch(Path::new(&args.workspace_path)).await)
+    respond(&app, app.unwatch(Path::new(&args.workspace_path)).await)
 }
 
 /// REST only: there is no MCP tool for this, so `tools/list` is unchanged.
@@ -74,6 +83,7 @@ async fn release_workspace(
     Json(args): Json<WorkspaceArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
+        &app,
         app.release_language_servers(Path::new(&args.workspace_path))
             .await,
     )
@@ -84,6 +94,7 @@ async fn search_symbols(
     Json(args): Json<SymbolArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
+        &app,
         app.symbols(Path::new(&args.workspace_path), &args.query)
             .await,
     )
@@ -94,6 +105,7 @@ async fn find_definition(
     Json(args): Json<PositionArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
+        &app,
         app.definition(
             Path::new(&args.workspace_path),
             &args.relative_file_path,
@@ -109,6 +121,7 @@ async fn find_references(
     Json(args): Json<ReferencesArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
+        &app,
         app.references(
             Path::new(&args.workspace_path),
             &args.relative_file_path,
@@ -138,6 +151,7 @@ async fn search_code(
     Json(args): Json<SearchArgs>,
 ) -> (StatusCode, Json<Value>) {
     respond(
+        &app,
         app.search_in_profile(
             Path::new(&args.workspace_path),
             &args.query,
@@ -155,7 +169,7 @@ async fn search_code(
 }
 
 async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>) {
-    respond(Ok(app.service_status().await))
+    respond(&app, Ok(app.service_status().await))
 }
 
 /// Hand-assembled rather than generated from route attributes: every
@@ -163,7 +177,7 @@ async fn service_status(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>
 /// for the matching MCP tool's arguments in `server.rs`, so the documented
 /// request contract cannot silently drift from what a handler actually
 /// deserializes. Response bodies are intentionally left as an open
-/// `object` -- see README.md's "MCP tools" table for the exact shape each
+/// `object` that requires only `profile_hash` -- see README.md's "MCP tools" table for the exact shape each
 /// endpoint returns, since committing a second, hand-maintained copy of
 /// those result schemas here would just be one more place for them to go
 /// stale.
@@ -185,7 +199,15 @@ fn openapi_document(config: &Config) -> Value {
 
     let result_schema = json!({
         "type": "object",
-        "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape."
+        "description": "Identical JSON to the matching MCP tool's structured result; see README.md's \"MCP tools\" table for the exact shape.",
+        "properties": {
+            "profile_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "The run-profile hash of the server's configuration (RunRecord run.profile.hash)."
+            }
+        },
+        "required": ["profile_hash"]
     });
     let error_schema = json!({
         "type": "object",
@@ -354,7 +376,7 @@ pub fn routes() -> Router<Arc<App>> {
 }
 
 async fn recipe(app: Arc<App>, request: recipes::Request) -> (StatusCode, Json<Value>) {
-    respond(recipes::serve(&app, &request).await)
+    respond(&app, recipes::serve(&app, &request).await)
 }
 
 async fn config_readers(

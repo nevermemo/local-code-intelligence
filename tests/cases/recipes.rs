@@ -17,7 +17,7 @@ const RECIPE_TOOLS: [&str; 6] = [
 /// `Foo` implements the trait `Speak` (its `say` is the trait method's
 /// implementation).
 #[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
-fn write_recipe_tree(root: &Path) {
+pub(super) fn write_recipe_tree(root: &Path) {
     use scip::types::{Document, Occurrence, SymbolInformation, symbol_information::Kind};
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(

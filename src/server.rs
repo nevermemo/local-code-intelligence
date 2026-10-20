@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, compact_view, recipes, traverse},
+    app::{App, compact_view, recipes, stamp, traverse},
     config::{McpPresentation, McpToolList},
 };
 use rmcp::{
@@ -170,9 +170,17 @@ pub struct ReferencesArgs {
     pub include_declaration: bool,
 }
 
-fn result<T: serde::Serialize>(value: anyhow::Result<T>) -> CallToolResult {
+/// A tool result: the serialized `value` stamped with `profile_hash` (see
+/// [`stamp`]), as structured content and, by `structured`, as the text
+/// content; an error is never stamped. Every tool but the compact
+/// `search_code` answers through here, so a new tool is stamped without
+/// further work.
+fn result<T: serde::Serialize>(profile_hash: &str, value: anyhow::Result<T>) -> CallToolResult {
     match value.and_then(|v| Ok(serde_json::to_value(v)?)) {
-        Ok(value) => CallToolResult::structured(value),
+        Ok(mut value) => {
+            stamp(&mut value, profile_hash);
+            CallToolResult::structured(value)
+        }
         Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))]),
     }
 }
@@ -239,17 +247,21 @@ impl McpServer {
     /// tells the agent to call `index_workspace` names `search_code` instead,
     /// a tool the endpoint has.
     fn answer<T: serde::Serialize>(&self, value: anyhow::Result<T>) -> CallToolResult {
+        let hash = self.app.profile_hash();
         if self.presentation.tools == McpToolList::Search {
-            return result(value.map_err(|error| {
-                let text = format!("{error:#}");
-                if text.contains(INDEX_FIRST) {
-                    anyhow::anyhow!(text.replace(INDEX_FIRST, SEARCH_FIRST))
-                } else {
-                    error
-                }
-            }));
+            return result(
+                hash,
+                value.map_err(|error| {
+                    let text = format!("{error:#}");
+                    if text.contains(INDEX_FIRST) {
+                        anyhow::anyhow!(text.replace(INDEX_FIRST, SEARCH_FIRST))
+                    } else {
+                        error
+                    }
+                }),
+            );
         }
-        result(value)
+        result(hash, value)
     }
 }
 
@@ -259,13 +271,19 @@ impl McpServer {
         description = "Index Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ source and Markdown documentation (opt-in, `[index].prose`) in a local workspace respecting gitignore. Reuses unchanged chunks and embeddings; returns when the persistent index is ready."
     )]
     async fn index_workspace(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {
-        result(self.app.index(Path::new(&args.workspace_path)).await)
+        result(
+            self.app.profile_hash(),
+            self.app.index(Path::new(&args.workspace_path)).await,
+        )
     }
     #[tool(
         description = "Read persistent index status for a canonical workspace, including chunk count and embedding compatibility."
     )]
     async fn index_status(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {
-        result(self.app.status(Path::new(&args.workspace_path)).await)
+        result(
+            self.app.profile_hash(),
+            self.app.status(Path::new(&args.workspace_path)).await,
+        )
     }
     #[tool(
         description = "List every file the persistent index currently has cached chunks for, with language and chunk count. Reflects the last successful index_workspace, not a fresh directory scan."
@@ -275,6 +293,7 @@ impl McpServer {
         Parameters(args): Parameters<WorkspaceArgs>,
     ) -> CallToolResult {
         result(
+            self.app.profile_hash(),
             self.app
                 .indexed_files(Path::new(&args.workspace_path))
                 .await,
@@ -284,14 +303,20 @@ impl McpServer {
         description = "Watch an indexed workspace for Rust, TypeScript, TSX, JavaScript, JSX, Python, C#, Go, Java, C, and C++ source and Markdown (opt-in, `[index].prose`) changes. Debounces changes and refreshes the persistent index while the server is running."
     )]
     async fn watch_workspace(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {
-        result(self.app.watch(Path::new(&args.workspace_path)).await)
+        result(
+            self.app.profile_hash(),
+            self.app.watch(Path::new(&args.workspace_path)).await,
+        )
     }
     #[tool(description = "Stop automatic indexing for a watched workspace.")]
     async fn unwatch_workspace(
         &self,
         Parameters(args): Parameters<WorkspaceArgs>,
     ) -> CallToolResult {
-        result(self.app.unwatch(Path::new(&args.workspace_path)).await)
+        result(
+            self.app.profile_hash(),
+            self.app.unwatch(Path::new(&args.workspace_path)).await,
+        )
     }
     #[tool(
         description = "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd."
@@ -379,7 +404,9 @@ impl McpServer {
             .await;
         match self.presentation.compact {
             // A presentation step after the search: retrieval is finished.
-            Some(limits) => match report.and_then(|report| compact_view(&report, limits)) {
+            Some(limits) => match report
+                .and_then(|report| compact_view(&report, limits, self.app.profile_hash()))
+            {
                 Ok(text) => ordered_result(text),
                 Err(error) => self.answer::<()>(Err(error)),
             },
@@ -390,7 +417,7 @@ impl McpServer {
         description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, and clangd. Missing language servers do not make readiness fail."
     )]
     async fn service_status(&self, Parameters(_args): Parameters<NoArgs>) -> CallToolResult {
-        result(Ok(self.app.service_status().await))
+        result(self.app.profile_hash(), Ok(self.app.service_status().await))
     }
 }
 
