@@ -1088,6 +1088,82 @@ async fn run_cli(
     .unwrap()
 }
 
+/// The run-profile hash `config --json` reports for `config_path`.
+async fn config_profile_hash(config_path: &Path, cwd: &Path) -> String {
+    let output = run_cli(
+        config_path,
+        cwd,
+        vec!["config".to_owned(), "--json".to_owned()],
+        None,
+    )
+    .await;
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hash = report["derived"]["run_profile_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 64, "{report}");
+    hash.to_owned()
+}
+
+#[tokio::test]
+async fn every_command_line_result_that_opens_the_application_carries_the_profile_hash() {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("stamp-cli");
+    write_dump_workspace(&workspace);
+    let config_path = write_dump_cli_config(temp.path(), &config);
+    let cwd = temp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let hash = config_profile_hash(&config_path, &cwd).await;
+    let workspace_arg = workspace.display().to_string();
+    let run_json = |args: Vec<String>| {
+        let (config_path, cwd) = (config_path.clone(), cwd.clone());
+        async move {
+            let output = run_cli(&config_path, &cwd, args, None).await;
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        }
+    };
+
+    let cases: [(&str, Vec<&str>); 4] = [
+        ("index", vec!["index", &workspace_arg]),
+        ("status", vec!["status", &workspace_arg]),
+        ("list-files", vec!["list-files", &workspace_arg]),
+        ("search", vec!["search", &workspace_arg, "translator"]),
+    ];
+    // `symbols`, `definition` and `references` print through the same stamp
+    // in `run()`; they are left out because on this Rust workspace they
+    // would start a real rust-analyzer, which CI runners cannot rely on.
+    for (name, args) in cases {
+        let result = run_json(args.into_iter().map(str::to_owned).collect()).await;
+        assert_eq!(result["profile_hash"], hash, "{name}: {result}");
+    }
+
+    // The evaluation report carries it too, and still loads as a baseline.
+    let definition_path = temp.path().join("definition.toml");
+    std::fs::write(
+        &definition_path,
+        "[[workspaces]]\nkey = \"stamp\"\nrequired = true\n\n[[queries]]\nworkspace = \"stamp\"\nquery = \"translator\"\ntop_k = 3\nexpected_paths = [\"src/many.rs\"]\n",
+    )
+    .unwrap();
+    let report_path = temp.path().join("report.json");
+    run_cli(
+        &config_path,
+        &cwd,
+        vec![
+            "evaluate".to_owned(),
+            definition_path.display().to_string(),
+            "--workspace".to_owned(),
+            format!("stamp={workspace_arg}"),
+            "--output".to_owned(),
+            report_path.display().to_string(),
+        ],
+        None,
+    )
+    .await;
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["profile_hash"], hash, "{report}");
+    load_report(&report_path).unwrap();
+    task.abort();
+}
+
 #[tokio::test]
 async fn the_candidate_dump_variable_makes_the_command_line_append_a_line_and_print_the_same_response()
  {

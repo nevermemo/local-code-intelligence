@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use local_code_intelligence::{
-    app::{App, CANDIDATE_DUMP_ENV},
+    app::{App, CANDIDATE_DUMP_ENV, stamp},
     config::{
         Config,
         layers::{self, Flags, LocalState, Provenance, ResolveSpec, Resolved, Source},
@@ -594,7 +594,8 @@ async fn run_recipe(
         root: &root,
         flow_judge: config.recipes.flow_judge,
     };
-    let answer = recipes::run(&ctx, &request).await?;
+    let mut answer = recipes::run(&ctx, &request).await?;
+    stamp(&mut answer, &config.run_profile().hash);
     println!("{}", serde_json::to_string_pretty(&answer)?);
     Ok(())
 }
@@ -756,7 +757,9 @@ async fn run_traverse(
     if let Some(trace) = &report.trace {
         eprintln!("trace {}", trace.display());
     }
-    println!("{}", serde_json::to_string_pretty(&report.response)?);
+    let mut response = report.response;
+    stamp(&mut response, &config.run_profile().hash);
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -1409,6 +1412,11 @@ async fn run() -> Result<()> {
             return Err(ShutdownSignalError(shutdown_rx.await?).into());
         }
     };
+    // Every result of the application commands (search, index, status,
+    // list-files, navigation, evaluate) carries the profile hash, as it does
+    // over MCP and REST.
+    let mut output = output;
+    stamp(&mut output, app.profile_hash());
     let json = serde_json::to_string_pretty(&output)?;
     if let Some(path) = output_path {
         std::fs::write(&path, format!("{json}\n"))?;
