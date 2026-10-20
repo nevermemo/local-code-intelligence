@@ -189,7 +189,7 @@ impl SeedSearch for AppSeeds<'_> {
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
         let report = self
             .app
-            .search_in_profile(
+            .search_in_profile_unverified(
                 self.workspace,
                 question,
                 Some(k),

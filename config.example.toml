@@ -559,7 +559,14 @@ sessions = "per_call"
 # index's lag (what they read is current; where they put it is the index's).
 # Every card gets file_changed: true, false, or null when no reference applies (a
 # commit, a file that is not a source file); true also covers a file that was
-# newer than the index file when its stamp was first seen (no baseline hash). Costs no second read of the tree.
+# newer than the index file when its stamp was first seen (no baseline hash).
+# A search report (JSON) gets a `freshness` block: the snapshot's lag, the lag of
+# the vector and lexical channels that ran, and file_changed per hit; lsp.symbols
+# is reported as a session answer that is not compared. It is read after the
+# search, so a snapshot refresh in between is not seen. This needs no other key
+# and costs one read of the tree's source files per search a caller asks for
+# (timings.verify_ms); a traversal's seed searches and the evaluation runner do
+# not pay it.
 # Part of the run-profile hash.
 [run_profile.freshness]
 verify_on_read = false

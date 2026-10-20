@@ -19,7 +19,7 @@ pub use navigation::{NavigationReport, ReleaseReport};
 pub use readiness::{ReadinessComponent, ReadinessDegraded, ServiceStatus};
 pub use search::{
     CANDIDATE_DUMP_ENV, CandidateTrace, RerankOutcome, SearchIndexLifecycle, SearchOptions,
-    SearchReport, Timings,
+    SearchReport, Timings, verify_scans_on_this_thread,
 };
 
 use crate::{config::Config, lsp, models::Models, store::Store};

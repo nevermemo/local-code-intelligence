@@ -26,7 +26,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 
 | Module | Crate | Role |
 | --- | --- | --- |
-| `app` | root | `App` is the public facade: coordinates indexing, retrieval, navigation, watching and readiness. Children: `indexing`, `search`, `navigation`, `readiness`, `compact`, `traverse`, `recipes` (see `src/app/AGENTS.md`) |
+| `app` | root | `App` is the public facade: coordinates indexing, retrieval, navigation, watching and readiness. Children: `indexing`, `search` (its report's `freshness` block under `verify_on_read`), `navigation`, `readiness`, `compact`, `traverse`, `recipes` (see `src/app/AGENTS.md`) |
 | `chunk`, `language` | core | `chunk` scans supported files into chunks (Tree-sitter for code, a heading splitter for Markdown); `language` is the registry of language adapters and their cache versions |
 | `store` | root | Embedded LanceDB persistence; the only LanceDB and Arrow code |
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
@@ -224,6 +224,7 @@ then labelled with it (`Observer` does not wrap them; the label is filled at rep
 `observed: live` with `places: "index"` and the SCIP lag (their places are the index's), and `response::add_file_changed` gives
 every card `file_changed` from the baseline of its maps (the SCIP baseline for the maps built from the index and the placed
 maps and the symbol cards, the manifest for the snapshot maps and the chunk cards; `null` where none applies). Key off: none of this, and no change to any answer.
+`search::App::verify_on_read` does the same for a search report the caller asked for: `SearchReport.freshness` (`snapshot`, `channels` for the channels that ran, `hits` with `file_changed` per result) from the manifest of the snapshot the search ran on and one scan of the tree (the manifest as its cache), read after the search (a refresh in between is not seen) and timed in `timings.verify_ms`. The searches inside the crate that discard the block (`AppSeeds::search`, the evaluation runner) call the `_unverified` entry points, so a traversal reads the tree once.
 
 ## MCP, REST and CLI surfaces
 

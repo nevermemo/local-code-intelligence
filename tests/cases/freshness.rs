@@ -47,7 +47,10 @@
 //! edit is not in it (correct by definition), and a commit is.
 use super::*;
 use local_code_intelligence::{
-    app::traverse::{self, AppSeeds, BudgetArgs, Call, Dirs, SteerArgs},
+    app::{
+        traverse::{self, AppSeeds, BudgetArgs, Call, Dirs, SteerArgs},
+        verify_scans_on_this_thread,
+    },
     config::IndexFreshness,
 };
 use std::{
@@ -1024,6 +1027,26 @@ fn map_entry<'a>(answer: &'a Value, map: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no maps[] entry for {map} in {answer}"))
 }
 
+/// The `freshness.channels` entry of `channel` in a search report.
+fn channel_entry<'a>(search: &'a Value, channel: &str) -> &'a Value {
+    search["freshness"]["channels"]
+        .as_array()
+        .and_then(|channels| channels.iter().find(|entry| entry["id"] == channel))
+        .unwrap_or_else(|| panic!("no channel {channel} in {}", search["freshness"]))
+}
+
+/// No hit of the search report says its file changed (the snapshot was
+/// refreshed by the search): `false`, or `null` for a hit the snapshot did not
+/// place.
+fn assert_hits_unchanged(search: &Value) {
+    let hits = search["freshness"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), search["results"].as_array().unwrap().len());
+    assert!(!hits.is_empty());
+    for hit in hits {
+        assert_ne!(hit["file_changed"], true, "{hit}");
+    }
+}
+
 /// The cards of a list whose `site.path` is `path`.
 fn cards_at<'a>(cards: &'a Value, path: &str) -> Vec<&'a Value> {
     cards
@@ -1151,10 +1174,6 @@ const EXPECTED_GAPS: &[(Case, &str, Why)] = &[
     // The language-server session walked the tree before the edit and is told
     // nothing after it, and its answer is not compared with the tree.
     (Case::OnSearch, "lsp.symbols", Why::OldSession),
-    // Under `manual` the snapshot is old too; the channels of the search
-    // report are not labelled yet.
-    (Case::Manual, "vec.chunk.code", Why::OldSnapshot),
-    (Case::Manual, "lexical", Why::OldSnapshot),
     (Case::Manual, "lsp.symbols", Why::OldSession),
     // After the SCIP file was rewritten only the session is behind.
     (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
@@ -1168,6 +1187,9 @@ const VERIFIED_ON_READ: &[(Case, &str, Why)] = &[
     (Case::Manual, "seeds.hybrid", Why::OldSnapshot),
     (Case::Manual, "search.lexical", Why::OldSnapshot),
     (Case::Manual, "search.vector", Why::OldSnapshot),
+    // The channels of the search report say it too (`freshness.channels`).
+    (Case::Manual, "vec.chunk.code", Why::OldSnapshot),
+    (Case::Manual, "lexical", Why::OldSnapshot),
     // One blank line moved: the two live maps ask or attribute at the index's
     // places; their label carries the index's lag.
     (Case::LineShift, "grep.live", Why::LostEdge),
@@ -1469,6 +1491,16 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
             assert_eq!(entry["stale"], false, "{entry}");
             assert_eq!(entry["lag"], 0, "{entry}");
         }
+        // The search report says the same of its channels and its snapshot.
+        let freshness = &now.search["freshness"];
+        assert_eq!(freshness["snapshot"], json!({"stale": false, "lag": 0}));
+        for map in ["vec.chunk.code", "lexical"] {
+            let entry = channel_entry(&now.search, map);
+            assert_eq!(entry["observed"], "snapshot", "{entry}");
+            assert_eq!(entry["stale"], false, "{entry}");
+            assert_eq!(entry["lag"], 0, "{entry}");
+        }
+        assert_hits_unchanged(&now.search);
         // The SCIP-built maps' cards cite files that changed.
         assert_file_changed(
             &now.walk,
@@ -1551,6 +1583,95 @@ async fn manual_mode_index_maps_answer_the_old_snapshot_and_the_search_report_sa
         &["src/Calculator.cs", "src/CallSite.cs", "src/shapes.rs"],
         false,
     );
+    // The search report: the snapshot is the three files behind, as its
+    // channels are; a hit in an edited file says so, and the session's answer
+    // is not compared.
+    let freshness = &now.search["freshness"];
+    assert_eq!(
+        freshness["snapshot"],
+        json!({"stale": true, "lag": behind}),
+        "{freshness}"
+    );
+    for map in ["vec.chunk.code", "lexical"] {
+        let entry = channel_entry(&now.search, map);
+        assert_eq!(entry["observed"], "snapshot", "{entry}");
+        assert_eq!(entry["stale"], true, "{entry}");
+        assert_eq!(entry["lag"], behind, "{entry}");
+    }
+    let session = channel_entry(&now.search, "lsp.symbols");
+    assert_eq!(session["observed"], "session", "{session}");
+    assert!(
+        session["stale"].is_null() && session["lag"].is_null(),
+        "{session}"
+    );
+    assert!(session["note"].as_str().unwrap().contains("not compared"));
+    let hits = freshness["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), now.search["results"].as_array().unwrap().len());
+    let in_calculator: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit["path"] == "src/Calculator.cs")
+        .collect();
+    assert!(!in_calculator.is_empty(), "{freshness}");
+    assert!(in_calculator.iter().all(|hit| hit["file_changed"] == true));
+    world.finish().await;
+}
+
+/// The walk reads the tree once, for its own labels. The search that finds its
+/// start nodes discards the `freshness` block, so it must not scan the tree
+/// again; a search of its own (the control) does.
+#[tokio::test]
+async fn the_search_that_seeds_a_walk_does_not_scan_the_tree_again() {
+    // The counter counts on the thread that polls the search: on another
+    // runtime flavour (or a spawned seed map) this test would pass without
+    // checking anything.
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
+    let world = World::start(IndexFreshness::OnSearch).await;
+    let seed_search = AppSeeds {
+        app: &world.app,
+        workspace: &world.workspace,
+        profile: None,
+    };
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let maps = ["seeds.hybrid".to_owned()];
+    let call = Call {
+        scip_index: &world.scip,
+        scip_root: Some(&world.workspace),
+        question: "`Combine`",
+        seeds: &[],
+        seed_search: Some(&seed_search),
+        top_k: 40,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: Some(&world.walk_config),
+        lsp_sessions: None,
+    };
+    let before = verify_scans_on_this_thread();
+    let report = world.run(&call).await;
+    assert!(
+        report.response["seeds"]
+            .as_array()
+            .is_some_and(|seeds| !seeds.is_empty()),
+        "the seed search found nothing: {}",
+        report.response
+    );
+    assert_eq!(
+        verify_scans_on_this_thread(),
+        before,
+        "the seed search scanned the tree"
+    );
+    // The control: a search of its own does scan, and says so in its timings.
+    let search = world
+        .app
+        .search(&world.workspace, "Combine", Some(5))
+        .await
+        .unwrap();
+    assert_eq!(verify_scans_on_this_thread(), before + 1);
+    assert!(search.timings.verify_ms > 0.0);
     world.finish().await;
 }
 
@@ -1772,6 +1893,7 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     let truth = world.truth();
     let now = world.observe().await;
     assert!(now.walk.get("maps").is_none(), "no maps[] with the key off");
+    assert!(now.search.get("freshness").is_none(), "no freshness block");
     let verdicts = world.verdicts(&before, &now, &truth);
     let shown = table(Case::OnSearch, &verdicts);
     eprintln!("key off\n{shown}");
@@ -1856,6 +1978,18 @@ async fn with_verify_on_read_off_the_snapshot_maps_and_the_shifted_live_maps_are
         assert!(!labelled, "{map} has no label with the key off");
     }
     live_as_before(&now.walk);
+    // The search report has no freshness block, and its channels are gaps.
+    assert!(now.search.get("freshness").is_none(), "{}", now.search);
+    for map in ["vec.chunk.code", "lexical"] {
+        assert_eq!(
+            verdicts[map],
+            Verdict::Gap {
+                why: Why::OldSnapshot,
+                lag: 1
+            },
+            "{map}"
+        );
+    }
     world.finish().await;
 
     let mut world = World::start_with(IndexFreshness::OnSearch, true, false).await;
@@ -1912,6 +2046,16 @@ fn the_gap_list_is_exact_in_both_directions() {
         );
     }
     assert_eq!(gaps, EXPECTED_GAPS);
+    // What is left of the gaps with both keys on: the language-server session
+    // answers its own view of the tree, which nothing compares yet.
+    assert_eq!(
+        EXPECTED_GAPS,
+        [
+            (Case::OnSearch, "lsp.symbols", Why::OldSession),
+            (Case::Manual, "lsp.symbols", Why::OldSession),
+            (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
+        ]
+    );
     let (gaps, labelled) = expected(true, false);
     for entry in VERIFIED_ON_READ {
         assert!(
