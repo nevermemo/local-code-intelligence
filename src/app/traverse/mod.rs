@@ -942,7 +942,10 @@ pub async fn run_with_trait_seeds(
         match backend {
             Ok(backend) => {
                 let places = Arc::new(ScipPlaces::from_scip(&loaded.scip));
-                let map = Arc::new(LspLive::new(Box::new(backend), places));
+                let map = Arc::new(
+                    LspLive::new(Box::new(backend), places)
+                        .implementations(profile.lsp.implementations),
+                );
                 register(
                     &mut registry,
                     &mut plan_maps,

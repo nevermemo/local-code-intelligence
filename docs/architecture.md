@@ -132,7 +132,11 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   jdtls, clangd: the hook resends the disk text and the server takes it): `Manager::document_symbols` keys each
   non-empty answer by (provider, workspace id, path),
   `lsp::content_hash` of the file (`workspace::hash`, as the manifest) and the id of the server session that gave it,
-  at most `MAX_CACHED_OUTLINES` (4096) entries.
+  at most `MAX_CACHED_OUTLINES` (4096) entries. With `[run_profile.lsp] implementations = true`
+  (default `false`) the map also asks `Manager::implementation` (`textDocument/implementation`) at each symbol node
+  and offers `Implements` edges from an interface or trait member to its implementing members (the direction of
+  `scip.implements`); it is the third request of a node, behind the same `max_external_calls` gate, and a failure of
+  it is recorded without dropping the edges of the first two.
 - **Model clients** (`lci-core` `models`): `embed` POSTs to `<embedding_url>/embeddings` and validates count, index,
   finiteness, non-zero vectors and one dimension; indexing retries up to 3 attempts (`MAX_ATTEMPTS`) with doubling
   backoff, `query` makes one attempt. Any refused connection trips a breaker for 30 s (`EMBEDDER_DOWN_WINDOW`): `query` and `embed_once` then skip at once

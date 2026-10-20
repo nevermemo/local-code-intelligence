@@ -1048,6 +1048,33 @@ impl Manager {
         locations_for(value, workspace, adapter.provider())
     }
 
+    /// `textDocument/implementation` at a position: where the member (or
+    /// type) named there is implemented. Same contract as [`Self::definition`].
+    pub async fn implementation(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        let uri = reqwest::Url::from_file_path(file)
+            .map_err(|_| anyhow!("cannot convert file path to URI"))?
+            .to_string();
+        let value = self
+            .position_request(
+                adapter,
+                workspace,
+                file,
+                relative,
+                "textDocument/implementation",
+                json!({"textDocument":{"uri":uri}, "position":{"line":line,"character":character}}),
+            )
+            .await?;
+        locations_for(value, workspace, adapter.provider())
+    }
+
     // One more parameter than `definition` (`include_declaration`), which is
     // enough to cross clippy's default threshold; a parameter struct would
     // add indirection for one caller (`app.rs`) without real benefit here.

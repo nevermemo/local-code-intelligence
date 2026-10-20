@@ -17,6 +17,15 @@
 //!   it, declaration left out, kind [`EdgeKind::CallsOrRefs`], **direction
 //!   reversed** as in `scip.impact` (the destination refers to the source).
 //!   The site is the first reference inside the destination.
+//! * with `[run_profile.lsp] implementations = true` (default off), a third
+//!   request for a symbol: the places `textDocument/implementation` gives for
+//!   the symbol's name, kind [`EdgeKind::Implements`], direction as in
+//!   `scip.implements` (from the interface or trait member to the members that
+//!   implement it), one edge per destination, the symbol itself left out. It is
+//!   asked only at a node with a place, which until types and traits have one
+//!   means a function or method: an interface member, not the interface. A
+//!   server that cannot answer it costs the edges of the other two requests
+//!   nothing (the error is kept in [`LspLive::last_error`]).
 //! * file (or chunk, standing for its file) -> the symbols
 //!   `textDocument/documentSymbol` lists whose name the index also defines,
 //!   kind [`EdgeKind::Contains`]. Members the index has no node for (fields,
@@ -126,6 +135,9 @@ pub trait LspBackend: Send + Sync {
     async fn definition(&self, at: &Place) -> Result<Vec<Place>, String>;
     /// Where the symbol named at `at` is referred to (declaration left out).
     async fn references(&self, at: &Place) -> Result<Vec<Place>, String>;
+    /// Where the member named at `at` is implemented (`textDocument/
+    /// implementation`).
+    async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String>;
     /// The symbols the server lists for `path`.
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String>;
 }
@@ -305,6 +317,16 @@ impl LspBackend for ManagerBackend {
             .map_err(|error| format!("{error:#}"))
     }
 
+    async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String> {
+        let adapter = self.adapter_for(&at.path)?;
+        let file = self.workspace.path.join(&at.path);
+        self.manager
+            .implementation(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+            .await
+            .map(places)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
         let adapter = self.adapter_for(path)?;
         let file = self.workspace.path.join(path);
@@ -333,6 +355,9 @@ pub struct LspLive {
     places: Arc<dyn SymbolPlaces>,
     log: CostLog,
     last_error: Mutex<Option<String>>,
+    /// Whether a symbol node also asks `textDocument/implementation`
+    /// (`[run_profile.lsp] implementations`).
+    implementations: bool,
 }
 
 /// What a call found, or why it stopped.
@@ -359,7 +384,17 @@ impl LspLive {
             places,
             log: CostLog::default(),
             last_error: Mutex::new(None),
+            implementations: false,
         }
+    }
+
+    /// Whether a symbol node also asks the server where it is implemented
+    /// (default off): one more external call per symbol node, and
+    /// [`EdgeKind::Implements`] edges.
+    #[must_use]
+    pub fn implementations(mut self, on: bool) -> Self {
+        self.implementations = on;
+        self
     }
 
     /// The call times kept so far.
@@ -442,6 +477,35 @@ impl LspLive {
                         found
                             .edges
                             .push(Self::edge(node, EdgeKind::CallsOrRefs, dst, &place));
+                    }
+                }
+                if self.implementations && found.calls < max_calls {
+                    found.calls += 1;
+                    // An answer this request cannot give (a server without
+                    // `textDocument/implementation`, say) is recorded and
+                    // costs the edges of the requests before it nothing.
+                    match self.backend.implementation(&at).await {
+                        Ok(mut implementors) => {
+                            implementors.sort();
+                            // The first place (in place order) in each destination.
+                            let mut members: BTreeMap<NodeId, Place> = BTreeMap::new();
+                            for place in implementors {
+                                if let Some(dst) =
+                                    self.holder(&place, true).filter(|dst| dst != node)
+                                {
+                                    members.entry(dst).or_insert(place);
+                                }
+                            }
+                            for (dst, place) in members {
+                                found.edges.push(Self::edge(
+                                    node,
+                                    EdgeKind::Implements,
+                                    dst,
+                                    &place,
+                                ));
+                            }
+                        }
+                        Err(error) => self.fail(error),
                     }
                 }
             }

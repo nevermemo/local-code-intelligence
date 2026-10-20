@@ -1176,6 +1176,7 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
                 lsp: lci_core::config::LspProfile {
                     sessions: lci_core::config::LspSessions::Shared,
                     outline_cache: true,
+                    ..lci_core::config::LspProfile::default()
                 },
                 ..RunProfileConfig::default()
             },
@@ -1215,4 +1216,33 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     assert!(!on.to_string().contains("file_changed"), "{on}");
     assert!(on.get("maps").is_none(), "{on}");
     assert_eq!(trace_ranks(&keyed), trace_ranks(&plain));
+}
+
+/// `[run_profile.lsp] implementations` reaches the recipes' walk (the profile
+/// is the one they run under) and changes nothing there: the walk has no
+/// `lsp.live`, the only map that asks for implementations, so the stamped
+/// profile hash stays true for a recipe whichever way the key is set.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_implementations_on() {
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let on = Tree::new()
+        .ask_under(
+            request,
+            false,
+            &RunProfileConfig {
+                lsp: lci_core::config::LspProfile {
+                    implementations: true,
+                    ..lci_core::config::LspProfile::default()
+                },
+                ..RunProfileConfig::default()
+            },
+        )
+        .await;
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"], "{on}");
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
 }

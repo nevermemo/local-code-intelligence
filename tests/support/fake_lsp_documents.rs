@@ -498,11 +498,38 @@ impl Store {
         json!(symbols)
     }
 
-    /// The types whose supertypes name the type under the position.
+    /// At a function declaration inside a type `C`: the same-named function
+    /// declarations inside the types that are subtypes of `C`, in document
+    /// order (a real server answers an interface member the same way). At
+    /// anything else: the types whose supertypes name the type under the
+    /// position.
     fn implementation(&self, params: &Value) -> Value {
-        let Some((_, tok)) = self.identifier_at(params) else {
+        let Some((uri, tok)) = self.identifier_at(params) else {
             return json!([]);
         };
+        let member_of = self.doc(&uri).and_then(|doc| {
+            doc.parsed
+                .fns
+                .iter()
+                .find(|decl| decl.tok.line == tok.line && decl.tok.start == tok.start)
+                .and_then(|decl| decl.container.as_deref())
+        });
+        if let Some(container) = member_of {
+            let relations = self.relations();
+            let found: Vec<Value> = self
+                .decls()
+                .iter()
+                .filter(|decl| {
+                    !decl.is_type
+                        && decl.tok.name == tok.name
+                        && decl
+                            .container
+                            .is_some_and(|sub| relations.contains(&(sub, container)))
+                })
+                .map(Decl::location)
+                .collect();
+            return json!(found);
+        }
         let found: Vec<Value> = self
             .subtypes_of(&tok.name)
             .iter()
