@@ -13,6 +13,7 @@
     "runId": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$", "description": "ULID; sortable by start time" },
     "utc": { "type": "string", "format": "date-time", "description": "RFC 3339, UTC, from the system clock" },
     "hex": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
+    "nullableHex": { "type": ["string", "null"], "pattern": "^[0-9a-f]{16,64}$" },
     "label": { "enum": ["vector", "lexical", "lsp", "scip", "tags", "heuristic", "git", "config", "doc", "agent", "prior"] },
     "yield": { "enum": ["Y1", "Y2", "Y3", "Y4", "none"] },
     "cost": {
@@ -118,7 +119,7 @@
     },
     "run": {
       "type": "object",
-      "required": ["type", "schema", "run_id", "started_at", "build", "workspace_id", "snapshot", "query", "plan"],
+      "required": ["type", "schema", "run_id", "started_at", "build", "workspace_id", "snapshot", "profile", "query", "plan"],
       "properties": {
         "type": { "const": "run" },
         "schema": { "const": "lci.runrecord/0" },
@@ -139,7 +140,20 @@
         "tree_commit": { "type": "string", "description": "HEAD of the indexed tree when known" },
         "snapshot": { "$ref": "#/$defs/snapshot" },
         "endpoint": { "type": "string", "description": "/mcp, /mcp/<profile>, /v1, cli or harness" },
-        "search_profile": { "type": "string" },
+        "search_profile": { "type": "string", "description": "the name of the [search_profiles] entry the request selected" },
+        "profile": {
+          "type": "object",
+          "description": "the resolved run profile and the answer-changing inputs it leaves out; not search_profile",
+          "required": ["hash", "keys", "embedding_identity_sha256", "priors_hash", "tie_break_hash"],
+          "properties": {
+            "hash": { "$ref": "#/$defs/hex", "description": "SHA-256 of the canonical run profile" },
+            "keys": { "type": "array", "items": { "type": "string" }, "description": "the dotted name of every profile leaf, sorted; no values" },
+            "embedding_identity_sha256": { "$ref": "#/$defs/hex" },
+            "priors_hash": { "$ref": "#/$defs/nullableHex", "description": "hash of the traverse priors file text; null when unset" },
+            "tie_break_hash": { "$ref": "#/$defs/nullableHex", "description": "hash of the traverse tie-break file text; null when unset" }
+          },
+          "additionalProperties": false
+        },
         "query": {
           "type": "object",
           "required": ["text"],

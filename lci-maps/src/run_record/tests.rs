@@ -15,8 +15,19 @@ fn run_line(run_id: &str) -> Value {
         "build": { "version": "0.0.0" },
         "workspace_id": "0123456789abcdef0123456789abcdef",
         "snapshot": { "indexed_at": "1", "fingerprint": "0123456789abcdef" },
+        "profile": profile(),
         "query": { "text": "query" },
         "plan": { "maps": [], "policy": { "kind": "one-shot" } },
+    })
+}
+
+fn profile() -> Value {
+    json!({
+        "hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "keys": ["fusion.lexical_weight", "rrf_k"],
+        "embedding_identity_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "priors_hash": null,
+        "tie_break_hash": "0123456789abcdef",
     })
 }
 
@@ -49,6 +60,26 @@ fn the_checked_in_schema_loads_and_accepts_minimal_lines() {
     wrong["schema"] = json!("lci.runrecord/1");
     assert!(validate_line(&wrong).is_err());
     assert!(validate_line(&json!({ "type": "other" })).is_err());
+
+    // The profile stamp is required and closed.
+    let mut stampless = run_line(&id);
+    stampless.as_object_mut().unwrap().remove("profile");
+    assert!(
+        validate_line(&stampless).is_err(),
+        "a run line needs a profile"
+    );
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let mut line = run_line(&id);
+        edit(&mut line["profile"]);
+        assert!(validate_line(&line).is_err(), "{}", line["profile"]);
+    };
+    refused(&|profile| {
+        profile.as_object_mut().unwrap().remove("hash");
+    });
+    refused(&|profile| profile["priors_hash"] = json!("not hex"));
+    refused(&|profile| profile["tie_break_hash"] = json!(7));
+    refused(&|profile| profile["keys"] = json!([1]));
+    refused(&|profile| profile["extra"] = json!(1));
 }
 
 #[test]
@@ -88,6 +119,10 @@ fn the_writer_appends_valid_lines_and_refuses_the_rest() {
     bad["seq"] = json!(0);
     let error = writer.append(&bad).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    let mut stampless = run_line(&id);
+    stampless.as_object_mut().unwrap().remove("profile");
+    let error = writer.append(&stampless).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     writer.append(&step_line(&id, 1)).unwrap();
     assert_eq!(writer.lines(), 2);
     let lines = lines_of(writer.path());
@@ -107,6 +142,46 @@ fn run_line_like(written: &Value, id: &str) -> Value {
     let mut expected = run_line(id);
     expected["started_at"] = written["started_at"].clone();
     expected
+}
+
+#[test]
+fn profile_stamp_hashes_the_configured_files_or_is_null() {
+    let dir = tempdir();
+    let mut config = Config::default();
+    let stamp = profile_stamp(&config).unwrap();
+    let mut line = run_line(&run_id_at(SystemTime::now()));
+    line["profile"] = stamp.clone();
+    validate_line(&line).unwrap();
+    let run_profile = config.run_profile();
+    assert_eq!(stamp["hash"], run_profile.hash);
+    assert_eq!(stamp["keys"], json!(run_profile.keys));
+    assert_eq!(
+        stamp["embedding_identity_sha256"],
+        lci_core::workspace::hash(&config.embedding_identity())
+    );
+    assert!(stamp["priors_hash"].is_null() && stamp["tie_break_hash"].is_null());
+
+    let priors_text =
+        r#"{"version": 1, "priors": {"flow": {"graph.scip": {"calls_or_refs": 0.5}}}}"#;
+    let tie_break_text = r#"{"version": 1, "features": {"depth": 10.0}}"#;
+    let (priors, tie_break) = (dir.join("priors.json"), dir.join("tiebreak.json"));
+    std::fs::write(&priors, priors_text).unwrap();
+    std::fs::write(&tie_break, tie_break_text).unwrap();
+    config.traverse.priors = Some(priors.to_string_lossy().into_owned());
+    config.traverse.tie_break = Some(tie_break.to_string_lossy().into_owned());
+    let stamp = profile_stamp(&config).unwrap();
+    let hop_priors = crate::traverse::priors::HopPriors::from_text(priors_text, "flow").unwrap();
+    assert_eq!(stamp["priors_hash"], hop_priors.fingerprint().unwrap().1);
+    let fitted = crate::traverse::tiebreak::TieBreak::from_text(tie_break_text).unwrap();
+    assert_eq!(stamp["tie_break_hash"], fitted.hash());
+    assert_eq!(
+        stamp["hash"], run_profile.hash,
+        "the files are not in the profile hash"
+    );
+
+    config.traverse.tie_break = Some(dir.join("missing.json").to_string_lossy().into_owned());
+    let error = profile_stamp(&config).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
 }
 
 #[test]

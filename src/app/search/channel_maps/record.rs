@@ -74,16 +74,18 @@ impl App {
                 path,
                 query,
                 |setup| {
-                    let recorder = RunRecordWriter::create(&options.dir, &run_id)
-                        .map_err(|error| format!("{}: {error}", options.dir.display()))
-                        .and_then(|writer| {
+                    // The line is built first: a profile stamp that cannot be
+                    // made leaves no empty record file behind.
+                    let recorder = self
+                        .run_line(setup, &run_id, started_at, query, top_k, options)
+                        .and_then(|line| {
+                            let writer = RunRecordWriter::create(&options.dir, &run_id)
+                                .map_err(|error| format!("{}: {error}", options.dir.display()))?;
                             let mut recorder = Recorder {
                                 writer,
                                 secrets: secrets.clone(),
                             };
-                            recorder.write(
-                                self.run_line(setup, &run_id, started_at, query, top_k, options),
-                            )?;
+                            recorder.write(line)?;
                             Ok(recorder)
                         });
                     (recorder, Instant::now())
@@ -201,8 +203,10 @@ impl App {
         query: &str,
         top_k: usize,
         options: &RecordOptions,
-    ) -> Value {
+    ) -> Result<Value, String> {
         let config = &self.config;
+        let profile = record::profile_stamp(config)
+            .map_err(|error| format!("the run profile stamp cannot be made: {error}"))?;
         let channels = config.channels;
         let fusion = &config.fusion;
         let map = |descriptor: MapDescriptor, weight: f32, limit: Option<usize>, enabled| {
@@ -287,6 +291,7 @@ impl App {
                 "fingerprint": fingerprint,
                 "embedding_identity_sha256": crate::workspace::hash(&snapshot.identity),
             },
+            "profile": profile,
             "endpoint": "harness",
             "query": { "text": query },
             "filters": {},
@@ -299,7 +304,7 @@ impl App {
         if let Some(item) = &options.item {
             line["item"] = json!({ "set": item.set, "id": item.id });
         }
-        line
+        Ok(line)
     }
 
     /// The `step` lines and the `end` line of a finished registry run.

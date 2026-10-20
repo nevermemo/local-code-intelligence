@@ -33,7 +33,7 @@ The dump writes `workspace_path`. A RunRecord does not: it carries the workspace
 
 | `type` | Count | Content |
 | --- | --- | --- |
-| `run` | 1, first | Who and what: schema, run id, start time, build, workspace id, snapshot, query, filters, plan (maps, weights, policy, budget), evaluation item reference. |
+| `run` | 1, first | Who and what: schema, run id, start time, build, workspace id, snapshot, profile stamp, query, filters, plan (maps, weights, policy, budget), evaluation item reference. |
 | `step` | 0..n | One engine step: its yield point, the map calls with status, cost and freshness, the frontier summary after the step, steering ops applied before it, notes and warnings raised in it. |
 | `end` | 1, last | Final results, totals (engine cost, agent tokens), outcome (`completed`, `expired`, `cancelled`, `failed`), and, when the harness filled it, scores and leak-scan results. |
 
@@ -41,10 +41,24 @@ Yield points: `Y1` after fan-out, before fusion; `Y2` after fuse, filter, cap an
 expansion hop. A one-shot search records steps for all of them and never pauses. (The search read guard, `_read_guard` in `search_once`, is held for the whole
 search; a paused traversal cannot hold it across MCP calls without blocking indexing, so each step re-acquires it and checks snapshot drift.)
 
+The `run` line's required `profile` object stamps the configuration the run answered under (`run_record::profile_stamp`, from `Config`):
+
+| Field | Value |
+| --- | --- |
+| `hash` | `Config::run_profile().hash`: SHA-256 of the canonical result-affecting configuration. |
+| `keys` | `Config::run_profile().keys`: the dotted name of every profile leaf, sorted; names only, no values. |
+| `embedding_identity_sha256` | SHA-256 of `Config::embedding_identity()`; never null. |
+| `priors_hash`, `tie_break_hash` | The first 16 hex digits of SHA-256 of the text of the file at `[traverse] priors` / `tie_break` (the hash `HopPriors` and `TieBreak` keep); `null` when the key is unset. A configured file that cannot be read makes the stamp, and so the record, fail (fail-open: a warning, the run's answer unchanged). |
+
+The two file hashes and the embedding identity are outside `hash` (`excluded_keys()` in `lci-core/src/config/profile.rs` leaves them out of the hash); the stamp carries them so a record names every
+answer-changing input. `profile` (this object) is not `search_profile` (a string: the name of the `[search_profiles]` entry a request selected, absent on the
+registry path).
+
 ### 3.2 Privacy rules (enforced by the writer, checked by a test)
 
 - No absolute paths: workspace id only; NodeIds carry repository-relative paths.
 - No service URLs: embedding and reranker identities are recorded as SHA-256 hex.
+- The profile stamp's `keys` are configuration key names, never values; the stamp holds hashes only (no file path, no URL).
 - Code text only as `snippet` (the existing bounded snippet: cut at 400 bytes plus a 3-byte ellipsis, `src/store.rs`), and only when `capture.snippets` is true.
 - Redaction: before a line is written, the workspace path and the data directory (as given when absolute, and resolved; trailing separators dropped; each also with
   `/` separators, as a `file://` URI and with spaces as `%20`, and on Windows lower-cased and with the drive colon as `%3A`), the embedding and reranker URLs and
@@ -63,7 +77,8 @@ rejects. Beyond the S0 draft (which was too loose to catch a wrong line): `addit
 map call, request, freshness, hit, evidence, frontier row, cost, snapshot, totals, capture, item, budget, policy, drift, evaluation), so a misspelt field is an
 error; a `runId` definition (ULID pattern) used by `run_id` and `parent_run_id` on every line; `mapHit` and `evidence` definitions, with `edge` required on evidence;
 `plan.maps[]` carries `contribution`, `limit`, `enabled` and `labels` (the labels the map's card lists, contract C5) and `plan` carries `top_k`; `end` carries
-`warnings` and `notes` (every map's, in fusion order); `minimum` on counts, ranks, lines and times.
+`warnings` and `notes` (every map's, in fusion order); `minimum` on counts, ranks, lines and times. The `run` line requires `profile` (3.1); a `nullableHex`
+definition (`hex` or `null`) types its two file hashes. A `run` line without `profile` is refused by the reader and the writer alike (d399).
 
 The checker is hand-written (`lci-maps/src/run_record/schema.rs`; no JSON Schema validator is in `Cargo.lock`; R-9, merge condition M7: the merge's `Cargo.lock` diff
 adds `lci-maps` and no schema-validation crate). It implements `$ref`, `oneOf`, `type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`,
@@ -123,6 +138,7 @@ happen need the S5 engine.
 | Crash safety | Kill a run after step 2: the file holds a valid `run` line and two valid `step` lines; the harness reports `outcome` missing, not a parse error. Built by killing a real writer process (the test binary re-run as a child that writes three lines and waits), since a map panic is caught by the registry and never stops a run. |
 | Privacy | A writer test asserts that no string field contains the workspace's absolute path, the data directory, or the configured service URLs, and that snippets are absent when `capture.snippets` is false. |
 | Replay | Re-running fusion from the recorded `map_calls` hits and the plan's weights reproduces each `fuse` step's scores bit for bit. Built as `src/evaluate/run_record.rs` (5.1) beside `replay.rs`, which still replays candidate dumps over the three legacy channels. |
+| Profile stamp | `run.profile.hash` equals `Config::run_profile().hash` of the recording app's config, `keys` equal and sorted, `embedding_identity_sha256` equals the snapshot's; both file hashes are `null` when unset and equal the `HopPriors` / `TieBreak` hashes of the files when set; an unreadable configured file is an error; a `run` line without `profile` is refused by writer and reader. |
 | Fail-open writer | Point the writer at an unwritable path: the search succeeds, a log warning is emitted, nothing else changes. |
 
 ### 5.1 Offline harness (built)

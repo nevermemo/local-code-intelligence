@@ -159,6 +159,13 @@ fn record_text(run: &Run, view: &SnapshotView<'_>, rows: usize) -> String {
             "build": { "version": "test" },
             "workspace_id": "0123456789abcdef",
             "snapshot": { "indexed_at": "1", "fingerprint": "0123456789abcdef" },
+            "profile": {
+                "hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "keys": ["rrf_k"],
+                "embedding_identity_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "priors_hash": null,
+                "tie_break_hash": null,
+            },
             "query": { "text": "query" },
             "plan": { "maps": maps, "rrf_k": record::number(RRF_K), "policy": { "kind": "one-shot" } },
             "capture": { "snippets": false },
@@ -187,6 +194,20 @@ fn edit(raw: &str, line: usize, change: impl FnOnce(&mut Value)) -> String {
     change(&mut value);
     lines[line] = value.to_string();
     lines.iter().map(|text| format!("{text}\n")).collect()
+}
+
+#[tokio::test]
+async fn a_run_line_without_a_profile_stamp_is_refused() {
+    let chunks = universe();
+    let view = SnapshotView::new(SnapshotRef::default(), chunks.iter().collect());
+    let run = registry_run(&view).await;
+    let raw = record_text(&run, &view, 50);
+    RunRecordFile::parse(&raw).unwrap();
+    let stampless = edit(&raw, 0, |run_line| {
+        run_line.as_object_mut().unwrap().remove("profile");
+    });
+    let error = RunRecordFile::parse(&stampless).unwrap_err();
+    assert!(error.to_string().contains("line 1"), "{error}");
 }
 
 #[tokio::test]

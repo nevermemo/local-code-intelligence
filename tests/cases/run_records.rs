@@ -141,6 +141,24 @@ async fn a_registry_run_writes_a_schema_valid_run_record() {
     assert_eq!(results.len(), pool.min(4));
     assert_eq!(lines[4]["outcome"], "completed");
     assert_eq!(lines[4]["totals"]["steps"], 3);
+
+    // The profile stamp is the resolved run profile of the app's config.
+    let profile = &lines[0]["profile"];
+    let resolved = app.config.run_profile();
+    assert_eq!(profile["hash"], resolved.hash);
+    let keys: Vec<&str> = profile["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    assert_eq!(keys, resolved.keys);
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+    assert_eq!(
+        profile["embedding_identity_sha256"],
+        lines[0]["snapshot"]["embedding_identity_sha256"]
+    );
+    assert!(profile["priors_hash"].is_null() && profile["tie_break_hash"].is_null());
     task.abort();
 }
 
@@ -257,6 +275,32 @@ async fn an_unwritable_record_directory_never_fails_the_run() {
     assert_eq!(recorded.value.rows, plain.rows);
     assert_eq!(recorded.value.warnings, plain.warnings);
     assert_eq!(recorded.value.notes, plain.notes);
+    task.abort();
+}
+
+/// Fail-open stamp: a configured tie-break file that cannot be read makes the
+/// record an error and leaves the answer as it is; no record file is left.
+#[tokio::test]
+async fn an_unreadable_profile_input_never_fails_the_run() {
+    let (temp, app, workspace, _fake, task) = indexed_fixture("stamp", |config| {
+        config.traverse.tie_break = Some("no-such-tie-break.json".into());
+    })
+    .await;
+    let dir = temp.path().join("stamp-records");
+    let recorded = app
+        .record_through_maps(&workspace, "Calculator", &RecordOptions::new(&dir))
+        .await
+        .unwrap();
+    let error = recorded.record.expect_err("the stamp cannot be made");
+    assert!(error.contains("profile stamp"), "{error}");
+    assert!(!recorded.value.rows.is_empty());
+    let plain = app
+        .fuse_through_maps(&workspace, "Calculator")
+        .await
+        .unwrap();
+    assert_eq!(recorded.value.rows, plain.rows);
+    let written = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(written, 0, "no record file is left behind");
     task.abort();
 }
 
