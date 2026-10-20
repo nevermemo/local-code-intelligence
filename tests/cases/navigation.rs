@@ -4797,20 +4797,46 @@ async fn traverse_add(
         .response
 }
 
-/// [`traverse_add`], walked again while `lsp.live` ran out of time. However
-/// wide the budget, one expansion waits at most `lsp_live::CALL_TIMEOUT` (15 s,
-/// a product constant), and a cold fake server on a loaded machine took 21 s
-/// to answer: the walk then ends with the deadline note and no edges from the
-/// map, as the map documents. Such a walk is asked again, up to three walks in
-/// all; any other answer is returned as it is. Under `shared` the next walk
-/// finds the server still starting; under `per_call` it starts its own.
+/// [`traverse_add`] past a cold language server. However wide the budget, one
+/// expansion waits at most `lsp_live::CALL_TIMEOUT` (15 s, a product
+/// constant), and a cold fake server on a loaded machine took 21 s to answer:
+/// a walk that starts a cold server may then end with the deadline note and no
+/// edges from the map, as the map documents.
+///
+/// Under `shared` the server is started first by one `symbols` call, which
+/// returns once it answers, so the single walk that follows must reach `Run`
+/// through `lsp.live` on its own: a product bug that makes a cold-start walk
+/// miss the deadline cannot hide behind a retry. Under `per_call` every walk
+/// starts its own server and no warm-up is possible, so a walk that ran out of
+/// time is asked again, up to three walks in all; each retried walk must have
+/// failed only on the deadline, and its server must have ended with it.
 async fn traverse_add_past_a_cold_start(
     config: &Config,
     workspace: &Workspace,
     index: &std::path::Path,
+    state: &std::path::Path,
     sessions: local_code_intelligence::config::LspSessions,
     manager: &Arc<Manager>,
 ) -> Value {
+    use local_code_intelligence::config::LspSessions;
+    if sessions == LspSessions::Shared {
+        let adapter = csharp_adapter(manager);
+        manager
+            .symbols(&adapter, workspace, "Calculator")
+            .await
+            .expect("the shared server starts and answers");
+        let answer = traverse_add(config, workspace, index, sessions, manager).await;
+        assert!(
+            reached_run_through_lsp_live(&answer),
+            "the first walk over a warm shared server reached no lsp.live edge to Run: {answer}"
+        );
+        assert_eq!(
+            state_count(state, "spawn_count.txt"),
+            1,
+            "the walk reused the warmed server"
+        );
+        return answer;
+    }
     let ran_out_of_time = |answer: &Value| {
         answer["notes"].as_array().is_some_and(|notes| {
             notes.iter().any(|note| {
@@ -4819,11 +4845,40 @@ async fn traverse_add_past_a_cold_start(
             })
         })
     };
+    let mut retried_servers = Vec::new();
     let mut walks = 1;
     loop {
         let answer = traverse_add(config, workspace, index, sessions, manager).await;
         if walks == 3 || !ran_out_of_time(&answer) {
+            eprintln!("per_call: {walks} walk(s) to reach an answer");
+            for server in retried_servers {
+                wait_until_process_ends(
+                    "the server of a retried per-call walk to end",
+                    server,
+                    DROP_KILL_DEADLINE,
+                )
+                .await;
+            }
             return answer;
+        }
+        let failures: Vec<&str> = answer["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|note| note.contains("calls failed"))
+            .collect();
+        assert!(
+            failures
+                .iter()
+                .all(|note| note.contains(lci_maps::lsp_live::DEADLINE_NOTE)),
+            "walk {walks} failed on more than the deadline: {failures:?}"
+        );
+        if let Some(server) = std::fs::read_to_string(state.join("pid.txt"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            retried_servers.push(server);
         }
         walks += 1;
     }
@@ -4879,9 +4934,15 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shared_sessions_fixture(&temp);
     let manager = Arc::new(Manager::new(&config));
-    let answer =
-        traverse_add_past_a_cold_start(&config, &workspace, &index, LspSessions::Shared, &manager)
-            .await;
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     let server = server_of(&state);
     assert!(
@@ -4902,9 +4963,15 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shared_sessions_fixture(&temp);
     let manager = Arc::new(Manager::new(&config));
-    let answer =
-        traverse_add_past_a_cold_start(&config, &workspace, &index, LspSessions::PerCall, &manager)
-            .await;
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::PerCall,
+        &manager,
+    )
+    .await;
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     wait_until_process_ends(
         "the per-call server to end with its walk",

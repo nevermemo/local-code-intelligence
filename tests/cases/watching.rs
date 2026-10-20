@@ -105,7 +105,9 @@ async fn watcher_skips_a_queued_reindex_when_the_explicit_job_already_committed(
         .unwrap();
     assert_eq!(indexed.embedded_chunks, 1);
 
-    // Allow the queued pass to finish and several more polls to run.
+    // Kept on purpose: this shows that nothing more happens (the version below
+    // must not move). The queued pass may not have started yet, so `indexing`
+    // can be false already and the loop alone would pass before the pass ran.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while app.status(&workspace).await.unwrap().indexing {
