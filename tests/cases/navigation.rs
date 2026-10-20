@@ -4683,6 +4683,220 @@ async fn documents_fake_serves_manager_navigation_and_outline() {
     manager.shutdown_all().await;
 }
 
+// ---- `[run_profile.lsp] outline_cache` (K7b-2) ------------------------------
+
+const CALCULATOR_PY: &str = "class Calculator:\n    def add(self, a, b):\n        return a + b\n";
+
+/// The C# fixture plus `src/calculator.py` and two files that declare nothing
+/// (`src/Notes.cs`, `src/notes.py`), with the documents-mode fake standing in
+/// for csharp-ls (sent no document text) and for pyright (sent the file's
+/// text in a `didOpen` before every position request), each recording under
+/// its own state directory, and a manager under `outline_cache`. Returns the
+/// manager, the workspace and the state directory of each fake.
+fn outline_fixture(
+    temp: &tempfile::TempDir,
+    outline_cache: bool,
+) -> (Manager, Workspace, OutlineStates) {
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let states = OutlineStates {
+        csharp: temp.path().join("state-csharp"),
+        python: temp.path().join("state-python"),
+    };
+    std::fs::create_dir_all(&data_path).unwrap();
+    write_csharp_workspace(&workspace_path);
+    write(&workspace_path, "src/Notes.cs", "namespace Acceptance;\n");
+    write(&workspace_path, "src/calculator.py", CALCULATOR_PY);
+    write(
+        &workspace_path,
+        "src/notes.py",
+        "# nothing is declared here\n",
+    );
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let mut config = with_fake_documents_server(
+        Config {
+            data_dir: data_path,
+            rust_analyzer_path: "definitely-missing-rust-analyzer".into(),
+            ..Config::default()
+        },
+        &states.csharp,
+        &[],
+        10,
+    );
+    config.python = PythonLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: vec![
+            "--mode".to_owned(),
+            "documents".to_owned(),
+            "--state".to_owned(),
+            states.python.to_string_lossy().into_owned(),
+        ],
+        disabled: false,
+    };
+    config.run_profile.lsp.outline_cache = outline_cache;
+    (Manager::new(&config), workspace, states)
+}
+
+struct OutlineStates {
+    csharp: std::path::PathBuf,
+    python: std::path::PathBuf,
+}
+
+/// The names of `relative`'s outline as the manager answers it.
+async fn outline_names(
+    manager: &Manager,
+    adapter: &Arc<dyn LspAdapter>,
+    workspace: &Workspace,
+    relative: &str,
+) -> Vec<String> {
+    manager
+        .document_symbols(adapter, workspace, &workspace.path.join(relative), relative)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|symbol| symbol.name.unwrap_or_default())
+        .collect()
+}
+
+/// How many `textDocument/documentSymbol` requests for `relative` the fake
+/// recording under `state` received (every server process it ran, from
+/// `events.jsonl`).
+fn outline_requests(state: &std::path::Path, relative: &str) -> usize {
+    std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| {
+            event["method"] == "textDocument/documentSymbol"
+                && event["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with(&format!("/{relative}")))
+        })
+        .count()
+}
+
+/// Under `outline_cache`, for a server sent the file's text before each
+/// request (pyright's adapter), a file's outline is asked once per content
+/// hash and server session: the same bytes are answered from the cache, an
+/// edit asks again and gets the new outline, and a new session asks again for
+/// unchanged bytes. An empty outline is never kept. A server told nothing
+/// about edits (csharp-ls) is asked every time, before and after an edit.
+/// Without the key every call asks.
+#[tokio::test]
+async fn the_outline_cache_answers_by_content_hash_and_never_stores_an_empty_outline() {
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, workspace, states) = outline_fixture(&temp, true);
+    let python = python_adapter(&manager);
+    let (calculator, first) = ("src/calculator.py", ["Calculator", "add"]);
+
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        first
+    );
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        first
+    );
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        1,
+        "the same bytes"
+    );
+
+    // A method is appended: the bytes changed, so the server is asked again,
+    // and the didOpen before the request gave it the new text.
+    let edited = format!("{CALCULATOR_PY}    def twice(self, a):\n        return a + a\n");
+    write(&workspace.path, calculator, &edited);
+    let second = ["Calculator", "add", "twice"];
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        second
+    );
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        2,
+        "an edit asks again"
+    );
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        second
+    );
+    assert_eq!(outline_requests(&states.python, calculator), 2);
+
+    // A new session (after a release, started by a symbol search so it is
+    // live when the outline is looked up) does not reuse the old session's
+    // answer for the same bytes.
+    assert!(manager.release(&workspace.id).await.contains(&"pyright"));
+    let twice = manager.symbols(&python, &workspace, "twice").await.unwrap();
+    assert_eq!(twice.len(), 1, "{twice:?}");
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        second
+    );
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        3,
+        "a new session asks"
+    );
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        second
+    );
+    assert_eq!(outline_requests(&states.python, calculator), 3);
+
+    // An empty outline is never kept.
+    for _ in 0..3 {
+        assert!(
+            outline_names(&manager, &python, &workspace, "src/notes.py")
+                .await
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        outline_requests(&states.python, "src/notes.py"),
+        3,
+        "empty: asked every time"
+    );
+
+    // csharp-ls is told nothing about edits, so nothing it answers is kept:
+    // after an edit (which it does not see) every ask is a request.
+    let csharp = csharp_adapter(&manager);
+    let cs = "src/Calculator.cs";
+    let old = ["Calculator", "Add"];
+    assert_eq!(outline_names(&manager, &csharp, &workspace, cs).await, old);
+    write(
+        &workspace.path,
+        cs,
+        &format!("{CALCULATOR_CS}public static class More {{ }}\n"),
+    );
+    for _ in 0..3 {
+        assert_eq!(outline_names(&manager, &csharp, &workspace, cs).await, old);
+    }
+    assert_eq!(
+        outline_requests(&states.csharp, cs),
+        4,
+        "not synced: never kept"
+    );
+    manager.shutdown_all().await;
+
+    // Without the key every call asks.
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, workspace, states) = outline_fixture(&temp, false);
+    let python = python_adapter(&manager);
+    for _ in 0..3 {
+        assert_eq!(
+            outline_names(&manager, &python, &workspace, calculator).await,
+            first
+        );
+    }
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        3,
+        "off: asked every time"
+    );
+    manager.shutdown_all().await;
+}
+
 // ---- `lsp.live` under `[run_profile.lsp] sessions` (K7b-1) -----------------
 
 /// A SCIP index over the C# fixture of [`fake_csharp_fixture`]: `Add`
@@ -4765,7 +4979,10 @@ async fn traverse_add(
         ..TraverseConfig::default()
     };
     let profile = RunProfileConfig {
-        lsp: LspProfile { sessions },
+        lsp: LspProfile {
+            sessions,
+            ..LspProfile::default()
+        },
         ..RunProfileConfig::default()
     };
     let (budget, steer) = (

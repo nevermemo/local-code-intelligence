@@ -92,6 +92,19 @@ pub trait LspAdapter: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Whether the server holds the file's current disk text at every
+    /// position request: [`Self::before_position_request`] sends it in a
+    /// `textDocument/didOpen` (read just before the request, up to
+    /// [`MAX_DID_OPEN_BYTES`]) and the server takes that text even when the
+    /// document is already open. Only then may the manager's outline cache
+    /// (`[run_profile.lsp] outline_cache`) keep an answer under the hash of
+    /// the bytes on disk. Default `false`: a server that is told nothing
+    /// (csharp-ls), or that watches the disk itself and can lag an edit
+    /// (rust-analyzer), could give the old outline for the new bytes.
+    fn opens_documents(&self) -> bool {
+        false
+    }
 }
 
 /// The largest file a `before_position_request` hook reads and sends whole in

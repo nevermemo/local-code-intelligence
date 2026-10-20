@@ -544,9 +544,22 @@ mode = "authoritative"
 # start is paid once; a server stops when it has been idle for
 # lsp_idle_timeout_seconds, on release_workspace and at service shutdown, not
 # when a walk ends. The recipes never run lsp.live and are the same under both.
-# Part of the run-profile hash.
+# outline_cache = false (default): every file outline lsp.live needs
+# (textDocument/documentSymbol) is asked of the server. true: for the servers that
+# are sent a file's current text before every request (pyright, gopls, jdtls,
+# clangd), the language-server manager keeps each non-empty outline under the
+# content hash of the file and answers it again while the file's bytes and the
+# server session are unchanged; an edited file, or a restarted or released
+# server, is asked again, and an empty outline is never kept. rust-analyzer (it
+# watches the disk itself and can lag an edit), csharp-ls and
+# typescript-language-server (they are not resent the text) are asked every time.
+# At most 4096 outlines per manager (a new one past that clears them). Within one
+# walk under "per_call", across calls under "shared".
+# The recipes never run lsp.live and are the same under both values.
+# Both keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"
+outline_cache = false
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against

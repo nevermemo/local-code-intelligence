@@ -120,6 +120,12 @@ impl LspAdapter for GoServer {
             .await
     }
 
+    // The hook sends the current disk text on every request, and
+    // gopls overwrites an open file's overlay on a repeated didOpen.
+    fn opens_documents(&self) -> bool {
+        true
+    }
+
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,

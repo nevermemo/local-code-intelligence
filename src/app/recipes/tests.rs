@@ -1159,9 +1159,10 @@ async fn flow_from_walks_under_the_run_profile() {
     }
 }
 
-/// `[run_profile.lsp] sessions` reaches the recipes' walk (the profile is the
-/// one they run under) and changes nothing there: the walk has no `lsp.live`,
-/// so no language server starts under either value.
+/// `[run_profile.lsp] sessions` and `outline_cache` reach the recipes' walk
+/// (the profile is the one they run under) and change nothing there: the walk
+/// has no `lsp.live`, so no language server starts and no outline is asked
+/// under any value.
 #[tokio::test]
 async fn flow_from_runs_the_same_under_both_session_settings() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
@@ -1174,6 +1175,7 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
             &RunProfileConfig {
                 lsp: lci_core::config::LspProfile {
                     sessions: lci_core::config::LspSessions::Shared,
+                    outline_cache: true,
                 },
                 ..RunProfileConfig::default()
             },

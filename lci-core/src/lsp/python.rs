@@ -122,6 +122,13 @@ impl LspAdapter for PythonServer {
             .await
     }
 
+    // The hook sends the current disk text on every request, and
+    // pyright replaces an open document's text on a repeated didOpen
+    // (it logs the redundant open and applies the new text).
+    fn opens_documents(&self) -> bool {
+        true
+    }
+
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
