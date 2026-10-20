@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K7a (fake LSP documents mode), K2a-2 (per-map freshness key), K23a (claim groups); K2a-1 after K7a; K20a after K23a; K7b after K7a, K2a-1 and K23a. Rewrite this line at every push.
+In flight: K23a (claim groups), K2a-2 (per-map freshness key), K2a-1 (freshness harness, on the K7a fake); K20a after K23a; K7b after K2a-1 and K23a. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |
 | K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
 | K23a | Evidence groups by claim (`walk.groups = tool or claim`): one call seen by LSP, SCIP and syntax counts once; grep corroboration gets its own discount key | Mechanism: no double count | S | - |

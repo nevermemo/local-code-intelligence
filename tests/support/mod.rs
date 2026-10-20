@@ -472,6 +472,30 @@ fn with_fake_csharp_server(
     config
 }
 
+/// [`with_fake_csharp_server`] in `documents` mode: the fake answers from the
+/// text it was sent (a start-up walk of the workspace root, then the document
+/// notifications) instead of canned ranges, and records `events.jsonl` and
+/// `documents.json` under `state_dir` (see `fake_lsp_documents.rs`).
+fn with_fake_documents_server(
+    mut config: Config,
+    state_dir: &Path,
+    extra_args: &[&str],
+    timeout_seconds: u64,
+) -> Config {
+    config.lsp_timeout_seconds = timeout_seconds;
+    config.csharp = local_code_intelligence::config::CSharpLspConfig {
+        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+        args: ["--mode", "documents", "--state"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain([state_dir.to_string_lossy().into_owned()])
+            .chain(extra_args.iter().map(|arg| (*arg).to_owned()))
+            .collect(),
+        disabled: false,
+    };
+    config
+}
+
 /// Removes every `LCI_*` variable the test process has from the environment
 /// `command` will spawn with, so what a developer's own shell exports
 /// (`LCI_CONFIG`, `LCI_PORT`, `LCI_DATA_DIR`, `LCI_CANDIDATE_DUMP`, any
