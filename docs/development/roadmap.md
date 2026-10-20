@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K0a (no-service path). Rewrite this line at every push.
+In flight: K0a (no-service path; part 1 landed, d402; next the repair trigger with an embedder breaker). Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K0a | No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
+| K0a | Partly done: a fresh workspace indexes without vectors when the embedding service is unavailable (d402); the repair on search when the service returns, the `search.vector` fail-open in traverse and the docs remain. No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
 | K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |
 | K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |

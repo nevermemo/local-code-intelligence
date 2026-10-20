@@ -31,6 +31,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// The search warning on a snapshot committed without vectors.
+const VECTORLESS_WARNING: &str = "Semantic retrieval unavailable: the index has no vectors (the embedding service was unreachable when it was built)";
+
 #[derive(Debug, Default, Serialize)]
 pub struct Timings {
     pub query_embedding_ms: f64,
@@ -871,7 +874,21 @@ impl App {
         // `[channels]` switches, as a search profile may override them. A
         // deliberately disabled channel is skipped outright: no work, a zero
         // timing, and no "unavailable" warning.
-        let channels = settings.channels;
+        let mut channels = settings.channels;
+        // A vectorless snapshot (built while the embedding service was
+        // unreachable) holds placeholders: the query is not embedded and the
+        // vector lane does not run, as with the semantic channel off, but the
+        // search says why. Lexical and LSP run as usual.
+        if channels.semantic && snapshot.vectors_missing {
+            channels.semantic = false;
+            let message = VECTORLESS_WARNING.to_owned();
+            report.warning = Some(
+                report
+                    .warning
+                    .take()
+                    .map_or(message.clone(), |w| format!("{w}; {message}")),
+            );
+        }
         let applicable_adapters = if channels.lsp {
             self.applicable_lsp_adapters(&all_chunks)
         } else {

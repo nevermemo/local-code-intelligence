@@ -190,6 +190,22 @@ fn is_connection_dropped(error: &reqwest::Error) -> bool {
         })
 }
 
+/// Whether `error` says the service was not available rather than that the
+/// request or the service's answer was wrong: it could not be reached
+/// ([`is_connect_error`]), the request timed out, the connection was closed or
+/// reset under it ([`is_connection_dropped`]), or it answered with an HTTP 5xx
+/// status. An HTTP 4xx, a malformed or mismatched response and a bad vector
+/// are not availability errors.
+pub fn is_service_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_connect() || error.is_timeout() || is_connection_dropped(error)
+        }) || cause
+            .downcast_ref::<HttpStatusError>()
+            .is_some_and(|error| error.status >= 500)
+    })
+}
+
 /// A model service answered with a non-success HTTP status. Carries the
 /// status and the (bounded, credential-redacted) response body, which is usually
 /// the only place the service says *why* -- e.g. vLLM's "maximum context length
