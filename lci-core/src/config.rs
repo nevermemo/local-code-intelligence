@@ -1335,10 +1335,13 @@ impl GoLspConfig {
 pub struct JavaLspConfig {
     /// Path to the jdtls installation directory. `None` (the default) keeps
     /// Java navigation disabled. An empty or whitespace-only value is
-    /// rejected by validation rather than silently counting as enabled.
+    /// rejected by validation rather than silently counting as enabled. A
+    /// relative path is resolved against the process's working directory.
     pub path: Option<String>,
-    /// Additional JVM/jdtls arguments, appended after the `-data <dir>`
-    /// flag this application always supplies.
+    /// Additional JVM/jdtls arguments. JVM options (`-X...`, `-D...`,
+    /// `-javaagent:`, `--add-*` and the other JVM flags) go before `-jar`;
+    /// every other argument goes after the `-data <dir>` flag this
+    /// application always supplies.
     pub args: Vec<String>,
     /// Explicitly disable the Java server even when a path is configured.
     pub disabled: bool,

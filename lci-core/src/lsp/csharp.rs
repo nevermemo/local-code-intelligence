@@ -214,7 +214,10 @@ const SKIP_DIRS: &[&str] = &[
 /// 4. If no solution or project is found, the root itself is returned.
 ///
 /// The scan is bounded: hidden directories and well-known build/dependency
-/// directories are skipped.
+/// directories are skipped, and a symbolic link (or Windows junction) to a
+/// directory is never followed. A link can point outside the workspace, where
+/// the entry point would not be the workspace's, and a link back up the tree
+/// would make the walk loop until the path is too long to open.
 pub fn discover_project(root: &Path) -> CSharpProject {
     let mut best_solution: Option<(usize, PathBuf)> = None;
     let mut best_project: Option<(usize, PathBuf)> = None;
@@ -260,8 +263,10 @@ fn walk(
             continue;
         };
         let path = entry.path();
-        if path.is_dir() {
-            if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+        // `DirEntry::file_type` does not follow links, unlike `Path::is_dir`.
+        let is_real_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_real_dir || path.is_dir() {
+            if !is_real_dir || name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
             walk(&path, depth + 1, best_solution, best_project);
@@ -294,6 +299,33 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// A directory symbolic link; an error where it cannot be made (Windows
+    /// needs developer mode or an elevated shell for it).
+    fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(windows)]
+        return std::os::windows::fs::symlink_dir(target, link);
+        #[cfg(not(windows))]
+        {
+            let _ = (target, link);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// A directory junction, which needs no privilege (`mklink /J`).
+    #[cfg(windows)]
+    fn junction_dir(target: &Path, link: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {link:?} {target:?}");
     }
 
     #[test]
@@ -405,6 +437,42 @@ mod tests {
             let project = discover_project(root);
             assert_eq!(project.kind, ProjectKind::Project);
             assert_eq!(project.path, root.join("a.csproj"));
+        }
+
+        // a linked directory is not followed, out of the workspace or back into it
+        {
+            let outside = tempfile::tempdir().unwrap();
+            write(&outside.path().join("Outside.sln"), "");
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(&root.join("sub").join("real.csproj"), "<Project/>");
+            let out_link = link_dir(outside.path(), &root.join("aaa_link"));
+            let loop_link = link_dir(root, &root.join("sub").join("loop"));
+            if out_link.is_err() || loop_link.is_err() {
+                // Creating a link needs a privilege on Windows (developer
+                // mode or an elevated shell); without it there is nothing
+                // to check.
+                eprintln!("skipped: cannot create a directory symlink here");
+            } else {
+                let project = discover_project(root);
+                assert_eq!(project.kind, ProjectKind::Project);
+                assert_eq!(project.path, root.join("sub").join("real.csproj"));
+            }
+        }
+
+        // a junction is not followed either, and needs no privilege to test
+        #[cfg(windows)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            write(&outside.path().join("Outside.sln"), "");
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(&root.join("sub").join("real.csproj"), "<Project/>");
+            junction_dir(outside.path(), &root.join("aaa_junction"));
+            junction_dir(root, &root.join("sub").join("loop"));
+            let project = discover_project(root);
+            assert_eq!(project.kind, ProjectKind::Project);
+            assert_eq!(project.path, root.join("sub").join("real.csproj"));
         }
 
         // build and hidden directories are skipped

@@ -169,7 +169,8 @@ lsp_stuck_seconds = 900
 # and platform config dir under that directory itself. Optional and
 # fail-open, same as csharp above.
 # [java]
-# path = "/path/to/jdtls"
+# path = "/path/to/jdtls"   # a relative path resolves against the working directory of the LCI process
+# JVM options (-Xmx..., -D...) go before -jar; other args after -data <dir>.
 # args = []
 # disabled = false
 

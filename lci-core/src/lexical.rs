@@ -443,6 +443,18 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
     find_on_path_in(name, std::env::var_os("PATH").as_deref(), cfg!(windows))
 }
 
+/// The first of `<name>.exe` and `<name>.cmd`, taken directory by directory in
+/// `path` order, that is a file: the Win32 programs a bare name can mean. Unlike
+/// [`find_on_path_in`] it never returns the extensionless name, so a POSIX
+/// script earlier on `PATH` cannot hide a `.cmd` shim in a later directory.
+/// `PATHEXT` is not consulted, so a `.bat` is not found by name.
+pub fn find_windows_program_on_path_in(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    first_file_on_path(path, &[format!("{name}.exe"), format!("{name}.cmd")])
+}
+
 /// [`find_on_path`] over an explicit `PATH` value and platform, so the lookup
 /// order is testable anywhere.
 pub fn find_on_path_in(name: &str, path: Option<&OsStr>, windows: bool) -> Option<PathBuf> {
