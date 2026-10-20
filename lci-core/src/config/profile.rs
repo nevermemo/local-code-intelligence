@@ -14,11 +14,73 @@ use super::{Config, layers::machine_keys};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// `[run_profile]`. No keys yet: the section is the home of the switches that
-/// later name a run's configuration. An unknown key is an error.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `[run_profile]`: the home of the switches that name a run's configuration.
+/// An unknown key is an error.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RunProfileConfig {}
+pub struct RunProfileConfig {
+    /// `[run_profile.walk]`: how a traversal counts evidence.
+    pub walk: WalkProfile,
+}
+
+/// How a traversal groups the evidence that reaches a node
+/// (`[run_profile.walk] groups`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalkGroups {
+    /// One group per map (the maps derived from one shared graph are one
+    /// group together). Today's behaviour.
+    #[default]
+    Tool,
+    /// One group per claim: the same `(source node, destination node, claim
+    /// family)` is one claim, whichever maps assert it.
+    Claim,
+}
+
+impl WalkGroups {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Claim => "claim",
+        }
+    }
+}
+
+impl std::str::FromStr for WalkGroups {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "tool" => Ok(Self::Tool),
+            "claim" => Ok(Self::Claim),
+            other => Err(format!(
+                "groups must be \"tool\" or \"claim\" (got {other:?})"
+            )),
+        }
+    }
+}
+
+/// `[run_profile.walk]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalkProfile {
+    /// What counts as one piece of evidence: `"tool"` (default, one per map)
+    /// or `"claim"`. `"claim"` cannot be combined with `[traverse] fusion =
+    /// "rrf"`.
+    pub groups: WalkGroups,
+    /// What a group made only of `mentions` edges (text matches) adds to the
+    /// evidence count, `0.0..=1.0`; 1.0 (default) counts it like any other.
+    pub grep_corroboration: f64,
+}
+
+impl Default for WalkProfile {
+    fn default() -> Self {
+        Self {
+            groups: WalkGroups::Tool,
+            grep_corroboration: 1.0,
+        }
+    }
+}
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
 /// a section (`system_one`) leaves out everything under it.
@@ -290,6 +352,8 @@ mod tests {
         config.compose.enabled = true;
         config.system_one = Some(SystemOneConfig::default());
         config.rescorer = crate::config::Rescorer::SystemOne;
+        config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
+        config.run_profile.walk.grep_corroboration = 0.5;
         config
     }
 
@@ -336,6 +400,36 @@ mod tests {
         shallow.traverse.max_depth = 3;
         assert_ne!(shallow.run_profile().hash, base);
         assert_ne!(shallow.run_profile().hash, reranker_off.run_profile().hash);
+    }
+
+    #[test]
+    fn walk_groups_and_grep_corroboration_change_the_profile_hash() {
+        let base = Config::default().run_profile();
+        assert!(
+            base.canonical
+                .contains(r#""run_profile":{"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#)
+        );
+        let mut claim = Config::default();
+        claim.run_profile.walk.groups = WalkGroups::Claim;
+        let mut discount = Config::default();
+        discount.run_profile.walk.grep_corroboration = 0.5;
+        let hashes = [
+            base.hash.clone(),
+            claim.run_profile().hash,
+            discount.run_profile().hash,
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Both are leaves of the profile, never excluded.
+        for key in [
+            "run_profile.walk.groups",
+            "run_profile.walk.grep_corroboration",
+        ] {
+            assert!(base.keys.iter().any(|k| k == key), "{key}");
+        }
     }
 
     #[test]
@@ -396,7 +490,7 @@ mod tests {
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "0218b08ee81dd57abdcd6d97278e1750a6ec213b19467899e9560522f0582523",
+            "b730719b8776c22c76a2ac91ac8252fcfe35aa0fcc61cd335f71627f890a8d73",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -411,7 +505,8 @@ mod tests {
             "traverse.policies.p.walk",
             "recipes.enabled",
             "rescorer",
-            "run_profile",
+            "run_profile.walk.groups",
+            "run_profile.walk.grep_corroboration",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -439,9 +534,11 @@ mod tests {
     fn the_default_profile_hash_is_pinned() {
         // Changes whenever a default, a Config key or the deny-list changes:
         // update it with the reason in the commit.
+        // K23a: a489865d... before `[run_profile.walk]` (`groups`,
+        // `grep_corroboration`) gave the section its two leaves.
         assert_eq!(
             Config::default().run_profile().hash,
-            "a489865da28049e15168145e9d5af53792b4fc388e35658ca5b558f6d3e12bef"
+            "c10fe368eeaef8e3f2aa3ba701d6a823fea3ce263f3565819f82ab583f85f7c6"
         );
     }
 }

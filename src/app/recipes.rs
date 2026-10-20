@@ -60,7 +60,7 @@ use crate::{
         App,
         traverse::{self, BudgetArgs, Call, Dirs, OpenedIndex, SteerArgs},
     },
-    config::{TraverseConfig, TraverseFirstStage},
+    config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use lci_core::node::{ConfigNamespace, NodeId};
@@ -260,6 +260,8 @@ impl Request {
 pub struct Ctx<'a> {
     /// `[traverse]`, for the SCIP index path and the walk of `flow_from`.
     pub limits: &'a TraverseConfig,
+    /// `[run_profile]`, which the walk of `flow_from` runs under.
+    pub profile: &'a RunProfileConfig,
     /// Where traversal traces and handles go.
     pub dirs: &'a Dirs,
     /// The SCIP index file.
@@ -306,6 +308,7 @@ pub async fn serve(app: &App, request: &Request) -> Result<Value> {
     let dirs = Dirs::under(&config.data_dir);
     let ctx = Ctx {
         limits: &config.traverse,
+        profile: &config.run_profile,
         dirs: &dirs,
         scip_index: &scip_index,
         root: &workspace,
@@ -1311,7 +1314,7 @@ async fn flow_from(
         lsp: None,
     };
     let at = Instant::now();
-    let report = Box::pin(traverse::run(&limits, ctx.dirs, &call)).await?;
+    let report = Box::pin(traverse::run(&limits, ctx.profile, ctx.dirs, &call)).await?;
     let response = report.response;
     let expands: u64 = response["totals"]["per_map"]
         .as_object()

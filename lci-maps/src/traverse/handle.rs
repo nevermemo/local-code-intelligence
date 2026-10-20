@@ -38,7 +38,8 @@
 //! agent's [`Steer`](super::steer::Steer).
 
 use super::{
-    Fusion, Run, State, Totals, Traversal, TraversalBudget, failure_reasons_json,
+    Fusion, GroupKey, Grouping, Groups, Run, State, Totals, Traversal, TraversalBudget,
+    failure_reasons_json,
     frontier::Frontier,
     priors::HopPriors,
     rank_json,
@@ -49,7 +50,11 @@ use super::{
     tiebreak::TieBreak,
     trace::{disagreement_json, value_hash},
 };
-use crate::{MapId, edge::WitnessClass, traverse::source::EdgeSource};
+use crate::{
+    MapId,
+    edge::WitnessClass,
+    traverse::source::{ClaimFamily, EdgeSource},
+};
 use lci_core::node::NodeId;
 use serde_json::{Map as JsonMap, Value, json};
 use std::{
@@ -245,6 +250,10 @@ pub struct Snapshot {
     /// The fusion the first call ranked with; a resume keeps it. Written to
     /// the handle only under `rrf` (a handle without it is `boost`).
     pub fusion: Fusion,
+    /// How the first call grouped evidence; a resume keeps it. Written to the
+    /// handle only when it is not the default (a handle without it is
+    /// `tool` groups with no discount).
+    pub grouping: Grouping,
     /// Whether the first call passed through connective nodes (their pops
     /// were free); a resume keeps it.
     pub pass_through: bool,
@@ -287,6 +296,15 @@ impl Snapshot {
             // Left out under `boost`, so those handles are what they were.
             if self.fusion == Fusion::Rrf {
                 object.insert("fusion".into(), json!(self.fusion.as_str()));
+            }
+            if !self.grouping.is_default() {
+                object.insert(
+                    "grouping".into(),
+                    json!({
+                        "groups": self.grouping.groups.as_str(),
+                        "grep_corroboration": self.grouping.grep_corroboration,
+                    }),
+                );
             }
             if let Some((question_type, hash)) = &self.priors {
                 object.insert(
@@ -525,6 +543,7 @@ impl Snapshot {
                             .map(|(m, p)| Ok((intern(m)?, f64_of(p)?)))
                             .collect::<Result<_, String>>()?,
                     },
+                    groups: groups_from_json(s.get("groups"))?,
                 })
             })
             .collect::<Result<Vec<State>, String>>()?;
@@ -720,6 +739,17 @@ impl Snapshot {
                 None | Some(Value::Null) => Fusion::Boost,
                 Some(v) => string_of(v)?.parse::<Fusion>()?,
             },
+            grouping: match obj.get("grouping") {
+                None | Some(Value::Null) => Grouping::default(),
+                Some(v) => {
+                    let v = v.as_object().ok_or("grouping is not an object")?;
+                    let share = f64_of(get(v, "grep_corroboration")?)?;
+                    if !(0.0..=1.0).contains(&share) {
+                        return Err("grep_corroboration is not a share".into());
+                    }
+                    Grouping::new(string_of(get(v, "groups")?)?.parse::<Groups>()?, share)
+                }
+            },
             pass_through: get(obj, "pass_through")?
                 .as_bool()
                 .ok_or("pass_through is not a boolean")?,
@@ -766,6 +796,9 @@ fn state_json(s: &State) -> Value {
         "dependent": s.dependent,
         "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
     });
+    if let (false, Some(object)) = (s.groups.is_empty(), value.as_object_mut()) {
+        object.insert("groups".into(), groups_json(&s.groups));
+    }
     // Only a walk under `rrf` fusion keeps the best potential per map.
     if let (false, Some(object)) = (s.reach.is_empty(), value.as_object_mut()) {
         object.insert(
@@ -779,6 +812,67 @@ fn state_json(s: &State) -> Value {
         );
     }
     value
+}
+
+/// The groups of evidence of a state: `["map", id, text]`, `["dependent",
+/// text]` or `["claim", node, family, text]`, where `text` is whether every
+/// edge of the group was a `mentions` edge.
+fn groups_json(groups: &BTreeMap<GroupKey, bool>) -> Value {
+    Value::Array(
+        groups
+            .iter()
+            .map(|(key, text)| match key {
+                GroupKey::Map(map) => json!(["map", map, text]),
+                GroupKey::Dependent => json!(["dependent", text]),
+                GroupKey::Claim(src, family) => {
+                    json!(["claim", src.to_string(), family.as_str(), text])
+                }
+            })
+            .collect(),
+    )
+}
+
+fn groups_from_json(value: Option<&Value>) -> Result<BTreeMap<GroupKey, bool>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut groups = BTreeMap::new();
+    for group in value.as_array().ok_or("groups is not an array")? {
+        let parts = group.as_array().ok_or("a group is not an array")?;
+        let text = |v: Option<&Value>| {
+            v.and_then(Value::as_bool)
+                .ok_or_else(|| "a group has no mentions flag".to_owned())
+        };
+        let (key, flag) = match parts.first().and_then(Value::as_str) {
+            Some("map") => (
+                GroupKey::Map(intern(
+                    parts
+                        .get(1)
+                        .and_then(Value::as_str)
+                        .ok_or("a map group has no map")?,
+                )?),
+                text(parts.get(2))?,
+            ),
+            Some("dependent") => (GroupKey::Dependent, text(parts.get(1))?),
+            Some("claim") => {
+                let family = parts
+                    .get(2)
+                    .and_then(Value::as_str)
+                    .and_then(ClaimFamily::parse)
+                    .ok_or("a claim group has no known family")?;
+                (
+                    GroupKey::Claim(
+                        node_id(parts.get(1).ok_or("a claim group has no node")?)?,
+                        family,
+                    ),
+                    text(parts.get(3))?,
+                )
+            }
+            _ => return Err("a group is neither map, dependent nor claim".into()),
+        };
+        groups.insert(key, flag);
+    }
+    Ok(groups)
 }
 
 fn tally_json(tally: &Tally) -> Value {
@@ -993,6 +1087,7 @@ impl Run<'_> {
             identity: self.t.identity.clone(),
             boost: self.t.boost,
             fusion: self.t.fusion,
+            grouping: self.t.grouping,
             pass_through: self.t.pass_through,
             rerank_floor: self.rerank_floor(),
             rerank_identity: self
@@ -1036,6 +1131,7 @@ impl Run<'_> {
             identity,
             boost,
             fusion,
+            grouping,
             pass_through,
             score_bound,
             ..
@@ -1053,6 +1149,7 @@ impl Run<'_> {
         }
         self.t.boost = boost;
         self.t.fusion = fusion;
+        self.t.grouping = grouping;
         self.t.pass_through = pass_through;
         self.t.score_bound = score_bound;
         self.state_of = states
@@ -1128,7 +1225,7 @@ impl Run<'_> {
             },
             "scorer": self.t.scorer.label(),
             "scorer_changed": scorer_changed,
-            "rank": rank_json(self.t.boost, self.t.fusion),
+            "rank": rank_json(self.t.boost, self.t.fusion, &self.t.grouping),
             "stops": stops_json(&self.t.stops),
         });
         if let (true, Some(object)) = (pass_through, resume.as_object_mut()) {

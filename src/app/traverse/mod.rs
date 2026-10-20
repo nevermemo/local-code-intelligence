@@ -60,7 +60,7 @@ mod tests;
 
 use crate::{
     app::App,
-    config::{TraverseConfig, TraverseFirstStage},
+    config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use first_stage::{
@@ -83,7 +83,7 @@ use lci_maps::{
         ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
     },
     traverse::{
-        Seed, Traversal, TraversalBudget,
+        Grouping, Seed, Traversal, TraversalBudget,
         frontier::HopPrice,
         handle::HandleStore,
         handler::StopPolicy,
@@ -464,8 +464,16 @@ fn identity_of(call: &Call<'_>, loaded: &Loaded) -> String {
 /// Runs one traversal call. Errors are the caller's mistakes (a bad rule, an
 /// unknown handle, a missing index) or the data directory not being writable
 /// for a handle; a failed trace write is a note, not an error.
-pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Result<Report> {
-    run_with_trait_seeds(limits, dirs, call, TraitSeedMode::Auto).await
+///
+/// `profile` is `[run_profile]`: its `walk` keys set how the walk groups
+/// evidence (see [`Grouping`]).
+pub async fn run(
+    limits: &TraverseConfig,
+    profile: &RunProfileConfig,
+    dirs: &Dirs,
+    call: &Call<'_>,
+) -> Result<Report> {
+    run_with_trait_seeds(limits, profile, dirs, call, TraitSeedMode::Auto).await
 }
 
 /// [`run`] with the mode in which the traits and trait methods the question
@@ -473,6 +481,7 @@ pub async fn run(limits: &TraverseConfig, dirs: &Dirs, call: &Call<'_>) -> Resul
 /// [`TraitSeedMode`]).
 pub async fn run_with_trait_seeds(
     limits: &TraverseConfig,
+    profile: &RunProfileConfig,
     dirs: &Dirs,
     call: &Call<'_>,
     trait_seed_mode: TraitSeedMode,
@@ -1094,6 +1103,10 @@ pub async fn run_with_trait_seeds(
         .identity(identity)
         .corroboration_boost(limits.corroboration_boost)
         .fusion(limits.fusion)
+        .grouping(Grouping::new(
+            profile.walk.groups,
+            profile.walk.grep_corroboration,
+        ))
         .pass_through(limits.pass_through)
         .score_bound(limits.score_bound)
         .priors(priors)
@@ -1306,9 +1319,14 @@ pub async fn search(
         handle,
         lsp: Some(config),
     };
-    Ok(run(limits, &Dirs::under(&config.data_dir), &call)
-        .await?
-        .response)
+    Ok(run(
+        limits,
+        &config.run_profile,
+        &Dirs::under(&config.data_dir),
+        &call,
+    )
+    .await?
+    .response)
 }
 
 /// Text for the server instructions when the mode is on.

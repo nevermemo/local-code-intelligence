@@ -18,7 +18,7 @@
 
 use super::merged::FileBlobs;
 use crate::{
-    Budget, Cost, EXPAND_LIMIT, MapId, Registry, SnapshotView,
+    Budget, Cost, EXPAND_LIMIT, EdgeKind, MapId, Registry, SnapshotView,
     edge::{CONF_MAX, Edge, MapCard, WitnessClass, sort_edges},
 };
 use futures::FutureExt;
@@ -30,6 +30,77 @@ use std::{
     sync::OnceLock,
     time::Instant,
 };
+
+/// What an edge asserts, for grouping evidence by claim: the edge kinds that
+/// say the same thing about a pair of nodes. A claim is a `(source node,
+/// destination node, family)`; the map and the witness class are not part of
+/// it, so two maps that both say `a` calls `b` make one claim, and `a`
+/// mentioning `b` is another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClaimFamily {
+    /// `CallsOrRefs`, `Imports`.
+    Refers,
+    /// `Contains`, `DefinedIn`.
+    Structure,
+    Implements,
+    /// `Mentions`: text matches.
+    Mentions,
+    Tests,
+    ReadsKey,
+    /// `Touched`, `Cochange`.
+    History,
+    Near,
+    /// `QueryMatch`, `Prior`, `CompileErrorAt`.
+    Other,
+}
+
+impl ClaimFamily {
+    /// Every family, in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::Refers,
+        Self::Structure,
+        Self::Implements,
+        Self::Mentions,
+        Self::Tests,
+        Self::ReadsKey,
+        Self::History,
+        Self::Near,
+        Self::Other,
+    ];
+
+    /// The family named `name` (the inverse of [`ClaimFamily::as_str`]).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|family| family.as_str() == name)
+    }
+
+    pub const fn of(kind: EdgeKind) -> Self {
+        match kind {
+            EdgeKind::CallsOrRefs | EdgeKind::Imports => Self::Refers,
+            EdgeKind::Contains | EdgeKind::DefinedIn => Self::Structure,
+            EdgeKind::Implements => Self::Implements,
+            EdgeKind::Mentions => Self::Mentions,
+            EdgeKind::Tests => Self::Tests,
+            EdgeKind::ReadsKey => Self::ReadsKey,
+            EdgeKind::Touched | EdgeKind::Cochange => Self::History,
+            EdgeKind::Near => Self::Near,
+            EdgeKind::QueryMatch | EdgeKind::Prior | EdgeKind::CompileErrorAt => Self::Other,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refers => "refers",
+            Self::Structure => "structure",
+            Self::Implements => "implements",
+            Self::Mentions => "mentions",
+            Self::Tests => "tests",
+            Self::ReadsKey => "reads_key",
+            Self::History => "history",
+            Self::Near => "near",
+            Self::Other => "other",
+        }
+    }
+}
 
 /// Edges to one destination from one or more maps.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +116,14 @@ pub struct FusedEdge {
     /// Each offering map with the witness class of its best edge, in `maps`
     /// order (the pairing `maps` and `witnesses` lose).
     pub offers: Vec<(MapId, WitnessClass)>,
+    /// Noisy-OR of the best confidence per claim family, whole percent: what
+    /// `conf` is when the same claim from several maps counts once. Always
+    /// computed; the traversal reads it under `groups = "claim"`.
+    pub claim_conf: u8,
+    /// Each claim family among the edges with the maps that asserted it
+    /// (sorted). The edges share their source node (the node expanded), so
+    /// the family stands for the claim `(source, destination, family)`.
+    pub claims: Vec<(ClaimFamily, Vec<MapId>)>,
 }
 
 /// Groups `edges` by destination and fuses each group. Sorted by fused
@@ -77,8 +156,34 @@ pub fn fuse(edges: Vec<Edge>) -> Vec<FusedEdge> {
                 }
             }
             offers.sort_unstable_by_key(|(map, _)| *map);
+            // The same claim from several maps counts once: the best
+            // confidence per claim family (the group is sorted, so the first
+            // edge of a family is its best), noisy-OR across families.
+            let mut families = HashSet::new();
+            let mut claim_miss = 1.0f64;
+            for edge in group
+                .iter()
+                .filter(|e| families.insert(ClaimFamily::of(e.kind)))
+            {
+                claim_miss *= 1.0 - f64::from(edge.conf) / f64::from(CONF_MAX);
+            }
+            let mut claims: Vec<(ClaimFamily, Vec<MapId>)> = Vec::new();
+            for edge in &group {
+                let family = ClaimFamily::of(edge.kind);
+                match claims.iter_mut().find(|(f, _)| *f == family) {
+                    Some((_, maps)) => maps.push(edge.map),
+                    None => claims.push((family, vec![edge.map])),
+                }
+            }
+            claims.sort_unstable_by_key(|(family, _)| *family);
+            for (_, maps) in &mut claims {
+                maps.sort_unstable();
+                maps.dedup();
+            }
             FusedEdge {
                 offers,
+                claims,
+                claim_conf: (f64::from(CONF_MAX) * (1.0 - claim_miss)).round() as u8,
                 conf: (f64::from(CONF_MAX) * (1.0 - miss)).round() as u8,
                 best: group.swap_remove(0),
                 maps,
@@ -363,5 +468,64 @@ impl EdgeSource for OnTheFly<'_, '_, '_> {
             self.off.insert(id.to_string());
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge(map: MapId, kind: EdgeKind, conf: u8) -> Edge {
+        Edge {
+            src: NodeId::file("src/s.rs").unwrap(),
+            dst: NodeId::file("src/a.rs").unwrap(),
+            kind,
+            map,
+            witness: WitnessClass::Compiler,
+            conf,
+            site: None,
+        }
+    }
+
+    #[test]
+    fn fuse_reports_the_best_conf_per_claim_family() {
+        // Three maps, one claim: noisy-OR over maps is 99, over claims 80.
+        let one_claim = fuse(vec![
+            edge("m1", EdgeKind::CallsOrRefs, 80),
+            edge("m2", EdgeKind::CallsOrRefs, 80),
+            edge("m3", EdgeKind::Imports, 80),
+        ]);
+        assert_eq!(one_claim.len(), 1);
+        assert_eq!(one_claim[0].conf, 99);
+        assert_eq!(one_claim[0].claim_conf, 80);
+        assert_eq!(
+            one_claim[0].claims,
+            vec![(ClaimFamily::Refers, vec!["m1", "m2", "m3"])]
+        );
+        // Two families, 80 and 50: 1 - 0.2 * 0.5 = 90.
+        let two = fuse(vec![
+            edge("m1", EdgeKind::CallsOrRefs, 80),
+            edge("m2", EdgeKind::Mentions, 50),
+        ]);
+        assert_eq!(two[0].claim_conf, 90);
+        assert_eq!(two[0].conf, 90);
+        assert_eq!(
+            two[0].claims,
+            vec![
+                (ClaimFamily::Refers, vec!["m1"]),
+                (ClaimFamily::Mentions, vec!["m2"])
+            ]
+        );
+    }
+
+    #[test]
+    fn every_edge_kind_has_a_claim_family() {
+        for kind in EdgeKind::ALL {
+            // Exhaustive by construction; the family names are stable.
+            assert!(!ClaimFamily::of(kind).as_str().is_empty());
+        }
+        assert_eq!(ClaimFamily::of(EdgeKind::Imports), ClaimFamily::Refers);
+        assert_eq!(ClaimFamily::of(EdgeKind::DefinedIn), ClaimFamily::Structure);
+        assert_eq!(ClaimFamily::of(EdgeKind::Cochange), ClaimFamily::History);
     }
 }

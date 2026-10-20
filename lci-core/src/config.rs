@@ -9,7 +9,7 @@ use std::{
 pub mod layers;
 pub mod profile;
 
-pub use profile::{RunProfile, RunProfileConfig};
+pub use profile::{RunProfile, RunProfileConfig, WalkGroups, WalkProfile};
 
 /// Controls when a search request may trigger an automatic incremental
 /// refresh of a workspace's index. `on-search` is the default for coding
@@ -626,8 +626,9 @@ pub struct Config {
     #[serde(skip_serializing_if = "Rescorer::is_default")]
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
-    /// result-affecting configuration. No keys yet. Always serialized; the
-    /// hashed profile of the whole configuration is [`Config::run_profile`].
+    /// result-affecting configuration (`walk.groups` and
+    /// `walk.grep_corroboration`). Always serialized; the hashed profile of the
+    /// whole configuration is [`Config::run_profile`].
     pub run_profile: RunProfileConfig,
 }
 
@@ -1487,6 +1488,23 @@ impl Config {
         }
     }
 
+    /// `[run_profile.walk]`: the corroboration discount is a share, and claim
+    /// groups are not defined under reciprocal rank fusion (its sources stay
+    /// per map).
+    fn validate_run_profile(&self) -> Result<()> {
+        let walk = &self.run_profile.walk;
+        ensure!(
+            (0.0..=1.0).contains(&walk.grep_corroboration),
+            "run_profile.walk.grep_corroboration must be a number from 0 to 1 (got {})",
+            walk.grep_corroboration
+        );
+        ensure!(
+            !(walk.groups == WalkGroups::Claim && self.traverse.fusion == TraverseFusion::Rrf),
+            "run_profile.walk.groups = \"claim\" cannot be combined with traverse.fusion = \"rrf\": the reciprocal-rank sources stay per map; use traverse.fusion = \"boost\" or groups = \"tool\""
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.data_dir.is_absolute(),
@@ -1526,6 +1544,7 @@ impl Config {
         );
         self.docs_lane.validate()?;
         self.traverse.validate()?;
+        self.validate_run_profile()?;
         ensure!(
             self.watch_poll_milliseconds > 0 && self.watch_debounce_milliseconds > 0,
             "watch intervals must be positive"
@@ -3713,6 +3732,78 @@ fusion = \"{fusion}\"
         config.traverse.priors = Some("table.json".into());
         config.traverse.question_type = Some("flow".into());
         config.traverse.tie_break = Some("tie-break.json".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn walk_grep_corroboration_is_validated() {
+        let with = |share: f64| Config {
+            data_dir: std::env::temp_dir(),
+            run_profile: RunProfileConfig {
+                walk: WalkProfile {
+                    grep_corroboration: share,
+                    ..WalkProfile::default()
+                },
+            },
+            ..Config::default()
+        };
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let error = with(bad).validate().unwrap_err().to_string();
+            assert!(
+                error.contains("run_profile.walk.grep_corroboration"),
+                "{bad}: {error}"
+            );
+        }
+        for good in [0.0, 0.5, 1.0] {
+            with(good).validate().unwrap();
+        }
+        // The file reads the keys; the defaults are today's behaviour.
+        let defaults = Config::default().run_profile.walk;
+        assert_eq!(defaults.groups, WalkGroups::Tool);
+        assert_eq!(defaults.grep_corroboration, 1.0);
+        let text = format!(
+            "{}[run_profile.walk]
+groups = \"claim\"
+grep_corroboration = 0.5
+",
+            base_toml()
+        );
+        let read: Config = toml::from_str(&text).unwrap();
+        read.validate().unwrap();
+        assert_eq!(read.run_profile.walk.groups, WalkGroups::Claim);
+        assert_eq!(read.run_profile.walk.grep_corroboration, 0.5);
+        for bad in [
+            "groups = \"Claim\"",
+            "groups = \"\"",
+            "groups = 1",
+            "nope = 1",
+            "grep_corroboration = \"half\"",
+        ] {
+            let text = format!(
+                "{}[run_profile.walk]
+{bad}
+",
+                base_toml()
+            );
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        assert_eq!("claim".parse::<WalkGroups>(), Ok(WalkGroups::Claim));
+        assert!("both".parse::<WalkGroups>().is_err());
+    }
+
+    #[test]
+    fn claim_groups_refuse_rrf_fusion() {
+        let mut config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.traverse.fusion = TraverseFusion::Rrf;
+        config.validate().unwrap();
+        config.run_profile.walk.groups = WalkGroups::Claim;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("run_profile.walk.groups"), "{error}");
+        assert!(error.contains("traverse.fusion"), "{error}");
+        config.traverse.fusion = TraverseFusion::Boost;
         config.validate().unwrap();
     }
 
