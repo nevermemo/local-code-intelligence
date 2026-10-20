@@ -269,7 +269,20 @@ async fn assert_fake_lsp_maps_symbols_definitions_and_references(
         ("references", "references"),
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, _) = fixture(&temp, mode);
+        let (mut config, workspace, _) = fixture(&temp, mode);
+        // Nothing here is about the timeout: the fixtures' 1 s failed a slow
+        // `initialize` under load. Each fake answers what its mode does not
+        // handle (the priming `workspace/symbol` of a `definition` server, say)
+        // with `null`, so no call waits on an unanswered request either.
+        config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+        for args in [
+            &mut config.csharp.args,
+            &mut config.typescript.args,
+            &mut config.python.args,
+            &mut config.clangd.args,
+        ] {
+            args.push("--answer-unhandled".to_owned());
+        }
         let manager = Manager::new(&config);
         let adapter = adapter_of(&manager);
         let results = match operation {
@@ -385,8 +398,7 @@ async fn fake_lsps_map_symbols_definitions_and_references() {
     };
     // The servers are separate processes, so the languages run side by side.
     // The extra clangd extensions run as a second batch: eleven fake servers
-    // at once could outlast the fake servers' one-second inactivity timeout
-    // on a loaded machine.
+    // at once load the machine more than the check needs.
     tokio::join!(
         csharp,
         typescript,
@@ -1334,10 +1346,14 @@ async fn a_server_that_stops_reading_is_replaced_once() {
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
+    // The 2 s timeout is the product's bound on the deaf server's write; the
+    // rest of the call is a fresh start that reads the 4 MiB query, which took
+    // 26 s on a loaded machine. A write waiting on the deaf pipe never ends,
+    // so the wide bounds below still catch it.
     let query = "x".repeat(4 * 1024 * 1024);
     let started = std::time::Instant::now();
     let results = tokio::time::timeout(
-        Duration::from_secs(30),
+        3 * LOADED_BUDGET,
         manager.symbols(&adapter, &workspace, &query),
     )
     .await
@@ -1345,7 +1361,7 @@ async fn a_server_that_stops_reading_is_replaced_once() {
     .unwrap();
     assert_eq!(results[0].name.as_deref(), Some("Calculator"));
     assert!(
-        started.elapsed() < Duration::from_secs(20),
+        started.elapsed() < 2 * LOADED_BUDGET,
         "{:?}",
         started.elapsed()
     );
@@ -2127,12 +2143,15 @@ fn second_workspace(temp: &tempfile::TempDir, config: &Config) -> Workspace {
 
 /// A C# fixture for the idle and release tests. They never depend on a 1 s
 /// request timeout, and the fixture's 1 s would make a slow process start
-/// under load fail their `initialize`, so this one allows 5 s.
+/// under load fail their `initialize` (so would 5 s: a timed-out start is a
+/// transport failure, and its retry spawns a server the test did not count),
+/// so this one allows [`LOADED_BUDGET_SECONDS`]. A test about the timeout sets
+/// its own.
 fn fake_csharp_release_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "workspace-symbols");
-    config.lsp_timeout_seconds = 5;
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     (config, workspace, state)
 }
 
@@ -2905,9 +2924,14 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
     write_csharp_workspace(&workspace);
     let other = temp.path().join("other-workspace");
     std::fs::create_dir_all(&other).unwrap();
-    let app = App::open(with_fake_csharp_server(config, &state, &[], 5))
-        .await
-        .unwrap();
+    let app = App::open(with_fake_csharp_server(
+        config,
+        &state,
+        &[],
+        LOADED_BUDGET_SECONDS,
+    ))
+    .await
+    .unwrap();
     let providers = [
         "clangd",
         "csharp-ls",
@@ -2988,14 +3012,16 @@ async fn analyzers_running_has_an_entry_per_language_server_and_follows_the_sess
 /// A workspace that mixes C# and TypeScript, so `App::symbols` asks both
 /// csharp-ls and typescript-language-server, each replaced by the fake server
 /// in the given mode (see `fake_lsp.rs`). Each fake records what it saw under
-/// its own directory of `state_dir`.
+/// its own directory of `state_dir`. No caller depends on the request timeout,
+/// so it is [`LOADED_BUDGET_SECONDS`]: 5 s failed a slow `initialize` under
+/// load.
 fn with_fake_csharp_and_typescript_servers(
     mut config: Config,
     state_dir: &std::path::Path,
     csharp_mode: &str,
     typescript_mode: &str,
 ) -> Config {
-    config.lsp_timeout_seconds = 5;
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     let args = |mode: &str, name: &str| {
         vec![
             "--mode".to_owned(),
@@ -3802,7 +3828,7 @@ async fn navigation_answers_after_index_workspace_with_the_embedder_down() {
     let closed = ClosedPort::new();
     config.embedding_url = format!("http://127.0.0.1:{}/v1", closed.port);
     let state = temp.path().join("state");
-    let config = with_fake_csharp_server(config, &state, &[], 10);
+    let config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let workspace = temp.path().join("workspace");
     write_csharp_workspace(&workspace);
     let app = App::open(config).await.unwrap();
@@ -4710,7 +4736,7 @@ fn shared_sessions_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
-    config.lsp_timeout_seconds = 10;
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     let index = csharp_scip_index(temp, &workspace);
     (config, workspace, state, index)
@@ -4771,6 +4797,93 @@ async fn traverse_add(
         .response
 }
 
+/// [`traverse_add`] past a cold language server. However wide the budget, one
+/// expansion waits at most `lsp_live::CALL_TIMEOUT` (15 s, a product
+/// constant), and a cold fake server on a loaded machine took 21 s to answer:
+/// a walk that starts a cold server may then end with the deadline note and no
+/// edges from the map, as the map documents.
+///
+/// Under `shared` the server is started first by one `symbols` call, which
+/// returns once it answers, so the single walk that follows must reach `Run`
+/// through `lsp.live` on its own: a product bug that makes a cold-start walk
+/// miss the deadline cannot hide behind a retry. Under `per_call` every walk
+/// starts its own server and no warm-up is possible, so a walk that ran out of
+/// time is asked again, up to three walks in all; each retried walk must have
+/// failed only on the deadline, and its server must have ended with it.
+async fn traverse_add_past_a_cold_start(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    state: &std::path::Path,
+    sessions: local_code_intelligence::config::LspSessions,
+    manager: &Arc<Manager>,
+) -> Value {
+    use local_code_intelligence::config::LspSessions;
+    if sessions == LspSessions::Shared {
+        let adapter = csharp_adapter(manager);
+        manager
+            .symbols(&adapter, workspace, "Calculator")
+            .await
+            .expect("the shared server starts and answers");
+        let answer = traverse_add(config, workspace, index, sessions, manager).await;
+        assert!(
+            reached_run_through_lsp_live(&answer),
+            "the first walk over a warm shared server reached no lsp.live edge to Run: {answer}"
+        );
+        assert_eq!(
+            state_count(state, "spawn_count.txt"),
+            1,
+            "the walk reused the warmed server"
+        );
+        return answer;
+    }
+    let ran_out_of_time = |answer: &Value| {
+        answer["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|note| {
+                note.as_str()
+                    .is_some_and(|text| text.contains(lci_maps::lsp_live::DEADLINE_NOTE))
+            })
+        })
+    };
+    let mut retried_servers = Vec::new();
+    let mut walks = 1;
+    loop {
+        let answer = traverse_add(config, workspace, index, sessions, manager).await;
+        if walks == 3 || !ran_out_of_time(&answer) {
+            eprintln!("per_call: {walks} walk(s) to reach an answer");
+            for server in retried_servers {
+                wait_until_process_ends(
+                    "the server of a retried per-call walk to end",
+                    server,
+                    DROP_KILL_DEADLINE,
+                )
+                .await;
+            }
+            return answer;
+        }
+        let failures: Vec<&str> = answer["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|note| note.contains("calls failed"))
+            .collect();
+        assert!(
+            failures
+                .iter()
+                .all(|note| note.contains(lci_maps::lsp_live::DEADLINE_NOTE)),
+            "walk {walks} failed on more than the deadline: {failures:?}"
+        );
+        if let Some(server) = std::fs::read_to_string(state.join("pid.txt"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            retried_servers.push(server);
+        }
+        walks += 1;
+    }
+}
+
 /// Whether the answer reached `Run` through `lsp.live`.
 fn reached_run_through_lsp_live(answer: &Value) -> bool {
     answer["results"].as_array().is_some_and(|cards| {
@@ -4821,7 +4934,15 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shared_sessions_fixture(&temp);
     let manager = Arc::new(Manager::new(&config));
-    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     let server = server_of(&state);
     assert!(
@@ -4842,7 +4963,15 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shared_sessions_fixture(&temp);
     let manager = Arc::new(Manager::new(&config));
-    let answer = traverse_add(&config, &workspace, &index, LspSessions::PerCall, &manager).await;
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::PerCall,
+        &manager,
+    )
+    .await;
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     wait_until_process_ends(
         "the per-call server to end with its walk",

@@ -141,6 +141,14 @@ pub trait ChunkSearch: Send + Sync {
     /// The stored embedding of a chunk, if the index has one.
     async fn stored_vector(&self, chunk: &NodeId) -> Result<Option<Vec<f32>>, String>;
 
+    /// Why [`Self::embed`] would send no request (for example, the index has
+    /// no vectors to compare with), or `None` when it would. The vector map
+    /// then makes no call, counts none, and records this reason, as for any
+    /// failed search. The default never skips.
+    async fn embedding_skipped(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// One embedding call (the configured embedder) of a document text.
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
 
@@ -658,6 +666,11 @@ impl<'a> VectorChunks<'a> {
         };
         if budget.max_external_calls == 0 {
             return (Ok(None), 0);
+        }
+        // An embedding that is skipped sends no request: no call is counted.
+        match self.search.embedding_skipped().await {
+            Ok(None) => {}
+            Ok(Some(why)) | Err(why) => return (Err(why), 0),
         }
         (self.search.embed(&text).await.map(Some), 1)
     }

@@ -3517,7 +3517,7 @@ async fn default_channels_keep_every_channel_and_the_reranker_on() {
     // channels, not the budget, so the budget must not be what they measure.
     // The other tests below that set 30 s do so for the same reason.
     config.lsp_search_budget_ms = 30_000;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     assert_eq!(
         config.channels,
         local_code_intelligence::config::ChannelsConfig::default()
@@ -3563,7 +3563,7 @@ async fn a_traced_search_records_the_rank_each_channel_gave_every_candidate() {
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-traced");
     config.lsp_search_budget_ms = 30_000;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config.clone()).await.unwrap();
     app.index(&workspace).await.unwrap();
 
@@ -4013,7 +4013,12 @@ async fn each_channel_switch_removes_exactly_that_channel() {
     ];
 
     // Index once with the defaults; every variant reuses the same index.
-    let indexing = with_fake_csharp_server(config.clone(), &state_root.join("indexing"), &[], 10);
+    let indexing = with_fake_csharp_server(
+        config.clone(),
+        &state_root.join("indexing"),
+        &[],
+        LOADED_BUDGET_SECONDS,
+    );
     let indexer = App::open(indexing).await.unwrap();
     indexer.index(&workspace).await.unwrap();
     drop(indexer);
@@ -4023,7 +4028,8 @@ async fn each_channel_switch_removes_exactly_that_channel() {
         let mut variant_config = config.clone();
         variant_config.lsp_search_budget_ms = 30_000;
         let state = state_root.join(name);
-        variant_config = with_fake_csharp_server(variant_config, &state, &[], 10);
+        variant_config =
+            with_fake_csharp_server(variant_config, &state, &[], LOADED_BUDGET_SECONDS);
         match name {
             "semantic" => variant_config.channels.semantic = false,
             "lexical" => {
@@ -4396,8 +4402,12 @@ async fn with_semantic_off_a_clean_miss_is_empty_but_failed_channels_are_an_erro
     // error.
     let mut lsp_broken = config.clone();
     lsp_broken.channels.lexical = false;
-    lsp_broken =
-        with_fake_csharp_server(lsp_broken, &temp.path().join("lsp-state-broken"), &[], 10);
+    lsp_broken = with_fake_csharp_server(
+        lsp_broken,
+        &temp.path().join("lsp-state-broken"),
+        &[],
+        LOADED_BUDGET_SECONDS,
+    );
     lsp_broken.csharp.path = Some("definitely-missing-csharp-ls".into());
     let app = App::open(lsp_broken).await.unwrap();
     let error = app
@@ -5419,7 +5429,7 @@ async fn search_code_json_matches_the_golden_file() {
     );
     let state = temp.path().join("lsp-state-golden");
     config.lsp_search_budget_ms = 30_000;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();
     let report = app
@@ -5511,7 +5521,7 @@ async fn the_map_registry_fuses_the_pool_of_a_traced_search_bit_for_bit() {
     );
     let state = temp.path().join("lsp-state-t0");
     config.lsp_search_budget_ms = 30_000;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();
     let report = app
@@ -5579,7 +5589,7 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
     );
     let state = temp.path().join("lsp-state-t0-failing");
     config.lsp_search_budget_ms = 30_000;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();
     for embedding_fails in [false, true] {
@@ -5640,5 +5650,86 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
         }
     }
     fake.embed_fails.store(false, Ordering::SeqCst);
+    task.abort();
+}
+
+/// K0a follow-up: on a vectorless snapshot the map registry keeps the
+/// semantic map off, as the production search does, so it sends no query
+/// embedding (the embedder is answering again here) and the record's plan
+/// lists the map as disabled. The warning stays the production search's.
+#[cfg(feature = "map-equivalence")]
+#[tokio::test]
+async fn the_map_registry_leaves_the_semantic_map_off_on_a_vectorless_snapshot() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("t0-vectorless");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let indexed = app.index(&workspace).await.unwrap();
+    assert!(indexed.vectors_missing);
+    // The service answers again, so an embedding request would be served.
+    fake.embed_fails.store(false, Ordering::SeqCst);
+
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let maps = app
+        .fuse_through_maps(&workspace, "translator")
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "the semantic map embedded the query on a vectorless snapshot"
+    );
+    assert_eq!(
+        maps.warnings,
+        [
+            "Semantic retrieval unavailable: the index has no vectors (the embedding service was unreachable when it was built)"
+        ]
+    );
+    assert!(!maps.rows.is_empty(), "lexical answered");
+
+    let dir = temp.path().join("records");
+    let recorded = app
+        .record_through_maps(
+            &workspace,
+            "translator",
+            &lci_maps::run_record::RecordOptions::new(&dir),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "the recorded run embedded the query on a vectorless snapshot"
+    );
+    let path = recorded.record.expect("the record was written");
+    let text = std::fs::read_to_string(path).unwrap();
+    let run: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let enabled: Vec<(&str, bool)> = run["plan"]["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|map| {
+            (
+                map["map"].as_str().unwrap(),
+                map["enabled"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        enabled,
+        [
+            ("vec.chunk.code", false),
+            ("lexical", true),
+            ("lsp.symbols", false),
+            ("prior.source_role", true)
+        ]
+    );
     task.abort();
 }

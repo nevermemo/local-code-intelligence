@@ -251,10 +251,15 @@ async fn rest_release_workspace_stops_the_language_servers_of_that_workspace() {
     let workspace = temp.path().join("release-repository");
     write_csharp_workspace(&workspace);
     let app = Arc::new(
-        App::open(with_fake_csharp_server(config, &state, &[], 5))
-            .await
-            .unwrap()
-            .with_candidate_dump(None),
+        App::open(with_fake_csharp_server(
+            config,
+            &state,
+            &[],
+            LOADED_BUDGET_SECONDS,
+        ))
+        .await
+        .unwrap()
+        .with_candidate_dump(None),
     );
     app.index(&workspace).await.unwrap();
     let (base, token, server) = serve_on_loopback(app).await;
@@ -2926,6 +2931,11 @@ async fn search_vector_skips_without_embedding_on_a_vectorless_index() {
         note.contains("the index has no vectors") && note.contains("fail-open"),
         "{note}"
     );
+    // The skipped embedding is not an external call.
+    assert_eq!(
+        answer["totals"]["external_calls"], 0,
+        "search.vector counted a call it did not make: {answer}"
+    );
 
     token.cancel();
     server.abort();
@@ -3379,7 +3389,10 @@ fn stamped_config(mut config: Config, state: &Path) -> Config {
     config.traverse.enabled = true;
     config.recipes.enabled = true;
     config.compose.enabled = true;
-    config.lsp_timeout_seconds = 5;
+    // Every fake answers what its mode does not handle with `null`, so no call
+    // waits out the request timeout, and the timeout is wide: 5 s failed a slow
+    // start under load (and the unanswered requests made it cost a wait each).
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
     let args = |mode: &str, name: &str, primary: &str, secondary: &str| {
         vec![
             "--mode".to_owned(),
@@ -3390,6 +3403,7 @@ fn stamped_config(mut config: Config, state: &Path) -> Config {
             primary.to_owned(),
             "--secondary-file".to_owned(),
             secondary.to_owned(),
+            "--answer-unhandled".to_owned(),
         ]
     };
     config.csharp = CSharpLspConfig {

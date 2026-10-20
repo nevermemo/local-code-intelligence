@@ -45,7 +45,7 @@ async fn indexed_fixture(
     let state = temp.path().join(format!("lsp-state-{name}"));
     config.lsp_search_budget_ms = 30_000;
     config.channels.reranker = false;
-    config = with_fake_csharp_server(config, &state, &[], 10);
+    config = with_fake_csharp_server(config, &state, &[], LOADED_BUDGET_SECONDS);
     tweak(&mut config);
     let app = App::open(config).await.unwrap().with_candidate_dump(None);
     app.index(&workspace).await.unwrap();
