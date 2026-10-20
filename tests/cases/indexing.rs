@@ -5642,3 +5642,84 @@ async fn the_map_registry_matches_a_traced_search_when_a_channel_fails() {
     fake.embed_fails.store(false, Ordering::SeqCst);
     task.abort();
 }
+
+/// K0a follow-up: on a vectorless snapshot the map registry keeps the
+/// semantic map off, as the production search does, so it sends no query
+/// embedding (the embedder is answering again here) and the record's plan
+/// lists the map as disabled. The warning stays the production search's.
+#[cfg(feature = "map-equivalence")]
+#[tokio::test]
+async fn the_map_registry_leaves_the_semantic_map_off_on_a_vectorless_snapshot() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.channels.lsp = false;
+    let workspace = temp.path().join("t0-vectorless");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap().with_candidate_dump(None);
+
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let indexed = app.index(&workspace).await.unwrap();
+    assert!(indexed.vectors_missing);
+    // The service answers again, so an embedding request would be served.
+    fake.embed_fails.store(false, Ordering::SeqCst);
+
+    let requests = fake.embed_requests.load(Ordering::SeqCst);
+    let maps = app
+        .fuse_through_maps(&workspace, "translator")
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "the semantic map embedded the query on a vectorless snapshot"
+    );
+    assert_eq!(
+        maps.warnings,
+        [
+            "Semantic retrieval unavailable: the index has no vectors (the embedding service was unreachable when it was built)"
+        ]
+    );
+    assert!(!maps.rows.is_empty(), "lexical answered");
+
+    let dir = temp.path().join("records");
+    let recorded = app
+        .record_through_maps(
+            &workspace,
+            "translator",
+            &lci_maps::run_record::RecordOptions::new(&dir),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.embed_requests.load(Ordering::SeqCst),
+        requests,
+        "the recorded run embedded the query on a vectorless snapshot"
+    );
+    let path = recorded.record.expect("the record was written");
+    let text = std::fs::read_to_string(path).unwrap();
+    let run: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let enabled: Vec<(&str, bool)> = run["plan"]["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|map| {
+            (
+                map["map"].as_str().unwrap(),
+                map["enabled"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        enabled,
+        [
+            ("vec.chunk.code", false),
+            ("lexical", true),
+            ("lsp.symbols", false),
+            ("prior.source_role", true)
+        ]
+    );
+    task.abort();
+}

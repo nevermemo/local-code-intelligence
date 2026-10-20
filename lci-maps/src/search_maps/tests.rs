@@ -837,3 +837,95 @@ async fn the_vector_map_is_global_so_any_index_change_asks_it_again() {
     assert_eq!(adjacency.canonical(), fresh.canonical(), "{stats:?}");
     assert!(stats.full_rebuild.is_some(), "{stats:?}");
 }
+
+// ---- a vectorless index: the embedding is skipped, not attempted ------------------
+
+const NO_VECTORS: &str =
+    "the index has no vectors (the embedding service was unreachable when it was built)";
+
+/// An index built without vectors, as the root crate's `AppChunks` sees one:
+/// no stored vector, and `embed` refuses with the reason without sending a
+/// request.
+struct Vectorless {
+    inner: Arc<Mem>,
+}
+
+#[crate::async_trait]
+impl ChunkSearch for Vectorless {
+    async fn lexical(&self, query: &str, limit: usize) -> Result<Vec<ChunkHit>, String> {
+        self.inner.lexical(query, limit).await
+    }
+
+    async fn chunk_at(&self, path: &str, line: Option<u32>) -> Result<Option<ChunkHit>, String> {
+        self.inner.chunk_at(path, line).await
+    }
+
+    async fn stored_vector(&self, _: &NodeId) -> Result<Option<Vec<f32>>, String> {
+        Ok(None)
+    }
+
+    async fn embedding_skipped(&self) -> Result<Option<String>, String> {
+        Ok(Some(NO_VECTORS.to_owned()))
+    }
+
+    async fn embed(&self, _: &str) -> Result<Vec<f32>, String> {
+        self.inner.embed_calls.fetch_add(1, Ordering::Relaxed);
+        Err(NO_VECTORS.to_owned())
+    }
+
+    async fn nearest(&self, vector: &[f32], limit: usize) -> Result<Vec<ChunkHit>, String> {
+        self.inner.nearest(vector, limit).await
+    }
+
+    async fn chunk_lines(&self) -> Result<Vec<(NodeId, (u32, u32))>, String> {
+        self.inner.chunk_lines().await
+    }
+}
+
+#[tokio::test]
+async fn vector_on_a_vectorless_index_counts_no_call_and_records_why() {
+    let mem = Mem::new();
+    let map = VectorChunks::new(Arc::new(Vectorless { inner: mem.clone() }), Some(decls()));
+    // A file whose chunk has no stored vector, and a symbol the index holds
+    // no chunk for: each would take the embedding fallback.
+    for node in [
+        file("src/omega.rs"),
+        NodeId::file("src/nowhere.rs").unwrap(),
+    ] {
+        let seeds = [(node.clone(), 1.0)];
+        let params = serde_json::Value::Null;
+        let response = map
+            .query(
+                &MapRequest {
+                    text: None,
+                    seeds: &seeds,
+                    limit: 10,
+                    budget: budget(u32::MAX),
+                    params: &params,
+                    as_of: None,
+                },
+                &view(),
+            )
+            .await;
+        assert_eq!(
+            response.cost.external_calls, 0,
+            "{node:?}: no call was made"
+        );
+        let expanded = map.expand(&node, budget(u32::MAX), &view()).await;
+        assert!(expanded.edges.is_empty(), "{node:?}");
+        assert_eq!(
+            expanded.cost.external_calls, 0,
+            "{node:?}: no call was made"
+        );
+    }
+    assert_eq!(
+        mem.embed_calls.load(Ordering::Relaxed),
+        0,
+        "nothing embedded"
+    );
+    // The reason is recorded for every skipped expansion.
+    assert_eq!(map.failures().count(), 4);
+    let why = map.failures().first().unwrap();
+    assert!(why.starts_with("search.vector: "), "{why}");
+    assert!(why.contains("the index has no vectors"), "{why}");
+}
