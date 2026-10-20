@@ -61,7 +61,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path**: done 2026-10-20 (K2b, d420) | | | |
 | **M2** | **Language servers as the source of truth** | | | |
-| K7b | Partly done: shared LSP sessions across traverse calls, `[run_profile.lsp] sessions` (d414). Remaining: a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
+| K7b | Partly done: shared LSP sessions across traverse calls, `[run_profile.lsp] sessions` (d414); the outline cache keyed by content hash, `[run_profile.lsp] outline_cache` (d424). Remaining: readiness signals per server (K7b-3) | Fake LSP tests | M | N8 (readiness part) |
 | K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
 | K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps | Fake LSP event log | M | N2 |
 | K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` | `lsp.live` runs with `scip.mode = off` | M | - |
