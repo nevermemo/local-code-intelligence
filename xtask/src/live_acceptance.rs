@@ -24,6 +24,20 @@ struct StepSpec {
     timeout: Duration,
 }
 
+impl StepSpec {
+    /// A [`cargo_step`] goes through [`crate::build::cargo_command`], so it
+    /// shares build artefacts with a direct `cargo` run.
+    fn command(&self) -> Command {
+        if self.program == CARGO {
+            crate::build::cargo_command()
+        } else {
+            Command::new(&self.program)
+        }
+    }
+}
+
+const CARGO: &str = "cargo";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Passed,
@@ -117,7 +131,7 @@ fn cargo_step(
     StepSpec {
         name,
         cmd,
-        program: "cargo".to_string(),
+        program: CARGO.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
         timeout: Duration::from_secs(timeout_minutes * 60),
     }
@@ -212,7 +226,8 @@ fn run_step(spec: &StepSpec, log_dir: &std::path::Path) -> Result<StepResult> {
     println!("{} {}", spec.program, spec.args.join(" "));
 
     let started = Instant::now();
-    let mut child = Command::new(&spec.program)
+    let mut child = spec
+        .command()
         .args(&spec.args)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))

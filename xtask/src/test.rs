@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use std::{
     io::{BufRead, BufReader},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -31,7 +31,7 @@ pub enum Suite {
 
 fn invoke(args: &[&str]) -> Result<()> {
     println!("> cargo {}", args.join(" "));
-    let mut command = Command::new("cargo");
+    let mut command = crate::build::cargo_command();
     command.args(args);
     crate::build::use_local_protoc(&mut command);
     let status = command.status()?;
@@ -62,7 +62,7 @@ fn executed_in_summary(line: &str) -> Option<usize> {
 /// while counting executed tests, and fails when the filter matched none.
 fn invoke_focused(args: &[&str]) -> Result<()> {
     println!("> cargo {}", args.join(" "));
-    let mut command = Command::new("cargo");
+    let mut command = crate::build::cargo_command();
     command.args(args).stdout(Stdio::piped());
     crate::build::use_local_protoc(&mut command);
     let mut child = command.spawn()?;

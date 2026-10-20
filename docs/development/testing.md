@@ -26,13 +26,14 @@ once a change also needs `App`, `Store`, or MCP coverage.
 
 Pick one scoping strategy per session rather than mixing them: alternating
 between a `-p`-scoped command and an unscoped `cargo test --test integration
-<name>` (or `cargo build` vs `cargo xtask build`) can trigger a full,
+<name>` (feature unification differs) can trigger a full,
 unexpectedly slow rebuild instead of reusing the previous run's cache, since
 the two invocations don't always share build artifacts. If a command that
 should be instant suddenly starts recompiling `ring`/`rustls`/`lance*` from
 scratch, that's the likely cause -- let it finish once rather than
 interrupting it, and prefer `cargo xtask test --suite Full` for the next full
 check instead of another narrow invocation.
+Nested cargo runs from `xtask` drop the variables `cargo run` sets (`CARGO_MANIFEST_DIR`, `CARGO_PKG_*` and the like), so a direct `cargo clippy`/`cargo test` and a `cargo xtask test` suite with the same flags share one set of build artefacts.
 
 ## Prerequisites for the test gate
 
