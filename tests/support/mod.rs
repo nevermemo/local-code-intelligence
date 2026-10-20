@@ -25,6 +25,18 @@ use std::{
     time::Duration,
 };
 
+/// Seconds a test may give something that is slow only on a loaded machine: a
+/// fake language server's start (`lsp_timeout_seconds`, a timeout of
+/// inactivity), a readiness probe of the fake model services, or the cap of a
+/// wait on a real signal. Parallel cargo builds on a developer machine, and
+/// the slow Windows CI runner, stretched 5 s and 10 s budgets past their limit.
+/// It is for tests that assert behaviour, not speed: a test whose point is a
+/// timeout keeps its own short value and widens only its outer wait.
+const LOADED_BUDGET_SECONDS: u64 = 30;
+
+/// [`LOADED_BUDGET_SECONDS`] as a duration.
+const LOADED_BUDGET: Duration = Duration::from_secs(LOADED_BUDGET_SECONDS);
+
 /// Ports a test chose and then released for a server or a probe to take. The
 /// OS may hand a released port to the next `127.0.0.1:0` bind, and tests run
 /// in parallel threads: a client polling the chosen port would then reach that
@@ -447,9 +459,10 @@ fn write_csharp_workspace(root: &Path) {
 /// `config` with the C# language server replaced by the fake one (see
 /// `fake_lsp.rs`) in `workspace-symbols` mode, recording what it saw under
 /// `state_dir`. `extra_args` are more fake-server flags, for example
-/// `--ignore-shutdown`. `timeout_seconds` is the request timeout: 5 s is
-/// enough for a slow process start under load not to fail `initialize`, and a
-/// test that measures timing passes the value it was written with. Keep
+/// `--ignore-shutdown`. `timeout_seconds` is the request timeout: a test that
+/// does not depend on it passes [`LOADED_BUDGET_SECONDS`], so that a slow
+/// process start under load does not fail `initialize` (5 s and 10 s did), and
+/// a test that measures timing passes the value it was written with. Keep
 /// `config` from [`fixture`]: it points the model services at the fake ones,
 /// never at a real port.
 fn with_fake_csharp_server(

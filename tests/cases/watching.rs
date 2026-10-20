@@ -16,7 +16,7 @@ async fn unwatch_deleted_workspace_stops_the_task() {
     assert!(!stopped.watched && !stopped.already_in_requested_state);
     let weak = Arc::downgrade(&app);
     drop(app);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(LOADED_BUDGET, async {
         while weak.strong_count() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -37,7 +37,7 @@ async fn watcher_removes_itself_when_workspace_disappears() {
     app.watch(&workspace).await.unwrap();
     std::fs::remove_dir_all(&workspace).unwrap();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(LOADED_BUDGET, async {
         while Arc::strong_count(&app) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -105,7 +105,9 @@ async fn watcher_skips_a_queued_reindex_when_the_explicit_job_already_committed(
         .unwrap();
     assert_eq!(indexed.embedded_chunks, 1);
 
-    // Allow the queued pass to finish and several more polls to run.
+    // Kept on purpose: this shows that nothing more happens (the version below
+    // must not move). The queued pass may not have started yet, so `indexing`
+    // can be false already and the loop alone would pass before the pass ran.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while app.status(&workspace).await.unwrap().indexing {
@@ -157,7 +159,7 @@ async fn watcher_debounces_and_refreshes_changed_typescript_source() {
         "src/runtime.ts",
         "export function afterTelemetry() {}\n",
     );
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + LOADED_BUDGET;
     loop {
         let report = app
             .search(&workspace, "afterTelemetry", Some(1))
@@ -341,7 +343,7 @@ async fn unwatch_ends_a_watcher_pass_that_waits_behind_an_index_job() {
     app.unwatch(&workspace).await.unwrap();
     // The job and this test hold one reference each; a watcher still queued for
     // the write lock holds a third until the job ends, which it never does here.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(LOADED_BUDGET, async {
         while Arc::strong_count(&app) != 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
