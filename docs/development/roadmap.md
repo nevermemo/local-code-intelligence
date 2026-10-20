@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2b (verify on read), K7b-1 (shared LSP sessions); K8a after K7b-1. Rewrite this line at every push.
+In flight: K2b (verify on read), K0a follow-ups (M0 filler); K7b-2, then K8a. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -62,7 +62,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | **M1** | **Profile, freshness harness, no-service path** | | | |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
 | **M2** | **Language servers as the source of truth** | | | |
-| K7b | Shared LSP sessions across traverse calls (server lifetime), a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
+| K7b | Partly done: shared LSP sessions across traverse calls, `[run_profile.lsp] sessions` (d414). Remaining: a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
 | K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
 | K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps | Fake LSP event log | M | N2 |
 | K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` | `lsp.live` runs with `scip.mode = off` | M | - |

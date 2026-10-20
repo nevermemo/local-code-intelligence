@@ -62,7 +62,7 @@ mod tests;
 
 use crate::{
     app::App,
-    config::{RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    config::{LspSessions, RunProfileConfig, TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use first_stage::{
@@ -268,6 +268,12 @@ pub struct Call<'a> {
     /// The settings `lsp.live` starts its language servers with (server
     /// paths, `lsp_timeout_seconds`); `None` is the defaults.
     pub lsp: Option<&'a lci_core::config::Config>,
+    /// The language-server manager the call shares when `[run_profile.lsp]
+    /// sessions = "shared"`: the MCP and REST server's own, one per process for
+    /// `lci traverse`. Used only under `shared`; `None` there (a caller with no
+    /// manager of its own, the recipes) starts the call's own servers as under
+    /// `per_call`. Under `per_call` it is never read.
+    pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
 }
 
 /// Where a call keeps what it writes.
@@ -873,7 +879,9 @@ pub async fn run_with_trait_seeds(
     let mut lsp_live = None;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
-        // expansion and stops when the map drops.
+        // expansion. `per_call`: the manager is the map's alone, so the server
+        // stops when the map drops. `shared`: the caller's manager, whose
+        // owner stops the server (idle sweeper, release, shutdown).
         let workspace = dunce::canonicalize(root)
             .map(|path| lci_core::workspace::Workspace {
                 id: lci_core::workspace::hash(&path.to_string_lossy()),
@@ -882,8 +890,14 @@ pub async fn run_with_trait_seeds(
             .map_err(|error| error.to_string());
         let backend = match workspace {
             Ok(workspace) => {
-                let defaults = lci_core::config::Config::default();
-                ManagerBackend::open(workspace, call.lsp.unwrap_or(&defaults)).await
+                let manager = match (profile.lsp.sessions, &call.lsp_sessions) {
+                    (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
+                    _ => {
+                        let defaults = lci_core::config::Config::default();
+                        Arc::new(lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults)))
+                    }
+                };
+                ManagerBackend::open(workspace, manager).await
             }
             Err(error) => Err(error),
         };
@@ -1426,6 +1440,7 @@ pub async fn search(
         steer: steer.unwrap_or(&no_steer),
         handle,
         lsp: Some(config),
+        lsp_sessions: Some(app.language_servers()),
     };
     Ok(run(
         limits,

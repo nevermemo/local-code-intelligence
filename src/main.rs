@@ -736,6 +736,12 @@ async fn run_traverse(
         )))),
         _ => None,
     };
+    // `[run_profile.lsp] sessions = "shared"`: this process's one set of
+    // language servers, which a CLI call has no other user of. Stopped here
+    // (cleanly, once the walk ends) instead of at process exit.
+    let lsp_sessions = (config.run_profile.lsp.sessions
+        == local_code_intelligence::config::LspSessions::Shared)
+        .then(|| std::sync::Arc::new(lsp::Manager::new(&config)));
     let report = traverse::run_with_trait_seeds(
         &config.traverse,
         &config.run_profile,
@@ -752,10 +758,15 @@ async fn run_traverse(
             steer: &steer,
             handle: args.handle.as_deref(),
             lsp: Some(&config),
+            lsp_sessions: lsp_sessions.clone(),
         },
         args.trait_seeds,
     )
-    .await?;
+    .await;
+    if let Some(sessions) = &lsp_sessions {
+        sessions.shutdown_all().await;
+    }
+    let report = report?;
     if let Some(trace) = &report.trace {
         eprintln!("trace {}", trace.display());
     }

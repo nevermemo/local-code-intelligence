@@ -536,6 +536,18 @@ grep_corroboration = 1.0
 [run_profile.scip]
 mode = "authoritative"
 
+# [run_profile.lsp]: whose language servers the lsp.live map asks (the map is
+# opt-in: name it in `maps`).
+# sessions = "per_call" (default): every traverse call starts its own servers
+# and stops them when its walk ends. "shared": the calls of this process use one
+# set of servers, the one that navigation and the search channel use, so a cold
+# start is paid once; a server stops when it has been idle for
+# lsp_idle_timeout_seconds, on release_workspace and at service shutdown, not
+# when a walk ends. The recipes never run lsp.live and are the same under both.
+# Part of the run-profile hash.
+[run_profile.lsp]
+sessions = "per_call"
+
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
 # the typed service behind `rescorer = "system_one"`. Off when the section is

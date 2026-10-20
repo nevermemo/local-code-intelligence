@@ -39,14 +39,27 @@
 //! A cold server start can exceed the default `[traverse] deadline_ms` (5000):
 //! a cold rust-analyzer took about 8 s to answer its first request, so the
 //! walk that starts a cold server may return [`DEADLINE_NOTE`] and no edges
-//! from this map (the server stops with the map, when the walk ends).
+//! from this map (under `per_call` the server stops with the map, when the walk
+//! ends; a shared server keeps starting for the next call).
 //!
-//! The server starts at the first request (not when the map is built), is
-//! reused for the walk and stops when the map is dropped:
-//! [`ManagerBackend`] owns the `lci-core` language-server manager, whose client
-//! ends the server's whole process tree when it drops. A missing server binary
-//! is found by [`ManagerBackend::open`], before any walk, as an error the
-//! caller reports; the map is then not registered.
+//! The server starts at the first request (not when the map is built) and is
+//! reused for the walk. Who stops it is the manager [`ManagerBackend::open`]
+//! is given:
+//!
+//! * a manager that only the map holds (`[run_profile.lsp] sessions =
+//!   "per_call"`, the default: the caller builds one per call): the server
+//!   stops when the map is dropped, because the manager's clients end the
+//!   server's whole process tree when they drop;
+//! * the process's own manager (`sessions = "shared"`: the MCP and REST
+//!   server's, the one navigation and the search channel use): dropping the
+//!   map stops nothing. The server stays for the next call and ends with that
+//!   manager's idle sweeper (`lsp_idle_timeout_seconds`), `release_workspace`,
+//!   a stuck-session replacement or service shutdown.
+//!
+//! A missing server binary is found by [`ManagerBackend::open`], before any
+//! walk, as an error the caller reports; the map is then not registered. The
+//! version probe of a server runs once per manager ([`Manager::probe_once`]),
+//! so a shared manager probes a binary once, not on every call.
 
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
@@ -57,7 +70,6 @@ use crate::{
     scip_graph::ScipMap,
 };
 use lci_core::{
-    config::Config,
     language,
     lsp::{Location, Manager, adapter::LspAdapter},
     node::{NodeId, NodeKind},
@@ -184,24 +196,26 @@ impl SymbolPlaces for ScipPlaces {
     }
 }
 
-/// The language servers of `lci-core`, through its [`Manager`]: one session
-/// per server and workspace, started by its first request.
+/// The language servers of `lci-core`, through a [`Manager`]: one session per
+/// server and workspace, started by its first request. The manager is shared
+/// (an `Arc`): a caller that keeps another reference keeps the sessions alive
+/// past this backend (see the module notes).
 pub struct ManagerBackend {
-    manager: Manager,
+    manager: Arc<Manager>,
     workspace: Workspace,
     /// The enabled servers whose binary answered the version probe.
     adapters: Vec<Arc<dyn LspAdapter>>,
 }
 
 impl ManagerBackend {
-    /// Probes the enabled servers (`--version`, no session) and keeps the ones
-    /// that answer. An error when none does, naming each failure.
-    pub async fn open(workspace: Workspace, config: &Config) -> Result<Self, String> {
-        let manager = Manager::new(config);
+    /// Probes the enabled servers of `manager` (`--version`, no session; once
+    /// per provider and manager) and keeps the ones that answer. An error when
+    /// none does, naming each failure.
+    pub async fn open(workspace: Workspace, manager: Arc<Manager>) -> Result<Self, String> {
         let mut adapters = Vec::new();
         let mut failures = Vec::new();
         for adapter in manager.adapters().iter().filter(|a| a.enabled()) {
-            match adapter.probe_readiness(PROBE_TIMEOUT).await {
+            match manager.probe_once(adapter, PROBE_TIMEOUT).await {
                 Ok(()) => adapters.push(Arc::clone(adapter)),
                 Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
             }

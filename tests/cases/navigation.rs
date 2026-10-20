@@ -4656,3 +4656,202 @@ async fn documents_fake_serves_manager_navigation_and_outline() {
     );
     manager.shutdown_all().await;
 }
+
+// ---- `lsp.live` under `[run_profile.lsp] sessions` (K7b-1) -----------------
+
+/// A SCIP index over the C# fixture of [`fake_csharp_fixture`]: `Add`
+/// (`src/Calculator.cs`, line 1) and `Run` (`src/CallSite.cs`, line 1), whose
+/// text calls `Add`. It lives next to the workspace, never in it. The graph
+/// has no call edge: the only way from `Add` to `Run` is `lsp.live`'s
+/// `textDocument/references`.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn csharp_scip_index(temp: &tempfile::TempDir, workspace: &Workspace) -> std::path::PathBuf {
+    use scip::types::{Document, Index, Occurrence, SymbolInformation, symbol_information::Kind};
+    let symbol = |name: &str| format!("rust-analyzer cargo demo 0.1.0 acceptance/{name}().");
+    let line_of = |file: &str| {
+        let text = std::fs::read_to_string(workspace.path.join(file)).unwrap();
+        text.lines().nth(1).unwrap().to_owned()
+    };
+    let definition = |name: &str, line: &str| {
+        let col = line.find(name).unwrap() as i32;
+        let mut o = Occurrence::default();
+        o.range = vec![1, col, col + name.len() as i32];
+        o.symbol = symbol(name);
+        o.symbol_roles = 1;
+        o.enclosing_range = vec![1, 0, 1, line.len() as i32];
+        o
+    };
+    let info = |name: &str| {
+        let mut i = SymbolInformation::default();
+        i.symbol = symbol(name);
+        i.kind = Kind::Function.into();
+        i
+    };
+    let (calculator, call_site) = (line_of("src/Calculator.cs"), line_of("src/CallSite.cs"));
+    let mut add = Document::default();
+    add.relative_path = "src/Calculator.cs".to_owned();
+    add.occurrences = vec![definition("Add", &calculator)];
+    add.symbols = vec![info("Add")];
+    let mut run = Document::default();
+    run.relative_path = "src/CallSite.cs".to_owned();
+    run.occurrences = vec![definition("Run", &call_site)];
+    run.symbols = vec![info("Run")];
+    let mut message = Index::default();
+    message.documents = vec![add, run];
+    let index = temp.path().join("index.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+    index
+}
+
+/// The C# fixture with the `documents`-mode fake and a request timeout that a
+/// slow start under load does not exceed; rust-analyzer is pointed at a binary
+/// that does not exist, so no test depends on one being installed.
+fn shared_sessions_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
+    config.lsp_timeout_seconds = 10;
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    let index = csharp_scip_index(temp, &workspace);
+    (config, workspace, state, index)
+}
+
+/// One `lsp.live` traversal of `Add` over the fixture, under `sessions`, with
+/// `manager` offered as the shared manager. The budgets are wide: a cold fake
+/// server starts well inside them even on a loaded machine.
+async fn traverse_add(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    sessions: local_code_intelligence::config::LspSessions,
+    manager: &Arc<Manager>,
+) -> Value {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{LspProfile, RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: 60_000,
+        ..TraverseConfig::default()
+    };
+    let profile = RunProfileConfig {
+        lsp: LspProfile { sessions },
+        ..RunProfileConfig::default()
+    };
+    let (budget, steer) = (
+        BudgetArgs {
+            deadline_ms: Some(60_000),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
+    let seeds = ["sym:rust:Calculator.cs::Add/fn".to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who uses Add",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: Some(config),
+        lsp_sessions: Some(Arc::clone(manager)),
+    };
+    run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+/// Whether the answer reached `Run` through `lsp.live`.
+fn reached_run_through_lsp_live(answer: &Value) -> bool {
+    answer["results"].as_array().is_some_and(|cards| {
+        cards.iter().any(|card| {
+            card["node"].as_str() == Some("sym:rust:CallSite.cs::Run/fn")
+                && card.to_string().contains("lsp.live")
+        })
+    })
+}
+
+#[tokio::test]
+async fn two_traverse_calls_share_one_language_server_under_shared_sessions() {
+    use local_code_intelligence::config::LspSessions;
+    for (sessions, spawned) in [(LspSessions::Shared, 1), (LspSessions::PerCall, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+        // The same manager is offered in both arms; only `shared` uses it.
+        let manager = Arc::new(Manager::new(&config));
+        for call in 1..=2 {
+            let answer = traverse_add(&config, &workspace, &index, sessions, &manager).await;
+            assert!(
+                reached_run_through_lsp_live(&answer),
+                "{sessions:?}, call {call}: no lsp.live edge to Run: {answer}"
+            );
+        }
+        assert_eq!(
+            state_count(&state, "spawn_count.txt"),
+            spawned,
+            "{sessions:?}: language servers started by two calls"
+        );
+        manager.shutdown_all().await;
+    }
+}
+
+#[tokio::test]
+async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
+    use local_code_intelligence::config::LspSessions;
+    let server_of = |state: &std::path::Path| -> u32 {
+        std::fs::read_to_string(state.join("pid.txt"))
+            .expect("the fake server records its process id on its first request")
+            .trim()
+            .parse()
+            .expect("a process id")
+    };
+
+    // `shared`: the walk is over, the server is not; releasing the workspace
+    // of the shared manager stops it.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    let manager = Arc::new(Manager::new(&config));
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    let server = server_of(&state);
+    assert!(
+        process_is_running(server).await,
+        "the shared server keeps running after the walk"
+    );
+    assert_eq!(manager.release(&workspace.id).await, ["csharp-ls"]);
+    wait_until_process_ends(
+        "the released shared server to end",
+        server,
+        DROP_KILL_DEADLINE,
+    )
+    .await;
+    assert!(manager.release(&workspace.id).await.is_empty());
+
+    // `per_call`: the server is the walk's own and ends with it, whatever
+    // manager the call was offered.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    let manager = Arc::new(Manager::new(&config));
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::PerCall, &manager).await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    wait_until_process_ends(
+        "the per-call server to end with its walk",
+        server_of(&state),
+        DROP_KILL_DEADLINE,
+    )
+    .await;
+    assert!(
+        manager.release(&workspace.id).await.is_empty(),
+        "the offered manager never held a session"
+    );
+}

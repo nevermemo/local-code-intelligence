@@ -32,7 +32,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
 | `lexical`, `lsp` | core | Independent, fail-open retrieval channels (ripgrep with BM25 scoring; language-server symbols) |
 | `filter` | core | Validates retrieval controls (`FilterRequest` to `EffectiveFilter`) and classifies source roles |
-| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
+| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index; `[run_profile.lsp]`: `sessions`, per call or shared, which `app::traverse::run` reads to pick the call's language-server manager) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
 | `evaluate` | root | Measures retrieval behaviour without influencing ranking (see Evaluation harness) |
 | `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse` (`src/app/traverse/`: `mod` holds the types, `run` and registration; `index` the SCIP index and map loading; `seeds` the seed search; `rescore` the `GraphRescorer`; `response` the response builders; `first_stage`, `presets`, `chunks`); named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
 | `server`, `rest`, `main` | root | MCP (rmcp, streamable HTTP), the REST/OpenAPI mirror on the same process and port, and the CLI |
@@ -119,7 +119,14 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   `#`, plus a singular form for plurals), providers in parallel, each under `lsp_search_budget_ms` (1500); a provider
   over budget adds a note, a provider that fails adds a warning; locations map onto chunks of the same language that
   contain `start_line`; capped at `lsp_candidate_count` (40). Navigation tools (`symbols`, `definition`, `references`)
-  are not fused, return raw `Location`s and need an index containing the file's language.
+  are not fused, return raw `Location`s and need an index containing the file's language. The `lsp.live` map of a
+  traversal (`lci-maps` `lsp_live`) asks a `Manager` it is given (`ManagerBackend::open(workspace, Arc<Manager>)`). Under
+  `[run_profile.lsp] sessions = "per_call"` (default) `app::traverse::run` builds one per call, so the map owns it and its
+  server dies with the map; under `"shared"` it uses `Call.lsp_sessions`, the `Arc<Manager>` that `App::language_servers()`
+  hands out (the service's own, so a server started by navigation, search or a traverse call serves the others; the CLI
+  `traverse` builds one per process and shuts it down after the walk), and the server's lifetime is the manager's (idle
+  sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful version probe per provider for
+  the manager's life. The recipes walk no `lsp.live` and pass no manager.
 - **Model clients** (`lci-core` `models`): `embed` POSTs to `<embedding_url>/embeddings` and validates count, index,
   finiteness, non-zero vectors and one dimension; indexing retries up to 3 attempts (`MAX_ATTEMPTS`) with doubling
   backoff, `query` makes one attempt. Any refused connection trips a breaker for 30 s (`EMBEDDER_DOWN_WINDOW`): `query` and `embed_once` then skip at once

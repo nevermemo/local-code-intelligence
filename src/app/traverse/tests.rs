@@ -566,6 +566,7 @@ async fn the_reranker_frontier_needs_the_application() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let limits = TraverseConfig {
         rerank_frontier: true,
@@ -653,6 +654,7 @@ impl Tree {
             steer,
             handle,
             lsp: None,
+            lsp_sessions: None,
         };
         Ok(run(
             limits,
@@ -840,6 +842,7 @@ fn a_handle_is_bound_to_the_workspace_and_the_index() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let stamped = |len: u64| {
         let mut loaded = loaded();
@@ -1239,6 +1242,7 @@ async fn seeds_for(
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     find_seeds(&limits(), &call, &loaded(), wanted)
         .await
@@ -1332,6 +1336,7 @@ async fn the_tree_maps_are_named_not_default_and_need_the_root() {
                 steer: &steer,
                 handle: None,
                 lsp: None,
+                lsp_sessions: None,
             };
             run(&limits(), &RunProfileConfig::default(), &dirs, &call)
                 .await
@@ -1388,6 +1393,7 @@ async fn first_stage_run(tree: &Tree, limits: &TraverseConfig, maps: Option<&[&s
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     run(
         limits,
@@ -1510,6 +1516,7 @@ async fn policy_run(
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     run(
         limits,
@@ -1668,6 +1675,7 @@ async fn a_policy_map_that_needs_the_tree_is_reported_when_there_is_no_tree() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let response = run(
         &limits,
@@ -1730,6 +1738,7 @@ async fn a_policy_adds_its_maps_only_when_the_call_names_none() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let error = run(
         &bad,
@@ -1781,6 +1790,7 @@ async fn a_continuation_does_not_run_the_first_stage_again() {
         steer: &steer,
         handle: Some(&handle),
         lsp: None,
+        lsp_sessions: None,
     };
     let next = run(
         &limits,
@@ -1909,6 +1919,7 @@ impl ScipTree {
             steer: &steer,
             handle: None,
             lsp: None,
+            lsp_sessions: None,
         };
         run(
             limits,
@@ -2189,6 +2200,7 @@ async fn a_hybrid_search_slower_than_the_deadline_does_not_starve_the_walk() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let response = run(
         &limits(),
@@ -2243,6 +2255,7 @@ async fn lsp_live_starts_the_servers_the_call_configures() {
         steer: &steer,
         handle: None,
         lsp: Some(&lsp),
+        lsp_sessions: None,
     };
     let dirs = Dirs::under(tree.path());
     let report = run(&limits(), &RunProfileConfig::default(), &dirs, &call)
@@ -2250,6 +2263,63 @@ async fn lsp_live_starts_the_servers_the_call_configures() {
         .unwrap();
     let notes = report.response["notes"].to_string();
     assert!(notes.contains("lsp.live is unavailable"), "{notes}");
+}
+
+/// Which language-server settings `lsp.live` opens under `[run_profile.lsp]
+/// sessions`: the settings of the call's own (`per_call`, and `shared` when the
+/// call has no manager) or the manager's (`shared`). Each names a server binary
+/// that does not exist, and the note of the missing one says whose it was.
+#[tokio::test]
+async fn lsp_live_opens_the_call_settings_or_the_shared_manager_as_the_profile_says() {
+    use lci_core::config::{LspProfile, LspSessions};
+    let tree = tempfile::tempdir().unwrap();
+    let index = tree.path().join("index.scip");
+    std::fs::write(&index, []).unwrap();
+    let missing = |name: &str| lci_core::config::Config {
+        rust_analyzer_path: name.into(),
+        ..Default::default()
+    };
+    let (own, shared) = (missing("lci-missing-own"), missing("lci-missing-shared"));
+    let manager = Arc::new(lci_core::lsp::Manager::new(&shared));
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let maps = [LSP_LIVE_ID.to_owned()];
+    let notes_of = |sessions: LspSessions, offered: Option<Arc<lci_core::lsp::Manager>>| {
+        let (index, tree, budget, steer, maps, own) = (&index, &tree, &budget, &steer, &maps, &own);
+        async move {
+            let call = Call {
+                scip_index: index,
+                scip_root: Some(tree.path()),
+                question: "q",
+                seeds: &[],
+                seed_search: None,
+                top_k: 8,
+                maps: Some(maps),
+                budget,
+                steer,
+                handle: None,
+                lsp: Some(own),
+                lsp_sessions: offered,
+            };
+            let profile = RunProfileConfig {
+                lsp: LspProfile { sessions },
+                ..RunProfileConfig::default()
+            };
+            let dirs = Dirs::under(tree.path());
+            let report = run(&limits(), &profile, &dirs, &call).await.unwrap();
+            report.response["notes"].to_string()
+        }
+    };
+    let per_call = notes_of(LspSessions::PerCall, Some(manager.clone())).await;
+    assert!(per_call.contains("lci-missing-own"), "{per_call}");
+    assert!(!per_call.contains("lci-missing-shared"), "{per_call}");
+    let shared_notes = notes_of(LspSessions::Shared, Some(manager.clone())).await;
+    assert!(
+        shared_notes.contains("lci-missing-shared"),
+        "{shared_notes}"
+    );
+    assert!(!shared_notes.contains("lci-missing-own"), "{shared_notes}");
+    let alone = notes_of(LspSessions::Shared, None).await;
+    assert!(alone.contains("lci-missing-own"), "{alone}");
 }
 
 #[tokio::test]
@@ -2267,6 +2337,7 @@ async fn a_tie_break_file_that_cannot_be_read_is_an_error() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let limits = TraverseConfig {
         tie_break: Some("no-such-tie-break.json".into()),
@@ -2372,6 +2443,7 @@ async fn the_beam_decides_how_many_of_a_nodes_edges_the_walk_follows() {
                 steer,
                 handle: None,
                 lsp: None,
+                lsp_sessions: None,
             };
             let limits = TraverseConfig { beam, ..limits() };
             let response = run(
@@ -2545,6 +2617,7 @@ async fn trait_run_top(
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     run_with_trait_seeds(
         &limits(),
@@ -2799,6 +2872,7 @@ async fn without_scip_implements_a_trait_path_changes_nothing() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let plain = find_seeds(&limits(), &call, &loaded, &[SEEDS_MAP, SCIP_MAP_ID])
         .await
@@ -2961,6 +3035,7 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let dirs = Dirs::under(tree.dir.path());
     // The default profile ranks as ever and says nothing about grouping.
@@ -3047,6 +3122,7 @@ async fn freshness_call(
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     run(&limits(), &profile, &Dirs::under(data), &call)
         .await
@@ -3250,6 +3326,7 @@ async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() 
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let response = run(&limits(), &profile, &Dirs::under(data.path()), &call)
         .await
@@ -3398,6 +3475,7 @@ impl ScipFileTree {
             steer: &steer,
             handle,
             lsp: None,
+            lsp_sessions: None,
         };
         let mut profile = RunProfileConfig::default();
         profile.scip.mode = mode;

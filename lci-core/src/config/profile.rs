@@ -26,6 +26,8 @@ pub struct RunProfileConfig {
     pub walk: WalkProfile,
     /// `[run_profile.scip]`: how a traversal treats the SCIP index.
     pub scip: ScipProfile,
+    /// `[run_profile.lsp]`: how `lsp.live` gets its language servers.
+    pub lsp: LspProfile,
 }
 
 /// What a traversal does with the SCIP index (`[run_profile.scip] mode`).
@@ -150,6 +152,56 @@ impl Default for WalkProfile {
             grep_corroboration: 1.0,
         }
     }
+}
+
+/// Whose language-server sessions `lsp.live` asks (`[run_profile.lsp] sessions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspSessions {
+    /// Every traverse call starts its own servers and stops them when its
+    /// walk ends. Today's behaviour.
+    #[default]
+    PerCall,
+    /// The calls of one process share that process's language servers (the
+    /// ones navigation and the search channel use): a server started by one
+    /// call is reused by the next and stops with the idle timeout,
+    /// `release_workspace` or service shutdown.
+    Shared,
+}
+
+impl LspSessions {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerCall => "per_call",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+impl std::str::FromStr for LspSessions {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "per_call" => Ok(Self::PerCall),
+            "shared" => Ok(Self::Shared),
+            other => Err(format!(
+                "sessions must be \"per_call\" or \"shared\" (got {other:?})"
+            )),
+        }
+    }
+}
+
+/// `[run_profile.lsp]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspProfile {
+    /// `"per_call"` (default): each traverse call starts and stops its own
+    /// language servers. `"shared"`: the calls of a process reuse one set (see
+    /// [`LspSessions`]). The set lives in a manager that the caller supplies:
+    /// the MCP and REST server's own, or one per process for `lci traverse`.
+    /// The recipes walk no `lsp.live` and run the same under both values.
+    pub sessions: LspSessions,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -426,6 +478,7 @@ mod tests {
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
+        config.run_profile.lsp.sessions = LspSessions::Shared;
         config
     }
 
@@ -480,7 +533,7 @@ mod tests {
         assert!(
             base.canonical
                 .contains(
-                    r#""run_profile":{"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
+                    r#""run_profile":{"lsp":{"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
                 )
         );
         let mut claim = Config::default();
@@ -626,7 +679,7 @@ mode = \"sometimes\"
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "195065ed32394b9055ad9bc5644ef7ca5e5a587a6e2473a778e0699db2664f67",
+            "7ba4de4746690a60f09e958f21522e8e0d7d748ed7837da51b1b40223cf7a218",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -645,6 +698,7 @@ mode = \"sometimes\"
             "run_profile.walk.grep_corroboration",
             "run_profile.traverse.map_freshness",
             "run_profile.scip.mode",
+            "run_profile.lsp.sessions",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -704,6 +758,44 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn lsp_sessions_are_per_call_by_default_and_change_the_profile_hash() {
+        let off = Config::default();
+        assert_eq!(off.run_profile.lsp.sessions, LspSessions::PerCall);
+        let text = format!("{}[run_profile.lsp]\nsessions = \"shared\"\n", base_toml());
+        let shared: Config = toml::from_str(&text).unwrap();
+        shared.validate().unwrap();
+        assert_eq!(shared.run_profile.lsp.sessions, LspSessions::Shared);
+        assert_eq!(
+            serde_json::to_value(&shared).unwrap()["run_profile"]["lsp"]["sessions"],
+            "shared"
+        );
+        let (off, shared) = (off.run_profile(), shared.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["sessions"], "per_call");
+        assert_eq!(shared.value["run_profile"]["lsp"]["sessions"], "shared");
+        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.sessions"));
+        assert_ne!(off.hash, shared.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsessions = \"per_call\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.lsp]\nsessions = \"always\"\n",
+            "[run_profile.lsp]\nsessions = true\n",
+            "[run_profile.lsp]\nfoo = 1\n",
+            "[run_profile]\nsessions = \"shared\"\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        assert_eq!(LspSessions::Shared.as_str(), "shared");
+        assert_eq!("per_call".parse::<LspSessions>(), Ok(LspSessions::PerCall));
+        assert!("per-call".parse::<LspSessions>().is_err());
+    }
+
+    #[test]
     fn the_default_profile_hash_is_pinned() {
         // Changes whenever a default, a Config key or the deny-list changes:
         // update it with the reason in the commit.
@@ -711,9 +803,10 @@ mode = \"sometimes\"
         // `grep_corroboration`) gave the section its two leaves.
         // K2a-2: c10fe368... before `[run_profile.traverse] map_freshness`.
         // K20a: 854c4164... before `[run_profile.scip] mode` added its leaf.
+        // K7b-1: e4cab053... before `[run_profile.lsp] sessions`.
         assert_eq!(
             Config::default().run_profile().hash,
-            "e4cab053b94a84d8d42e1c019f4ad3b3db9246a56ddfe20583ce06319f20a7a8"
+            "7c5a1ce880f62c278a0948d3c60edcdb3d7dd6cae2e869428a2514384298f0c3"
         );
     }
 }
