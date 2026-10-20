@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2b (verify on read), K0a follow-ups (M0 filler); K7b-2, then K8a. Rewrite this line at every push.
+In flight: K2b (verify on read), K0a follow-ups (M0 filler), load-flaky tests (d418); speed-up lane first (owner), then K7b-2, then K8a. Rewrite this line at every push.
 
 ## Cycle 1
 
