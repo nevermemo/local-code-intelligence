@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2a-1 (freshness harness), N20 c and d, K2b planning; K7b after K2a-1. Rewrite this line at every push.
+In flight: K2a-1 (freshness harness), K7b-1 (shared LSP sessions), K8a planning; K2b after K2a-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -104,7 +104,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K19 | `grep.structural` map over ast-grep-core (pinned, after K15a) | Ceiling on structural queries | M | - |
 | K31 | Opengrep data-flow map, opt-in | Ceiling on a flow set | M | - |
 | K32 | Verify which planned maps exist (`tests.tested_by`, `docs.mentions`, pickaxe as a walk map); build the missing ones | Ceiling per map | XS each | - |
-| K37a | One request queue per server | Load test | S | N20 (a, b, e) |
+| K37a | One request queue per server | Load test | S | N20 (a, b, d scan residue, e) |
 | K37b | Concurrent walks | Load test | S | - |
 | K37c | `probe.compile` runs `cargo check`, which can execute build scripts: a bounded sandbox, or opt-in only with a warning | Test | S | - |
 | K36 | Language scope table: server, syntax tier and gold per language | Docs | XS | - |
@@ -115,7 +115,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 
-M0 filler, any time a build slot is free: N20 (c, d); K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404); K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410).
+M0 filler, any time a build slot is free: K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404); K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410).
 
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
@@ -164,7 +164,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N8 | The LSP channel goes dark for 15 to 25 s windows under back-to-back searches (hypothesis: rust-analyzer swaps its crate graph after build scripts and proc macros load, invalidating the primed symbol index); diagnose and fix (roadmap@bbd3292 N8) | absorbed(K7b (readiness); the live diagnosis stays open) | S-M, live | N7 done |
 | N16 rest | A workspace search on a legacy-only table waits on the store-wide legacy guard; the revision pin and the re-read after a commit during the freshness check are not pinned by a failing test (roadmap@bbd3292 N16) | ready | S | - |
 | N18 | Low batch (item (b), the Java readiness probe, was fixed as N77, d190): (a) `manifest::save` removes the destination before `rename`; (c) `serve --port 0` advertises port 0; (d) three navigation tests assert rust-analyzer's flag; (e) the embedding model listing is probed at the origin; (f) no per-file size cap (roadmap@bbd3292 N18) | ready | XS each | - |
-| N20 | Cancellation and lock scope: (a) the MCP index and search handlers ignore the request's cancellation token; (b) lock scope; (c) `unwatch` race; (d) blocking lock inside `spawn_blocking`; (e) Ctrl+C graceful shutdown has no deadline (roadmap@bbd3292 N20) | ready | S-M | N16 done |
+| N20 | Cancellation and lock scope: (a) the MCP index and search handlers ignore the request's cancellation token; (b) lock scope; (c) done (a watcher pass queued for the workspace write lock ends on `unwatch`); (d) partly done (the data-directory file lock was fixed in N91; a `probe.compile` probe now waits for its scratch-checkout gate only as long as the query budget; still open: the scan threads in `src/app/indexing.rs` (`chunk::scan_incremental_with`, `fingerprint_with`) outlive a dropped request and run to their end, which needs cooperative cancellation in the scanner); (e) Ctrl+C graceful shutdown has no deadline (roadmap@bbd3292 N20) | ready | S-M | N16 done |
 | N21 | Two open test-quality items (a third, a fixed 500 ms sleep in the data-dir lock test, was fixed as N83, d193): (a) `evaluation_reports_required_failures_optional_skips_and_json_metrics` checks only that `hit_at_1_rate`, `mrr` and `role_distribution` exist, not their values (check whether another test pins them); (b) its last assert checks an `EvaluationFile` the test built itself (tautological): exercise `load_definition` instead (roadmap@bbd3292 N21) | ready | XS | - |
 | N25 | Six weak assertions in `tests/cases/indexing.rs`: (a) `a_hung_reranker_is_tried_once_and_keeps_earlier_warnings` sets a 1 s reranker timeout but bounds the elapsed time at 10 s; (b) the unreachable-reranker test asserts only `reranking_ms` < 5000 (count accepted connections instead); (c) the 200 ms budget tests use 150 to 1200 ms bounds; (d) a stop-word query is not in the fixture; (e) the traced-search test lacks a rank >= 1 assert; (f) the `mixed_languages` deletion test checks top-8 over equal vectors without a chunk count (roadmap@bbd3292 N25) | ready | XS | - |
 | N26 c | `search_symbols` has no result cap; record the size of a broad name's answer first (roadmap@bbd3292 N26) | ready | XS | - |

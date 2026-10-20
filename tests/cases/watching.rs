@@ -309,3 +309,52 @@ async fn sigterm_ends_serve_while_a_reindex_waits_for_another_process_lock() {
     assert_eq!(status.code(), Some(143), "serve exit status: {status}");
     drop(lock);
 }
+
+#[tokio::test]
+async fn unwatch_ends_a_watcher_pass_that_waits_behind_an_index_job() {
+    let (temp, mut config, fake, task) = fixture().await;
+    config.index.freshness = IndexFreshness::Watch;
+    config.watch_poll_milliseconds = 5;
+    config.watch_debounce_milliseconds = 5;
+    let workspace = temp.path().join("watched");
+    write(&workspace, "lib.rs", "fn before() {}\n");
+    let app = Arc::new(App::open(config).await.unwrap());
+    app.index(&workspace).await.unwrap();
+
+    // An explicit job holds the workspace write lock at the embedder, so the
+    // watcher's pass for the changed file queues behind it.
+    write(&workspace, "lib.rs", "fn after() {}\n");
+    fake.hold_documents.store(true, Ordering::SeqCst);
+    let indexing_app = app.clone();
+    let indexing_workspace = workspace.clone();
+    let job = tokio::spawn(async move { indexing_app.index(&indexing_workspace).await });
+    tokio::time::timeout(Duration::from_secs(30), fake.document_held.notified())
+        .await
+        .expect("explicit index did not reach the held embedder");
+    app.watch(&workspace).await.unwrap();
+    // The watcher polls every 5 ms and debounces for 5 ms; this is the one
+    // timed wait. It lets the pass queue before `unwatch` (a watcher that was
+    // not yet queued would end by its cancelled poll and the test could not
+    // tell the fix from the bug).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    app.unwatch(&workspace).await.unwrap();
+    // The job and this test hold one reference each; a watcher still queued for
+    // the write lock holds a third until the job ends, which it never does here.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&app) != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the unwatched watcher is still queued behind the index job");
+
+    fake.hold_documents.store(false, Ordering::SeqCst);
+    fake.release_documents.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), job)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    task.abort();
+}
