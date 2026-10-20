@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fmt,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -109,9 +110,54 @@ pub struct TransportConfig {
     pub label: String,
 }
 
+/// The program to start for a configured server `executable` (a bare name or a
+/// path): on Windows, a name or path without an extension is looked up as
+/// `<it>.exe` and then `<it>.cmd` (a bare name directory by directory along
+/// `PATH`), so that `typescript-language-server`, or an extensionless path to an
+/// npm install, starts the `.cmd` shim the way a shell would. `PATHEXT` is not
+/// consulted: a `.bat` is not found by name, only by a path that names it.
+/// A relative path with a directory part comes back absolute, because the
+/// server starts in the workspace directory, not in ours. `CreateProcess` itself appends only `.exe`, and a path that
+/// names a file (`x.cmd`, `x.bat`, `x.exe`) needs no help: the standard
+/// library runs a `.cmd` or `.bat` through `cmd.exe`. Elsewhere, and when
+/// nothing is found, the configured value is returned unchanged so the spawn
+/// error names what the user wrote.
+pub(crate) fn resolve_executable(executable: &str) -> std::ffi::OsString {
+    resolve_executable_in(
+        Path::new(executable),
+        std::env::var_os("PATH").as_deref(),
+        cfg!(windows),
+    )
+    .map_or_else(|| executable.into(), PathBuf::into_os_string)
+}
+
+/// [`resolve_executable`] over an explicit `PATH` value and platform, so the
+/// lookup is testable anywhere. `None` when there is nothing to change.
+fn resolve_executable_in(
+    executable: &Path,
+    path: Option<&OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if !windows || executable.extension().is_some() {
+        return None;
+    }
+    let bare = executable.components().count() == 1
+        && matches!(executable.components().next(), Some(Component::Normal(_)));
+    if bare {
+        // Only the Win32 names: npm installs an extensionless POSIX script
+        // beside the shim, and it must not hide a shim further along `PATH`.
+        return crate::lexical::find_windows_program_on_path_in(executable.to_str()?, path);
+    }
+    let found = ["exe", "cmd"]
+        .into_iter()
+        .map(|extension| executable.with_extension(extension))
+        .find(|candidate| candidate.is_file())?;
+    Some(std::path::absolute(&found).unwrap_or(found))
+}
+
 impl TransportConfig {
     pub(crate) fn command(&self, environment: &[(String, String)]) -> Command {
-        let mut command = Command::new(&self.executable);
+        let mut command = Command::new(resolve_executable(&self.executable));
         command
             .args(&self.args)
             .envs(environment.iter().map(|(key, value)| (key, value)))
@@ -901,5 +947,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_windows_server_name_without_an_extension_finds_its_cmd_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("typescript-language-server.cmd");
+        // npm installs the extensionless POSIX script beside the shim.
+        std::fs::write(dir.path().join("typescript-language-server"), b"").unwrap();
+        std::fs::write(&shim, b"").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        // a bare name is found on PATH, and the shim beats the POSIX script
+        assert_eq!(
+            resolve_executable_in(
+                Path::new("typescript-language-server"),
+                Some(path.as_os_str()),
+                true
+            ),
+            Some(shim.clone())
+        );
+        // an extensionless path gets the shim beside it
+        assert_eq!(
+            resolve_executable_in(&dir.path().join("typescript-language-server"), None, true),
+            Some(shim.clone())
+        );
+        // a name with an extension, a missing tool, and other platforms are left alone
+        assert_eq!(
+            resolve_executable_in(&shim, Some(path.as_os_str()), true),
+            None
+        );
+        assert_eq!(
+            resolve_executable_in(Path::new("absent"), Some(path.as_os_str()), true),
+            None
+        );
+        assert_eq!(
+            resolve_executable_in(
+                Path::new("typescript-language-server"),
+                Some(path.as_os_str()),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_posix_script_early_on_path_does_not_hide_a_later_cmd_shim() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("pyright-langserver"), b"").unwrap();
+        let shim = second.path().join("pyright-langserver.cmd");
+        std::fs::write(&shim, b"").unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_eq!(
+            resolve_executable_in(
+                Path::new("pyright-langserver"),
+                Some(path.as_os_str()),
+                true
+            ),
+            Some(shim)
+        );
+        // `PATHEXT` is not consulted: a `.bat` is not found by name.
+        std::fs::write(second.path().join("only-bat.bat"), b"").unwrap();
+        assert_eq!(
+            resolve_executable_in(Path::new("only-bat"), Some(path.as_os_str()), true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_path_resolved_to_a_shim_comes_back_absolute() {
+        // The server starts in the workspace directory, so a path relative to
+        // our working directory would name a different file there.
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("shimdir")
+            .tempdir_in(&cwd)
+            .unwrap();
+        std::fs::write(dir.path().join("tool.cmd"), b"").unwrap();
+        let relative = Path::new(dir.path().file_name().unwrap()).join("tool");
+        let found = resolve_executable_in(&relative, None, true).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert!(found.is_file(), "{found:?}");
+        assert!(found.ends_with("tool.cmd"), "{found:?}");
+    }
+
+    /// End to end on Windows: the spawned program is the `.cmd` shim, which
+    /// the standard library starts through `cmd.exe`, and its output arrives.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cmd_shim_configured_without_its_extension_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shim.cmd"), "@echo shim-ran %1\r\n").unwrap();
+        let config = TransportConfig {
+            executable: dir.path().join("shim").to_string_lossy().into_owned(),
+            args: vec!["arg".into()],
+            working_dir: dir.path().to_path_buf(),
+            timeout: Duration::from_secs(30),
+            label: "shim".into(),
+        };
+        let output = config.command(&[]).output().await.unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("shim-ran arg"),
+            "{output:?}"
+        );
     }
 }

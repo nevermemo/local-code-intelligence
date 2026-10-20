@@ -136,8 +136,10 @@ pub async fn read_for_did_open(
 }
 
 /// Checks a configured executable with a bounded `--version` invocation.
-pub async fn probe_subprocess_version(resolved: &Path, timeout: Duration) -> Result<()> {
-    let mut command = tokio::process::Command::new(resolved);
+pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> Result<()> {
+    let mut command = tokio::process::Command::new(crate::lsp::transport::resolve_executable(
+        &executable.to_string_lossy(),
+    ));
     command.arg("--version");
     command
         .stdout(std::process::Stdio::piped())
@@ -145,12 +147,12 @@ pub async fn probe_subprocess_version(resolved: &Path, timeout: Duration) -> Res
         .kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
         .await
-        .with_context(|| format!("timed out running {} --version", resolved.display()))?
-        .with_context(|| format!("start {}", resolved.display()))?;
+        .with_context(|| format!("timed out running {} --version", executable.display()))?
+        .with_context(|| format!("start {}", executable.display()))?;
     ensure!(
         output.status.success(),
         "subprocess {} --version failed",
-        resolved.display()
+        executable.display()
     );
     Ok(())
 }
