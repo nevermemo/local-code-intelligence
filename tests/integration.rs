@@ -4,6 +4,8 @@ include!("support/mod.rs");
 mod config;
 #[path = "cases/evaluation.rs"]
 mod evaluation;
+#[path = "cases/freshness.rs"]
+mod freshness;
 #[path = "cases/indexing.rs"]
 mod indexing;
 #[path = "cases/mcp.rs"]
