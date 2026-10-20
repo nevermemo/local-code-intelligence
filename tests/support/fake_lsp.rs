@@ -85,6 +85,11 @@ pub struct FakeLspConfig {
     /// answer to the first and keeps running after the second, so only a
     /// kill ends it.
     pub ignore_shutdown: bool,
+    /// A request the scenario does not handle (a `workspace/symbol` to a
+    /// `definition` server, say) gets a `null` result (`--answer-unhandled`)
+    /// instead of no answer, so a test that needs only some answer does not
+    /// wait out the request timeout.
+    pub answer_unhandled: bool,
     /// An error response for `workspace/symbol` requests (`--symbol-error
     /// CODE:MESSAGE`, with `--symbol-error-count N` to stop after N). The
     /// first `workspace/symbol` request of the process is the priming one and
@@ -260,6 +265,7 @@ pub fn run_from_env() -> io::Result<()> {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
         exit_on_definition_request: cli.iter().any(|arg| arg == "--exit-on-definition-request"),
+        answer_unhandled: cli.iter().any(|arg| arg == "--answer-unhandled"),
         ignore_shutdown,
         symbol_error: InjectedError::from_cli(&cli, "--symbol-error", "--symbol-error-count"),
         symbol_ok_at,
@@ -773,7 +779,13 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                         )?;
                     }
                 }
-                _ => {}
+                _ => {
+                    if config.answer_unhandled
+                        && let Some(id) = id
+                    {
+                        write_message(&mut stdout, &json_response(id, json!(null)))?;
+                    }
+                }
             }
         }
         stdout.flush()?;

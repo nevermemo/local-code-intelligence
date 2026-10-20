@@ -37,6 +37,8 @@ async fn java_readiness_without_a_launcher_jar_is_degraded_but_optional() {
     )
     .unwrap();
     config.java.path = Some(install.to_string_lossy().into_owned());
+    // The overall `ready` below needs the fake embedder's probes to answer.
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     let app = App::open(config).await.unwrap();
     let status = app.service_status().await;
     let component = status
@@ -110,7 +112,9 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
     config.reranker_url = "http://127.0.0.1:1/rerank".into();
     config.ripgrep_path = "definitely-missing-ripgrep".into();
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
-    config.readiness_timeout_seconds = 1;
+    // The fake embedder must answer its probes inside the timeout: 1 s timed
+    // out under load. The failing components fail by refusal, not by it.
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     let app = Arc::new(App::open(config).await.unwrap());
     let direct = serde_json::to_value(app.service_status().await).unwrap();
     assert_eq!(direct["ready"], true);
@@ -183,7 +187,9 @@ async fn health_is_liveness_and_ready_reports_required_and_optional_failures() {
 async fn readiness_lists_the_data_dir_length_component_as_optional() {
     // A short data_dir never trips the Windows path-length warning, so the
     // component is present, optional, ready, and not among the degraded ones.
-    let (_temp, config, _fake, models_task) = fixture().await;
+    let (_temp, mut config, _fake, models_task) = fixture().await;
+    // The overall `ready` below needs the fake embedder's probes to answer.
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     let app = App::open(config).await.unwrap();
     let status = serde_json::to_value(app.service_status().await).unwrap();
     let component = status["components"]
@@ -242,8 +248,11 @@ async fn readiness_still_probes_the_embedding_service_when_semantic_search_is_of
     }
 
     // A healthy embedding service keeps the service ready with semantic off.
+    // Its probes get the loaded-machine budget: the default 5 s timed out
+    // under load.
     let (_temp, mut config, _fake, models_task) = fixture().await;
     config.channels.semantic = false;
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     let app = App::open(config).await.unwrap();
     let status = serde_json::to_value(app.service_status().await).unwrap();
     assert_eq!(status["ready"], true);

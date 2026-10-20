@@ -448,21 +448,30 @@ fn traverse_starts_at_the_trait_method_a_question_names_and_checks_trait_seeds()
     let temp = tempfile::tempdir().unwrap();
     let tree = temp.path().join("tree");
     write_recipe_tree(&tree);
+    // The traversal deadline starts before the index is read and the start
+    // nodes are found; under load that took longer than the default 5 s, and
+    // the walk stopped before its first step. The walk is not about time.
+    let config = temp.path().join("traverse.toml");
+    std::fs::write(&config, "[traverse]\ndeadline_ms = 60000\n").unwrap();
     let run = |extra: &[&str]| {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_local-code-intelligence"));
-        command.current_dir(temp.path()).args([
-            "traverse",
-            "--scip",
-            tree.join("index.scip").to_str().unwrap(),
-            "--root",
-            tree.to_str().unwrap(),
-            "--question",
-            "What must change if `Speak::say` changes?",
-            "--maps",
-            "scip.implements",
-            "--out",
-            temp.path().join("out").to_str().unwrap(),
-        ]);
+        command
+            .current_dir(temp.path())
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "traverse",
+                "--scip",
+                tree.join("index.scip").to_str().unwrap(),
+                "--root",
+                tree.to_str().unwrap(),
+                "--question",
+                "What must change if `Speak::say` changes?",
+                "--maps",
+                "scip.implements",
+                "--out",
+                temp.path().join("out").to_str().unwrap(),
+            ]);
         command.args(extra);
         strip_lci_env(&mut command);
         let output = command.output().unwrap();
