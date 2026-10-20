@@ -1,0 +1,55 @@
+# cargo-deny configuration (slice K34a). Run: cargo deny check
+# It runs as the non-blocking `deny` job in .github/workflows/ci.yml.
+# The licence list below is what the dependency tree needs today, no more.
+# The workspace crates are unlicensed on purpose (no LICENSE file) and carry
+# `publish = false`, which makes cargo-deny treat them as private.
+
+[advisories]
+# Every RustSec advisory fails the check unless it is listed in `ignore` with a reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # Compile-time proc macro of the lance/arrow tree; no runtime code, no fix exists.
+    { id = "RUSTSEC-2024-0436", reason = "paste is a proc macro that runs at build time only; no replacement is released upstream" },
+    # Used by lindera (via lance-tokenizer) to read its own dictionary metadata; LCI builds no full-text or tokenizer index.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is reached only through lance-tokenizer/lindera, which LCI never calls; unmaintained, not a vulnerability" },
+]
+
+[licenses]
+# Licences the dependency tree needs today. The project also accepts GPL and
+# LGPL families for code (d396); add one here only when a crate needs it (r-efi
+# offers LGPL-2.1-or-later only as an alternative to MIT or Apache-2.0).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# Exceptions such as LLVM-exception are carried by the `WITH` part of an
+# SPDX expression (for example `Apache-2.0 WITH LLVM-exception`).
+
+[licenses.private]
+# LCI has no LICENSE file on purpose: the workspace crates are unlicensed
+# and are treated as private (unpublished) crates, not checked for a licence.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

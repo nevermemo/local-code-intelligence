@@ -115,3 +115,12 @@ Estimate, undated and unsourced: on a machine with both set up, a full-workspace
 from 8-9 minutes to under a minute -- most of that from sccache reusing previously
 compiled objects across the large `lancedb`/`arrow` dependency tree, the rest
 from lld linking faster than the default MSVC linker on a binary this size.
+
+## Dependency policy
+
+Rules for what goes into a `Cargo.toml` of this workspace (decisions d396, d397):
+
+- Reuse a proven library where it fills a slot; the licence must be one the project accepts for code (permissive, MPL-2.0, GPL and LGPL families).
+- A crate whose resolved version in `Cargo.lock` is `0.0.x` is pinned exactly (`=0.0.x`) in the manifest that names it, because Cargo treats every `0.0.x` release as breaking. Today `Cargo.lock` holds no `0.0.x` crate, so nothing is pinned for this rule; add the pin in the change that introduces one. Other `=` pins in a manifest keep the reason written beside them.
+- Heavy third-party code (a large library or its transitive tree) is an optional dependency behind a Cargo feature that is off by default. The default build compiles none of it and stays unchanged (an optional dependency still appears in `Cargo.lock`).
+- A dependency change that alters the default build is a deliberate change: say so in the commit message and check `git diff Cargo.lock` before committing.

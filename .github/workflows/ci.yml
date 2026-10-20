@@ -110,3 +110,18 @@ jobs:
 
       - name: Unit tests on the newest stable
         run: cargo xtask test --suite Unit
+
+  # Supply-chain check with deny.toml: RustSec advisories, the licence
+  # allow-list, bans and sources. It reads Cargo.lock and the manifests only
+  # (no build, no platform test), so it runs on Linux, and it never fails the
+  # workflow (K34a). A red job means a new advisory or an unlisted licence:
+  # read the log, then update the lockfile or deny.toml on purpose.
+  deny:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
