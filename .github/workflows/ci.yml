@@ -31,16 +31,15 @@ env:
   RUST_PIN: 1.99.0
 
 jobs:
-  # Windows first during development: the Windows job is the one that must
-  # pass. Linux and macOS run for early warning only and never fail the
-  # workflow; their support is decided closer to a release.
+  # Windows first during development (d381): the tests run on Windows only.
+  # Linux and macOS test runs return in cycle 2 (d403); their support is
+  # decided closer to a release.
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os != 'windows-latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -55,14 +54,6 @@ jobs:
       # it: a runner without `rg` fails 24 of them with "Lexical retrieval
       # unavailable". Install it, then print its version so a missing or
       # shadowed binary fails in one clear step.
-      - name: Install protoc, cmake and ripgrep (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake ripgrep
-
-      - name: Install protoc and ripgrep (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf ripgrep
-
       - name: Install ripgrep (Windows)
         if: runner.os == 'Windows'
         run: choco install ripgrep --no-progress -y
