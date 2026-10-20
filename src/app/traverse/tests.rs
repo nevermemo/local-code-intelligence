@@ -2973,6 +2973,7 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
             groups: lci_core::config::WalkGroups::Claim,
             grep_corroboration: 0.5,
         },
+        ..RunProfileConfig::default()
     };
     let claim = run(&limits(), &profile, &dirs, &call).await.unwrap();
     let rank = &start_event(&claim)["rank"];
@@ -2996,4 +2997,276 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
     let rank = &start_event(&resumed)["rank"];
     assert_eq!(rank["groups"], "claim", "{rank}");
     assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
+}
+
+// ---- `[run_profile.traverse] map_freshness` (slice K2a-2) ---------------------------
+
+/// The maps built from the SCIP index and the tree: they state a snapshot.
+const SCIP_BUILT_MAPS: [&str; 7] = [
+    "graph.scip",
+    "structure.contains",
+    "seeds.scip_names",
+    "exact.closure",
+    "config.key",
+    "scip.impact",
+    "scip.implements",
+];
+
+/// One call over `dir` with the given maps and the key `[run_profile.traverse]
+/// map_freshness` as `fresh` says, starting from the file
+/// node `a.rs`; its traces go under `data`, outside the tree.
+async fn freshness_call(
+    dir: &Path,
+    index: &Path,
+    data: &Path,
+    fresh: bool,
+    maps: &[&str],
+) -> Value {
+    let profile = lci_core::config::RunProfileConfig {
+        traverse: lci_core::config::RunProfileTraverse {
+            map_freshness: fresh,
+        },
+        ..Default::default()
+    };
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let seeds = [NodeId::file("a.rs").unwrap().to_string()];
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(dir),
+        question: "q",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+    };
+    run(&limits(), &profile, &Dirs::under(data), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+/// `maps` of a response as `id -> (observed, stale, lag)`, checking that
+/// every entry has exactly the four documented fields.
+fn freshness_of(response: &Value) -> HashMap<String, (String, bool, Value)> {
+    response["maps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no maps in {response}"))
+        .iter()
+        .map(|entry| {
+            let mut fields: Vec<&str> = entry
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            assert_eq!(fields, ["id", "lag", "observed", "stale"], "{entry}");
+            (
+                entry["id"].as_str().unwrap().to_owned(),
+                (
+                    entry["observed"].as_str().unwrap().to_owned(),
+                    entry["stale"].as_bool().unwrap(),
+                    entry["lag"].clone(),
+                ),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_traverse_answer_names_each_maps_observation_and_lag_when_the_key_is_on() {
+    let (dir, index) = crowded_tree(2);
+    let data = tempfile::tempdir().unwrap();
+    let named: Vec<&str> = SCIP_BUILT_MAPS.into_iter().chain(["grep.live"]).collect();
+    let call = || freshness_call(dir.path(), &index, data.path(), true, &named);
+
+    // The first call that sees the index's stamp takes the baseline: every
+    // SCIP-built map reads the snapshot, nothing differs; grep.live reads the
+    // tree itself.
+    let first = freshness_of(&call().await);
+    let mut ids: Vec<&str> = first.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    let mut want: Vec<&str> = named.clone();
+    want.sort_unstable();
+    assert_eq!(ids, want, "one entry for each map that states a freshness");
+    for id in SCIP_BUILT_MAPS {
+        assert_eq!(first[id], ("snapshot".to_owned(), false, json!(0)), "{id}");
+    }
+    assert_eq!(first["grep.live"], ("live".to_owned(), false, json!(0)));
+
+    // Appending to a file (a different byte length, no sleep and no clock)
+    // makes the SCIP-built maps stale by one file; grep.live is not.
+    let source = dir.path().join("a.rs");
+    let mut text = std::fs::read_to_string(&source).unwrap();
+    text.push_str("fn appended() {}\n");
+    std::fs::write(&source, text).unwrap();
+    let edited = freshness_of(&call().await);
+    for id in SCIP_BUILT_MAPS {
+        assert_eq!(edited[id], ("snapshot".to_owned(), true, json!(1)), "{id}");
+    }
+    assert_eq!(edited["grep.live"], ("live".to_owned(), false, json!(0)));
+
+    // The lag counts files: one more added and the first removed make two.
+    std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+    std::fs::remove_file(&source).unwrap();
+    let files = freshness_of(&call().await);
+    for id in SCIP_BUILT_MAPS {
+        assert_eq!(files[id], ("snapshot".to_owned(), true, json!(2)), "{id}");
+    }
+
+    // A rewritten index has a new stamp, hence a new baseline: the maps are
+    // built from the tree as it is and nothing differs again.
+    let (_other, regenerated) = crowded_tree(3);
+    std::fs::copy(&regenerated, &index).unwrap();
+    let rewritten = freshness_of(&call().await);
+    for id in SCIP_BUILT_MAPS {
+        assert_eq!(
+            rewritten[id],
+            ("snapshot".to_owned(), false, json!(0)),
+            "{id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn with_the_key_off_the_answer_has_no_maps_and_the_key_on_adds_only_that_key() {
+    let (dir, index) = crowded_tree(2);
+    let data = tempfile::tempdir().unwrap();
+    let named: Vec<&str> = SCIP_BUILT_MAPS.into_iter().chain(["grep.live"]).collect();
+    let off = freshness_call(dir.path(), &index, data.path(), false, &named).await;
+    let mut with = freshness_call(dir.path(), &index, data.path(), true, &named).await;
+
+    assert!(off.get("maps").is_none(), "{off}");
+    assert!(
+        !lci_core::config::Config::default()
+            .run_profile
+            .traverse
+            .map_freshness,
+        "off by default"
+    );
+    // Without the `maps` key and the timings, the two answers are one.
+    let strip = |response: &mut Value| {
+        if let Some(object) = response.as_object_mut() {
+            object.remove("maps");
+        }
+        if let Some(totals) = response["totals"].as_object_mut() {
+            totals.remove("elapsed_ms");
+            if let Some(per_map) = totals.get_mut("per_map").and_then(Value::as_object_mut) {
+                per_map.values_mut().for_each(|stat| {
+                    stat.as_object_mut().map(|stat| stat.remove("ms"));
+                });
+            }
+        }
+        if let Some(trace) = response["trace"].as_object_mut() {
+            trace.remove("file");
+        }
+        // The cached maps keep one timing log across calls, so the second call's
+        // p50 note counts more calls: the timings are not the answer.
+        if let Some(notes) = response["notes"].as_array_mut() {
+            notes.retain(|note| !note.as_str().is_some_and(|n| n.contains("expand p50")));
+        }
+    };
+    let mut off = off;
+    strip(&mut off);
+    strip(&mut with);
+    assert_eq!(off, with);
+}
+
+#[tokio::test]
+async fn files_newer_than_the_index_count_from_the_first_call_once_each() {
+    let (dir, index) = crowded_tree(2);
+    let data = tempfile::tempdir().unwrap();
+    // The index is ten seconds older than its tree (no sleep): `a.rs` is newer.
+    let past = SystemTime::now() - Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    let named = ["graph.scip", "structure.contains", "grep.live"];
+    let lag = |response: &Value| {
+        let maps = freshness_of(response);
+        let scip = maps["graph.scip"].clone();
+        assert_eq!(maps["structure.contains"], scip);
+        assert_eq!(maps["grep.live"], ("live".to_owned(), false, json!(0)));
+        (scip.1, scip.2)
+    };
+    let call = || freshness_call(dir.path(), &index, data.path(), true, &named);
+    let source = dir.path().join("a.rs");
+    let edit = |text: &str| {
+        let mut now = std::fs::read_to_string(&source).unwrap();
+        now.push_str(text);
+        std::fs::write(&source, now).unwrap();
+    };
+
+    // The first call has no earlier call to compare with, yet it does not
+    // say "fresh": the file newer than the index is already counted.
+    edit("fn edited() {}\n");
+    assert_eq!(lag(&call().await), (true, json!(1)));
+    // A second edit of the same file is the same one file.
+    edit("fn edited_again() {}\n");
+    assert_eq!(lag(&call().await), (true, json!(1)));
+    // A file added counts too.
+    std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+    assert_eq!(lag(&call().await), (true, json!(2)));
+    // A file removed that the index did not predate does not.
+    std::fs::remove_file(dir.path().join("b.rs")).unwrap();
+    assert_eq!(lag(&call().await), (true, json!(1)));
+}
+
+#[tokio::test]
+async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() {
+    // No tree: the call gives no root.
+    let (dir, index) = crowded_tree(2);
+    let data = tempfile::tempdir().unwrap();
+    let profile = lci_core::config::RunProfileConfig {
+        traverse: lci_core::config::RunProfileTraverse {
+            map_freshness: true,
+        },
+        ..Default::default()
+    };
+    let maps = ["graph.scip", "structure.contains"].map(String::from);
+    let seeds = [NodeId::file("a.rs").unwrap().to_string()];
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: &index,
+        scip_root: None,
+        question: "q",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+    };
+    let response = run(&limits(), &profile, &Dirs::under(data.path()), &call)
+        .await
+        .unwrap()
+        .response;
+    for (_, (observed, stale, lag)) in freshness_of(&response) {
+        assert_eq!(
+            (observed.as_str(), stale, lag),
+            ("snapshot", false, Value::Null)
+        );
+    }
+    assert!(
+        response["notes"].to_string().contains("has no tree"),
+        "{response}"
+    );
+    drop(dir);
+
+    // An index file with no modified time is not compared.
+    let tree = tempfile::tempdir().unwrap();
+    let lag = freshness::tree_lag(&tree.path().join("index.scip"), tree.path(), (None, 7))
+        .await
+        .unwrap();
+    assert_eq!(lag, None);
 }

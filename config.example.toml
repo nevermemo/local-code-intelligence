@@ -495,6 +495,20 @@ enabled = false
 # key is an error. `lci config --json` prints derived.run_profile_hash, the hash
 # of the result-affecting settings; README `[run_profile]` lists what is left out.
 [run_profile]
+[run_profile.traverse]
+# Name each map's freshness in a traverse answer: `maps`, an array of
+# {id, observed, stale, lag}, one entry for every map of the call that states it
+# (the SCIP-built maps and the maps that read the tree or git). `observed` is
+# "snapshot" (stored data) or "live" (read from the tree or git now; grep.live and
+# lsp.live still place what they read by the index's positions). `lag` counts
+# source files, never wall time: those newer than the index file plus those that
+# changed (content hash), were added or removed since this process first saw the
+# index's stamp, each counted once. `stale` is true when lag is above 0. lag is
+# null (stale false: not compared) when the call has no tree, the tree could not
+# be read or the index file has no modified time. Costs one read of the tree's
+# source files per call. false (default): the answer has no `maps` key and is as
+# without the key.
+map_freshness = false
 
 # [run_profile.walk]: how a traversal counts the evidence that reaches a node.
 # groups = "tool" (default): every map is one piece of evidence (maps over one

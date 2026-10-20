@@ -32,7 +32,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
 | `lexical`, `lsp` | core | Independent, fail-open retrieval channels (ripgrep with BM25 scoring; language-server symbols) |
 | `filter` | core | Validates retrieval controls (`FilterRequest` to `EffectiveFilter`) and classifies source roles |
-| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
+| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
 | `evaluate` | root | Measures retrieval behaviour without influencing ranking (see Evaluation harness) |
 | `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse` (`src/app/traverse/`: `mod` holds the types, `run` and registration; `index` the SCIP index and map loading; `seeds` the seed search; `rescore` the `GraphRescorer`; `response` the response builders; `first_stage`, `presets`, `chunks`); named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
 | `server`, `rest`, `main` | root | MCP (rmcp, streamable HTTP), the REST/OpenAPI mirror on the same process and port, and the CLI |
@@ -195,6 +195,17 @@ totals and, only when work is left, a `handle` and `checkpoint`. The first stage
 `exact.pickaxe`, then seeds), named policies per question type and the steering ladder are described in
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
+
+With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
+states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
+`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` report `live` with `lag` 0 (they read current
+bytes or git, placed by the index's positions for the first two). `lag` is the number of source files (language-adapter
+files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
+first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`
+means not compared (no tree, unreadable tree, or an index file without a modified time). The tree is read and hashed
+once per call with `chunk::scan_incremental_with`; only changed files are parsed. `Expanded` carries an optional
+`edge::Freshness` that a wrapper around each stating map records; the walk itself does not read it. Key off: no
+wrapper, no tree read, no `maps` key.
 
 ## MCP, REST and CLI surfaces
 

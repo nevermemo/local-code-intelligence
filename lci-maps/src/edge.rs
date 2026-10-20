@@ -6,7 +6,9 @@
 //! ([`sort_edges`]). A prefix of a sorted list is a cap, not a rank (design
 //! rule 1): a consumer that wants a different order computes it at walk time.
 
-use crate::{Cost, EdgeKind, MapDescriptor, MapId, MapResponse, MapStatus, NodeKind, SourceLabel};
+use crate::{
+    Cost, EdgeKind, MapDescriptor, MapId, MapResponse, MapStatus, NodeKind, Observed, SourceLabel,
+};
 use lci_core::node::NodeId;
 use std::{cmp::Reverse, time::Duration};
 
@@ -119,6 +121,45 @@ pub struct Edge {
     pub site: Option<Site>,
 }
 
+/// How current one map's answer is, as the map or the code that built it
+/// knows it. Not [`crate::Freshness`], the per-query label of a
+/// [`crate::MapResponse`] (model and snapshot identity): this one is a call's
+/// short statement of what the answer was read from and how far behind it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freshness {
+    /// What the answer was read from: the map's stored snapshot, the working
+    /// tree as it is now, or a named point in time.
+    pub observed: Observed,
+    /// The source the answer was read from is known to differ from the tree
+    /// now. `false` also when nothing was compared (`lag` is then `None`).
+    pub stale: bool,
+    /// How many files differ between what the answer was read from and the
+    /// tree now (changed, added or removed), a count and never wall time;
+    /// `None` when it was not measured. A live map reads the tree itself: `0`.
+    pub lag: Option<u32>,
+}
+
+impl Freshness {
+    /// A map that reads the working tree (or git) as it is when it answers.
+    pub const fn live() -> Self {
+        Self {
+            observed: Observed::LiveTree,
+            stale: false,
+            lag: Some(0),
+        }
+    }
+
+    /// A map that answers from stored data built from the tree at some point;
+    /// `lag` is the number of files that differ from that point, when known.
+    pub const fn snapshot(lag: Option<u32>) -> Self {
+        Self {
+            observed: Observed::Snapshot,
+            stale: matches!(lag, Some(1..)),
+            lag,
+        }
+    }
+}
+
 /// What one [`crate::Map::expand`] call returns: the edges and what the call
 /// cost. The cost belongs to the call, so it is reported once however many
 /// edges come back, and an expansion with no edges still has one.
@@ -126,16 +167,30 @@ pub struct Edge {
 pub struct Expanded {
     pub edges: Vec<Edge>,
     pub cost: Cost,
+    /// What the map says about the freshness of this answer; `None` when it
+    /// does not say. A map that knows its source snapshot sets it, and so
+    /// does the layer that built the map for it (`[run_profile.traverse] map_freshness`).
+    pub freshness: Option<Freshness>,
 }
 
 impl Expanded {
     pub fn new(edges: Vec<Edge>, cost: Cost) -> Self {
-        Self { edges, cost }
+        Self {
+            edges,
+            cost,
+            freshness: None,
+        }
     }
 
     /// Edges of a call that reports no cost.
     pub fn free(edges: Vec<Edge>) -> Self {
         Self::new(edges, Cost::default())
+    }
+
+    /// The same answer with its freshness stated.
+    pub fn with_freshness(mut self, freshness: Freshness) -> Self {
+        self.freshness = Some(freshness);
+        self
     }
 }
 
@@ -465,6 +520,23 @@ mod tests {
         let card = MapCard::from_descriptor(&descriptor(vec![SourceLabel::Scip]));
         assert_eq!(card.coverage, vec![NodeKind::File]);
         assert!(card.expand_p50_ms.is_none() && card.good_for.is_empty());
+    }
+
+    #[test]
+    fn a_stored_answer_is_stale_only_when_a_difference_was_counted() {
+        assert!(!Freshness::snapshot(Some(0)).stale);
+        assert!(!Freshness::snapshot(None).stale, "nothing compared");
+        let behind = Freshness::snapshot(Some(3));
+        assert!(behind.stale && behind.lag == Some(3));
+        assert_eq!(behind.observed, Observed::Snapshot);
+        let live = Freshness::live();
+        assert!(!live.stale && live.lag == Some(0));
+        assert_eq!(live.observed, Observed::LiveTree);
+        // An expansion states nothing unless it is told to.
+        assert_eq!(Expanded::free(Vec::new()).freshness, None);
+        assert_eq!(Expanded::default().freshness, None);
+        let stated = Expanded::default().with_freshness(live.clone());
+        assert_eq!(stated.freshness, Some(live));
     }
 
     #[test]

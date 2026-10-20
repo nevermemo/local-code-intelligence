@@ -44,12 +44,14 @@
 //! seam, the name-token stand-in, the mapping of hits to graph nodes);
 //! `rescore` rates the reranker frontier; `response` shapes the JSON answer;
 //! `first_stage` holds the answers that are not the walk, `chunks` the index
-//! behind the search maps and `presets` the named steering policies. This
+//! behind the search maps, `presets` the named steering policies and
+//! `freshness` what `[run_profile.traverse] map_freshness` reports. This
 //! file keeps the request types, the budget and ladder setup, [`run`] and
 //! [`search`].
 
 mod chunks;
 mod first_stage;
+mod freshness;
 mod index;
 pub mod presets;
 mod rescore;
@@ -107,11 +109,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use freshness::Observer;
 use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
-    add_commits, add_first_stage_only, add_policy, add_sites, chunk_lines, lint_steer,
+    add_commits, add_first_stage_only, add_maps, add_policy, add_sites, chunk_lines, lint_steer,
     no_seeds_response, response_json,
 };
 pub use seeds::TraitSeedMode;
@@ -623,6 +626,42 @@ pub async fn run_with_trait_seeds(
     };
 
     let loaded = load(call.scip_index, call.scip_root).await?;
+    // `[run_profile.traverse] map_freshness` (from the run profile of the call):
+    // the tree against the index file (see [`freshness`]), read once per call
+    // and before the maps built from the tree are built.
+    // Reading the tree is setup, not walking: the deadline does not run.
+    let observer = if profile.traverse.map_freshness {
+        let started = Instant::now();
+        let lag = match call.scip_root {
+            Some(root) => match freshness::tree_lag(call.scip_index, root, loaded.stamp).await {
+                Ok(Some(lag)) => Some(lag),
+                Ok(None) => {
+                    notes.push(
+                        "map_freshness: the index file has no modified time; the tree was not compared with it"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "map_freshness: the tree could not be compared with the index file: {error:#}"
+                    ));
+                    None
+                }
+            },
+            None => {
+                notes.push(
+                    "map_freshness: the call has no tree (give its root); the tree was not compared with the index file"
+                        .to_owned(),
+                );
+                None
+            }
+        };
+        budget.deadline += started.elapsed();
+        Observer::on(lag)
+    } else {
+        Observer::off()
+    };
     // A handle resumes on the workspace and index it was made for.
     let identity = identity_of(call, &loaded);
     let make_rescorer = |setting: &str| match call
@@ -687,18 +726,21 @@ pub async fn run_with_trait_seeds(
     register(
         &mut registry,
         &mut plan_maps,
+        &observer,
         Box::new(SeedMap::hybrid()),
         wants(SEEDS_HYBRID),
     )?;
     register(
         &mut registry,
         &mut plan_maps,
+        &observer,
         Box::new(SeedMap::name_tokens()),
         wants(SEEDS_MAP),
     )?;
     register(
         &mut registry,
         &mut plan_maps,
+        &observer,
         Box::new(Shared(loaded.scip.clone())),
         wants(SCIP_MAP_ID),
     )?;
@@ -732,6 +774,7 @@ pub async fn run_with_trait_seeds(
     register(
         &mut registry,
         &mut plan_maps,
+        &observer,
         Box::new(loaded.contains.with_chunk_lines(lines)),
         wants(CONTAINS_MAP_ID),
     )?;
@@ -742,7 +785,13 @@ pub async fn run_with_trait_seeds(
         let grep = LiveGrep::new(root, Some(Arc::new(ScipSpans::from_scip(&loaded.scip))));
         // Measure the map's cost before the walk prices a hop by it.
         grep.calibrate(3).await;
-        register(&mut registry, &mut plan_maps, Box::new(grep), true)?;
+        register(
+            &mut registry,
+            &mut plan_maps,
+            &observer,
+            Box::new(grep),
+            true,
+        )?;
     }
     if let (true, Some(root)) = (wants(CONFIG_KEY_MAP_ID), call.scip_root) {
         let map = match config_key_map(call.scip_index, root, &loaded).await {
@@ -759,7 +808,13 @@ pub async fn run_with_trait_seeds(
                 Arc::new(ConfigKeyMap::empty(ConfigKeyOptions::default()))
             }
         };
-        register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+        register(
+            &mut registry,
+            &mut plan_maps,
+            &observer,
+            Box::new(Shared(map)),
+            true,
+        )?;
     }
     let mut git_history = None;
     if wants(GIT_HISTORY_ID) {
@@ -773,6 +828,7 @@ pub async fn run_with_trait_seeds(
                         register(
                             &mut registry,
                             &mut plan_maps,
+                            &observer,
                             Box::new(Shared(map.clone())),
                             true,
                         )?;
@@ -791,6 +847,7 @@ pub async fn run_with_trait_seeds(
                 register(
                     &mut registry,
                     &mut plan_maps,
+                    &observer,
                     Box::new(Shared(Arc::new(map))),
                     true,
                 )?;
@@ -821,6 +878,7 @@ pub async fn run_with_trait_seeds(
                 register(
                     &mut registry,
                     &mut plan_maps,
+                    &observer,
                     Box::new(Shared(map.clone())),
                     true,
                 )?;
@@ -852,7 +910,13 @@ pub async fn run_with_trait_seeds(
                     }
                 };
                 impact = Some(map.clone());
-                register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+                register(
+                    &mut registry,
+                    &mut plan_maps,
+                    &observer,
+                    Box::new(Shared(map)),
+                    true,
+                )?;
             }
         }
     }
@@ -905,7 +969,13 @@ pub async fn run_with_trait_seeds(
                     notes.push(note);
                 }
                 implements = Some(map.clone());
-                register(&mut registry, &mut plan_maps, Box::new(Shared(map)), true)?;
+                register(
+                    &mut registry,
+                    &mut plan_maps,
+                    &observer,
+                    Box::new(Shared(map)),
+                    true,
+                )?;
             }
         }
     }
@@ -915,6 +985,7 @@ pub async fn run_with_trait_seeds(
         register(
             &mut registry,
             &mut plan_maps,
+            &observer,
             Box::new(SeedMap::exact_closure()),
             true,
         )?;
@@ -923,6 +994,7 @@ pub async fn run_with_trait_seeds(
         register(
             &mut registry,
             &mut plan_maps,
+            &observer,
             Box::new(SeedMap::exact_pickaxe()),
             true,
         )?;
@@ -1038,6 +1110,7 @@ pub async fn run_with_trait_seeds(
             register(
                 &mut registry,
                 &mut plan_maps,
+                &observer,
                 Box::new(Shared(map.clone())),
                 true,
             )?;
@@ -1048,6 +1121,7 @@ pub async fn run_with_trait_seeds(
             register(
                 &mut registry,
                 &mut plan_maps,
+                &observer,
                 Box::new(Shared(map.clone())),
                 true,
             )?;
@@ -1065,6 +1139,12 @@ pub async fn run_with_trait_seeds(
         Some(snapshot) => presets::restored(&plan_maps, &snapshot.weights, &snapshot.switches),
         None => plan_maps.clone(),
     };
+    // The maps this call runs, in registration order, for `maps`.
+    let enabled_maps: Vec<String> = running_maps
+        .iter()
+        .filter(|map| map.enabled)
+        .map(|map| map.id.clone())
+        .collect();
     let (effective, plan_effective) = presets::effective(
         preset,
         &steer,
@@ -1082,6 +1162,10 @@ pub async fn run_with_trait_seeds(
                 add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, warnings);
                 add_trait_seed_count(&mut response, &found);
+                add_maps(
+                    &mut response,
+                    observer.report(enabled_maps.iter().map(String::as_str)),
+                );
                 return Ok(Report {
                     response,
                     trace: None,
@@ -1239,6 +1323,10 @@ pub async fn run_with_trait_seeds(
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
     }
+    add_maps(
+        &mut response,
+        observer.report(enabled_maps.iter().map(String::as_str)),
+    );
     Ok(Report {
         response,
         trace: trace_path,
@@ -1250,9 +1338,13 @@ pub async fn run_with_trait_seeds(
 fn register<'a>(
     registry: &mut Registry<'a>,
     plan: &mut Vec<PlanMap>,
+    observer: &Observer,
     map: Box<dyn Map + 'a>,
     enabled: bool,
 ) -> Result<()> {
+    // With `[run_profile.traverse] map_freshness` on, a map that states its freshness is
+    // wrapped so that its expansions are recorded; off, it is registered as is.
+    let map = observer.wrap(map);
     let descriptor = map.describe();
     plan.push(PlanMap {
         id: descriptor.id.to_owned(),

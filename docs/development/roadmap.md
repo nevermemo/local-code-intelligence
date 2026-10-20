@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2a-2 (per-map freshness key), K2a-1 (freshness harness), N19 and N24 (Java and C# server fixes); K20a next; K7b after K2a-1. Rewrite this line at every push.
+In flight: K2a-1 (freshness harness), K20a (`scip.mode`), N20 c and d; K7b after K2a-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
+| K2a | Partly done: the per-map freshness label `[run_profile.traverse] map_freshness` (d410); the harness remains. Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
 | **M2** | **Language servers as the source of truth** | | | |
 | K20a | Traverse no longer loads the SCIP index unconditionally (`scip.mode = off, cache, authoritative`; default stays authoritative until K20b) | Traverse runs with no index file | S-M | - |
@@ -116,7 +116,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 
-M0 filler, any time a build slot is free: N20 (c, d); K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404).
+M0 filler, any time a build slot is free: N20 (c, d); K0a follow-ups: `VectorChunks::vector_of` (lci-maps) counts an external call it never makes on a vectorless snapshot, and `with_legacy_run` builds its `SemanticMap` from the unadjusted channels (d404); K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410).
 
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
