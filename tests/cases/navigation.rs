@@ -3834,3 +3834,825 @@ async fn navigation_answers_after_index_workspace_with_the_embedder_down() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     models_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// The fake language server in `documents` mode (`fake_lsp_documents.rs`): it
+// answers from the text it was sent, so these tests drive it with disk edits
+// and document notifications and read back what it answers and records.
+// ---------------------------------------------------------------------------
+
+const CALCULATOR_CS: &str = "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; }\n";
+const CALL_SITE_CS: &str = "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\n";
+const SHAPES_CS: &str = "public interface IShape { double Area(); }\npublic class Circle : IShape { public double Area() => 3.14; }\npublic class Square : IShape { public double Area() => 1.0; }\n";
+
+/// `(line, character)` of the first `needle` in `text`.
+fn position_of(text: &str, needle: &str) -> (u32, u32) {
+    text.lines()
+        .enumerate()
+        .find_map(|(line, content)| {
+            content
+                .find(needle)
+                .map(|column| (line as u32, column as u32))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not in {text:?}"))
+}
+
+/// A raw client for the documents-mode fake, started past its handshake.
+struct DocumentsFake {
+    client: Arc<JsonRpcClient>,
+    root: std::path::PathBuf,
+    state: std::path::PathBuf,
+}
+
+impl DocumentsFake {
+    /// The fake on a temporary C# workspace (`src/Calculator.cs`,
+    /// `src/CallSite.cs`).
+    async fn start(temp: &tempfile::TempDir) -> Self {
+        let root = temp.path().join("workspace");
+        write_csharp_workspace(&root);
+        Self::start_on(temp, root).await
+    }
+
+    /// The fake on `root`, whose files are already written: the start-up walk
+    /// reads them when `initialized` arrives.
+    async fn start_on(temp: &tempfile::TempDir, root: std::path::PathBuf) -> Self {
+        let state = temp.path().join("state");
+        let transport = TransportConfig {
+            executable: env!("CARGO_BIN_EXE_fake-lsp-server").to_owned(),
+            args: vec![
+                "--mode".to_owned(),
+                "documents".to_owned(),
+                "--state".to_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            working_dir: temp.path().to_owned(),
+            timeout: Duration::from_secs(20),
+            label: "fake".to_owned(),
+        };
+        let client = JsonRpcClient::spawn(&transport, &[], Box::new(|_| false))
+            .await
+            .unwrap();
+        let root_uri = reqwest::Url::from_directory_path(&root)
+            .unwrap()
+            .to_string();
+        client
+            .request(
+                "initialize",
+                json!({"rootUri": root_uri, "capabilities": {}}),
+            )
+            .await
+            .unwrap();
+        client.notify("initialized", json!({})).await.unwrap();
+        Self {
+            client,
+            root,
+            state,
+        }
+    }
+
+    fn uri(&self, relative: &str) -> String {
+        reqwest::Url::from_file_path(self.root.join(relative))
+            .unwrap()
+            .to_string()
+    }
+
+    /// The workspace-relative path of an answer's uri.
+    fn relative(&self, uri: &str) -> String {
+        let path = reqwest::Url::parse(uri).unwrap().to_file_path().unwrap();
+        path.strip_prefix(&self.root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    async fn ask(&self, method: &str, params: Value) -> Value {
+        self.client.request(method, params).await.unwrap()
+    }
+
+    async fn at(&self, method: &str, relative: &str, at: (u32, u32)) -> Value {
+        self.ask(
+            method,
+            json!({
+                "textDocument": {"uri": self.uri(relative)},
+                "position": {"line": at.0, "character": at.1},
+            }),
+        )
+        .await
+    }
+
+    async fn definition(&self, relative: &str, at: (u32, u32)) -> Vec<(String, u64, u64)> {
+        let answer = self.at("textDocument/definition", relative, at).await;
+        self.places(&answer)
+    }
+
+    async fn references(
+        &self,
+        relative: &str,
+        at: (u32, u32),
+        declaration: bool,
+    ) -> Vec<(String, u64, u64)> {
+        let answer = self
+            .ask(
+                "textDocument/references",
+                json!({
+                    "textDocument": {"uri": self.uri(relative)},
+                    "position": {"line": at.0, "character": at.1},
+                    "context": {"includeDeclaration": declaration},
+                }),
+            )
+            .await;
+        self.places(&answer)
+    }
+
+    async fn symbols(&self, query: &str) -> Value {
+        self.ask("workspace/symbol", json!({"query": query})).await
+    }
+
+    /// `(file, line, character)` of every location (or symbol) in an answer,
+    /// in the order answered.
+    fn places(&self, answer: &Value) -> Vec<(String, u64, u64)> {
+        answer
+            .as_array()
+            .unwrap_or_else(|| panic!("not a list: {answer}"))
+            .iter()
+            .map(|item| {
+                let location = item.get("location").unwrap_or(item);
+                (
+                    self.relative(location["uri"].as_str().unwrap()),
+                    location["range"]["start"]["line"].as_u64().unwrap(),
+                    location["range"]["start"]["character"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    async fn open(&self, relative: &str, version: i64, text: &str) {
+        self.client
+            .notify(
+                "textDocument/didOpen",
+                json!({"textDocument": {
+                    "uri": self.uri(relative), "languageId": "csharp",
+                    "version": version, "text": text,
+                }}),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn change(&self, relative: &str, version: i64, text: &str) {
+        self.client
+            .notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": self.uri(relative), "version": version},
+                    "contentChanges": [{"text": text}],
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn close(&self, relative: &str) {
+        self.client
+            .notify(
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": self.uri(relative)}}),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `workspace/didChangeWatchedFiles` with `(file, type)` pairs: 1 created,
+    /// 2 changed, 3 deleted.
+    async fn watched(&self, changes: &[(&str, u32)]) {
+        let changes: Vec<Value> = changes
+            .iter()
+            .map(|(relative, kind)| json!({"uri": self.uri(relative), "type": kind}))
+            .collect();
+        self.client
+            .notify(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes": changes}),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `events.jsonl`: one object per message the fake received, in order.
+    fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.state.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The documents the fake answers from, as it recorded them.
+    fn documents(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.state.join("documents.json")).unwrap())
+            .unwrap()
+    }
+
+    /// What `documents.json` says about one file (`Null` when it is absent).
+    fn document(&self, relative: &str) -> Value {
+        self.documents()[self.uri(relative)].clone()
+    }
+
+    async fn finish(self) {
+        self.client.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+fn place(file: &str, at: (u32, u32)) -> (String, u64, u64) {
+    (file.to_owned(), u64::from(at.0), u64::from(at.1))
+}
+
+fn names(items: &Value) -> Vec<&str> {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect()
+}
+
+/// A definition and the references come from the text the start-up walk read,
+/// and a disk edit that no notification reports stays unseen: the answer still
+/// has the old line.
+#[tokio::test]
+async fn documents_fake_answers_definition_and_references_from_the_walked_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let declared = place("src/Calculator.cs", position_of(CALCULATOR_CS, "Add"));
+    let call = position_of(CALL_SITE_CS, "Add");
+    let called = place("src/CallSite.cs", call);
+
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        std::slice::from_ref(&declared)
+    );
+    let mut references = fake.references("src/CallSite.cs", call, true).await;
+    references.sort();
+    assert_eq!(references, [declared.clone(), called.clone()]);
+    assert_eq!(
+        fake.references("src/CallSite.cs", call, false).await,
+        [called],
+        "the declaration only with includeDeclaration"
+    );
+
+    // The file moves `Add` one line lower on disk; nothing tells the fake.
+    write(
+        &fake.root,
+        "src/Calculator.cs",
+        &format!("// moved\n{CALCULATOR_CS}"),
+    );
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        [declared],
+        "the snapshot of the walk is answered, not the disk"
+    );
+    let calculator = fake.document("src/Calculator.cs");
+    assert_eq!(calculator["source"], "walk");
+    assert_eq!(calculator["lines"], 2, "the walked text, not the edit");
+    fake.finish().await;
+}
+
+/// `didOpen` text wins over the walked snapshot; `didClose` brings the
+/// snapshot back. The log has the open, the request that saw it and the close
+/// in the order they arrived.
+#[tokio::test]
+async fn documents_fake_did_change_moves_the_answer_and_did_close_restores_the_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let walked = place("src/Calculator.cs", position_of(CALCULATOR_CS, "Add"));
+    let call = position_of(CALL_SITE_CS, "Add");
+    let moved_text = format!("\n{CALCULATOR_CS}");
+    let moved = place("src/Calculator.cs", position_of(&moved_text, "Add"));
+    assert_ne!(moved, walked);
+
+    fake.open("src/Calculator.cs", 1, &moved_text).await;
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        [moved],
+        "the open text"
+    );
+    assert_eq!(fake.document("src/Calculator.cs")["source"], "open");
+
+    fake.close("src/Calculator.cs").await;
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        [walked],
+        "the walked snapshot again"
+    );
+    assert_eq!(fake.document("src/Calculator.cs")["source"], "walk");
+
+    let events = fake.events();
+    let log: Vec<(&str, Option<i64>)> = events
+        .iter()
+        .map(|event| (event["method"].as_str().unwrap(), event["version"].as_i64()))
+        .filter(|(method, _)| {
+            matches!(
+                *method,
+                "textDocument/didOpen" | "textDocument/definition" | "textDocument/didClose"
+            )
+        })
+        .collect();
+    assert_eq!(
+        log,
+        [
+            ("textDocument/didOpen", Some(1)),
+            ("textDocument/definition", None),
+            ("textDocument/didClose", None),
+            ("textDocument/definition", None),
+        ]
+    );
+    let seqs: Vec<u64> = events
+        .iter()
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    fake.finish().await;
+}
+
+/// Full sync with a version that does not exceed the stored one is ignored
+/// (a reordered notification), and so is a change for a document that was
+/// never opened. The answers show it and the log names the reason.
+#[tokio::test]
+async fn documents_fake_refuses_a_stale_or_unopened_did_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let call = position_of(CALL_SITE_CS, "Add");
+    let v3_text = format!("\n{CALCULATOR_CS}");
+    let v2_text = format!("\n\n\n{CALCULATOR_CS}");
+    let v3 = place("src/Calculator.cs", position_of(&v3_text, "Add"));
+
+    fake.open("src/Calculator.cs", 1, CALCULATOR_CS).await;
+    fake.change("src/Calculator.cs", 3, &v3_text).await;
+    fake.change("src/Calculator.cs", 2, &v2_text).await;
+    // Never opened: the walked text of the call site stays.
+    fake.change("src/CallSite.cs", 1, &format!("\n\n{CALL_SITE_CS}"))
+        .await;
+
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        std::slice::from_ref(&v3),
+        "version 3 stays after the stale version 2"
+    );
+    let mut references = fake
+        .references("src/Calculator.cs", (v3.1 as u32, v3.2 as u32), true)
+        .await;
+    references.sort();
+    assert_eq!(
+        references,
+        [v3, place("src/CallSite.cs", call)],
+        "the unopened change did not move the call site"
+    );
+
+    let events = fake.events();
+    let notes: Vec<(String, Option<&str>)> = events
+        .iter()
+        .filter(|event| event["method"] == "textDocument/didChange")
+        .map(|event| (event["version"].to_string(), event["note"].as_str()))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            ("3".to_owned(), None),
+            ("2".to_owned(), Some("change-stale-version")),
+            ("1".to_owned(), Some("change-unopened")),
+        ]
+    );
+    assert_eq!(fake.document("src/Calculator.cs")["version"], 3);
+    fake.finish().await;
+}
+
+/// `didChangeWatchedFiles` makes the fake read the disk then, not before and
+/// not at answer time: a changed file moves, a deleted one disappears from
+/// `workspace/symbol`, a created one is listed only after its event.
+#[tokio::test]
+async fn documents_fake_did_change_watched_files_re_reads_the_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let call = position_of(CALL_SITE_CS, "Add");
+
+    // Changed.
+    let moved_text = format!("\n{CALCULATOR_CS}");
+    write(&fake.root, "src/Calculator.cs", &moved_text);
+    fake.watched(&[("src/Calculator.cs", 2)]).await;
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        [place("src/Calculator.cs", position_of(&moved_text, "Add"))]
+    );
+    assert_eq!(fake.document("src/Calculator.cs")["source"], "watched");
+
+    // Created: on disk but not announced is not listed; announced is.
+    write(
+        &fake.root,
+        "src/Circle.cs",
+        "public class Circle { public int Area() => 1; }\n",
+    );
+    assert_eq!(fake.symbols("Circle").await, json!([]));
+    fake.watched(&[("src/Circle.cs", 1)]).await;
+    assert_eq!(
+        fake.places(&fake.symbols("Circle").await),
+        [place("src/Circle.cs", (0, 13))]
+    );
+
+    // Deleted.
+    assert_eq!(names(&fake.symbols("Calculator").await), ["Calculator"]);
+    std::fs::remove_file(fake.root.join("src/Calculator.cs")).unwrap();
+    fake.watched(&[("src/Calculator.cs", 3)]).await;
+    assert_eq!(fake.symbols("Calculator").await, json!([]));
+    assert_eq!(fake.symbols("Add").await, json!([]));
+    assert_eq!(fake.document("src/Calculator.cs"), Value::Null);
+
+    let types: Vec<Value> = fake
+        .events()
+        .iter()
+        .filter(|event| event["method"] == "workspace/didChangeWatchedFiles")
+        .map(|event| event["changes"][0]["type"].clone())
+        .collect();
+    assert_eq!(types, [json!(2), json!(1), json!(3)]);
+    let events = fake.events();
+    let queries: Vec<&str> = events
+        .iter()
+        .filter(|event| event["method"] == "workspace/symbol")
+        .map(|event| event["query"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        queries,
+        ["Circle", "Circle", "Calculator", "Calculator", "Add"]
+    );
+    fake.finish().await;
+}
+
+/// `implementation` and the type hierarchy follow the supertype lists of the
+/// store, so an opened text that drops a base type changes them.
+#[tokio::test]
+async fn documents_fake_answers_implementation_and_type_hierarchy_from_the_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write(&root, "src/Shapes.cs", SHAPES_CS);
+    let fake = DocumentsFake::start_on(&temp, root).await;
+    let interface = position_of(SHAPES_CS, "IShape");
+    let circle = position_of(SHAPES_CS, "Circle");
+    let square = position_of(SHAPES_CS, "Square");
+
+    let implementations = fake
+        .at("textDocument/implementation", "src/Shapes.cs", interface)
+        .await;
+    assert_eq!(
+        fake.places(&implementations),
+        [
+            place("src/Shapes.cs", circle),
+            place("src/Shapes.cs", square)
+        ]
+    );
+    let circle_item = fake
+        .at("textDocument/prepareTypeHierarchy", "src/Shapes.cs", circle)
+        .await;
+    assert_eq!(names(&circle_item), ["Circle"]);
+    let supertypes = fake
+        .ask("typeHierarchy/supertypes", json!({"item": circle_item[0]}))
+        .await;
+    assert_eq!(names(&supertypes), ["IShape"]);
+    let interface_item = fake
+        .at(
+            "textDocument/prepareTypeHierarchy",
+            "src/Shapes.cs",
+            interface,
+        )
+        .await;
+    let subtypes = fake
+        .ask("typeHierarchy/subtypes", json!({"item": interface_item[0]}))
+        .await;
+    assert_eq!(names(&subtypes), ["Circle", "Square"]);
+
+    // An opened text in which Square no longer implements IShape.
+    fake.open(
+        "src/Shapes.cs",
+        1,
+        &SHAPES_CS.replace("public class Square : IShape", "public class Square"),
+    )
+    .await;
+    let implementations = fake
+        .at("textDocument/implementation", "src/Shapes.cs", interface)
+        .await;
+    assert_eq!(
+        fake.places(&implementations),
+        [place("src/Shapes.cs", circle)]
+    );
+    let subtypes = fake
+        .ask("typeHierarchy/subtypes", json!({"item": interface_item[0]}))
+        .await;
+    assert_eq!(names(&subtypes), ["Circle"]);
+    fake.finish().await;
+}
+
+/// Incoming calls are the call sites of the name grouped by the function that
+/// holds them; outgoing calls are the calls inside a function resolved to
+/// declarations. A `didChange` that adds a second call line shows in both.
+#[tokio::test]
+async fn documents_fake_answers_call_hierarchy_in_and_out_from_the_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let add = position_of(CALCULATOR_CS, "Add");
+
+    let add_item = fake
+        .at(
+            "textDocument/prepareCallHierarchy",
+            "src/Calculator.cs",
+            add,
+        )
+        .await;
+    assert_eq!(names(&add_item), ["Add"]);
+    let incoming = fake
+        .ask("callHierarchy/incomingCalls", json!({"item": add_item[0]}))
+        .await;
+    assert_eq!(incoming.as_array().unwrap().len(), 1, "{incoming}");
+    assert_eq!(incoming[0]["from"]["name"], "Run");
+    assert_eq!(incoming[0]["fromRanges"].as_array().unwrap().len(), 1);
+
+    let run = position_of(CALL_SITE_CS, "Run");
+    let run_item = fake
+        .at("textDocument/prepareCallHierarchy", "src/CallSite.cs", run)
+        .await;
+    assert_eq!(names(&run_item), ["Run"]);
+    let outgoing = fake
+        .ask("callHierarchy/outgoingCalls", json!({"item": run_item[0]}))
+        .await;
+    assert_eq!(outgoing.as_array().unwrap().len(), 1, "{outgoing}");
+    assert_eq!(outgoing[0]["to"]["name"], "Add");
+    assert_eq!(outgoing[0]["fromRanges"].as_array().unwrap().len(), 1);
+
+    // A call site resolves to its callee, in the file that declares it.
+    let call = position_of(CALL_SITE_CS, "Add");
+    let callee = fake
+        .at("textDocument/prepareCallHierarchy", "src/CallSite.cs", call)
+        .await;
+    assert_eq!(names(&callee), ["Add"]);
+    assert_eq!(
+        fake.relative(callee[0]["uri"].as_str().unwrap()),
+        "src/Calculator.cs"
+    );
+
+    // `Run` now calls `Add` twice.
+    let two_calls = "namespace Acceptance;\npublic static class CallSite {\n    public static int Run(Calculator value) {\n        var first = value.Add(1, 2);\n        return value.Add(first, 3);\n    }\n}\n";
+    fake.open("src/CallSite.cs", 1, CALL_SITE_CS).await;
+    fake.change("src/CallSite.cs", 2, two_calls).await;
+    let incoming = fake
+        .ask("callHierarchy/incomingCalls", json!({"item": add_item[0]}))
+        .await;
+    assert_eq!(incoming.as_array().unwrap().len(), 1, "{incoming}");
+    assert_eq!(incoming[0]["from"]["name"], "Run");
+    assert_eq!(incoming[0]["fromRanges"].as_array().unwrap().len(), 2);
+    let run_item = fake
+        .at(
+            "textDocument/prepareCallHierarchy",
+            "src/CallSite.cs",
+            position_of(two_calls, "Run"),
+        )
+        .await;
+    let outgoing = fake
+        .ask("callHierarchy/outgoingCalls", json!({"item": run_item[0]}))
+        .await;
+    assert_eq!(outgoing.as_array().unwrap().len(), 1, "{outgoing}");
+    assert_eq!(outgoing[0]["fromRanges"].as_array().unwrap().len(), 2);
+
+    // A drifted position (indentation, or past the end) is on no identifier.
+    for drifted in [(3, 2), (99, 0)] {
+        let none = fake
+            .at(
+                "textDocument/prepareCallHierarchy",
+                "src/CallSite.cs",
+                drifted,
+            )
+            .await;
+        assert_eq!(none, json!([]), "{drifted:?}");
+    }
+    // The log names the item of a hierarchy request.
+    let events = fake.events();
+    let incoming_items: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["method"] == "callHierarchy/incomingCalls")
+        .map(|event| &event["item"]["name"])
+        .collect();
+    assert_eq!(incoming_items, ["Add", "Add"]);
+    fake.finish().await;
+}
+
+const COUNTER_RS: &str = "pub trait Shape { fn area(&self) -> f64; }\npub struct Counter { n: u32 }\nimpl Counter {\n    pub fn new() -> Counter { Counter { n: 0 } }\n}\npub fn make() -> Counter { Counter::new() }\n";
+
+/// In Rust `fn new(` declares a function and `Counter::new()` is a call of it;
+/// a bodiless trait member (`fn area(&self) -> f64;`) is a declaration too. A
+/// disk edit without a notification changes nothing.
+#[tokio::test]
+async fn documents_fake_reads_fn_new_as_a_declaration_and_a_path_call_as_a_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write(&root, "src/lib.rs", COUNTER_RS);
+    let fake = DocumentsFake::start_on(&temp, root).await;
+    let new = position_of(COUNTER_RS, "new");
+    assert_eq!(new.0, 3, "the first `new` is the declaration");
+
+    let symbols = fake.symbols("new").await;
+    assert_eq!(fake.places(&symbols), [place("src/lib.rs", new)]);
+    assert_eq!(symbols[0]["kind"], 6);
+    assert_eq!(symbols[0]["containerName"], "Counter");
+    let area = fake.symbols("area").await;
+    assert_eq!(
+        fake.places(&area),
+        [place("src/lib.rs", position_of(COUNTER_RS, "area"))],
+        "a bodiless member is a declaration"
+    );
+
+    let last_line = COUNTER_RS.lines().nth(5).unwrap();
+    let call = (5, last_line.find("new").unwrap() as u32);
+    let callee = fake
+        .at("textDocument/prepareCallHierarchy", "src/lib.rs", call)
+        .await;
+    assert_eq!(fake.places(&callee), [place("src/lib.rs", new)]);
+    let incoming = fake
+        .ask("callHierarchy/incomingCalls", json!({"item": callee[0]}))
+        .await;
+    assert_eq!(incoming.as_array().unwrap().len(), 1, "{incoming}");
+    assert_eq!(incoming[0]["from"]["name"], "make");
+    assert_eq!(incoming[0]["fromRanges"].as_array().unwrap().len(), 1);
+
+    // `fn new` is renamed on disk; no notification.
+    write(
+        &fake.root,
+        "src/lib.rs",
+        &COUNTER_RS.replace("fn new", "fn create"),
+    );
+    assert_eq!(
+        fake.places(&fake.symbols("new").await),
+        [place("src/lib.rs", new)]
+    );
+    fake.finish().await;
+}
+
+/// Odd notifications are applied or refused, never silently: a second
+/// `didOpen` of an open document still applies, and a `didChange` without
+/// changes, without text or with a range is ignored, each with its own note.
+#[tokio::test]
+async fn documents_fake_names_the_notifications_it_ignores_or_applies_oddly() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start(&temp).await;
+    let call = position_of(CALL_SITE_CS, "Add");
+    let second_text = format!("\n{CALCULATOR_CS}");
+    let uri = fake.uri("src/Calculator.cs");
+
+    fake.open("src/Calculator.cs", 1, CALCULATOR_CS).await;
+    fake.open("src/Calculator.cs", 1, &second_text).await;
+    for (version, changes) in [
+        (2, json!([])),
+        (3, json!([{}])),
+        (
+            4,
+            json!([{"range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": 0}}, "text": "x"}]),
+        ),
+    ] {
+        fake.client
+            .notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": changes,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        fake.definition("src/CallSite.cs", call).await,
+        [place("src/Calculator.cs", position_of(&second_text, "Add"))],
+        "the second didOpen applied and no odd change did"
+    );
+    let events = fake.events();
+    let notes: Vec<(&str, i64, Option<&str>)> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["method"].as_str(),
+                Some("textDocument/didOpen" | "textDocument/didChange")
+            )
+        })
+        .map(|event| {
+            (
+                event["method"].as_str().unwrap(),
+                event["version"].as_i64().unwrap(),
+                event["note"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            ("textDocument/didOpen", 1, None),
+            ("textDocument/didOpen", 1, Some("open-reopened")),
+            ("textDocument/didChange", 2, Some("change-empty")),
+            ("textDocument/didChange", 3, Some("change-no-text")),
+            (
+                "textDocument/didChange",
+                4,
+                Some("change-incremental-ignored")
+            ),
+        ]
+    );
+    assert!(
+        events.iter().all(|event| event["spawn"] == 1),
+        "every event carries the ordinal of the server process"
+    );
+    fake.finish().await;
+}
+
+/// The mode works behind the product's client: the manager's `symbols`,
+/// `definition` and `document_symbols` return locations derived from the
+/// store, mapped to workspace files with kinds.
+#[tokio::test]
+async fn documents_fake_serves_manager_navigation_and_outline() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_path = temp.path().join("workspace");
+    let data_path = temp.path().join("data");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&data_path).unwrap();
+    write_csharp_workspace(&workspace_path);
+    let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
+    let config = with_fake_documents_server(
+        Config {
+            data_dir: data_path,
+            ..Config::default()
+        },
+        &state,
+        &[],
+        10,
+    );
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    let add = position_of(CALCULATOR_CS, "Add");
+
+    let symbols = manager.symbols(&adapter, &workspace, "Add").await.unwrap();
+    assert_eq!(symbols.len(), 1, "{symbols:?}");
+    assert_eq!(symbols[0].name.as_deref(), Some("Add"));
+    assert_eq!(symbols[0].kind, Some(6));
+    assert_eq!(
+        symbols[0].relative_file_path.as_deref(),
+        Some("src/Calculator.cs")
+    );
+    assert_eq!(
+        (symbols[0].start_line, symbols[0].start_character),
+        (add.0 + 1, add.1)
+    );
+    assert_eq!(symbols[0].provider.as_deref(), Some("csharp-ls"));
+
+    // The file moves `Add` one line lower on disk. The csharp adapter sends no
+    // notification, so the fake still answers from the text it walked.
+    write(
+        &workspace_path,
+        "src/Calculator.cs",
+        &format!("\n{CALCULATOR_CS}"),
+    );
+    let call = position_of(CALL_SITE_CS, "Add");
+    let definitions = manager
+        .definition(
+            &adapter,
+            &workspace,
+            &workspace.path.join("src/CallSite.cs"),
+            "src/CallSite.cs",
+            call.0,
+            call.1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(definitions.len(), 1, "{definitions:?}");
+    assert_eq!(
+        definitions[0].relative_file_path.as_deref(),
+        Some("src/Calculator.cs")
+    );
+    assert_eq!(
+        (definitions[0].start_line, definitions[0].start_character),
+        (add.0 + 1, add.1)
+    );
+
+    let outline = manager
+        .document_symbols(
+            &adapter,
+            &workspace,
+            &workspace.path.join("src/Calculator.cs"),
+            "src/Calculator.cs",
+        )
+        .await
+        .unwrap();
+    let outline: Vec<(Option<&str>, Option<u64>)> = outline
+        .iter()
+        .map(|symbol| (symbol.name.as_deref(), symbol.kind))
+        .collect();
+    assert_eq!(
+        outline,
+        [(Some("Calculator"), Some(5)), (Some("Add"), Some(6))]
+    );
+    manager.shutdown_all().await;
+}

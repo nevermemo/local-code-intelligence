@@ -7,6 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Shared by the test crate (which includes this file through `support/mod.rs`)
+// and the `fake-lsp-server` binary: `#[path]` on a `mod` declaration outside an
+// inline module resolves next to this file in both.
+#[path = "fake_lsp_documents.rs"]
+mod documents;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeScenario {
     Initialized,
@@ -35,6 +41,12 @@ pub enum FakeScenario {
     /// error-response`): a server that fails without exiting, hanging, or
     /// breaking the protocol.
     ErrorResponse,
+    /// Answers from the documents it was sent instead of canned ranges
+    /// (`--mode documents`): a start-up walk of the workspace root, then
+    /// `didOpen`/`didChange`/`didClose`/`didChangeWatchedFiles`, and a toy
+    /// parser behind every navigation request. See `fake_lsp_documents.rs`.
+    /// `--primary-file` and `--secondary-file` are not used.
+    Documents,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +214,7 @@ pub fn run_from_env() -> io::Result<()> {
         "exit-during-request" => FakeScenario::ExitDuringRequest,
         "restart-success" => FakeScenario::RestartSuccess,
         "error-response" => FakeScenario::ErrorResponse,
+        "documents" => FakeScenario::Documents,
         other => {
             eprintln!("unexpected FAKE_LSP_MODE: {other}");
             return Err(io::Error::new(
@@ -399,6 +412,8 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut pending_definition = None;
     let mut pid_written = false;
     let mut root_uri: Option<String> = None;
+    let mut document_store = matches!(config.scenario, FakeScenario::Documents)
+        .then(|| documents::Store::new(config.state_dir.clone(), spawn_count));
 
     loop {
         let Some(frame) = read_frame(&mut stdin)? else {
@@ -455,6 +470,30 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             root_uri = Some(uri.to_string());
         }
 
+        // `--mode documents`: the store answers navigation requests and keeps
+        // the documents; the handshake, `shutdown`, `exit` and `didOpen`
+        // fall through to the standard handling below.
+        if let Some(store) = document_store.as_mut()
+            && let Some(method) = method
+        {
+            match store.handle(method, &request["params"], id.is_some()) {
+                documents::Outcome::Pass => {}
+                documents::Outcome::Handled => continue,
+                documents::Outcome::Response(result) => {
+                    if let Some(id) = id {
+                        write_message(&mut stdout, &json_response(id, result))?;
+                    }
+                    continue;
+                }
+                documents::Outcome::Unsupported => {
+                    if let Some(id) = id {
+                        write_message(&mut stdout, &json_error(id, -32601, "method not found"))?;
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Every scenario must accept the initialize handshake, because the real
         // CSharpClient::spawn always sends initialize + initialized before any
         // scenario-specific request. Scenario-specific behavior on initialize
@@ -471,7 +510,15 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 thread::sleep(Duration::from_millis(config.initialize_delay_ms));
             }
             if let Some(id) = id {
-                write_message(&mut stdout, &json_response(id, json!({"capabilities": {}})))?;
+                let capabilities = if document_store.is_some() {
+                    documents::capabilities()
+                } else {
+                    json!({})
+                };
+                write_message(
+                    &mut stdout,
+                    &json_response(id, json!({"capabilities": capabilities})),
+                )?;
             }
             match config.scenario {
                 FakeScenario::UnsolicitedNotification => {
