@@ -36,8 +36,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The test-only map entry points (`App::fuse_through_maps`,
 # `App::record_through_maps`) and the wrapped channel maps they use.
 # Renamed from `spike-maps` (decision d366; recorded break, no alias).
-# `cargo xtask test --suite Full` and `--suite Indexing` enable it; the
-# default build has neither (merge condition M3).
+# Every `cargo xtask test` suite enables it; the default build has neither
+# (merge condition M3).
 map-equivalence = []
 
 [dev-dependencies]

@@ -24,15 +24,14 @@ that tree is the reason a full-workspace build/test cycle can take several
 minutes. Reach for the full `cargo xtask test --suite <name>` commands below
 once a change also needs `App`, `Store`, or MCP coverage.
 
-Pick one scoping strategy per session rather than mixing them: alternating
-between a `-p`-scoped command and an unscoped `cargo test --test integration
-<name>` (feature unification differs) can trigger a full,
-unexpectedly slow rebuild instead of reusing the previous run's cache, since
-the two invocations don't always share build artifacts. If a command that
-should be instant suddenly starts recompiling `ring`/`rustls`/`lance*` from
-scratch, that's the likely cause -- let it finish once rather than
-interrupting it, and prefer `cargo xtask test --suite Full` for the next full
-check instead of another narrow invocation.
+Run the integration tests through `cargo xtask test --suite <name>`. Every focused suite passes `--workspace --features
+local-code-intelligence/map-equivalence`, so it resolves dependencies exactly as `--suite Full` does. A direct `cargo test`
+that builds the root crate must carry the same two flags: Cargo unifies dependency features over the selected packages, so
+a bare `cargo test --test integration` (or a `-p`-scoped command mixed in) rebuilds reqwest and the lance stack (measured
+at 490 s) and then flips the root crate's artefacts back and forth against Full's (52 s per switch). If a command that
+should be instant starts recompiling `ring`/`rustls`/`lance*` from scratch, that is the likely cause; let it finish once
+rather than interrupting it.
+
 Nested cargo runs from `xtask` drop the variables `cargo run` sets (`CARGO_MANIFEST_DIR`, `CARGO_PKG_*` and the like), so a direct `cargo clippy`/`cargo test` and a `cargo xtask test` suite with the same flags share one set of build artefacts.
 
 ## Prerequisites for the test gate
@@ -59,7 +58,7 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
 | Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |
 | Documentation link check (`xtask/src/docs.rs`) | `cargo test -p xtask docs::` (its repository case needs `git` on `PATH`); `cargo xtask docs check` runs the check itself and is the second step of `--suite Full` |
-| Index lifecycle or persistence | `cargo xtask test --suite Indexing` (runs with the `map-equivalence` feature) |
+| Index lifecycle or persistence | `cargo xtask test --suite Indexing` |
 | Readiness and health | `cargo xtask test --suite Readiness` |
 | MCP transport and tools | `cargo xtask test --suite Mcp` |
 | Watched refresh | `cargo xtask test --suite Watching` |
@@ -69,13 +68,14 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 The unit-test suites (`Unit`, `Chunk`, `Filter`, and the unit halves of
 `Evaluation` and `Lsp`) run `cargo test --workspace --lib <module>::`, so a
 module filter reaches unit tests in both the root crate and `lci-core`, and
-they share `--suite Full`'s feature resolution and build cache. Every focused
+they share `--suite Full`'s feature resolution and build cache (as do the integration suites, which also pass the
+`map-equivalence` feature). Every focused
 suite counts the tests it executed and fails when its filter matched none, so
 a renamed or moved module can't make a suite pass vacuously.
 
 `cargo xtask test --suite Full` runs, in order: the machine-value lint, the documentation link check, `cargo fmt --all -- --check`, `cargo test
---workspace --locked --features local-code-intelligence/map-equivalence`, and Clippy with the same `--locked` and feature
-flags. `--locked` makes a pull request that edits `Cargo.toml` without its lockfile fail here instead of in a locked
+--workspace --locked --features local-code-intelligence/map-equivalence` (under cargo-nextest when it is installed, see
+below), and Clippy with the same `--locked` and feature flags. `--locked` makes a pull request that edits `Cargo.toml` without its lockfile fail here instead of in a locked
 build later; the focused suites stay unlocked. The `map-equivalence` feature compiles the test-only map entry points (the T0 bit-for-bit map check and the `RunRecord` paths); it was named `spike-maps` before decision d366, with no alias, so external CI scripts must use the new name.
 Live model acceptance (`cargo xtask acceptance <name>`) remains separate because
 it depends on locally running services. Generated reports belong under
@@ -87,12 +87,21 @@ and link cost of many separate integration binaries.
 
 ## Optional: cargo-nextest
 
-`.config/nextest.toml` defines a `ci` profile for
-[cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`):
+When [cargo-nextest](https://nexte.st) is installed (`cargo install cargo-nextest --locked`), the test step of
+`cargo xtask test --suite Full` runs `cargo nextest run --workspace --locked --features local-code-intelligence/map-equivalence --no-fail-fast`
+followed by `cargo test ... --doc` (nextest does not run doctests), and prints which path ran. It uses the default profile,
+which has no retries, so a flaky test fails the gate, and ends a test that runs past 10 minutes. Measured on a warm
+target: 83 s for the test phase against 110 s for the serial `cargo test` binaries. Set `LCI_NO_NEXTEST` to anything but
+empty or `0` to run the plain `cargo test` step instead; CI installs no nextest and always runs that step, so both
+isolation models stay exercised. The step line says which path ran and why (`LCI_NO_NEXTEST` set, or `cargo nextest
+--version` failed). The focused suites always use `cargo test`.
+
+`.config/nextest.toml` also defines a `ci` profile:
 `cargo nextest run --workspace --locked --features local-code-intelligence/map-equivalence --profile ci`
 retries a failed test once and reports it as flaky, ends a test that runs past
 5 minutes, and runs the language-server, model-client and process tests at
-most two at a time. `cargo xtask test` does not use it.
+most four at a time (that last limit is set in the default profile and applies to `ci` too).
+`cargo xtask test` does not use the `ci` profile.
 
 ## Optional: sccache and a faster linker
 
