@@ -114,6 +114,13 @@ const CAP_KEYS: usize = 20;
 const CAP_OTHER_READERS: usize = 80;
 /// The walk beam of `flow_from`: the edges of a node the traversal follows.
 const RECIPE_BEAM: usize = 64;
+/// The maps of the walk `flow_from` runs. None of them is `lsp.live`, so no
+/// language server starts under a recipe and `[run_profile.lsp] sessions` has
+/// nothing to decide there: the walk's call hands over no manager (`shared`
+/// then falls back to the call's own, as `per_call` does), and the key still
+/// reaches `traverse::run` through [`Ctx::profile`], so the stamped profile
+/// hash is the one that ran.
+const FLOW_WALK_MAPS: [&str; 2] = ["graph.scip", "structure.contains"];
 /// Deepest `flow_path` search.
 const MAX_PATH_DEPTH: u32 = 8;
 /// The file whose keys `config.key` knows.
@@ -1294,7 +1301,7 @@ async fn flow_from(
         exact_seeds: false,
         ..ctx.limits.clone()
     };
-    let maps = ["graph.scip".to_owned(), "structure.contains".to_owned()];
+    let maps = FLOW_WALK_MAPS.map(str::to_owned);
     let steer = SteerArgs {
         policy: Some("flow".into()),
         ..SteerArgs::default()
@@ -1313,6 +1320,7 @@ async fn flow_from(
         steer: &steer,
         handle: None,
         lsp: None,
+        lsp_sessions: None,
     };
     let at = Instant::now();
     let report = Box::pin(traverse::run(&limits, ctx.profile, ctx.dirs, &call)).await?;

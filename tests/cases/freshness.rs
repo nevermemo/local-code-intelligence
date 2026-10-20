@@ -713,6 +713,7 @@ impl World {
             steer: &steer,
             handle: None,
             lsp: Some(&self.walk_config),
+            lsp_sessions: None,
         };
         let mut walk = read_walk(&self.run(&base).await);
         let edges = walk.edges;
@@ -726,6 +727,7 @@ impl World {
                 question: &truth.probe,
                 seeds: &[],
                 maps: Some(&only),
+                lsp_sessions: None,
                 ..base
             };
             let report = self.run(&call).await;
@@ -818,6 +820,7 @@ impl World {
             steer: &steer,
             handle: None,
             lsp: Some(&self.walk_config),
+            lsp_sessions: None,
         };
         let found = read_walk(&self.run(&call).await);
         found
@@ -867,6 +870,7 @@ impl World {
             steer: &steer,
             handle: None,
             lsp: Some(&self.walk_config),
+            lsp_sessions: None,
         };
         let walk = read_walk(&self.run(&call).await);
         let commits = |map: &str| -> BTreeSet<String> {

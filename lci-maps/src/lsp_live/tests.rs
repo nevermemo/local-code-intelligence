@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::{SnapshotRef, kit_c3::check_edge_invariants};
+use lci_core::config::Config;
 use lci_core::node::{SymbolKey, SymbolKind};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -285,7 +286,7 @@ async fn a_missing_server_binary_makes_the_map_unavailable_before_any_walk() {
         id: "test".into(),
         path: std::env::temp_dir(),
     };
-    let error = ManagerBackend::open(workspace, &config)
+    let error = ManagerBackend::open(workspace, Arc::new(Manager::new(&config)))
         .await
         .err()
         .expect("no server can be found");

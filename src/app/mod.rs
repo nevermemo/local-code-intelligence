@@ -61,7 +61,10 @@ pub struct App {
     // Bound concurrent model traffic from different indexing clients.
     index_lock: Mutex<()>,
     watchers: Mutex<HashMap<String, (crate::workspace::Workspace, CancellationToken)>>,
-    analyzer: lsp::Manager,
+    /// The language servers: navigation, the search channel and, under
+    /// `[run_profile.lsp] sessions = "shared"`, the traverse calls share it
+    /// (see [`Self::language_servers`]).
+    analyzer: Arc<lsp::Manager>,
     /// File every search appends its candidate dump line to (see
     /// [`CANDIDATE_DUMP_ENV`]); `None` writes nothing.
     candidate_dump: Option<PathBuf>,
@@ -74,7 +77,7 @@ impl App {
         config.data_dir = dunce::canonicalize(&config.data_dir)?;
         let store = Store::open(&config.data_dir.join("lancedb")).await?;
         let models = Models::new(&config)?;
-        let analyzer = lsp::Manager::new(&config);
+        let analyzer = Arc::new(lsp::Manager::new(&config));
         let profile_hash = config.run_profile().hash;
         Ok(Self {
             config,
@@ -104,6 +107,15 @@ impl App {
     /// characters), the value of the `profile_hash` key of every result.
     pub fn profile_hash(&self) -> &str {
         &self.profile_hash
+    }
+
+    /// The service's language-server manager, for a caller that shares its
+    /// sessions (the traverse calls under `[run_profile.lsp] sessions =
+    /// "shared"`). A server started through a clone is stopped like any other
+    /// of the service: by the idle sweeper, [`Self::release_language_servers`]
+    /// and [`Self::shutdown_language_servers`].
+    pub fn language_servers(&self) -> Arc<lsp::Manager> {
+        Arc::clone(&self.analyzer)
     }
 
     async fn lock(&self, id: &str) -> Arc<WorkspaceCoordination> {

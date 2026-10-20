@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
@@ -540,6 +540,9 @@ pub struct Manager {
     /// `lsp_stuck_seconds`: how long a session may answer nothing but transient
     /// errors before it is replaced. `None` never replaces it.
     stuck_after: Option<Duration>,
+    /// The providers whose binary has answered a version probe (see
+    /// [`Self::probe_once`]).
+    probed: std::sync::Mutex<HashSet<&'static str>>,
 }
 
 impl Manager {
@@ -570,7 +573,23 @@ impl Manager {
             adapters,
             sessions,
             stuck_after,
+            probed: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// [`LspAdapter::probe_readiness`] for the adapter, answered from memory
+    /// once the probe has succeeded for its provider: the binary is not asked
+    /// again for the life of this manager (a binary removed meanwhile is found
+    /// when its session fails). A failed probe is remembered nowhere and is
+    /// run again by the next caller. Concurrent first callers each probe.
+    pub async fn probe_once(&self, adapter: &Arc<dyn LspAdapter>, timeout: Duration) -> Result<()> {
+        let provider = adapter.provider();
+        if self.probed.lock().unwrap().contains(provider) {
+            return Ok(());
+        }
+        adapter.probe_readiness(timeout).await?;
+        self.probed.lock().unwrap().insert(provider);
+        Ok(())
     }
 
     pub fn adapters(&self) -> &[Arc<dyn LspAdapter>] {
@@ -1490,6 +1509,78 @@ mod tests {
         fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
             Box::new(|_| false)
         }
+    }
+
+    /// An adapter whose version probe answers from a list (the last answer
+    /// repeats) and counts how often it was asked.
+    struct Probing {
+        answers: Vec<bool>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LspAdapter for Probing {
+        fn provider(&self) -> &'static str {
+            "probing-server"
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "probing_server_available"
+        }
+        async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
+            let n = self.asked.fetch_add(1, Ordering::SeqCst);
+            match self.answers[n.min(self.answers.len() - 1)] {
+                true => Ok(()),
+                false => Err(anyhow!("no such binary")),
+            }
+        }
+        fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
+            None
+        }
+        fn initialize_params(&self, _root: &std::path::Path) -> Option<Value> {
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_is_run_once_per_provider_until_it_fails() {
+        let timeout = Duration::from_secs(1);
+        let probing = |answers: &[bool]| {
+            let adapter = Arc::new(Probing {
+                answers: answers.to_vec(),
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (Arc::clone(&adapter) as Arc<dyn LspAdapter>, adapter)
+        };
+        let manager = Manager::new(&Config::default());
+        // Ok, Ok: the second call is answered from memory.
+        let (adapter, counts) = probing(&[true]);
+        manager.probe_once(&adapter, timeout).await.unwrap();
+        manager.probe_once(&adapter, timeout).await.unwrap();
+        assert_eq!(counts.asked.load(Ordering::SeqCst), 1);
+        // Err, Ok: a failure is not remembered, the next call asks again, and
+        // after the Ok no more probes are made.
+        let manager = Manager::new(&Config::default());
+        let (adapter, counts) = probing(&[false, true]);
+        assert!(manager.probe_once(&adapter, timeout).await.is_err());
+        manager.probe_once(&adapter, timeout).await.unwrap();
+        manager.probe_once(&adapter, timeout).await.unwrap();
+        assert_eq!(counts.asked.load(Ordering::SeqCst), 2);
+        // Another manager keeps its own memory.
+        let other = Manager::new(&Config::default());
+        other.probe_once(&adapter, timeout).await.unwrap();
+        assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
     }
 
     const FAST_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];
