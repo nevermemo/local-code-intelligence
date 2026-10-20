@@ -22,6 +22,10 @@ use std::{
     sync::Arc,
 };
 
+/// Table metadata key and value marking an index committed without vectors.
+const VECTORS_KEY: &str = "vectors";
+const VECTORS_MISSING: &str = "missing";
+
 #[derive(Clone)]
 pub struct Store {
     db: Connection,
@@ -108,6 +112,11 @@ pub struct Snapshot {
     pub identity: String,
     pub dimension: usize,
     pub indexed_at: String,
+    /// The index was committed while the embedding service was unreachable:
+    /// its `vector` column holds placeholders, never real embeddings. No
+    /// vector-lane reader may serve them ([`Store::cached_vectors`],
+    /// [`Store::chunk_vector`] and the nearest-neighbour searches all refuse).
+    pub vectors_missing: bool,
     _legacy_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
@@ -200,11 +209,16 @@ impl Store {
             .get("indexed_at")
             .cloned()
             .unwrap_or_default();
+        let vectors_missing = schema
+            .metadata()
+            .get(VECTORS_KEY)
+            .is_some_and(|value| value == VECTORS_MISSING);
         Ok(Some(Snapshot {
             table,
             identity,
             dimension,
             indexed_at,
+            vectors_missing,
             _legacy_read_guard: legacy_read_guard,
         }))
     }
@@ -216,6 +230,10 @@ impl Store {
         snapshot: &Snapshot,
         uses_path: bool,
     ) -> Result<HashMap<String, Vec<f32>>> {
+        // A vectorless snapshot holds placeholders, not embeddings to reuse.
+        if snapshot.vectors_missing {
+            return Ok(HashMap::new());
+        }
         let columns: &[&str] = if uses_path {
             &["content_hash", "relative_file_path", "vector"]
         } else {
@@ -262,6 +280,35 @@ impl Store {
         identity: &str,
         dimension: usize,
     ) -> Result<()> {
+        self.commit(workspace, chunks, vectors, identity, dimension, false)
+            .await
+    }
+
+    /// Commits `chunks` with placeholder vectors (one zero per chunk) and the
+    /// table metadata `vectors = "missing"`, keeping the real `identity`. Used
+    /// when the embedding service was unreachable and no real vectors exist to
+    /// keep; the snapshot reports `vectors_missing` and no vector-lane reader
+    /// serves the placeholders.
+    pub async fn replace_vectorless(
+        &self,
+        workspace: &Workspace,
+        chunks: &[Chunk],
+        identity: &str,
+    ) -> Result<()> {
+        let vectors = vec![vec![0.0_f32]; chunks.len()];
+        self.commit(workspace, chunks, &vectors, identity, 1, true)
+            .await
+    }
+
+    async fn commit(
+        &self,
+        workspace: &Workspace,
+        chunks: &[Chunk],
+        vectors: &[Vec<f32>],
+        identity: &str,
+        dimension: usize,
+        vectors_missing: bool,
+    ) -> Result<()> {
         ensure!(
             chunks.len() == vectors.len() && dimension > 0,
             "invalid chunk/vector dimensions"
@@ -290,7 +337,7 @@ impl Store {
             ),
             true,
         ));
-        let metadata = HashMap::from([
+        let mut metadata = HashMap::from([
             ("embedding_identity".into(), identity.into()),
             (
                 "workspace_path".into(),
@@ -304,6 +351,9 @@ impl Store {
                     .to_string(),
             ),
         ]);
+        if vectors_missing {
+            metadata.insert(VECTORS_KEY.into(), VECTORS_MISSING.into());
+        }
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let array = |values: Vec<String>| -> ArrayRef { Arc::new(StringArray::from(values)) };
         let batch = RecordBatch::try_new(
@@ -441,6 +491,10 @@ impl Store {
         prose_exempt: bool,
     ) -> Result<SemanticHits> {
         ensure!(
+            !snapshot.vectors_missing,
+            "the index has no vectors (the embedding service was unreachable when it was built)"
+        );
+        ensure!(
             vector.len() == snapshot.dimension,
             "query embedding dimension differs from index; reindex workspace"
         );
@@ -550,6 +604,10 @@ impl Store {
         content_hash: &str,
         start_line: u32,
     ) -> Result<Option<Vec<f32>>> {
+        // Placeholders are not the chunk's embedding.
+        if snapshot.vectors_missing {
+            return Ok(None);
+        }
         let quoted = |text: &str| text.replace('\'', "''");
         let batches = snapshot
             .table

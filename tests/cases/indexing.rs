@@ -619,33 +619,310 @@ async fn concurrent_first_searches_share_one_initial_index_job() {
 }
 
 #[tokio::test]
-async fn failed_initial_search_preserves_no_snapshot_and_can_retry() {
+async fn a_failed_initial_embedding_indexes_without_vectors_and_the_next_index_run_embeds_them() {
     let (temp, config, fake, task) = fixture().await;
     let workspace = temp.path().join("retry");
     write(&workspace, "lib.rs", "fn translator() {}\n");
     let app = App::open(config).await.unwrap();
     fake.embed_fails.store(true, Ordering::SeqCst);
 
+    // A fresh workspace has no vectors to lose: the chunks are committed
+    // without them and the search runs on the other channels.
+    let first = app.search(&workspace, "translator", None).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["index"]["action"],
+        "created"
+    );
+    assert!(first.results[0].chunk.code.contains("translator"));
+    let status = app.status(&workspace).await.unwrap();
+    assert!(status.indexed && status.vectors_missing);
+    assert_eq!(status.embedding_dimension, None);
+
+    // A vectorless previous snapshot (same identity, nothing cached) stays
+    // indexable without vectors while the service is still down.
+    let again = app.index(&workspace).await.unwrap();
+    assert!(again.vectors_missing);
+    assert_eq!(again.embedded_chunks, 0);
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+
+    fake.embed_fails.store(false, Ordering::SeqCst);
+    let repaired = app.index(&workspace).await.unwrap();
+    assert!(!repaired.vectors_missing);
+    assert_eq!(repaired.embedded_chunks, 1);
+    let status = app.status(&workspace).await.unwrap();
+    assert!(!status.vectors_missing);
+    assert!(status.embedding_dimension.is_some());
+    let retried = app.search(&workspace, "translator", Some(1)).await.unwrap();
+    assert!(
+        retried.results[0]
+            .retrieval_channels
+            .contains(&"semantic".to_string()),
+        "{:?}",
+        retried.results[0].retrieval_channels
+    );
+    task.abort();
+}
+
+/// A fresh workspace whose embedder port refuses connections is indexed
+/// without vectors; the search answers from lexical and says why.
+#[tokio::test]
+async fn a_fresh_workspace_is_indexed_without_vectors_when_the_embedder_port_is_closed() {
+    let started = std::time::Instant::now();
+    let (temp, mut config, _fake, task) = fixture().await;
+    // A port that refuses connections, held for the whole test.
+    let closed = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", closed.port);
+    config.channels.lsp = false;
+    let workspace = temp.path().join("no-embedder");
+    write(
+        &workspace,
+        "lib.rs",
+        "fn translator() {}\nfn unrelated() {}\n",
+    );
+    let app = App::open(config).await.unwrap();
+
+    let report = app.search(&workspace, "translator", Some(2)).await.unwrap();
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["index"]["action"], "created", "{wire}");
+    assert!(!report.results.is_empty(), "{wire}");
+    assert!(
+        report.results[0].chunk.code.contains("translator"),
+        "{wire}"
+    );
+    assert_eq!(report.results[0].retrieval_channels, ["lexical"]);
+    assert!(report.results[0].semantic_score.is_none());
+    let warning = report.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("Semantic retrieval unavailable: the index has no vectors (the embedding service was unreachable when it was built)"),
+        "{warning}"
+    );
+    assert_eq!(report.timings.query_embedding_ms, 0.0);
+    assert_eq!(report.timings.lancedb_search_ms, 0.0);
+
+    let status = app.status(&workspace).await.unwrap();
+    assert!(status.indexed && status.compatible && status.vectors_missing);
+    assert!(status.chunks > 0);
+    assert_eq!(
+        serde_json::to_value(&status).unwrap()["vectors_missing"],
+        true
+    );
+
+    // A second search reuses the vectorless snapshot and neither embeds the
+    // query nor serves a placeholder.
+    let again = app.search(&workspace, "unrelated", Some(2)).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&again).unwrap()["index"]["action"],
+        "reused"
+    );
+    assert!(again.results.iter().all(|hit| hit.semantic_score.is_none()
+        && !hit.retrieval_channels.contains(&"semantic".to_string())));
+    assert!(
+        again
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("the index has no vectors")
+    );
+
+    // Each attempt to embed against a refused port costs about 9 s of
+    // retries on Windows, so the test makes one (the first search): the
+    // `index_workspace` report is checked by the navigation test instead.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    task.abort();
+}
+
+/// The hard rule survives: an embedding URL/model change makes the old
+/// vectors incompatible, and a down embedder must not turn that into a
+/// vectorless index.
+#[tokio::test]
+async fn an_embedding_identity_change_still_fails_with_the_embedder_down() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("identity");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config.clone()).await.unwrap();
+    app.index(&workspace).await.unwrap();
+    drop(app);
+
+    // Another model name is another identity; the service (HTTP 503, which
+    // is not retried) is down.
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let mut changed = config;
+    changed.embedding_model = "another-model".into();
+    let app = App::open(changed).await.unwrap();
+    assert!(!app.status(&workspace).await.unwrap().compatible);
+
     let error = app
         .search(&workspace, "translator", None)
         .await
         .unwrap_err();
-    assert!(format!("{error:#}").contains("embedding service HTTP error"));
-    assert!(!app.status(&workspace).await.unwrap().indexed);
-
-    fake.embed_fails.store(false, Ordering::SeqCst);
-    let retried = app.search(&workspace, "translator", Some(1)).await.unwrap();
-    assert_eq!(
-        serde_json::to_value(retried).unwrap()["index"]["action"],
-        "created"
+    assert!(
+        format!("{error:#}").contains("embedding configuration changed"),
+        "{error:#}"
     );
-    assert!(app.status(&workspace).await.unwrap().indexed);
+    let error = app.index(&workspace).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("embedding a batch"),
+        "{error:#}"
+    );
+    // The old snapshot, with its real vectors, is untouched.
+    let status = app.status(&workspace).await.unwrap();
+    assert!(!status.compatible && !status.vectors_missing);
+    assert_eq!(status.chunks, 1);
+    task.abort();
+}
+
+/// The gate is the empty vector cache, not the snapshot's flag: a snapshot
+/// that holds no chunks has no vectors and no flag, and its next index run
+/// may still go vectorless.
+#[tokio::test]
+async fn a_workspace_first_indexed_empty_can_then_be_indexed_vectorless_with_the_embedder_down() {
+    let (temp, config, fake, task) = fixture().await;
+    let workspace = temp.path().join("empty-first");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let app = App::open(config).await.unwrap();
+    let empty = app.index(&workspace).await.unwrap();
+    assert_eq!(empty.chunks, 0);
+    assert!(!empty.vectors_missing);
+    let status = app.status(&workspace).await.unwrap();
+    assert!(status.indexed && !status.vectors_missing);
+
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    fake.embed_fails.store(true, Ordering::SeqCst);
+    let indexed = app.index(&workspace).await.unwrap();
+    assert_eq!(indexed.chunks, 1);
+    assert_eq!(indexed.embedded_chunks, 0);
+    assert!(indexed.vectors_missing);
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+    task.abort();
+}
+
+/// Only an availability error goes vectorless: a service that answers with a
+/// client error (here HTTP 401) is a configuration problem and fails the
+/// index with its message, fresh workspace or not.
+#[tokio::test]
+async fn a_configuration_error_from_the_embedder_still_fails_a_fresh_index() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let router = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post(|| async { (axum::http::StatusCode::UNAUTHORIZED, "bad key marker") }),
+    );
+    let listener = loopback_tokio_listener();
+    config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let rejecting = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let workspace = temp.path().join("rejected");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let error = app.index(&workspace).await.unwrap_err();
+    assert!(format!("{error:#}").contains("bad key marker"), "{error:#}");
+    let error = app
+        .search(&workspace, "translator", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("bad key marker"), "{error:#}");
+    assert!(!app.status(&workspace).await.unwrap().indexed);
+    rejecting.abort();
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_search_waiting_for_a_vectorless_explicit_index_uses_its_snapshot() {
+    let (temp, mut config, _fake, task) = fixture().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post({
+            let requests = requests.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let requests = requests.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    let cause = match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            started.notify_one();
+                            release.notified().await;
+                            "explicit-index failure"
+                        }
+                        // A waiter that missed the explicit index indexes by
+                        // itself; answer at once so the assertions fail fast.
+                        _ => "duplicate request",
+                    };
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, cause)
+                }
+            }
+        }),
+    );
+    let listener = loopback_tokio_listener();
+    config.embedding_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let failing_models = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let workspace = temp.path().join("vectorless-explicit-index");
+    write(&workspace, "lib.rs", "fn translator() {}\n");
+    let app = App::open(config).await.unwrap();
+
+    let indexing = app.index(&workspace);
+    tokio::pin!(indexing);
+    tokio::select! {
+        result = &mut indexing => panic!("index finished before release: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), started.notified()) => {
+            result.expect("explicit indexing reaches the embedding request");
+        }
+    }
+
+    let waiting = app.search(&workspace, "translator", None);
+    tokio::pin!(waiting);
+    // Keep the explicit index blocked while polling the search into its wait.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let explicit = indexing.await.unwrap();
+    assert!(explicit.vectors_missing);
+    let found = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&found).unwrap()["index"]["action"],
+        "waited_for_existing_job"
+    );
+    assert!(found.results[0].chunk.code.contains("translator"));
+    assert!(
+        found
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("the index has no vectors")
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the vectorless search embeds nothing"
+    );
+    failing_models.abort();
     task.abort();
 }
 
 #[tokio::test]
 async fn a_search_waiting_for_a_failed_explicit_index_reports_its_error() {
     let (temp, mut config, _fake, task) = fixture().await;
+    // HTTP 401 is a configuration error, not an availability one: the index
+    // fails hard even on a fresh workspace, and the failure is what a waiting
+    // search reports.
     let requests = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -671,7 +948,7 @@ async fn a_search_waiting_for_a_failed_explicit_index_reports_its_error() {
                         // itself; answer at once so the assertions fail fast.
                         _ => "duplicate request",
                     };
-                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, cause)
+                    (axum::http::StatusCode::UNAUTHORIZED, cause)
                 }
             }
         }),
@@ -748,7 +1025,7 @@ async fn a_search_waiting_for_a_cancelled_explicit_index_does_not_report_a_stale
                         }
                         _ => "own failure Z",
                     };
-                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, cause)
+                    (axum::http::StatusCode::UNAUTHORIZED, cause)
                 }
             }
         }),

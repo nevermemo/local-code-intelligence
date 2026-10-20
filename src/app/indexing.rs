@@ -41,6 +41,10 @@ pub struct IndexReport {
     /// chunk is still stored, returned, and lexically searchable.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub truncated_for_embedding: Vec<String>,
+    /// The embedding service was unreachable and the index was committed
+    /// without vectors (placeholders no search serves); the semantic channel
+    /// is unavailable until a later index run embeds the chunks.
+    pub vectors_missing: bool,
     pub total_ms: f64,
 }
 
@@ -119,6 +123,9 @@ pub struct Status {
     pub chunks: usize,
     pub embedding_dimension: Option<usize>,
     pub compatible: bool,
+    /// The snapshot was committed without vectors because the embedding
+    /// service was unreachable; semantic retrieval is unavailable on it.
+    pub vectors_missing: bool,
     pub stale: bool,
     /// Why staleness could not be determined (e.g. an unreadable file);
     /// `stale` is then reported as `true` for an indexed workspace.
@@ -317,7 +324,19 @@ impl App {
         };
         let mut cached_keys: HashSet<String> = cache.keys().cloned().collect();
         let mut truncated_for_embedding = Vec::new();
-        let mut embedded_chunks = self
+        // An embedding failure may commit the chunks without vectors only when
+        // there are no real vectors to lose: the cache is empty (a fresh
+        // workspace, a vectorless previous snapshot, or one that held no
+        // chunks) and the previous snapshot, if any, has this identity (an
+        // identity change also leaves the cache empty, but must stay a hard
+        // failure). Decided before `embed_missing` fills the cache. Even then
+        // only an availability error (service unreachable, timeout, dropped
+        // connection, HTTP 5xx) is caught; a configuration or protocol error
+        // (HTTP 4xx, a bad response) stays a hard error.
+        let may_index_vectorless =
+            cache.is_empty() && previous.as_ref().is_none_or(|s| s.identity == identity);
+        let mut vectors_missing = false;
+        let mut embedded_chunks = match self
             .embed_missing(
                 &workspace,
                 &chunks,
@@ -325,7 +344,18 @@ impl App {
                 &mut cache,
                 &mut truncated_for_embedding,
             )
-            .await?;
+            .await
+        {
+            Ok(embedded) => embedded,
+            Err(error) if may_index_vectorless && models::is_service_unavailable(&error) => {
+                tracing::warn!(workspace_id = %workspace.id, error = %format!("{error:#}"), "the embedding service is unreachable; indexing without vectors");
+                cache.clear();
+                truncated_for_embedding.clear();
+                vectors_missing = true;
+                0
+            }
+            Err(error) => return Err(error),
+        };
         // The identity names the URL and model, not the width: a service can
         // start returning another width under both. Cached vectors of another
         // width than the service returns now are embedded again; mixing widths
@@ -363,16 +393,23 @@ impl App {
             .iter()
             .filter(|&c| cached_keys.contains(&key_of(c)))
             .count();
-        let vectors: Vec<_> = chunks.iter().map(|c| cache[&key_of(c)].clone()).collect();
-        let dimension = vectors
-            .first()
-            .map(Vec::len)
-            .or_else(|| previous.as_ref().map(|s| s.dimension))
-            .unwrap_or(1);
-        drop(previous);
-        self.store
-            .replace(&workspace, &chunks, &vectors, &identity, dimension)
-            .await?;
+        if vectors_missing {
+            drop(previous);
+            self.store
+                .replace_vectorless(&workspace, &chunks, &identity)
+                .await?;
+        } else {
+            let vectors: Vec<_> = chunks.iter().map(|c| cache[&key_of(c)].clone()).collect();
+            let dimension = vectors
+                .first()
+                .map(Vec::len)
+                .or_else(|| previous.as_ref().map(|s| s.dimension))
+                .unwrap_or(1);
+            drop(previous);
+            self.store
+                .replace(&workspace, &chunks, &vectors, &identity, dimension)
+                .await?;
+        }
         let files = scan.files.len();
         for path in &scan.lossy_files {
             tracing::warn!(workspace_id = %workspace.id, file = %path, "file is not valid UTF-8; indexed from a lossy decoding");
@@ -402,6 +439,7 @@ impl App {
             skipped_non_source_files,
             lossy_decoded_files,
             truncated_for_embedding,
+            vectors_missing,
             total_ms: ms(start),
         })
     }
@@ -595,11 +633,12 @@ impl App {
             chunks,
             embedding_dimension: snapshot
                 .as_ref()
-                .filter(|_| chunks > 0)
+                .filter(|s| chunks > 0 && !s.vectors_missing)
                 .map(|s| s.dimension),
             compatible: snapshot
                 .as_ref()
                 .is_some_and(|s| s.identity == self.config.embedding_identity()),
+            vectors_missing: snapshot.as_ref().is_some_and(|s| s.vectors_missing),
             stale,
             stale_check_error,
             watched,

@@ -2735,7 +2735,54 @@ async fn traverse_starts_from_the_hybrid_search_and_records_what_found_each_seed
 }
 
 #[tokio::test]
-async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
+async fn traverse_answers_with_the_embedder_down_on_a_fresh_workspace() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    config.traverse.first_stage = lci_core::config::TraverseFirstStage::Off;
+    config.traverse.answer_seeds = false;
+    config.traverse.exact_seeds = false;
+    // A port that refuses connections, held for the whole test.
+    let dead = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", dead.port);
+    let workspace = temp.path().join("scip-fresh-down");
+    write_hybrid_workspace(&workspace);
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+
+    // The workspace has no snapshot: the hybrid search indexes it without
+    // vectors and the lexical channel supplies the seeds, so the stand-in
+    // does not take over.
+    let answer = mcp_search_call(
+        &client,
+        &base,
+        &session,
+        json!({"workspace_path":workspace,"query":"translator","top_k":20,"mode":"traverse"}),
+    )
+    .await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    let answer = answer["structuredContent"].clone();
+    assert_eq!(answer["status"], "complete", "{answer}");
+    assert_eq!(answer["seed_source"], "hybrid", "{answer}");
+    assert!(answer.get("seed_fallback").is_none(), "{answer}");
+    let hits = answer["seed_hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{answer}");
+    for name in ["translator_entry", "translator_helper", "translator_leaf"] {
+        let hit = hits
+            .iter()
+            .find(|hit| hit["node"].as_str().unwrap().contains(name))
+            .unwrap_or_else(|| panic!("{name} is a seed: {hits:?}"));
+        assert_eq!(hit["retrievers"], json!(["lexical"]), "{hit}");
+    }
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
+}
+
+#[tokio::test]
+async fn traverse_says_so_when_every_search_channel_is_off_and_the_stand_in_seeds_it() {
     let (temp, mut config, _fake, models_task) = fixture().await;
     config.traverse.enabled = true;
     // A port nothing listens on: the embedder is unreachable.
@@ -2743,6 +2790,12 @@ async fn traverse_says_so_when_the_search_is_down_and_the_stand_in_seeds_it() {
     let dead = ClosedPort::new();
     config.embedding_url = format!("http://127.0.0.1:{}/v1", dead.port);
     config.embedding_timeout_seconds = 2;
+    // With the embedder down the index is still built without vectors and the
+    // lexical channel answers, so the hybrid search is only unavailable when
+    // no channel can answer: the lexical and LSP channels are switched off
+    // here and the semantic one has no vectors.
+    config.channels.lexical = false;
+    config.channels.lsp = false;
     let workspace = temp.path().join("scip-down");
     write_hybrid_workspace(&workspace);
     let data_dir = config.data_dir.clone();

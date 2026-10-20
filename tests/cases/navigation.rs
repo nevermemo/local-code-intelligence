@@ -3792,3 +3792,45 @@ async fn assert_optional_server_stays_off(case: OptionalServerCase) {
     }
     task.abort();
 }
+
+/// With the embedder down, `index_workspace` still builds a vectorless index,
+/// so the navigation tools, which need an index but no vectors, answer.
+#[tokio::test]
+async fn navigation_answers_after_index_workspace_with_the_embedder_down() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    // A port that refuses connections, held for the whole test.
+    let closed = ClosedPort::new();
+    config.embedding_url = format!("http://127.0.0.1:{}/v1", closed.port);
+    let state = temp.path().join("state");
+    let config = with_fake_csharp_server(config, &state, &[], 10);
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let app = App::open(config).await.unwrap();
+
+    let error = app.symbols(&workspace, "Calculator").await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("workspace is not indexed"),
+        "{error:#}"
+    );
+    let indexed = app.index(&workspace).await.unwrap();
+    assert!(indexed.vectors_missing);
+    assert_eq!(indexed.embedded_chunks, 0);
+    assert!(indexed.chunks > 0);
+    assert_eq!(
+        serde_json::to_value(&indexed).unwrap()["vectors_missing"],
+        true
+    );
+    assert!(app.status(&workspace).await.unwrap().vectors_missing);
+
+    let report = app.symbols(&workspace, "Calculator").await.unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|location| location.name.as_deref() == Some("Calculator")),
+        "{:?}",
+        report.results
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    models_task.abort();
+}
