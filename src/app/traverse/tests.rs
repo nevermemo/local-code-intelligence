@@ -3607,6 +3607,18 @@ impl ScipFileTree {
         handle: Option<&str>,
         pops: u32,
     ) -> Result<Value> {
+        self.run_at(&self.index, mode, maps, handle, pops).await
+    }
+
+    /// `run`, naming the index file by `index` (another spelling of its path).
+    async fn run_at(
+        &self,
+        index: &Path,
+        mode: ScipMode,
+        maps: &[&str],
+        handle: Option<&str>,
+        pops: u32,
+    ) -> Result<Value> {
         let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
         let (budget, steer) = (
             BudgetArgs {
@@ -3617,7 +3629,7 @@ impl ScipFileTree {
         );
         let seeds = [self.seed.clone()];
         let call = Call {
-            scip_index: &self.index,
+            scip_index: index,
             scip_root: Some(self.dir.path()),
             question: "q",
             seeds: &seeds,
@@ -3737,4 +3749,73 @@ async fn a_handle_made_with_a_graph_does_not_resume_under_scip_mode_off() {
         error.contains("belongs to another workspace or index"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn a_handle_is_bound_to_the_index_stamp_not_to_the_spelling_of_its_path() {
+    let tree = ScipFileTree::new().await;
+    let maps = ["graph.scip"];
+    let first = tree
+        .run(ScipMode::Authoritative, &maps, None, 1)
+        .await
+        .unwrap();
+    let handle = handle_of(&first);
+    // Each call builds its own store, so this reads the handle from its file,
+    // as a restarted server would.
+    tree.run(ScipMode::Authoritative, &maps, Some(&handle), 1)
+        .await
+        .unwrap();
+
+    // Another spelling of the same index path (a `..` segment) is the same
+    // index.
+    std::fs::create_dir(tree.dir.path().join("sub")).unwrap();
+    let spelled = tree.dir.path().join("sub").join("..").join("index.scip");
+    assert_ne!(spelled, tree.index);
+    tree.run_at(&spelled, ScipMode::Authoritative, &maps, Some(&handle), 1)
+        .await
+        .unwrap();
+
+    // The same bytes with a later modified time are another index.
+    let stamped = std::fs::metadata(&tree.index).unwrap().modified().unwrap();
+    let set_modified = |time| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tree.index)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    };
+    set_modified(stamped + std::time::Duration::from_secs(1));
+    let error = tree
+        .run(ScipMode::Authoritative, &maps, Some(&handle), 1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("belongs to another workspace or index"),
+        "{error}"
+    );
+    // The stamp is the binding, not the content: it resumes again when the
+    // stamp is back.
+    set_modified(stamped);
+    tree.run(ScipMode::Authoritative, &maps, Some(&handle), 1)
+        .await
+        .unwrap();
+
+    // A text that cannot be a handle is refused before the store is asked
+    // (empty or over 64 characters), then by the store (not 17 characters of
+    // `h` and lowercase hex); a well-formed handle the store never wrote is
+    // unknown.
+    for (given, wanted) in [
+        ("h".repeat(65), "handle is not a handle this server issued"),
+        ("h".repeat(20), "not a handle: "),
+        (format!("h{}", "0".repeat(16)), "unknown handle"),
+    ] {
+        let error = tree
+            .run(ScipMode::Authoritative, &maps, Some(&given), 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(wanted), "{given}: {error}");
+    }
 }

@@ -36,6 +36,48 @@
 //! expand what the first call queued below it, and one with a higher limit
 //! queues the states the first call held back. A resumed call may carry the
 //! agent's [`Steer`](super::steer::Steer).
+//!
+//! # The handle, as specified
+//!
+//! - Shape: `h` and the first 16 hex digits of the SHA-256 of the compact JSON
+//!   text of the snapshot, so `^h[0-9a-f]{16}$`, 17 characters. [`HandleStore::get`]
+//!   refuses other text as `BadHandle` (`not a handle: ..`). The app refuses an
+//!   empty handle or one over 64 characters first, with its own text (`handle
+//!   is not a handle this server issued`), so a 20-character string reaches the
+//!   store and a 65-character one does not.
+//! - Content: `VERSION` 10; another version, and a `bandit` key, are `Corrupt`.
+//!   Written only when not the default: `fusion` (`rrf`), `grouping`, `priors`,
+//!   `tie_break` and `rerank_identity`, and per state `groups` and `reach`; an
+//!   absent key loads as the default, so older handles keep their text. Object
+//!   keys come in the fixed order `to_json` builds them (serde_json's
+//!   `preserve_order` is on through a dependency), so equal snapshots give
+//!   equal JSON and equal handles.
+//!   Every index is range-checked and every parent chain reaches a root.
+//! - Storage: [`HandleStore::put`] writes `<dir>/<handle>.json` only when it is
+//!   absent, through a temporary name and a rename, and a second `put` of the
+//!   same snapshot returns the same handle. `get` re-parses the file and
+//!   refuses one that does not hash to its name. A finished walk leaves no
+//!   snapshot and no handle.
+//! - Lifetime: the app builds a store for every call, in
+//!   `<data_dir>/traverse/handles` (`<out>/handles` for `lci traverse --out`),
+//!   so the file is the only state between calls. Nothing removes a file; there
+//!   is no TTL and no cap. A handle outlives a restart of the server, and it
+//!   resumes while the workspace root and the index file stay as they were.
+//! - Binding: [`Snapshot::identity`] is `w<h(root)>.i<h(index)>`, each `h` the
+//!   16 hex digits of a SHA-256. The root is the canonical workspace root (or
+//!   `no tree`); the index is its path, its size and its modified time in
+//!   nanoseconds, joined by `|`. The path is canonical, so another spelling of
+//!   it is the same index, except under `scip.mode = off`, where it is the path
+//!   as given; with no index the size and the time are 0. A re-index
+//!   (a new size or time, even for the same bytes), another root or a change to
+//!   or from `scip.mode = off` refuses with `WrongIdentity` (`belongs to another
+//!   workspace or index`). An empty expected identity matches anything.
+//! - Also refused on resume: other priors, tie-break file, reranker floor or
+//!   identity, corroboration boost and `top_k`. Kept from the handle without a
+//!   check: fusion, grouping, `pass_through` and the score bound. The call's
+//!   own: the scorer, the depth limit, the deadline and the steer. A
+//!   continuation always walks (it is never the first stage alone), and
+//!   `steer.actions` needs a handle.
 
 use super::{
     Fusion, GroupKey, Grouping, Groups, Run, State, Totals, Traversal, TraversalBudget,

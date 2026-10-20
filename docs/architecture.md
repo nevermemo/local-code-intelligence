@@ -230,7 +230,8 @@ maps and the symbol cards, the manifest for the snapshot maps and the chunk card
 
 - **MCP** (`src/server.rs`, `#[tool_router] impl McpServer`) is mounted at `/mcp` and at `/mcp/<profile>` for each search
   profile; `/mcp/<unknown>` is 404; each endpoint has its own session manager (keep-alive 1 h) and the same instructions.
-  Tools are stateless request/response (`App` keeps no per-MCP-session state; traversal continuation uses a `handle`).
+  Tools are stateless request/response (`App` keeps no per-MCP-session state; traversal continuation uses a `handle`, a
+  content hash of the snapshot kept as a file under the data directory, bound to the workspace and index).
   A profile may set `tools = "search"` (only `search_code`, `search_symbols`, `find_definition`, `find_references`) and
   `response = "compact"`. 16 tools: 10 always (`index_workspace`, `index_status`, `list_indexed_files`,
   `watch_workspace`, `unwatch_workspace`, `search_symbols`, `find_definition`, `find_references`, `search_code`,

@@ -76,7 +76,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K3a | Cost metrics in every report: answer tokens, external calls, LSP ms, pops, per stratum; `compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies |
 | K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld | Card schema test | S | - |
 | K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |
-| K28 | Handle spec (format, lifetime, snapshot binding) and a round-trip test | Test | S | - |
 | K29 | `likely_complete`, the score bound and tau get written meanings | Docs and unit tests | S | - |
 | K21a | BM25 entity seeds over symbol names, qualified paths and doc comments, in process (reusing the lexical scoring); `seeds.bm25` off | Ceiling: gold symbol in top k on the trait and where-to gold | M | L1, L4, I-1 |
 | K22a | Exact-literal seed source (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases | Ceiling | S | item 4 rest |
