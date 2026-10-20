@@ -2,7 +2,7 @@
 //! reached nodes, the call sites, the commits and the checkpoint.
 
 use super::first_stage::{FirstStage, merge, origin_counts};
-use super::{Call, MAPS, OPT_IN_MAPS, SteerArgs, index::Loaded, seeds::Seeds};
+use super::{Call, MAPS, OPT_IN_MAPS, SteerArgs, freshness::Observer, index::Loaded, seeds::Seeds};
 use crate::config::TraverseFirstStage;
 use lci_core::node::{NodeId, NodeKind};
 use lci_maps::{
@@ -45,6 +45,52 @@ pub(super) fn add_maps(response: &mut Value, maps: Option<Value>) {
         object.insert("maps".into(), maps);
     }
 }
+
+/// `file_changed` on every card (only with `[run_profile.freshness]
+/// verify_on_read`; otherwise the response is left as it was): `true` when the
+/// content hash of the file the card cites now differs from the one its maps
+/// read, `false` when it does not, `null` when no reference applies (see
+/// [`super::freshness`]). One note says how many cards are `null`.
+pub(super) fn add_file_changed(response: &mut Value, observer: &Observer) {
+    if !observer.verifies() {
+        return;
+    }
+    let mut unknown = 0usize;
+    for list in CARD_LISTS {
+        let Some(Value::Array(items)) = response.pointer_mut(list) else {
+            continue;
+        };
+        for card in items {
+            let verdict = observer.file_changed(card);
+            unknown += usize::from(verdict.is_none());
+            if let Some(object) = card.as_object_mut() {
+                object.insert("file_changed".into(), json!(verdict));
+            }
+        }
+    }
+    if unknown == 0 {
+        return;
+    }
+    let note = format!(
+        "verify_on_read: file_changed is null on {unknown} cards: no source file to compare (a commit, a file that is not a source file, or no tree was read)"
+    );
+    match response.get_mut("notes").and_then(Value::as_array_mut) {
+        Some(notes) => notes.push(json!(note)),
+        None => {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("notes".into(), json!([note]));
+            }
+        }
+    }
+}
+
+/// The lists of a response whose items are cards.
+const CARD_LISTS: [&str; 4] = [
+    "/results",
+    "/checkpoint/answer",
+    "/checkpoint/visited_cards",
+    "/checkpoint/frontier",
+];
 
 /// The steer lint of a call (see [`lci_maps::traverse::lint`]), plus the two
 /// checks that need the steer's own fields: a ladder that omits `rules` while
@@ -404,14 +450,8 @@ pub(super) fn add_sites(
     impact: Option<&ImpactMap>,
     seeds: &[Value],
 ) {
-    const LISTS: [&str; 4] = [
-        "/results",
-        "/checkpoint/answer",
-        "/checkpoint/visited_cards",
-        "/checkpoint/frontier",
-    ];
     let mut wanted: HashSet<String> = HashSet::new();
-    for list in LISTS {
+    for list in CARD_LISTS {
         if let Some(Value::Array(items)) = response.pointer(list) {
             wanted.extend(
                 items
@@ -485,7 +525,7 @@ pub(super) fn add_sites(
     if let (false, Some(object)) = (seed_sites.is_empty(), response.as_object_mut()) {
         object.insert("seed_sites".into(), Value::Object(seed_sites));
     }
-    for list in LISTS {
+    for list in CARD_LISTS {
         let Some(Value::Array(items)) = response.pointer_mut(list) else {
             continue;
         };

@@ -26,13 +26,13 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 
 | Module | Crate | Role |
 | --- | --- | --- |
-| `app` | root | `App` is the public facade: coordinates indexing, retrieval, navigation, watching and readiness. Children: `indexing`, `search`, `navigation`, `readiness`, `compact`, `traverse`, `recipes` (see `src/app/AGENTS.md`) |
+| `app` | root | `App` is the public facade: coordinates indexing, retrieval, navigation, watching and readiness. Children: `indexing`, `search` (its report's `freshness` block under `verify_on_read`), `navigation`, `readiness`, `compact`, `traverse`, `recipes` (see `src/app/AGENTS.md`) |
 | `chunk`, `language` | core | `chunk` scans supported files into chunks (Tree-sitter for code, a heading splitter for Markdown); `language` is the registry of language adapters and their cache versions |
 | `store` | root | Embedded LanceDB persistence; the only LanceDB and Arrow code |
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
 | `lexical`, `lsp` | core | Independent, fail-open retrieval channels (ripgrep with BM25 scoring; language-server symbols) |
 | `filter` | core | Validates retrieval controls (`FilterRequest` to `EffectiveFilter`) and classifies source roles |
-| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index; `[run_profile.lsp]`: `sessions`, per call or shared, which `app::traverse::run` reads to pick the call's language-server manager) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
+| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index; `[run_profile.lsp]`: `sessions`, per call or shared, which `app::traverse::run` reads to pick the call's language-server manager; `[run_profile.freshness]`: `verify_on_read`, which `app::traverse::run` reads from the run profile it is given) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
 | `evaluate` | root | Measures retrieval behaviour without influencing ranking (see Evaluation harness) |
 | `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse` (`src/app/traverse/`: `mod` holds the types, `run` and registration; `index` the SCIP index and map loading; `seeds` the seed search; `rescore` the `GraphRescorer`; `response` the response builders; `first_stage`, `presets`, `chunks`); named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
 | `server`, `rest`, `main` | root | MCP (rmcp, streamable HTTP), the REST/OpenAPI mirror on the same process and port, and the CLI |
@@ -213,6 +213,18 @@ means not compared (no tree, unreadable tree, or an index file without a modifie
 once per call with `chunk::scan_incremental_with`; only changed files are parsed. `Expanded` carries an optional
 `edge::Freshness` that a wrapper around each stating map records; the walk itself does not read it. Key off: no
 wrapper, no tree read, no `maps` key.
+
+`[run_profile.freshness] verify_on_read = true` (default `false`, in the profile hash) adds, on top of `map_freshness`, a check of
+what the answer cites against the tree by content hash. It reuses the one read of the tree (`freshness::tree_view` returns the
+lag with the file sets it came from; no second scan), reads and labels, and never refreshes the index or touches
+`[index].freshness`. `SeedSearch::snapshot_hashes` (`AppSeeds` reads the manifest of the index snapshot) is read after the walk,
+because the walk's first search may refresh the snapshot; the snapshot lag is the source files (the `tree_lag` set; manifest prose
+entries are left out) that differ between the manifest and the tree. `seeds.hybrid`, `search.lexical` and `search.vector` are
+then labelled with it (`Observer` does not wrap them; the label is filled at report time), `grep.live` and `lsp.live` say
+`observed: live` with `places: "index"` and the SCIP lag (their places are the index's), and `response::add_file_changed` gives
+every card `file_changed` from the baseline of its maps (the SCIP baseline for the maps built from the index and the placed
+maps and the symbol cards, the manifest for the snapshot maps and the chunk cards; `null` where none applies). Key off: none of this, and no change to any answer.
+`search::App::verify_on_read` does the same for a search report the caller asked for: `SearchReport.freshness` (`snapshot`, `channels` for the channels that ran, `hits` with `file_changed` per result) from the manifest of the snapshot the search ran on and one scan of the tree (the manifest as its cache), read after the search (a refresh in between is not seen) and timed in `timings.verify_ms`. The searches inside the crate that discard the block (`AppSeeds::search`, the evaluation runner) call the `_unverified` entry points, so a traversal reads the tree once.
 
 ## MCP, REST and CLI surfaces
 

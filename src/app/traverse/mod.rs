@@ -56,7 +56,7 @@ mod index;
 pub mod presets;
 mod rescore;
 mod response;
-mod seeds;
+pub(crate) mod seeds;
 #[cfg(test)]
 mod tests;
 
@@ -114,8 +114,8 @@ use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
-    add_commits, add_first_stage_only, add_maps, add_policy, add_sites, chunk_lines, lint_steer,
-    no_seeds_response, response_json,
+    add_commits, add_file_changed, add_first_stage_only, add_maps, add_policy, add_sites,
+    chunk_lines, lint_steer, no_seeds_response, response_json,
 };
 pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
@@ -647,30 +647,36 @@ pub async fn run_with_trait_seeds(
     // the tree against the index file (see [`freshness`]), read once per call
     // and before the maps built from the tree are built.
     // Reading the tree is setup, not walking: the deadline does not run.
+    // With `[run_profile.freshness] verify_on_read` the same read also gives the
+    // file sets that the snapshot lag and `file_changed` compare with.
+    let verify = profile.freshness.verify_on_read;
     let observer = if profile.traverse.map_freshness {
         let started = Instant::now();
-        let lag = match call.scip_root {
-            Some(root) => match freshness::tree_lag(call.scip_index, root, loaded.stamp).await {
-                Ok(Some(lag)) => Some(lag),
-                Ok(None) => {
-                    notes.push(if let Some(mode) = loaded.absent {
-                        format!(
-                            "map_freshness: no SCIP index is read (scip.mode = {}); the tree was not compared with it",
-                            mode.as_str()
-                        )
-                    } else {
-                        "map_freshness: the index file has no modified time; the tree was not compared with it"
-                            .to_owned()
-                    });
-                    None
+        let view = match call.scip_root {
+            Some(root) => {
+                match freshness::tree_view(call.scip_index, root, loaded.stamp, verify).await {
+                    Ok(view) => {
+                        if view.as_ref().is_none_or(|view| view.lag.is_none()) {
+                            notes.push(if let Some(mode) = loaded.absent {
+                                format!(
+                                    "map_freshness: no SCIP index is read (scip.mode = {}); the tree was not compared with it",
+                                    mode.as_str()
+                                )
+                            } else {
+                                "map_freshness: the index file has no modified time; the tree was not compared with it"
+                                    .to_owned()
+                            });
+                        }
+                        view
+                    }
+                    Err(error) => {
+                        notes.push(format!(
+                            "map_freshness: the tree could not be compared with the index file: {error:#}"
+                        ));
+                        None
+                    }
                 }
-                Err(error) => {
-                    notes.push(format!(
-                        "map_freshness: the tree could not be compared with the index file: {error:#}"
-                    ));
-                    None
-                }
-            },
+            }
             None => {
                 notes.push(
                     "map_freshness: the call has no tree (give its root); the tree was not compared with the index file"
@@ -680,7 +686,12 @@ pub async fn run_with_trait_seeds(
             }
         };
         budget.deadline += started.elapsed();
-        Observer::on(lag)
+        let lag = view.as_ref().and_then(|view| view.lag);
+        if verify {
+            Observer::on(lag).verifying(view)
+        } else {
+            Observer::on(lag)
+        }
     } else {
         Observer::off()
     };
@@ -1192,10 +1203,12 @@ pub async fn run_with_trait_seeds(
                 add_first_stage_only(&mut response, &stage, call.top_k, &exact_report);
                 add_policy(&mut response, effective, warnings);
                 add_trait_seed_count(&mut response, &found);
+                observer.settle(call.seed_search).await;
                 add_maps(
                     &mut response,
                     observer.report(enabled_maps.iter().map(String::as_str)),
                 );
+                add_file_changed(&mut response, &observer);
                 return Ok(Report {
                     response,
                     trace: None,
@@ -1353,10 +1366,12 @@ pub async fn run_with_trait_seeds(
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
     }
+    observer.settle(call.seed_search).await;
     add_maps(
         &mut response,
         observer.report(enabled_maps.iter().map(String::as_str)),
     );
+    add_file_changed(&mut response, &observer);
     Ok(Report {
         response,
         trace: trace_path,

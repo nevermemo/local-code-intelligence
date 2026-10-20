@@ -1188,3 +1188,29 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
         );
     }
 }
+
+/// The recipes pass their run profile to the walk of `flow_from`, so the
+/// freshness keys reach it. Its answer carries no `maps` and no `file_changed`
+/// (it reads the walk's cards, not the labels), so with both keys on it is the
+/// answer without them, and the walk runs.
+#[tokio::test]
+async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let plain = Tree::new();
+    let off = plain.ask(request.clone(), false).await;
+    let keyed = Tree::new();
+    let mut profile = RunProfileConfig::default();
+    profile.traverse.map_freshness = true;
+    profile.freshness.verify_on_read = true;
+    let on = keyed.ask_under(request, false, &profile).await;
+    assert_eq!(names(&on, "walk"), names(&off, "walk"), "{on}");
+    assert!(!names(&on, "walk").is_empty(), "{on}");
+    // The counts are the walk's; `ms` is a clock.
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert_eq!(on["stop"], off["stop"]);
+    assert!(!on.to_string().contains("file_changed"), "{on}");
+    assert!(on.get("maps").is_none(), "{on}");
+    assert_eq!(trace_ranks(&keyed), trace_ranks(&plain));
+}
