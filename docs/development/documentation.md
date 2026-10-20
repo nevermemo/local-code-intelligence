@@ -6,7 +6,7 @@ Agents read these files without chat context and pay for every token, so the fil
 1. Facts first. State what the code does today, in the present tense, before any history or rationale.
 2. One place per fact. A fact has one home; every other file points to that home instead of restating it.
    Homes: behaviour and surfaces in `README.md`; module structure in `docs/architecture.md`; build and test in
-   `docs/development/testing.md`; machine values in `docs/development/machine-values.md`; traversal engine in
+   `docs/development/testing.md`; language scope in `docs/languages.md`; machine values in `docs/development/machine-values.md`; traversal engine in
    `docs/spike/multimap/engine.md`; measurement method in `docs/spike/multimap/evaluation.md`; plans in
    `docs/development/roadmap.md`; decisions, findings and history in `docs/decisions.md`.
 3. Sections stand alone. An `##` section can be loaded by itself: it names what it is about in its first line and

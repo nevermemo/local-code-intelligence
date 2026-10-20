@@ -106,7 +106,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K37a | One request queue per server | Load test | S | N20 (a, b, d scan residue, e) |
 | K37b | Concurrent walks | Load test | S | - |
 | K37c | `probe.compile` runs `cargo check`, which can execute build scripts: a bounded sandbox, or opt-in only with a warning | Test | S | - |
-| K36 | Language scope table: server, syntax tier and gold per language | Docs | XS | - |
 | K4a | External held-out gold adapters (SWE-PolyBench Verified, LongCodeArena); dataset licences recorded; never used for tuning | Leak check | S | - |
 | K4b | External gold download and conversion | Counts | S | - |
 | K5a | Baseline arms rg-only and LSP-over-MCP wired into `maps baseline` (no A/B runs) | Smoke query | S | item 6 arm |

@@ -40,6 +40,7 @@ These eighteen extensions (twelve language identifiers) are the whole indexable 
 ## Documentation
 
 - [Architecture guide](docs/architecture.md): crates, runtime boundaries, data flow, the agent control-plane exclusion.
+- [Language scope](docs/languages.md): language server, syntax tier, SCIP and gold per language.
 - [Testing guide](docs/development/testing.md): focused suite selection and the full deterministic gate.
 - [Local live acceptance](docs/development/local-live-acceptance.md): the live acceptance matrix without GitHub Actions (the default path).
 - [Live acceptance CI](docs/development/live-acceptance-ci.md): the GitHub workflow for the same matrix. It needs a self-hosted runner; none is registered today, so it does not run.
