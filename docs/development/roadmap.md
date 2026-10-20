@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2b (verify on read), K0a follow-ups (M0 filler); K7b-2, then K8a. Rewrite this line at every push.
+In flight: S1 (one feature set for every test suite, nextest in Full; speed-up lane, owner priority); then K2b (verify on read), K7b-2, K9a, K8a. Rewrite this line at every push.
 
 ## Cycle 1
 
