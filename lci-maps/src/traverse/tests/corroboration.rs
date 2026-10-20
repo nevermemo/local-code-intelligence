@@ -387,3 +387,233 @@ fn the_most_a_node_can_be_corroborated_by_counts_dependent_maps_once() {
     assert_eq!(reg.independent_expanders(), 3);
     assert_eq!(reg.expanding_maps(), ["m1", "m2", "m3", "m4"]);
 }
+
+// ---- K23a: evidence groups by claim -----------------------------------------
+
+const CLAIM: Grouping = Grouping {
+    groups: Groups::Claim,
+    grep_corroboration: 1.0,
+};
+
+/// `m1` (dependent, compiler-grade) and `m2`, `m3` (exact) all say `s` refers
+/// to `a`, each at 80.
+fn one_claim_three_maps() -> Registry<'static> {
+    registry(vec![
+        GraphMap::new("m1", &[("s", "a")]).dependent().conf(80),
+        GraphMap::new("m2", &[("s", "a")])
+            .witness(WitnessClass::Exact)
+            .conf(80),
+        GraphMap::new("m3", &[("s", "a")])
+            .witness(WitnessClass::Exact)
+            .conf(80),
+    ])
+}
+
+fn hop_conf(result: &TraversalResult, dst: &str) -> u64 {
+    let wanted = node(dst).to_string();
+    events_of(result, "hop")
+        .into_iter()
+        .find(|e| e["dst"] == wanted.as_str())
+        .unwrap_or_else(|| panic!("no hop to {dst}"))["conf"]
+        .as_u64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn three_maps_asserting_one_claim_count_once_under_claim_groups() {
+    let reg = one_claim_three_maps();
+    let claim = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(CLAIM)).await;
+    let a = state(&claim, "a");
+    assert_eq!(a.maps.len(), 3, "the maps stay in the display list");
+    assert_eq!(a.groups.len(), 1);
+    assert_eq!(a.n_groups(&CLAIM), 1.0);
+    assert_eq!(claim.ranked_potential(a), a.potential);
+    // The hop is worth the claim's confidence, not the noisy-OR of its maps.
+    assert_eq!(hop_conf(&claim, "a"), 80);
+    assert_eq!(claim.events[0]["rank"]["groups"], "claim");
+
+    // By tool the same walk counts three maps (the dependent one among them
+    // is one more than none) and fuses their confidences.
+    let tool = walk(&reg, vec![seed("s")], budget(20), |t| t).await;
+    let a = state(&tool, "a");
+    assert_eq!(a.n_maps(), 3);
+    assert!(a.groups.is_empty(), "the default keeps no groups");
+    assert!((tool.ranked_potential(a) - a.potential * 1.2).abs() < 1e-12);
+    assert_eq!(hop_conf(&tool, "a"), 99);
+    assert!(tool.events[0]["rank"].get("groups").is_none());
+}
+
+#[tokio::test]
+async fn different_claims_to_one_node_still_corroborate_under_claim_groups() {
+    // `s` refers to `z` (m1) and contains it (m2): two claims on one edge.
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("s", "z")]).conf(80),
+        GraphMap::new("m2", &[("s", "z")])
+            .kind(EdgeKind::Contains)
+            .conf(80),
+    ]);
+    let result = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(CLAIM)).await;
+    let z = state(&result, "z");
+    assert_eq!(z.n_groups(&CLAIM), 2.0);
+    assert!((result.ranked_potential(z) - z.potential * 1.1).abs() < 1e-12);
+    // Two claims of 80 fuse to 96, not the one-claim 80.
+    assert_eq!(hop_conf(&result, "z"), 96);
+
+    // `a -> z` and `b -> z` are two claims, whatever the maps.
+    let reg = two_maps_one_node();
+    let result = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(CLAIM)).await;
+    let (z, y) = (state(&result, "z"), state(&result, "y"));
+    assert_eq!(z.n_groups(&CLAIM), 2.0);
+    assert_eq!(y.n_groups(&CLAIM), 1.0);
+    assert!((result.ranked_potential(z) - z.potential * 1.1).abs() < 1e-12);
+    assert_eq!(result.ranked_potential(y), y.potential);
+
+    // One map asserting two claims about one node is two pieces of evidence
+    // by claim, one by tool.
+    let one_map = registry(vec![GraphMap::new(
+        "m1",
+        &[("s", "a"), ("s", "b"), ("a", "z"), ("b", "z")],
+    )]);
+    let by_claim = walk(&one_map, vec![seed("s")], budget(20), |t| t.grouping(CLAIM)).await;
+    assert_eq!(state(&by_claim, "z").n_groups(&CLAIM), 2.0);
+    let by_tool = walk(&one_map, vec![seed("s")], budget(20), |t| t).await;
+    assert_eq!(state(&by_tool, "z").n_maps(), 1);
+}
+
+#[tokio::test]
+async fn tool_groups_keep_todays_rank_numbers() {
+    let dependent_pair = registry(vec![
+        GraphMap::new("m1", &[("s", "a"), ("a", "z")]).dependent(),
+        GraphMap::new("m2", &[("s", "b"), ("b", "z")]).dependent(),
+    ]);
+    // (registry, the node to read, its n_maps, its rank factor)
+    for (reg, name, n_maps, factor) in [
+        (two_maps_one_node(), "z", 2, 1.1),
+        (dependent_pair, "z", 1, 1.0),
+        (one_claim_three_maps(), "a", 3, 1.2),
+    ] {
+        let none = walk(&reg, vec![seed("s")], budget(20), |t| t).await;
+        let default = walk(&reg, vec![seed("s")], budget(20), |t| {
+            t.grouping(Grouping::default())
+        })
+        .await;
+        assert_eq!(none.states, default.states);
+        assert_eq!(none.events, default.events);
+        assert_eq!(none.popped, default.popped);
+        for (a, b) in none.states.iter().zip(&default.states) {
+            assert_eq!(none.ranked_potential(a), default.ranked_potential(b));
+            assert_eq!(none.ranked_potential(a), a.ranked_potential(0.1));
+        }
+        assert_eq!(default.grouping, Grouping::default());
+        let target = state(&default, name);
+        assert_eq!(target.n_maps(), n_maps);
+        assert!((default.ranked_potential(target) - target.potential * factor).abs() < 1e-12);
+        assert_eq!(card_json_of(&default, name)["n_maps"], n_maps);
+    }
+    // The other node of the first graph is one map.
+    let result = walk(&two_maps_one_node(), vec![seed("s")], budget(20), |t| t).await;
+    assert_eq!(card_json_of(&result, "y")["n_maps"], 1);
+}
+
+#[tokio::test]
+async fn a_mentions_only_group_adds_grep_corroboration() {
+    // `m1` says `s` refers to `a`; `m2` only mentions it.
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("s", "a")]),
+        GraphMap::new("m2", &[("s", "a")]).kind(EdgeKind::Mentions),
+    ]);
+    for groups in [Groups::Tool, Groups::Claim] {
+        for (share, factor) in [(1.0, 1.1), (0.5, 1.05), (0.0, 1.0)] {
+            let grouping = Grouping::new(groups, share);
+            let result = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(grouping)).await;
+            let a = state(&result, "a");
+            assert_eq!(a.maps.len(), 2);
+            let got = result.ranked_potential(a);
+            assert!(
+                (got - a.potential * factor).abs() < 1e-12,
+                "{groups:?} {share}: {got} vs {}",
+                a.potential * factor
+            );
+            // The card still counts both maps.
+            assert_eq!(card_json_of(&result, "a")["n_maps"], 2);
+        }
+    }
+    // The discount is in the start event, and a text group alone adds none.
+    let half = Grouping::new(Groups::Tool, 0.5);
+    let result = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(half)).await;
+    assert_eq!(result.events[0]["rank"]["groups"], "tool");
+    assert_eq!(result.events[0]["rank"]["grep_corroboration"], 0.5);
+    let texts = registry(vec![
+        GraphMap::new("m1", &[("s", "a")]).kind(EdgeKind::Mentions),
+        GraphMap::new("m2", &[("s", "a")]).kind(EdgeKind::Mentions),
+    ]);
+    let result = walk(&texts, vec![seed("s")], budget(20), |t| t.grouping(half)).await;
+    let a = state(&result, "a");
+    assert_eq!(a.n_groups(&half), 1.0, "two text groups at one half");
+    assert_eq!(result.ranked_potential(a), a.potential);
+}
+
+#[tokio::test]
+async fn claim_groups_turn_the_score_bound_off() {
+    let reg = two_maps_one_node();
+    let with_bound = |grouping: Grouping| {
+        let reg = &reg;
+        async move {
+            walk(reg, vec![seed("s")], budget(20), |t| {
+                t.top_k(1, 2).grouping(grouping)
+            })
+            .await
+        }
+    };
+    let claim = with_bound(CLAIM).await;
+    assert!(events_of(&claim, "bound").is_empty());
+    assert_ne!(claim.stop_reason, stop::StopReason::Bound);
+    // A tool walk is unaffected by the setting existing.
+    let tool = with_bound(Grouping::default()).await;
+    let plain = walk(&reg, vec![seed("s")], budget(20), |t| t.top_k(1, 2)).await;
+    assert_eq!(tool.events, plain.events);
+}
+
+#[tokio::test]
+async fn dependent_maps_share_one_text_group_under_tool_groups() {
+    let half = Grouping::new(Groups::Tool, 0.5);
+    let rank_of_a = |reg: Registry<'static>| async move {
+        let result = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(half)).await;
+        let a = state(&result, "a");
+        (
+            a.groups.clone(),
+            a.n_groups(&half),
+            result.ranked_potential(a) / a.potential,
+        )
+    };
+    // m2 and m3 derive from one graph and only mention `a`: together one
+    // text group, worth one half next to m1's reference.
+    let (groups, n, factor) = rank_of_a(registry(vec![
+        GraphMap::new("m1", &[("s", "a")]),
+        GraphMap::new("m2", &[("s", "a")])
+            .kind(EdgeKind::Mentions)
+            .dependent(),
+        GraphMap::new("m3", &[("s", "a")])
+            .kind(EdgeKind::Mentions)
+            .dependent(),
+    ]))
+    .await;
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups.get(&GroupKey::Dependent), Some(&true));
+    assert_eq!(groups.get(&GroupKey::Map("m1")), Some(&false));
+    assert_eq!(n, 1.5);
+    assert!((factor - 1.05).abs() < 1e-12);
+    // Once one of the dependent maps says more than a mention, the shared
+    // group is not text any more.
+    let (groups, n, factor) = rank_of_a(registry(vec![
+        GraphMap::new("m1", &[("s", "a")]),
+        GraphMap::new("m2", &[("s", "a")])
+            .kind(EdgeKind::Mentions)
+            .dependent(),
+        GraphMap::new("m3", &[("s", "a")]).dependent(),
+    ]))
+    .await;
+    assert_eq!(groups.get(&GroupKey::Dependent), Some(&false));
+    assert_eq!(n, 2.0);
+    assert!((factor - 1.1).abs() < 1e-12);
+}

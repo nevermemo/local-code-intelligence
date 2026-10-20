@@ -275,6 +275,12 @@ pub(super) fn response_json(
                 .to_owned(),
         );
     }
+    if result.grouping.groups == lci_maps::traverse::Groups::Claim {
+        notes.push(
+            "groups claim: maps that assert one claim count once, an edge is worth the noisy-OR over its claims, and the score bound is off"
+                .to_owned(),
+        );
+    }
     if result.events.iter().any(|e| e["external_spent"] == true) {
         notes.push(
             "the external-call allowance was spent: from then on only maps that need no external call were asked"

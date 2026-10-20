@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K23a (claim groups), K2a-2 (per-map freshness key), K2a-1 (freshness harness, on the K7a fake); K20a after K23a; K7b after K2a-1 and K23a. Rewrite this line at every push.
+In flight: K2a-2 (per-map freshness key), K2a-1 (freshness harness), N19 and N24 (Java and C# server fixes); K20a next; K7b after K2a-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -62,7 +62,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | **M1** | **Profile, freshness harness, no-service path** | | | |
 | K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
-| K23a | Evidence groups by claim (`walk.groups = tool or claim`): one call seen by LSP, SCIP and syntax counts once; grep corroboration gets its own discount key | Mechanism: no double count | S | - |
 | **M2** | **Language servers as the source of truth** | | | |
 | K20a | Traverse no longer loads the SCIP index unconditionally (`scip.mode = off, cache, authoritative`; default stays authoritative until K20b) | Traverse runs with no index file | S-M | - |
 | K7b | Shared LSP sessions across traverse calls (server lifetime), a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |

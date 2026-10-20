@@ -589,6 +589,7 @@ async fn run_recipe(
     };
     let ctx = Ctx {
         limits: &config.traverse,
+        profile: &config.run_profile,
         dirs: &dirs,
         scip_index: &scip,
         root: &root,
@@ -737,6 +738,7 @@ async fn run_traverse(
     };
     let report = traverse::run_with_trait_seeds(
         &config.traverse,
+        &config.run_profile,
         &dirs,
         &Call {
             scip_index: &args.scip,

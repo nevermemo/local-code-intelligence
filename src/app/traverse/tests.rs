@@ -571,11 +571,16 @@ async fn the_reranker_frontier_needs_the_application() {
         rerank_frontier: true,
         ..limits()
     };
-    let error = run(&limits, &Dirs::under(tree.path()), &call)
-        .await
-        .err()
-        .expect("no reranker")
-        .to_string();
+    let error = run(
+        &limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.path()),
+        &call,
+    )
+    .await
+    .err()
+    .expect("no reranker")
+    .to_string();
     assert!(
         error.contains("rerank_frontier needs the reranker"),
         "{error}"
@@ -649,9 +654,14 @@ impl Tree {
             handle,
             lsp: None,
         };
-        Ok(run(limits, &Dirs::under(self.dir.path()), &call)
-            .await?
-            .response)
+        Ok(run(
+            limits,
+            &RunProfileConfig::default(),
+            &Dirs::under(self.dir.path()),
+            &call,
+        )
+        .await?
+        .response)
     }
 }
 
@@ -1323,7 +1333,7 @@ async fn the_tree_maps_are_named_not_default_and_need_the_root() {
                 handle: None,
                 lsp: None,
             };
-            run(&limits(), &dirs, &call)
+            run(&limits(), &RunProfileConfig::default(), &dirs, &call)
                 .await
                 .err()
                 .map(|e| e.to_string())
@@ -1379,10 +1389,15 @@ async fn first_stage_run(tree: &Tree, limits: &TraverseConfig, maps: Option<&[&s
         handle: None,
         lsp: None,
     };
-    run(limits, &Dirs::under(tree.dir.path()), &call)
-        .await
-        .unwrap()
-        .response
+    run(
+        limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response
 }
 
 #[tokio::test]
@@ -1496,10 +1511,15 @@ async fn policy_run(
         handle: None,
         lsp: None,
     };
-    run(limits, &Dirs::under(tree.dir.path()), &call)
-        .await
-        .unwrap()
-        .response
+    run(
+        limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response
 }
 
 fn notes_of(response: &Value) -> String {
@@ -1649,10 +1669,15 @@ async fn a_policy_map_that_needs_the_tree_is_reported_when_there_is_no_tree() {
         handle: None,
         lsp: None,
     };
-    let response = run(&limits, &Dirs::under(tree.dir.path()), &call)
-        .await
-        .expect("run")
-        .response;
+    let response = run(
+        &limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .expect("run")
+    .response;
     let notes = notes_of(&response);
     assert!(
         notes.contains("exact.closure") && notes.contains("left out"),
@@ -1706,11 +1731,16 @@ async fn a_policy_adds_its_maps_only_when_the_call_names_none() {
         handle: None,
         lsp: None,
     };
-    let error = run(&bad, &Dirs::under(tree.dir.path()), &call)
-        .await
-        .map(|_| ())
-        .unwrap_err()
-        .to_string();
+    let error = run(
+        &bad,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains("policy flow") && error.contains("nope.map"),
         "{error}"
@@ -1752,10 +1782,15 @@ async fn a_continuation_does_not_run_the_first_stage_again() {
         handle: Some(&handle),
         lsp: None,
     };
-    let next = run(&limits, &Dirs::under(tree.dir.path()), &call)
-        .await
-        .unwrap()
-        .response;
+    let next = run(
+        &limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response;
     assert!(
         next["notes"].to_string().contains("not run again"),
         "{next}"
@@ -1875,10 +1910,15 @@ impl ScipTree {
             handle: None,
             lsp: None,
         };
-        run(limits, &Dirs::under(self.dir.path()), &call)
-            .await
-            .unwrap()
-            .response
+        run(
+            limits,
+            &RunProfileConfig::default(),
+            &Dirs::under(self.dir.path()),
+            &call,
+        )
+        .await
+        .unwrap()
+        .response
     }
 }
 
@@ -2150,10 +2190,15 @@ async fn a_hybrid_search_slower_than_the_deadline_does_not_starve_the_walk() {
         handle: None,
         lsp: None,
     };
-    let response = run(&limits(), &Dirs::under(tree.dir.path()), &call)
-        .await
-        .unwrap()
-        .response;
+    let response = run(
+        &limits(),
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response;
     assert_eq!(response["seed_source"], "hybrid", "{response}");
     assert!(
         response["totals"]["pops"].as_u64().unwrap() >= 1,
@@ -2200,7 +2245,9 @@ async fn lsp_live_starts_the_servers_the_call_configures() {
         lsp: Some(&lsp),
     };
     let dirs = Dirs::under(tree.path());
-    let report = run(&limits(), &dirs, &call).await.unwrap();
+    let report = run(&limits(), &RunProfileConfig::default(), &dirs, &call)
+        .await
+        .unwrap();
     let notes = report.response["notes"].to_string();
     assert!(notes.contains("lsp.live is unavailable"), "{notes}");
 }
@@ -2226,7 +2273,10 @@ async fn a_tie_break_file_that_cannot_be_read_is_an_error() {
         ..limits()
     };
     let dirs = Dirs::under(Path::new("unused"));
-    let error = run(&limits, &dirs, &call).await.err().expect("an error");
+    let error = run(&limits, &RunProfileConfig::default(), &dirs, &call)
+        .await
+        .err()
+        .expect("an error");
     let error = error.to_string();
     assert!(
         error.contains("tie_break no-such-tie-break.json"),
@@ -2322,10 +2372,15 @@ async fn the_beam_decides_how_many_of_a_nodes_edges_the_walk_follows() {
                 lsp: None,
             };
             let limits = TraverseConfig { beam, ..limits() };
-            let response = run(&limits, &Dirs::under(dir.path()), &call)
-                .await
-                .unwrap()
-                .response;
+            let response = run(
+                &limits,
+                &RunProfileConfig::default(),
+                &Dirs::under(dir.path()),
+                &call,
+            )
+            .await
+            .unwrap()
+            .response;
             response["totals"]["hops"].as_u64().unwrap()
         }
     };
@@ -2489,10 +2544,16 @@ async fn trait_run_top(
         handle: None,
         lsp: None,
     };
-    run_with_trait_seeds(&limits(), &Dirs::under(tree.0.path()), &call, mode)
-        .await
-        .unwrap()
-        .response
+    run_with_trait_seeds(
+        &limits(),
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.0.path()),
+        &call,
+        mode,
+    )
+    .await
+    .unwrap()
+    .response
 }
 
 fn reached(response: &Value) -> Vec<String> {
@@ -2865,4 +2926,74 @@ async fn trait_seeds_and_the_stand_in_seeds_combine_per_mode() {
             }
         }
     }
+}
+
+/// The first event of a run's trace: the `start` event.
+fn start_event(report: &Report) -> Value {
+    let trace = report.trace.as_ref().expect("the trace was written");
+    let text = std::fs::read_to_string(trace).unwrap();
+    serde_json::from_str(text.lines().next().expect("a trace has events")).unwrap()
+}
+
+#[tokio::test]
+async fn the_walk_reads_walk_groups_from_the_run_profile() {
+    let tree = Tree::new();
+    let (budget, steer) = (
+        BudgetArgs {
+            pops: Some(1),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: Some(tree.dir.path()),
+        question: "q",
+        seeds: &tree.seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: None,
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+    };
+    let dirs = Dirs::under(tree.dir.path());
+    // The default profile ranks as ever and says nothing about grouping.
+    let plain = run(&limits(), &RunProfileConfig::default(), &dirs, &call)
+        .await
+        .unwrap();
+    let rank = &start_event(&plain)["rank"];
+    assert!(rank.get("groups").is_none(), "{rank}");
+    assert!(rank.get("grep_corroboration").is_none(), "{rank}");
+    assert!(!notes_of(&plain.response).contains("groups claim"));
+    // The profile's walk keys reach the start event.
+    let profile = RunProfileConfig {
+        walk: lci_core::config::WalkProfile {
+            groups: lci_core::config::WalkGroups::Claim,
+            grep_corroboration: 0.5,
+        },
+    };
+    let claim = run(&limits(), &profile, &dirs, &call).await.unwrap();
+    let rank = &start_event(&claim)["rank"];
+    assert_eq!(rank["groups"], "claim", "{rank}");
+    assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
+    let notes = notes_of(&claim.response);
+    assert!(
+        notes.contains("groups claim") && notes.contains("score bound is off"),
+        "{notes}"
+    );
+    // A handle made under claim groups resumes under them, whatever the
+    // profile of the resuming call says.
+    let handle = handle_of(&claim.response);
+    let resume_call = Call {
+        handle: Some(&handle),
+        ..call
+    };
+    let resumed = run(&limits(), &RunProfileConfig::default(), &dirs, &resume_call)
+        .await
+        .unwrap();
+    let rank = &start_event(&resumed)["rank"];
+    assert_eq!(rank["groups"], "claim", "{rank}");
+    assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
 }

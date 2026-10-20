@@ -926,6 +926,16 @@ impl Tree {
     }
 
     async fn ask(&self, request: Value, flow_judge: bool) -> Value {
+        self.ask_under(request, flow_judge, &RunProfileConfig::default())
+            .await
+    }
+
+    async fn ask_under(
+        &self,
+        request: Value,
+        flow_judge: bool,
+        profile: &RunProfileConfig,
+    ) -> Value {
         let (name, args) = match request.as_object().unwrap().iter().next() {
             Some((name, args)) => (name.clone(), args.clone()),
             None => unreachable!(),
@@ -938,6 +948,7 @@ impl Tree {
         let index = self.dir.path().join("index.scip");
         let ctx = Ctx {
             limits: &limits,
+            profile,
             dirs: &dirs,
             scip_index: &index,
             root: self.dir.path(),
@@ -1067,4 +1078,43 @@ async fn recipes_over_calls_do_not_follow_a_trait_implementation() {
     .unwrap();
     assert_eq!(answer["stop"]["reason"], "empty", "{answer}");
     assert!(names(&answer, "path").is_empty(), "{answer}");
+}
+
+/// The `rank` objects of the start events of every trace the walks left.
+fn trace_ranks(tree: &Tree) -> Vec<Value> {
+    let traces = Dirs::under(&tree.dir.path().join("data")).traces;
+    let mut ranks = Vec::new();
+    for entry in std::fs::read_dir(traces).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        let start: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        if start["ev"] == "start" {
+            ranks.push(start["rank"].clone());
+        }
+    }
+    ranks
+}
+
+#[tokio::test]
+async fn flow_from_walks_under_the_run_profile() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let plain = Tree::new();
+    plain.ask(request.clone(), false).await;
+    let ranks = trace_ranks(&plain);
+    assert!(!ranks.is_empty());
+    assert!(ranks.iter().all(|rank| rank.get("groups").is_none()));
+
+    let claim = Tree::new();
+    let profile = RunProfileConfig {
+        walk: lci_core::config::WalkProfile {
+            groups: lci_core::config::WalkGroups::Claim,
+            grep_corroboration: 0.5,
+        },
+    };
+    claim.ask_under(request, false, &profile).await;
+    let ranks = trace_ranks(&claim);
+    assert!(!ranks.is_empty());
+    for rank in &ranks {
+        assert_eq!(rank["groups"], "claim", "{rank}");
+        assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
+    }
 }

@@ -490,10 +490,24 @@ flow_judge = false
 [compose]
 enabled = false
 
-# [run_profile] has no keys yet; an unknown key is an error. `lci config --json`
-# prints derived.run_profile_hash, the hash of the result-affecting settings;
-# README `[run_profile]` lists what is left out.
+# [run_profile] holds the switches that name a run's configuration; an unknown
+# key is an error. `lci config --json` prints derived.run_profile_hash, the hash
+# of the result-affecting settings; README `[run_profile]` lists what is left out.
 [run_profile]
+
+# [run_profile.walk]: how a traversal counts the evidence that reaches a node.
+# groups = "tool" (default): every map is one piece of evidence (maps over one
+# shared graph count once). "claim": the same (source node, destination node,
+# claim family) is one piece of evidence whichever maps assert it, and an edge's
+# confidence is the noisy-OR over its claims, not its maps; the score bound is
+# off, and it cannot be combined with [traverse] fusion = "rrf".
+# grep_corroboration (0 to 1, default 1): what a group made only of text-match
+# ("mentions") edges adds to the evidence count; 1 counts it like any other.
+# Both keys are part of the run-profile hash; a handle keeps the values it was
+# made with.
+[run_profile.walk]
+groups = "tool"
+grep_corroboration = 1.0
 
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and

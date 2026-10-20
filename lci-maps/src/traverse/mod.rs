@@ -101,6 +101,18 @@
 //! the walk ends by its budgets or when the frontier is dry. A handle keeps
 //! the fusion it started with.
 //!
+//! Grouping ([`Grouping`], `[run_profile.walk]`): what counts as one piece of
+//! evidence. By `tool` (the default) it is a map, as above. By `claim` it is a
+//! claim (the expanding node, the destination and a
+//! [`source::ClaimFamily`]): maps that
+//! say the same thing about the same pair count once, and the confidence of a
+//! fused edge is the noisy-OR over its claims ([`source::FusedEdge::claim_conf`])
+//! instead of over its maps. `grep_corroboration` scales what a group of
+//! `mentions` edges only adds to the count. The score bound is off under
+//! `claim` (one map can add several claims, so the map ceiling bounds
+//! nothing). A walk with the default grouping keeps no groups on its states
+//! and ranks by `n_maps`, exactly as before; a handle keeps the grouping.
+//!
 //! Pass-through (`[traverse] pass_through`, off by default): popping a
 //! connective node (a file, a commit or a config key: [`is_connective`]) is
 //! free, so it does not count toward the pop budget. Its tokens and external
@@ -170,7 +182,7 @@ use lci_core::node::{NodeId, NodeKind};
 use priors::HopPriors;
 use rescore::{FrontierRescorer, RerankFailure};
 use serde_json::{Value, json};
-use source::{EdgeSource, Expansion, FusedEdge};
+use source::{ClaimFamily, EdgeSource, Expansion, FusedEdge};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::Instant,
@@ -185,6 +197,8 @@ use tiebreak::{Facts, TieBreak};
 pub use fusion::RRF_K;
 /// How results are ranked (`[traverse] fusion`); see the module docs.
 pub use lci_core::config::TraverseFusion as Fusion;
+/// How evidence is grouped (`[run_profile.walk] groups`); see [`Grouping`].
+pub use lci_core::config::WalkGroups as Groups;
 
 /// Tokens charged per adopted edge: roughly one ~12-token card line (a guess).
 pub const TOKENS_PER_EDGE: u64 = 12;
@@ -249,6 +263,62 @@ impl TraversalStatus {
     }
 }
 
+/// How a traversal counts the evidence that reaches a node (`[run_profile.walk]`).
+///
+/// Under [`Groups::Tool`] (the default) every map is one piece of evidence
+/// (the maps derived from one shared graph are one together), as ever. Under
+/// [`Groups::Claim`] the same claim (source node, destination node and
+/// [`ClaimFamily`]) is one piece of evidence whichever maps assert it, and
+/// the fused confidence of an edge is the noisy-OR over its claims instead of
+/// over its maps. A group made only of `mentions` edges counts
+/// `grep_corroboration` (0 to 1) instead of 1. The default is today's
+/// numbers; a walk that has it keeps no groups at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grouping {
+    pub groups: Groups,
+    pub grep_corroboration: f64,
+}
+
+impl Default for Grouping {
+    fn default() -> Self {
+        Self {
+            groups: Groups::Tool,
+            grep_corroboration: 1.0,
+        }
+    }
+}
+
+impl Grouping {
+    /// A discount outside `[0, 1]` is clamped, one that is not a number is 1.
+    pub fn new(groups: Groups, grep_corroboration: f64) -> Self {
+        let share = if grep_corroboration.is_nan() {
+            1.0
+        } else {
+            grep_corroboration.clamp(0.0, 1.0)
+        };
+        Self {
+            groups,
+            grep_corroboration: share,
+        }
+    }
+
+    /// Whether this is today's grouping (tool, no discount).
+    pub fn is_default(&self) -> bool {
+        self.groups == Groups::Tool && self.grep_corroboration == 1.0
+    }
+}
+
+/// The identity of one group of evidence at a node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GroupKey {
+    /// Tool grouping: one independent map.
+    Map(MapId),
+    /// Tool grouping: all the dependent maps together.
+    Dependent,
+    /// Claim grouping: the claim from the expanding node to this one.
+    Claim(NodeId, ClaimFamily),
+}
+
 /// A start node, with the map that found it when a map did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seed {
@@ -289,6 +359,10 @@ pub struct State {
     /// arrival outside the beam delivers at 0. When a stronger route rescales
     /// a subtree, the entries of its states scale with their potential.
     pub reach: BTreeMap<MapId, f64>,
+    /// Only under a non-default [`Grouping`] (empty otherwise): the groups of
+    /// evidence that reached the node, each with whether every edge of the
+    /// group so far was a `mentions` edge.
+    pub groups: BTreeMap<GroupKey, bool>,
 }
 
 impl State {
@@ -302,6 +376,25 @@ impl State {
     /// by. A node no map reached counts as one map.
     pub fn ranked_potential(&self, boost: f64) -> f64 {
         let extra = self.n_maps().saturating_sub(1) as f64;
+        self.potential * (1.0 + boost * extra)
+    }
+
+    /// The pieces of evidence under `grouping`: the groups, a `mentions`-only
+    /// group counting `grep_corroboration`. Under the default grouping this
+    /// is [`State::n_maps`].
+    pub fn n_groups(&self, grouping: &Grouping) -> f64 {
+        if grouping.is_default() {
+            return self.n_maps() as f64;
+        }
+        let text = self.groups.values().filter(|only_text| **only_text).count();
+        let other = self.groups.len() - text;
+        other as f64 + grouping.grep_corroboration * text as f64
+    }
+
+    /// `potential * (1 + boost * (n_groups - 1))`: the rank under `grouping`
+    /// ([`State::ranked_potential`] under the default one).
+    pub fn ranked_potential_by(&self, boost: f64, grouping: &Grouping) -> f64 {
+        let extra = (self.n_groups(grouping) - 1.0).max(0.0);
         self.potential * (1.0 + boost * extra)
     }
 }
@@ -361,6 +454,8 @@ pub struct TraversalResult {
     pub corroboration_boost: f64,
     /// How the run ranked its results.
     pub fusion: Fusion,
+    /// How the run grouped evidence.
+    pub grouping: Grouping,
     /// Whether the run passed through connective nodes (see the module docs).
     pub pass_through: bool,
     /// Under `rrf` fusion: the fused score of every result, by node (empty
@@ -404,7 +499,7 @@ impl TraversalResult {
     /// a result, such as a start node).
     pub fn ranked_potential(&self, state: &State) -> f64 {
         match self.fusion {
-            Fusion::Boost => state.ranked_potential(self.corroboration_boost),
+            Fusion::Boost => state.ranked_potential_by(self.corroboration_boost, &self.grouping),
             Fusion::Rrf => self.fused.get(&state.node).copied().unwrap_or(0.0),
         }
     }
@@ -466,6 +561,7 @@ pub struct Traversal<'s> {
     plan: Option<trace::StartPlan>,
     boost: f64,
     fusion: Fusion,
+    grouping: Grouping,
     pass_through: bool,
     /// The reranker frontier: the rescorer and the floor of the hop factor.
     rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
@@ -506,6 +602,7 @@ impl<'s> Traversal<'s> {
             plan: None,
             boost: DEFAULT_CORROBORATION_BOOST,
             fusion: Fusion::Boost,
+            grouping: Grouping::default(),
             pass_through: false,
             rerank: None,
             score_bound: true,
@@ -598,6 +695,15 @@ impl<'s> Traversal<'s> {
     /// Under [`Fusion::Rrf`] the score bound is off.
     pub fn fusion(mut self, fusion: Fusion) -> Self {
         self.fusion = fusion;
+        self
+    }
+
+    /// How evidence is grouped (default [`Grouping::default`], today's
+    /// numbers); see [`Grouping`]. Under [`Groups::Claim`] the score bound is
+    /// off (a map can add several claims, so the map ceiling bounds nothing).
+    /// A resumed traversal keeps the grouping its handle was made with.
+    pub fn grouping(mut self, grouping: Grouping) -> Self {
+        self.grouping = grouping;
         self
     }
 
@@ -846,6 +952,7 @@ impl<'s> Run<'s> {
                 (Fusion::Rrf, Some(map)) => BTreeMap::from([(map, 1.0)]),
                 _ => BTreeMap::new(),
             },
+            groups: BTreeMap::new(),
         });
         self.state_of.insert(seed.node.clone(), index);
         if self.t.budget.max_depth > 0 {
@@ -872,7 +979,7 @@ impl<'s> Run<'s> {
                 },
                 "scorer": self.t.scorer.label(),
                 "stops": stops_json(&self.t.stops),
-                "rank": rank_json(self.t.boost, self.t.fusion),
+                "rank": rank_json(self.t.boost, self.t.fusion, &self.t.grouping),
             });
             if let (true, Some(object)) = (self.t.pass_through, start.as_object_mut()) {
                 object.insert("pass_through".into(), json!(true));
@@ -1069,6 +1176,7 @@ impl<'s> Run<'s> {
             events: self.events,
             corroboration_boost: self.t.boost,
             fusion: self.t.fusion,
+            grouping: self.t.grouping,
             pass_through: self.t.pass_through,
             fused: fused_by_node,
             stop_reason,
@@ -1146,7 +1254,11 @@ impl<'s> Run<'s> {
         let (k, n_maps) = self.t.bound?;
         // A fused score depends on the ranks of all the other results, so no
         // frontier state has a bound on it.
-        if !self.t.score_bound || self.t.fusion == Fusion::Rrf || !self.t.targets.is_empty() {
+        if !self.t.score_bound
+            || self.t.fusion == Fusion::Rrf
+            || self.t.grouping.groups == Groups::Claim
+            || !self.t.targets.is_empty()
+        {
             return None;
         }
         // The results: every state reached by an edge that is not pruned, as
@@ -1155,7 +1267,12 @@ impl<'s> Run<'s> {
             .states
             .iter()
             .filter(|s| s.parent.is_some() && !self.cleared.contains(&s.node))
-            .map(|s| (s.ranked_potential(self.t.boost), s.potential))
+            .map(|s| {
+                (
+                    s.ranked_potential_by(self.t.boost, &self.t.grouping),
+                    s.potential,
+                )
+            })
             .collect();
         if ranks.len() < k {
             return None;
@@ -1268,7 +1385,19 @@ impl<'s> Run<'s> {
             max_nodes_touched: u64::MAX,
         };
         self.counted.clear();
-        let Expansion { edges, calls } = self.t.source.edges(&node, budget).await;
+        let Expansion { mut edges, calls } = self.t.source.edges(&node, budget).await;
+        if self.t.grouping.groups == Groups::Claim {
+            // The same claim from several maps counts once: an edge is worth
+            // its claims, not its maps. Still best first, then destination.
+            for edge in &mut edges {
+                edge.conf = edge.claim_conf;
+            }
+            edges.sort_by(|a, b| {
+                b.conf
+                    .cmp(&a.conf)
+                    .then_with(|| a.best.dst.cmp(&b.best.dst))
+            });
+        }
 
         // Every call that ran is counted here, before any early exit, cut or
         // retried; the tokens of a call are counted once it completes.
@@ -1424,6 +1553,7 @@ impl<'s> Run<'s> {
                 dependent: 0,
                 witnesses: BTreeSet::new(),
                 reach: BTreeMap::new(),
+                groups: BTreeMap::new(),
             });
             self.add_evidence(child, edge, potential);
             self.state_of.insert(dst.clone(), child);
@@ -1617,6 +1747,7 @@ impl<'s> Run<'s> {
                 *reach = reach.max(potential);
             }
         }
+        self.add_groups(index, edge);
         let mut new_maps = Vec::new();
         for &map in &edge.maps {
             if self.states[index].maps.contains(&map) {
@@ -1632,6 +1763,50 @@ impl<'s> Run<'s> {
             .witnesses
             .extend(edge.witnesses.iter().copied());
         new_maps
+    }
+
+    /// Under a non-default [`Grouping`]: the groups of `edge` join the evidence
+    /// of the state, each remembering whether all its edges so far were
+    /// `mentions` edges. By claim a group is the edge's claim family from the
+    /// expanding node; by tool it is the map (the dependent maps together), and
+    /// a map counts as text when every claim it made on this edge was one.
+    fn add_groups(&mut self, index: usize, edge: &FusedEdge) {
+        if self.t.grouping.is_default() {
+            return;
+        }
+        let mut keys: Vec<(GroupKey, bool)> = Vec::new();
+        match self.t.grouping.groups {
+            Groups::Claim => {
+                for (family, _) in &edge.claims {
+                    keys.push((
+                        GroupKey::Claim(edge.best.src.clone(), *family),
+                        *family == ClaimFamily::Mentions,
+                    ));
+                }
+            }
+            Groups::Tool => {
+                for &map in &edge.maps {
+                    let text = edge
+                        .claims
+                        .iter()
+                        .filter(|(_, maps)| maps.contains(&map))
+                        .all(|(family, _)| *family == ClaimFamily::Mentions);
+                    let key = if self.map_card(map).dependent {
+                        GroupKey::Dependent
+                    } else {
+                        GroupKey::Map(map)
+                    };
+                    keys.push((key, text));
+                }
+            }
+        }
+        let groups = &mut self.states[index].groups;
+        for (key, text) in keys {
+            groups
+                .entry(key)
+                .and_modify(|only_text| *only_text &= text)
+                .or_insert(text);
+        }
     }
 
     /// A route from the expanding state `from` (`parent`) to a node that
@@ -1866,7 +2041,7 @@ impl<'s> Run<'s> {
     fn rank_of(&self, state: usize, fused: Option<&[f64]>) -> f64 {
         match fused {
             Some(scores) => scores[state],
-            None => self.states[state].ranked_potential(self.t.boost),
+            None => self.states[state].ranked_potential_by(self.t.boost, &self.t.grouping),
         }
     }
 
@@ -2220,14 +2395,25 @@ pub fn is_connective(node: &NodeId) -> bool {
 }
 
 /// The `rank` object of the `start` and `resume` events. Under `boost` fusion
-/// it is what it always was; `rrf` adds the fusion and its `k`.
-pub(crate) fn rank_json(boost: f64, fusion: Fusion) -> Value {
-    match fusion {
+/// it is what it always was; `rrf` adds the fusion and its `k`; a grouping that
+/// is not the default adds `groups` and `grep_corroboration`.
+pub(crate) fn rank_json(boost: f64, fusion: Fusion, grouping: &Grouping) -> Value {
+    let mut rank = match fusion {
         Fusion::Boost => json!({"corroboration_boost": boost}),
         Fusion::Rrf => json!({
             "corroboration_boost": boost, "fusion": fusion.as_str(), "rrf_k": RRF_K,
         }),
+    };
+    if !grouping.is_default()
+        && let Some(object) = rank.as_object_mut()
+    {
+        object.insert("groups".into(), json!(grouping.groups.as_str()));
+        object.insert(
+            "grep_corroboration".into(),
+            json!(grouping.grep_corroboration),
+        );
     }
+    rank
 }
 
 /// The stop policy as the trace records it.

@@ -584,3 +584,94 @@ async fn a_version_10_handle_round_trips_its_new_fields() {
         .remove("physical_map_calls");
     assert!(Snapshot::from_json(&missing).is_err());
 }
+
+// ---- K23a: a handle keeps the grouping and its groups --------------------------
+
+#[tokio::test]
+async fn a_resume_keeps_the_grouping_and_its_groups() {
+    // `m1` and `m2` say `s` refers to `a`, `m3` only mentions it; `z` is
+    // reached from `a` and `b` later.
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("s", "a"), ("s", "b"), ("a", "z"), ("b", "z")]),
+        GraphMap::new("m2", &[("s", "a"), ("b", "z")]),
+        GraphMap::new("m3", &[("s", "a"), ("b", "z")]).kind(EdgeKind::Mentions),
+    ]);
+    let grouping = Grouping::new(Groups::Claim, 0.5);
+    let straight = walk(&reg, vec![seed("s")], budget(20), |t| t.grouping(grouping)).await;
+    let first = walk(&reg, vec![seed("s")], budget(2), |t| t.grouping(grouping)).await;
+    let snapshot = first.snapshot.expect("the walk paused with work left");
+    assert_eq!(snapshot.grouping, grouping);
+    assert!(snapshot.states.iter().any(|s| !s.groups.is_empty()));
+    // The handle JSON carries both, and reads back to the same snapshot.
+    let json = snapshot.to_json();
+    assert_eq!(json["grouping"]["groups"], "claim");
+    assert_eq!(json["grouping"]["grep_corroboration"], 0.5);
+    assert!(
+        json["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("groups").is_some())
+    );
+    assert_eq!(Snapshot::from_json(&json).unwrap(), snapshot);
+    // A resume that is not told the grouping ranks with the handle's.
+    let second = resume(&reg, snapshot, budget(20), |t| t).await;
+    assert_eq!(second.grouping, grouping);
+    let rank = &events_of(&second, "resume")[0]["rank"];
+    assert_eq!(rank["groups"], "claim");
+    assert_eq!(rank["grep_corroboration"], 0.5);
+    assert_eq!(second.states.len(), straight.states.len());
+    for state in &straight.states {
+        let again = second.states.iter().find(|s| s.node == state.node).unwrap();
+        assert_eq!(again.groups, state.groups);
+        assert_eq!(
+            second.ranked_potential(again),
+            straight.ranked_potential(state)
+        );
+    }
+    // m1 and m2 refer (one claim), m3 mentions (a text group at one half).
+    let a = second.states.iter().find(|s| s.node == node("a")).unwrap();
+    assert_eq!(a.groups.len(), 2);
+    assert_eq!(a.n_groups(&grouping), 1.5);
+}
+
+#[tokio::test]
+async fn a_handle_without_a_grouping_loads_as_tool_groups() {
+    let reg = registry(vec![
+        GraphMap::new("m1", &[("s", "a"), ("s", "b"), ("a", "z")]),
+        GraphMap::new("m2", &[("b", "z")]),
+    ]);
+    let first = walk(&reg, vec![seed("s")], budget(2), |t| t).await;
+    let snapshot = first.snapshot.expect("the walk paused with work left");
+    assert_eq!(snapshot.grouping, Grouping::default());
+    // A default walk writes neither key, so older handles are what they were.
+    let json = snapshot.to_json();
+    assert!(json.get("grouping").is_none());
+    assert!(
+        json["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s.get("groups").is_none())
+    );
+    let back = Snapshot::from_json(&json).unwrap();
+    assert_eq!(back.grouping, Grouping::default());
+    assert!(back.states.iter().all(|s| s.groups.is_empty()));
+    let resumed = resume(&reg, back, budget(20), |t| t).await;
+    assert_eq!(resumed.grouping, Grouping::default());
+    assert!(resumed.events[0]["rank"].get("groups").is_none());
+    // A malformed grouping is refused, not defaulted.
+    let mut bad = json.clone();
+    bad["grouping"] = json!({"groups": "both", "grep_corroboration": 1.0});
+    assert!(Snapshot::from_json(&bad).is_err());
+    // So is a discount that is not a share, not clamped into one.
+    for share in [json!(1.5), json!(-0.1)] {
+        let mut bad = json.clone();
+        bad["grouping"] = json!({"groups": "claim", "grep_corroboration": share});
+        let error = Snapshot::from_json(&bad).unwrap_err();
+        assert!(
+            error.contains("grep_corroboration is not a share"),
+            "{error}"
+        );
+    }
+}
