@@ -9,7 +9,8 @@ Ids are never renumbered or reused.
 
 ## How to use this file
 
-1. Take the top `ready` item of "Now and next", then the lowest tier in "Open items by tier" whose dependencies are done.
+1. Take the next slice of "Cycle 1" in table order (named in "Now and next"), then "Earlier items outside cycle 1", then
+   the lowest tier in "Open items by tier" whose dependencies are done.
 2. One item is one slice and one commit, plus the regular `cargo xtask test --suite Full` gate. Split an item that grows.
 3. Load the matching project skill first (`.agents/skills/lci-*`; the list is in `AGENTS.md`).
 4. A ranking, fusion, reranker, document-format, instruction or candidate-count change needs a before/after evaluation
@@ -22,7 +23,7 @@ Ids are never renumbered or reused.
    belong in the parking lot.
 
 Status legend: `ready` (dependencies met) | `in-progress` | `partly done: <what remains>` | `blocked(reason)` |
-`needs-approval(what)` | `research` (produces a decision, not a feature) | `paused(direction)` (parked by the 2026-10-17
+`needs-approval(what)` | `absorbed(K..)` (taken into a cycle 1 slice) | `research` (produces a decision, not a feature) | `paused(direction)` (parked by the 2026-10-17
 direction, see below). The table row is the only home of a status.
 
 Size: XS = a few lines, S = under half a day, M = about a day, L = more than a day (split before picking).
@@ -36,23 +37,105 @@ that document and is not a roadmap id.
 - Main focus (owner, 2026-10-17, d313): multimap traversal and its iterations. The embedder and reranker premise gets no
   further benches or iterations; its merit and lessons stay in the log. LCI is an extension of grep: grep and the other
   agent tools are steps inside multi-step queries (d337).
-- Core loop (d330): a Wikirace on a code graph, with a System 1 racer and compiler-grade links. Without SCIP and doc
-  edges the graph is sparse, so traversal equalled search (d333); building those edges comes first.
-- Order (d317, d319, d320): doc types first, then SCIP for the Rust repositories, then the walk-on-SCIP premise test.
-  Cleanup order, sanity adjustments, metric tiers and the simulated agent are decisions d319 to d329. The cleanup run's
-  own decisions are d300 to d312.
+- Core loop (d330): a Wikirace on a code graph, with a System 1 racer and compiler-grade links.
+- Cycles (owner, 2026-10-19/20, d396): work runs in cycles. Cycle 1 puts every layer of the vision in place at least once
+  behind flags in one typed profile; later cycles iterate on what high-volume real-agent A/B runs show. Features get
+  ceiling tests and mechanism checks, not per-feature kill rules; the final selection is a later preregistered
+  screening or factorial design. Real-agent A/B runs wait for the owner.
+- Sources (d396): language servers are the source of truth for meaning-level facts and are on by default where a server
+  is available; no batch index file is a primary source (SCIP is a cache or test ground truth); proven libraries are
+  reused where they fill a slot (custom code only for a measured gap).
 
 ## Now and next
 
-Ordered; the first item with all dependencies met is next. Every item gets its kill rule written before its slice runs.
+In flight: none. Next: K1a, the first slice of "Cycle 1" (milestone M1). Rewrite this line at every push.
+
+## Cycle 1
+
+Plan reviewed by the planning workflow, the coordinator and a cross-family reviewer (d397). Milestones run in order;
+inside a milestone the order below is the default. Each row is one slice and one commit unless marked. Check = what the
+slice's tests must show (ceiling test: works given ideal input; mechanism: the code path does what it claims). Every
+new behaviour is a `[run_profile]` key whose default keeps today's behaviour unless the row says otherwise.
+
+| Slice | Item | Check | Size | Absorbs |
+| --- | --- | --- | --- | --- |
+| **M1** | **Profile, freshness harness, no-service path** | | | |
+| K1a | `[run_profile]`: typed keys, resolved value and a sha-256 hash of its canonical JSON (hashed in `lci-core`), unknown keys rejected | Same profile, same hash; unknown key refused | S-M | - |
+| K1b | RunRecord stamp: additive required `run.profile {hash, keys}` on runrecord-0 (pre-freeze; the rename stays an S4 step) | Schema test; writer refuses lines without it | S | - |
+| K1c | Inventory every MCP, REST and CLI result shape; each carries the profile hash | One test per shape | S-M | - |
+| K0a | No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |
+| K7a | Fake LSP: implementation, call and type hierarchy, didOpen/didChange/didClose/didChangeWatchedFiles; answers come from the documents the fake server was sent, so a missing, late or reordered notification shows | Fake LSP tests | S | - |
+| K2a | Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
+| K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
+| K23a | Evidence groups by claim (`walk.groups = tool or claim`): one call seen by LSP, SCIP and syntax counts once; grep corroboration gets its own discount key | Mechanism: no double count | S | - |
+| K35a | Dependency policy: exact pins for 0.0.x crates; heavy third-party code behind a Cargo feature; default build unchanged | Docs | XS | - |
+| K34a | `cargo-deny` (advisories, licence allow-list, workspace crates unlicensed) as a non-blocking CI job; third-party notices file | CI | S | - |
+| **M2** | **Language servers as the source of truth** | | | |
+| K20a | Traverse no longer loads the SCIP index unconditionally (`scip.mode = off, cache, authoritative`; default stays authoritative until K20b) | Traverse runs with no index file | S-M | - |
+| K7b | Shared LSP sessions across traverse calls (server lifetime), a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
+| K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
+| K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps | Fake LSP event log | M | N2 |
+| K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` | `lsp.live` runs with `scip.mode = off` | M | - |
+| K9a | `lsp.live` implementation edges (`Implements`) | Ceiling: edges equal the server's answers | S | N6 (map side), G1 |
+| K9b | `lsp.live` call-hierarchy edges in and out (`CallsOrRefs`, witness `Exact`; no new `EdgeKind`) | Same | M | - |
+| K11d | LSP cost report: cold and warm ms per hop, RAM, budget hits, fail-open behaviour, pops per 5 s, before any default flips | Report under `test-results/` | S | I-8 |
+| K11b | `lsp.live` on by default when a server is available (`lsp.default = on`), fails open, spent from the external-call budget; the search channel's default is verified | Tests that assumed it absent are updated | S | - |
+| K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement | K2a | S | - |
+| **M3** | **Walk, cards, seeds, router, cost** | | | |
+| K10b | New `SymbolKind` variants (Field, Variable, Interface, Class) from LSP outlines; adapter version bump | Unit tests | S | - |
+| K11c | Prime before the first timed query; per-query budget-hit flag | Bench | S | E5 |
+| K3a | Cost metrics in every report: answer tokens, external calls, LSP ms, pops, per stratum; `compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies |
+| K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld | Card schema test | S | - |
+| K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |
+| K28 | Handle spec (format, lifetime, snapshot binding) and a round-trip test | Test | S | - |
+| K29 | `likely_complete`, the score bound and tau get written meanings | Docs and unit tests | S | - |
+| K21a | BM25 entity seeds over symbol names, qualified paths and doc comments, in process (reusing the lexical scoring); `seeds.bm25` off | Ceiling: gold symbol in top k on the trait and where-to gold | M | L1, L4, I-1 |
+| K22a | Exact-literal seed source (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases | Ceiling | S | item 4 rest |
+| K24a | Fusion variant: capped log-odds next to the current fusion (`walk.fusion`) | Unit tests | S | - |
+| K24b | Rank pricing normalised by sibling count (`walk.pricing`) | Unit tests | S | - |
+| K25 | Depth registered as a profile factor (`max_depth` 1, 2, 3, 6) | Profile test | XS | - |
+| K30a | Router (`router.mode = off, intent, features`): a caller-supplied intent or observable query features pick walk, grep or LSP; gold labels never route | Ceiling: route by the gold's question type | S-M | F3, N100 (detector stays killed) |
+| K33a | Trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs | Schema test | S | - |
+| **M4** | **Syntax tier, more maps, gold, baselines** | | | |
+| K15a | tree-sitter 0.26 and its grammar crates; every chunking test re-run; adapter version bump; default-build regression check | Existing tests | M | - |
+| K14a | Offline proof for Codanna 0.16.0 as an optional crates.io dependency: public API, dependency graph, grammar compatibility; TypeScript edge quality against an offline ground truth | Report | S | - |
+| K14b | Cargo feature `syntax-codanna`: parse one file through Codanna into LCI nodes | Ceiling on fixtures | M | - |
+| K14c | In-memory resolution glue; edges with confidence by the rule that picked them | Precision and recall against LSP on fixtures | M | - |
+| K14d | Name-based invalidation: on a change, re-resolve the file's outgoing edges and edges whose target names it added or removed | K2a | S | - |
+| K16 | Codanna parser tests as fixtures; its `tsconfig`, `go.mod` and `pyproject` readers for server root discovery | Tests | S | N4 (part) |
+| K17 | `oxc_resolver` for TS and JS imports, only if K14a shows Codanna's TS resolution is weak | Imports against typescript-go | S | - |
+| K26 | Syntax proposes, LSP confirms the top-k frontier (`walk.confirm`) | Cost and quality per call | M | G1 |
+| K9c | Type-hierarchy edges | Ceiling | S | - |
+| K12a | Server roster and per-language readiness; root discovery per server | Live acceptance per server | S | N4 |
+| K12b | typescript-go adapter | Live acceptance | M | - |
+| K12c | marksman adapter for prose | Live acceptance | S | N95 |
+| K18a | Repo map: PageRank over the syntax and outline graph as a seed prior (`seeds.repo_map` off) | Ceiling | M | G2 |
+| K19 | `grep.structural` map over ast-grep-core (pinned, after K15a) | Ceiling on structural queries | M | - |
+| K31 | Opengrep data-flow map, opt-in | Ceiling on a flow set | M | - |
+| K32 | Verify which planned maps exist (`tests.tested_by`, `docs.mentions`, pickaxe as a walk map); build the missing ones | Ceiling per map | XS each | - |
+| K37a | One request queue per server | Load test | S | N20 (a, b, e) |
+| K37b | Concurrent walks | Load test | S | - |
+| K37c | `probe.compile` runs `cargo check`, which can execute build scripts: a bounded sandbox, or opt-in only with a warning | Test | S | - |
+| K36 | Language scope table: server, syntax tier and gold per language | Docs | XS | - |
+| K4a | External held-out gold adapters (SWE-PolyBench Verified, LongCodeArena); dataset licences recorded; never used for tuning | Leak check | S | - |
+| K4b | External gold download and conversion | Counts | S | - |
+| K5a | Baseline arms rg-only and LSP-over-MCP wired into `maps baseline` (no A/B runs) | Smoke query | S | item 6 arm |
+| K5b | Baseline arms Codanna and Serena wired (no A/B runs) | Smoke query | S | - |
+| K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
+| K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
+
+M0 filler, any time a build slot is free: N19, N24, N20 (c, d).
+
+Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
+server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
+
+## Earlier items outside cycle 1
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
 | 1 | Doc-type prose adapters: `.md`, `.rst`, `.adoc`, `.txt` | partly done: `.txt`, `.rst`, `.adoc` (each its own slice behind the Markdown tests); DocSection nodes and a `doc.sections` map after (shaping count 54.9% > the 30% bar) | Real adapters, never wrapped as code-like files (d317, d325). Markdown landed as heading sections (d375) and is opt-in via `[index] prose` after its docs-lane evaluation (d380). |
 | 2 | Structured formats `.json`, `.yaml`, `.toml` | unfinished (d393): the lockfile skip failed its rule and was dropped | Grep fallback stays as it is (d325). Skipping files does not shorten a capped listing; a follow-up would test listing relevance, on a set where the simulated agent can succeed. Real adapters only if a measured gap appears. |
-| 4 | Walk-on-SCIP premise test | done on the trait set (d392): not killed; the walk beats `lci search` (Q1 set F1 +0.40) but beats rg on no metric, at about 2.7 times its tokens. The R1 re-run with the walk on was not run. Any follow-up (the walk as a step after rg, Q2 ranking) needs its own preregistration. The rg-then-walk chain is parked (d394): its best realised merge adds +0.012 Q1 F1; rg-derived seeds for the 7 seedless traits stay open | Trait-impl set plus an R1 re-run with the walk on (d320). On the R1 and external-repository trees the walk was never measured with SCIP edges (d333); the frozen tree `bfaff44` already has a SCIP index and its walk benches are in `docs/spike/multimap/v2/engine-results.md`, so the test targets the new trees. The implementation edges of N97 exist (d379) and a trait or trait method can seed a walk when `scip.implements` is on (trait seeds, PR 85); the trait set stratifies explicit, derive and macro impls and takes its gold independently of the derivation (d378). Kill rule set before the run; the comparison is against plain `lci search` (R1 span hit .64) and against rg. |
 | 5 | Error-to-commit set with SZZ gold | parked (d377) | "Which code changes in git history are responsible for this error" (d314). Gold: blame the fix commit's lines at its parent, then verify; first a premise check of usable fix commits. Baseline: `git bisect` where a reproducing test exists (d324). The premise check failed its kill rule (8 usable items, 40 needed); re-check is N96. |
-| 6 | LSP-MCP baseline for the trait set | done for tauri and bevy (d392): rust-analyzer beats the walk and rg there (Q1 set F1 0.951 against D1 0.802); deno did not finish (free-RAM floor, bindgen build-script panic) | rust-analyzer implementation requests as the competitor (d324). Hypotheses for why LCI never measured trait impls: no SCIP in the trees, implementation edge not ingested, LSP channel sends no implementation request, derive/blanket/macro impls (d315). |
 | 8 | Tier-2 calibration | partly done: the judged subset of the simulated agent ran (d390, inconclusive at n 48, proxies uncalibrated) | The one allowed follow-up (a new prereg at n 96) is dropped (d395): a zero-cost projection gives P(inconclusive again) 0.84 or more. Confidence calibration of an LCI score (the other half of d327) waits for a component that emits a probability. Tier 3, real agent A/B runs, stays rare and validates the proxies (pv2 rho .699, d261). |
 | 10 | N14 re-evaluate | paused until search work resumes | Tag `keep/n14-lexical-suffix`, commit e0f7c10 (d115, d302). The before/after run needs the 4B pass. |
 
@@ -65,9 +148,9 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 
 | ID | Item | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` excludes budget-hit queries. After N7 the budget-hit windows cover 14 to 22 of 35 mined queries (d054) (roadmap@bbd3292 E5) | ready | S | N7 done |
+| E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` excludes budget-hit queries. After N7 the budget-hit windows cover 14 to 22 of 35 mined queries (d054) (roadmap@bbd3292 E5) | absorbed(K11c, K3a) | S | N7 done |
 | E6 | Identifier-query stratum: `cargo xtask mine-symbols` samples declaration names (seeded, names of 5+ characters, defined in one file, not test-only) with `expected_paths` = the defining file, tag `identifier`, committed apart from `self.toml`; unit tests on synthetic input; one fusion-only and one reranked baseline recorded (roadmap@bbd3292 E6) | ready | S | E2 done |
-| N8 | The LSP channel goes dark for 15 to 25 s windows under back-to-back searches (hypothesis: rust-analyzer swaps its crate graph after build scripts and proc macros load, invalidating the primed symbol index); diagnose and fix (roadmap@bbd3292 N8) | ready | S-M, live | N7 done |
+| N8 | The LSP channel goes dark for 15 to 25 s windows under back-to-back searches (hypothesis: rust-analyzer swaps its crate graph after build scripts and proc macros load, invalidating the primed symbol index); diagnose and fix (roadmap@bbd3292 N8) | absorbed(K7b (readiness); the live diagnosis stays open) | S-M, live | N7 done |
 | N16 rest | A workspace search on a legacy-only table waits on the store-wide legacy guard; the revision pin and the re-read after a commit during the freshness check are not pinned by a failing test (roadmap@bbd3292 N16) | ready | S | - |
 | N18 | Low batch (item (b), the Java readiness probe, was fixed as N77, d190): (a) `manifest::save` removes the destination before `rename`; (c) `serve --port 0` advertises port 0; (d) three navigation tests assert rust-analyzer's flag; (e) the embedding model listing is probed at the origin; (f) no per-file size cap (roadmap@bbd3292 N18) | ready | XS each | - |
 | N19 | Language-adapter batch: `java.args` is appended after `-jar` so JVM options never apply; relative `java.path`; C# project discovery follows symlinked directories (roadmap@bbd3292 N19) | ready | XS-S each | - |
@@ -76,7 +159,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N24 | Java launcher jar ordering (`find_launcher_jar` takes the first directory entry that matches); Windows `.cmd` spawn. The third part, non-adjacent `search_symbols` duplicates, was fixed as N74 (d187) (roadmap@bbd3292 N24) | ready | XS | - |
 | N25 | Six weak assertions in `tests/cases/indexing.rs`: (a) `a_hung_reranker_is_tried_once_and_keeps_earlier_warnings` sets a 1 s reranker timeout but bounds the elapsed time at 10 s; (b) the unreachable-reranker test asserts only `reranking_ms` < 5000 (count accepted connections instead); (c) the 200 ms budget tests use 150 to 1200 ms bounds; (d) a stop-word query is not in the fixture; (e) the traced-search test lacks a rank >= 1 assert; (f) the `mixed_languages` deletion test checks top-8 over equal vectors without a chunk count (roadmap@bbd3292 N25) | ready | XS | - |
 | N26 c | `search_symbols` has no result cap; record the size of a broad name's answer first (roadmap@bbd3292 N26) | ready | XS | - |
-| N32 | Rewrite the model-facing strings within budgets: `search_code` 350 characters (436 today), `search_symbols` 280 (328), instructions 450 (732); state facts only (d278): what comes back, the first-call index cost and the navigation preconditions; no advice on when to prefer Grep, which goes to an on-demand skill measured as its own arm. Kill rule: uptake rises by fewer than 6 of 27 runs, mean F1 falls by more than 0.05, or tokens rise by more than 5%. Text is `cloud-ok`, the A/B arm is `local`. See [agent-payload-notes.md](agent-payload-notes.md) (roadmap@bbd3292 N32) | ready after N26 | S | N26 |
+| N32 | Rewrite the model-facing strings within budgets: `search_code` 350 characters (436 today), `search_symbols` 280 (328), instructions 450 (732); state facts only (d278): what comes back, the first-call index cost and the navigation preconditions; no advice on when to prefer Grep, which goes to an on-demand skill measured as its own arm. Its former kill-rule thresholds move to the cycle 2 screening design (d396). Text is `cloud-ok`, the A/B arm is `local`. See [agent-payload-notes.md](agent-payload-notes.md) (roadmap@bbd3292 N32) | ready after N26 | S | N26 |
 | N33 | Schema documentation for the four search and navigation tools: describe `query`; list the valid `languages` and `source_roles` values (roles: source, test, benchmark, example, generated, documentation, configuration); state glob syntax, that an empty `include_paths` matches nothing and that empty language or role lists are errors; document `include_declaration`; describe `workspace_path` on every tool (today only on `WorkspaceArgs`, 73 characters); stop hard-coding "(8)" in the `top_k` text; drop what N32 makes redundant (the language-server list repeated 4 times, about 400 characters). Acceptance: a test that every argument of the four tools has a description; `tools/list` no larger than today (roadmap@bbd3292 N33) | ready | S | N32 |
 | N34 | `default_top_k` 5 versus 8 as a measured arm: 61 appearances, 57 at rank 5 or better, ranks 6 to 8 carry 18.7% of returned lines, 20 of 94 answered files were at rank 6 or later (U1 calls); lowest priority (roadmap@bbd3292 N34) | ready, local | S | N28 done |
 | N42 | Incremental-index peak memory: `Store::cached_vectors` plus a vector clone scale with the whole index (estimate 0.9 to 1.5 GB at 150,000 to 250,000 chunks of 768 floats, not measured); measure first; fix direction: load only vectors whose chunk hash is still present and move instead of clone; acceptance: state the bound and a test fails above it; `cloud-ok` (roadmap@bbd3292 N42) | ready, low | S | - |
@@ -87,11 +170,11 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N87 | The live-acceptance workflow does not use `--require-all`, so a missing tool reads green (roadmap@bbd3292 N87) | ready | S | N56 done |
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
 | N94 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
-| N95 | A Markdown language server (marksman, MIT) for prose navigation: links, headings, references; the language bar's LSP item is waived for prose until then (d375) | research | S | - |
+| N95 | A Markdown language server (marksman, MIT) for prose navigation: links, headings, references; the language bar's LSP item is waived for prose until then (d375) | absorbed(K12c) | S | - |
 | N96 | Re-check the error-to-commit premise (item 5) with full clones and the error text of linked GitHub issues, under a new pre-registered rule (d377) | ready | M | - |
 | N99 | System-1 rescoring rung: a decision model orders the reranker's 24-candidate shortlist, the seam where N98 (killed) showed the reranker's value (d382). Gate K0 passed on a hosted System One prototype arm (d383); slice 2 (the opt-in rescorer rung, with status-only HTTP errors, transmitted trace sizes and a joint-batch replay guard) merged as PR 88 and the default is unchanged; K1 passed (slice 3, d385); slice 4 failed bar S (d387): the local 4B decider loses on flow and mined search and needs about 19 GB of VRAM, so the reranker stays the default and the rung stays opt-in. The hosted model is never shipped | done (local rung killed, d387) | M | - |
 | N100 | Where-to routing: an un-steered `traverse` call on a where-to question returns 16 answers (8 seeds and 8 walk) where the `where-to` preset returns the 8 first-stage answers, with set_f1 +0.015 [+0.005, +0.026] and 42% fewer answer tokens; cut to 8 the two are identical, so the gain is the shorter list (d389). Whether to route such questions to the preset (question-type detection, or a fact in the tool description under the facts-only rule) needs its own pre-registered test. Detection (b) was killed at B0 (R 0.339 against the 0.70 bar, d391) | partly done: detection killed (d391); the description fact (a) is parked until a tier-3 run is approved | S | - |
-| N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Now and next 10) (roadmap@bbd3292 N14) | paused | S | - |
+| N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Earlier items outside cycle 1, row 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.
 
@@ -103,20 +186,20 @@ acceptance data is in the log.
 | ID | Item | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
 | L0 | Engine-independent lexical fixes: scanner-aligned `rg` flags, timeout and stdout cap, newest bundled `rg`, interval index for LSP mapping, timing split (d074) (roadmap@bbd3292 L0) | paused(direction) | XS-S | - |
-| L1 | Lexical engine spike: arms (a) `rg` subprocess, (b) in-process `grep-searcher` + `ignore`, (c) LanceDB FTS, (d) Tantivy. Adoption rule: +20% relative nDCG@10 on both strata with p50 not worse (d075); prefer (c) over (d) at equal quality; adopt (b) only if at least as fast and it removes the rg-not-found failure; a missing index degrades to `rg` with a warning (roadmap@bbd3292 L1) | research, paused | M | - |
+| L1 | Lexical engine spike: arms (a) `rg` subprocess, (b) in-process `grep-searcher` + `ignore`, (c) LanceDB FTS, (d) Tantivy. The adoption rule (d075) is retired by d396; K21a builds the in-process arm; a missing index degrades to `rg` with a warning (roadmap@bbd3292 L1) | absorbed(K21a) | M | - |
 | L3 | Anchor extraction for issue-like queries; optional agent-supplied `lexical_terms` (roadmap@bbd3292 L3) | paused(direction) | S | - |
-| L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) (roadmap@bbd3292 L4) | blocked(L1) | L, split | L1 |
+| L4 | Ranked BM25 channel as a fourth RRF list (engine per L1) (roadmap@bbd3292 L4) | absorbed(K21a) | L, split | L1 |
 | C1 | Per-chunk symbol metadata (name, kind, enclosing, signature) and Rust `impl` header carry (roadmap@bbd3292 C1) | ready | M | - |
 | C2 | Contextual headers in embedding, lexical and reranker documents (one re-embed); gate: no keyword-stratum loss, core hit@1 at least 0.818 (d076) (roadmap@bbd3292 C2) | blocked(C1), paused | M | C1 |
 | F2d | Definition boost in fusion (LSP symbol kinds now, C1 `kind` later) (roadmap@bbd3292 F2d) | proposed, paused | S | C1 |
-| F3 | Query-type routing (identifier, prose, issue-like) (roadmap@bbd3292 F3) | blocked(L3, R2, E6); R2 is dropped (d357) | M | L3, R2, E6 |
+| F3 | Query-type routing (identifier, prose, issue-like) (roadmap@bbd3292 F3) | absorbed(K30a) | M | L3, R2, E6 |
 | N1 | Per-provider symbol-query syntax (roadmap@bbd3292 N1) | ready | S | - |
 | S1 | Per-file incremental table writes (delete + add or `merge_insert`), lancedb bump (roadmap@bbd3292 S1) | ready | M | - |
 | S2 | `optimize()` and version cleanup, `gc` for orphaned workspaces and manifests (roadmap@bbd3292 S2) | ready | M | S1 preferred |
 | S4 | Stop loading every chunk's code per search; interval maps for channel mapping (roadmap@bbd3292 S4) | ready | M | - |
 | W1 | mtime+size stat cache before hashing (manifest additive fields) (roadmap@bbd3292 W1) | ready | M | - |
-| W2 | `notify`-based watcher with polling fallback and persisted watch roots (roadmap@bbd3292 W2) | ready | M | W1 preferred |
-| N2 | LSP document lifecycle: open once, `didChange` on edits, `didClose`, drop fixed sleeps (roadmap@bbd3292 N2) | ready | M | - |
+| W2 | `notify`-based watcher with polling fallback and persisted watch roots (roadmap@bbd3292 W2) | absorbed(K8a) | M | W1 preferred |
+| N2 | LSP document lifecycle: open once, `didChange` on edits, `didClose`, drop fixed sleeps (roadmap@bbd3292 N2) | absorbed(K7c) | M | - |
 
 Short accounts. C1: carries the `impl` header into method chunks and gives later features a `kind`; accept with unit
 tests per language and a before/after run on both sets. S1/S2/S4: a commit today overwrites the whole workspace table
@@ -128,9 +211,9 @@ N2: accept with a live LSP test that a second symbol request reuses the open doc
 
 | ID | Item | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| N4 | Project-root discovery and priming for TS/Python/Go servers (roadmap@bbd3292 N4) | ready | M | N2 |
+| N4 | Project-root discovery and priming for TS/Python/Go servers (roadmap@bbd3292 N4) | absorbed(K12a, K16) | M | N2 |
 | N5 | Symbol-name addressing for `find_definition` and `find_references` (roadmap@bbd3292 N5) | ready | M | N1 |
-| N6 | Outline, hover, implementations, call hierarchy tools (two slices) (roadmap@bbd3292 N6) | blocked(C1) | M + M | C1, N2 |
+| N6 | Outline, hover, implementations, call hierarchy tools (two slices) (roadmap@bbd3292 N6) | absorbed(K9a, K9b, K10a (map side); the tool side stays open) | M + M | C1, N2 |
 | A1 | Compact results, `read_chunk`, `token_estimate`, `max_tokens` (roadmap@bbd3292 A1) | ready | M | - |
 | A2 | MCP `outputSchema`, tool annotations, deterministic tool order, instructions (roadmap@bbd3292 A2) | ready (verify rmcp support) | S | A1 preferred |
 | A3 | Upgrade rmcp 3.2.0 to 3.5.1 (2026-07-28 stateless spec, back-compatible) (roadmap@bbd3292 A3) | ready | M | - |
@@ -146,8 +229,8 @@ Umbrella items: split each into S/M slices with acceptance criteria, and show a 
 
 | ID | Item | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| G1 | Bounded structural expansion of top hits via LSP references or call hierarchy, labelled with a reason; evidence: SpIDER arXiv 2512.16956 (+27% relative Recall@20), CodexGraph token cost arXiv 2408.03910 (roadmap@bbd3292 G1) | blocked(N6b, E2) | L | N6b (a slice of N6), E2 |
-| G2 | `repo_map(query, max_tokens)` from tree-sitter tags and personalized PageRank (Aider's repo map; best at an 8K-token budget, arXiv 2607.24882) (roadmap@bbd3292 G2) | blocked(C1) | L | C1 |
+| G1 | Bounded structural expansion of top hits via LSP references or call hierarchy, labelled with a reason; evidence: SpIDER arXiv 2512.16956 (+27% relative Recall@20), CodexGraph token cost arXiv 2408.03910 (roadmap@bbd3292 G1) | absorbed(K9a, K26) | L | N6b (a slice of N6), E2 |
+| G2 | `repo_map(query, max_tokens)` from tree-sitter tags and personalized PageRank (Aider's repo map; best at an 8K-token budget, arXiv 2607.24882) (roadmap@bbd3292 G2) | absorbed(K18a) | L | C1 |
 | X2 | Cross-workspace vector reuse by content hash (worktrees, clones, branches), multi-repo query-time merge (Cursor content-hash cache, Semble) (roadmap@bbd3292 X2) | research | L | S1 |
 | X3 | Dependency scope: lockfile to registry sources, read-only, version-keyed; optional SCIP ingestion (SCIP, Glean, Context7 pattern) (roadmap@bbd3292 X3) | research | L | X2 |
 | X4 | Git-aware channels: `changes_since(ref)`, commit-message channel mapped to touched files (BM25 over commit messages up to +80% MAP, arXiv 2502.07067) (roadmap@bbd3292 X4) | research | M | E2 |
@@ -159,16 +242,16 @@ Umbrella items: split each into S/M slices with acceptance criteria, and show a 
 
 | ID | Question | Status |
 | --- | --- | --- |
-| I-1 | Is shelling out to `rg` worth keeping over in-process grep crates, LanceDB FTS or Tantivy? Design: L1's four arms on this repository and the mined set, lexical-only; metric: nDCG@10 and hit@3 per stratum, p50 and p95, index size and build time, new crates; decision: see L1 (roadmap@bbd3292 I-1) | research, paused |
+| I-1 | Is shelling out to `rg` worth keeping over in-process grep crates, LanceDB FTS or Tantivy? Design: L1's four arms on this repository and the mined set, lexical-only; metric: nDCG@10 and hit@3 per stratum, p50 and p95, index size and build time, new crates; decision: see L1 (roadmap@bbd3292 I-1) | absorbed(K21a)
 | I-6 | Does evaluating mined queries at HEAD, not at the parent commit, bias results? Design: for 50 mined commits, index a `git worktree` at the parent into a disposable data dir and compare; decision: if the bias is above 0.05 absolute, extend E2 with an `--at-parent` mode (roadmap@bbd3292 I-6) | research |
-| I-8 | How expensive is harvesting LSP references and call hierarchy at index time with rust-analyzer, jdtls and clangd? Design: time per symbol on this repository and a Java fixture; decision: above 50 ms per symbol, G1 stays query-time only (roadmap@bbd3292 I-8) | research |
+| I-8 | How expensive is harvesting LSP references and call hierarchy at index time with rust-analyzer, jdtls and clangd? Design: time per symbol on this repository and a Java fixture; the 50 ms decision rule is retired by d396 (roadmap@bbd3292 I-8) | absorbed(K11d)
 
 ## Deferred
 
 - Adoption logging from real sessions (owner, 2026-10-17, d328): until LCI reaches release stage, tier-3 agent runs are
   the only adoption measure; occasional CLI use is qualitative only.
-- Freshness (F1, F2), not before the spike works on live trees (d247): F1 verify on read, so that every answer checks
-  the files it cites; F2 measure staleness after real edits. A freshness contract stays a release blocker.
+- Freshness: F1 (verify on read) and F2 (staleness after real edits) are cycle 1 slices K2b and K2a (d396). A freshness
+  contract stays a release blocker.
 - A/B-era items: the U1 4B pass and the other agent A/B reruns rebuild their indexes on the current model (d304); they
   wait for a real need and a tier-3 slot (d327). Occasional-use and uptake questions are recorded in d122.
 - Direction-paused retrieval items (d313): the embedder and reranker trials, window and instruction sweeps, and the
