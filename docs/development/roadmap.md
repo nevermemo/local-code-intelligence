@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: none. Next: K1a, the first slice of "Cycle 1" (milestone M1). Rewrite this line at every push.
+In flight: none. Next: K1b (milestone M1; K1a landed, d398). Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -60,7 +60,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path** | | | |
-| K1a | `[run_profile]`: typed keys, resolved value and a sha-256 hash of its canonical JSON (hashed in `lci-core`), unknown keys rejected | Same profile, same hash; unknown key refused | S-M | - |
 | K1b | RunRecord stamp: additive required `run.profile {hash, keys}` on runrecord-0 (pre-freeze; the rename stays an S4 step) | Schema test; writer refuses lines without it | S | - |
 | K1c | Inventory every MCP, REST and CLI result shape; each carries the profile hash | One test per shape | S-M | - |
 | K0a | No-service path: a fresh workspace with the embedder down still answers traverse, lexical and LSP requests (the semantic channel fails open); fix what blocks | Test with the fake model service down | S-M | - |

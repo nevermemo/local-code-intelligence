@@ -862,6 +862,7 @@ fn derived_values(config: &Config) -> Value {
         "ready_url": format!("{base}/ready"),
         "openapi_url": format!("{base}/openapi.json"),
         "embedding_identity": config.embedding_identity(),
+        "run_profile_hash": config.run_profile().hash,
     })
 }
 
