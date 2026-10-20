@@ -37,9 +37,11 @@
 //!   second world, that the same maps are plain gaps with it off, so the label
 //!   and not the data is what changed.
 //! * `Gap`: it did not and the answer is silent or says "not stale" (the live
-//!   maps, the search channels, `lsp.symbols`). `EXPECTED_GAPS` and
-//!   `EXPECTED_LABELLED` list today's outcomes and are asserted in both
-//!   directions.
+//!   maps, the search channels, `lsp.symbols`). `EXPECTED_GAPS`,
+//!   `EXPECTED_LABELLED` and `VERIFIED_ON_READ` list today's outcomes and are
+//!   asserted in both directions. `VERIFIED_ON_READ` holds the maps that are
+//!   labelled only with `[run_profile.freshness] verify_on_read` (K2b) on, on
+//!   top of `map_freshness`; with it off they are gaps again.
 //!
 //! `git.history` and `exact.pickaxe` read committed history: an uncommitted
 //! edit is not in it (correct by definition), and a commit is.
@@ -364,6 +366,31 @@ fn assert_no_timeout(answer: &Value) {
     assert!(!notes.contains("deadline passed"), "{notes}");
 }
 
+/// `base` asked another question, with other start nodes and maps: every other
+/// field is `base`'s. One place builds these calls (no struct update from a
+/// reused `Call`), so a field added to `Call` is named here once.
+fn asked<'a>(
+    base: &Call<'a>,
+    question: &'a str,
+    seeds: &'a [String],
+    maps: Option<&'a [String]>,
+) -> Call<'a> {
+    Call {
+        scip_index: base.scip_index,
+        scip_root: base.scip_root,
+        question,
+        seeds,
+        seed_search: base.seed_search,
+        top_k: base.top_k,
+        maps,
+        budget: base.budget,
+        steer: base.steer,
+        handle: base.handle,
+        lsp: base.lsp,
+        lsp_sessions: None,
+    }
+}
+
 fn read_walk(report: &traverse::Report) -> Walk {
     let mut reached = Reached::new();
     let mut edges = Edges::new();
@@ -448,6 +475,8 @@ struct Observed {
     edges: Edges,
     /// The walk call's answer (cards with their sites).
     walk: Value,
+    /// The search report of the call that came first (as JSON).
+    search: Value,
     /// For each live map (`grep.live`, `lsp.live`): how many edges it offers
     /// from the probe's own symbol, asked alone about it. The probe's name is
     /// in the tree only from its generation on, so an answer made from older
@@ -489,6 +518,9 @@ struct World {
     last_fresh: BTreeMap<&'static str, u32>,
     /// `[run_profile.traverse] map_freshness` for the calls of this world.
     labels: bool,
+    /// `[run_profile.freshness] verify_on_read` for the calls and the searches
+    /// of this world.
+    verify: bool,
     /// Observations made so far (names the SCIP file of each probe call).
     probe_runs: std::cell::Cell<u32>,
     /// The source files of the tree (path and content hash) as they were when
@@ -498,13 +530,14 @@ struct World {
 }
 
 impl World {
-    /// With the map labels on (`map_freshness`).
+    /// With the map labels (`map_freshness`) and `verify_on_read` on.
     async fn start(freshness: IndexFreshness) -> World {
-        World::start_with(freshness, true).await
+        World::start_with(freshness, true, true).await
     }
 
-    async fn start_with(freshness: IndexFreshness, labels: bool) -> World {
+    async fn start_with(freshness: IndexFreshness, labels: bool, verify: bool) -> World {
         let (temp, mut config, fake, models_task) = fixture().await;
+        config.run_profile.freshness.verify_on_read = verify;
         config.traverse.enabled = true;
         // The exact cards would otherwise start the walk from the probes.
         config.traverse.exact_seeds = false;
@@ -545,6 +578,7 @@ impl World {
             shifted: false,
             last_fresh: BTreeMap::new(),
             labels,
+            verify,
             probe_runs: std::cell::Cell::new(0),
             scip_tree,
         }
@@ -625,6 +659,7 @@ impl World {
     async fn run(&self, call: &Call<'_>) -> traverse::Report {
         let mut profile = self.app.config.run_profile.clone();
         profile.traverse.map_freshness = self.labels;
+        profile.freshness.verify_on_read = self.verify;
         let report = traverse::run(
             &self.app.config.traverse,
             &profile,
@@ -723,13 +758,7 @@ impl World {
         // The start nodes of the seed maps, each map alone.
         for seed_map in SEED_MAPS {
             let only = [seed_map.to_owned()];
-            let call = Call {
-                question: &truth.probe,
-                seeds: &[],
-                maps: Some(&only),
-                lsp_sessions: None,
-                ..base
-            };
+            let call = asked(&base, &truth.probe, &[], Some(&only));
             let report = self.run(&call).await;
             // The label of a seed map is in the answer of the call that ran it.
             let label = report.response["maps"]
@@ -744,10 +773,7 @@ impl World {
             }
             // The same for a seed map: an old index does not know the probe,
             // but it knows `Combine`.
-            let known = Call {
-                question: "`Combine`",
-                ..call
-            };
+            let known = asked(&call, "`Combine`", &[], Some(&only));
             let baseline = self.run(&known).await;
             if baseline.response["seeds"]
                 .as_array()
@@ -789,6 +815,7 @@ impl World {
             reached,
             edges,
             walk: walk.response,
+            search,
         }
     }
 
@@ -963,15 +990,97 @@ fn classify(
     }
 }
 
-/// The lag the traverse answer labels `map` with as stale: its `maps[]` entry
-/// (`{id, observed, stale, lag}`, with `[run_profile.traverse] map_freshness`),
-/// when it says `stale` and gives a lag.
-fn labelled_lag(answer: &Value, map: &str) -> Option<u32> {
-    answer["maps"]
+/// The lag an entry list (`maps[]` of a traverse answer, `channels` of a
+/// search report: `{id, observed, stale, lag}`) gives `map`, when its entry says
+/// `stale` and gives a lag.
+fn entry_lag(entries: &Value, map: &str) -> Option<u32> {
+    entries
         .as_array()?
         .iter()
         .find(|entry| entry["id"] == map && entry["stale"] == true)
         .and_then(|entry| u32::try_from(entry["lag"].as_u64()?).ok())
+}
+
+/// The lag the answers label `map` with as stale: for the three search
+/// channels the `freshness.channels` of the search report
+/// (`[run_profile.freshness] verify_on_read`), for every other map its `maps[]`
+/// entry in the traverse answer (`[run_profile.traverse] map_freshness`).
+fn labelled_lag(now: &Observed, map: &str) -> Option<u32> {
+    if CHANNELS.contains(&map) {
+        entry_lag(&now.search["freshness"]["channels"], map)
+    } else {
+        entry_lag(&now.walk["maps"], map)
+    }
+}
+
+/// The search channels the harness asks about.
+const CHANNELS: [&str; 3] = ["vec.chunk.code", "lexical", "lsp.symbols"];
+
+/// The `maps[]` entry of `map` in a traverse answer.
+fn map_entry<'a>(answer: &'a Value, map: &str) -> &'a Value {
+    answer["maps"]
+        .as_array()
+        .and_then(|maps| maps.iter().find(|entry| entry["id"] == map))
+        .unwrap_or_else(|| panic!("no maps[] entry for {map} in {answer}"))
+}
+
+/// The cards of a list whose `site.path` is `path`.
+fn cards_at<'a>(cards: &'a Value, path: &str) -> Vec<&'a Value> {
+    cards
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|card| card["site"]["path"] == path)
+        .collect()
+}
+
+/// The maps whose cards a comparison with the SCIP index's tree answers for:
+/// the maps built from the index, and the live maps that place by it.
+const INDEX_MAPS: [&str; 9] = [
+    "graph.scip",
+    "structure.contains",
+    "seeds.scip_names",
+    "exact.closure",
+    "config.key",
+    "scip.impact",
+    "scip.implements",
+    "grep.live",
+    "lsp.live",
+];
+
+/// With `verify_on_read`, every result card has `file_changed`, and a card
+/// that a reference applies to (its maps are built from the index or placed
+/// by it, or, unless `index_maps_only`, read the snapshot) says `true` for the
+/// source files in `changed` and `false` for the other source files; a file
+/// that is not a source file (the TOML example) is `null`.
+fn assert_file_changed(answer: &Value, changed: &[&str], index_maps_only: bool) {
+    let mut checked = 0;
+    for card in answer["results"].as_array().expect("results") {
+        assert!(card.get("file_changed").is_some(), "{card}");
+        let Some(path) = card["site"]["path"].as_str() else {
+            continue;
+        };
+        let named = |maps: &[&str]| {
+            let listed = card["maps"].as_array().into_iter().flatten();
+            listed
+                .chain(card.get("via"))
+                .filter_map(Value::as_str)
+                .any(|map| maps.contains(&map))
+        };
+        let applies = named(&INDEX_MAPS)
+            || (!index_maps_only && named(&["seeds.hybrid", "search.lexical", "search.vector"]));
+        if !applies {
+            continue;
+        }
+        let want = if path.ends_with(".toml") {
+            Value::Null
+        } else {
+            json!(changed.contains(&path))
+        };
+        assert_eq!(card["file_changed"], want, "{card}");
+        checked += 1;
+    }
+    assert!(checked > 0, "no card to check in {answer}");
 }
 
 /// The data a silent gap of this map is behind.
@@ -1019,7 +1128,7 @@ impl World {
                 classify(
                     sees,
                     !is.is_empty() || now.answered.contains(map),
-                    labelled_lag(&now.walk, map),
+                    labelled_lag(now, map),
                     needed,
                     lag,
                     why_of(map),
@@ -1034,27 +1143,35 @@ impl World {
     }
 }
 
-/// The gaps with `[run_profile.traverse] map_freshness` on: stale and silent.
-/// A map that becomes fresh (K20b, K8a, K14d, K2b) or that gets a label that
-/// covers its lag must be struck from this list in the same commit, and a new
-/// gap fails the case that finds it.
+/// The gaps with `[run_profile.traverse] map_freshness` and `[run_profile.freshness]
+/// verify_on_read` on: stale and silent. A map that becomes fresh (K8a, K14d)
+/// or that gets a label that covers its lag must be struck from this list in
+/// the same commit, and a new gap fails the case that finds it.
 const EXPECTED_GAPS: &[(Case, &str, Why)] = &[
     // The language-server session walked the tree before the edit and is told
-    // nothing after it; the search maps are not labelled at all.
+    // nothing after it, and its answer is not compared with the tree.
     (Case::OnSearch, "lsp.symbols", Why::OldSession),
-    // Under `manual` the snapshot is old too.
-    (Case::Manual, "seeds.hybrid", Why::OldSnapshot),
-    (Case::Manual, "search.lexical", Why::OldSnapshot),
-    (Case::Manual, "search.vector", Why::OldSnapshot),
+    // Under `manual` the snapshot is old too; the channels of the search
+    // report are not labelled yet.
     (Case::Manual, "vec.chunk.code", Why::OldSnapshot),
     (Case::Manual, "lexical", Why::OldSnapshot),
     (Case::Manual, "lsp.symbols", Why::OldSession),
-    // One blank line moved: the two live maps ask or attribute at the index's
-    // places, and the label of a live map says "live", not "stale".
-    (Case::LineShift, "grep.live", Why::LostEdge),
-    (Case::LineShift, "lsp.live", Why::LostEdge),
     // After the SCIP file was rewritten only the session is behind.
     (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
+];
+
+/// The maps that miss the edit and say so only with `verify_on_read` on (K2b):
+/// with it off they are gaps (the same data, no label).
+const VERIFIED_ON_READ: &[(Case, &str, Why)] = &[
+    // Under `manual` the snapshot is old: the lag is the manifest's against
+    // the tree.
+    (Case::Manual, "seeds.hybrid", Why::OldSnapshot),
+    (Case::Manual, "search.lexical", Why::OldSnapshot),
+    (Case::Manual, "search.vector", Why::OldSnapshot),
+    // One blank line moved: the two live maps ask or attribute at the index's
+    // places; their label carries the index's lag.
+    (Case::LineShift, "grep.live", Why::LostEdge),
+    (Case::LineShift, "lsp.live", Why::LostEdge),
 ];
 
 /// The maps that miss the edit but say so in `maps[]` with a lag that covers
@@ -1086,14 +1203,18 @@ const EXPECTED_LABELLED: &[(Case, &str, Why)] = &[
 
 type Listed = Vec<(Case, &'static str, Why)>;
 
-/// The gaps and the labelled maps a case must find: with the key on, as the
-/// two lists say; with it off, every labelled map is a gap.
-fn expected(labels: bool) -> (Listed, Listed) {
-    if labels {
-        (EXPECTED_GAPS.to_vec(), EXPECTED_LABELLED.to_vec())
-    } else {
-        let all = EXPECTED_GAPS.iter().chain(EXPECTED_LABELLED).copied();
-        (all.collect(), Vec::new())
+/// The gaps and the labelled maps a case must find. Both keys on: as the lists
+/// say. `verify_on_read` off: the verified maps are gaps. `map_freshness` off:
+/// every labelled map is a gap (`verify_on_read` does nothing without it in a
+/// traverse answer).
+fn expected(labels: bool, verify: bool) -> (Listed, Listed) {
+    let gaps = EXPECTED_GAPS.iter().copied();
+    let labelled = EXPECTED_LABELLED.iter().copied();
+    let verified = VERIFIED_ON_READ.iter().copied();
+    match (labels, verify) {
+        (true, true) => (gaps.collect(), labelled.chain(verified).collect()),
+        (true, false) => (gaps.chain(verified).collect(), labelled.collect()),
+        (false, _) => (gaps.chain(verified).chain(labelled).collect(), Vec::new()),
     }
 }
 
@@ -1235,7 +1356,7 @@ fn shift_verdicts(
             classify(
                 false,
                 answered,
-                labelled_lag(&after.walk, map),
+                labelled_lag(after, map),
                 needed,
                 1,
                 Why::LostEdge,
@@ -1244,7 +1365,7 @@ fn shift_verdicts(
             classify(
                 false,
                 answered,
-                labelled_lag(&after.walk, map),
+                labelled_lag(after, map),
                 needed,
                 1,
                 Why::SiteDrift,
@@ -1265,9 +1386,21 @@ fn shift_table(verdicts: &BTreeMap<&str, Verdict>) -> String {
     text
 }
 
-fn problems_of(labels: bool, case: Case, found: &BTreeMap<&str, Verdict>) -> Result<(), String> {
-    let (gaps, labelled) = expected(labels);
+fn problems_of(
+    labels: bool,
+    verify: bool,
+    case: Case,
+    found: &BTreeMap<&str, Verdict>,
+) -> Result<(), String> {
+    let (gaps, labelled) = expected(labels, verify);
     compare_gaps(&gaps, &labelled, case, found)
+}
+
+impl World {
+    /// The lists of this world's keys against what a case found.
+    fn problems(&self, case: Case, found: &BTreeMap<&str, Verdict>) -> Result<(), String> {
+        problems_of(self.labels, self.verify, case, found)
+    }
 }
 
 // ---- the cases ---------------------------------------------------------------
@@ -1311,7 +1444,8 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
         let verdicts = world.verdicts(&before, &now, &truth);
         let shown = table(Case::OnSearch, &verdicts);
         eprintln!("generation {generation}\n{shown}");
-        problems_of(world.labels, Case::OnSearch, &verdicts)
+        world
+            .problems(Case::OnSearch, &verdicts)
             .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
         // The lag is the number of generations since the map was fresh.
         for (map, verdict) in &verdicts {
@@ -1327,6 +1461,20 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
                 other => panic!("{map}: {other:?}"),
             }
         }
+        // The search refreshed the snapshot: the maps that read it are not
+        // behind the tree, whatever the SCIP index is.
+        for map in ["seeds.hybrid", "search.lexical", "search.vector"] {
+            let entry = map_entry(&now.walk, map);
+            assert_eq!(entry["observed"], "snapshot", "{entry}");
+            assert_eq!(entry["stale"], false, "{entry}");
+            assert_eq!(entry["lag"], 0, "{entry}");
+        }
+        // The SCIP-built maps' cards cite files that changed.
+        assert_file_changed(
+            &now.walk,
+            &["src/Calculator.cs", "src/CallSite.cs", "src/shapes.rs"],
+            true,
+        );
         // The edit is not history yet.
         let (history, pickaxe) = world.history().await;
         assert_eq!(
@@ -1368,12 +1516,41 @@ async fn manual_mode_index_maps_answer_the_old_snapshot_and_the_search_report_sa
     let verdicts = world.verdicts(&before, &now, &truth);
     let shown = table(Case::Manual, &verdicts);
     eprintln!("{shown}");
-    problems_of(world.labels, Case::Manual, &verdicts)
+    world
+        .problems(Case::Manual, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     // The live maps still see the edit.
     for map in ["grep.live", "lsp.live"] {
         assert_eq!(verdicts[map], Verdict::Fresh, "{map}");
     }
+    // With `verify_on_read` the maps that read the snapshot say how far it is
+    // behind the tree: the three source files the probes were written to, as
+    // the SCIP-built maps count them. The live maps place by the index, which
+    // is as far behind, and say so.
+    let behind = u64::from(world.files_behind());
+    assert_eq!(behind, 3);
+    for map in ["seeds.hybrid", "search.lexical", "search.vector"] {
+        let entry = map_entry(&now.walk, map);
+        assert_eq!(entry["observed"], "snapshot", "{entry}");
+        assert_eq!(entry["stale"], true, "{entry}");
+        assert_eq!(entry["lag"], behind, "{entry}");
+        assert!(entry.get("places").is_none(), "{entry}");
+    }
+    for map in LIVE_MAPS {
+        let entry = map_entry(&now.walk, map);
+        assert_eq!(entry["observed"], "live", "{entry}");
+        assert_eq!(entry["stale"], true, "{entry}");
+        assert_eq!(entry["lag"], behind, "{entry}");
+        assert_eq!(entry["places"], "index", "{entry}");
+    }
+    // Every card says whether its file changed: the three edited sources
+    // did, the rest of the tree did not (the config example is not a source
+    // file: nothing to compare).
+    assert_file_changed(
+        &now.walk,
+        &["src/Calculator.cs", "src/CallSite.cs", "src/shapes.rs"],
+        false,
+    );
     world.finish().await;
 }
 
@@ -1394,8 +1571,28 @@ async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
     let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
     let shown = shift_table(&verdicts);
     eprintln!("{shown}");
-    problems_of(world.labels, Case::LineShift, &verdicts)
+    world
+        .problems(Case::LineShift, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    // The cards the maps built from the index and placed by it cite: the file
+    // that moved changed, the file that did not move did not.
+    assert_eq!(world.files_behind(), 1);
+    for map in LIVE_MAPS {
+        let entry = map_entry(&after.walk, map);
+        assert_eq!(entry["stale"], true, "{entry}");
+        assert_eq!(entry["lag"], 1, "{entry}");
+        assert_eq!(entry["places"], "index", "{entry}");
+    }
+    assert_file_changed(&after.walk, &["src/Calculator.cs"], true);
+    let at = |path: &str| cards_at(&after.walk["results"], path);
+    assert!(!at("src/Calculator.cs").is_empty(), "{}", after.walk);
+    assert!(!at("src/CallSite.cs").is_empty(), "{}", after.walk);
+    for card in at("src/Calculator.cs") {
+        assert_eq!(card["file_changed"], true, "{card}");
+    }
+    for card in at("src/CallSite.cs") {
+        assert_eq!(card["file_changed"], false, "{card}");
+    }
     world.finish().await;
 }
 
@@ -1411,7 +1608,8 @@ async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     let stale = world.observe().await;
     let verdicts = world.verdicts(&before, &stale, &truth);
     let shown = table(Case::OnSearch, &verdicts);
-    problems_of(world.labels, Case::OnSearch, &verdicts)
+    world
+        .problems(Case::OnSearch, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
 
     world.regenerate_scip();
@@ -1419,7 +1617,8 @@ async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     let verdicts = world.verdicts(&before, &rewritten, &truth);
     let shown = table(Case::ScipRewritten, &verdicts);
     eprintln!("{shown}");
-    problems_of(world.labels, Case::ScipRewritten, &verdicts)
+    world
+        .problems(Case::ScipRewritten, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     for map in SCOPE.iter().filter(|map| why_of(map) == Why::OldIndex) {
         assert_eq!(verdicts[map], Verdict::Fresh, "{map} reloads by the stamp");
@@ -1563,7 +1762,7 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
 /// the most (`on-search`) and on the line shift.
 #[tokio::test]
 async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps() {
-    let mut world = World::start_with(IndexFreshness::OnSearch, false).await;
+    let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
     let before = world.observe().await;
     assert!(
         before.walk.get("maps").is_none(),
@@ -1576,7 +1775,7 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     let verdicts = world.verdicts(&before, &now, &truth);
     let shown = table(Case::OnSearch, &verdicts);
     eprintln!("key off\n{shown}");
-    problems_of(false, Case::OnSearch, &verdicts)
+    problems_of(false, false, Case::OnSearch, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     // Every map the key labels is a silent gap here (the lag is the number of
     // generations).
@@ -1588,7 +1787,7 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     }
     world.finish().await;
 
-    let mut world = World::start_with(IndexFreshness::OnSearch, false).await;
+    let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
     world.edit();
     world.regenerate_scip();
     let before = world.observe().await;
@@ -1602,8 +1801,87 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
     let shown = shift_table(&verdicts);
     eprintln!("key off\n{shown}");
-    problems_of(false, Case::LineShift, &verdicts)
+    problems_of(false, false, Case::LineShift, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    world.finish().await;
+}
+
+/// With `map_freshness` on and `verify_on_read` off, the answers are those of
+/// K2a-2: the snapshot maps have no label, the live maps say `live`, not stale,
+/// lag 0, and no card says `file_changed`. So the maps of `VERIFIED_ON_READ`
+/// are gaps, and it is the key that labels them. Run on the two cases that list
+/// them (`manual` and the line shift).
+#[tokio::test]
+async fn with_verify_on_read_off_the_snapshot_maps_and_the_shifted_live_maps_are_gaps() {
+    let live_as_before = |walk: &Value| {
+        for map in LIVE_MAPS {
+            assert_eq!(
+                *map_entry(walk, map),
+                json!({"id": map, "observed": "live", "stale": false, "lag": 0}),
+            );
+        }
+        for card in walk["results"].as_array().unwrap() {
+            assert!(card.get("file_changed").is_none(), "{card}");
+        }
+        for entry in walk["maps"].as_array().unwrap() {
+            assert!(entry.get("places").is_none(), "{entry}");
+        }
+    };
+
+    let mut world = World::start_with(IndexFreshness::Manual, true, false).await;
+    let before = world.observe().await;
+    world.edit();
+    let truth = world.truth();
+    let now = world.observe().await;
+    let verdicts = world.verdicts(&before, &now, &truth);
+    let shown = table(Case::Manual, &verdicts);
+    eprintln!("verify off\n{shown}");
+    world
+        .problems(Case::Manual, &verdicts)
+        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    for map in ["seeds.hybrid", "search.lexical", "search.vector"] {
+        assert_eq!(
+            verdicts[map],
+            Verdict::Gap {
+                why: Why::OldSnapshot,
+                lag: 1
+            },
+            "{map}"
+        );
+        let labelled = now.walk["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == map);
+        assert!(!labelled, "{map} has no label with the key off");
+    }
+    live_as_before(&now.walk);
+    world.finish().await;
+
+    let mut world = World::start_with(IndexFreshness::OnSearch, true, false).await;
+    world.edit();
+    world.regenerate_scip();
+    let before = world.observe().await;
+    world.shift();
+    let truth = world.truth();
+    let after = world.observe().await;
+    let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
+    let shown = shift_table(&verdicts);
+    eprintln!("verify off\n{shown}");
+    world
+        .problems(Case::LineShift, &verdicts)
+        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    for map in LIVE_MAPS {
+        assert_eq!(
+            verdicts[map],
+            Verdict::Gap {
+                why: Why::LostEdge,
+                lag: 1
+            },
+            "{map}"
+        );
+    }
+    live_as_before(&after.walk);
     world.finish().await;
 }
 
@@ -1615,95 +1893,130 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
 fn the_gap_list_is_exact_in_both_directions() {
     // Every entry names a map of the scope, once per case, in one list.
     let mut seen = BTreeSet::new();
-    for (case, map, _) in EXPECTED_GAPS.iter().chain(EXPECTED_LABELLED) {
+    for (case, map, _) in EXPECTED_GAPS
+        .iter()
+        .chain(EXPECTED_LABELLED)
+        .chain(VERIFIED_ON_READ)
+    {
         assert!(SCOPE.contains(map) || PLACED_MAPS.contains(map), "{map}");
         assert!(seen.insert((*case, *map)), "{case:?} {map} twice");
     }
-    let found = |case: Case| -> BTreeMap<&'static str, Verdict> {
-        SCOPE
-            .iter()
-            .chain(&PLACED_MAPS)
-            .map(|map| {
-                let in_case = |list: &[(Case, &'static str, Why)]| {
-                    list.iter()
-                        .find(|(c, m, _)| *c == case && m == map)
-                        .copied()
-                };
-                let verdict = match (in_case(EXPECTED_GAPS), in_case(EXPECTED_LABELLED)) {
-                    (Some((_, _, why)), _) => Verdict::Gap { why, lag: 1 },
-                    (None, Some(_)) => Verdict::StaleLabelled { lag: 3 },
-                    (None, None) => Verdict::Fresh,
-                };
-                (*map, verdict)
-            })
-            .collect()
-    };
+    // `verify_on_read` moves exactly the verified maps between the lists:
+    // labelled with both keys on, gaps with it off, and every labelled map is
+    // a gap with `map_freshness` off.
+    let (gaps, labelled) = expected(true, true);
+    for entry in VERIFIED_ON_READ {
+        assert!(
+            labelled.contains(entry) && !gaps.contains(entry),
+            "{entry:?}"
+        );
+    }
+    assert_eq!(gaps, EXPECTED_GAPS);
+    let (gaps, labelled) = expected(true, false);
+    for entry in VERIFIED_ON_READ {
+        assert!(
+            gaps.contains(entry) && !labelled.contains(entry),
+            "{entry:?}"
+        );
+    }
+    assert_eq!(labelled, EXPECTED_LABELLED);
+    let (gaps, labelled) = expected(false, true);
+    assert!(labelled.is_empty());
+    assert_eq!(
+        gaps.len(),
+        EXPECTED_GAPS.len() + EXPECTED_LABELLED.len() + VERIFIED_ON_READ.len()
+    );
+    for (labels, verify) in [(true, true), (true, false), (false, false)] {
+        let (gaps, labelled) = expected(labels, verify);
+        lists_are_exact(&gaps, &labelled);
+    }
+    // A map that gave nothing before the edit cannot be called fresh or a gap.
+    let (gaps, labelled) = expected(true, true);
+    let mut unexercised = verdicts_of(Case::OnSearch, &gaps, &labelled);
+    unexercised.insert("grep.live", Verdict::Unexercised);
+    assert!(compare_gaps(&gaps, &labelled, Case::OnSearch, &unexercised).is_err());
+}
+
+/// The verdicts a case would find if the lists were true.
+fn verdicts_of(case: Case, gaps: &Listed, labelled: &Listed) -> BTreeMap<&'static str, Verdict> {
+    SCOPE
+        .iter()
+        .chain(&PLACED_MAPS)
+        .map(|map| {
+            let in_case = |list: &Listed| {
+                list.iter()
+                    .find(|(c, m, _)| *c == case && m == map)
+                    .copied()
+            };
+            let verdict = match (in_case(gaps), in_case(labelled)) {
+                (Some((_, _, why)), _) => Verdict::Gap { why, lag: 1 },
+                (None, Some(_)) => Verdict::StaleLabelled { lag: 3 },
+                (None, None) => Verdict::Fresh,
+            };
+            (*map, verdict)
+        })
+        .collect()
+}
+
+/// Striking, labelling, silencing or re-explaining an entry of the lists fails
+/// the comparison, for each case.
+fn lists_are_exact(gaps: &Listed, labelled: &Listed) {
     for case in [
         Case::OnSearch,
         Case::Manual,
         Case::LineShift,
         Case::ScipRewritten,
     ] {
-        compare_gaps(EXPECTED_GAPS, EXPECTED_LABELLED, case, &found(case)).unwrap();
+        let found = || verdicts_of(case, gaps, labelled);
+        compare_gaps(gaps, labelled, case, &found()).unwrap();
         // The verdict a case finds for each entry the lists name.
-        let Some(at) = EXPECTED_GAPS.iter().position(|(c, _, _)| *c == case) else {
+        let Some(at) = gaps.iter().position(|(c, _, _)| *c == case) else {
             continue;
         };
         // Strike one entry: the gap the case finds is now a new gap.
-        let struck: Vec<_> = EXPECTED_GAPS
+        let struck: Vec<_> = gaps
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != at)
             .map(|(_, entry)| *entry)
             .collect();
-        let error = compare_gaps(&struck, EXPECTED_LABELLED, case, &found(case)).unwrap_err();
+        let error = compare_gaps(&struck, labelled, case, &found()).unwrap_err();
         assert!(error.contains("new gap"), "{error}");
         // A map that became fresh, still listed.
-        let mut fresh = found(case);
-        fresh.insert(EXPECTED_GAPS[at].1, Verdict::Fresh);
-        let error = compare_gaps(EXPECTED_GAPS, EXPECTED_LABELLED, case, &fresh).unwrap_err();
+        let mut fresh = found();
+        fresh.insert(gaps[at].1, Verdict::Fresh);
+        let error = compare_gaps(gaps, labelled, case, &fresh).unwrap_err();
         assert!(error.contains("not one now"), "{error}");
         // A listed gap that the answer now labels.
-        let mut labelled = found(case);
-        labelled.insert(EXPECTED_GAPS[at].1, Verdict::StaleLabelled { lag: 3 });
-        let error = compare_gaps(EXPECTED_GAPS, EXPECTED_LABELLED, case, &labelled).unwrap_err();
+        let mut now_labelled = found();
+        now_labelled.insert(gaps[at].1, Verdict::StaleLabelled { lag: 3 });
+        let error = compare_gaps(gaps, labelled, case, &now_labelled).unwrap_err();
         assert!(error.contains("labelled, not on the list"), "{error}");
         // A listed gap with the wrong reason is both.
-        let mut wrong = found(case);
+        let mut wrong = found();
         wrong.insert(
-            EXPECTED_GAPS[at].1,
+            gaps[at].1,
             Verdict::Gap {
                 why: Why::Unexplained,
                 lag: 1,
             },
         );
-        assert!(compare_gaps(EXPECTED_GAPS, EXPECTED_LABELLED, case, &wrong).is_err());
+        assert!(compare_gaps(gaps, labelled, case, &wrong).is_err());
         // A listed label that is a gap again (the label went silent, or it
         // does not cover the lag).
-        if let Some((_, map, why)) = EXPECTED_LABELLED.iter().find(|(c, _, _)| *c == case) {
-            let mut silent = found(case);
+        if let Some((_, map, why)) = labelled.iter().find(|(c, _, _)| *c == case) {
+            let mut silent = found();
             silent.insert(map, Verdict::Gap { why: *why, lag: 1 });
-            let error = compare_gaps(EXPECTED_GAPS, EXPECTED_LABELLED, case, &silent).unwrap_err();
+            let error = compare_gaps(gaps, labelled, case, &silent).unwrap_err();
             assert!(error.contains("new gap"), "{error}");
             assert!(error.contains("listed as labelled"), "{error}");
         }
     }
-    // A map that gave nothing before the edit cannot be called fresh or a gap.
-    let mut unexercised = found(Case::OnSearch);
-    unexercised.insert("grep.live", Verdict::Unexercised);
-    assert!(
-        compare_gaps(
-            EXPECTED_GAPS,
-            EXPECTED_LABELLED,
-            Case::OnSearch,
-            &unexercised
-        )
-        .is_err()
-    );
 }
 
 /// The classifier: a stale map is a gap unless the answer labels it stale with
-/// a lag that covers the files it is behind by (`maps[]` of K2a-2).
+/// a lag that covers the files it is behind by (`maps[]` of K2a-2, the
+/// `freshness.channels` of a search report of K2b).
 #[test]
 fn a_stale_map_is_labelled_only_by_a_lag_that_covers_the_truth() {
     assert_eq!(
@@ -1737,20 +2050,49 @@ fn a_stale_map_is_labelled_only_by_a_lag_that_covers_the_truth() {
             lag: 2
         }
     );
-    let answer = json!({"maps": [
-        {"id": "graph.scip", "observed": "snapshot", "stale": true, "lag": 3},
-        {"id": "config.key", "observed": "snapshot", "stale": true, "lag": null},
-        {"id": "exact.closure", "observed": "snapshot", "stale": false, "lag": 3},
-        {"id": "grep.live", "observed": "live", "stale": false, "lag": 0},
-    ]});
+    let observed = |walk: Value, search: Value| Observed {
+        index_action: String::new(),
+        stale_before_search: false,
+        stale_after_search: false,
+        reached: Reached::new(),
+        edges: Edges::new(),
+        walk,
+        search,
+        probes: BTreeMap::new(),
+        answered: BTreeSet::new(),
+    };
+    let answer = observed(
+        json!({"maps": [
+            {"id": "graph.scip", "observed": "snapshot", "stale": true, "lag": 3},
+            {"id": "config.key", "observed": "snapshot", "stale": true, "lag": null},
+            {"id": "exact.closure", "observed": "snapshot", "stale": false, "lag": 3},
+            {"id": "grep.live", "observed": "live", "stale": false, "lag": 0},
+            {"id": "lexical", "observed": "snapshot", "stale": true, "lag": 9},
+        ]}),
+        json!({"freshness": {"channels": [
+            {"id": "vec.chunk.code", "observed": "snapshot", "stale": true, "lag": 3},
+            {"id": "lexical", "observed": "snapshot", "stale": false, "lag": 0},
+            {"id": "lsp.symbols", "observed": "session", "stale": null, "lag": null},
+        ]}}),
+    );
     assert_eq!(labelled_lag(&answer, "graph.scip"), Some(3));
     // A label with no lag, or one that says not stale, labels nothing.
     assert_eq!(labelled_lag(&answer, "config.key"), None);
     assert_eq!(labelled_lag(&answer, "exact.closure"), None);
     assert_eq!(labelled_lag(&answer, "grep.live"), None);
+    // A search channel is read from the search report, not from `maps[]`; a
+    // session answer that is not compared labels nothing.
+    assert_eq!(labelled_lag(&answer, "vec.chunk.code"), Some(3));
+    assert_eq!(labelled_lag(&answer, "lexical"), None);
+    assert_eq!(labelled_lag(&answer, "lsp.symbols"), None);
     assert_eq!(
-        labelled_lag(&json!({}), "graph.scip"),
+        labelled_lag(&observed(json!({}), json!({})), "graph.scip"),
         None,
         "no maps[] with the key off"
+    );
+    assert_eq!(
+        labelled_lag(&observed(json!({}), json!({})), "vec.chunk.code"),
+        None,
+        "no freshness block with the key off"
     );
 }

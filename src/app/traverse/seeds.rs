@@ -131,6 +131,13 @@ pub trait SeedSearch: Send + Sync {
     fn reranker_identity(&self) -> Option<String> {
         None
     }
+
+    /// The content hash of every file of the index snapshot's manifest, by
+    /// path, for `[run_profile.freshness] verify_on_read`; `None` when this
+    /// search has no index snapshot (or an empty one). Reads only.
+    async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
+        None
+    }
 }
 
 /// The search `search_code` runs in its normal mode, over one workspace and
@@ -160,6 +167,23 @@ impl SeedSearch for AppSeeds<'_> {
             config.reranker_model,
             lci_maps::traverse::trace::hash16(config.reranker_url.as_bytes())
         ))
+    }
+
+    async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
+        let data_dir = self.app.config.data_dir.clone();
+        let workspace = crate::workspace::Workspace::resolve(self.workspace, &data_dir).ok()?;
+        let manifest =
+            tokio::task::spawn_blocking(move || crate::manifest::try_load(&data_dir, &workspace))
+                .await
+                .ok()?
+                .ok()?;
+        (!manifest.files.is_empty()).then(|| {
+            manifest
+                .files
+                .into_iter()
+                .map(|(path, file)| (path, file.content_hash))
+                .collect()
+        })
     }
 
     async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
@@ -219,6 +243,32 @@ impl SeedSearch for AppSeeds<'_> {
             })
             .collect())
     }
+}
+
+/// Whether the language adapters that index code (not prose) own this path.
+pub(crate) fn is_source_path(path: &str) -> bool {
+    lci_core::language::for_path(Path::new(path)).is_some_and(|adapter| !adapter.is_prose())
+}
+
+/// How many source files differ between an index snapshot's manifest
+/// (`path -> content hash`) and the tree's source files now (`path -> content
+/// hash`): changed, added or removed. The manifest's prose entries are left
+/// out (the tree scan leaves prose out); a manifest entry the tree no longer
+/// has counts when it is a source path. Shared by the traverse labels and the
+/// search report of `[run_profile.freshness] verify_on_read`.
+pub(crate) fn snapshot_differing(
+    manifest: &HashMap<String, String>,
+    now: &HashMap<&str, &str>,
+) -> u32 {
+    let changed = now
+        .iter()
+        .filter(|(path, hash)| manifest.get(**path).map(String::as_str) != Some(**hash))
+        .count();
+    let removed = manifest
+        .keys()
+        .filter(|path| !now.contains_key(path.as_str()) && is_source_path(path))
+        .count();
+    u32::try_from(changed + removed).unwrap_or(u32::MAX)
 }
 
 /// A search that is known to be unavailable: it fails with the reason, which

@@ -3352,6 +3352,159 @@ async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() 
     assert_eq!(lag, None);
 }
 
+// ---- `[run_profile.freshness] verify_on_read` (slice K2b) ---------------------------
+
+/// One call over `tree` under the two keys as given, with every map named; the
+/// question names `Foo` and asks which commit created it.
+async fn verified_run(
+    tree: &ScipTree,
+    limits: &TraverseConfig,
+    labels: bool,
+    verify: bool,
+    maps: &[&str],
+) -> Value {
+    let mut profile = RunProfileConfig::default();
+    profile.traverse.map_freshness = labels;
+    profile.freshness.verify_on_read = verify;
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let (budget, steer) = (
+        BudgetArgs {
+            pops: Some(3),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: Some(tree.dir.path()),
+        question: "Which commit first created `Foo`?",
+        seeds: &[],
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    run(limits, &profile, &Dirs::under(tree.dir.path()), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+/// The cards of a response that name a file, by `file_changed`: the files
+/// whose card says `true`, the files whose card says `false`.
+fn changed_files(response: &Value) -> (Vec<String>, Vec<String>) {
+    let (mut changed, mut same) = (Vec::new(), Vec::new());
+    for card in response["results"].as_array().unwrap() {
+        let Some(path) = card["site"]["path"].as_str() else {
+            continue;
+        };
+        match &card["file_changed"] {
+            Value::Bool(true) => changed.push(path.to_owned()),
+            Value::Bool(false) => same.push(path.to_owned()),
+            other => panic!("{path}: {other} in {card}"),
+        }
+    }
+    (changed, same)
+}
+
+#[tokio::test]
+async fn file_changed_is_null_for_a_commit_card_and_absent_with_the_key_off() {
+    let tree = ScipTree::new();
+    tree.commit();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID, EXACT_PICKAXE_ID];
+    // With a walk (`exact_seeds`) and without one (no start node): the cards of
+    // both paths say whether their file changed.
+    for limits in [stage_limits(true, false), stage_limits(false, false)] {
+        let response = verified_run(&tree, &limits, true, true, &maps).await;
+        let results = response["results"].as_array().unwrap();
+        let commits: Vec<&Value> = results
+            .iter()
+            .filter(|card| card["node"].as_str().unwrap().starts_with("commit:"))
+            .collect();
+        assert_eq!(commits.len(), 1, "{response}");
+        // A commit is history, not a file in the tree: nothing to compare.
+        assert!(commits[0]["file_changed"].is_null(), "{}", commits[0]);
+        assert!(
+            commits[0].as_object().unwrap().contains_key("file_changed"),
+            "the key is there, null: {}",
+            commits[0]
+        );
+        let notes = response["notes"].to_string();
+        assert!(
+            notes.contains("verify_on_read: file_changed is null on 1 cards"),
+            "{notes}"
+        );
+        // The tree is as the index saw it.
+        let (changed, same) = changed_files(&response);
+        assert!(changed.is_empty(), "{response}");
+        assert!(same.iter().all(|path| path == "a.rs") && !same.is_empty());
+    }
+
+    // Either key off: the answer has no `file_changed` anywhere.
+    for (labels, verify) in [(true, false), (false, true), (false, false)] {
+        let response = verified_run(&tree, &stage_limits(true, false), labels, verify, &maps).await;
+        assert!(!response.to_string().contains("file_changed"), "{response}");
+        assert_eq!(response.get("maps").is_some(), labels, "{response}");
+    }
+
+    // An edit after the first call: the cards of the changed file say so.
+    let source = tree.dir.path().join("a.rs");
+    let mut text = std::fs::read_to_string(&source).unwrap();
+    text.push_str("fn appended() {}\n");
+    std::fs::write(&source, text).unwrap();
+    let response = verified_run(&tree, &stage_limits(true, false), true, true, &maps).await;
+    let (changed, same) = changed_files(&response);
+    assert!(!changed.is_empty() && same.is_empty(), "{response}");
+    assert!(changed.iter().all(|path| path == "a.rs"));
+}
+
+#[tokio::test]
+async fn verify_on_read_labels_the_live_map_that_places_by_the_index() {
+    let tree = ScipTree::new();
+    let named = ["graph.scip", "grep.live"];
+    let limits = stage_limits(true, false);
+    let first = verified_run(&tree, &limits, true, true, &named).await;
+    let entry = |response: &Value, id: &str| {
+        response["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} in {response}"))
+    };
+    // No edit: the index's places hold, and the entry says whose they are.
+    assert_eq!(
+        entry(&first, "grep.live"),
+        json!({"id": "grep.live", "observed": "live", "stale": false, "lag": 0, "places": "index"})
+    );
+    assert!(entry(&first, "graph.scip").get("places").is_none());
+    // An edit: the same lag as the maps built from the index.
+    let source = tree.dir.path().join("a.rs");
+    let mut text = std::fs::read_to_string(&source).unwrap();
+    text.push_str("fn appended() {}\n");
+    std::fs::write(&source, text).unwrap();
+    let edited = verified_run(&tree, &limits, true, true, &named).await;
+    assert_eq!(
+        entry(&edited, "grep.live"),
+        json!({"id": "grep.live", "observed": "live", "stale": true, "lag": 1, "places": "index"})
+    );
+    assert_eq!(
+        entry(&edited, "graph.scip"),
+        json!({"id": "graph.scip", "observed": "snapshot", "stale": true, "lag": 1})
+    );
+    // With the key off the entry is what it was: live, not stale, no places.
+    let off = verified_run(&tree, &limits, true, false, &named).await;
+    assert_eq!(
+        entry(&off, "grep.live"),
+        json!({"id": "grep.live", "observed": "live", "stale": false, "lag": 0})
+    );
+}
+
 // ---- `[run_profile.scip] mode` (slice K20a) ---------------------------
 
 /// The wire form of a one-document SCIP index (`scip.proto`: Index.documents
