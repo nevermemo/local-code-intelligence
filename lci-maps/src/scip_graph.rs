@@ -265,6 +265,19 @@ pub struct ScipGraph {
 }
 
 impl ScipGraph {
+    /// A graph with no nodes and no edges (`[run_profile.scip] mode` `off`, or
+    /// `cache` with no index file): nothing resolves in it.
+    pub fn empty() -> Self {
+        Self {
+            nodes: Vec::new(),
+            out: Vec::new(),
+            indegree: Vec::new(),
+            impls: Vec::new(),
+            report: BuildReport::default(),
+            index: HashMap::new(),
+        }
+    }
+
     /// Loads the index at `path`; `source` enables the enclosing-range repair.
     pub fn load(path: &Path, source: Option<&dyn SourceText>) -> Result<Self, String> {
         Ok(Self::build(&read_documents(path)?, source))
@@ -2296,6 +2309,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_empty_graph_has_no_nodes_and_resolves_no_symbol() {
+        let graph = ScipGraph::empty();
+        assert!(graph.nodes.is_empty() && graph.out.is_empty() && graph.impls.is_empty());
+        assert_eq!(graph.node_index(&sym("a/alpha().")), None);
+        for kind in [
+            GraphEdgeKind::CallsOrRefs,
+            GraphEdgeKind::Contains,
+            GraphEdgeKind::Implements,
+        ] {
+            assert_eq!(graph.edge_count(kind), 0);
+        }
+        assert_eq!(graph.report.documents, 0);
+        let map = ScipMap::with_default_ids(graph);
+        assert!(map.graph().nodes.is_empty());
     }
 
     #[test]

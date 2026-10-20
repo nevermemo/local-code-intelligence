@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K2a-1 (freshness harness), K20a (`scip.mode`), N20 c and d; K7b after K2a-1. Rewrite this line at every push.
+In flight: K2a-1 (freshness harness), N20 c and d, K2b planning; K7b after K2a-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -63,7 +63,6 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K2a | Partly done: the per-map freshness label `[run_profile.traverse] map_freshness` (d410); the harness remains. Freshness harness: edit a fixture file, query every map at once, assert the answer reflects the edit or carries an accurate stale label and lag | Ceiling per map | M | Deferred F2 |
 | K2b | Verify on read (`freshness.verify_on_read`): cited files re-checked by content hash; which maps may return stale evidence is listed; the index-freshness contract is unchanged | K2a | S-M | Deferred F1 |
 | **M2** | **Language servers as the source of truth** | | | |
-| K20a | Traverse no longer loads the SCIP index unconditionally (`scip.mode = off, cache, authoritative`; default stays authoritative until K20b) | Traverse runs with no index file | S-M | - |
 | K7b | Shared LSP sessions across traverse calls (server lifetime), a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
 | K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
 | K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps | Fake LSP event log | M | N2 |
@@ -72,7 +71,7 @@ new behaviour is a `[run_profile]` key whose default keeps today's behaviour unl
 | K9b | `lsp.live` call-hierarchy edges in and out (`CallsOrRefs`, witness `Exact`; no new `EdgeKind`) | Same | M | - |
 | K11d | LSP cost report: cold and warm ms per hop, RAM, budget hits, fail-open behaviour, pops per 5 s, before any default flips | Report under `test-results/` | S | I-8 |
 | K11b | `lsp.live` on by default when a server is available (`lsp.default = on`), fails open, spent from the external-call budget; the search channel's default is verified | Tests that assumed it absent are updated | S | - |
-| K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement | K2a | S | - |
+| K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement; under `cache` an unreadable index is re-parsed on every call: remember the failure per file stamp (K20a review) | K2a | S | - |
 | **M3** | **Walk, cards, seeds, router, cost** | | | |
 | K10b | New `SymbolKind` variants (Field, Variable, Interface, Class) from LSP outlines; adapter version bump | Unit tests | S | - |
 | K11c | Prime before the first timed query; per-query budget-hit flag | Bench | S | E5 |

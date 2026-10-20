@@ -936,6 +936,17 @@ impl Tree {
         flow_judge: bool,
         profile: &RunProfileConfig,
     ) -> Value {
+        self.try_ask_under(request, flow_judge, profile)
+            .await
+            .unwrap()
+    }
+
+    async fn try_ask_under(
+        &self,
+        request: Value,
+        flow_judge: bool,
+        profile: &RunProfileConfig,
+    ) -> Result<Value> {
         let (name, args) = match request.as_object().unwrap().iter().next() {
             Some((name, args)) => (name.clone(), args.clone()),
             None => unreachable!(),
@@ -954,7 +965,7 @@ impl Tree {
             root: self.dir.path(),
             flow_judge,
         };
-        run(&ctx, &request).await.unwrap()
+        run(&ctx, &request).await
     }
 }
 
@@ -1092,6 +1103,34 @@ fn trace_ranks(tree: &Tree) -> Vec<Value> {
         }
     }
     ranks
+}
+
+#[tokio::test]
+async fn a_recipe_refuses_when_the_run_profile_reads_no_index() {
+    use lci_core::config::profile::ScipMode;
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let mut profile = RunProfileConfig::default();
+    // Off: the index file is there and is not read.
+    let tree = Tree::new();
+    profile.scip.mode = ScipMode::Off;
+    let error = tree
+        .try_ask_under(request.clone(), false, &profile)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scip.mode = off"), "{error}");
+    // Cache without the file: nothing to read either.
+    profile.scip.mode = ScipMode::Cache;
+    std::fs::remove_file(tree.dir.path().join("index.scip")).unwrap();
+    let error = tree
+        .try_ask_under(request.clone(), false, &profile)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scip.mode = cache"), "{error}");
+    // Cache with the file reads it, as authoritative does.
+    let present = Tree::new();
+    present.ask_under(request, false, &profile).await;
 }
 
 #[tokio::test]
