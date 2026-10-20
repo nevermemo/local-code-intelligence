@@ -4721,7 +4721,7 @@ fn outline_fixture(
         },
         &states.csharp,
         &[],
-        10,
+        LOADED_BUDGET_SECONDS,
     );
     config.python = PythonLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
