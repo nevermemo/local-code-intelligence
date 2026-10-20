@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K7b-2 (outline cache), K9a (implementation edges), K8a next; off-milestone (owner): test speed, K36, K14a, plans for K9b, K10a, K28, K29. Rewrite this line at every push.
+In flight: K7b-2 (re-pin), S2 (profile golden), K9a, K28, K29, test speed; M2 lanes next: K8a, K10a, K9b. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -57,62 +57,69 @@ inside a milestone the order below is the default. Each row is one slice and one
 slice's tests must show (ceiling test: works given ideal input; mechanism: the code path does what it claims). Every
 new behaviour is a `[run_profile]` key whose default keeps today's behaviour unless the row says otherwise.
 
+M2 runs as three lanes by real dependencies: {K7b, K10a}, {K8a, K7c} and {K9a, K9b}, converging on K11d; K11e is
+independent, and K20b comes before K11b so the default is tested with SCIP absent. Ceiling and mechanism checks show that
+an arm works: no slice claims a gain over rg or LSP before the paired screening of cycle 2 (d422).
+
 | Slice | Item | Check | Size | Absorbs |
 | --- | --- | --- | --- | --- |
 | **M1** | **Profile, freshness harness, no-service path**: done 2026-10-20 (K2b, d420) | | | |
 | **M2** | **Language servers as the source of truth** | | | |
 | K7b | Partly done: shared LSP sessions across traverse calls, `[run_profile.lsp] sessions` (d414). Remaining: a symbol-outline cache keyed by content hash (no empty results), readiness signals per server | Fake LSP tests | M | N8 (readiness part) |
-| K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake | M | W2 |
-| K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps | Fake LSP event log | M | N2 |
-| K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` | `lsp.live` runs with `scip.mode = off` | M | - |
+| K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` (lane with K7b) | `lsp.live` runs with `scip.mode = off`; a shifted-line placement check: after lines are inserted above a symbol its place follows (closes the freshness `LineShift` gap under `places = outline`) | M | - |
+| K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake; plus a real-server edit check (live acceptance, skipped when the server is missing): an edit reaches a running session and the next `lsp.symbols` answer shows it (the `OldSession` gap, d413) | M | W2 |
+| K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps (after K8a) | Fake LSP event log; the value check is K11d's latency measurement (per adapter, `open` against `per_request`, real servers) | M | N2 |
 | K9a | `lsp.live` implementation edges (`Implements`) | Ceiling: edges equal the server's answers | S | N6 (map side), G1 |
-| K9b | `lsp.live` call-hierarchy edges in and out (`CallsOrRefs`, witness `Exact`; no new `EdgeKind`) | Same | M | - |
-| K11d | LSP cost report: cold and warm ms per hop, RAM, budget hits, fail-open behaviour, pops per 5 s, before any default flips | Report under `test-results/` | S | I-8 |
-| K11b | `lsp.live` on by default when a server is available (`lsp.default = on`), fails open, spent from the external-call budget; the search channel's default is verified | Tests that assumed it absent are updated | S | - |
-| K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement; under `cache` an unreadable index is re-parsed on every call: remember the failure per file stamp (K20a review) | K2a | S | - |
+| K9b | `lsp.live` call-hierarchy edges in and out (`CallsOrRefs`, witness `Exact`; no new `EdgeKind`) (after K9a) | Same | M | - |
+| K11e | LSP down-window breaker: after a provider's probe or request fails, skip it for a window and fail open; the embedder has had one since d404, LSP has none | Fake LSP tests: a dead server costs one probe per window, not one per call | S | - |
+| K11d | LSP cost report: cold and warm ms per hop, RAM, budget hits, fail-open behaviour, pops per 5 s, per-adapter ms for K7c; the 15 to 25 s dark windows diagnosed and fixed (N8), the readiness probe deadline made load-proof (N101) | Report under `test-results/` | S-M | I-8, N8 (live diagnosis), N101 |
+| K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement; under `cache` an unreadable index is re-parsed on every call: remember the failure per file stamp (K20a review). Slice K20b-1 after K11d; the arbitration split K20c after K9b | Its own tests: SCIP absent, SCIP present but subordinate, a disagreement, the remembered failure | S | - |
+| K11b | `lsp.live` on by default when a server is available (`lsp.default = on`), fails open, spent from the external-call budget; the search channel's default is verified. After K11d (which fixes N101), K11e and K20b | Fail-open test with a dead server; K11d's cold ms in range; tests that assumed it absent are updated | S | - |
 | **M3** | **Walk, cards, seeds, router, cost** | | | |
 | K10b | New `SymbolKind` variants (Field, Variable, Interface, Class) from LSP outlines; adapter version bump | Unit tests | S | - |
-| K11c | Prime before the first timed query; per-query budget-hit flag | Bench | S | E5 |
-| K3a | Cost metrics in every report: answer tokens, external calls, LSP ms, pops, per stratum; `compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies |
-| K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld | Card schema test | S | - |
-| K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |
+| K3a | Cost metrics in every report: answer tokens, external calls, LSP ms, pops, per stratum; a per-query budget-hit field (the `over_budget` note exists) and priming before the first timed query (`Session::primed` exists); `compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies, K11c (folded in, row removed) |
 | K28 | Handle spec (format, lifetime, snapshot binding) and a round-trip test | Test | S | - |
 | K29 | `likely_complete`, the score bound and tau get written meanings | Docs and unit tests | S | - |
-| K21a | BM25 entity seeds over symbol names, qualified paths and doc comments, in process (reusing the lexical scoring); `seeds.bm25` off | Ceiling: gold symbol in top k on the trait and where-to gold | M | L1, L4, I-1 |
-| K22a | Exact-literal seed source (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases | Ceiling | S | item 4 rest |
+| K38 | Stat-gated freshness re-hash: with `map_freshness` on, keep `(mtime, len)` per file and re-hash only changed files; needs the public lci-core source lister K8a adds (the former M0 filler "K2a-2 follow-up", d410). After K8a | Unit tests: unchanged files are not re-read, a touched file is re-hashed, answers equal the full-hash path | S | - |
+| K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld. After K29 (the wording) and K38 (`map_freshness` and `verify_on_read` made affordable) | Card schema test | S | - |
+| K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |
+| K21a | BM25 entity seeds over symbol names, qualified paths and doc comments, in process, built on the existing in-process BM25 lexical scorer; `seeds.bm25` off | Ceiling: gold symbol in top k on the trait and where-to gold, beside `lsp.symbols` and `rg --fixed-strings` baseline arms | M | L1, L4, I-1 |
+| K22a | Exact-literal seed source over ripgrep (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases; K10a's `OutlinePlaces` is the occurrence-to-node lookup d394 lacked. After K10a | Ceiling, beside an rg baseline arm | S | item 4 rest |
 | K24a | Fusion variant: capped log-odds next to the current fusion (`walk.fusion`) | Unit tests | S | - |
 | K24b | Rank pricing normalised by sibling count (`walk.pricing`) | Unit tests | S | - |
-| K25 | Depth registered as a profile factor (`max_depth` 1, 2, 3, 6) | Profile test | XS | - |
-| K30a | Router (`router.mode = off, intent, features`): a caller-supplied intent or observable query features pick walk, grep or LSP; gold labels never route | Ceiling: route by the gold's question type | S-M | F3, N100 (detector stays killed) |
+| K30a | Router: caller intent through the existing `steer.policy` is the router (it picks walk, grep or LSP); document it and test it. Observable query features go to the cycle 2 screening (d391 killed text features at 20 of 59); gold labels never route | Test: each intent picks its policy | S | F3, N100 (detector stays killed) |
 | K33a | Trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs | Schema test | S | - |
-| **M4** | **Syntax tier, more maps, gold, baselines** | | | |
-| K15a | tree-sitter 0.26 and its grammar crates; every chunking test re-run; adapter version bump; default-build regression check | Existing tests | M | - |
-| K14a | Offline proof for Codanna 0.16.0 as an optional crates.io dependency: public API, dependency graph, grammar compatibility; TypeScript edge quality against an offline ground truth | Report | S | - |
-| K14b | Cargo feature `syntax-codanna`: parse one file through Codanna into LCI nodes | Ceiling on fixtures | M | - |
-| K14c | In-memory resolution glue; edges with confidence by the rule that picked them | Precision and recall against LSP on fixtures | M | - |
-| K14d | Name-based invalidation: on a change, re-resolve the file's outgoing edges and edges whose target names it added or removed | K2a | S | - |
-| K16 | Codanna parser tests as fixtures; its `tsconfig`, `go.mod` and `pyproject` readers for server root discovery | Tests | S | N4 (part) |
-| K17 | `oxc_resolver` for TS and JS imports, only if K14a shows Codanna's TS resolution is weak | Imports against typescript-go | S | - |
-| K26 | Syntax proposes, LSP confirms the top-k frontier (`walk.confirm`) | Cost and quality per call | M | G1 |
+| **M4-core** | **Maps, servers, safety, mining (unconditional)** | | | |
+| K26 | `grep.live` proposes, `lsp.live` confirms the top-k frontier (`walk.confirm`); no Codanna dependency | Cost and quality per call against the walk without confirmation | M | G1 |
 | K9c | Type-hierarchy edges | Ceiling | S | - |
 | K12a | Server roster and per-language readiness; root discovery per server | Live acceptance per server | S | N4 |
-| K12b | typescript-go adapter | Live acceptance | M | - |
 | K12c | marksman adapter for prose | Live acceptance | S | N95 |
 | K18a | Repo map: PageRank over the syntax and outline graph as a seed prior (`seeds.repo_map` off) | Ceiling | M | G2 |
-| K19 | `grep.structural` map over ast-grep-core (pinned, after K15a) | Ceiling on structural queries | M | - |
-| K31 | Opengrep data-flow map, opt-in | Ceiling on a flow set | M | - |
-| K32 | Verify which planned maps exist (`tests.tested_by`, `docs.mentions`, pickaxe as a walk map); build the missing ones | Ceiling per map | XS each | - |
-| K37a | One request queue per server | Load test | S | N20 (a, b, d scan residue, e) |
-| K37b | Concurrent walks | Load test | S | - |
+| K19 | `grep.structural` map wrapping ast-grep-core (pinned to the tree-sitter version it requires, 0.25 today; not after K15a) | Ceiling on structural queries | M | - |
+| K32 | Verify which planned maps exist: `tests.tested_by` and `docs.mentions` do not (`Tests` and `Mentions` are edge kinds only); build each; check pickaxe as a walk map | Ceiling per map | S each | - |
+| K37b | Concurrent walks; also shows whether per-server request ordering needs a queue (K37a dropped, the transport already multiplexes by id, d422) | Load test | S | - |
 | K37c | `probe.compile` runs `cargo check`, which can execute build scripts: a bounded sandbox, or opt-in only with a warning | Test | S | - |
-| K4a | External held-out gold adapters (SWE-PolyBench Verified, LongCodeArena); dataset licences recorded; never used for tuning | Leak check | S | - |
-| K4b | External gold download and conversion | Counts | S | - |
-| K5a | Baseline arms rg-only and LSP-over-MCP wired into `maps baseline` (no A/B runs) | Smoke query | S | item 6 arm |
-| K5b | Baseline arms Codanna and Serena wired (no A/B runs) | Smoke query | S | - |
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
+| **M4-conditional** | **Codanna, grammar upgrade, optional tools, external gold, baselines: each runs in cycle 1 when its condition holds** | | | |
+| K14b | Cargo feature `syntax-codanna`: parse one file through Codanna into LCI nodes | Ceiling on fixtures | M | blocked: owner and Codanna repo owner; K14a NO-GO as specified (d422) |
+| K14a2 | Run the built Codanna 0.17.1 binary on the offline TypeScript ground truth (384 and 291 distinct pairs) and join its edges with it; pre-register the kill rule first (suggested: stop below 95% precision or below 85% recall on `this.m()` plus bare calls) | Precision and recall per call shape | S | held for the owner (d422) |
+| K14c | In-memory resolution glue; edges with confidence by the rule that picked them | Precision and recall against LSP on fixtures | M | blocked(K14b) |
+| K14d | Name-based invalidation: on a change, re-resolve the file's outgoing edges and edges whose target names it added or removed | K2a | S | blocked(K14b) |
+| K16 | Codanna parser tests as fixtures; its `tsconfig`, `go.mod` and `pyproject` readers for server root discovery | Tests | S | N4 (part); blocked(K14b) |
+| K15a | tree-sitter 0.26 and its grammar crates (javascript and python also to 0.25, K14a); every chunking test re-run; adapter version bump; default-build regression check. Waits for the Codanna decision or a measured grammar need; ast-grep-core needs tree-sitter ^0.25.4 (K19), check before moving | Existing tests | M | - |
+| K17 | `oxc_resolver` for TS and JS imports, only if K14a2 shows Codanna's TS resolution is weak | Imports against typescript-go | S | - |
+| K12b | typescript-go adapter | Live acceptance | M | - |
+| K31 | Opengrep data-flow map, opt-in; consumes Opengrep's existing flow analysis, no engine written | Ceiling on a flow set | M | - |
+| K4a | External held-out gold adapters (SWE-PolyBench Verified, LongCodeArena); dataset licences recorded; never used for tuning (stays in cycle 1; downloads approved) | Leak check | S | - |
+| K4b | External gold download and conversion | Counts | S | - |
+| K5a | Baseline arms rg-only and LSP-over-MCP wired into `maps baseline` (no A/B runs); not blocked | Smoke query | S | item 6 arm |
+| K5b | Baseline arms Codanna and Serena wired (no A/B runs); the Serena arm is not blocked, only the Codanna arm waits for the owner | Smoke query | S | - |
 
-M0 filler, any time a build slot is free: K2a-2 follow-up: with `map_freshness` on, every traverse call reads and hashes the whole tree; keep `(mtime, len)` per file and re-hash only changed files (needs a public lci-core source lister) (d410); K0a follow-ups review: a breaker-open embedder skip in traverse `search.vector` still counts one external call (`AppChunks::embedding_skipped` could return the models' `embedder_skipped()`), and the `EXTERNAL_CALLS` doc in src/app/traverse/mod.rs says no map makes any (d416).
+M0 filler, any time a build slot is free: K0a follow-ups review: a breaker-open embedder skip in traverse `search.vector` still counts one external call (`AppChunks::embedding_skipped` could return the models' `embedder_skipped()`), and the `EXTERNAL_CALLS` doc in src/app/traverse/mod.rs says no map makes any (d416). The stat-gated re-hash left this filler for K38 (M3).
+
+Finish line of the cycle 1 report (d422): M2 + M3 + M4-core plus every unblocked M4-conditional slice. Conditional slices
+still run in cycle 1 when their condition holds; K4a and K4b do not move to cycle 2.
 
 Deferred to cycle 2: rust-analyzer in process (`ra_ap_*`), ty or Pyrefly (in process or as servers), ts-rust as a TS
 server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (only after a measured gap).
@@ -122,15 +129,18 @@ server arm, rung 2 model training, a gix blame map, a tantivy engine for K21 (on
 Agent wall time per slice, for the whole loop (plan, implement, Full gate, review, PR, CI): XS 0.5 h, S 1.5 h, S-M
 2.5 h, M 3.5 h. Measured on 2026-10-20 for S slices only (K1a, K1b, K1c in two parts: 1 to 1.5 h each, one at a
 time; the Full gate takes about 25 min and CI about 20 min); K0a part 1 (S-M) took about 3.5 h with two review
-rounds. M is not measured yet. Update this table at each milestone end with the measured hours.
+rounds. M is not measured yet. Update this table at each milestone end with the measured hours. Re-base it at the end of M2 (d422): the warm Full gate
+is now about 3 min and CI about 8 min (d415, d419), so per-slice time is review rounds and serial merges, and the
+`Merge wait` column then records the measured wait for a merge into `main`. Slice counts and hours here are the d397
+figures and are not recomputed until that re-base.
 
-| Milestone | Slices left (by size) | Sequential hours | Measured | Note |
-| --- | --- | --- | --- | --- |
-| M1 | K0a part 2, K7a, K2a (M), K2b (S-M), K23a, K35a (XS), K34a | ~12 | ~20 h wall (roadmap merge 03:49Z to K2b), with K7b-1, K7b-2 and K9a of M2 and a 2.5 h speed-up lane in parallel | five lanes in parallel since 2026-10-20 |
-| M2 | 6 M, 1 S-M, 4 S | ~30 | - | K7b, K8a and K7c build on each other |
-| M3 | 1 M, 1 S-M, 11 S, 1 XS | ~23 | - | mostly independent slices |
-| M4 | 8 M, 16 S, 4 XS | ~54 | - | most uncertain: Codanna on tree-sitter 0.26, typescript-go, marksman, live server checks, external gold |
-| Total | 55 slices | ~119 | - | |
+| Milestone | Slices left (by size) | Sequential hours | Measured | Merge wait | Note |
+| --- | --- | --- | --- | --- | --- |
+| M1 | K0a part 2, K7a, K2a (M), K2b (S-M), K23a, K35a (XS), K34a | ~12 | ~20 h wall (roadmap merge 03:49Z to K2b), with K7b-1, K7b-2 and K9a of M2 and a 2.5 h speed-up lane in parallel | not tracked | five lanes in parallel since 2026-10-20 |
+| M2 | 6 M, 1 S-M, 4 S | ~30 | - | - | three lanes converging on K11d (see the lanes sentence above) |
+| M3 | 1 M, 1 S-M, 11 S, 1 XS | ~23 | - | - | mostly independent slices |
+| M4 | 8 M, 16 S, 4 XS | ~54 | - | - | split into M4-core and M4-conditional (d422); most uncertain: Codanna on tree-sitter 0.26, typescript-go, marksman, live server checks, external gold |
+| Total | 55 slices | ~119 | - | - | |
 
 Parallel lanes (separate worktrees, up to three cargo builds gated on free RAM) are expected to give a 2 to 2.5x
 speed-up, limited by dependencies, by merges into `main` one at a time and by the build slots: about 48 to 60 h of
@@ -156,9 +166,9 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 
 | ID | Item | Status | Size | Deps |
 | --- | --- | --- | --- | --- |
-| E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` excludes budget-hit queries. After N7 the budget-hit windows cover 14 to 22 of 35 mined queries (d054) (roadmap@bbd3292 E5) | absorbed(K11c, K3a) | S | N7 done |
+| E5 | LSP-stable evaluations: prime before the first timed query; per-query `lsp_budget_hit`; `compare` excludes budget-hit queries. After N7 the budget-hit windows cover 14 to 22 of 35 mined queries (d054) (roadmap@bbd3292 E5) | absorbed(K3a) | S | N7 done |
 | E6 | Identifier-query stratum: `cargo xtask mine-symbols` samples declaration names (seeded, names of 5+ characters, defined in one file, not test-only) with `expected_paths` = the defining file, tag `identifier`, committed apart from `self.toml`; unit tests on synthetic input; one fusion-only and one reranked baseline recorded (roadmap@bbd3292 E6) | ready | S | E2 done |
-| N8 | The LSP channel goes dark for 15 to 25 s windows under back-to-back searches (hypothesis: rust-analyzer swaps its crate graph after build scripts and proc macros load, invalidating the primed symbol index); diagnose and fix (roadmap@bbd3292 N8) | absorbed(K7b (readiness); the live diagnosis stays open) | S-M, live | N7 done |
+| N8 | The LSP channel goes dark for 15 to 25 s windows under back-to-back searches (hypothesis: rust-analyzer swaps its crate graph after build scripts and proc macros load, invalidating the primed symbol index); diagnose and fix (roadmap@bbd3292 N8) | absorbed(K7b (readiness), K11d (the live diagnosis)) | S-M, live | N7 done |
 | N16 rest | A workspace search on a legacy-only table waits on the store-wide legacy guard; the revision pin and the re-read after a commit during the freshness check are not pinned by a failing test (roadmap@bbd3292 N16) | ready | S | - |
 | N18 | Low batch (item (b), the Java readiness probe, was fixed as N77, d190): (a) `manifest::save` removes the destination before `rename`; (c) `serve --port 0` advertises port 0; (d) three navigation tests assert rust-analyzer's flag; (e) the embedding model listing is probed at the origin; (f) no per-file size cap (roadmap@bbd3292 N18) | ready | XS each | - |
 | N20 | Cancellation and lock scope: (a) the MCP index and search handlers ignore the request's cancellation token; (b) lock scope; (c) done (a watcher pass queued for the workspace write lock ends on `unwatch`); (d) partly done (the data-directory file lock was fixed in N91; a `probe.compile` probe now waits for its scratch-checkout gate only as long as the query budget; still open: the scan threads in `src/app/indexing.rs` (`chunk::scan_incremental_with`, `fingerprint_with`) outlive a dropped request and run to their end, which needs cooperative cancellation in the scanner); (e) Ctrl+C graceful shutdown has no deadline (roadmap@bbd3292 N20) | ready | S-M | N16 done |
@@ -180,7 +190,7 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N96 | Re-check the error-to-commit premise (item 5) with full clones and the error text of linked GitHub issues, under a new pre-registered rule (d377) | ready | M | - |
 | N99 | System-1 rescoring rung: a decision model orders the reranker's 24-candidate shortlist, the seam where N98 (killed) showed the reranker's value (d382). Gate K0 passed on a hosted System One prototype arm (d383); slice 2 (the opt-in rescorer rung, with status-only HTTP errors, transmitted trace sizes and a joint-batch replay guard) merged as PR 88 and the default is unchanged; K1 passed (slice 3, d385); slice 4 failed bar S (d387): the local 4B decider loses on flow and mined search and needs about 19 GB of VRAM, so the reranker stays the default and the rung stays opt-in. The hosted model is never shipped | done (local rung killed, d387) | M | - |
 | N100 | Where-to routing: an un-steered `traverse` call on a where-to question returns 16 answers (8 seeds and 8 walk) where the `where-to` preset returns the 8 first-stage answers, with set_f1 +0.015 [+0.005, +0.026] and 42% fewer answer tokens; cut to 8 the two are identical, so the gain is the shorter list (d389). Whether to route such questions to the preset (question-type detection, or a fact in the tool description under the facts-only rule) needs its own pre-registered test. Detection (b) was killed at B0 (R 0.339 against the 0.70 bar, d391) | partly done: detection killed (d391); the description fact (a) is parked until a tier-3 run is approved | S | - |
-| N101 | The 5 s readiness probe of `lsp.live` (`PROBE_TIMEOUT`, the server `--version` call in `ManagerBackend::open`) times out under machine load and fails a walk before the server is asked anything; seen in K9a's runs. Decide a configurable or wider deadline and test it under load | ready | XS | - |
+| N101 | The 5 s readiness probe of `lsp.live` (`PROBE_TIMEOUT`, the server `--version` call in `ManagerBackend::open`) times out under machine load and fails a walk before the server is asked anything; seen in K9a's runs. Decide a configurable or wider deadline and test it under load | absorbed(K11d) | XS | - |
 | N14 | Lexical matches credited to the first chunk of a path-suffix match: tag only (see Earlier items outside cycle 1, row 10) (roadmap@bbd3292 N14) | paused | S | - |
 
 Items marked `cloud-ok` in older notes may run in a cloud agent; items marked `local` need the owner's machine.
