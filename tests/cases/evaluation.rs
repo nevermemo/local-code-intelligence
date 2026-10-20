@@ -1127,17 +1127,13 @@ async fn every_command_line_result_that_opens_the_application_carries_the_profil
         ("list-files", vec!["list-files", &workspace_arg]),
         ("search", vec!["search", &workspace_arg, "translator"]),
     ];
+    // `symbols`, `definition` and `references` print through the same stamp
+    // in `run()`; they are left out because on this Rust workspace they
+    // would start a real rust-analyzer, which CI runners cannot rely on.
     for (name, args) in cases {
         let result = run_json(args.into_iter().map(str::to_owned).collect()).await;
         assert_eq!(result["profile_hash"], hash, "{name}: {result}");
     }
-    let symbols = run_json(vec![
-        "symbols".to_owned(),
-        workspace_arg.clone(),
-        "translator".to_owned(),
-    ])
-    .await;
-    assert_eq!(symbols["profile_hash"], hash, "symbols: {symbols}");
 
     // The evaluation report carries it too, and still loads as a baseline.
     let definition_path = temp.path().join("definition.toml");
