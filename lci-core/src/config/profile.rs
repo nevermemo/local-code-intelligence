@@ -9,6 +9,12 @@
 //! [`EXCLUDED_KEYS`] (timeouts and timing, throughput, file paths, per-machine
 //! security, service identity). Everything else is in, so a key added to
 //! [`Config`] is part of the profile until someone excludes it by name.
+//!
+//! `golden/run_profile_default.txt` lists every leaf of the profile with its
+//! default value. Adding, removing or re-defaulting a leaf fails the golden
+//! test until the golden moves: run the profile test with `BLESS_GOLDEN=1`
+//! (`BLESS_GOLDEN=1 cargo test -p lci-core --lib config::profile`) and review
+//! the golden's diff.
 
 use super::{Config, layers::machine_keys};
 use serde::{Deserialize, Serialize};
@@ -561,12 +567,6 @@ mod tests {
     #[test]
     fn walk_groups_and_grep_corroboration_change_the_profile_hash() {
         let base = Config::default().run_profile();
-        assert!(
-            base.canonical
-                .contains(
-                    r#""run_profile":{"freshness":{"verify_on_read":false},"lsp":{"outline_cache":false,"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
-                )
-        );
         let mut claim = Config::default();
         claim.run_profile.walk.groups = WalkGroups::Claim;
         let mut discount = Config::default();
@@ -706,10 +706,14 @@ mode = \"sometimes\"
             canonical_json(&mixed),
             r#"{"a":[{"c":"x y","d":1},2.5],"b":1,"e":{}}"#
         );
+        // The hash function itself, on a fixed string (independent of the key set).
+        assert_eq!(
+            crate::workspace::hash(r#"{"a":[{"c":"x y","d":1},2.5],"b":1,"e":{}}"#),
+            "8f0efc09ffcd537ac704f59b6ef31bb890f5945e5b1f289cd30efa0b0102cf78"
+        );
         let profile = Config::default().run_profile();
-        assert!(profile.canonical.starts_with(
-            r#"{"channels":{"lexical":true,"lsp":true,"reranker":true,"semantic":true},"compose":{"enabled":false},"default_top_k":8,"#
-        ));
+        assert!(profile.canonical.starts_with(r#"{""#));
+        assert!(profile.canonical.ends_with('}'));
         assert!(!profile.canonical.contains('\n'));
         assert!(profile.canonical.contains(r#""tau":0.800000011920929"#));
         assert_eq!(
@@ -753,13 +757,11 @@ mode = \"sometimes\"
         for key in &profile.keys {
             assert!(all.contains(key), "{key} is not a Config leaf");
         }
-        // A new key changes this hash, so adding one is a conscious step:
-        // classify it (profile or deny-list) and set it in `full_config`.
-        assert_eq!(
-            crate::workspace::hash(&profile.keys.join("\n")),
-            "e62510c9f9c4fb2f00bf3d02ffcb388810b3a255eacdc07ce5d3d99ad26893aa",
-            "the profile key set changed"
-        );
+        // A new key is classified here (profile or deny-list) and set in
+        // `full_config`. The golden shows a new key only if the default
+        // profile has it or `full_config` sets it: an optional key that is
+        // unset in `full_config` and skipped while default (e.g.
+        // `traverse.policies`) is not visible there.
         // Spot checks of the classification.
         for key in [
             "default_top_k",
@@ -897,20 +899,89 @@ mode = \"sometimes\"
         assert!("per-call".parse::<LspSessions>().is_err());
     }
 
+    /// The golden's value for a leaf that a full configuration has and the
+    /// default one does not (an optional key left unset).
+    const UNSET: &str = "<unset by default>";
+
+    /// `key = value` for every leaf of the profile in `full_config`, sorted
+    /// by key: the default value where the default profile has the leaf,
+    /// [`UNSET`] where only an optional key of the full configuration does.
+    fn golden_text() -> String {
+        fn leaf_values(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
+            match value {
+                Value::Object(map) if !map.is_empty() => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        leaf_values(child, &path, out);
+                    }
+                }
+                _ => out.push((prefix.to_owned(), canonical_json(value))),
+            }
+        }
+        let mut leaves = std::collections::BTreeMap::new();
+        for key in full_config().run_profile().keys {
+            leaves.insert(key, UNSET.to_owned());
+        }
+        let mut defaults = Vec::new();
+        leaf_values(&Config::default().run_profile().value, "", &mut defaults);
+        leaves.extend(defaults);
+        let mut text = String::from(
+            "# The default run profile: one line per leaf of `Config::run_profile()`, sorted\n\
+             # by key path, with the leaf's default value. Regenerate with\n\
+             # `BLESS_GOLDEN=1 cargo test -p lci-core --lib config::profile` and review the diff.\n",
+        );
+        for (key, value) in leaves {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+        text.push_str(&format!(
+            "# hash = {}\n",
+            Config::default().run_profile().hash
+        ));
+        text
+    }
+
+    /// A leaf added, removed or re-defaulted shows as `-`/`+` lines.
+    fn golden_diff(expected_text: &str, actual_text: &str) -> String {
+        let expected: Vec<&str> = expected_text.lines().collect();
+        let actual: Vec<&str> = actual_text.lines().collect();
+        let mut diff = String::new();
+        for line in expected.iter().filter(|line| !actual.contains(line)) {
+            diff.push_str(&format!("- {line}\n"));
+        }
+        for line in actual.iter().filter(|line| !expected.contains(line)) {
+            diff.push_str(&format!("+ {line}\n"));
+        }
+        if diff.is_empty() && expected_text != actual_text {
+            // Same lines, different text (a header edit, a reorder, a
+            // duplicate): show both in full.
+            diff = format!("golden:\n{expected_text}\ncode:\n{actual_text}");
+        }
+        diff
+    }
+
     #[test]
-    fn the_default_profile_hash_is_pinned() {
-        // Changes whenever a default, a Config key or the deny-list changes:
-        // update it with the reason in the commit.
-        // K23a: a489865d... before `[run_profile.walk]` (`groups`,
-        // `grep_corroboration`) gave the section its two leaves.
-        // K2a-2: c10fe368... before `[run_profile.traverse] map_freshness`.
-        // K20a: 854c4164... before `[run_profile.scip] mode` added its leaf.
-        // K7b-1: e4cab053... before `[run_profile.lsp] sessions`.
-        // K2b: 7c5a1ce8... before `[run_profile.freshness] verify_on_read`.
-        // K7b-2: 47ed48e6... before `[run_profile.lsp] outline_cache`.
-        assert_eq!(
-            Config::default().run_profile().hash,
-            "a39b847179ca0e19bd4c64269644201540e5a9343879e392aa12d02f1417ebbd"
+    fn the_default_profile_matches_the_golden() {
+        let actual = golden_text();
+        let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/config/golden/run_profile_default.txt");
+        if std::env::var_os("BLESS_GOLDEN").is_some() {
+            std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+            std::fs::write(&golden, &actual).unwrap();
+        }
+        let expected = std::fs::read_to_string(&golden)
+            .unwrap_or_else(|error| {
+                panic!("{}: {error}; run with BLESS_GOLDEN=1", golden.display())
+            })
+            .replace("\r\n", "\n");
+        assert!(
+            actual == expected,
+            "the default run profile changed (- golden, + code); if the change is meant, \
+             run with BLESS_GOLDEN=1 and review the golden's diff:\n{}",
+            golden_diff(&expected, &actual)
         );
     }
 }
