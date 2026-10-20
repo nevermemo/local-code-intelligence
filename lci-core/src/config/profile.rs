@@ -14,13 +14,31 @@ use super::{Config, layers::machine_keys};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// `[run_profile]`: the home of the switches that name a run's configuration.
-/// An unknown key is an error.
+/// `[run_profile]`: the home of the switches that name a run's configuration
+/// (cycle 1: every new behaviour is a key here whose default keeps today's
+/// behaviour). An unknown key is an error.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunProfileConfig {
+    /// `[run_profile.traverse]`: switches of the traversal.
+    pub traverse: RunProfileTraverse,
     /// `[run_profile.walk]`: how a traversal counts evidence.
     pub walk: WalkProfile,
+}
+
+/// `[run_profile.traverse]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileTraverse {
+    /// Name each map's freshness in a traverse answer: `maps`, an array of
+    /// `{id, observed, stale, lag}` with one entry for every map of the call
+    /// that states it. `false` (the default): the answer has no `maps` key and
+    /// is as without the key. `true` counts the tree's source files that are
+    /// newer than the index file or changed since the process first saw its
+    /// stamp (a read of the tree's source files once per call) and adds the
+    /// result to every response. See the README "Map freshness" for what
+    /// `observed`, `stale` and `lag` mean.
+    pub map_freshness: bool,
 }
 
 /// How a traversal groups the evidence that reaches a node
@@ -336,6 +354,7 @@ mod tests {
         config.traverse.scip_index = "other.scip".into();
         config.traverse.deadline_ms = 19;
         config.traverse.max_depth = 3;
+        config.run_profile.traverse.map_freshness = true;
         config.traverse.fusion = TraverseFusion::Rrf;
         config.traverse.max_model_calls = Some(4);
         config.traverse.priors = Some("priors.json".into());
@@ -407,7 +426,9 @@ mod tests {
         let base = Config::default().run_profile();
         assert!(
             base.canonical
-                .contains(r#""run_profile":{"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#)
+                .contains(
+                    r#""run_profile":{"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
+                )
         );
         let mut claim = Config::default();
         claim.run_profile.walk.groups = WalkGroups::Claim;
@@ -490,7 +511,7 @@ mod tests {
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "b730719b8776c22c76a2ac91ac8252fcfe35aa0fcc61cd335f71627f890a8d73",
+            "9a1e65516b6e863c3cdb15aa8762eb265d3d0a9473c94d6c59c98db721547514",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -507,6 +528,7 @@ mod tests {
             "rescorer",
             "run_profile.walk.groups",
             "run_profile.walk.grep_corroboration",
+            "run_profile.traverse.map_freshness",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -531,14 +553,50 @@ mod tests {
     }
 
     #[test]
+    fn map_freshness_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.traverse.map_freshness);
+        let text = format!(
+            "{}[run_profile.traverse]\nmap_freshness = true\n",
+            base_toml()
+        );
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.traverse.map_freshness);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["traverse"]["map_freshness"],
+            true
+        );
+        // It changes what a traverse answer holds, so it changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["traverse"]["map_freshness"], false);
+        assert_eq!(on.value["run_profile"]["traverse"]["map_freshness"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.traverse.map_freshness")
+        );
+        assert_ne!(off.hash, on.hash);
+        for bad in [
+            "[run_profile.traverse]\nmap_freshness = \"yes\"\n",
+            "[run_profile.traverse]\nfoo = 1\n",
+            "[run_profile]\nmap_freshness = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_default_profile_hash_is_pinned() {
         // Changes whenever a default, a Config key or the deny-list changes:
         // update it with the reason in the commit.
         // K23a: a489865d... before `[run_profile.walk]` (`groups`,
         // `grep_corroboration`) gave the section its two leaves.
+        // K2a-2: c10fe368... before `[run_profile.traverse] map_freshness`.
         assert_eq!(
             Config::default().run_profile().hash,
-            "c10fe368eeaef8e3f2aa3ba701d6a823fea3ce263f3565819f82ab583f85f7c6"
+            "854c41649c271f59b76ab7e903ff3a55f5b65da888e35a87fa76a77a34e8cc46"
         );
     }
 }

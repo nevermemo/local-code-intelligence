@@ -1109,6 +1109,7 @@ async fn flow_from_walks_under_the_run_profile() {
             groups: lci_core::config::WalkGroups::Claim,
             grep_corroboration: 0.5,
         },
+        ..RunProfileConfig::default()
     };
     claim.ask_under(request, false, &profile).await;
     let ranks = trace_ranks(&claim);

@@ -36,6 +36,16 @@ pub(super) fn add_policy(response: &mut Value, effective: Value, warnings: Vec<S
     }
 }
 
+/// `maps` (only with `[run_profile.traverse] map_freshness`; `None` otherwise leaves the
+/// response as it was): for each map of the call that states it, `id`,
+/// `observed` (`snapshot`, `live` or `as_of:<point>`), `stale` and `lag`
+/// (see [`super::freshness`]).
+pub(super) fn add_maps(response: &mut Value, maps: Option<Value>) {
+    if let (Some(maps), Some(object)) = (maps, response.as_object_mut()) {
+        object.insert("maps".into(), maps);
+    }
+}
+
 /// The steer lint of a call (see [`lci_maps::traverse::lint`]), plus the two
 /// checks that need the steer's own fields: a ladder that omits `rules` while
 /// rules are given, and `budget` actions that add more than the engine

@@ -2070,6 +2070,8 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
     let plain = first["structuredContent"].clone();
     assert_eq!(plain["mode"], "traverse");
     assert_eq!(plain["status"], "complete", "{plain}");
+    // `[run_profile.traverse] map_freshness` is off by default: no `maps` key.
+    assert!(plain.get("maps").is_none(), "{plain}");
     // The index-only workspace has nothing to search, so the stand-in seeds
     // it, and the answer says so.
     assert_eq!(plain["seed_source"], "name_tokens", "{plain}");
@@ -2263,6 +2265,80 @@ fn start_event_json(data_dir: &Path, response: &Value) -> Value {
     let file = response["trace"]["file"].as_str().unwrap();
     let text = std::fs::read_to_string(data_dir.join("traces").join(file)).unwrap();
     serde_json::from_str(text.lines().next().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn with_map_freshness_on_a_tree_edit_after_the_index_marks_the_scip_maps_stale() {
+    let (temp, mut config, _fake, models_task) = fixture().await;
+    config.traverse.enabled = true;
+    config.run_profile.traverse.map_freshness = true;
+    let workspace = temp.path().join("scip-fresh");
+    // The source is written before the index, so it is not newer than it.
+    let source = workspace.join("src").join("search.rs");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, "pub fn search() {}\n").unwrap();
+    write_scip_workspace(&workspace);
+    let app = Arc::new(App::open(config).await.unwrap());
+    let (base, token, server) = serve_on_loopback(app).await;
+    let client = reqwest::Client::new();
+    let (session, _) = mcp_initialize(&client, &base, "/mcp").await;
+    let ask = || async {
+        let answer = mcp_search_call(
+            &client,
+            &base,
+            &session,
+            json!({"workspace_path":workspace,"query":"how does search rank hits","mode":"traverse"}),
+        )
+        .await;
+        assert_ne!(answer["isError"], true, "{answer}");
+        answer["structuredContent"].clone()
+    };
+    let states = |answer: &Value| -> Vec<(String, String, bool, Value)> {
+        answer["maps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no maps in {answer}"))
+            .iter()
+            .map(|map| {
+                (
+                    map["id"].as_str().unwrap().to_owned(),
+                    map["observed"].as_str().unwrap().to_owned(),
+                    map["stale"].as_bool().unwrap(),
+                    map["lag"].clone(),
+                )
+            })
+            .collect()
+    };
+    let at = |stale: bool, lag: u64| -> Vec<(String, String, bool, Value)> {
+        ["seeds.scip_names", "graph.scip", "structure.contains"]
+            .into_iter()
+            .map(|id| (id.to_owned(), "snapshot".to_owned(), stale, json!(lag)))
+            .collect()
+    };
+
+    // The default maps are `MAPS`: `exact.closure` and the other maps that read
+    // the tree are opt-in and not registered by a plain call. Of the defaults
+    // the three built from the index state a freshness; `seeds.hybrid` states
+    // none. The index is not older than its tree.
+    use local_code_intelligence::app::traverse::{MAPS, OPT_IN_MAPS};
+    assert_eq!(
+        MAPS,
+        [
+            "seeds.hybrid",
+            "seeds.scip_names",
+            "graph.scip",
+            "structure.contains"
+        ]
+    );
+    assert!(OPT_IN_MAPS.contains(&"exact.closure"));
+    assert_eq!(states(&ask().await), at(false, 0));
+    // A tree edit after that (the byte length always changes) makes them
+    // stale by one file; the index file was not touched.
+    std::fs::write(&source, "pub fn search() {}\npub fn appended() {}\n").unwrap();
+    assert_eq!(states(&ask().await), at(true, 1));
+
+    token.cancel();
+    server.abort();
+    models_task.abort();
 }
 
 #[tokio::test]

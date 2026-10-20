@@ -9,7 +9,7 @@ use std::{
 pub mod layers;
 pub mod profile;
 
-pub use profile::{RunProfile, RunProfileConfig, WalkGroups, WalkProfile};
+pub use profile::{RunProfile, RunProfileConfig, RunProfileTraverse, WalkGroups, WalkProfile};
 
 /// Controls when a search request may trigger an automatic incremental
 /// refresh of a workspace's index. `on-search` is the default for coding
@@ -626,9 +626,9 @@ pub struct Config {
     #[serde(skip_serializing_if = "Rescorer::is_default")]
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
-    /// result-affecting configuration (`walk.groups` and
-    /// `walk.grep_corroboration`). Always serialized; the hashed profile of the
-    /// whole configuration is [`Config::run_profile`].
+    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`
+    /// and `traverse.map_freshness`). Always serialized; the hashed profile of
+    /// the whole configuration is [`Config::run_profile`].
     pub run_profile: RunProfileConfig,
 }
 
@@ -3747,6 +3747,7 @@ fusion = \"{fusion}\"
                     grep_corroboration: share,
                     ..WalkProfile::default()
                 },
+                ..RunProfileConfig::default()
             },
             ..Config::default()
         };
