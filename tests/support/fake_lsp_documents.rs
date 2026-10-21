@@ -115,10 +115,12 @@ pub struct Store {
     /// The ordinal of this server process in its state directory (1 for the
     /// first), recorded on every event so a restart is told from a reorder.
     spawn: u64,
+    /// `--ignore-watched-files`: `didChangeWatchedFiles` is logged, not applied.
+    ignore_watched: bool,
 }
 
 impl Store {
-    pub fn new(state_dir: Option<PathBuf>, spawn: u64) -> Self {
+    pub fn new(state_dir: Option<PathBuf>, spawn: u64, ignore_watched: bool) -> Self {
         Self {
             state_dir,
             root: None,
@@ -126,6 +128,7 @@ impl Store {
             open: BTreeMap::new(),
             seq: 0,
             spawn,
+            ignore_watched,
         }
     }
 
@@ -249,6 +252,9 @@ impl Store {
     /// Created (1) and Changed (2) re-read the disk now; Deleted (3) drops the
     /// snapshot. An open document keeps winning over the snapshot.
     fn did_change_watched_files(&mut self, params: &Value) -> Option<&'static str> {
+        if self.ignore_watched {
+            return Some("watched-ignored");
+        }
         let mut note = None;
         for change in params["changes"].as_array().into_iter().flatten() {
             let Some(uri) = change["uri"].as_str().map(normalize_uri) else {

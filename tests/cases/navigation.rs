@@ -8253,3 +8253,298 @@ async fn a_slow_initialize_is_bounded_by_the_start_timeout_not_the_request_timeo
     assert_eq!(state_count(&state, "spawn_count.txt"), 1);
     manager.shutdown_all().await;
 }
+
+// ----- K37b: concurrent walks --------------------------------------------
+//
+// Two or more walks that share one server (the service's manager), with an
+// edit between them. Every assert is on counts, notes or answers: no timer, no
+// sleep, no wall-clock bound. The order of overlapping calls is the calls' own
+// (`tokio::join!`).
+
+/// [`watching_sessions_fixture`] whose fake also ignores
+/// `didChangeWatchedFiles` (`--ignore-watched-files`): under `sync = "watch"`
+/// the sync would tell a kept server about an edit and hide a barrier that did
+/// not restart it, so with the flag the barrier's restart is the only way the
+/// new tree reaches the server.
+fn barrier_only_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (mut config, workspace, state, index) = watching_sessions_fixture(temp);
+    config.csharp.args.push("--ignore-watched-files".to_owned());
+    (config, workspace, state, index)
+}
+
+/// How many server processes the fake started in `state`. `spawns/` holds one
+/// entry per start, claimed atomically, so it counts overlapping starts that
+/// `spawn_count.txt` (last writer wins) can hide.
+fn spawns_started(state: &std::path::Path) -> usize {
+    std::fs::read_dir(state.join("spawns"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// How many of `answers` carry the note `wanted` says is true.
+fn answers_where(answers: &[&Value], wanted: impl Fn(&Value) -> bool) -> usize {
+    answers.iter().filter(|answer| wanted(answer)).count()
+}
+
+/// `(file, 0-based line)` of every place, in the order given.
+fn files_and_lines(places: &[lci_maps::lsp_live::Place]) -> Vec<(String, u32)> {
+    places
+        .iter()
+        .map(|place| (place.path.clone(), place.line))
+        .collect()
+}
+
+/// Two walks that start together over a manager with no server running share
+/// one start: one server process, answers from it for both walks, and exactly
+/// one of the two labelled as coming from a kept session (the walk that did
+/// not start it). Neither is told the tree changed.
+#[tokio::test]
+async fn two_overlapping_walks_share_one_server_and_exactly_one_is_labelled_kept() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+
+    let (first, second) = tokio::join!(
+        traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager),
+        traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager),
+    );
+    for answer in [&first, &second] {
+        assert!(reached_run_through_lsp_live(answer), "{answer}");
+        assert!(!restart_noted(answer, "csharp-ls"), "{answer}");
+    }
+    assert_eq!(spawns_started(&state), 1, "the two walks share one start");
+    assert!(
+        requests_of(&state, "textDocument/references") >= 2,
+        "both walks asked the one server"
+    );
+    assert_eq!(
+        answers_where(&[&first, &second], |answer| kept_noted(answer, "csharp-ls")),
+        1,
+        "the walk that started the server is not labelled kept, the other is: {first} {second}"
+    );
+    assert_eq!(
+        manager.release(&workspace.id).await,
+        ["csharp-ls"],
+        "one session in the manager"
+    );
+    manager.shutdown_all().await;
+}
+
+/// An edit between a lone walk and two overlapping ones: the barrier that saw
+/// the new stamp restarts the server (one restart note in all), the other
+/// barrier saw the stamp the first recorded, and the two walks share the one
+/// post-edit start (two servers in all, never three). The fake ignores the
+/// sync's `didChangeWatchedFiles`, so the barrier's restart is the only way
+/// `Twice` reaches the server: no stale reuse.
+#[tokio::test]
+async fn an_edit_between_overlapping_walks_restarts_the_server_once_and_both_answer_the_new_tree() {
+    use local_code_intelligence::config::LspSessions;
+    const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = barrier_only_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert!(!reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert_eq!(spawns_started(&state), 1);
+
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    let index = csharp_scip_index_of(
+        &temp.path().join("index-twice.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/CallSite.cs", 2, "Twice"),
+        ],
+    );
+    let (first, second) = tokio::join!(
+        traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager),
+        traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager),
+    );
+    for answer in [&first, &second] {
+        assert!(reached_through_lsp_live(answer, TWICE), "{answer}");
+        assert!(reached_run_through_lsp_live(answer), "{answer}");
+    }
+    let both = [&first, &second];
+    assert_eq!(
+        answers_where(&both, |answer| restart_noted(answer, "csharp-ls")),
+        1,
+        "the barrier that saw the new stamp restarted the server, the other saw the recorded one: {first} {second}"
+    );
+    assert!(
+        answers_where(&both, |answer| kept_noted(answer, "csharp-ls")) <= 1,
+        "at most one walk found the post-edit server running: {first} {second}"
+    );
+    assert_eq!(
+        spawns_started(&state),
+        2,
+        "the first server, then one post-edit server shared by both walks"
+    );
+    // The flag reached the fake: every watched-files notice it got was ignored,
+    // so the new tree came from the barrier's restart, not from the sync.
+    let ignored: Vec<Value> = std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["method"] == "workspace/didChangeWatchedFiles")
+        .map(|event| event["note"].clone())
+        .collect();
+    assert!(
+        ignored.iter().all(|note| note == "watched-ignored"),
+        "{ignored:?}"
+    );
+    manager.shutdown_all().await;
+}
+
+/// A walk whose server the barrier of another walk stopped does not go on
+/// with it: its next request looks the session up again, starts a server on
+/// the new tree and is answered from it. The walk's own record names no kept session, because the
+/// second server is one the walk started.
+#[tokio::test]
+async fn a_walk_whose_server_the_barrier_stopped_answers_its_next_request_from_the_new_tree() {
+    use lci_maps::lsp_live::{LspBackend, ManagerBackend, Place};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, _index) = barrier_only_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    let own = Arc::new(Manager::new(&config).without_sync());
+    let open = || {
+        ManagerBackend::open_split(
+            workspace.clone(),
+            Arc::clone(&manager),
+            Arc::clone(&own),
+            LOADED_BUDGET,
+        )
+    };
+    age_tree(&workspace.path);
+    let add = {
+        let (line, col) = position_of(CALCULATOR_CS, "Add");
+        Place {
+            path: "src/Calculator.cs".into(),
+            line,
+            col,
+        }
+    };
+
+    let first = open().await.unwrap();
+    assert!(first.restarted().is_empty());
+    let before = first.references(&add).await.unwrap();
+    assert_eq!(
+        files_and_lines(&before),
+        [("src/CallSite.cs".to_owned(), 1)],
+        "only `Run` calls `Add` on the tree the server started from"
+    );
+    assert_eq!(spawns_started(&state), 1);
+
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    let second = open().await.unwrap();
+    assert_eq!(
+        second.restarted(),
+        ["csharp-ls"],
+        "the second walk's barrier saw the edit and stopped the server"
+    );
+
+    let after = first.references(&add).await.unwrap();
+    assert_eq!(
+        files_and_lines(&after),
+        [
+            ("src/CallSite.cs".to_owned(), 1),
+            ("src/CallSite.cs".to_owned(), 2)
+        ],
+        "the first walk's next request is answered from the new tree"
+    );
+    assert_eq!(spawns_started(&state), 2, "one restart, no third start");
+    assert!(
+        first.walk().reused().is_empty(),
+        "the second server is one the first walk started: {:?}",
+        first.walk().reused()
+    );
+    manager.shutdown_all().await;
+}
+
+/// The queue question: two walks' requests in flight at once on one server
+/// each get their own answer (the transport matches responses by id), so no
+/// per-server request queue is needed. The fake does not log message ids; the
+/// events show both requests were handled by the one server process (`spawn`
+/// 1) and that nothing else started.
+#[tokio::test]
+async fn interleaved_requests_of_two_walks_on_one_server_each_get_their_own_answer() {
+    use lci_maps::lsp_live::{LspBackend, ManagerBackend, Place};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, _index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    let own = Arc::new(Manager::new(&config).without_sync());
+    let open = || {
+        ManagerBackend::open_split(
+            workspace.clone(),
+            Arc::clone(&manager),
+            Arc::clone(&own),
+            LOADED_BUDGET,
+        )
+    };
+    age_tree(&workspace.path);
+    let (first, second) = (open().await.unwrap(), open().await.unwrap());
+    let call = {
+        let (line, col) = position_of(CALL_SITE_CS, "Add");
+        Place {
+            path: "src/CallSite.cs".into(),
+            line,
+            col,
+        }
+    };
+    let add = {
+        let (line, col) = position_of(CALCULATOR_CS, "Add");
+        Place {
+            path: "src/Calculator.cs".into(),
+            line,
+            col,
+        }
+    };
+
+    let (defined, referred) = tokio::join!(first.definition(&call), second.references(&add));
+    assert_eq!(
+        files_and_lines(&defined.unwrap()),
+        [("src/Calculator.cs".to_owned(), 1)],
+        "the definition request got the definition's answer"
+    );
+    assert_eq!(
+        files_and_lines(&referred.unwrap()),
+        [("src/CallSite.cs".to_owned(), 1)],
+        "the references request got the references' answer"
+    );
+    assert_eq!(spawns_started(&state), 1, "one server for both walks");
+    assert_eq!(requests_of(&state, "textDocument/definition"), 1);
+    assert_eq!(requests_of(&state, "textDocument/references"), 1);
+    let events = std::fs::read_to_string(state.join("events.jsonl")).unwrap();
+    let served_by: std::collections::BTreeSet<u64> = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| {
+            matches!(
+                event["method"].as_str(),
+                Some("textDocument/definition" | "textDocument/references")
+            )
+        })
+        .map(|event| event["spawn"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        served_by,
+        std::collections::BTreeSet::from([1]),
+        "both requests reached the one server process"
+    );
+    manager.shutdown_all().await;
+}
