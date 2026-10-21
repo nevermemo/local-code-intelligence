@@ -21,6 +21,15 @@
 //!   files by matched lines (most first), then the most needles any one of
 //!   its lines holds, then path.
 //!
+//! `--rule regex` (traits only) reproduces the rule of the earlier `rg_arm.py`
+//! driver (d392) instead: one `rg --sort path --glob *.rs` call per question
+//! with an impl-header regex and a derive regex built from the trait name the
+//! question gives (templates Q1/Q2/Q3, read from the question text), Q1 by
+//! line, Q2/Q3 by the first `fn member` at depth 1 of each impl block, Q2
+//! ranked by the type named after `for`. `meta.json["rule"]` names the wave's
+//! rule: `fixed`, `fixed-decl-first` or `regex`. rg has no total-output cap
+//! or timeout beyond the fixed rule's per-file `--max-count`.
+//!
 //! A baseline record has no K3a-1 cost keys (`external_calls`, `lsp_ms`,
 //! `answer_tokens`, `budget_hit`): the arm has no walk, so `maps compare`
 //! pairs no item on them, which is right.
@@ -33,7 +42,7 @@ use lci_core::{language, lexical};
 use lci_maps::impact::code_names;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -96,9 +105,24 @@ pub struct RgArgs {
     /// rg `--max-count`: matched lines kept per file.
     #[arg(long, default_value_t = 50)]
     max_per_file: usize,
+    /// The rule: `fixed` (fixed-string whole-word needles, the default) or
+    /// `regex` (traits only: one call with an impl-header regex and a derive
+    /// regex built from the trait name, answers by the three trait question
+    /// templates; the rule of the earlier `rg_arm.py` driver, d392).
+    #[arg(long, value_enum, default_value_t = RgRule::Fixed)]
+    rule: RgRule,
+    /// `--rule regex` only: answers per Q1/Q3 item (Q2 is cut to --top-k).
+    #[arg(long, default_value_t = 40)]
+    max_answers: usize,
     /// Where the run dir is written.
     #[arg(long)]
     out_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RgRule {
+    Fixed,
+    Regex,
 }
 
 /// Where an item's needles came from.
@@ -349,6 +373,309 @@ fn order_text(set: Set, decl_first: bool) -> String {
     }
 }
 
+// ------------------------------------------------- the regex rule (traits)
+
+/// Which trait question template a question is (read from its text, never
+/// from the gold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Template {
+    /// "Which types implement `Trait`?"
+    Q1,
+    /// "Where is `Trait::member` implemented for `Type`?"
+    Q2,
+    /// "What must change if `Trait::member` changes?"
+    Q3,
+}
+
+/// The names a trait question gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RegexQuery {
+    pub template: Template,
+    pub trait_name: String,
+    pub member: Option<String>,
+    pub ty: Option<String>,
+}
+
+/// Reads the three trait question templates from the question text (backticked
+/// names via `code_names`); `None` when the text matches none of them.
+pub(super) fn regex_query(question: &str) -> Option<RegexQuery> {
+    let text = question.trim();
+    if !text.ends_with('?') {
+        return None;
+    }
+    let (names, _) = code_names(text);
+    let member_of = |path: &Vec<String>| -> Option<(String, String)> {
+        let [.., t, m] = path.as_slice() else {
+            return None;
+        };
+        Some((t.clone(), m.clone()))
+    };
+    if text.starts_with("Which types implement") && names.len() == 1 {
+        return Some(RegexQuery {
+            template: Template::Q1,
+            trait_name: names[0].last()?.clone(),
+            member: None,
+            ty: None,
+        });
+    }
+    if text.starts_with("Where is") && text.contains(" implemented for ") && names.len() == 2 {
+        let (trait_name, member) = member_of(&names[0])?;
+        return Some(RegexQuery {
+            template: Template::Q2,
+            trait_name,
+            member: Some(member),
+            ty: Some(names[1].last()?.clone()),
+        });
+    }
+    if text.starts_with("What must change if") && names.len() == 1 {
+        let (trait_name, member) = member_of(&names[0])?;
+        return Some(RegexQuery {
+            template: Template::Q3,
+            trait_name,
+            member: Some(member),
+            ty: None,
+        });
+    }
+    None
+}
+
+/// Escapes a name for a regex: every character that is not a word character
+/// gets a backslash.
+fn regex_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !(c.is_alphanumeric() || c == '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The two patterns of the rule, built from the trait name only: an impl
+/// header on one line, and a derive list naming the trait.
+pub(super) fn regex_patterns(trait_name: &str) -> (String, String) {
+    let t = regex_escape(trait_name);
+    (
+        format!(r"\bimpl\b[^{{;]*\b{t}\b[^{{;]*\bfor\b"),
+        format!(r"#\[derive\([^)]*\b{t}\b"),
+    )
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `\bword\b` occurs in `hay`.
+fn has_word(hay: &str, word: &str) -> bool {
+    hay.match_indices(word).any(|(at, _)| {
+        !hay[..at].chars().next_back().is_some_and(is_word)
+            && !hay[at + word.len()..].chars().next().is_some_and(is_word)
+    })
+}
+
+/// `#\[derive\([^)]*\bTRAIT\b` matches somewhere in `text`.
+pub(super) fn is_derive_line(text: &str, trait_name: &str) -> bool {
+    text.match_indices("#[derive(").any(|(at, m)| {
+        let rest = &text[at + m.len()..];
+        has_word(rest.split(')').next().unwrap_or_default(), trait_name)
+    })
+}
+
+/// `\bfor\b[^{]*\bTYPE\b` matches in an impl header line.
+fn type_after_for(text: &str, ty: &str) -> bool {
+    text.match_indices("for").any(|(at, m)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + m.len()..].chars().next();
+        if before.is_some_and(is_word) || after.is_some_and(is_word) {
+            return false;
+        }
+        has_word(
+            text[at + m.len()..].split('{').next().unwrap_or_default(),
+            ty,
+        )
+    })
+}
+
+/// `\bfn\s+MEMBER\b` matches in `line`.
+fn has_fn_member(line: &str, member: &str) -> bool {
+    line.match_indices("fn").any(|(at, m)| {
+        if line[..at].chars().next_back().is_some_and(is_word) {
+            return false;
+        }
+        let rest = &line[at + m.len()..];
+        let trimmed = rest.trim_start();
+        trimmed.len() < rest.len()
+            && trimmed.starts_with(member)
+            && !trimmed[member.len()..].chars().next().is_some_and(is_word)
+    })
+}
+
+/// 1-based line of `fn member` at brace depth 1 of the block opened at or
+/// after the 0-based `header0`, or `None`; looks at most `budget` lines.
+pub(super) fn member_line(
+    lines: &[String],
+    header0: usize,
+    member: &str,
+    budget: usize,
+) -> Option<u64> {
+    let (mut depth, mut opened) = (0i64, false);
+    for (i, text) in lines.iter().enumerate().skip(header0).take(budget) {
+        if opened && depth == 1 && has_fn_member(text, member) {
+            return Some(i as u64 + 1);
+        }
+        for c in text.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return None;
+        }
+    }
+    None
+}
+
+/// One line the header or derive pattern matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HeaderHit {
+    pub path: String,
+    pub line: u64,
+    pub text: String,
+    pub derive: bool,
+}
+
+/// The `match` events of `rg --json` output as [`HeaderHit`]s.
+pub(super) fn parse_header_hits(stdout: &[u8], trait_name: &str) -> Result<Vec<HeaderHit>> {
+    let mut hits = Vec::new();
+    for raw in stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.trim_ascii().is_empty())
+    {
+        let event: Value = serde_json::from_slice(raw).context("invalid ripgrep JSON")?;
+        if event["type"] != "match" {
+            continue;
+        }
+        let data = &event["data"];
+        let (Some(path), Some(line), Some(text)) = (
+            data["path"]["text"].as_str(),
+            data["line_number"].as_u64(),
+            data["lines"]["text"].as_str(),
+        ) else {
+            continue;
+        };
+        let mut path = path.replace('\\', "/");
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest.to_owned();
+        }
+        hits.push(HeaderHit {
+            path,
+            line,
+            text: text.trim_end_matches(['\r', '\n']).to_owned(),
+            derive: is_derive_line(text, trait_name),
+        });
+    }
+    Ok(hits)
+}
+
+/// One rg call over `tree` for the rule's two patterns (`*.rs` only).
+pub(super) fn run_rg_headers(rg: &Path, tree: &Path, trait_name: &str) -> Result<Vec<HeaderHit>> {
+    let (header, derive) = regex_patterns(trait_name);
+    let output = Command::new(rg)
+        .current_dir(tree)
+        .args([
+            "--json",
+            "--line-number",
+            "--sort",
+            "path",
+            "--glob",
+            "*.rs",
+        ])
+        .arg("-e")
+        .arg(&header)
+        .arg("-e")
+        .arg(&derive)
+        .arg("--")
+        .arg(".")
+        .output()
+        .with_context(|| format!("start ripgrep at {}", rg.display()))?;
+    match output.status.code() {
+        Some(0 | 1) => {}
+        Some(code) => {
+            let tail = &output.stderr[output.stderr.len().saturating_sub(512)..];
+            bail!(
+                "ripgrep exited with code {code}: {}",
+                String::from_utf8_lossy(tail).trim()
+            );
+        }
+        None => bail!("ripgrep terminated without an exit code: {}", output.status),
+    }
+    parse_header_hits(&output.stdout, trait_name)
+}
+
+/// Finds the member line of the impl block that opens at a header line:
+/// `(path, header_line, member)`.
+pub(super) type MemberAt<'a> = dyn FnMut(&str, u64, &str) -> Result<Option<u64>> + 'a;
+
+const REGEX_ORDER: &str = "Q1: every header or derive line by path, line; Q3: the first `fn member` at brace depth 1 of each impl block (derive lines and headers without it give nothing) by path, line; Q2: as Q3, headers naming the type after `for` first, then path, line";
+
+/// Lines a member search may scan below an impl header.
+const MEMBER_BUDGET: usize = 2000;
+
+/// The rule's answers. Q1: every matched line (header or derive) in path/line
+/// order, cut to `max_answers`. Q3: the first `fn member` at depth 1 of each
+/// header's block (derive lines and headers without it give nothing), in
+/// path/line order, cut to `max_answers`. Q2: as Q3, headers whose text names
+/// the type after `for` first, then path/line, cut to `q2_cut`.
+/// `member_at(path, header_line, member)` finds the member line of a block
+/// (the driver reads the file; tests pass an in-memory tree).
+pub(super) fn rank_regex(
+    query: &RegexQuery,
+    hits: &[HeaderHit],
+    member_at: &mut MemberAt,
+    max_answers: usize,
+    q2_cut: usize,
+) -> Result<Vec<Value>> {
+    let mut sorted: Vec<&HeaderHit> = hits.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    let place = |path: &str, line: u64| json!({ "path": path, "line": line });
+    if query.template == Template::Q1 {
+        return Ok(cut(
+            sorted.iter().map(|h| place(&h.path, h.line)).collect(),
+            max_answers,
+        ));
+    }
+    let member = query.member.as_deref().unwrap_or_default();
+    let mut candidates: Vec<(u8, &str, u64)> = Vec::new();
+    for hit in sorted.iter().filter(|h| !h.derive) {
+        if let Some(line) = member_at(&hit.path, hit.line, member)? {
+            let names_type = query
+                .ty
+                .as_deref()
+                .is_some_and(|ty| type_after_for(&hit.text, ty));
+            candidates.push((u8::from(!names_type), hit.path.as_str(), line));
+        }
+    }
+    let (keep, cap) = if query.template == Template::Q2 {
+        candidates.sort();
+        (candidates, q2_cut)
+    } else {
+        candidates.sort_by(|a, b| a.1.cmp(b.1).then(a.2.cmp(&b.2)));
+        (candidates, max_answers)
+    };
+    Ok(cut(
+        keep.iter()
+            .map(|(_, path, line)| place(path, *line))
+            .collect(),
+        cap,
+    ))
+}
+
 /// `rg --version`, first line.
 fn rg_version(rg: &Path) -> Result<String> {
     let output = Command::new(rg)
@@ -379,6 +706,14 @@ pub(super) fn run_rg_arm(args: RgArgs) -> Result<()> {
         RgSet::Traits => Set::Traits,
         RgSet::WhereTo => Set::WhereTo,
     };
+    if args.rule == RgRule::Regex && (set != Set::Traits || args.decl_first) {
+        bail!("--rule regex answers the traits set only and takes no --decl-first");
+    }
+    let rule = match (args.rule, args.decl_first) {
+        (RgRule::Regex, _) => "regex",
+        (RgRule::Fixed, true) => "fixed-decl-first",
+        (RgRule::Fixed, false) => "fixed",
+    };
     if !args.tree.is_dir() {
         bail!("--tree {} is not a directory", args.tree.display());
     }
@@ -388,25 +723,65 @@ pub(super) fn run_rg_arm(args: RgArgs) -> Result<()> {
     let (mut backticked, mut fallback, mut none) = (0usize, 0usize, 0usize);
     let (mut failures, mut first_failure, mut empty) = (0usize, None::<String>, 0usize);
     let mut answers: Vec<Vec<Value>> = Vec::with_capacity(items.len());
+    let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         let question = item["question"].as_str().unwrap_or_default();
-        let (needles, source) = needles_of(question);
-        match source {
-            NeedleSource::Backticked => backticked += 1,
-            NeedleSource::Fallback => fallback += 1,
-            NeedleSource::None => none += 1,
-        }
-        let mut picked = Vec::new();
-        if source != NeedleSource::None {
-            let case_sensitive = source == NeedleSource::Backticked;
-            match run_rg(&rg, &args.tree, &needles, case_sensitive, args.max_per_file) {
-                Ok(lines) => picked = answers_for(set, &lines, args.top_k, args.decl_first),
-                Err(e) => {
-                    failures += 1;
-                    first_failure.get_or_insert_with(|| format!("{e:#}"));
+        let outcome: Result<Option<Vec<Value>>> = if args.rule == RgRule::Regex {
+            // Needles are the question's trait name (and member, type).
+            match regex_query(question) {
+                None => {
+                    none += 1;
+                    Ok(None)
+                }
+                Some(query) => {
+                    backticked += 1;
+                    run_rg_headers(&rg, &args.tree, &query.trait_name).and_then(|hits| {
+                        let mut member_at =
+                            |path: &str, header: u64, member: &str| -> Result<Option<u64>> {
+                                if !file_cache.contains_key(path) {
+                                    let text = std::fs::read(args.tree.join(path))
+                                        .with_context(|| format!("read {path}"))?;
+                                    let lines = String::from_utf8_lossy(&text)
+                                        .lines()
+                                        .map(str::to_owned)
+                                        .collect();
+                                    file_cache.insert(path.to_owned(), lines);
+                                }
+                                Ok(member_line(
+                                    &file_cache[path],
+                                    (header as usize).saturating_sub(1),
+                                    member,
+                                    MEMBER_BUDGET,
+                                ))
+                            };
+                        rank_regex(&query, &hits, &mut member_at, args.max_answers, args.top_k)
+                            .map(Some)
+                    })
                 }
             }
-        }
+        } else {
+            let (needles, source) = needles_of(question);
+            match source {
+                NeedleSource::Backticked => backticked += 1,
+                NeedleSource::Fallback => fallback += 1,
+                NeedleSource::None => none += 1,
+            }
+            if source == NeedleSource::None {
+                Ok(None)
+            } else {
+                let case_sensitive = source == NeedleSource::Backticked;
+                run_rg(&rg, &args.tree, &needles, case_sensitive, args.max_per_file)
+                    .map(|lines| Some(answers_for(set, &lines, args.top_k, args.decl_first)))
+            }
+        };
+        let picked = match outcome {
+            Ok(found) => found.unwrap_or_default(),
+            Err(e) => {
+                failures += 1;
+                first_failure.get_or_insert_with(|| format!("{e:#}"));
+                Vec::new()
+            }
+        };
         empty += usize::from(picked.is_empty());
         answers.push(picked);
         if (index + 1) % 10 == 0 {
@@ -415,11 +790,12 @@ pub(super) fn run_rg_arm(args: RgArgs) -> Result<()> {
     }
     let scored: Vec<(&Value, Vec<Value>)> = items.iter().zip(answers).collect();
     let wave = args.wave.clone().unwrap_or_else(|| {
-        if args.decl_first {
-            "baseline-rg-decl".to_owned()
-        } else {
-            "baseline-rg".to_owned()
+        match rule {
+            "regex" => "baseline-rg-regex",
+            "fixed-decl-first" => "baseline-rg-decl",
+            _ => "baseline-rg",
         }
+        .to_owned()
     });
     let dir = args.out_dir.join(slug(&wave)).join(set_name(set));
     let cap = if args.top_k == 0 {
@@ -427,21 +803,40 @@ pub(super) fn run_rg_arm(args: RgArgs) -> Result<()> {
     } else {
         format!("top {}", args.top_k)
     };
+    let regex = args.rule == RgRule::Regex;
+    let (arm, order, answers_text) = if regex {
+        (
+            "rg baseline (regex rule of rg_arm.py)",
+            REGEX_ORDER.to_owned(),
+            format!("Q1/Q3 up to {}, Q2 top {}", args.max_answers, args.top_k),
+        )
+    } else {
+        (
+            "rg baseline (fixed strings, whole word)",
+            order_text(set, args.decl_first),
+            cap,
+        )
+    };
     let meta = json!({
-        "arm": "rg baseline (fixed strings, whole word)",
+        "arm": arm,
+        "rule": rule,
         "gold_aware": false,
-        "answers": cap,
-        "order": order_text(set, args.decl_first),
+        "answers": answers_text,
+        "order": order,
         "needles": { "backticked": backticked, "fallback": fallback, "none": none },
         "rg": rg.display().to_string(),
         "rg_version": version,
         "rg_failures": failures,
         "first_rg_failure": first_failure,
         "items_with_empty_answer": empty,
-        "max_per_file": args.max_per_file,
+        "max_per_file": if regex { Value::Null } else { json!(args.max_per_file) },
         "decl_first": args.decl_first,
         "items": items.len(),
-        "note": "needles come from the question only (backticked names, else lexical terms); no index, no SCIP, no model service",
+        "note": if regex {
+            "names come from the question's template only (trait, member, type); no index, no SCIP, no model service"
+        } else {
+            "needles come from the question only (backticked names, else lexical terms); no index, no SCIP, no model service"
+        },
     });
     let zeros = vec![0u64; scored.len()];
     let summary = write_arm_run(&dir, set, &scored, &zeros, &zeros, &meta)?;
@@ -637,6 +1032,169 @@ mod tests {
         assert_eq!(record["expansions"], Some(0.0));
         assert_eq!(record["model_calls"], Some(0.0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regex_rule_reads_the_templates_and_builds_the_patterns_from_the_trait_name() {
+        let q1 = regex_query("Which types implement `shapes::Shape`?").unwrap();
+        assert_eq!(
+            (q1.template, q1.trait_name.as_str(), q1.member, q1.ty),
+            (Template::Q1, "Shape", None, None)
+        );
+        let q2 = regex_query("Where is `shapes::Shape::area` implemented for `Circle`?").unwrap();
+        assert_eq!(
+            (
+                q2.template,
+                q2.trait_name.as_str(),
+                q2.member.as_deref(),
+                q2.ty.as_deref()
+            ),
+            (Template::Q2, "Shape", Some("area"), Some("Circle"))
+        );
+        let q3 = regex_query("What must change if `Shape::area` changes?").unwrap();
+        assert_eq!(
+            (q3.template, q3.trait_name.as_str(), q3.member.as_deref()),
+            (Template::Q3, "Shape", Some("area"))
+        );
+        // a member needs a trait before it; other wordings are not templates
+        assert!(regex_query("What must change if `area` changes?").is_none());
+        assert!(regex_query("where do config readers register").is_none());
+
+        let (header, derive) = regex_patterns("Shape");
+        assert_eq!(header, r"\bimpl\b[^{;]*\bShape\b[^{;]*\bfor\b");
+        assert_eq!(derive, r"#\[derive\([^)]*\bShape\b");
+        assert_eq!(
+            regex_patterns("a.b").0,
+            r"\bimpl\b[^{;]*\ba\.b\b[^{;]*\bfor\b"
+        );
+
+        // the derive test is the derive pattern; whole words only
+        assert!(is_derive_line("#[derive(Debug, Shape)]", "Shape"));
+        assert!(!is_derive_line("#[derive(Debug, ShapeExt)]", "Shape"));
+        assert!(!is_derive_line("#[derive(Debug)] // Shape", "Shape"));
+        assert!(!is_derive_line("impl Shape for Circle {", "Shape"));
+        assert!(type_after_for("impl Shape for Circle {", "Circle"));
+        assert!(!type_after_for(
+            "impl<T: Circle> Shape for Square {",
+            "Circle"
+        ));
+        assert!(!type_after_for("impl Shape for CircleX {", "Circle"));
+    }
+
+    fn hit(path: &str, line: u64, text: &str, derive: bool) -> HeaderHit {
+        HeaderHit {
+            path: path.to_owned(),
+            line,
+            text: text.to_owned(),
+            derive,
+        }
+    }
+
+    #[test]
+    fn regex_rule_member_search_and_ranking() {
+        let source: Vec<String> = [
+            "impl Shape for Square {",
+            "    fn name(&self) -> &str { \"sq\" }",
+            "    fn area(&self) -> f64 {",
+            "        1.0",
+            "    }",
+            "}",
+            "impl Shape for Circle {",
+            "    fn side(&self) {}",
+            "}",
+            "impl Shape for Disc {",
+            "    fn area(&self) -> f64 {",
+            "        fn area() {}",
+            "    }",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // depth 1 only; the header line itself opens the block
+        assert_eq!(member_line(&source, 0, "area", 2000), Some(3));
+        assert_eq!(member_line(&source, 6, "area", 2000), None);
+        assert_eq!(member_line(&source, 9, "area", 2000), Some(11));
+        assert_eq!(member_line(&source, 0, "area", 2), None);
+        assert!(has_fn_member("    pub fn area(&self)", "area"));
+        assert!(!has_fn_member("    fn areas(&self)", "area"));
+        assert!(!has_fn_member("    fnarea", "area"));
+
+        let hits = vec![
+            hit("b.rs", 1, "impl Shape for Square {", false),
+            hit("a.rs", 1, "impl Shape for Circle {", false),
+            hit("a.rs", 4, "impl Shape for Disc {", false),
+            hit("a.rs", 9, "#[derive(Shape)]", true),
+        ];
+        // b.rs holds Square's block; a.rs holds Circle (no area) and Disc
+        let mut member_at = |path: &str, header: u64, member: &str| -> Result<Option<u64>> {
+            let lines = if path == "b.rs" {
+                &source[0..6]
+            } else {
+                &source[6..]
+            };
+            let start = (header as usize).saturating_sub(1);
+            Ok(member_line(lines, start, member, 2000))
+        };
+        let q = |template, ty: Option<&str>| RegexQuery {
+            template,
+            trait_name: "Shape".into(),
+            member: Some("area".into()),
+            ty: ty.map(String::from),
+        };
+        // Q1: every header or derive line, path then line
+        let q1 = RegexQuery {
+            member: None,
+            ..q(Template::Q1, None)
+        };
+        let all = rank_regex(&q1, &hits, &mut member_at, 40, 10).unwrap();
+        assert_eq!(
+            places(&all),
+            [at("a.rs", 1), at("a.rs", 4), at("a.rs", 9), at("b.rs", 1)]
+        );
+        assert_eq!(
+            rank_regex(&q1, &hits, &mut member_at, 2, 10).unwrap().len(),
+            2
+        );
+        // Q3: headers with the member, derives skipped, path then line
+        let q3 = rank_regex(&q(Template::Q3, None), &hits, &mut member_at, 40, 10).unwrap();
+        assert_eq!(places(&q3), [at("a.rs", 5), at("b.rs", 3)]);
+        // Q2: the header naming the type first, then path/line; cut by q2_cut
+        let q2 = rank_regex(
+            &q(Template::Q2, Some("Square")),
+            &hits,
+            &mut member_at,
+            40,
+            10,
+        )
+        .unwrap();
+        assert_eq!(places(&q2), [at("b.rs", 3), at("a.rs", 5)]);
+        let q2 = rank_regex(
+            &q(Template::Q2, Some("Square")),
+            &hits,
+            &mut member_at,
+            40,
+            1,
+        )
+        .unwrap();
+        assert_eq!(places(&q2), [at("b.rs", 3)]);
+    }
+
+    #[test]
+    fn regex_rule_parses_rg_json_hits_and_marks_derives() {
+        let json = r##"{"type":"begin","data":{"path":{"text":"./src\\a.rs"}}}
+{"type":"match","data":{"path":{"text":"./src\\a.rs"},"lines":{"text":"impl Shape for Circle {\n"},"line_number":3,"absolute_offset":10,"submatches":[]}}
+{"type":"match","data":{"path":{"text":"./src\\a.rs"},"lines":{"text":"#[derive(Clone, Shape)]\n"},"line_number":9,"absolute_offset":60,"submatches":[]}}
+{"type":"summary","data":{"stats":{}}}
+"##;
+        let hits = parse_header_hits(json.as_bytes(), "Shape").unwrap();
+        assert_eq!(
+            hits,
+            [
+                hit("src/a.rs", 3, "impl Shape for Circle {", false),
+                hit("src/a.rs", 9, "#[derive(Clone, Shape)]", true)
+            ]
+        );
     }
 
     #[test]
