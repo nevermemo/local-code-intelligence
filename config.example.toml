@@ -582,9 +582,12 @@ grep_corroboration = 1.0
 pricing = "rank"
 
 # [run_profile.scip]: what a traversal does with the SCIP index (index.scip).
-# mode = "authoritative" (default): the index is required; a missing or
-# unreadable file is an error. "cache": the index is read when the file is there
-# and readable; otherwise the SCIP graph is empty and a note says so. "off": the
+# mode = "cache" (default): the index is read when the file is there and
+# readable; otherwise the SCIP graph is empty and a note says so. A file that
+# cannot be parsed is parsed once per file stamp (size and modified time); later
+# calls say it was not read again until the stamp changes or 30 s pass. An I/O
+# error is never remembered. "authoritative": the
+# index is required; a missing or unreadable file is an error. "off": the
 # index path is never touched; graph.scip, structure.contains (beyond chunk
 # lines), scip.impact, scip.implements, tests.tested_by, config.key and
 # exact.closure are empty,
@@ -592,7 +595,7 @@ pricing = "rank"
 # Part of the run-profile hash. Recipes read the index under "cache" when it is
 # there and refuse under "off" or without it.
 [run_profile.scip]
-mode = "authoritative"
+mode = "cache"
 
 # [run_profile.lsp]: whose language servers the lsp.live map asks (the map is
 # opt-in: name it in `maps`).

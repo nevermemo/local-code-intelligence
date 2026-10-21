@@ -105,11 +105,12 @@ pub struct RunProfileFreshness {
 #[serde(rename_all = "lowercase")]
 pub enum ScipMode {
     /// The index is required and read; a missing or unreadable file is an
-    /// error. Today's behaviour.
-    #[default]
+    /// error. The strict opt-in.
     Authoritative,
-    /// The index is a cache: a missing or unreadable file gives an empty SCIP
-    /// graph and a note; a readable one is loaded as under `authoritative`.
+    /// The default. The index is a cache: a missing or unreadable file gives
+    /// an empty SCIP graph and a note; a readable one is loaded as under
+    /// `authoritative`. An unreadable file is parsed once per file stamp.
+    #[default]
     Cache,
     /// The index path is never touched; the SCIP graph and every map built
     /// from the index are empty.
@@ -145,8 +146,8 @@ impl std::str::FromStr for ScipMode {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScipProfile {
-    /// `"authoritative"` (default, the index is required), `"cache"` (read it
-    /// when it is there) or `"off"` (never read it).
+    /// `"cache"` (default: read the index when it is there), `"authoritative"`
+    /// (the index is required) or `"off"` (never read it).
     pub mode: ScipMode,
 }
 
@@ -769,7 +770,7 @@ mod tests {
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
-        config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
+        config.run_profile.scip.mode = crate::config::profile::ScipMode::Authoritative;
         config.run_profile.lsp.sessions = LspSessions::PerCall;
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.freshness.stat_gate = true;
@@ -903,11 +904,8 @@ mod tests {
     #[test]
     fn scip_mode_changes_the_profile_hash() {
         let base = Config::default().run_profile();
-        assert!(
-            base.canonical
-                .contains(r#""scip":{"mode":"authoritative"}"#)
-        );
-        let hashes: Vec<String> = [ScipMode::Authoritative, ScipMode::Cache, ScipMode::Off]
+        assert!(base.canonical.contains(r#""scip":{"mode":"cache"}"#));
+        let hashes: Vec<String> = [ScipMode::Cache, ScipMode::Authoritative, ScipMode::Off]
             .into_iter()
             .map(|mode| {
                 let mut config = Config::default();
