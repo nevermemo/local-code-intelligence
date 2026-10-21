@@ -239,6 +239,9 @@ pub fn run_capture(mut command: Command, timeout: Duration) -> Result<String, St
     );
     let waited = wait_limited(child, timeout, KillScope::Process)
         .map_err(|e| format!("wait for git: {e}"))?;
+    if !waited.reaped {
+        tracing::warn!(pid = waited.pid, "a timed-out git child was not reaped");
+    }
     let Some(status) = waited.status else {
         let _ = (stdout.join(), stderr.join());
         return Err(format!("timeout after {}s", timeout.as_secs()));

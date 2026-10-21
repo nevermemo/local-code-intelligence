@@ -552,8 +552,10 @@ mod tests {
         let holder = open_lock_file(temp.path());
         holder.lock().unwrap();
 
-        // The waiter tells the test when its thread is about to block in
-        // `lock()`; the release then has to be what wakes it.
+        // The waiter tells the test when its thread is about to enter
+        // `lock()` (the callback fires just before the call, so the release
+        // below may come before or after the thread blocks); either way the
+        // wait can only end through the release, since the holder keeps the lock.
         let (blocking, about_to_block) = std::sync::mpsc::channel();
         let waiter = tokio::spawn(lock_file_exclusive(
             open_lock_file(temp.path()),

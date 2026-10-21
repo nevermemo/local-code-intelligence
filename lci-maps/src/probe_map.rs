@@ -139,6 +139,9 @@ pub(crate) fn run_limited(mut command: Command, timeout: Duration) -> std::io::R
     );
     let waited = wait_limited(child, timeout, KillScope::Tree)?;
     let (status, timed_out) = (waited.status, waited.timed_out);
+    if !waited.reaped {
+        tracing::warn!(pid = waited.pid, "a timed-out probe child was not reaped");
+    }
     // After a kill a grandchild that survived may still hold the pipes: wait
     // a moment, then take what there is.
     let grace = if timed_out {
