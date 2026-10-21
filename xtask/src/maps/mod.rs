@@ -8,6 +8,7 @@ pub mod bench;
 pub mod compare;
 pub mod fit_priors;
 pub mod fit_tiebreak;
+pub mod lsp_cost;
 pub mod oracle;
 pub mod supplement;
 pub mod trend;
@@ -29,6 +30,13 @@ pub enum MapsCommand {
     /// tied at the same rank) from the raw outputs of a bench run of one set,
     /// leaving the hold-out items out of the fit.
     FitTiebreak(fit_tiebreak::FitTiebreakArgs),
+    /// What `lsp.live` costs on a live tree (K11d-1): one `serve` process per
+    /// arm on 127.0.0.1:8769, the committed questions asked over MCP
+    /// `search_code mode=traverse`, cold and warm ms per expansion, external
+    /// calls, pops per 5 s, RSS, budget hits and the version probe's ms, quiet
+    /// and under a CPU-only synthetic load. The report goes to
+    /// test-results/lsp-cost/<stamp>/.
+    LspCost(lsp_cost::LspCostArgs),
     /// Compare two bench runs of one set item by item: per metric the paired
     /// means, the mean difference B - A with a 95% paired-bootstrap interval,
     /// and the counts of items B is above, below or level on. Items either run
@@ -61,6 +69,7 @@ pub fn run(command: MapsCommand) -> Result<()> {
         MapsCommand::Bench(args) => bench::run(*args),
         MapsCommand::FitPriors(args) => fit_priors::run(args),
         MapsCommand::FitTiebreak(args) => fit_tiebreak::run(args),
+        MapsCommand::LspCost(args) => lsp_cost::run(args),
         MapsCommand::Compare(args) => compare::run(args),
         MapsCommand::Baseline { which } => baseline::run(which),
         MapsCommand::OraclePolicy(args) => oracle::run_policy(args),

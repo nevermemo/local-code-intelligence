@@ -85,6 +85,34 @@ The integration cases remain one Cargo test binary. Their source is divided by
 behavior so agents can read and run a narrow group without paying the compile
 and link cost of many separate integration binaries.
 
+## LSP cost report (`cargo xtask maps lsp-cost`)
+
+A live measurement, not a test, and never part of `--suite Full`: what `lsp.live` costs on a real tree with a real
+rust-analyzer. It needs a built server binary (`cargo build --workspace --features local-code-intelligence/map-equivalence`),
+`rust-analyzer` on `PATH`, and no model service: the arms build their index vectorless (the model URLs name closed
+ports, and the semantic, LSP-search and reranker channels are off). Each arm starts `serve` on 127.0.0.1:8769 from a
+copy of the binary (one process, one scratch data directory, one config), builds the index over MCP, asks the committed
+questions (`xtask/questions/lsp-cost.json`) with `search_code mode = traverse`, and kills the process tree at the end.
+Never run it while something else holds 8769. The harness has no Ctrl-C handler: if it is interrupted or killed, the `serve` process and its rust-analyzer may outlive it and the scratch directories (`--work-dir`, default `lci-lsp-cost-<stamp>` under the OS temp dir) are not removed. Stop that process tree (the `lci-lsp-cost` copy of the server and its children, not by image name across the machine), check that 8769 is free, and delete the work directory by hand. `--report-from <dir>[,<dir>...]` rebuilds a merged report (`report-merged.md`) from finished or cut-short run directories without running anything.
+
+```bash
+# the compiled xtask, not `cargo xtask`: the run takes about two hours and must not hold a cargo slot
+xtask maps lsp-cost --binary <target>/debug/local-code-intelligence --arms base --max-questions 2 --repeat 1 --load none   # smoke
+xtask maps lsp-cost --binary <target>/debug/local-code-intelligence                                                         # all 7 arms, 12 questions x 5 rounds, quiet then loaded
+```
+
+Options: `--arms` (`base`, `shared`, `shared+cache`, `shared+impl`, `shared+sync`, `per_call+sync`, `lifecycle`),
+`--repeat`, `--max-questions`, `--load none|cpu|both`, `--load-threads` (default: half the logical cores), `--deadline-ms`
+(20000), `--scip` (an `index.scip` of the tree; missing, `rust-analyzer scip` writes one into the output directory and
+the report says so), `--questions`, `--out`, `--work-dir`. The `loaded` condition is CPU-only synthetic load (busy
+threads, no disk traffic), not parallel `cargo` builds. The output, `test-results/lsp-cost/<stamp>/`, holds `report.md`
+(one table per condition, a `diff` column against `base`, the version-probe distribution, the N8 window of the `shared`
+arm), `calls.jsonl` (one line per call) and `raw/` (every answer). The report reads cold and warm ms per expansion,
+external calls and pops per 5 s from the answer's `totals` (wall time only for the cold call, the probe and the pops row)
+and the probe's ms from a `debug!` line of the server (`lsp.live version probe`, run with
+`RUST_LOG=local_code_intelligence::app::traverse=debug`). Its mechanism (answer parsing, arm configs, the arithmetic and
+the tables) is covered by `cargo test -p xtask lsp_cost::`.
+
 ## Optional: cargo-nextest
 
 When [cargo-nextest](https://nexte.st) is installed (`cargo install cargo-nextest --locked`), the test step of

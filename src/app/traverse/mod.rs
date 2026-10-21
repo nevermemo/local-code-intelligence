@@ -1010,7 +1010,18 @@ pub async fn run_with_trait_seeds(
                 // The version probe is bounded like the readiness probes.
                 let probe =
                     std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
-                ManagerBackend::open_with_probe_timeout(workspace, manager, probe).await
+                let probe_started = Instant::now();
+                let opened =
+                    ManagerBackend::open_with_probe_timeout(workspace, manager, probe).await;
+                // `cargo xtask maps lsp-cost` reads this line: a shared manager
+                // probes a binary once, so later calls log about 0 ms.
+                tracing::debug!(
+                    probe_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
+                    probe_limit_ms = probe.as_millis() as u64,
+                    ok = opened.is_ok(),
+                    "lsp.live version probe"
+                );
+                opened
             }
             Err(error) => Err(error),
         };
