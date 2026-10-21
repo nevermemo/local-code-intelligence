@@ -391,6 +391,53 @@ pub fn source_files(root: &Path, prose: bool) -> Result<Vec<ListedSource>> {
     Ok(listed)
 }
 
+/// What reading one source file gave (see [`read_source`]).
+enum ReadSource {
+    /// Removed between the walk and the read.
+    Removed,
+    /// A known non-source format saved under a source extension.
+    Skipped(language::NonSource),
+    /// The decoded text, its hash and whether the decoding was lossy.
+    Source {
+        source: String,
+        content_hash: String,
+        lossy: bool,
+    },
+}
+
+/// The one place a listed file is read, skipped by content, decoded and
+/// hashed: the index scan ([`sources_with_read`]) and the freshness hashes
+/// ([`source_hashes_with`]) both go through it, so a hash is the same bytes
+/// through the same function whichever path made it.
+fn read_source(
+    adapter: &language::LanguageAdapter,
+    path: &Path,
+    relative: &str,
+    read: &mut impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<ReadSource> {
+    let bytes = match read(path) {
+        Ok(bytes) => bytes,
+        // Removed between the walk and the read (a branch switch during a
+        // run): not an error. Any other failure aborts the pass, so the
+        // previous index is kept rather than silently losing the file.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(path = %relative, %error, "skipping source file removed during the scan");
+            return Ok(ReadSource::Removed);
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {relative}")),
+    };
+    if let Some(reason) = adapter.non_source(&bytes) {
+        return Ok(ReadSource::Skipped(reason));
+    }
+    let (source, lossy) = decode_source(bytes);
+    let content_hash = hash(&source);
+    Ok(ReadSource::Source {
+        source,
+        content_hash,
+        lossy,
+    })
+}
+
 fn sources_with_read(
     root: &Path,
     prose: bool,
@@ -403,37 +450,225 @@ fn sources_with_read(
         let Some((adapter, relative)) = source_entry(root, &entry, prose)? else {
             continue;
         };
-        let bytes = match read(entry.path()) {
-            Ok(bytes) => bytes,
-            // Removed between the walk and the read (a branch switch during a
-            // run): not an error. Any other failure aborts the pass, so the
-            // previous index is kept rather than silently losing the file.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(path = %relative, %error, "skipping source file removed during the scan");
-                continue;
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {relative}")),
-        };
-        if let Some(reason) = adapter.non_source(&bytes) {
-            skipped.push(SkippedFile {
+        match read_source(adapter, entry.path(), &relative, &mut read)? {
+            ReadSource::Removed => {}
+            ReadSource::Skipped(reason) => skipped.push(SkippedFile {
                 relative_path: relative,
                 reason,
-            });
-            continue;
+            }),
+            ReadSource::Source {
+                source,
+                content_hash,
+                lossy,
+            } => files.push(SourceFile {
+                relative_path: relative,
+                source,
+                content_hash,
+                adapter,
+                lossy,
+            }),
         }
-        let (source, lossy) = decode_source(bytes);
-        let source_hash = hash(&source);
-        files.push(SourceFile {
-            relative_path: relative,
-            source,
-            content_hash: source_hash,
-            adapter,
-            lossy,
-        });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     skipped.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(Sources { files, skipped })
+}
+
+/// One source file's content hash from [`source_hashes`]: the hash is of the
+/// decoded text, the one the index scan records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedSource {
+    /// Path relative to the root, with `/`.
+    pub relative: String,
+    /// The adapter's identifier (`"rust"`), as the index records it.
+    pub language: &'static str,
+    /// The adapter's cache version, as the index records it.
+    pub adapter_version: &'static str,
+    pub content_hash: String,
+    /// The file's modification time, `None` where the platform has none.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// What [`source_hashes`] gave: the hashed files sorted by path, and how many
+/// files it read against how many it listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceHashes {
+    pub files: Vec<HashedSource>,
+    /// Files whose bytes were read this call (a gated call reads only the
+    /// files whose stamp is new or changed).
+    pub read_files: usize,
+    /// Files the walk listed that the index would read, including those a
+    /// content check skips.
+    pub listed_files: usize,
+}
+
+/// A file modified less than this before the moment its stamp would be kept
+/// (or in the future of that moment) has a racy stamp: the gate does not keep
+/// it, so the next call reads the file again. It covers a write that lands in
+/// the same clock tick as the stamp and filesystems whose stamps are coarse
+/// (FAT and exFAT 2 s, SMB shares, some 1 s filesystems).
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a [`StatGate`] remembers of one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateEntry {
+    /// `None`: no stamp is kept (the file has no modified time, or its stamp
+    /// was racy), so the entry never matches and the file is read next call.
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    /// The content hash; `None`: the file is a known non-source format and is
+    /// skipped (it is not read again while its stamp stays).
+    hash: Option<String>,
+}
+
+/// The stat gate of [`source_hashes_with`]: per file, the `(modified, length)`
+/// it was last read at and the hash that read gave. A file whose stamp is the
+/// same and has a modified time is not read again. A stamp younger than
+/// [`RACY_WINDOW`] when it is taken is not kept. The gap, by construction: a
+/// same-length edit that keeps a modified time older than `RACY_WINDOW`
+/// before the previous read (a deliberate `set_modified`, or a clock that went
+/// back) is not seen until the file's next edit.
+#[derive(Debug, Default)]
+pub struct StatGate {
+    entries: HashMap<String, GateEntry>,
+}
+
+impl StatGate {
+    /// The files the gate holds an entry for.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The process-wide gate of one root (keyed by its canonical path, so two
+/// spellings of a root share it). A call holds the gate for its walk: two
+/// calls on one root run one after the other, and a call on another root is
+/// never held up.
+pub fn stat_gate(root: &Path) -> std::sync::Arc<std::sync::Mutex<StatGate>> {
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    static GATES: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<StatGate>>>>> =
+        OnceLock::new();
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+/// The content hashes of the files the index would read under `root`, for the
+/// freshness checks that compare hashes only (no chunks are made).
+/// `stat_gate = false`: every file is read and hashed. `true`: through the
+/// root's process-wide [`StatGate`], which reads only the files whose
+/// `(modified, length)` is new or changed. Prose files only with `prose`.
+pub fn source_hashes(root: &Path, prose: bool, stat_gate_on: bool) -> Result<SourceHashes> {
+    if !stat_gate_on {
+        return source_hashes_with(root, prose, None, |path| std::fs::read(path));
+    }
+    let gate = stat_gate(root);
+    let mut gate = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    source_hashes_with(root, prose, Some(&mut gate), |path| std::fs::read(path))
+}
+
+/// [`source_hashes`] with an explicit gate and file reader. A file whose
+/// stamp equals the gate's entry (and has a modified time) is not read: its
+/// kept hash, or its kept "skipped", stands. Anything else is read, checked
+/// against the non-source formats, decoded and hashed by the index's own
+/// function ([`read_source`]), and the gate keeps the result. Entries of files
+/// no longer listed are dropped. A file removed during the walk is left out.
+/// The stamp is taken before the read, so an edit between the two is seen on
+/// the next call.
+pub fn source_hashes_with(
+    root: &Path,
+    prose: bool,
+    mut gate: Option<&mut StatGate>,
+    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<SourceHashes> {
+    let mut out = SourceHashes::default();
+    let mut listed = HashSet::new();
+    for entry in source_walk(root) {
+        let entry = entry.context("workspace traversal failed")?;
+        let Some((adapter, relative)) = source_entry(root, &entry, prose)? else {
+            continue;
+        };
+        // A stat that fails otherwise is no stamp: the file is read and never
+        // gated, as a file with no modified time is.
+        let (modified, len) = match entry.metadata() {
+            Ok(metadata) => (metadata.modified().ok(), metadata.len()),
+            Err(error)
+                if error.io_error().map(std::io::Error::kind)
+                    == Some(std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(_) => (None, 0),
+        };
+        out.listed_files += 1;
+        let kept = gate
+            .as_deref()
+            .and_then(|gate| gate.entries.get(&relative))
+            .filter(|kept| modified.is_some() && kept.modified == modified && kept.len == len)
+            .map(|kept| kept.hash.clone());
+        // A kept entry was trusted when it was recorded (see `RACY_WINDOW`).
+        let mut trusted = true;
+        let content_hash = match kept {
+            Some(content_hash) => content_hash,
+            None => {
+                out.read_files += 1;
+                let content_hash = match read_source(adapter, entry.path(), &relative, &mut read)? {
+                    ReadSource::Removed => {
+                        out.listed_files -= 1;
+                        continue;
+                    }
+                    ReadSource::Skipped(_) => None,
+                    ReadSource::Source { content_hash, .. } => Some(content_hash),
+                };
+                // Racy stamp: a file modified within `RACY_WINDOW` of this
+                // read can be written again under the same stamp and length
+                // (a clock tick, or a coarse filesystem), so its stamp is not
+                // kept and the next call reads it again.
+                trusted = modified.is_some_and(|modified| {
+                    std::time::SystemTime::now()
+                        .duration_since(modified)
+                        .is_ok_and(|age| age >= RACY_WINDOW)
+                });
+                content_hash
+            }
+        };
+        if let Some(gate) = gate.as_deref_mut() {
+            listed.insert(relative.clone());
+            gate.entries.insert(
+                relative.clone(),
+                GateEntry {
+                    modified: modified.filter(|_| trusted),
+                    len,
+                    hash: content_hash.clone(),
+                },
+            );
+        }
+        if let Some(content_hash) = content_hash {
+            out.files.push(HashedSource {
+                relative,
+                language: adapter.identifier(),
+                adapter_version: adapter.cache_version(),
+                content_hash,
+                modified,
+            });
+        }
+    }
+    if let Some(gate) = gate {
+        gate.entries.retain(|relative, _| listed.contains(relative));
+    }
+    out.files.sort_by(|a, b| a.relative.cmp(&b.relative));
+    Ok(out)
 }
 
 fn fingerprint_material(file: &SourceFile) -> String {
@@ -2385,5 +2620,263 @@ T add(T a, T b) {
             );
         }
         assert_chunks_cover(&chunks, source);
+    }
+
+    // ---- the stat-gated hashes of the freshness checks (slice K38) ------------
+
+    /// Sets a file's modified time (std, no sleeping).
+    fn stamp(path: &Path, modified: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    /// One pass of [`source_hashes_with`] over `root` with a counting reader:
+    /// the result and how many files the reader was asked for.
+    fn gated_pass(root: &Path, gate: Option<&mut StatGate>) -> (SourceHashes, usize) {
+        let reads = std::cell::Cell::new(0);
+        let hashes = source_hashes_with(root, false, gate, |path| {
+            reads.set(reads.get() + 1);
+            std::fs::read(path)
+        })
+        .unwrap();
+        assert_eq!(hashes.read_files, reads.get());
+        (hashes, reads.get())
+    }
+
+    fn by_path(hashes: &SourceHashes) -> std::collections::BTreeMap<&str, &str> {
+        hashes
+            .files
+            .iter()
+            .map(|file| (file.relative.as_str(), file.content_hash.as_str()))
+            .collect()
+    }
+
+    fn base_stamp() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+    }
+
+    #[test]
+    fn a_stat_gated_pass_reads_only_what_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.join(name), format!("fn {}() {{}}\n", &name[..1])).unwrap();
+            stamp(&root.join(name), base_stamp());
+        }
+        let mut gate = StatGate::default();
+
+        let (first, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!((reads, first.listed_files, gate.len()), (3, 3, 3));
+        // Nothing changed: nothing is read, and the hashes are the same.
+        let (second, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(reads, 0);
+        assert_eq!(by_path(&second), by_path(&first));
+        assert_eq!(second.listed_files, 3);
+
+        // A new length: that file alone is read, with a new hash.
+        let mut text = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        text.push_str("fn more() {}\n");
+        std::fs::write(root.join("a.rs"), text).unwrap();
+        // (An old stamp: a stamp near now is racy and is read every call, see
+        // the racy test below.)
+        stamp(
+            &root.join("a.rs"),
+            base_stamp() + std::time::Duration::from_secs(5),
+        );
+        let (third, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(reads, 1);
+        assert_ne!(by_path(&third)["a.rs"], by_path(&first)["a.rs"]);
+        assert_eq!(by_path(&third)["b.rs"], by_path(&first)["b.rs"]);
+
+        // A touch (a new modified time, the same bytes): read once, the hash
+        // is unchanged.
+        stamp(
+            &root.join("b.rs"),
+            base_stamp() + std::time::Duration::from_secs(1),
+        );
+        let (fourth, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(reads, 1);
+        assert_eq!(by_path(&fourth), by_path(&third));
+
+        // A file deleted leaves the result and the gate; a file added is read.
+        std::fs::remove_file(root.join("c.rs")).unwrap();
+        std::fs::write(root.join("d.rs"), "fn d() {}\n").unwrap();
+        stamp(
+            &root.join("d.rs"),
+            base_stamp() + std::time::Duration::from_secs(6),
+        );
+        let (fifth, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(reads, 1);
+        assert_eq!(
+            by_path(&fifth).keys().copied().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "d.rs"]
+        );
+        assert_eq!(gate.len(), 3);
+
+        // The language and adapter version are the index's.
+        let rust = language::for_extension("rs").unwrap();
+        assert!(fifth.files.iter().all(|file| {
+            file.language == rust.identifier() && file.adapter_version == rust.cache_version()
+        }));
+
+        // Without a gate every pass reads every file.
+        assert_eq!(gated_pass(root, None).1, 3);
+        assert_eq!(gated_pass(root, None).1, 3);
+    }
+
+    #[test]
+    fn a_file_with_no_modified_time_is_never_gated_and_a_gate_entry_needs_one() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        stamp(&temp.path().join("a.rs"), base_stamp());
+        let mut gate = StatGate::default();
+        // An entry with no modified time never matches, whatever the length.
+        gate.entries.insert(
+            "a.rs".into(),
+            GateEntry {
+                modified: None,
+                len: 10,
+                hash: Some("kept".into()),
+            },
+        );
+        let (hashes, reads) = gated_pass(temp.path(), Some(&mut gate));
+        assert_eq!(reads, 1);
+        assert_ne!(by_path(&hashes)["a.rs"], "kept");
+        assert!(gate.entries["a.rs"].modified.is_some());
+    }
+
+    #[test]
+    fn the_stat_gate_misses_a_same_length_same_mtime_edit_and_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.rs");
+        std::fs::write(&file, "fn old() {}\n").unwrap();
+        stamp(&file, base_stamp());
+        let mut gate = StatGate::default();
+        let (before, _) = gated_pass(temp.path(), Some(&mut gate));
+
+        // The documented gap: new bytes of the same length under the old stamp.
+        std::fs::write(&file, "fn new() {}\n").unwrap();
+        stamp(&file, base_stamp());
+        let (gated, reads) = gated_pass(temp.path(), Some(&mut gate));
+        assert_eq!(reads, 0);
+        assert_eq!(by_path(&gated), by_path(&before), "the gated hash is stale");
+        let (ungated, _) = gated_pass(temp.path(), None);
+        assert_ne!(
+            by_path(&ungated)["a.rs"],
+            by_path(&before)["a.rs"],
+            "the ungated hash sees the edit"
+        );
+        // The next edit that moves the stamp is seen.
+        stamp(&file, base_stamp() + std::time::Duration::from_secs(1));
+        let (after, reads) = gated_pass(temp.path(), Some(&mut gate));
+        assert_eq!(reads, 1);
+        assert_eq!(by_path(&after), by_path(&ungated));
+    }
+
+    #[test]
+    fn a_stamp_near_now_is_racy_and_a_same_length_rewrite_is_seen() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.rs");
+        // Just written: its stamp is within `RACY_WINDOW` of the read.
+        std::fs::write(&file, "fn old() {}\n").unwrap();
+        let mut gate = StatGate::default();
+        let (before, reads) = gated_pass(temp.path(), Some(&mut gate));
+        assert_eq!(reads, 1);
+        // The same length, no `set_modified`: whether or not the filesystem
+        // moved the stamp, the racy file is read again and the new hash shows.
+        std::fs::write(&file, "fn new() {}\n").unwrap();
+        let (after, reads) = gated_pass(temp.path(), Some(&mut gate));
+        assert_eq!(reads, 1, "a racy stamp is not trusted");
+        assert_ne!(by_path(&after)["a.rs"], by_path(&before)["a.rs"]);
+        assert_eq!(by_path(&after), by_path(&gated_pass(temp.path(), None).0));
+        // A stamp older than the window is kept.
+        stamp(&file, std::time::SystemTime::now() - RACY_WINDOW * 2);
+        assert_eq!(gated_pass(temp.path(), Some(&mut gate)).1, 1);
+        assert_eq!(gated_pass(temp.path(), Some(&mut gate)).1, 0);
+        // A stamp in the future is racy too.
+        stamp(&file, std::time::SystemTime::now() + RACY_WINDOW * 2);
+        assert_eq!(gated_pass(temp.path(), Some(&mut gate)).1, 1);
+        assert_eq!(gated_pass(temp.path(), Some(&mut gate)).1, 1);
+    }
+
+    #[test]
+    fn gated_hashes_equal_the_scan_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("locale")).unwrap();
+        std::fs::write(root.join("plain.rs"), "fn plain() {}\n").unwrap();
+        std::fs::write(root.join("bom.rs"), "\u{feff}fn bom() {}\n").unwrap();
+        std::fs::write(root.join("lossy.c"), b"int x = 1; /* caf\xe9 */\n").unwrap();
+        std::fs::write(root.join("send.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(root.join("locale/app_de.ts"), QT_LINGUIST_CATALOG).unwrap();
+        std::fs::write(root.join("notes.md"), "# Notes\n\ntext\n").unwrap();
+        // Old stamps, so the gate keeps them (a stamp near now is racy).
+        for name in [
+            "plain.rs",
+            "bom.rs",
+            "lossy.c",
+            "send.ts",
+            "locale/app_de.ts",
+            "notes.md",
+        ] {
+            stamp(&root.join(name), base_stamp());
+        }
+
+        let scan = scan_incremental_with(root, &HashMap::new(), false).unwrap();
+        let scanned: std::collections::BTreeMap<&str, &str> = scan
+            .files
+            .iter()
+            .map(|(path, file)| (path.as_str(), file.content_hash.as_str()))
+            .collect();
+        assert!(!scanned.contains_key("locale/app_de.ts"));
+        assert!(!scanned.contains_key("notes.md"));
+        assert_eq!(scanned.len(), 4, "{scanned:?}");
+
+        let mut gate = StatGate::default();
+        let (first, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(by_path(&first), scanned);
+        // Five files are read (the catalog too); none again.
+        assert_eq!(reads, 5);
+        let (second, reads) = gated_pass(root, Some(&mut gate));
+        assert_eq!(by_path(&second), scanned);
+        assert_eq!(
+            reads, 0,
+            "a skipped file stays skipped while its stamp stays"
+        );
+        assert_eq!(second.listed_files, 5);
+        assert_eq!(by_path(&gated_pass(root, None).0), scanned);
+
+        // The same through the process-wide gate of the root.
+        let global = source_hashes(root, false, true).unwrap();
+        assert_eq!(by_path(&global), scanned);
+        assert_eq!(global.read_files, 5);
+        assert_eq!(source_hashes(root, false, true).unwrap().read_files, 0);
+        assert_eq!(source_hashes(root, false, false).unwrap().read_files, 5);
+    }
+
+    #[test]
+    fn the_stat_gate_registry_is_per_root() {
+        let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = stat_gate(one.path());
+        assert!(std::sync::Arc::ptr_eq(&a, &stat_gate(one.path())));
+        assert!(!std::sync::Arc::ptr_eq(&a, &stat_gate(two.path())));
+        // A root's gate does not hold up a call on another root.
+        let _held = a.lock().unwrap();
+        std::fs::write(two.path().join("a.rs"), "fn a() {}\n").unwrap();
+        // Run on a thread with a bound, so a shared gate fails the test
+        // instead of hanging it.
+        let other = two.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(source_hashes(&other, false, true).map(|h| h.files.len()));
+        });
+        let files = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a call on another root waited for the first root's gate");
+        assert_eq!(files.unwrap(), 1);
     }
 }

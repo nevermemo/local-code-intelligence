@@ -69,6 +69,24 @@ pub struct RunProfileFreshness {
     /// `[index].freshness`. It costs one read of the tree's source files per
     /// call. See the README "Verify on read".
     pub verify_on_read: bool,
+    /// Skip re-reading files whose modified time and length have not changed
+    /// when `map_freshness` or `verify_on_read` reads the tree. `false` (the
+    /// default): every such read hashes every source file, as before. `true`:
+    /// the process keeps `(modified time, length)` and the content hash per
+    /// source file and per root, lists the tree without reading it, and reads
+    /// and hashes only the files whose stamp is new or changed (a file with no
+    /// modified time is always read). The answers equal the full-hash path's
+    /// except for one gap: a same-length edit that keeps a modified time older
+    /// than 3 seconds before the previous read of the file (a deliberate
+    /// `set_modified`, or a clock that went back) is not seen until the file's
+    /// next edit. A file modified within 3 seconds of a read is not trusted
+    /// and is read again on the next call, which covers a write in the same
+    /// clock tick and filesystems with coarse stamps (FAT and exFAT 2 s, SMB
+    /// shares, 1 s filesystems). The table is
+    /// per process and per root and is rebuilt on the first call; the index
+    /// scan is not gated. The key is in the profile hash (the stamp says what
+    /// ran).
+    pub stat_gate: bool,
 }
 
 /// What a traversal does with the SCIP index (`[run_profile.scip] mode`).
@@ -656,6 +674,7 @@ mod tests {
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config.run_profile.lsp.sessions = LspSessions::Shared;
         config.run_profile.freshness.verify_on_read = true;
+        config.run_profile.freshness.stat_gate = true;
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
         config.run_profile.lsp.call_hierarchy = true;
@@ -929,6 +948,36 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn stat_gate_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.freshness.stat_gate);
+        let text = format!("{}[run_profile.freshness]\nstat_gate = true\n", base_toml());
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.freshness.stat_gate);
+        // The key is independent of `verify_on_read`.
+        assert!(!on.run_profile.freshness.verify_on_read);
+        // It changes what ran (the cost, and the same-stamp gap), so it
+        // changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["freshness"]["stat_gate"], false);
+        assert_eq!(on.value["run_profile"]["freshness"]["stat_gate"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.freshness.stat_gate")
+        );
+        assert_ne!(off.hash, on.hash);
+        for bad in [
+            "[run_profile.freshness]\nstat_gate = \"yes\"\n",
+            "[run_profile]\nstat_gate = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -1011,6 +1060,7 @@ mode = \"sometimes\"
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",
             "run_profile.freshness.verify_on_read",
+            "run_profile.freshness.stat_gate",
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
             "run_profile.lsp.call_hierarchy",
