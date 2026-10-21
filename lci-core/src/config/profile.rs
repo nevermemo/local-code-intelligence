@@ -492,6 +492,21 @@ pub struct LspProfile {
     /// (see [`LspPlaces`]). The recipes walk no `lsp.live` and run the same
     /// under both values.
     pub places: LspPlaces,
+    /// `false` (default): every call probes and starts a language server as it
+    /// is asked, so a server that is not there is probed again on every call.
+    /// `true`: a provider whose version probe failed, or whose server could not
+    /// be started (it could not be spawned, exited, or broke the protocol), is
+    /// left alone for 30 seconds: the next probe or start of that provider is
+    /// refused at once, with a note that names the window (see
+    /// `lsp::LspBreakers`). The windows are per provider and shared by the
+    /// process's managers (the MCP and REST server's and each call's);
+    /// `lci traverse` under `sessions = "per_call"` builds no shared manager
+    /// and so has no window. A
+    /// server that is already running is still asked, a start that timed out
+    /// opens no window (it may only be slow), and `/ready` still probes the
+    /// binaries. The recipes walk no `lsp.live` and run the same under both
+    /// values.
+    pub breaker: bool,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -508,6 +523,7 @@ pub const EXCLUDED_KEYS: &[&str] = &[
     "reranker_timeout_seconds",
     "readiness_timeout_seconds",
     "lsp_timeout_seconds",
+    "lsp_start_timeout_seconds",
     "lsp_search_budget_ms",
     "lsp_idle_timeout_seconds",
     "lsp_stuck_seconds",
@@ -717,6 +733,7 @@ mod tests {
         config.rust_analyzer_path = "ra2".into();
         config.rust_analyzer_trusted = true;
         config.lsp_timeout_seconds = 11;
+        config.lsp_start_timeout_seconds = 19;
         config.lsp_search_budget_ms = 12;
         config.lsp_idle_timeout_seconds = 13;
         config.lsp_stuck_seconds = 14;
@@ -1209,6 +1226,7 @@ mode = \"sometimes\"
             "run_profile.seeds.literal",
             "run_profile.lsp.sync",
             "run_profile.lsp.places",
+            "run_profile.lsp.breaker",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -1603,6 +1621,49 @@ mode = \"sometimes\"
         assert_eq!(LspPlaces::Outline.as_str(), "outline");
         assert_eq!("scip".parse::<LspPlaces>(), Ok(LspPlaces::Scip));
         assert!("index".parse::<LspPlaces>().is_err());
+    }
+
+    #[test]
+    fn lsp_breaker_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.lsp.breaker);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nbreaker = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.lsp.breaker);
+        // Only the named leaf moves.
+        assert_eq!(on.run_profile.lsp.sessions, LspSessions::Shared);
+        assert_eq!(on.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(on.run_profile.lsp.places, LspPlaces::Scip);
+        assert!(!on.run_profile.lsp.implementations);
+        assert!(!on.run_profile.lsp.call_hierarchy);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["lsp"]["breaker"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["breaker"], false);
+        assert_eq!(on.value["run_profile"]["lsp"]["breaker"], true);
+        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.breaker"));
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nbreaker = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.lsp]\nbreaker = \"yes\"\n",
+            "[run_profile.lsp]\nbreaker = 1\n",
+            "[run_profile]\nbreaker = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

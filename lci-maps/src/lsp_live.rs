@@ -118,6 +118,11 @@
 //! walk, as an error the caller reports; the map is then not registered. The
 //! version probe of a server runs once per manager ([`Manager::probe_once`]),
 //! so a shared manager probes a binary once, not on every call. Under
+//! `[run_profile.lsp] breaker = true` a probe that failed, or a server that
+//! failed to start without timing out, also opens a 30 s window in which the
+//! next probe or start of that provider is refused at once, by the shared and the
+//! per-call manager alike ([`lci_core::lsp::LspBreakers`]); a server already
+//! running is still asked. Under
 //! `[run_profile.lsp] outline_cache = true` the manager also keeps each file's
 //! non-empty outline by content hash and server session, for the servers that
 //! are resent a file's text before every request (pyright, gopls, jdtls,
