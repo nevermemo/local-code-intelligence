@@ -8281,13 +8281,25 @@ async fn an_edit_between_overlapping_walks_restarts_the_server_once_and_both_ans
         2,
         "the first server, then one post-edit server shared by both walks"
     );
+    // The flag reached the fake: every watched-files notice it got was ignored,
+    // so the new tree came from the barrier's restart, not from the sync.
+    let ignored: Vec<Value> = std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["method"] == "workspace/didChangeWatchedFiles")
+        .map(|event| event["note"].clone())
+        .collect();
+    assert!(
+        ignored.iter().all(|note| note == "watched-ignored"),
+        "{ignored:?}"
+    );
     manager.shutdown_all().await;
 }
 
 /// A walk whose server the barrier of another walk stopped does not go on
 /// with it: its next request looks the session up again, starts a server on
-/// the new tree (no retry needed, the stopped one is not consulted) and is
-/// answered from it. The walk's own record names no kept session, because the
+/// the new tree and is answered from it. The walk's own record names no kept session, because the
 /// second server is one the walk started.
 #[tokio::test]
 async fn a_walk_whose_server_the_barrier_stopped_answers_its_next_request_from_the_new_tree() {
