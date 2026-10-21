@@ -7047,9 +7047,9 @@ async fn lsp_live_outline_places_walk_without_a_scip_index() {
             "sym:csharp:Shapes.cs::Area/method",
             "sym:csharp:Shapes.cs::Area/method~1",
             "sym:csharp:Shapes.cs::Area/method~2",
-            "sym:csharp:Shapes.cs::Circle/struct",
-            "sym:csharp:Shapes.cs::IShape/trait",
-            "sym:csharp:Shapes.cs::Square/struct",
+            "sym:csharp:Shapes.cs::Circle/class",
+            "sym:csharp:Shapes.cs::IShape/interface",
+            "sym:csharp:Shapes.cs::Square/class",
         ],
         "{}",
         report.response
@@ -7178,9 +7178,9 @@ async fn lsp_live_outline_places_give_contains_and_implements_edges_without_an_i
             "sym:csharp:Shapes.cs::Area/method",
             "sym:csharp:Shapes.cs::Area/method~1",
             "sym:csharp:Shapes.cs::Area/method~2",
-            "sym:csharp:Shapes.cs::Circle/struct",
-            "sym:csharp:Shapes.cs::IShape/trait",
-            "sym:csharp:Shapes.cs::Square/struct",
+            "sym:csharp:Shapes.cs::Circle/class",
+            "sym:csharp:Shapes.cs::IShape/interface",
+            "sym:csharp:Shapes.cs::Square/class",
         ]
     );
     assert_eq!(found.cost.external_calls, 1);

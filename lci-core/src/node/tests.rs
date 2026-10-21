@@ -591,3 +591,55 @@ fn ord_agrees_with_eq_even_for_invalid_ids() {
     assert_ne!(none.cmp(&empty), std::cmp::Ordering::Equal);
     assert_eq!(BTreeSet::from([none, empty]).len(), 2);
 }
+
+#[test]
+fn every_symbol_kind_name_round_trips_and_the_outline_kinds_parse() {
+    let kinds = [
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Struct,
+        SymbolKind::Enum,
+        SymbolKind::Union,
+        SymbolKind::Trait,
+        SymbolKind::Const,
+        SymbolKind::Static,
+        SymbolKind::TypeAlias,
+        SymbolKind::Module,
+        SymbolKind::Macro,
+        SymbolKind::Field,
+        SymbolKind::Variable,
+        SymbolKind::Interface,
+        SymbolKind::Class,
+    ];
+    for kind in kinds {
+        let id = NodeId::Symbol(SymbolKey {
+            language: "rust".into(),
+            module_path: vec!["a".into()],
+            container: Vec::new(),
+            name: "x".into(),
+            kind,
+            disambiguator: 0,
+        });
+        let parsed: NodeId = id.to_string().parse().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(parsed, id, "{id}");
+    }
+    for (text, kind) in [
+        ("sym:csharp:Shapes.cs::Circle/class", SymbolKind::Class),
+        (
+            "sym:csharp:Shapes.cs::IShape/interface",
+            SymbolKind::Interface,
+        ),
+        ("sym:typescript:a::x/variable", SymbolKind::Variable),
+        ("sym:rust:a::f/field", SymbolKind::Field),
+    ] {
+        match text.parse::<NodeId>() {
+            Ok(NodeId::Symbol(key)) => assert_eq!(key.kind, kind, "{text}"),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+    assert!(
+        "sym:csharp:Shapes.cs::P/property"
+            .parse::<NodeId>()
+            .is_err()
+    );
+}

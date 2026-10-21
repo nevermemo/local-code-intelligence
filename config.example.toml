@@ -627,12 +627,14 @@ mode = "authoritative"
 # and walk, none for a file already outlined) and from then on the outline's
 # places win in that file, so lines inserted since the index was written no
 # longer lose edges. A symbol of the index keeps its id; a function, method,
-# type, enum, module or constant the index lacks gets an id with the file's
-# language (sym:csharp:Shapes.cs::Area/method), so with scip.mode = "off" a
-# file's declarations have ids once it is outlined. Fields, properties and
-# variables have no node yet. A seed that is a symbol id of a file never
-# outlined still has no place. Needs a server that answers documentSymbol. The
-# recipes never run lsp.live and are the same under both values.
+# type, enum, module, constant, field (a property too) or variable the index
+# lacks gets an id with the file's language (sym:csharp:Shapes.cs::Area/method;
+# a class is /class, an interface /interface, a Rust trait /trait), so with
+# scip.mode = "off" a file's declarations have ids once it is outlined. Enum
+# members, impl blocks and type parameters have no node. A seed that is a
+# symbol id of a file never outlined still has no place. Needs a server that
+# answers documentSymbol. The recipes never run lsp.live and are the same
+# under both values.
 # All six keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"

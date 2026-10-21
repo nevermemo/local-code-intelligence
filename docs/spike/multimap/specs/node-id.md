@@ -76,7 +76,7 @@ Canonical strings (all scoped by the workspace id, which is not part of the stri
 | DocSection | `doc:<path>#<slug>/<slug>[~<n>]` | `doc:AGENTS.md#hard-rules` |
 | StringLiteral | `str:<text_hash>` | `str:41ab...` (SHA-256 of the literal's normalised text) |
 
-Symbol kinds' string names: `fn`, `method`, `struct`, `enum`, `union`, `trait`, `const`, `static`, `type`, `mod`, `macro`.
+Symbol kinds' string names: `fn`, `method`, `struct`, `enum`, `union`, `trait`, `const`, `static`, `type`, `mod`, `macro`, `field`, `variable`, `interface`, `class`. The first eleven come from the Rust extractor and the SCIP index; the last four only from language-server outlines (`lsp.live` under `places = "outline"`).
 
 Percent-encoding (upper-case `%XX` per UTF-8 byte) applies to `%` and control characters everywhere; to `@`, `#` and `~` inside a
 path (a path may contain them; `/` stays as written); to `@`, `#`, `~`, `/` and `:` inside a segment (hash, slug, container

@@ -46,8 +46,9 @@
 //!   complements `graph.scip`, it does not replace it.
 //! * file (or chunk, standing for its file) -> the symbols
 //!   `textDocument/documentSymbol` lists whose name the table also defines,
-//!   kind [`EdgeKind::Contains`]. Members the table has no node for (fields,
-//!   variables: a node id needs a symbol the walk can name) are left out.
+//!   kind [`EdgeKind::Contains`]. Under `places = "outline"` that includes
+//!   fields, properties and variables; members the table has no node for (enum
+//!   members, impl blocks, type parameters) are left out.
 //!
 //! The symbol <-> place table is the SCIP index's ([`ScipPlaces`]): the node
 //! ids of `graph.scip` are the ids there are. Under `[run_profile.lsp] places =

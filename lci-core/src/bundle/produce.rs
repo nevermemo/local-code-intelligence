@@ -206,7 +206,7 @@ impl StoredDeclaration {
     }
 }
 
-const KINDS: [SymbolKind; 11] = [
+const KINDS: [SymbolKind; 15] = [
     SymbolKind::Function,
     SymbolKind::Method,
     SymbolKind::Struct,
@@ -218,6 +218,10 @@ const KINDS: [SymbolKind; 11] = [
     SymbolKind::TypeAlias,
     SymbolKind::Module,
     SymbolKind::Macro,
+    SymbolKind::Field,
+    SymbolKind::Variable,
+    SymbolKind::Interface,
+    SymbolKind::Class,
 ];
 
 /// The kind whose [`SymbolKind::as_str`] is `name`.
@@ -243,6 +247,10 @@ mod tests {
             SymbolKind::TypeAlias => 8,
             SymbolKind::Module => 9,
             SymbolKind::Macro => 10,
+            SymbolKind::Field => 11,
+            SymbolKind::Variable => 12,
+            SymbolKind::Interface => 13,
+            SymbolKind::Class => 14,
         }
     }
 
@@ -252,6 +260,7 @@ mod tests {
             assert_eq!(position(kind), index);
             assert_eq!(symbol_kind(kind.as_str()), Some(kind));
         }
-        assert_eq!(symbol_kind("class"), None);
+        assert_eq!(symbol_kind("property"), None);
+        assert_eq!(symbol_kind("field"), Some(SymbolKind::Field));
     }
 }
