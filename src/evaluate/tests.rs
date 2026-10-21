@@ -1200,6 +1200,42 @@ fn untagged_runs_omit_by_tag_and_old_reports_still_load() {
     let back: AggregateReport = serde_json::from_str(&json).unwrap();
     assert_eq!(back.by_tag, tagged_report.by_tag);
     assert_eq!(back.queries[0].query.tags, ["keyword"]);
+
+    // A tagged report written before `lsp_budget_hit_queries` existed still
+    // loads, with the count read as zero.
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let keyword = value["by_tag"]["keyword"].as_object_mut().unwrap();
+    assert!(keyword.remove("lsp_budget_hit_queries").is_some());
+    let old: AggregateReport = serde_json::from_value(value).unwrap();
+    assert_eq!(old.by_tag["keyword"].lsp_budget_hit_queries, 0);
+    assert_eq!(old.by_tag["keyword"].executed_count, 1);
+}
+
+#[test]
+fn by_tag_counts_the_budget_hits_of_each_tag() {
+    let mut keyword = run_tagged(tagged("src/a.rs", &["keyword"]), &["src/a.rs"]);
+    keyword.metrics.lsp_budget_hit = true;
+    // A repeated tag on one query counts once.
+    let mut both = run_tagged(
+        tagged("src/a.rs", &["keyword", "keyword-agnostic", "keyword"]),
+        &["src/a.rs"],
+    );
+    both.metrics.lsp_budget_hit = true;
+    let reports = [
+        keyword,
+        both,
+        run_tagged(tagged("src/a.rs", &["keyword"]), &["src/a.rs"]),
+        run_tagged(tagged("src/a.rs", &["keyword-agnostic"]), &["src/a.rs"]),
+        QueryReport::skipped(tagged("src/a.rs", &["skipped-only"]), "optional".to_owned()),
+    ];
+    let report = aggregate(&reports);
+
+    assert_eq!(report.lsp_budget_hit_queries, 2);
+    assert_eq!(report.by_tag["keyword"].executed_count, 3);
+    assert_eq!(report.by_tag["keyword"].lsp_budget_hit_queries, 2);
+    assert_eq!(report.by_tag["keyword-agnostic"].executed_count, 2);
+    assert_eq!(report.by_tag["keyword-agnostic"].lsp_budget_hit_queries, 1);
+    assert!(!report.by_tag.contains_key("skipped-only"));
 }
 
 #[tokio::test]
