@@ -575,11 +575,21 @@ mode = "authoritative"
 # external call per symbol) and offers the answers as `implements` edges, from
 # an interface or trait member to the members that implement it. Needs a server
 # that answers the request; a failed request leaves the other edges alone.
-# All three keys are part of the run-profile hash.
+# sync = "off" (default): a language server is told nothing about edits after it
+# starts. "watch": this process's language-server manager watches each workspace
+# that has a running session and sends every source-file change to its servers
+# (workspace/didChangeWatchedFiles), so a long-lived session (search_symbols, the
+# search channel, a "shared" lsp.live) answers the tree as it is. It falls back to
+# polling every watch_poll_milliseconds when the platform watcher cannot start,
+# and stops with the workspace's last session. Independent of index watching. A
+# per-call manager (sessions = "per_call") never syncs. The recipes are the same
+# under both values.
+# All four keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"
 outline_cache = false
 implementations = false
+sync = "off"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against

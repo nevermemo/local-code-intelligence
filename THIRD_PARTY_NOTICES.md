@@ -187,6 +187,7 @@ foldhash@0.2.0 (1): Zlib
 form_urlencoded@1.2.2 (2): MIT, Apache-2.0
 frostem@1.20260821.5 (1): BSD-3-Clause
 fs_extra@1.3.0 (1): MIT
+fsevent-sys@4.1.0 (1): MIT
 fsst@11.0.0 (1): Apache-2.0
 fst@0.4.7 (2): Unlicense, MIT
 funty@2.0.0 (1): MIT
@@ -244,6 +245,8 @@ idna@1.1.0 (2): MIT, Apache-2.0
 idna_adapter@1.2.2 (2): Apache-2.0, MIT
 ignore@0.4.33 (2): Unlicense, MIT
 indexmap@2.14.2 (2): Apache-2.0, MIT
+inotify@0.11.5 (1): ISC
+inotify-sys@0.1.8 (1): ISC
 io-uring@0.7.15 (2): MIT, Apache-2.0
 ipnet@2.12.2 (2): MIT, Apache-2.0
 is_terminal_polyfill@1.70.2 (2): MIT, Apache-2.0
@@ -263,6 +266,8 @@ jobserver@0.1.35 (2): MIT, Apache-2.0
 js-sys@0.3.105 (2): MIT, Apache-2.0
 jsonb@0.5.6 (1): Apache-2.0
 kanaria@0.2.0 (1): MIT
+kqueue@1.2.1 (1): MIT
+kqueue-sys@1.1.2 (1): MIT
 lance@11.0.0 (1): Apache-2.0
 lance-arrow@11.0.0 (1): Apache-2.0
 lance-arrow-scalar@58.0.0 (1): Apache-2.0
@@ -326,6 +331,8 @@ munge@0.4.7 (1): MIT
 munge_macro@0.4.7 (1): MIT
 ndarray@0.16.1 (2): MIT, Apache-2.0
 nom@8.0.0 (1): MIT
+notify@8.2.0 (1): CC0-1.0
+notify-types@2.1.0 (2): MIT, Apache-2.0
 nu-ansi-term@0.50.3 (1): MIT
 num-bigint@0.4.8 (2): MIT, Apache-2.0
 num-complex@0.4.6 (2): MIT, Apache-2.0
@@ -556,16 +563,26 @@ windows-registry@0.6.1 (2): MIT, Apache-2.0
 windows-result@0.4.1 (2): MIT, Apache-2.0
 windows-strings@0.5.1 (2): MIT, Apache-2.0
 windows-sys@0.52.0 (2): MIT, Apache-2.0
+windows-sys@0.60.2 (2): MIT, Apache-2.0
 windows-sys@0.61.2 (2): MIT, Apache-2.0
 windows-targets@0.52.6 (2): MIT, Apache-2.0
+windows-targets@0.53.5 (2): MIT, Apache-2.0
 windows_aarch64_gnullvm@0.52.6 (2): MIT, Apache-2.0
+windows_aarch64_gnullvm@0.53.1 (2): MIT, Apache-2.0
 windows_aarch64_msvc@0.52.6 (2): MIT, Apache-2.0
+windows_aarch64_msvc@0.53.1 (2): MIT, Apache-2.0
 windows_i686_gnu@0.52.6 (2): MIT, Apache-2.0
+windows_i686_gnu@0.53.1 (2): MIT, Apache-2.0
 windows_i686_gnullvm@0.52.6 (2): MIT, Apache-2.0
+windows_i686_gnullvm@0.53.1 (2): MIT, Apache-2.0
 windows_i686_msvc@0.52.6 (2): MIT, Apache-2.0
+windows_i686_msvc@0.53.1 (2): MIT, Apache-2.0
 windows_x86_64_gnu@0.52.6 (2): MIT, Apache-2.0
+windows_x86_64_gnu@0.53.1 (2): MIT, Apache-2.0
 windows_x86_64_gnullvm@0.52.6 (2): MIT, Apache-2.0
+windows_x86_64_gnullvm@0.53.1 (2): MIT, Apache-2.0
 windows_x86_64_msvc@0.52.6 (2): MIT, Apache-2.0
+windows_x86_64_msvc@0.53.1 (2): MIT, Apache-2.0
 winnow@0.7.15 (1): MIT
 winnow@1.0.4 (1): MIT
 wit-bindgen@0.57.1 (3): Apache-2.0 WITH LLVM-exception, Apache-2.0, MIT

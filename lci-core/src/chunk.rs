@@ -307,13 +307,9 @@ fn sources(root: &Path, prose: bool) -> Result<Sources> {
     sources_with_read(root, prose, |path| std::fs::read(path))
 }
 
-fn sources_with_read(
-    root: &Path,
-    prose: bool,
-    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
-) -> Result<Sources> {
-    let mut files = Vec::new();
-    let mut skipped = Vec::new();
+/// The walk of the index: `.gitignore` and `.lciignore` honoured, hidden
+/// files included, links not followed, `.git` skipped.
+fn source_walk(root: &Path) -> ignore::Walk {
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(false)
@@ -321,28 +317,92 @@ fn sources_with_read(
         .require_git(false)
         .add_custom_ignore_filename(".lciignore")
         .filter_entry(|e| e.file_name() != ".git");
-    for entry in walker.build() {
+    walker.build()
+}
+
+/// The language adapter and `/`-separated relative path of a walked entry the
+/// index reads, or `None` for a directory, a file of no language, a prose file
+/// under `prose = false` or a non-UTF-8 path.
+fn source_entry(
+    root: &Path,
+    entry: &ignore::DirEntry,
+    prose: bool,
+) -> Result<Option<(&'static language::LanguageAdapter, String)>> {
+    if !entry.file_type().is_some_and(|t| t.is_file()) {
+        return Ok(None);
+    }
+    let Some(adapter) = language::for_path(entry.path()) else {
+        return Ok(None);
+    };
+    // `[index].prose = false`: prose files are not indexed at all.
+    if !prose && adapter.is_prose() {
+        return Ok(None);
+    }
+    let path = entry.path().strip_prefix(root)?;
+    let relative = path
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>();
+    let Some(relative) = relative else {
+        tracing::warn!(path = ?path, "skipping source file: non-UTF-8 file path");
+        return Ok(None);
+    };
+    Ok(Some((adapter, relative.join("/"))))
+}
+
+/// One file the index would read, from [`source_files`]: its path relative
+/// to the root (with `/`), its modification time (`None` where the platform
+/// has none) and its length in bytes. Nothing is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSource {
+    pub relative: String,
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+}
+
+/// The source files under `root` by the index's walk rules (the walk of the
+/// chunk scan, prose files only with `prose`), with their metadata and
+/// without reading them, sorted by path. A file removed during the walk is
+/// left out.
+pub fn source_files(root: &Path, prose: bool) -> Result<Vec<ListedSource>> {
+    let mut listed = Vec::new();
+    for entry in source_walk(root) {
+        let entry = entry.context("workspace traversal failed")?;
+        let Some((_, relative)) = source_entry(root, &entry, prose)? else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.io_error().map(std::io::Error::kind)
+                    == Some(std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).with_context(|| format!("stat {relative}")),
+        };
+        listed.push(ListedSource {
+            relative,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        });
+    }
+    listed.sort_by(|a, b| a.relative.cmp(&b.relative));
+    Ok(listed)
+}
+
+fn sources_with_read(
+    root: &Path,
+    prose: bool,
+    mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Sources> {
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in source_walk(root) {
         let entry = entry.context("workspace traversal failed; previous index retained")?;
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let Some(adapter) = language::for_path(entry.path()) else {
+        let Some((adapter, relative)) = source_entry(root, &entry, prose)? else {
             continue;
         };
-        // `[index].prose = false`: prose files are not indexed at all.
-        if !prose && adapter.is_prose() {
-            continue;
-        }
-        let path = entry.path().strip_prefix(root)?;
-        let relative = path
-            .components()
-            .map(|component| component.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>();
-        let Some(relative) = relative else {
-            tracing::warn!(path = ?path, "skipping source file: non-UTF-8 file path");
-            continue;
-        };
-        let relative = relative.join("/");
         let bytes = match read(entry.path()) {
             Ok(bytes) => bytes,
             // Removed between the walk and the read (a branch switch during a

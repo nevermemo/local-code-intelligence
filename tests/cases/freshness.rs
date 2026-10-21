@@ -11,11 +11,13 @@
 //! case says so (a longer file each time: the stamp is `(mtime, length)` and a
 //! Windows mtime may not move).
 //!
-//! No sleep, no wait: a case edits, searches (which is what the product does
-//! before it walks: the hybrid search refreshes a stale index under
-//! `on-search`), asks every map once, and compares. Lag is a generation
-//! distance: a map's lag at generation `g` is `g` minus the last generation it
-//! was fresh at.
+//! No sleep: a case edits, searches (which is what the product does before it
+//! walks: the hybrid search refreshes a stale index under `on-search`), asks
+//! every map once, and compares. The one wait is the product's own
+//! asynchronous window under `[run_profile.lsp] sync = "watch"`: after an edit
+//! the case waits, bounded, until the watcher has told the session (K8a).
+//! Lag is a generation distance: a map's lag at generation `g` is `g` minus
+//! the last generation it was fresh at.
 //!
 //! What counts as seeing the edit: the map reached a node that names the
 //! probe or the chunk that holds the probe in the tree as it is now; a channel
@@ -113,6 +115,15 @@ fn write_tree(root: &Path, generation: u32, shifted: bool) {
     write(root, "lci-core/src/config.rs", CONFIG_RS);
     write(root, "config.example.toml", "rate = 1\n");
 }
+
+/// The files of [`write_tree`] that the language-server sync forwards (the
+/// TOML example is no source file).
+const SYNCED_SOURCES: [&str; 4] = [
+    "src/Calculator.cs",
+    "src/CallSite.cs",
+    "src/shapes.rs",
+    "lci-core/src/config.rs",
+];
 
 /// The content hash of every source file of the tree, by relative path: the
 /// set the product counts for `map_freshness` (the chunk scan with prose off,
@@ -524,6 +535,9 @@ struct World {
     /// `[run_profile.freshness] verify_on_read` for the calls and the searches
     /// of this world.
     verify: bool,
+    /// `[run_profile.lsp] sync = "watch"` for the application's language
+    /// servers (`lsp.symbols`).
+    sync: bool,
     /// Observations made so far (names the SCIP file of each probe call).
     probe_runs: std::cell::Cell<u32>,
     /// The source files of the tree (path and content hash) as they were when
@@ -533,14 +547,25 @@ struct World {
 }
 
 impl World {
-    /// With the map labels (`map_freshness`) and `verify_on_read` on.
+    /// With the map labels (`map_freshness`), `verify_on_read` and the
+    /// language-server sync on.
     async fn start(freshness: IndexFreshness) -> World {
-        World::start_with(freshness, true, true).await
+        World::start_with(freshness, true, true, true).await
     }
 
-    async fn start_with(freshness: IndexFreshness, labels: bool, verify: bool) -> World {
+    async fn start_with(
+        freshness: IndexFreshness,
+        labels: bool,
+        verify: bool,
+        sync: bool,
+    ) -> World {
         let (temp, mut config, fake, models_task) = fixture().await;
         config.run_profile.freshness.verify_on_read = verify;
+        config.run_profile.lsp.sync = if sync {
+            local_code_intelligence::config::LspSync::Watch
+        } else {
+            local_code_intelligence::config::LspSync::Off
+        };
         config.traverse.enabled = true;
         // The exact cards would otherwise start the walk from the probes.
         config.traverse.exact_seeds = false;
@@ -584,6 +609,7 @@ impl World {
             last_fresh: BTreeMap::new(),
             labels,
             verify,
+            sync,
             probe_runs: std::cell::Cell::new(0),
             scip_tree,
         }
@@ -607,16 +633,52 @@ impl World {
     }
 
     /// Generation `g + 1`: the probes are written to the tree. Nothing else
-    /// moves: not the index, not the SCIP file, not the language server.
-    fn edit(&mut self) {
+    /// moves: not the index, not the SCIP file, not the language server
+    /// (unless the sync is on, which tells it).
+    async fn edit(&mut self) {
         self.generation += 1;
-        write_tree(&self.workspace, self.generation, self.shifted);
+        self.write_generation(self.shifted).await;
     }
 
     /// One blank line on top of `Calculator.cs`.
-    fn shift(&mut self) {
+    async fn shift(&mut self) {
         self.shifted = true;
-        write_tree(&self.workspace, self.generation, true);
+        self.write_generation(true).await;
+    }
+
+    /// The application's workspace id (its language-server sessions' key).
+    fn workspace_id(&self) -> String {
+        lci_core::workspace::Workspace::resolve(&self.workspace, &self.app.config.data_dir)
+            .unwrap()
+            .id
+    }
+
+    /// Writes the tree at the current generation. With the sync on, the
+    /// session started by the first observation is told about it before this
+    /// returns: a bounded wait on the watcher's own forwarding (the product's
+    /// asynchronous window), never a fixed sleep. The first wait makes sure
+    /// the sync's first walk is over, so an edit is a change of a known file.
+    async fn write_generation(&self, shifted: bool) {
+        let servers = self.app.language_servers();
+        let id = self.workspace_id();
+        // A session exists after the first observation (or a symbol call);
+        // before it there is none to tell: it walks the disk when it starts.
+        let told = self.sync && (self.probe_runs.get() > 0 || servers.sync_status(&id).is_some());
+        if told {
+            assert!(
+                servers.synced(&id, &[], LOADED_BUDGET).await,
+                "the sync of the session runs: {:?}",
+                servers.sync_status(&id)
+            );
+        }
+        write_tree(&self.workspace, self.generation, shifted);
+        if told {
+            assert!(
+                servers.synced(&id, &SYNCED_SOURCES, LOADED_BUDGET).await,
+                "the session was told about the edit: {:?}",
+                servers.sync_status(&id)
+            );
+        }
     }
 
     /// The SCIP file as an indexer would write it for the tree now. Its length
@@ -1168,13 +1230,18 @@ impl World {
     }
 }
 
-/// The gaps with `[run_profile.traverse] map_freshness` and `[run_profile.freshness]
-/// verify_on_read` on: stale and silent. A map that becomes fresh (K8a, K14d)
-/// or that gets a label that covers its lag must be struck from this list in
-/// the same commit, and a new gap fails the case that finds it.
-const EXPECTED_GAPS: &[(Case, &str, Why)] = &[
-    // The language-server session walked the tree before the edit and is told
-    // nothing after it, and its answer is not compared with the tree.
+/// The gaps with `[run_profile.traverse] map_freshness`, `[run_profile.freshness]
+/// verify_on_read` and `[run_profile.lsp] sync` on: stale and silent. A map
+/// that becomes fresh (K14d) or that gets a label that covers its lag must be
+/// struck from this list in the same commit, and a new gap fails the case
+/// that finds it.
+const EXPECTED_GAPS: &[(Case, &str, Why)] = &[];
+
+/// The maps that miss the edit only with `[run_profile.lsp] sync` off (K8a):
+/// the language-server session walked the tree before the edit and is told
+/// nothing after it, and its answer is not compared with the tree. With the
+/// sync on the session is told and answers the edit.
+const SYNCED: &[(Case, &str, Why)] = &[
     (Case::OnSearch, "lsp.symbols", Why::OldSession),
     (Case::Manual, "lsp.symbols", Why::OldSession),
     // After the SCIP file was rewritten only the session is behind.
@@ -1227,12 +1294,13 @@ const EXPECTED_LABELLED: &[(Case, &str, Why)] = &[
 
 type Listed = Vec<(Case, &'static str, Why)>;
 
-/// The gaps and the labelled maps a case must find. Both keys on: as the lists
+/// The gaps and the labelled maps a case must find. Every key on: as the lists
 /// say. `verify_on_read` off: the verified maps are gaps. `map_freshness` off:
 /// every labelled map is a gap (`verify_on_read` does nothing without it in a
-/// traverse answer).
-fn expected(labels: bool, verify: bool) -> (Listed, Listed) {
-    let gaps = EXPECTED_GAPS.iter().copied();
+/// traverse answer). `sync` off: the session's maps are gaps.
+fn expected(labels: bool, verify: bool, sync: bool) -> (Listed, Listed) {
+    let unsynced = SYNCED.iter().copied().filter(|_| !sync);
+    let gaps = EXPECTED_GAPS.iter().copied().chain(unsynced);
     let labelled = EXPECTED_LABELLED.iter().copied();
     let verified = VERIFIED_ON_READ.iter().copied();
     match (labels, verify) {
@@ -1411,28 +1479,60 @@ fn shift_table(verdicts: &BTreeMap<&str, Verdict>) -> String {
 }
 
 fn problems_of(
-    labels: bool,
-    verify: bool,
+    (labels, verify, sync): (bool, bool, bool),
     case: Case,
     found: &BTreeMap<&str, Verdict>,
 ) -> Result<(), String> {
-    let (gaps, labelled) = expected(labels, verify);
+    let (gaps, labelled) = expected(labels, verify, sync);
     compare_gaps(&gaps, &labelled, case, found)
 }
 
 impl World {
     /// The lists of this world's keys against what a case found.
     fn problems(&self, case: Case, found: &BTreeMap<&str, Verdict>) -> Result<(), String> {
-        problems_of(self.labels, self.verify, case, found)
+        problems_of((self.labels, self.verify, self.sync), case, found)
+    }
+
+    /// With the sync on, the session's own record shows it was told: a
+    /// `workspace/didChangeWatchedFiles` that names `src/Calculator.cs` as
+    /// changed (type 2) and that the fake applied (no note), from the one
+    /// server that started. Read after an observation, whose requests follow
+    /// the notification.
+    fn assert_session_told(&self) {
+        assert!(self.sync);
+        let events = events_of(&self.session_state);
+        assert!(events.iter().all(|event| event["spawn"] == 1), "one server");
+        let told: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["method"] == "workspace/didChangeWatchedFiles")
+            .collect();
+        assert!(!told.is_empty(), "no didChangeWatchedFiles");
+        for event in &told {
+            assert!(event.get("note").is_none(), "{event}");
+        }
+        assert!(
+            told.iter().any(|event| {
+                event["changes"].as_array().is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change["type"] == 2
+                            && change["uri"]
+                                .as_str()
+                                .is_some_and(|uri| uri.ends_with("src/Calculator.cs"))
+                    })
+                })
+            }),
+            "{told:?}"
+        );
     }
 }
 
 // ---- the cases ---------------------------------------------------------------
 
-/// The index and the snapshot follow an edit (`on-search`); every SCIP-built
-/// map and the language-server session do not. Two generations show the lag
-/// growing. (The two git maps have a test of their own below: they read
-/// commits, not the index, so it runs beside this one.)
+/// The index and the snapshot follow an edit (`on-search`), and so does the
+/// language-server session, which the sync tells; every SCIP-built map does
+/// not. Two generations show the lag growing. (The two git maps have a test of
+/// their own below: they read commits, not the index, so it runs beside this
+/// one.)
 #[tokio::test]
 async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
@@ -1441,7 +1541,7 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
     assert!(!before.stale_before_search);
 
     for generation in 1..=2u32 {
-        world.edit();
+        world.edit().await;
         let truth = world.truth();
         assert_eq!(truth.generation, generation);
         assert!(
@@ -1501,6 +1601,7 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
             &["src/Calculator.cs", "src/CallSite.cs", "src/shapes.rs"],
             true,
         );
+        world.assert_session_told();
         // The next generation is compared with this one.
         before = now;
     }
@@ -1523,7 +1624,7 @@ async fn on_search_the_git_maps_see_a_commit_and_not_an_uncommitted_edit() {
     );
 
     for generation in 1..=2u32 {
-        world.edit();
+        world.edit().await;
         assert_eq!(world.truth().generation, generation);
         // The edit is not history yet.
         let (history, pickaxe) = world.history().await;
@@ -1555,7 +1656,7 @@ async fn on_search_the_git_maps_see_a_commit_and_not_an_uncommitted_edit() {
 async fn manual_mode_index_maps_answer_the_old_snapshot_and_the_search_report_says_reused() {
     let mut world = World::start(IndexFreshness::Manual).await;
     let before = world.observe().await;
-    world.edit();
+    world.edit().await;
     let truth = world.truth();
     let now = world.observe().await;
     assert!(now.stale_before_search);
@@ -1567,6 +1668,7 @@ async fn manual_mode_index_maps_answer_the_old_snapshot_and_the_search_report_sa
     world
         .problems(Case::Manual, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    world.assert_session_told();
     // The live maps still see the edit.
     for map in ["grep.live", "lsp.live"] {
         assert_eq!(verdicts[map], Verdict::Fresh, "{map}");
@@ -1696,10 +1798,10 @@ async fn the_search_that_seeds_a_walk_does_not_scan_the_tree_again() {
 #[tokio::test]
 async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
-    world.edit();
+    world.edit().await;
     world.regenerate_scip();
     let before = world.observe().await;
-    world.shift();
+    world.shift().await;
     let truth = world.truth();
     let after = world.observe().await;
     assert_eq!(after.index_action, "refreshed_incrementally");
@@ -1734,16 +1836,17 @@ async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
 }
 
 /// A rewritten SCIP file (a longer one: the stamp is `(mtime, length)`)
-/// refreshes every map built from it, and only those: the language-server
-/// session is still behind. The next edit makes them lag again by one. The
-/// snapshot is refreshed by a search before the rewrite, so the stamp reload is
-/// tested on its own, not as a side effect of an index refresh (the stale
-/// verdicts of that search are the first generation of the `on_search` case).
+/// refreshes every map built from it, and only those (the language-server
+/// session is fresh by the sync, which this world has on). The next edit
+/// makes them lag again by one. The snapshot is refreshed by a search before
+/// the rewrite, so the stamp reload is tested on its own, not as a side effect
+/// of an index refresh (the stale verdicts of that search are the first
+/// generation of the `on_search` case).
 #[tokio::test]
 async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
     let before = world.observe().await;
-    world.edit();
+    world.edit().await;
     let truth = world.truth();
     let stale = world.observe().await;
     assert_eq!(stale.index_action, "refreshed_incrementally");
@@ -1761,9 +1864,15 @@ async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     for map in SCOPE.iter().filter(|map| why_of(map) == Why::OldIndex) {
         assert_eq!(verdicts[map], Verdict::Fresh, "{map} reloads by the stamp");
     }
+    assert_eq!(
+        verdicts["lsp.symbols"],
+        Verdict::Fresh,
+        "the sync told the session"
+    );
+    world.assert_session_told();
 
     // The next edit: the SCIP-built maps are one generation behind.
-    world.edit();
+    world.edit().await;
     let truth = world.truth();
     let again = world.observe().await;
     let verdicts = world.verdicts(&before, &again, &truth);
@@ -1806,13 +1915,14 @@ fn events_of(state: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// The application's language-server session walks the tree when it starts
-/// and is told nothing after that: an edit on disk is not in its answers, and
-/// a new session has it. The fake answers from its store (K7a), so this is the
-/// store's staleness and not the disk's.
+/// With `[run_profile.lsp] sync` off (the default), the application's
+/// language-server session walks the tree when it starts and is told nothing
+/// after that: an edit on disk is not in its answers, and a new session has it.
+/// The fake answers from its store (K7a), so this is the store's staleness and
+/// not the disk's.
 #[tokio::test]
 async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
-    let mut world = World::start(IndexFreshness::OnSearch).await;
+    let mut world = World::start_with(IndexFreshness::OnSearch, true, true, false).await;
     // The names the session lists in `Calculator.cs` (the fake walks the
     // sidecar's Rust file too, and answers from it).
     let names = |results: &[local_code_intelligence::lsp::Location]| -> Vec<String> {
@@ -1829,7 +1939,7 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
         .unwrap();
     assert_eq!(names(&first.results), ["Combine"]);
 
-    world.edit();
+    world.edit().await;
     assert!(
         std::fs::read_to_string(world.workspace.join("src/Calculator.cs"))
             .unwrap()
@@ -1871,6 +1981,14 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
         "the store still holds the text it walked"
     );
 
+    // No sync ran.
+    assert!(
+        world
+            .app
+            .language_servers()
+            .sync_status(&world.workspace_id())
+            .is_none()
+    );
     // A new session walks the disk again and has it.
     world
         .app
@@ -1895,18 +2013,74 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
     world.finish().await;
 }
 
+/// With `[run_profile.lsp] sync = "watch"` the same session is told about the
+/// edit and lists the probe: no new server answered, the fake's store holds
+/// the new text, and the sync walked the tree once (at start), not per event.
+#[tokio::test]
+async fn with_sync_on_the_session_is_told_about_the_edit_and_lists_the_probe() {
+    let mut world = World::start(IndexFreshness::OnSearch).await;
+    let names = |results: &[local_code_intelligence::lsp::Location]| -> Vec<String> {
+        results
+            .iter()
+            .filter(|found| found.relative_file_path.as_deref() == Some("src/Calculator.cs"))
+            .map(|found| found.name.clone().unwrap_or_default())
+            .collect()
+    };
+    let first = world
+        .app
+        .symbols(&world.workspace, "Combine")
+        .await
+        .unwrap();
+    assert_eq!(names(&first.results), ["Combine"]);
+
+    world.edit().await;
+    let found = world
+        .app
+        .symbols(&world.workspace, "ProbeG1")
+        .await
+        .unwrap();
+    assert_eq!(names(&found.results), ["ProbeG1"], "{found:?}");
+    world.assert_session_told();
+    assert_eq!(
+        store_lines(&world.session_state),
+        calculator(1, false).lines().count() as u64,
+        "the store holds the edited text"
+    );
+    let status = world
+        .app
+        .language_servers()
+        .sync_status(&world.workspace_id())
+        .expect("the session's workspace is synced");
+    assert_eq!((status.walks, status.rescans), (1, 0), "{status:?}");
+    assert!(status.batches >= 1 && status.forwarded >= 1, "{status:?}");
+    // Released with its last session.
+    world
+        .app
+        .release_language_servers(&world.workspace)
+        .await
+        .unwrap();
+    assert!(
+        world
+            .app
+            .language_servers()
+            .sync_status(&world.workspace_id())
+            .is_none()
+    );
+    world.finish().await;
+}
+
 /// With the key off the answer has no `maps[]`, so the maps that are labelled
 /// with it on are gaps: the same data, no label. Run on the case that finds
 /// the most (`on-search`) here, and on the line shift in the test below.
 #[tokio::test]
 async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps() {
-    let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
+    let mut world = World::start_with(IndexFreshness::OnSearch, false, false, false).await;
     let before = world.observe().await;
     assert!(
         before.walk.get("maps").is_none(),
         "no maps[] with the key off"
     );
-    world.edit();
+    world.edit().await;
     let truth = world.truth();
     let now = world.observe().await;
     assert!(now.walk.get("maps").is_none(), "no maps[] with the key off");
@@ -1914,7 +2088,7 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     let verdicts = world.verdicts(&before, &now, &truth);
     let shown = table(Case::OnSearch, &verdicts);
     eprintln!("key off\n{shown}");
-    problems_of(false, false, Case::OnSearch, &verdicts)
+    problems_of((false, false, false), Case::OnSearch, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     // Every map the key labels is a silent gap here (the lag is the number of
     // generations).
@@ -1930,11 +2104,11 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
 /// The line shift of the test above, with the key off.
 #[tokio::test]
 async fn without_the_key_the_labelled_maps_are_gaps_on_a_line_shift_too() {
-    let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
-    world.edit();
+    let mut world = World::start_with(IndexFreshness::OnSearch, false, false, false).await;
+    world.edit().await;
     world.regenerate_scip();
     let before = world.observe().await;
-    world.shift();
+    world.shift().await;
     let truth = world.truth();
     let after = world.observe().await;
     assert!(
@@ -1944,7 +2118,7 @@ async fn without_the_key_the_labelled_maps_are_gaps_on_a_line_shift_too() {
     let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
     let shown = shift_table(&verdicts);
     eprintln!("key off\n{shown}");
-    problems_of(false, false, Case::LineShift, &verdicts)
+    problems_of((false, false, false), Case::LineShift, &verdicts)
         .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     world.finish().await;
 }
@@ -1971,9 +2145,9 @@ async fn with_verify_on_read_off_the_snapshot_maps_and_the_shifted_live_maps_are
         }
     };
 
-    let mut world = World::start_with(IndexFreshness::Manual, true, false).await;
+    let mut world = World::start_with(IndexFreshness::Manual, true, false, false).await;
     let before = world.observe().await;
-    world.edit();
+    world.edit().await;
     let truth = world.truth();
     let now = world.observe().await;
     let verdicts = world.verdicts(&before, &now, &truth);
@@ -2013,11 +2187,11 @@ async fn with_verify_on_read_off_the_snapshot_maps_and_the_shifted_live_maps_are
     }
     world.finish().await;
 
-    let mut world = World::start_with(IndexFreshness::OnSearch, true, false).await;
-    world.edit();
+    let mut world = World::start_with(IndexFreshness::OnSearch, true, false, false).await;
+    world.edit().await;
     world.regenerate_scip();
     let before = world.observe().await;
-    world.shift();
+    world.shift().await;
     let truth = world.truth();
     let after = world.observe().await;
     let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
@@ -2050,6 +2224,7 @@ fn the_gap_list_is_exact_in_both_directions() {
     let mut seen = BTreeSet::new();
     for (case, map, _) in EXPECTED_GAPS
         .iter()
+        .chain(SYNCED)
         .chain(EXPECTED_LABELLED)
         .chain(VERIFIED_ON_READ)
     {
@@ -2059,7 +2234,7 @@ fn the_gap_list_is_exact_in_both_directions() {
     // `verify_on_read` moves exactly the verified maps between the lists:
     // labelled with both keys on, gaps with it off, and every labelled map is
     // a gap with `map_freshness` off.
-    let (gaps, labelled) = expected(true, true);
+    let (gaps, labelled) = expected(true, true, true);
     for entry in VERIFIED_ON_READ {
         assert!(
             labelled.contains(entry) && !gaps.contains(entry),
@@ -2067,17 +2242,32 @@ fn the_gap_list_is_exact_in_both_directions() {
         );
     }
     assert_eq!(gaps, EXPECTED_GAPS);
-    // What is left of the gaps with both keys on: the language-server session
-    // answers its own view of the tree, which nothing compares yet.
+    // With every key on no gap is left: the language-server session, the last
+    // one, is told about edits by the sync.
+    assert!(EXPECTED_GAPS.is_empty(), "{EXPECTED_GAPS:?}");
+    // `sync` moves exactly the session's maps: gaps with it off, absent
+    // (fresh) with it on, whatever the other keys are.
     assert_eq!(
-        EXPECTED_GAPS,
+        SYNCED,
         [
             (Case::OnSearch, "lsp.symbols", Why::OldSession),
             (Case::Manual, "lsp.symbols", Why::OldSession),
             (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
         ]
     );
-    let (gaps, labelled) = expected(true, false);
+    for (labels, verify) in [(true, true), (true, false), (false, false)] {
+        let (on, on_labelled) = expected(labels, verify, true);
+        let (off, off_labelled) = expected(labels, verify, false);
+        assert_eq!(on_labelled, off_labelled);
+        let added: Listed = off
+            .iter()
+            .filter(|entry| !on.contains(entry))
+            .copied()
+            .collect();
+        assert_eq!(added, SYNCED);
+        assert!(on.iter().all(|entry| off.contains(entry)));
+    }
+    let (gaps, labelled) = expected(true, false, true);
     for entry in VERIFIED_ON_READ {
         assert!(
             gaps.contains(entry) && !labelled.contains(entry),
@@ -2085,18 +2275,20 @@ fn the_gap_list_is_exact_in_both_directions() {
         );
     }
     assert_eq!(labelled, EXPECTED_LABELLED);
-    let (gaps, labelled) = expected(false, true);
+    let (gaps, labelled) = expected(false, true, false);
     assert!(labelled.is_empty());
     assert_eq!(
         gaps.len(),
-        EXPECTED_GAPS.len() + EXPECTED_LABELLED.len() + VERIFIED_ON_READ.len()
+        EXPECTED_GAPS.len() + SYNCED.len() + EXPECTED_LABELLED.len() + VERIFIED_ON_READ.len()
     );
     for (labels, verify) in [(true, true), (true, false), (false, false)] {
-        let (gaps, labelled) = expected(labels, verify);
-        lists_are_exact(&gaps, &labelled);
+        for sync in [true, false] {
+            let (gaps, labelled) = expected(labels, verify, sync);
+            lists_are_exact(&gaps, &labelled);
+        }
     }
     // A map that gave nothing before the edit cannot be called fresh or a gap.
-    let (gaps, labelled) = expected(true, true);
+    let (gaps, labelled) = expected(true, true, true);
     let mut unexercised = verdicts_of(Case::OnSearch, &gaps, &labelled);
     unexercised.insert("grep.live", Verdict::Unexercised);
     assert!(compare_gaps(&gaps, &labelled, Case::OnSearch, &unexercised).is_err());
