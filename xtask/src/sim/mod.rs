@@ -186,6 +186,7 @@ pub fn run(args: SimArgs) -> Result<()> {
                 tree: args.tree.clone(),
                 maps: args.maps.clone(),
                 policy: None,
+                config: None,
                 policy_dir: None,
                 max_depth: None,
                 fusion: None,
