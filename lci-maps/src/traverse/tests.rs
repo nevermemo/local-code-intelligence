@@ -2404,6 +2404,38 @@ mod steering {
         assert!(lc.fraction > 0.0 && lc.fraction <= 1.0);
     }
 
+    /// K13: the answer shows the estimate on every result, not only in a
+    /// checkpoint (d425 left a complete answer without one).
+    #[tokio::test]
+    async fn the_result_carries_the_estimate_the_checkpoint_would() {
+        let edges = [("a", "b"), ("a", "c"), ("a", "d"), ("a", "e")];
+        let shared = || {
+            registry(vec![
+                GraphMap::new("m1", &edges),
+                GraphMap::new("m2", &[("a", "d"), ("a", "e"), ("a", "f")]),
+            ])
+        };
+        // A walk the pop cap ends with work left: the result has a checkpoint
+        // and the same estimate.
+        let reg = shared();
+        let capped = walk(&reg, vec![seed("a")], budget(1), |t| t).await;
+        let checkpoint = capped.checkpoint.as_ref().expect("work was left");
+        assert!(checkpoint.likely_complete.is_some());
+        assert_eq!(capped.estimate, checkpoint.likely_complete);
+
+        // A walk that completes has no checkpoint and still has the estimate.
+        let reg = shared();
+        let done = walk(&reg, vec![seed("a")], budget(50), |t| t).await;
+        assert!(done.checkpoint.is_none());
+        let lc = done.estimate.as_ref().expect("the maps share nodes");
+        assert!(lc.fraction > 0.0 && lc.fraction <= 1.0);
+
+        // One map has nothing to recapture against.
+        let alone = registry(vec![GraphMap::new("m1", &edges)]);
+        let one = walk(&alone, vec![seed("a")], budget(50), |t| t).await;
+        assert!(one.estimate.is_none());
+    }
+
     #[test]
     fn the_estimate_is_lincoln_petersen_over_the_two_largest_finders() {
         let set = |names: &[&str]| -> BTreeSet<NodeId> { names.iter().map(|n| node(n)).collect() };

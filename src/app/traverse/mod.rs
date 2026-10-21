@@ -132,8 +132,8 @@ use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
-    add_commits, add_file_changed, add_first_stage_only, add_maps, add_paths, add_policy,
-    add_sites, chunk_lines, lint_steer, no_seeds_response, response_json,
+    add_answer_labels, add_commits, add_file_changed, add_first_stage_only, add_maps, add_paths,
+    add_policy, add_sites, chunk_lines, lint_steer, no_seeds_response, response_json,
 };
 pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
@@ -856,6 +856,9 @@ pub async fn run_with_trait_seeds(
             .map_err(|e| anyhow!("{e}"))?;
     }
     let wants = |id: MapId| wanted.contains(&id);
+    // The maps the call asked for that could not be set up (K13: an answer that
+    // lacks one is not labelled complete). Read only under `answer_labels`.
+    let mut unavailable: Vec<MapId> = Vec::new();
 
     // The start nodes (not on a continuation, which resumes the old ones).
     let mut found = Seeds::default();
@@ -920,9 +923,16 @@ pub async fn run_with_trait_seeds(
     let mut search_index: Option<Arc<dyn ChunkSearch + '_>> = None;
     if wants(SEARCH_LEXICAL_ID) || wants(SEARCH_VECTOR_ID) {
         match call.seed_search.and_then(|search| search.chunk_search()) {
-            None => notes.push(
-                "search.lexical and search.vector need the workspace index: give --root and a question or seeds, with the application available".to_owned(),
-            ),
+            None => {
+                notes.push(
+                    "search.lexical and search.vector need the workspace index: give --root and a question or seeds, with the application available".to_owned(),
+                );
+                unavailable.extend(
+                    [SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID]
+                        .into_iter()
+                        .filter(|id| wants(id)),
+                );
+            }
             Some(index) => {
                 match index.chunk_lines().await {
                     Ok(all) => {
@@ -973,6 +983,7 @@ pub async fn run_with_trait_seeds(
             }
             Err(error) => {
                 notes.push(format!("config.key has no edges: {error:#}"));
+                unavailable.push(CONFIG_KEY_MAP_ID);
                 Arc::new(ConfigKeyMap::empty(ConfigKeyOptions::default()))
             }
         };
@@ -987,7 +998,10 @@ pub async fn run_with_trait_seeds(
     let mut git_history = None;
     if wants(GIT_HISTORY_ID) {
         match call.scip_root {
-            None => notes.push("git.history needs the tree: give --root".to_owned()),
+            None => {
+                notes.push("git.history needs the tree: give --root".to_owned());
+                unavailable.push(GIT_HISTORY_ID);
+            }
             Some(root) => {
                 let table = symbol_files(&loaded.scip);
                 match GitHistoryMap::open_with(root, GitHistoryConfig::default(), table) {
@@ -1002,16 +1016,23 @@ pub async fn run_with_trait_seeds(
                         )?;
                         git_history = Some(map);
                     }
-                    Err(error) => notes.push(format!("git.history is unavailable: {error}")),
+                    Err(error) => {
+                        notes.push(format!("git.history is unavailable: {error}"));
+                        unavailable.push(GIT_HISTORY_ID);
+                    }
                 }
             }
         }
     }
     if wants(PROBE_COMPILE_ID) {
         match call.scip_root {
-            None => notes.push("probe.compile needs the tree: give --root".to_owned()),
+            None => {
+                notes.push("probe.compile needs the tree: give --root".to_owned());
+                unavailable.push(PROBE_COMPILE_ID);
+            }
             Some(_) if !call.lsp.is_some_and(|config| config.rust_analyzer_trusted) => {
                 notes.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
+                unavailable.push(PROBE_COMPILE_ID);
                 warnings.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
             }
             Some(root) => {
@@ -1101,13 +1122,27 @@ pub async fn run_with_trait_seeds(
                 )?;
                 lsp_live = Some(map);
             }
-            Err(error) => notes.push(format!("lsp.live is unavailable: {error}")),
+            Err(error) => {
+                notes.push(format!("lsp.live is unavailable: {error}"));
+                unavailable.push(LSP_LIVE_ID);
+            }
         }
+    }
+    // The maps above that read the tree and were skipped without a word for lack of one.
+    if call.scip_root.is_none() {
+        unavailable.extend(
+            [GREP_LIVE_MAP_ID, CONFIG_KEY_MAP_ID, LSP_LIVE_ID]
+                .into_iter()
+                .filter(|id| wants(id)),
+        );
     }
     let mut impact = None;
     if wants(SCIP_IMPACT_ID) {
         match call.scip_root {
-            None => notes.push("scip.impact needs the tree: give --root".to_owned()),
+            None => {
+                notes.push("scip.impact needs the tree: give --root".to_owned());
+                unavailable.push(SCIP_IMPACT_ID);
+            }
             Some(root) => {
                 let map = match impact_map(call.scip_index, root, &loaded).await {
                     Ok(map) => {
@@ -1123,6 +1158,7 @@ pub async fn run_with_trait_seeds(
                     }
                     Err(error) => {
                         notes.push(format!("scip.impact has no edges: {error:#}"));
+                        unavailable.push(SCIP_IMPACT_ID);
                         Arc::new(ImpactMap::empty(ImpactOptions::default()))
                     }
                 };
@@ -1141,7 +1177,10 @@ pub async fn run_with_trait_seeds(
     let mut site_impact = None;
     if wants(SCIP_IMPLEMENTS_ID) {
         match call.scip_root {
-            None => notes.push("scip.implements needs the tree: give --root".to_owned()),
+            None => {
+                notes.push("scip.implements needs the tree: give --root".to_owned());
+                unavailable.push(SCIP_IMPLEMENTS_ID);
+            }
             Some(root) => {
                 let map = match implements_map(call.scip_index, root, &loaded).await {
                     Ok(map) => {
@@ -1176,6 +1215,7 @@ pub async fn run_with_trait_seeds(
                     }
                     Err(error) => {
                         notes.push(format!("scip.implements has no edges: {error:#}"));
+                        unavailable.push(SCIP_IMPLEMENTS_ID);
                         Arc::new(ImplementsMap::empty(ImplementsOptions::default()))
                     }
                 };
@@ -1393,6 +1433,9 @@ pub async fn run_with_trait_seeds(
                     observer.report(enabled_maps.iter().map(String::as_str)),
                 );
                 add_file_changed(&mut response, &observer);
+                if profile.traverse.answer_labels {
+                    add_answer_labels(&mut response, None, &unavailable);
+                }
                 return Ok(Report {
                     response,
                     trace: None,
@@ -1580,6 +1623,9 @@ pub async fn run_with_trait_seeds(
         observer.report(enabled_maps.iter().map(String::as_str)),
     );
     add_file_changed(&mut response, &observer);
+    if profile.traverse.answer_labels {
+        add_answer_labels(&mut response, Some(&result), &unavailable);
+    }
     Ok(Report {
         response,
         trace: trace_path,
