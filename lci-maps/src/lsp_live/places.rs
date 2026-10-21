@@ -12,15 +12,22 @@
 //! document order). Where the file is learned the outline's places win over
 //! the index's, which may be older than the tree; the index fills what the
 //! outline does not list (a kind this build has no node for).
+//!
+//! A Rust file of a tree ([`OutlinePlaces::with_tree`]) takes the ids of its own
+//! declarations (the extractor `sym.defs` stores, the crate name read as the
+//! index reads it) for a member the index has no node for, so a walk seeded
+//! by `sym.defs` and this map name one node. A member with no declaration
+//! (or a file that does not read or parse) is minted as above.
 
 use super::{Member, Place, SymbolPlaces};
+use crate::crates::CrateNames;
 use lci_core::{
-    language,
+    chunk, language,
     node::{NodeId, SymbolKey, SymbolKind, rust_module_path},
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
 
@@ -46,6 +53,16 @@ fn callable(kind: SymbolKind) -> bool {
     matches!(kind, SymbolKind::Function | SymbolKind::Method)
 }
 
+/// One declaration of a Rust file of the tree: its name, one-based inclusive
+/// lines and canonical id.
+#[derive(Debug, Clone)]
+struct Declared {
+    name: String,
+    start_line: u32,
+    end_line: u32,
+    id: NodeId,
+}
+
 /// One learned member.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -69,6 +86,8 @@ struct Learned {
 pub struct OutlinePlaces {
     /// The index's table ([`super::ScipPlaces`] in production).
     scip: Box<dyn SymbolPlaces>,
+    /// The tree's root: where a Rust file's declarations are read from.
+    tree: Option<PathBuf>,
     state: Mutex<Learned>,
 }
 
@@ -76,8 +95,46 @@ impl OutlinePlaces {
     pub fn over(scip: impl SymbolPlaces + 'static) -> Self {
         Self {
             scip: Box::new(scip),
+            tree: None,
             state: Mutex::default(),
         }
+    }
+
+    /// Reads the declarations of the Rust files it learns from `root` (the
+    /// bytes on disk, the text the index hashes; a document the editor holds
+    /// open may differ). Without it every unindexed member is minted.
+    #[must_use]
+    pub fn with_tree(mut self, root: impl Into<PathBuf>) -> Self {
+        self.tree = Some(root.into());
+        self
+    }
+
+    /// The declarations of the Rust file `path` with their canonical ids;
+    /// empty for any other file, without a tree, or when the file cannot be
+    /// read or parsed.
+    fn declarations(&self, path: &str) -> Vec<Declared> {
+        let Some(root) = self.tree.as_deref().filter(|_| path.ends_with(".rs")) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(root.join(path)) else {
+            return Vec::new();
+        };
+        let (source, _) = chunk::decode_source(bytes);
+        let Ok(extraction) = chunk::extract_for_path(path, &source) else {
+            return Vec::new();
+        };
+        let crates = CrateNames::read_paths(root, &[path]);
+        extraction
+            .declarations
+            .into_iter()
+            .flatten()
+            .map(|declaration| Declared {
+                id: crates.canonical(declaration.node_id(path)),
+                name: declaration.name,
+                start_line: declaration.start_line,
+                end_line: declaration.end_line,
+            })
+            .collect()
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, Learned> {
@@ -86,16 +143,17 @@ impl OutlinePlaces {
 
     /// The id of the member named `name` of `kind` at `line` of `path`: the
     /// index's node there that no earlier member took (the nearest line, a
-    /// node of the member's own kind before the other callable kind), else a
-    /// minted one.
+    /// node of the member's own kind before the other callable kind), else the
+    /// id of the innermost declaration of that name around the line that no
+    /// earlier member took, else a minted one.
     fn id_for(
         &self,
         path: &str,
         name: &str,
         kind: SymbolKind,
-        line: u32,
-        equals_before: u16,
+        (line, equals_before): (u32, u16),
         taken: &HashSet<NodeId>,
+        declared: &[Declared],
     ) -> Option<NodeId> {
         let nodes = self.scip.nodes_in(path);
         let indexed = nodes
@@ -113,6 +171,15 @@ impl OutlinePlaces {
             .min_by_key(|(other_kind, distance, _)| (*other_kind, *distance));
         if let Some((_, _, id)) = indexed {
             return Some(id.clone());
+        }
+        // The member's line is zero-based, a declaration's one-based.
+        let declaration = declared
+            .iter()
+            .filter(|d| d.name == name && (d.start_line..=d.end_line).contains(&(line + 1)))
+            .filter(|d| !taken.contains(&d.id) && self.scip.place_of(&d.id).is_none())
+            .min_by_key(|d| d.end_line - d.start_line);
+        if let Some(declaration) = declaration {
+            return Some(declaration.id.clone());
         }
         let language = language::for_path(Path::new(path))?.identifier();
         let mut key = SymbolKey {
@@ -204,6 +271,7 @@ impl SymbolPlaces for OutlinePlaces {
         let mut taken: HashSet<NodeId> = HashSet::new();
         let mut places: HashSet<Place> = HashSet::new();
         let mut equals: HashMap<(&str, SymbolKind), u16> = HashMap::new();
+        let declared = self.declarations(path);
         for (member, kind) in ordered {
             let before = equals.entry((member.name.as_str(), kind)).or_insert(0);
             let equals_before = *before;
@@ -215,9 +283,9 @@ impl SymbolPlaces for OutlinePlaces {
                 path,
                 &member.name,
                 kind,
-                member.place.line,
-                equals_before,
+                (member.place.line, equals_before),
                 &taken,
+                &declared,
             ) else {
                 continue;
             };
