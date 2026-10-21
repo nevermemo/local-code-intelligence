@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K7b-2 (re-pin), S2 (profile golden), K9a, K28, K29, test speed; M2 lanes next: K8a, K10a, K9b. Rewrite this line at every push.
+In flight: K8a (PR 137), K21a-1 (PR 138), K9b, K3a-1, K24b, K27; next after K8a: K11d-1 (LSP cost report), K7b-3, K38, K3a-2, the load-flake slice; then K7c, K10a-1, K22a-1. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -69,7 +69,6 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K10a | Place table without SCIP: `SymbolPlaces` over the LSP outline and `symdefs` (lane with K7b) | `lsp.live` runs with `scip.mode = off`; a shifted-line placement check: after lines are inserted above a symbol its place follows (closes the freshness `LineShift` gap under `places = outline`) | M | - |
 | K8a | LSP sync independent of index watching: while any session is live, file changes reach every session (`didChangeWatchedFiles`, `didChange`); a full walk only at start and after a watcher overflow | K2a with K7a's strict fake; plus a real-server edit check (live acceptance, skipped when the server is missing): an edit reaches a running session and the next `lsp.symbols` answer shows it (the `OldSession` gap, d413) | M | W2 |
 | K7c | Document lifecycle: open once, `didChange` on edits, `didClose` on eviction, no fixed sleeps (after K8a) | Fake LSP event log; the value check is K11d's latency measurement (per adapter, `open` against `per_request`, real servers) | M | N2 |
-| K9b | `lsp.live` call-hierarchy edges in and out (`CallsOrRefs`, witness `Exact`; no new `EdgeKind`) (after K9a) | Same | M | - |
 | K11e | LSP down-window breaker: after a provider's probe or request fails, skip it for a window and fail open; the embedder has had one since d404, LSP has none | Fake LSP tests: a dead server costs one probe per window, not one per call | S | - |
 | K11d | LSP cost report: cold and warm ms per hop, RAM, budget hits, fail-open behaviour, pops per 5 s, per-adapter ms for K7c; the 15 to 25 s dark windows diagnosed and fixed (N8), the readiness probe deadline made load-proof (N101) | Report under `test-results/` | S-M | I-8, N8 (live diagnosis), N101 |
 | K20b | `scip.mode` default `cache`: SCIP edges are subordinate and labelled; LSP wins a disagreement; under `cache` an unreadable index is re-parsed on every call: remember the failure per file stamp (K20a review). Slice K20b-1 after K11d; the arbitration split K20c after K9b | Its own tests: SCIP absent, SCIP present but subordinate, a disagreement, the remembered failure | S | - |

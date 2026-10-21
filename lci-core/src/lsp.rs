@@ -1075,6 +1075,78 @@ impl Manager {
         locations_for(value, workspace, adapter.provider())
     }
 
+    /// `textDocument/prepareCallHierarchy` at a position: the call-hierarchy
+    /// items of the symbol named there (none when the position names no
+    /// callable). Same contract as [`Self::definition`]. A server that lacks
+    /// the capability answers an error, returned as the [`RpcError`].
+    pub async fn prepare_call_hierarchy(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<HierarchyItem>> {
+        let uri = reqwest::Url::from_file_path(file)
+            .map_err(|_| anyhow!("cannot convert file path to URI"))?
+            .to_string();
+        let value = self
+            .position_request(
+                adapter,
+                workspace,
+                file,
+                relative,
+                "textDocument/prepareCallHierarchy",
+                json!({"textDocument":{"uri":uri}, "position":{"line":line,"character":character}}),
+            )
+            .await?;
+        hierarchy_items(&value, workspace, adapter.provider())
+    }
+
+    /// `callHierarchy/incomingCalls` of an item [`Self::prepare_call_hierarchy`]
+    /// gave (its [`HierarchyItem::raw`], sent back verbatim): the callers, each
+    /// with the places of its calls (in the caller's file).
+    pub async fn incoming_calls(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        item: &Value,
+    ) -> Result<Vec<HierarchyCall>> {
+        let value = self
+            .request(
+                adapter,
+                workspace,
+                "callHierarchy/incomingCalls",
+                json!({"item": item}),
+                false,
+            )
+            .await?;
+        hierarchy_calls(&value, "from", None, workspace, adapter.provider())
+    }
+
+    /// `callHierarchy/outgoingCalls` of an item [`Self::prepare_call_hierarchy`]
+    /// gave (its [`HierarchyItem::raw`]): the callees, each with the places of
+    /// the calls (in the asked item's file, as the protocol says).
+    pub async fn outgoing_calls(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        item: &Value,
+    ) -> Result<Vec<HierarchyCall>> {
+        let value = self
+            .request(
+                adapter,
+                workspace,
+                "callHierarchy/outgoingCalls",
+                json!({"item": item}),
+                false,
+            )
+            .await?;
+        let uri = item.get("uri").and_then(Value::as_str);
+        hierarchy_calls(&value, "to", uri, workspace, adapter.provider())
+    }
+
     // One more parameter than `definition` (`include_declaration`), which is
     // enough to cross clippy's default threshold; a parameter struct would
     // add indirection for one caller (`app.rs`) without real benefit here.
@@ -1515,6 +1587,96 @@ fn locations_for(value: Value, workspace: &Workspace, provider: &str) -> Result<
     Ok(output)
 }
 
+/// A call-hierarchy item: where the callable's name is, and the server's own
+/// item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HierarchyItem {
+    /// The place of the name (the item's `selectionRange`, else its `range`).
+    pub location: Location,
+    /// The item as the server sent it. Its `data` is opaque by the protocol,
+    /// so a follow-up request sends the item back verbatim.
+    pub raw: Value,
+}
+
+/// One caller (`callHierarchy/incomingCalls`) or callee (`outgoingCalls`) of
+/// an item, with the places of the calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HierarchyCall {
+    /// The caller (incoming) or the callee (outgoing).
+    pub item: HierarchyItem,
+    /// Where the calls are: in the caller's file for an incoming call, in the
+    /// asked item's file for an outgoing one.
+    pub from_ranges: Vec<Location>,
+}
+
+/// The items of a call-hierarchy response (a null answer is empty). Each is
+/// read as a `SymbolInformation` whose location is the item's
+/// `selectionRange`, not its `range` (the whole definition, which
+/// `locations_for` would take from the item as it is); an item outside the
+/// workspace or with no readable place is left out.
+fn hierarchy_items(
+    value: &Value,
+    workspace: &Workspace,
+    provider: &str,
+) -> Result<Vec<HierarchyItem>> {
+    let items: Vec<&Value> = match value {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items.iter().collect(),
+        item => vec![item],
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let range = item.get("selectionRange").or_else(|| item.get("range"));
+        let (Some(uri), Some(range)) = (item.get("uri"), range) else {
+            continue;
+        };
+        let symbol = json!({
+            "name": item.get("name"), "kind": item.get("kind"),
+            "location": {"uri": uri, "range": range}
+        });
+        if let Some(location) = locations_for(symbol, workspace, provider)?.pop() {
+            out.push(HierarchyItem {
+                location,
+                raw: item.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The entries of an `incomingCalls` (`key` = `"from"`) or `outgoingCalls`
+/// (`key` = `"to"`) response. `ranges_uri` is the file `fromRanges` are in
+/// when it is not the entry's item's (an outgoing call's: the asked item's).
+fn hierarchy_calls(
+    value: &Value,
+    key: &str,
+    ranges_uri: Option<&str>,
+    workspace: &Workspace,
+    provider: &str,
+) -> Result<Vec<HierarchyCall>> {
+    let mut out = Vec::new();
+    for entry in value.as_array().into_iter().flatten() {
+        let Some(raw) = entry.get(key) else { continue };
+        let Some(item) = hierarchy_items(raw, workspace, provider)?.pop() else {
+            continue;
+        };
+        let uri = ranges_uri.or_else(|| raw.get("uri").and_then(Value::as_str));
+        let mut from_ranges = Vec::new();
+        if let Some(uri) = uri {
+            let located = entry
+                .get("fromRanges")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|range| json!({"uri": uri, "range": range}))
+                .collect::<Vec<_>>();
+            from_ranges = locations_for(Value::Array(located), workspace, provider)?;
+        }
+        out.push(HierarchyCall { item, from_ranges });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1708,50 @@ mod tests {
         assert_eq!(result[0].language.as_deref(), Some("rust"));
         assert_eq!(result[0].provider.as_deref(), Some("rust-analyzer"));
         assert_eq!(result[1].start_line, 5);
+    }
+
+    #[test]
+    fn hierarchy_items_take_the_selection_range_and_keep_the_raw_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            id: "test".into(),
+            path: dunce::canonicalize(temp.path()).unwrap(),
+        };
+        let file = workspace.path.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn item() {}\n").unwrap();
+        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        let item = json!({
+            "name": "item", "kind": 12, "uri": uri, "data": {"opaque": [1, 2]},
+            "range": {"start":{"line":3,"character":0},"end":{"line":9,"character":1}},
+            "selectionRange": {"start":{"line":4,"character":8},"end":{"line":4,"character":12}}
+        });
+        let items = hierarchy_items(&json!([item]), &workspace, "rust-analyzer").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].location.start_line, 5);
+        assert_eq!(items[0].location.start_character, 8);
+        assert_eq!(items[0].location.name.as_deref(), Some("item"));
+        assert_eq!(items[0].raw, item);
+        assert!(
+            hierarchy_items(&Value::Null, &workspace, "rust-analyzer")
+                .unwrap()
+                .is_empty()
+        );
+        // The ranges of an outgoing call are in the asked item's file.
+        let calls = hierarchy_calls(
+            &json!([{"to": item, "fromRanges": [
+                {"start":{"line":0,"character":3},"end":{"line":0,"character":7}}
+            ]}]),
+            "to",
+            Some(&uri),
+            &workspace,
+            "rust-analyzer",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].from_ranges.len(), 1);
+        assert_eq!(calls[0].from_ranges[0].start_line, 1);
+        assert_eq!(calls[0].from_ranges[0].start_character, 3);
     }
 
     #[test]

@@ -243,6 +243,15 @@ pub struct LspProfile {
     /// symbol node). The recipes walk no `lsp.live` and run the same under both
     /// values.
     pub implementations: bool,
+    /// `false` (default): `lsp.live` asks a symbol node for its definition and
+    /// its references (and, under `implementations`, its implementations).
+    /// `true`: it also asks the call hierarchy (`textDocument/
+    /// prepareCallHierarchy`, then `callHierarchy/incomingCalls` and
+    /// `callHierarchy/outgoingCalls`: up to three more external calls per
+    /// symbol node) and reports the callers and callees as `calls_or_refs`
+    /// edges. A server that refuses a request costs the other edges nothing.
+    /// The recipes walk no `lsp.live` and run the same under both values.
+    pub call_hierarchy: bool,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -523,6 +532,7 @@ mod tests {
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
+        config.run_profile.lsp.call_hierarchy = true;
         config
     }
 
@@ -804,6 +814,7 @@ mode = \"sometimes\"
             "run_profile.freshness.verify_on_read",
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
+            "run_profile.lsp.call_hierarchy",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -987,43 +998,64 @@ mode = \"sometimes\"
     }
 
     #[test]
-    fn lsp_implementations_is_off_by_default_and_changes_the_profile_hash() {
-        let off = Config::default();
-        assert!(!off.run_profile.lsp.implementations);
-        let text = format!("{}[run_profile.lsp]\nimplementations = true\n", base_toml());
-        let on: Config = toml::from_str(&text).unwrap();
-        on.validate().unwrap();
-        assert!(on.run_profile.lsp.implementations);
-        // The other leaf of the section keeps its default.
-        assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
-        assert_eq!(
-            serde_json::to_value(&on).unwrap()["run_profile"]["lsp"]["implementations"],
-            true
-        );
-        // It changes what an lsp.live answer holds, so it changes the hash.
-        let (off, on) = (off.run_profile(), on.run_profile());
-        assert_eq!(off.value["run_profile"]["lsp"]["implementations"], false);
-        assert_eq!(on.value["run_profile"]["lsp"]["implementations"], true);
-        assert!(
-            off.keys
-                .iter()
-                .any(|key| key == "run_profile.lsp.implementations")
-        );
-        assert_ne!(off.hash, on.hash);
-        // Spelling out the default is the default.
-        let spelled: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nimplementations = false\n",
-            base_toml()
-        ))
-        .unwrap();
-        assert_eq!(spelled.run_profile().hash, off.hash);
-        for bad in [
-            "[run_profile.lsp]\nimplementations = \"yes\"\n",
-            "[run_profile.lsp]\nimplementations = 1\n",
-            "[run_profile]\nimplementations = true\n",
-        ] {
-            let text = format!("{}{bad}", base_toml());
-            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+    fn lsp_request_switches_are_off_by_default_and_change_the_profile_hash() {
+        for leaf in ["implementations", "call_hierarchy"] {
+            let off = Config::default();
+            assert!(!off.run_profile.lsp.implementations);
+            assert!(!off.run_profile.lsp.call_hierarchy);
+            let text = format!("{}[run_profile.lsp]\n{leaf} = true\n", base_toml());
+            let on: Config = toml::from_str(&text).unwrap();
+            on.validate().unwrap();
+            // Only the named leaf moves; the others keep their defaults.
+            let value = serde_json::to_value(&on).unwrap();
+            for other in ["implementations", "call_hierarchy"] {
+                assert_eq!(
+                    value["run_profile"]["lsp"][other],
+                    other == leaf,
+                    "{leaf} vs {other}"
+                );
+            }
+            assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+            assert!(!on.run_profile.lsp.outline_cache);
+            // It changes what an lsp.live answer holds, so it changes the hash.
+            let (off, on) = (off.run_profile(), on.run_profile());
+            assert_eq!(off.value["run_profile"]["lsp"][leaf], false);
+            assert_eq!(on.value["run_profile"]["lsp"][leaf], true);
+            let key = format!("run_profile.lsp.{leaf}");
+            assert!(off.keys.contains(&key), "{key}");
+            assert_ne!(off.hash, on.hash, "{leaf}");
+            // Spelling out the default is the default.
+            let spelled: Config = toml::from_str(&format!(
+                "{}[run_profile.lsp]\n{leaf} = false\n",
+                base_toml()
+            ))
+            .unwrap();
+            assert_eq!(spelled.run_profile().hash, off.hash, "{leaf}");
+            for bad in [
+                format!("[run_profile.lsp]\n{leaf} = \"yes\"\n"),
+                format!("[run_profile.lsp]\n{leaf} = 1\n"),
+                format!("[run_profile]\n{leaf} = true\n"),
+            ] {
+                let text = format!("{}{bad}", base_toml());
+                assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+            }
+        }
+        // The two switches are separate leaves of the hash.
+        let with = |leaves: &str| -> Config {
+            toml::from_str(&format!("{}[run_profile.lsp]\n{leaves}", base_toml())).unwrap()
+        };
+        let hashes = [
+            with("implementations = true\ncall_hierarchy = true\n")
+                .run_profile()
+                .hash,
+            with("implementations = true\n").run_profile().hash,
+            with("call_hierarchy = true\n").run_profile().hash,
+            Config::default().run_profile().hash,
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
         }
     }
 

@@ -636,7 +636,7 @@ pub struct Config {
     /// `[run_profile]`: the home of the switches that name a run's
     /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`,
     /// `traverse.map_freshness`, `scip.mode`, `lsp.sessions`,
-    /// `lsp.outline_cache`, `lsp.implementations` and
+    /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy` and
     /// `freshness.verify_on_read`). Always
     /// serialized; the hashed profile of the whole configuration is
     /// [`Config::run_profile`].

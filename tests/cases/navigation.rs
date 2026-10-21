@@ -5646,3 +5646,282 @@ async fn lsp_live_implements_edges_sit_at_the_places_the_server_answered() {
     assert_eq!(requests_of(&state, "textDocument/implementation"), 1);
     manager.shutdown_all().await;
 }
+
+// ---- `lsp.live` call hierarchy (K9b) ----------------------------------------
+
+const ADD_SEED: &str = "sym:rust:Calculator.cs::Add/fn";
+const RUN_SEED: &str = "sym:rust:CallSite.cs::Run/fn";
+
+/// What the documents fake answers, asked raw, for the call hierarchy of `Run`
+/// (`src/CallSite.cs`): the 0-based `(line, character)` of every call site of
+/// its outgoing calls (`fromRanges`, in `Run`'s file) and the number of its
+/// incoming callers.
+async fn raw_hierarchy_of_run(workspace: &Workspace) -> (Vec<(u64, u64)>, usize) {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start_on(&temp, workspace.path.clone()).await;
+    let run = position_of(CALL_SITE_CS, "Run");
+    let items = fake
+        .at("textDocument/prepareCallHierarchy", "src/CallSite.cs", run)
+        .await;
+    assert_eq!(names(&items), ["Run"]);
+    let outgoing = fake
+        .ask("callHierarchy/outgoingCalls", json!({"item": items[0]}))
+        .await;
+    assert_eq!(names_of(&outgoing, "to"), ["Add"], "{outgoing}");
+    let sites = outgoing[0]["fromRanges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|range| {
+            (
+                range["start"]["line"].as_u64().unwrap(),
+                range["start"]["character"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let incoming = fake
+        .ask("callHierarchy/incomingCalls", json!({"item": items[0]}))
+        .await;
+    fake.finish().await;
+    (sites, incoming.as_array().unwrap().len())
+}
+
+/// The `key` item names of a call-hierarchy answer.
+fn names_of<'a>(calls: &'a Value, key: &str) -> Vec<&'a str> {
+    calls
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call[key]["name"].as_str().unwrap())
+        .collect()
+}
+
+/// One `lsp.live` walk of `seed` alone (`max_depth` 1), under `profile`, with
+/// the loaded-machine budget.
+async fn traverse_symbol(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    profile: &local_code_intelligence::config::RunProfileConfig,
+    seed: &str,
+) -> local_code_intelligence::app::traverse::Report {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: LOADED_BUDGET_SECONDS * 1000,
+        ..TraverseConfig::default()
+    };
+    let (budget, steer) = (
+        BudgetArgs {
+            deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
+            max_depth: Some(1),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
+    let seeds = [seed.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "what does it call",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .unwrap()
+}
+
+/// The destinations of the `lsp.live` hops out of `seed` in a trace, sorted.
+fn lsp_live_hops_from(
+    report: &local_code_intelligence::app::traverse::Report,
+    seed: &str,
+) -> Vec<String> {
+    let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+    let mut hops: Vec<String> = events
+        .iter()
+        .filter(|event| event["ev"] == "hop" && event["map"] == "lsp.live" && event["src"] == seed)
+        .map(|event| event["dst"].as_str().unwrap().to_owned())
+        .collect();
+    hops.sort();
+    hops
+}
+
+/// The ceiling of the call-hierarchy request: edges equal what the server
+/// answers. With the key on, a walk of `Run` asks prepare, incoming and
+/// outgoing once each, pays the three calls, and reaches exactly `Add` (the
+/// call site the server names is checked on the edge, in
+/// `lsp_live_call_hierarchy_edges_sit_at_the_call_sites`); with it off (the default) the
+/// same walk asks none, pays two and reaches nothing (`definition` answers
+/// `Run` itself, nothing refers to it). Without the slice nothing reaches
+/// `Add` from `Run`.
+#[tokio::test]
+async fn lsp_live_call_hierarchy_edges_equal_the_servers_answer() {
+    use local_code_intelligence::config::{LspProfile, RunProfileConfig};
+    let profile = |call_hierarchy| RunProfileConfig {
+        lsp: LspProfile {
+            call_hierarchy,
+            ..LspProfile::default()
+        },
+        ..RunProfileConfig::default()
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    let (sites, callers) = raw_hierarchy_of_run(&workspace).await;
+    let call = position_of(CALL_SITE_CS, "Add");
+    assert_eq!(sites, [(u64::from(call.0), u64::from(call.1))]);
+    assert_eq!(callers, 0, "nothing calls Run");
+
+    // Key on.
+    let report = traverse_symbol(&config, &workspace, &index, &profile(true), RUN_SEED).await;
+    assert_eq!(
+        lsp_live_hops_from(&report, RUN_SEED),
+        [ADD_SEED],
+        "{}",
+        report.response
+    );
+    assert_eq!(report.response["totals"]["external_calls"], 5);
+    assert_eq!(requests_of(&state, "textDocument/prepareCallHierarchy"), 1);
+    assert_eq!(requests_of(&state, "callHierarchy/incomingCalls"), 1);
+    assert_eq!(requests_of(&state, "callHierarchy/outgoingCalls"), 1);
+    // A card sits at its node's own definition (the cards' sites count from
+    // 1), not at the edge's site: the call site is checked on the edges, in
+    // `lsp_live_call_hierarchy_edges_sit_at_the_call_sites`.
+    let reached: Vec<(String, u64, u64)> = report.response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|card| card.to_string().contains("lsp.live"))
+        .map(|card| {
+            let site = &card["site"];
+            (
+                site["path"].as_str().unwrap().to_owned(),
+                site["line"].as_u64().unwrap(),
+                site["col"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let add = position_of(CALCULATOR_CS, "Add");
+    assert_eq!(
+        reached,
+        [(
+            "src/Calculator.cs".to_owned(),
+            u64::from(add.0) + 1,
+            u64::from(add.1) + 1
+        )],
+        "{}",
+        report.response
+    );
+
+    // Key off: no hierarchy request, no hop.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    let report = traverse_symbol(&config, &workspace, &index, &profile(false), RUN_SEED).await;
+    assert!(
+        lsp_live_hops_from(&report, RUN_SEED).is_empty(),
+        "{}",
+        report.response
+    );
+    assert_eq!(report.response["totals"]["external_calls"], 2);
+    for method in [
+        "textDocument/prepareCallHierarchy",
+        "callHierarchy/incomingCalls",
+        "callHierarchy/outgoingCalls",
+    ] {
+        assert_eq!(requests_of(&state, method), 0, "{method} with the key off");
+    }
+}
+
+/// The edges themselves: `lsp.live` over the real manager and the documents
+/// fake. From `Run` the `CallsOrRefs` edge to `Add` sits at the call (the raw
+/// outgoing answer's `fromRanges[0]`); from `Add` the edge to `Run` exists
+/// once, though `references` and the incoming calls both name it.
+#[tokio::test]
+async fn lsp_live_call_hierarchy_edges_sit_at_the_call_sites() {
+    use lci_maps::{
+        Budget, EdgeKind, Map, SnapshotRef, SnapshotView,
+        lsp_live::{LspLive, ManagerBackend, ScipPlaces},
+        scip_graph::{ScipGraph, ScipMap},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    let (sites, _) = raw_hierarchy_of_run(&workspace).await;
+
+    let scip = ScipMap::with_default_ids(ScipGraph::load(&index, None).unwrap());
+    let places = Arc::new(ScipPlaces::from_scip(&scip));
+    let manager = Arc::new(Manager::new(&config));
+    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
+        .await
+        .unwrap();
+    let map = LspLive::new(Box::new(backend), places).call_hierarchy(true);
+    let seed_of = |id: &str| {
+        (0..scip.graph().nodes.len())
+            .map(|i| scip.node_id(i).clone())
+            .find(|node| node.to_string() == id)
+            .unwrap_or_else(|| panic!("{id} is not in the index"))
+    };
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let wide = || Budget {
+        deadline: std::time::Instant::now() + LOADED_BUDGET,
+        max_external_calls: 10,
+        max_nodes_touched: u64::MAX,
+    };
+
+    // `Run` calls `Add` once.
+    let found = map.expand(&seed_of(RUN_SEED), wide(), &view).await;
+    assert!(map.last_error().is_none(), "{:?}", map.last_error());
+    let got: Vec<(EdgeKind, String, String, u64, u64)> = found
+        .edges
+        .iter()
+        .map(|edge| {
+            let site = edge.site.as_ref().unwrap();
+            (
+                edge.kind,
+                edge.dst.to_string(),
+                site.path.clone(),
+                u64::from(site.line),
+                u64::from(site.col),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [(
+            EdgeKind::CallsOrRefs,
+            ADD_SEED.to_owned(),
+            "src/CallSite.cs".to_owned(),
+            sites[0].0,
+            sites[0].1
+        )]
+    );
+    assert_eq!(found.cost.external_calls, 5);
+
+    // `Add` is called by `Run`: one edge, from the references request.
+    let found = map.expand(&seed_of(ADD_SEED), wide(), &view).await;
+    let to_run: Vec<_> = found
+        .edges
+        .iter()
+        .filter(|edge| edge.dst.to_string() == RUN_SEED)
+        .collect();
+    assert_eq!(to_run.len(), 1, "{:?}", found.edges);
+    assert_eq!(to_run[0].kind, EdgeKind::CallsOrRefs);
+    assert_eq!(found.edges.len(), 1, "{:?}", found.edges);
+    assert_eq!(found.cost.external_calls, 5);
+    assert_eq!(requests_of(&state, "callHierarchy/incomingCalls"), 2);
+    manager.shutdown_all().await;
+}
