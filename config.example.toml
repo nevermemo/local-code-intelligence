@@ -370,8 +370,15 @@ corroboration_boost = 0.1
 # sources of weight / (rank + 2), rank from 0, weight the map weight a steering
 # policy sets (1 by default). Ties go by node id. Under "rrf" the score bound
 # (the early stop `bound`) is off, because a fused score depends on the ranks of
-# all the other results, and corroboration_boost does not rank. A resumed
-# traversal keeps the fusion its handle was made with.
+# all the other results, and corroboration_boost does not rank. "log_odds":
+# capped log-odds over the same sources: a node scores the sum over sources of
+# weight * clamp(ln(p / (1 - p)), -3, 3), p the best potential with which the
+# source delivered it, and a source that delivered other results but not this
+# node costs weight * 3. So one strong source with one silent can beat two weak
+# ones, and no flood of low-weight deliveries moves a node past weight * 3 per
+# source. Ties by node id; the score bound is off and corroboration_boost does
+# not rank here either. A resumed traversal keeps the fusion its handle was made
+# with.
 fusion = "boost"
 # Connective nodes (files, commits, config keys) are passed through: expanding one
 # does not cost a pop, so they do not eat the budget that answer nodes need. The
@@ -522,7 +529,7 @@ map_freshness = false
 # shared graph count once). "claim": the same (source node, destination node,
 # claim family) is one piece of evidence whichever maps assert it, and an edge's
 # confidence is the noisy-OR over its claims, not its maps; the score bound is
-# off, and it cannot be combined with [traverse] fusion = "rrf".
+# off, and it cannot be combined with [traverse] fusion = "rrf" or "log_odds".
 # grep_corroboration (0 to 1, default 1): what a group made only of text-match
 # ("mentions") edges adds to the evidence count; 1 counts it like any other.
 # Both keys are part of the run-profile hash; a handle keeps the values it was

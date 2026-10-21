@@ -16,8 +16,20 @@
 //! Only the results take part: the states reached by an edge that are not
 //! pruned. A start node is not a result, so the seed map's list holds a start
 //! node only when a stronger route made it one.
+//!
+//! `[traverse] fusion = "log_odds"` uses the same sources and weights but
+//! scores a node
+//!
+//! `score(node) = sum over sources of weight * clamp(logit(p), -CAP, CAP)`
+//!
+//! with `p` the best potential the source delivered the node with, and 0 when
+//! the source delivered other results but not this node, or delivered it only at
+//! potential 0 (outside the beam), which counts as silence: a silent source costs
+//! `weight * CAP` ([`LOG_ODDS_CAP`], 3). Prior odds are 1, so a potential of
+//! 0.5 is neutral, and no run of low-potential deliveries can move a node past
+//! `weight * CAP` per source. Equal scores order by node id.
 
-use super::{State, source::EdgeSource};
+use super::{Fusion, State, source::EdgeSource};
 use crate::MapId;
 use lci_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -39,10 +51,14 @@ pub struct Item<'a> {
     pub deliveries: Vec<(MapId, f64, f64)>,
 }
 
-/// The fused scores of `items`, in item order. `dependent` says whether a map
-/// is one of the maps that count as one source.
-pub fn rrf(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Vec<f64> {
-    // Per source: the weight, and each node's best potential.
+/// Per source: its weight, and the nodes it delivered.
+type Sources = (BTreeMap<Source, f64>, BTreeMap<Source, Vec<(usize, f64)>>);
+
+/// The evidence sources of `items`: per source the weight (the largest of its
+/// maps), and the nodes it delivered as `(item index, best potential)` in item
+/// order. `dependent` says whether a map is one of the maps that count as one
+/// source.
+fn sources(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Sources {
     let mut weights: BTreeMap<Source, f64> = BTreeMap::new();
     let mut lists: BTreeMap<Source, Vec<(usize, f64)>> = BTreeMap::new();
     for (at, item) in items.iter().enumerate() {
@@ -62,6 +78,13 @@ pub fn rrf(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Vec<f64> {
             lists.entry(source).or_default().push((at, potential));
         }
     }
+    (weights, lists)
+}
+
+/// The fused scores of `items`, in item order. `dependent` says whether a map
+/// is one of the maps that count as one source.
+pub fn rrf(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Vec<f64> {
+    let (weights, lists) = sources(items, dependent);
     let mut scores = vec![0.0; items.len()];
     for (source, mut list) in lists {
         list.sort_by(|a, b| {
@@ -76,9 +99,48 @@ pub fn rrf(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Vec<f64> {
     scores
 }
 
+/// The most log-odds one source can add (or, when it is silent, cost) per
+/// unit of weight: a potential between about 0.047 and 0.953 moves a source,
+/// anything beyond it counts as this.
+pub const LOG_ODDS_CAP: f64 = 3.0;
+
+/// `ln(p / (1 - p))` with `p` held inside `(1e-6, 1 - 1e-6)`, then clamped to
+/// `-LOG_ODDS_CAP..=LOG_ODDS_CAP`.
+fn capped_logit(p: f64) -> f64 {
+    let p = p.clamp(1e-6, 1.0 - 1e-6);
+    (p / (1.0 - p)).ln().clamp(-LOG_ODDS_CAP, LOG_ODDS_CAP)
+}
+
+/// The capped log-odds scores of `items`, in item order:
+/// `sum over sources of weight * capped_logit(p)`, `p` the best potential with
+/// which the source delivered the node and 0 when it did not (so a silent
+/// source costs `weight * LOG_ODDS_CAP`). Sources are those of [`rrf`]; a
+/// source counts for every node once it has delivered any of them.
+///
+/// The map weight enters twice: a hop's potential already carries it, and the
+/// term is multiplied by it. So a map at weight 0.5 or less never adds a
+/// positive term on a first hop; its deliveries only cost less than silence.
+pub fn log_odds(items: &[Item<'_>], dependent: impl Fn(MapId) -> bool) -> Vec<f64> {
+    let (weights, lists) = sources(items, dependent);
+    let mut scores = vec![0.0; items.len()];
+    for (source, list) in lists {
+        let weight = weights[&source];
+        let mut potentials = vec![0.0; items.len()];
+        for (at, potential) in list {
+            potentials[at] = potential;
+        }
+        for (score, potential) in scores.iter_mut().zip(potentials) {
+            *score += weight * capped_logit(potential);
+        }
+    }
+    scores
+}
+
 /// The fused score of every state, parallel to `states`: a result (a state
-/// with a parent that is not pruned) gets its score, any other 0.
+/// with a parent that is not pruned) gets its score, any other 0. `fusion`
+/// is `rrf` or `log_odds`.
 pub(super) fn state_scores(
+    fusion: Fusion,
     states: &[State],
     cleared: &BTreeSet<NodeId>,
     source: &dyn EdgeSource,
@@ -108,7 +170,11 @@ pub(super) fn state_scores(
                 .collect(),
         })
         .collect();
-    let fused = rrf(&items, |map| dependent.get(map).copied().unwrap_or(false));
+    let is_dependent = |map: MapId| dependent.get(map).copied().unwrap_or(false);
+    let fused = match fusion {
+        Fusion::LogOdds => log_odds(&items, is_dependent),
+        _ => rrf(&items, is_dependent),
+    };
     let mut scores = vec![0.0; states.len()];
     for (&i, score) in results.iter().zip(fused) {
         scores[i] = score;

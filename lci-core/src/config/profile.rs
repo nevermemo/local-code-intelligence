@@ -162,7 +162,7 @@ impl std::str::FromStr for WalkGroups {
 pub struct WalkProfile {
     /// What counts as one piece of evidence: `"tool"` (default, one per map)
     /// or `"claim"`. `"claim"` cannot be combined with `[traverse] fusion =
-    /// "rrf"`.
+    /// "rrf"` or `"log_odds"`.
     pub groups: WalkGroups,
     /// What a group made only of `mentions` edges (text matches) adds to the
     /// evidence count, `0.0..=1.0`; 1.0 (default) counts it like any other.
@@ -595,6 +595,21 @@ mod tests {
         ] {
             assert!(base.keys.iter().any(|k| k == key), "{key}");
         }
+    }
+
+    #[test]
+    fn traverse_fusion_log_odds_changes_the_profile_hash() {
+        let base = Config::default().run_profile();
+        assert!(base.canonical.contains(r#""fusion":"boost""#));
+        let mut rrf = Config::default();
+        rrf.traverse.fusion = TraverseFusion::Rrf;
+        let mut log_odds = Config::default();
+        log_odds.traverse.fusion = TraverseFusion::LogOdds;
+        let log_odds = log_odds.run_profile();
+        assert!(log_odds.canonical.contains(r#""fusion":"log_odds""#));
+        assert_ne!(base.hash, log_odds.hash);
+        assert_ne!(rrf.run_profile().hash, log_odds.hash);
+        assert!(base.keys.iter().any(|k| k == "traverse.fusion"));
     }
 
     #[test]

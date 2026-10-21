@@ -46,7 +46,7 @@
 //!   is not a handle this server issued`), so a 20-character string reaches the
 //!   store and a 65-character one does not.
 //! - Content: `VERSION` 10; another version, and a `bandit` key, are `Corrupt`.
-//!   Written only when not the default: `fusion` (`rrf`), `grouping`, `priors`,
+//!   Written only when not the default: `fusion` (`rrf`, `log_odds`), `grouping`, `priors`,
 //!   `tie_break` and `rerank_identity`, and per state `groups` and `reach`; an
 //!   absent key loads as the default, so older handles keep their text. Object
 //!   keys come in the fixed order `to_json` builds them (serde_json's
@@ -290,7 +290,7 @@ pub struct Snapshot {
     /// it too, so the order of results does not change between calls.
     pub boost: f64,
     /// The fusion the first call ranked with; a resume keeps it. Written to
-    /// the handle only under `rrf` (a handle without it is `boost`).
+    /// the handle only when not `boost` (a handle without it is `boost`).
     pub fusion: Fusion,
     /// How the first call grouped evidence; a resume keeps it. Written to the
     /// handle only when it is not the default (a handle without it is
@@ -336,7 +336,7 @@ impl Snapshot {
         let mut value = self.base_json();
         if let Some(object) = value.as_object_mut() {
             // Left out under `boost`, so those handles are what they were.
-            if self.fusion == Fusion::Rrf {
+            if self.fusion != Fusion::Boost {
                 object.insert("fusion".into(), json!(self.fusion.as_str()));
             }
             if !self.grouping.is_default() {
@@ -575,7 +575,7 @@ impl Snapshot {
                         .iter()
                         .map(|w| witness_of(w))
                         .collect::<Result<_, _>>()?,
-                    // Only a walk under `rrf` fusion has them.
+                    // Only a walk under `rrf` or `log_odds` fusion has them.
                     reach: match s.get("reach") {
                         None | Some(Value::Null) => BTreeMap::new(),
                         Some(v) => v
@@ -841,7 +841,7 @@ fn state_json(s: &State) -> Value {
     if let (false, Some(object)) = (s.groups.is_empty(), value.as_object_mut()) {
         object.insert("groups".into(), groups_json(&s.groups));
     }
-    // Only a walk under `rrf` fusion keeps the best potential per map.
+    // Only a walk under `rrf` or `log_odds` fusion keeps the best potential per map.
     if let (false, Some(object)) = (s.reach.is_empty(), value.as_object_mut()) {
         object.insert(
             "reach".into(),

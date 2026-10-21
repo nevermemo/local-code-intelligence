@@ -98,8 +98,12 @@
 //! results and the `start` event's `rank` object differ). The score bound
 //! below is NOT valid under `rrf` (a node's fused score depends on the ranks
 //! of all the others, so no frontier state has a bound on it): it is off, and
-//! the walk ends by its budgets or when the frontier is dry. A handle keeps
-//! the fusion it started with.
+//! the walk ends by its budgets or when the frontier is dry. `log_odds` is
+//! the same walk with the same sources, scoring a node by capped log-odds
+//! (`weight * clamp(logit(potential), -3, 3)` per source, `-3 * weight` for a
+//! source that delivered other results but not this node), see [`fusion`];
+//! the score bound is off there too. A handle keeps the fusion it started
+//! with.
 //!
 //! Grouping ([`Grouping`], `[run_profile.walk]`): what counts as one piece of
 //! evidence. By `tool` (the default) it is a map, as above. By `claim` it is a
@@ -194,7 +198,7 @@ use stop::{
 };
 use tiebreak::{Facts, TieBreak};
 
-pub use fusion::RRF_K;
+pub use fusion::{LOG_ODDS_CAP, RRF_K};
 /// How results are ranked (`[traverse] fusion`); see the module docs.
 pub use lci_core::config::TraverseFusion as Fusion;
 /// How evidence is grouped (`[run_profile.walk] groups`); see [`Grouping`].
@@ -353,7 +357,7 @@ pub struct State {
     pub dependent: usize,
     /// The witness classes of those edges.
     pub witnesses: BTreeSet<WitnessClass>,
-    /// Under `rrf` fusion only (empty otherwise): the best potential with
+    /// Under `rrf` or `log_odds` fusion only (empty otherwise): the best potential with
     /// which each map delivered the node, a seed's own map included (at 1).
     /// All the maps of a fused edge share the potential of its route; an
     /// arrival outside the beam delivers at 0. When a stronger route rescales
@@ -458,7 +462,7 @@ pub struct TraversalResult {
     pub grouping: Grouping,
     /// Whether the run passed through connective nodes (see the module docs).
     pub pass_through: bool,
-    /// Under `rrf` fusion: the fused score of every result, by node (empty
+    /// Under `rrf` or `log_odds` fusion: the fused score of every result, by node (empty
     /// otherwise).
     pub fused: HashMap<NodeId, f64>,
     /// Why the call ended, on every exit path: `Complete` (nothing left or
@@ -500,7 +504,7 @@ impl TraversalResult {
     pub fn ranked_potential(&self, state: &State) -> f64 {
         match self.fusion {
             Fusion::Boost => state.ranked_potential_by(self.corroboration_boost, &self.grouping),
-            Fusion::Rrf => self.fused.get(&state.node).copied().unwrap_or(0.0),
+            Fusion::Rrf | Fusion::LogOdds => self.fused.get(&state.node).copied().unwrap_or(0.0),
         }
     }
 
@@ -529,7 +533,7 @@ impl TraversalResult {
                 .total_cmp(&self.ranked_potential(x))
                 .then_with(|| match self.fusion {
                     Fusion::Boost => tie_score(b).total_cmp(&tie_score(a)).then(a.cmp(&b)),
-                    Fusion::Rrf => x.node.cmp(&y.node),
+                    Fusion::Rrf | Fusion::LogOdds => x.node.cmp(&y.node),
                 })
         });
         results
@@ -692,7 +696,7 @@ impl<'s> Traversal<'s> {
 
     /// How results are ranked (default [`Fusion::Boost`]); see the module
     /// docs. A resumed traversal keeps the fusion its handle was made with.
-    /// Under [`Fusion::Rrf`] the score bound is off.
+    /// Under [`Fusion::Rrf`] and [`Fusion::LogOdds`] the score bound is off.
     pub fn fusion(mut self, fusion: Fusion) -> Self {
         self.fusion = fusion;
         self
@@ -949,7 +953,7 @@ impl<'s> Run<'s> {
             dependent: 0,
             witnesses: BTreeSet::new(),
             reach: match (self.t.fusion, seed.map) {
-                (Fusion::Rrf, Some(map)) => BTreeMap::from([(map, 1.0)]),
+                (fusion, Some(map)) if fusion.uses_reach() => BTreeMap::from([(map, 1.0)]),
                 _ => BTreeMap::new(),
             },
             groups: BTreeMap::new(),
@@ -1255,7 +1259,7 @@ impl<'s> Run<'s> {
         // A fused score depends on the ranks of all the other results, so no
         // frontier state has a bound on it.
         if !self.t.score_bound
-            || self.t.fusion == Fusion::Rrf
+            || self.t.fusion.uses_reach()
             || self.t.grouping.groups == Groups::Claim
             || !self.t.targets.is_empty()
         {
@@ -1741,7 +1745,7 @@ impl<'s> Run<'s> {
     /// `potential` (their best so far is kept): the potential of the route the
     /// edge is on, 0 for an arrival the beam did not keep.
     fn add_evidence(&mut self, index: usize, edge: &FusedEdge, potential: f64) -> Vec<MapId> {
-        if self.t.fusion == Fusion::Rrf {
+        if self.t.fusion.uses_reach() {
             for &map in &edge.maps {
                 let reach = self.states[index].reach.entry(map).or_insert(potential);
                 *reach = reach.max(potential);
@@ -2025,10 +2029,12 @@ impl<'s> Run<'s> {
         )
     }
 
-    /// The fused score of every state under `rrf` fusion (see [`fusion`]).
+    /// The fused score of every state under `rrf` or `log_odds` fusion (see
+    /// [`fusion`]).
     fn fused_scores(&self) -> Option<Vec<f64>> {
-        (self.t.fusion == Fusion::Rrf).then(|| {
+        self.t.fusion.uses_reach().then(|| {
             fusion::state_scores(
+                self.t.fusion,
                 &self.states,
                 &self.cleared,
                 self.t.source.as_ref(),
@@ -2073,7 +2079,7 @@ impl<'s> Run<'s> {
 
         // Best rank first (potential, boosted by corroboration, or the fused
         // score); discovery order breaks ties under `boost`, node id under
-        // `rrf`.
+        // `rrf` and `log_odds`.
         let fused = self.fused_scores();
         let fused = fused.as_deref();
         let rank = |s: &usize| self.rank_of(*s, fused);
@@ -2395,13 +2401,17 @@ pub fn is_connective(node: &NodeId) -> bool {
 }
 
 /// The `rank` object of the `start` and `resume` events. Under `boost` fusion
-/// it is what it always was; `rrf` adds the fusion and its `k`; a grouping that
+/// it is what it always was; `rrf` adds the fusion and its `k`, `log_odds` the
+/// fusion and its `cap`; a grouping that
 /// is not the default adds `groups` and `grep_corroboration`.
 pub(crate) fn rank_json(boost: f64, fusion: Fusion, grouping: &Grouping) -> Value {
     let mut rank = match fusion {
         Fusion::Boost => json!({"corroboration_boost": boost}),
         Fusion::Rrf => json!({
             "corroboration_boost": boost, "fusion": fusion.as_str(), "rrf_k": RRF_K,
+        }),
+        Fusion::LogOdds => json!({
+            "corroboration_boost": boost, "fusion": fusion.as_str(), "cap": LOG_ODDS_CAP,
         }),
     };
     if !grouping.is_default()
