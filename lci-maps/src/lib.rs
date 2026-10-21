@@ -37,6 +37,7 @@ pub mod scip_implements;
 pub mod scratch;
 pub mod search_maps;
 pub mod symdefs;
+pub mod tested_by;
 pub mod traverse;
 pub mod walk;
 
