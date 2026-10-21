@@ -136,6 +136,14 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   (default `false`) the map also asks `Manager::implementation` (`textDocument/implementation`) at each symbol node
   and offers `Implements` edges from an interface or trait member to its implementing members (the direction of
   `scip.implements`); it is the third request of a node, behind the same `max_external_calls` gate, and a failure of
+  it is recorded without dropping the edges of the first two. With `[run_profile.lsp] call_hierarchy = true`
+  (default `false`) it asks up to three more requests per symbol node, each behind the same gate and counted:
+  `Manager::prepare_call_hierarchy` (`textDocument/prepareCallHierarchy`), then `Manager::incoming_calls` and
+  `Manager::outgoing_calls` with the item the server gave, sent back verbatim (`HierarchyItem::raw`; the place of an
+  item is its `selectionRange`, the name). The callers and callees are `CallsOrRefs` edges (witness `Exact`, no new
+  edge kind), one per destination per expansion, seen at the call (`fromRanges`). Every error reply is recorded
+  and keeps the other edges, which is also how a server without `callHierarchyProvider` (it answers -32601) is found:
+  the capabilities are not read.
   it is recorded without dropping the edges of the first two.
   `[run_profile.lsp] sync = "watch"` (read by `Manager::new`; a per-call
   manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`

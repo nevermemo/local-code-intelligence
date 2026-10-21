@@ -1005,7 +1005,8 @@ pub async fn run_with_trait_seeds(
                 let places = Arc::new(ScipPlaces::from_scip(&loaded.scip));
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)
-                        .implementations(profile.lsp.implementations),
+                        .implementations(profile.lsp.implementations)
+                        .call_hierarchy(profile.lsp.call_hierarchy),
                 );
                 register(
                     &mut registry,

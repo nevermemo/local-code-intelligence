@@ -575,6 +575,14 @@ mode = "authoritative"
 # external call per symbol) and offers the answers as `implements` edges, from
 # an interface or trait member to the members that implement it. Needs a server
 # that answers the request; a failed request leaves the other edges alone.
+# call_hierarchy = false (default): as above. true: lsp.live also asks the call
+# hierarchy of a symbol: textDocument/prepareCallHierarchy, then
+# callHierarchy/incomingCalls and callHierarchy/outgoingCalls of the item that
+# answers (up to three more external calls per symbol; none after an empty
+# prepare). The callers and callees become `calls_or_refs` edges (one per
+# destination), seen at the call. A server without call hierarchy refuses the
+# request: that is noted and the other edges stay. Servers miss some calls
+# (macro arguments, for one): this complements graph.scip.
 # sync = "off" (default): a language server is told nothing about edits after it
 # starts. "watch": this process's language-server manager watches each workspace
 # that has a running session and sends every source-file change to its servers
@@ -584,11 +592,12 @@ mode = "authoritative"
 # and stops with the workspace's last session. Independent of index watching. A
 # per-call manager (sessions = "per_call") never syncs. The recipes are the same
 # under both values.
-# All four keys are part of the run-profile hash.
+# All five keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"
 outline_cache = false
 implementations = false
+call_hierarchy = false
 sync = "off"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
