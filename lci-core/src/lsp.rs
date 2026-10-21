@@ -728,6 +728,20 @@ async fn outline_hash(file: &Path) -> Option<String> {
         .map(|text| content_hash(&text))
 }
 
+/// What one [`Manager::tree_barrier`] did to the sessions it was asked about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BarrierOutcome {
+    /// The providers whose running session was stopped (the tree changed since
+    /// its last check, or no stamp could be taken): the caller's request starts
+    /// a fresh server that reads the disk.
+    pub restarted: Vec<&'static str>,
+    /// The providers whose running session the barrier kept, with how long the
+    /// tree stamp has been unchanged (about how long ago the session started
+    /// from this tree): the caller says so beside the answer, since it is not a
+    /// fresh server's.
+    pub kept: Vec<(&'static str, Duration)>,
+}
+
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
 /// and C# (csharp-ls) are always constructed; TypeScript/JavaScript, Python,
 /// Go, and Java join the same registry as optional, individually
@@ -775,7 +789,12 @@ pub struct Manager {
     probed: std::sync::Mutex<HashSet<&'static str>>,
     /// The tree stamp each kept session was last checked against (see
     /// [`Self::tree_barrier`]).
-    stamps: std::sync::Mutex<HashMap<SessionKey, stamp::TreeStamp>>,
+    stamps: std::sync::Mutex<HashMap<SessionKey, (stamp::TreeStamp, Instant)>>,
+    /// One lock per workspace id: the barrier of a workspace (stamp, compare,
+    /// stop, record) runs one at a time, so a barrier that took its stamp
+    /// earlier cannot overwrite a newer record or stop a server a later
+    /// walk has just started.
+    barriers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Where the barrier gets the index's file list (`None`: no sharing).
     indexed: std::sync::Mutex<Option<Arc<dyn stamp::IndexedFiles>>>,
     /// The kept outlines, `Some` only under `[run_profile.lsp]
@@ -897,6 +916,7 @@ impl Manager {
             stuck_after,
             probed: std::sync::Mutex::new(HashSet::new()),
             stamps: std::sync::Mutex::new(HashMap::new()),
+            barriers: std::sync::Mutex::new(HashMap::new()),
             indexed: std::sync::Mutex::new(None),
             outlines: config
                 .run_profile
@@ -1068,32 +1088,51 @@ impl Manager {
 
     /// The tree barrier of the kept sessions: for each of `adapters`, takes
     /// the workspace's tree stamp ([`stamp::TreeStamp`], built from the
-    /// index's file list with no directory walk, before any server is started
-    /// or reused for the caller) and compares it with the one recorded when
-    /// the adapter's session was last checked. A different stamp (or a session
-    /// with no recorded stamp, whose age is unknown) stops that session, so
-    /// the caller's request starts a fresh server that reads the disk as
-    /// `per_call` would; an equal stamp keeps it. The new stamp is recorded
-    /// either way, and a first sight with no session records it for the
-    /// session that starts next. Returns the providers whose session was
-    /// restarted. With no file list (no [`stamp::IndexedFiles`] source, no
-    /// index snapshot) or a failed stat pass every session of `adapters` is
-    /// restarted and nothing is recorded: no sharing without a stamp.
+    /// index's file list and one directory read per stamped directory, with no
+    /// recursive walk, before any server is started or reused for the caller)
+    /// and compares it with the one recorded when the adapter's session was
+    /// last checked. A different stamp (or a session with no recorded stamp,
+    /// whose age is unknown) stops that session, so the caller's request
+    /// starts a fresh server that reads the disk as `per_call` would; an equal
+    /// stamp keeps it. A first sight with no session records the stamp for the
+    /// session that starts next. With no file list (no [`stamp::IndexedFiles`]
+    /// source, no index snapshot) or a failed stamp (a stat or directory read
+    /// that failed for a reason other than "not found") every session of
+    /// `adapters` is restarted and nothing is recorded: no sharing without a
+    /// stamp.
+    ///
+    /// The barriers of one workspace run one at a time (the stamp is taken
+    /// under the workspace's barrier lock), so a slower barrier cannot record
+    /// an older stamp over a newer one, nor stop a server that a later walk
+    /// has just started from a newer tree.
     ///
     /// This makes a kept session never older than the tree as of the check,
-    /// up to what a stamp can see (see [`stamp`]): an edit that keeps a
-    /// file's length and modification time is not seen, nor a new file in a
-    /// directory that holds none of the server's indexed files. An edit during
-    /// the call is seen by the next barrier, as under `per_call`. It does not
-    /// depend on the server's own file watcher or on `sync`.
+    /// for any change inside what a stamp covers (see [`stamp`]: the indexed
+    /// files, their directories and one level of child directories, the
+    /// ancestors, the server's configuration files). Outside that coverage an
+    /// edit that keeps a file's length and modification time is not seen, nor
+    /// a new file two or more levels below a stamped directory; the caller
+    /// labels the answer of a kept session for that reason
+    /// ([`BarrierOutcome::kept`]). An edit during the call is seen by the next
+    /// barrier, as under `per_call`. It does not depend on the server's own
+    /// file watcher or on `sync`.
     pub async fn tree_barrier(
         &self,
         workspace: &Workspace,
         adapters: &[&Arc<dyn LspAdapter>],
-    ) -> Vec<&'static str> {
+    ) -> BarrierOutcome {
+        let mut outcome = BarrierOutcome::default();
         if adapters.is_empty() {
-            return Vec::new();
+            return outcome;
         }
+        let lock = Arc::clone(
+            self.barriers
+                .lock()
+                .unwrap()
+                .entry(workspace.id.clone())
+                .or_default(),
+        );
+        let _serial = lock.lock().await;
         let source = self.indexed.lock().unwrap().clone();
         let listed = match source {
             Some(source) => source.indexed_files(workspace).await,
@@ -1126,14 +1165,19 @@ impl Manager {
             }
             None => vec![None; adapters.len()],
         };
-        let mut restarted = Vec::new();
         for (adapter, stamp) in adapters.iter().zip(stamps) {
             let key = Self::session_key(adapter, workspace);
-            let same = {
+            let unchanged_since = {
                 let recorded = self.stamps.lock().unwrap();
-                matches!((recorded.get(&key), stamp), (Some(before), Some(now)) if *before == now)
+                match (recorded.get(&key), stamp) {
+                    (Some((before, since)), Some(now)) if *before == now => Some(*since),
+                    _ => None,
+                }
             };
-            if same {
+            if let Some(since) = unchanged_since {
+                if self.sessions.lock().await.contains_key(&key) {
+                    outcome.kept.push((adapter.provider(), since.elapsed()));
+                }
                 continue;
             }
             // The only await between the decision and the record is the
@@ -1144,15 +1188,15 @@ impl Manager {
             {
                 let mut recorded = self.stamps.lock().unwrap();
                 match stamp {
-                    Some(stamp) => recorded.insert(key, stamp),
+                    Some(stamp) => recorded.insert(key, (stamp, Instant::now())),
                     None => recorded.remove(&key),
                 };
             }
             if stopped {
-                restarted.push(adapter.provider());
+                outcome.restarted.push(adapter.provider());
             }
         }
-        restarted
+        outcome
     }
 
     /// Removes the session under `key` and stops its server on a task of its
@@ -2602,6 +2646,100 @@ mod tests {
             7,
             "a new adapter must be classified"
         );
+    }
+
+    /// Only a server that declares the configuration files its tree stamp
+    /// covers may be kept, even under `sync = "watch"`; the others start per
+    /// call. A new adapter must be classified here.
+    #[test]
+    fn only_servers_with_a_stamped_configuration_list_keep_a_session() {
+        let manager = Manager::new(&Config::default());
+        let keeping = |synced: bool| -> Vec<&str> {
+            manager
+                .adapters()
+                .iter()
+                .filter(|adapter| adapter.keeps_session(synced))
+                .map(|adapter| adapter.provider())
+                .collect()
+        };
+        assert_eq!(keeping(false), ["rust-analyzer"], "sync = off");
+        let mut watched = keeping(true);
+        watched.sort_unstable();
+        assert_eq!(
+            watched,
+            [
+                "clangd",
+                "csharp-ls",
+                "gopls",
+                "pyright",
+                "rust-analyzer",
+                "typescript-language-server"
+            ],
+            "sync = watch: jdtls lists no configuration files"
+        );
+        for adapter in manager.adapters() {
+            if adapter.keeps_session(true) {
+                assert!(!adapter.stamp_manifests().is_empty());
+            }
+        }
+    }
+
+    /// An index file list that counts how many stamps are being taken at once.
+    struct SlowFiles {
+        in_flight: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl stamp::IndexedFiles for SlowFiles {
+        async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Some(Arc::new(vec!["src/lib.rs".to_owned()]))
+        }
+    }
+
+    /// The barriers of one workspace run one at a time: a barrier that took
+    /// its stamp before another finished could record an older stamp over the
+    /// newer one and stop the server the other had just started.
+    #[tokio::test]
+    async fn concurrent_barriers_of_one_workspace_run_one_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(temp.path()).unwrap();
+        let ws = Workspace {
+            id: crate::workspace::hash(&path.to_string_lossy()),
+            path,
+        };
+        std::fs::create_dir_all(ws.path.join("src")).unwrap();
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let source = Arc::new(SlowFiles {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            most: std::sync::atomic::AtomicUsize::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Manager::new(&Config::default())
+            .with_indexed_files(Arc::clone(&source) as Arc<dyn stamp::IndexedFiles>);
+        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
+        let only = [&rust];
+        let (a, b, c) = tokio::join!(
+            manager.tree_barrier(&ws, &only),
+            manager.tree_barrier(&ws, &only),
+            manager.tree_barrier(&ws, &only),
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            source.most.load(Ordering::SeqCst),
+            1,
+            "two barriers of one workspace took their stamps at once"
+        );
+        // No session ran, so nothing was stopped or kept.
+        for outcome in [a, b, c] {
+            assert_eq!(outcome, BarrierOutcome::default());
+        }
     }
 
     #[tokio::test]

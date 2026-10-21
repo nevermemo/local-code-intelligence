@@ -321,7 +321,8 @@ pub struct Call<'a> {
     /// sessions = "shared"` (the default): the MCP and REST server's own, one
     /// per process for `lci traverse`. Used only under `shared`, and only for
     /// a server that sees an edit on its own (`LspAdapter::watches_workspace`)
-    /// or when `sync = "watch"`; every other server starts on the call's own
+    /// or when `sync = "watch"`, and lists its tree stamp's configuration files
+    /// (`LspAdapter::keeps_session`); every other server starts on the call's own
     /// manager, as under `per_call`. `None` there (a caller with no manager of
     /// its own, the recipes) starts all the call's servers as under `per_call`.
     /// Under `per_call` it is never read.
@@ -1115,6 +1116,14 @@ pub async fn run_with_trait_seeds(
                 for provider in backend.restarted() {
                     notes.push(format!(
                         "lsp.live: {provider} restarted: the tree changed since its last call"
+                    ));
+                }
+                // An answer from a reused server is not a fresh server's: it
+                // is exact for what the tree stamp covers and says so.
+                for (provider, unchanged) in backend.kept() {
+                    notes.push(format!(
+                        "lsp.live: {provider} kept session; tree stamp unchanged since {} s ago",
+                        unchanged.as_secs()
                     ));
                 }
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);

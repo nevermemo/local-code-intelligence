@@ -55,6 +55,16 @@ impl LspAdapter for TypeScriptServer {
         LANGUAGES
     }
 
+    /// The project configuration the server reads (see the trait).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &[
+            "tsconfig.json",
+            "jsconfig.json",
+            "package.json",
+            "tsconfig.*.json",
+        ]
+    }
+
     fn enabled(&self) -> bool {
         self.config.enabled()
     }

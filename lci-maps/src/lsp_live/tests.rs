@@ -771,10 +771,13 @@ async fn the_version_probe_honours_the_timeout_it_is_given() {
 }
 
 /// `open_split` routes each probed server by whether it sees an edit on its
-/// own: rust-analyzer (a watching adapter) to the `shared` manager, csharp-ls
-/// (it is told nothing) to the call's `own` one, unless `shared` syncs edits
-/// (`sync = "watch"`), when both go to `shared`. The servers are the real
-/// adapters of the manager, pointed at cargo, which answers `--version`.
+/// own: rust-analyzer (a watching adapter) to the `shared` manager; csharp-ls
+/// and gopls (they are told nothing) to the call's `own` one, unless `shared`
+/// syncs edits (`sync = "watch"`), when both go to `shared`. A server that
+/// lists no configuration files for the tree stamp (jdtls) is never shared:
+/// `lci_core::lsp::adapter::LspAdapter::keeps_session` says so, and the lsp
+/// unit tests pin the list. The servers are the real adapters of the manager,
+/// pointed at cargo, which answers `--version`.
 #[tokio::test]
 async fn open_split_routes_by_watching_and_sync() {
     use lci_core::config::LspSync;
@@ -793,6 +796,7 @@ async fn open_split_routes_by_watching_and_sync() {
             ..Config::default()
         };
         config.csharp.path = Some(cargo.clone());
+        config.go.path = Some(cargo.clone());
         config.run_profile.lsp.sync = sync;
         let shared = Arc::new(Manager::new(&config));
         let own = Arc::new(Manager::new(&config).without_sync());
@@ -809,6 +813,11 @@ async fn open_split_routes_by_watching_and_sync() {
         .await
         .expect("cargo answers --version");
         assert!(routed(&backend, "rust-analyzer", &shared), "{sync:?}");
+        assert_eq!(
+            routed(&backend, "gopls", &shared),
+            csharp_shared,
+            "{sync:?}"
+        );
         assert_eq!(
             routed(&backend, "csharp-ls", &shared),
             csharp_shared,

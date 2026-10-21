@@ -597,17 +597,26 @@ mode = "authoritative"
 # opt-in: name it in `maps`).
 # sessions = "shared" (default): the calls of this process may keep a server
 # across calls, the one that navigation and the search channel use, so a cold
-# start is paid once, but only a server that sees an edit on its own (today
-# rust-analyzer) or, for any server, when sync = "watch" is set. Every other
-# server (csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd)
+# start is paid once, but only a server that lists the configuration files its
+# tree stamp covers (every adapter but jdtls) and sees an edit on its own (today
+# rust-analyzer) or is told by sync = "watch". Every other server
+# (csharp-ls, typescript-language-server, pyright, gopls, clangd; jdtls always)
 # is started by each call and stopped when its walk ends, as under "per_call".
-# Before a walk uses a kept server it passes a tree barrier: a stat of the
-# server's indexed files, their directories and ancestors and its project
-# manifests (rust-analyzer: Cargo.toml, Cargo.lock, rust-analyzer.toml), taken
-# from the index's file list with no directory walk; if the stamp differs from
-# the last one the server is stopped and the walk starts a fresh one that reads
-# the disk (a note says so), so no answer is staler than under "per_call". Not
-# seen: a new file in a directory with none of the server's indexed files, and
+# Before a walk uses a kept server it passes a tree barrier: a stamp of the
+# server's indexed files, their directories and ancestors (child names too),
+# one level of child directories of those (except .git, target, node_modules,
+# obj, bin, build, dist, out and virtual environments) and the server's
+# configuration files among those children by name (rust-analyzer: Cargo.toml,
+# Cargo.lock, rust-analyzer.toml; typescript: tsconfig.json, tsconfig.*.json,
+# jsconfig.json, package.json; and so on), taken from the index's file list and
+# one directory read each, with no recursive walk. If the stamp differs from the
+# last one, or cannot be taken (a stat error other than "not found"), the
+# server is stopped and the walk starts a fresh one that reads the disk (a note
+# says so); an unchanged stamp keeps the server and a note says that too ("kept
+# session; tree stamp unchanged since N s ago"). So a reused server is never
+# staler than under "per_call" for a change inside that coverage. Not seen: a
+# new file two or more levels below a stamped directory or inside a skipped
+# build directory, a configuration file that is not on the server's list, and
 # an edit that keeps modification time and length. A workspace with no index
 # snapshot has no sharing. A kept server stops when it has been idle for
 # lsp_idle_timeout_seconds (which only limits residency), on release_workspace

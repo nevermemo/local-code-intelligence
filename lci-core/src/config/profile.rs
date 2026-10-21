@@ -321,14 +321,16 @@ pub enum LspSessions {
     /// The calls of one process share that process's language servers (the
     /// ones navigation and the search channel use): a server started by one
     /// call is reused by the next and stops with the idle timeout,
-    /// `release_workspace` or service shutdown. Only a server that sees an
-    /// edit on its own (`LspAdapter::watches_workspace`, today
-    /// rust-analyzer) keeps its session across calls, or any server when
-    /// `[run_profile.lsp] sync = "watch"` tells it; every other server
-    /// behaves as under `per_call`. A kept session first passes the tree
-    /// barrier of each walk (`Manager::tree_barrier`: a stamp from the index's
-    /// file list; a changed stamp restarts the server), so no answer is staler
-    /// than under `per_call`.
+    /// `release_workspace` or service shutdown. Only a server that lists the
+    /// configuration files of its tree stamp (`LspAdapter::keeps_session`) and
+    /// sees an edit on its own (`LspAdapter::watches_workspace`, today
+    /// rust-analyzer) or is told by `[run_profile.lsp] sync = "watch"` keeps
+    /// its session across calls; every other server behaves as under
+    /// `per_call`. A kept session first passes the tree barrier of each walk
+    /// (`Manager::tree_barrier`: a stamp from the index's file list; a changed
+    /// or failed stamp restarts the server), so a reused server is never
+    /// staler than under `per_call` for a change inside the stamp's coverage,
+    /// and the walk labels its answer with a `kept session` note.
     #[default]
     Shared,
 }

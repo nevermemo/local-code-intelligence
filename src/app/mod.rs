@@ -194,15 +194,16 @@ impl App {
     }
 
     /// Whether a traverse call under the profile keeps this adapter's session
-    /// in the service's manager: `sessions = "shared"` and the server sees an
-    /// edit on its own (`LspAdapter::watches_workspace`) or `sync = "watch"`
-    /// tells it. These sessions pass the tree barrier of a traverse walk
+    /// in the service's manager: `sessions = "shared"` and
+    /// `LspAdapter::keeps_session` (the server lists its tree stamp's
+    /// configuration files and sees an edit on its own or `sync = "watch"`
+    /// tells it). These sessions pass the tree barrier of a traverse walk
     /// (`lsp::Manager::tree_barrier`); navigation and the search channel do
     /// not (their kept sessions are as before).
     fn shares_session(&self, adapter: &Arc<dyn crate::lsp::adapter::LspAdapter>) -> bool {
         let profile = &self.config.run_profile.lsp;
         profile.sessions == crate::config::LspSessions::Shared
-            && (profile.sync == crate::config::LspSync::Watch || adapter.watches_workspace())
+            && adapter.keeps_session(profile.sync == crate::config::LspSync::Watch)
     }
 
     /// First touch of `workspace`: starts, in the background, the language

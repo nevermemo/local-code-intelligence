@@ -5426,10 +5426,17 @@ impl local_code_intelligence::lsp::stamp::IndexedFiles for SnapshotFiles {
 /// service's has: without one the tree barrier restarts every shared session
 /// it is asked about (no sharing without a stamp).
 fn indexed_manager(config: &Config, workspace: &Workspace) -> Arc<Manager> {
+    indexed_manager_listing(config, workspace, &[])
+}
+
+/// [`indexed_manager`] whose snapshot also lists `extra` (paths the disk may
+/// not have, or refuses).
+fn indexed_manager_listing(config: &Config, workspace: &Workspace, extra: &[&str]) -> Arc<Manager> {
     let files = local_code_intelligence::chunk::source_files(&workspace.path, true)
         .unwrap()
         .into_iter()
         .map(|file| file.relative)
+        .chain(extra.iter().map(|path| (*path).to_owned()))
         .collect();
     Arc::new(Manager::new(config).with_indexed_files(Arc::new(SnapshotFiles(Arc::new(files)))))
 }
@@ -5472,6 +5479,18 @@ fn restart_noted(answer: &Value, provider: &str) -> bool {
         notes
             .iter()
             .any(|note| note.as_str() == Some(wanted.as_str()))
+    })
+}
+
+/// Whether the walk labelled its answer as coming from a kept session of
+/// `provider`, whose tree stamp has not changed (the answer of a reused server
+/// is not a fresh server's).
+fn kept_noted(answer: &Value, provider: &str) -> bool {
+    let wanted = format!("lsp.live: {provider} kept session; tree stamp unchanged since ");
+    answer["notes"].as_array().is_some_and(|notes| {
+        notes
+            .iter()
+            .any(|note| note.as_str().is_some_and(|note| note.starts_with(&wanted)))
     })
 }
 
@@ -6806,6 +6825,16 @@ async fn a_shared_server_is_kept_while_the_tree_does_not_change() {
             "call {call}: {answer}"
         );
     }
+    // The reused server is not a fresh server's: the last answer says so.
+    let answer = traverse_add(
+        &config,
+        &workspace,
+        &index,
+        local_code_intelligence::config::LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(kept_noted(&answer, "csharp-ls"), "{answer}");
     assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
     manager.shutdown_all().await;
 }
@@ -6848,6 +6877,10 @@ async fn a_shared_server_is_restarted_after_an_edit_between_two_walks() {
     );
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
     assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(
+        !kept_noted(&answer, "csharp-ls"),
+        "a restarted server is a fresh one: {answer}"
+    );
     assert!(reached_through_lsp_live(&answer, TWICE), "{answer}");
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
     assert_eq!(
@@ -6859,6 +6892,7 @@ async fn a_shared_server_is_restarted_after_an_edit_between_two_walks() {
     // Unchanged since the restart: the second server is kept.
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
     assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(kept_noted(&answer, "csharp-ls"), "{answer}");
     assert_eq!(state_count(&state, "spawn_count.txt"), 2);
     manager.shutdown_all().await;
 }
@@ -6893,6 +6927,110 @@ async fn a_new_file_in_an_indexed_directory_restarts_the_shared_server() {
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
     assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
     assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    manager.shutdown_all().await;
+}
+
+/// A new file in an existing child directory of a stamped directory that holds
+/// no indexed file of the server's language (what a rust `#[path]` attribute
+/// can name, here `src/generated/`) moves that child's modification time: the
+/// stamp covers one level of children, so the server restarts.
+#[tokio::test]
+async fn a_new_file_in_an_unindexed_child_directory_restarts_the_shared_server() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    write(&workspace.path, "src/generated/README", "generated\n");
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(kept_noted(&answer, "csharp-ls"), "{answer}");
+
+    write(
+        &workspace.path,
+        "src/generated/Api.cs",
+        "namespace Acceptance;\npublic static class Api { }\n",
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    manager.shutdown_all().await;
+}
+
+/// An edit of a project file the server reads (csharp-ls: `*.csproj`) changes
+/// no source file and no directory's modification time, but the stamp covers
+/// the server's configuration files by name in every stamped directory.
+#[tokio::test]
+async fn a_configuration_file_edit_restarts_the_shared_server() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    write(&workspace.path, "src/App.csproj", "<Project />\n");
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+
+    write(
+        &workspace.path,
+        "src/App.csproj",
+        "<Project Sdk=\"Microsoft.NET.Sdk\" />\n",
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    manager.shutdown_all().await;
+}
+
+/// A stat that fails for a reason other than "not found" fails the stamp: the
+/// barrier restarts the server on every walk and records nothing, as it does
+/// with no snapshot. (A path with an embedded NUL is refused by every
+/// platform.)
+#[tokio::test]
+async fn a_stamp_that_cannot_be_taken_restarts_the_shared_server_every_walk() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager_listing(&config, &workspace, &["src/bad\0name.cs"]);
+    age_tree(&workspace.path);
+    let adapter = csharp_adapter(&manager);
+    manager.tree_barrier(&workspace, &[&adapter]).await;
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts and answers");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "nothing unchanged can be shown: a fresh server"
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 3);
     manager.shutdown_all().await;
 }
 

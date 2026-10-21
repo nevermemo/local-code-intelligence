@@ -104,8 +104,9 @@
 //! A server kept in the process's manager passes the tree barrier when the
 //! backend opens ([`Manager::tree_barrier`]: a stamp from the index's file
 //! list, once per walk): a changed tree stops it and the walk starts a fresh
-//! one ([`ManagerBackend::restarted`]), so no answer is staler than under
-//! `per_call`.
+//! one ([`ManagerBackend::restarted`]), so a reused server is never staler
+//! than under `per_call` for a change the stamp covers; the providers it kept
+//! are listed by [`ManagerBackend::kept`], and the walk labels their answers.
 //!
 //! A missing server binary is found by [`ManagerBackend::open`], before any
 //! walk, as an error the caller reports; the map is then not registered. The
@@ -132,7 +133,7 @@ use crate::{
 use lci_core::{
     config::LspSync,
     language,
-    lsp::{HierarchyCall, HierarchyItem, Location, Manager, adapter::LspAdapter},
+    lsp::{BarrierOutcome, HierarchyCall, HierarchyItem, Location, Manager, adapter::LspAdapter},
     node::{NodeId, NodeKind},
     workspace::Workspace,
 };
@@ -326,6 +327,9 @@ pub struct ManagerBackend {
     /// The providers whose kept session the tree barrier stopped because the
     /// tree changed since its last check (see [`Self::open_split`]).
     restarted: Vec<&'static str>,
+    /// The providers whose running kept session the barrier kept, with how
+    /// long the tree stamp has been unchanged.
+    kept: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl ManagerBackend {
@@ -354,15 +358,18 @@ impl ManagerBackend {
     /// the version probes run through `shared`, so its per-provider cache
     /// holds, and each probed server is then routed to `shared` when it sees
     /// an edit on its own ([`LspAdapter::watches_workspace`]) or `shared`
-    /// syncs edits to its servers (`sync = "watch"`), and to `own` otherwise.
+    /// syncs edits to its servers (`sync = "watch"`) and it lists the
+    /// configuration files of its tree stamp ([`LspAdapter::keeps_session`]),
+    /// and to `own` otherwise.
     /// A server on `own` starts after the last edit, as under `per_call`, and
     /// stops when `own` drops. A server on `shared` first passes the tree
-    /// barrier ([`Manager::tree_barrier`], one stat walk, once here and not per
+    /// barrier ([`Manager::tree_barrier`], one stamp, once here and not per
     /// expansion, before the server is started or reused): its session is
-    /// stopped, and so started again from the disk, when the files of its
-    /// languages changed since the session was last checked. So no answer is
-    /// staler than under `per_call`, whatever the server's own watcher or the
-    /// sync did. No barrier when `shared` and `own` are one manager.
+    /// stopped, and so started again from the disk, when the stamp of its
+    /// languages changed since the session was last checked or cannot be
+    /// taken. So a reused server is never staler than under `per_call` for a
+    /// change the stamp covers, whatever the server's own watcher or the sync
+    /// did. No barrier when `shared` and `own` are one manager.
     pub async fn open_split(
         workspace: Workspace,
         shared: Arc<Manager>,
@@ -378,13 +385,13 @@ impl ManagerBackend {
         let probes = enabled
             .iter()
             .map(|adapter| shared.probe_once(adapter, probe_timeout));
-        let keeps_session = shared.sync_mode() == LspSync::Watch;
+        let synced = shared.sync_mode() == LspSync::Watch;
         let split = !Arc::ptr_eq(&shared, &own);
         let mut on_shared: Vec<&Arc<dyn LspAdapter>> = Vec::new();
         for (adapter, probed) in enabled.iter().zip(futures::future::join_all(probes).await) {
             match probed {
                 Ok(()) => {
-                    let manager = if keeps_session || adapter.watches_workspace() {
+                    let manager = if adapter.keeps_session(synced) {
                         on_shared.push(*adapter);
                         &shared
                     } else {
@@ -401,15 +408,16 @@ impl ManagerBackend {
                 failures.join("; ")
             ));
         }
-        let restarted = if split {
+        let outcome = if split {
             shared.tree_barrier(&workspace, &on_shared).await
         } else {
-            Vec::new()
+            BarrierOutcome::default()
         };
         Ok(Self {
             workspace,
             adapters,
-            restarted,
+            restarted: outcome.restarted,
+            kept: outcome.kept,
         })
     }
 
@@ -418,6 +426,14 @@ impl ManagerBackend {
     /// starts from the disk.
     pub fn restarted(&self) -> &[&'static str] {
         &self.restarted
+    }
+
+    /// The providers whose running kept session the barrier kept when this
+    /// backend opened, with how long the tree stamp has been unchanged: the
+    /// walk's answer comes from that session, not from a server started
+    /// fresh, so the caller labels it.
+    pub fn kept(&self) -> &[(&'static str, std::time::Duration)] {
+        &self.kept
     }
 
     /// Each probed server's provider and the manager that runs it, for the
