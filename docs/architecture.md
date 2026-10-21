@@ -242,7 +242,7 @@ BM25 over the SCIP graph's node names, qualified paths and documentation, whose 
 when the search gave none; `...+literal` or `literal` with `[run_profile.seeds] literal = true`: the opt-in map `seeds.literal`, a whole-word ripgrep search (`lexical::search_literals`) for the names the question puts in code spans, each line placed in the SCIP graph (the symbol defined there, the one around it, else the file of a declaration line), appended after those sources; or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
 `[traverse]` caps (a request can only lower them), writes a trace under `data_dir`, and answers with the reached nodes,
 totals and, only when work is left, a `handle` and `checkpoint`. The first stage (exact operators `exact.closure` and
-`exact.pickaxe`, then seeds), named policies per question type and the steering ladder are described in
+`exact.pickaxe`, then seeds), named policies per question type (the router, chosen by the caller's `steer.policy`) and the steering ladder are described in
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
 

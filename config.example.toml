@@ -464,7 +464,10 @@ exact_seeds = true
 #                           more (first_k + top_k); below that the first stage alone
 #                           answers. 0: no minimum.
 #   extra_maps = [...]      maps added to the default maps when the call names none
-#                           (they read the tree).
+#                           (they read the tree). It may name the opt-in maps, e.g.
+#                           "grep.live" or "lsp.live" (needs the tree), which is how an
+#                           intent is routed to grep or a language server. A list given
+#                           here replaces the built-in list of the policy whole.
 #   first_k, seed_k         the policy's own first_k and seed_k.
 # Built-in values:
 #   impact   walk = false, extra_maps = ["exact.closure"], first_k = 20, seed_k = 20

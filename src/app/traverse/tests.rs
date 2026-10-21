@@ -1756,6 +1756,115 @@ async fn a_policy_adds_its_maps_only_when_the_call_names_none() {
     );
 }
 
+/// One call over the three-file tree with the given steer and question;
+/// `rooted` false is a call without a tree.
+async fn steered_run(
+    tree: &Tree,
+    limits: &TraverseConfig,
+    question: &str,
+    steer: &SteerArgs,
+    rooted: bool,
+) -> Value {
+    let budget = BudgetArgs::default();
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: rooted.then(|| tree.dir.path()),
+        question,
+        seeds: &tree.seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: None,
+        budget: &budget,
+        steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    run(
+        limits,
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response
+}
+
+#[tokio::test]
+async fn a_policy_table_routes_an_intent_to_grep_without_naming_maps() {
+    let tree = Tree::new();
+    let mut routed = limits();
+    routed.policies.insert(
+        "flow".into(),
+        TraversePolicy {
+            extra_maps: Some(vec![GREP_LIVE_MAP_ID.to_owned()]),
+            ..TraversePolicy::default()
+        },
+    );
+    // The intent alone brings grep.live in, beside the default maps.
+    let flow = policy_run(&tree, &routed, "flow", 8, None).await;
+    assert_eq!(flow["effective_policy"]["preset"], "flow", "{flow}");
+    assert!(policy_has_map(&flow, GREP_LIVE_MAP_ID), "{flow}");
+    let grep = flow["effective_policy"]["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|map| map["id"] == GREP_LIVE_MAP_ID)
+        .unwrap();
+    assert_eq!(grep["enabled"], true, "{flow}");
+    for id in MAPS {
+        assert!(policy_has_map(&flow, id), "{id} {flow}");
+    }
+    // Another intent has no table entry: grep.live is not run.
+    let explore = policy_run(&tree, &routed, "explore", 8, None).await;
+    assert!(!policy_has_map(&explore, GREP_LIVE_MAP_ID), "{explore}");
+    // Without a tree the map cannot run and the call says so.
+    let steer = SteerArgs {
+        policy: Some("flow".to_owned()),
+        ..SteerArgs::default()
+    };
+    let rootless = steered_run(&tree, &routed, "q", &steer, false).await;
+    assert!(!policy_has_map(&rootless, GREP_LIVE_MAP_ID), "{rootless}");
+    let notes = notes_of(&rootless);
+    assert!(
+        notes.contains(GREP_LIVE_MAP_ID) && notes.contains("left out") && notes.contains("--root"),
+        "{notes}"
+    );
+}
+
+// Gold is not an input of `Call` at all (labels live only in xtask), so the gold half holds by type;
+// this test pins the text half: wording of every intent still resolves to `explore`.
+#[tokio::test]
+async fn the_question_text_and_the_gold_never_pick_a_policy() {
+    let tree = Tree::new();
+    let limits = TraverseConfig {
+        first_stage: TraverseFirstStage::Append,
+        answer_seeds: true,
+        ..limits()
+    };
+    let wording = "Where should I register a new command? what breaks if I change search? \
+                   how does flow get from a to b";
+    let none = SteerArgs::default();
+    let asked = steered_run(&tree, &limits, wording, &none, true).await;
+    let plain = steered_run(&tree, &limits, "q", &none, true).await;
+    // Every intent's wording, and still the default policy.
+    assert_eq!(asked["effective_policy"]["preset"], "explore", "{asked}");
+    assert_eq!(asked["results"], plain["results"]);
+    assert_eq!(asked["totals"]["pops"], plain["totals"]["pops"]);
+    assert_eq!(
+        asked["effective_policy"]["hash"],
+        plain["effective_policy"]["hash"]
+    );
+    // Only the caller's name picks one.
+    let named = SteerArgs {
+        policy: Some("where-to".to_owned()),
+        ..SteerArgs::default()
+    };
+    let routed = steered_run(&tree, &limits, wording, &named, true).await;
+    assert_eq!(routed["effective_policy"]["preset"], "where-to", "{routed}");
+}
+
 #[tokio::test]
 async fn a_continuation_does_not_run_the_first_stage_again() {
     let tree = Tree::new();
