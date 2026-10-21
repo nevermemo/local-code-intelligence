@@ -56,6 +56,25 @@ impl LspAdapter for RustServer {
         "rust_analyzer_available"
     }
 
+    /// Evidence: the client capabilities in [`Self::initialize_params`]
+    /// declare only `workspace.symbol.resolveSupport` and
+    /// `experimental.serverStatusNotification`, no
+    /// `workspace.didChangeWatchedFiles`, so rust-analyzer cannot rely on the
+    /// client for file changes and runs its own watcher (its documented
+    /// fallback). Correctness does not rely on that watcher: a kept session
+    /// passes the tree barrier of each walk (`Manager::tree_barrier`), so its
+    /// lag is not a staleness. Checked
+    /// against the real server by the SHARED smoke (decision d454).
+    fn watches_workspace(&self) -> bool {
+        true
+    }
+
+    /// `Cargo.toml` and `Cargo.lock` (the crate graph) and `rust-analyzer.toml`
+    /// (its per-project settings).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &["Cargo.toml", "Cargo.lock", "rust-analyzer.toml"]
+    }
+
     fn transport_config(&self, root: &Path) -> Option<TransportConfig> {
         Some(TransportConfig {
             executable: self.path.clone(),

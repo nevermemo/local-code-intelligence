@@ -318,10 +318,13 @@ pub struct Call<'a> {
     /// `probe.compile` reads; `None` is the defaults.
     pub lsp: Option<&'a lci_core::config::Config>,
     /// The language-server manager the call shares when `[run_profile.lsp]
-    /// sessions = "shared"`: the MCP and REST server's own, one per process for
-    /// `lci traverse`. Used only under `shared`; `None` there (a caller with no
-    /// manager of its own, the recipes) starts the call's own servers as under
-    /// `per_call`. Under `per_call` it is never read.
+    /// sessions = "shared"` (the default): the MCP and REST server's own, one
+    /// per process for `lci traverse`. Used only under `shared`, and only for
+    /// a server that sees an edit on its own (`LspAdapter::watches_workspace`)
+    /// or when `sync = "watch"`; every other server starts on the call's own
+    /// manager, as under `per_call`. `None` there (a caller with no manager of
+    /// its own, the recipes) starts all the call's servers as under `per_call`.
+    /// Under `per_call` it is never read.
     pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
 }
 
@@ -1032,14 +1035,18 @@ pub async fn run_with_trait_seeds(
         }
     }
     let mut lsp_live = None;
-    // The manager and workspace id `lsp.live` runs on, to report after the walk
-    // how its servers stood.
-    let mut lsp_live_sessions: Option<(Arc<lci_core::lsp::Manager>, String)> = None;
+    // Each server `lsp.live` runs, with the manager that runs it and the workspace id,
+    // to report after the walk how its servers stood.
+    let mut lsp_live_sessions: Vec<(&'static str, Arc<lci_core::lsp::Manager>, String)> =
+        Vec::new();
+    let mut lsp_live_workspace = String::new();
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
-        // stops when the map drops. `shared`: the caller's manager, whose
-        // owner stops the server (idle sweeper, release, shutdown).
+        // stops when the map drops. `shared`: a server that sees an edit on its
+        // own (or every server under `sync = "watch"`) runs on the caller's
+        // manager, whose owner stops it (idle sweeper, release, shutdown); the
+        // other servers run on the call's own manager, as under `per_call`.
         let workspace = dunce::canonicalize(root)
             .map(|path| lci_core::workspace::Workspace {
                 id: lci_core::workspace::hash(&path.to_string_lossy()),
@@ -1050,11 +1057,12 @@ pub async fn run_with_trait_seeds(
             Ok(workspace) => {
                 let defaults = lci_core::config::Config::default();
                 let settings = call.lsp.unwrap_or(&defaults);
-                let manager = match (profile.lsp.sessions, &call.lsp_sessions) {
-                    (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
-                    _ => per_call_manager(call),
+                let own = per_call_manager(call);
+                let shared = match (profile.lsp.sessions, &call.lsp_sessions) {
+                    (LspSessions::Shared, Some(shared)) => Some(Arc::clone(shared)),
+                    _ => None,
                 };
-                lsp_live_sessions = Some((Arc::clone(&manager), workspace.id.clone()));
+                lsp_live_workspace = workspace.id.clone();
                 // The version probe is bounded like the readiness probes. It
                 // runs inside the setup window that `budget.deadline +=
                 // setup.elapsed()` below credits back to the walk deadline, so
@@ -1062,8 +1070,10 @@ pub async fn run_with_trait_seeds(
                 let probe =
                     std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
                 let probe_started = Instant::now();
-                let opened =
-                    ManagerBackend::open_with_probe_timeout(workspace, manager, probe).await;
+                let opened = match shared {
+                    Some(shared) => ManagerBackend::open_split(workspace, shared, own, probe).await,
+                    None => ManagerBackend::open_with_probe_timeout(workspace, own, probe).await,
+                };
                 // `cargo xtask maps lsp-cost` reads this line: a shared manager
                 // probes a binary once, so later calls log about 0 ms.
                 tracing::debug!(
@@ -1078,6 +1088,14 @@ pub async fn run_with_trait_seeds(
         };
         match backend {
             Ok(backend) => {
+                for (provider, manager) in backend.routes() {
+                    lsp_live_sessions.push((provider, manager, lsp_live_workspace.clone()));
+                }
+                for provider in backend.restarted() {
+                    notes.push(format!(
+                        "lsp.live: {provider} restarted: the tree changed since its last call"
+                    ));
+                }
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);
                 // `outline`: the index's table first, the server's own outline
                 // for what it lacks (everything under `scip.mode = "off"`).
@@ -1509,19 +1527,16 @@ pub async fn run_with_trait_seeds(
     // A server that is not ready when the walk ends says why a node may have
     // had no edges; a ready one adds nothing, so a walk whose servers are
     // ready answers exactly as before.
-    if let Some((manager, workspace_id)) = &lsp_live_sessions {
-        for adapter in manager.adapters() {
-            let provider = adapter.provider();
-            if let Some(readiness) = manager.readiness(provider, workspace_id).await
-                && readiness.state != lci_core::lsp::ServerStateName::Ready
-            {
-                notes.push(format!(
-                    "lsp.live: {provider} {} when the walk ended (ready changes {}, progress {})",
-                    readiness.state.as_str(),
-                    readiness.ready_changes,
-                    readiness.progress
-                ));
-            }
+    for (provider, manager, workspace_id) in &lsp_live_sessions {
+        if let Some(readiness) = manager.readiness(provider, workspace_id).await
+            && readiness.state != lci_core::lsp::ServerStateName::Ready
+        {
+            notes.push(format!(
+                "lsp.live: {provider} {} when the walk ended (ready changes {}, progress {})",
+                readiness.state.as_str(),
+                readiness.ready_changes,
+                readiness.progress
+            ));
         }
     }
     // What the new maps cost per call, measured in this run (the p50 ring the

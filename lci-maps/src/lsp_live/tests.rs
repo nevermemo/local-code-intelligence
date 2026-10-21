@@ -770,6 +770,52 @@ async fn the_version_probe_honours_the_timeout_it_is_given() {
         .expect("the executable answers --version within a minute");
 }
 
+/// `open_split` routes each probed server by whether it sees an edit on its
+/// own: rust-analyzer (a watching adapter) to the `shared` manager, csharp-ls
+/// (it is told nothing) to the call's `own` one, unless `shared` syncs edits
+/// (`sync = "watch"`), when both go to `shared`. The servers are the real
+/// adapters of the manager, pointed at cargo, which answers `--version`.
+#[tokio::test]
+async fn open_split_routes_by_watching_and_sync() {
+    use lci_core::config::LspSync;
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let routed = |backend: &ManagerBackend, provider: &str, shared: &Arc<Manager>| {
+        let (_, manager) = backend
+            .adapters
+            .iter()
+            .find(|(adapter, _)| adapter.provider() == provider)
+            .unwrap_or_else(|| panic!("{provider} was probed"));
+        Arc::ptr_eq(manager, shared)
+    };
+    for (sync, csharp_shared) in [(LspSync::Off, false), (LspSync::Watch, true)] {
+        let mut config = Config {
+            rust_analyzer_path: cargo.clone(),
+            ..Config::default()
+        };
+        config.csharp.path = Some(cargo.clone());
+        config.run_profile.lsp.sync = sync;
+        let shared = Arc::new(Manager::new(&config));
+        let own = Arc::new(Manager::new(&config).without_sync());
+        let workspace = Workspace {
+            id: "test".into(),
+            path: std::env::temp_dir(),
+        };
+        let backend = ManagerBackend::open_split(
+            workspace,
+            Arc::clone(&shared),
+            Arc::clone(&own),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("cargo answers --version");
+        assert!(routed(&backend, "rust-analyzer", &shared), "{sync:?}");
+        assert_eq!(
+            routed(&backend, "csharp-ls", &shared),
+            csharp_shared,
+            "{sync:?}"
+        );
+    }
+}
 #[tokio::test]
 async fn a_missing_server_binary_makes_the_map_unavailable_before_any_walk() {
     let config = Config {

@@ -292,13 +292,21 @@ impl Default for WalkProfile {
 #[serde(rename_all = "snake_case")]
 pub enum LspSessions {
     /// Every traverse call starts its own servers and stops them when its
-    /// walk ends. Today's behaviour.
-    #[default]
+    /// walk ends: every answer is read from a server that started after the
+    /// last edit.
     PerCall,
     /// The calls of one process share that process's language servers (the
     /// ones navigation and the search channel use): a server started by one
     /// call is reused by the next and stops with the idle timeout,
-    /// `release_workspace` or service shutdown.
+    /// `release_workspace` or service shutdown. Only a server that sees an
+    /// edit on its own (`LspAdapter::watches_workspace`, today
+    /// rust-analyzer) keeps its session across calls, or any server when
+    /// `[run_profile.lsp] sync = "watch"` tells it; every other server
+    /// behaves as under `per_call`. A kept session first passes the tree
+    /// barrier of each walk (`Manager::tree_barrier`: a stamp from the index's
+    /// file list; a changed stamp restarts the server), so no answer is staler
+    /// than under `per_call`.
+    #[default]
     Shared,
 }
 
@@ -404,10 +412,12 @@ impl std::str::FromStr for LspPlaces {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LspProfile {
-    /// `"per_call"` (default): each traverse call starts and stops its own
-    /// language servers. `"shared"`: the calls of a process reuse one set (see
-    /// [`LspSessions`]). The set lives in a manager that the caller supplies:
-    /// the MCP and REST server's own, or one per process for `lci traverse`.
+    /// `"shared"` (default): the calls of a process reuse the sessions of the
+    /// servers that see an edit on their own, and every other server runs per
+    /// call (see [`LspSessions`]). `"per_call"`: each traverse call starts and
+    /// stops its own language servers. The set lives in a manager that the
+    /// caller supplies: the MCP and REST server's own, or one per process for
+    /// `lci traverse`.
     /// The recipes walk no `lsp.live` and run the same under both values.
     pub sessions: LspSessions,
     /// `false` (default): every outline `lsp.live` needs (a file's
@@ -731,7 +741,7 @@ mod tests {
         config.run_profile.walk.grep_corroboration = 0.5;
         config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
-        config.run_profile.lsp.sessions = LspSessions::Shared;
+        config.run_profile.lsp.sessions = LspSessions::PerCall;
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.freshness.stat_gate = true;
         config.run_profile.lsp.outline_cache = true;
@@ -1257,17 +1267,20 @@ mode = \"sometimes\"
     }
 
     #[test]
-    fn lsp_sessions_and_outline_cache_are_off_by_default_and_change_the_profile_hash() {
-        let off = Config::default();
-        assert_eq!(off.run_profile.lsp.sessions, LspSessions::PerCall);
-        assert!(!off.run_profile.lsp.outline_cache);
-        let text = format!("{}[run_profile.lsp]\nsessions = \"shared\"\n", base_toml());
-        let shared: Config = toml::from_str(&text).unwrap();
-        shared.validate().unwrap();
-        assert_eq!(shared.run_profile.lsp.sessions, LspSessions::Shared);
+    fn lsp_sessions_defaults_to_shared_and_per_call_changes_the_profile_hash() {
+        let default = Config::default();
+        assert_eq!(default.run_profile.lsp.sessions, LspSessions::Shared);
+        assert!(!default.run_profile.lsp.outline_cache);
+        let text = format!(
+            "{}[run_profile.lsp]\nsessions = \"per_call\"\n",
+            base_toml()
+        );
+        let per_call: Config = toml::from_str(&text).unwrap();
+        per_call.validate().unwrap();
+        assert_eq!(per_call.run_profile.lsp.sessions, LspSessions::PerCall);
         assert_eq!(
-            serde_json::to_value(&shared).unwrap()["run_profile"]["lsp"]["sessions"],
-            "shared"
+            serde_json::to_value(&per_call).unwrap()["run_profile"]["lsp"]["sessions"],
+            "per_call"
         );
         let cached: Config = toml::from_str(&format!(
             "{}[run_profile.lsp]\noutline_cache = true\n",
@@ -1276,29 +1289,29 @@ mode = \"sometimes\"
         .unwrap();
         cached.validate().unwrap();
         assert!(cached.run_profile.lsp.outline_cache);
-        assert_eq!(cached.run_profile.lsp.sessions, LspSessions::PerCall);
-        let (off, shared, cached) = (
-            off.run_profile(),
-            shared.run_profile(),
+        assert_eq!(cached.run_profile.lsp.sessions, LspSessions::Shared);
+        let (default, per_call, cached) = (
+            default.run_profile(),
+            per_call.run_profile(),
             cached.run_profile(),
         );
-        assert_eq!(off.value["run_profile"]["lsp"]["sessions"], "per_call");
-        assert_eq!(shared.value["run_profile"]["lsp"]["sessions"], "shared");
-        assert_eq!(off.value["run_profile"]["lsp"]["outline_cache"], false);
+        assert_eq!(default.value["run_profile"]["lsp"]["sessions"], "shared");
+        assert_eq!(per_call.value["run_profile"]["lsp"]["sessions"], "per_call");
+        assert_eq!(default.value["run_profile"]["lsp"]["outline_cache"], false);
         assert_eq!(cached.value["run_profile"]["lsp"]["outline_cache"], true);
         for key in ["run_profile.lsp.sessions", "run_profile.lsp.outline_cache"] {
-            assert!(off.keys.iter().any(|k| k == key), "{key}");
+            assert!(default.keys.iter().any(|k| k == key), "{key}");
         }
-        assert_ne!(off.hash, shared.hash);
-        assert_ne!(off.hash, cached.hash);
-        assert_ne!(shared.hash, cached.hash);
+        assert_ne!(default.hash, per_call.hash);
+        assert_ne!(default.hash, cached.hash);
+        assert_ne!(per_call.hash, cached.hash);
         // Spelling out the defaults is the default.
         let spelled: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nsessions = \"per_call\"\noutline_cache = false\n",
+            "{}[run_profile.lsp]\nsessions = \"shared\"\noutline_cache = false\n",
             base_toml()
         ))
         .unwrap();
-        assert_eq!(spelled.run_profile().hash, off.hash);
+        assert_eq!(spelled.run_profile().hash, default.hash);
         for bad in [
             "[run_profile.lsp]\nsessions = \"always\"\n",
             "[run_profile.lsp]\nsessions = true\n",
@@ -1398,7 +1411,7 @@ mode = \"sometimes\"
                     "{leaf} vs {other}"
                 );
             }
-            assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+            assert_eq!(on.run_profile.lsp.sessions, LspSessions::Shared);
             assert!(!on.run_profile.lsp.outline_cache);
             // It changes what an lsp.live answer holds, so it changes the hash.
             let (off, on) = (off.run_profile(), on.run_profile());
@@ -1453,7 +1466,7 @@ mode = \"sometimes\"
         .unwrap();
         watch.validate().unwrap();
         assert_eq!(watch.run_profile.lsp.sync, LspSync::Watch);
-        assert_eq!(watch.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert_eq!(watch.run_profile.lsp.sessions, LspSessions::Shared);
         assert!(!watch.run_profile.lsp.outline_cache);
         assert_eq!(
             serde_json::to_value(&watch).unwrap()["run_profile"]["lsp"]["sync"],
@@ -1501,7 +1514,7 @@ mode = \"sometimes\"
         outline.validate().unwrap();
         assert_eq!(outline.run_profile.lsp.places, LspPlaces::Outline);
         // Only the named leaf moves.
-        assert_eq!(outline.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert_eq!(outline.run_profile.lsp.sessions, LspSessions::Shared);
         assert_eq!(outline.run_profile.lsp.sync, LspSync::Off);
         assert!(!outline.run_profile.lsp.implementations);
         assert_eq!(
@@ -1543,7 +1556,7 @@ mode = \"sometimes\"
         on.validate().unwrap();
         assert!(on.run_profile.lsp.implementations);
         // The other leaf of the section keeps its default.
-        assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert_eq!(on.run_profile.lsp.sessions, LspSessions::Shared);
         assert_eq!(
             serde_json::to_value(&on).unwrap()["run_profile"]["lsp"]["implementations"],
             true

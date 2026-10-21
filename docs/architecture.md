@@ -120,11 +120,11 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   over budget adds a note, a provider that fails adds a warning; locations map onto chunks of the same language that
   contain `start_line`; capped at `lsp_candidate_count` (40). Navigation tools (`symbols`, `definition`, `references`)
   are not fused, return raw `Location`s and need an index containing the file's language. The `lsp.live` map of a
-  traversal (`lci-maps` `lsp_live`) asks a `Manager` it is given (`ManagerBackend::open(workspace, Arc<Manager>)`). Under
-  `[run_profile.lsp] sessions = "per_call"` (default) `app::traverse::run` builds one per call, so the map owns it and its
-  server dies with the map; under `"shared"` it uses `Call.lsp_sessions`, the `Arc<Manager>` that `App::language_servers()`
-  hands out (the service's own, so a server started by navigation, search or a traverse call serves the others; the CLI
-  `traverse` builds one per process and shuts it down after the walk), and the server's lifetime is the manager's (idle
+  traversal (`lci-maps` `lsp_live`) asks the `Manager`s it is given: `ManagerBackend::open(workspace, Arc<Manager>)` (one for every server) or `ManagerBackend::open_split(workspace, shared, own, probe)`, which probes through `shared` and routes each server to `shared` when `LspAdapter::watches_workspace()` (rust-analyzer alone: it runs its own file watcher) or `shared` syncs (`sync = "watch"`), else to `own`; a server routed to `shared` first passes `Manager::tree_barrier` once per walk, which stats the server's indexed files, their directories and ancestors and its manifests (`lsp::stamp`, from the index's file list that `App` supplies through `stamp::IndexedFiles` over the workspace manifest) and stops the session when the stamp changed, so the walk starts one that reads the disk. Under
+  `[run_profile.lsp] sessions = "per_call"` `app::traverse::run` builds one per call, so the map owns it and its
+  server dies with the map; under `"shared"` (default) it uses `Call.lsp_sessions` as `shared` and a per-call manager as `own`, so a server that does not see an edit on its own starts per call and no answer is staler than under `per_call`; `Call.lsp_sessions` is the `Arc<Manager>` that `App::language_servers()`
+  hands out (the service's own, so a server started by navigation, search or a kept traverse server serves the others; the CLI
+  `traverse` builds one per process and shuts it down after the walk), and a kept server's lifetime is the manager's (idle
   sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful version probe per provider for
   the manager's life. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the

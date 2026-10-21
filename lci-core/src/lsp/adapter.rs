@@ -115,6 +115,32 @@ pub trait LspAdapter: Send + Sync {
     fn opens_documents(&self) -> bool {
         false
     }
+
+    /// Whether the server learns of an edit to any file of its workspace on
+    /// its own, without the client resending text or sending
+    /// `workspace/didChangeWatchedFiles`: it runs its own file watcher. Only
+    /// such a server may keep one session across traverse calls under the
+    /// default `[run_profile.lsp] sessions = "shared"` without `sync =
+    /// "watch"`; every other server is started per call. (A kept session also
+    /// passes the tree barrier of each walk, `Manager::tree_barrier`, so no
+    /// answer is staler than under `per_call` whatever the watcher does.) A
+    /// server that is resent only the requested file
+    /// ([`Self::opens_documents`]) does not qualify: an edit
+    /// to another file stays unseen. Default `false`; an override names its
+    /// capability evidence.
+    fn watches_workspace(&self) -> bool {
+        false
+    }
+
+    /// The project manifest file names that change what the server sees
+    /// without changing a source file (rust-analyzer: its crate graph and its
+    /// settings). The tree stamp (`lsp::stamp`) stats each of them in every
+    /// directory that holds one of the server's indexed files, and in that
+    /// directory's ancestors. Default none; an adapter that can be shared
+    /// lists its own.
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// The largest file a `before_position_request` hook reads and sends whole in

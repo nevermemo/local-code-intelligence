@@ -114,6 +114,11 @@ impl ManifestV1 {
     }
 }
 
+/// Where the manifest of the workspace with id `workspace_id` is stored.
+pub fn manifest_path(data_dir: &Path, workspace_id: &str) -> PathBuf {
+    path(data_dir, workspace_id)
+}
+
 fn path(data_dir: &Path, workspace_id: &str) -> PathBuf {
     data_dir
         .join("manifests")

@@ -5397,6 +5397,84 @@ fn shared_sessions_fixture(
     (config, workspace, state, index)
 }
 
+/// [`shared_sessions_fixture`] with `[run_profile.lsp] sync = "watch"`. The
+/// default `sessions = "shared"` keeps a server across walks only when it sees
+/// an edit on its own (`LspAdapter::watches_workspace`: rust-analyzer) or when
+/// the sync tells it. csharp-ls is a non-watching adapter, so without `watch`
+/// a walk starts its own csharp-ls, as under `per_call`; the tests that mean a
+/// server shared across calls use this fixture.
+fn watching_sessions_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (mut config, workspace, state, index) = shared_sessions_fixture(temp);
+    config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Watch;
+    (config, workspace, state, index)
+}
+
+/// The index's file list for the tree barrier, fixed when the manager is
+/// built: the snapshot of the workspace as the fixture wrote it.
+struct SnapshotFiles(Arc<Vec<String>>);
+
+#[lci_maps::async_trait]
+impl local_code_intelligence::lsp::stamp::IndexedFiles for SnapshotFiles {
+    async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+/// A manager of `config` that has `workspace`'s index snapshot, as the
+/// service's has: without one the tree barrier restarts every shared session
+/// it is asked about (no sharing without a stamp).
+fn indexed_manager(config: &Config, workspace: &Workspace) -> Arc<Manager> {
+    let files = local_code_intelligence::chunk::source_files(&workspace.path, true)
+        .unwrap()
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    Arc::new(Manager::new(config).with_indexed_files(Arc::new(SnapshotFiles(Arc::new(files)))))
+}
+
+/// Gives every file and directory under `root` (and `root`) an old
+/// modification time, so that a change made after it cannot share its clock
+/// tick (a directory's modification time moves when an entry is added).
+fn age_tree(root: &std::path::Path) {
+    fn set_modified(path: &std::path::Path, time: std::time::SystemTime) {
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS opens a directory.
+            options.write(true).custom_flags(0x0200_0000);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+        options.open(path).unwrap().set_modified(time).unwrap();
+    }
+    fn visit(path: &std::path::Path, time: std::time::SystemTime) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                visit(&entry.unwrap().path(), time);
+            }
+        }
+        set_modified(path, time);
+    }
+    visit(
+        root,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+}
+
+/// Whether the walk noted that the tree barrier restarted `provider`'s kept
+/// session.
+fn restart_noted(answer: &Value, provider: &str) -> bool {
+    let wanted = format!("lsp.live: {provider} restarted: the tree changed since its last call");
+    answer["notes"].as_array().is_some_and(|notes| {
+        notes
+            .iter()
+            .any(|note| note.as_str() == Some(wanted.as_str()))
+    })
+}
+
 /// One `lsp.live` traversal of `Add` over the fixture, under `sessions`, with
 /// `manager` offered as the shared manager. The budgets are wide: a cold fake
 /// server starts well inside them even on a loaded machine.
@@ -5479,6 +5557,10 @@ async fn traverse_add_past_a_cold_start(
     use local_code_intelligence::config::LspSessions;
     if sessions == LspSessions::Shared {
         let adapter = csharp_adapter(manager);
+        // Stamped first, as the service's warm start does: a session started
+        // by a call that passes no barrier has no stamp and would be
+        // restarted by the walk.
+        manager.tree_barrier(workspace, &[&adapter]).await;
         manager
             .symbols(&adapter, workspace, "Calculator")
             .await
@@ -5554,8 +5636,12 @@ fn reached_run_through_lsp_live(answer: &Value) -> bool {
 
 /// `config` as a service that warms the language servers at the first touch of
 /// a workspace: shared sessions and a traverse policy that adds `lsp.live`.
+/// `sync = "watch"` because csharp-ls is a non-watching adapter: under
+/// `shared` alone a walk starts its own csharp-ls and the warm start primes
+/// nothing for it (see [`watching_sessions_fixture`]); `watch` keeps it shared.
 fn with_lsp_live_warm_start(mut config: Config) -> Config {
     config.run_profile.lsp.sessions = local_code_intelligence::config::LspSessions::Shared;
+    config.run_profile.lsp.sync = local_code_intelligence::config::LspSync::Watch;
     config.traverse.enabled = true;
     config.traverse.policies.insert(
         "explore".to_owned(),
@@ -5910,9 +5996,9 @@ async fn two_traverse_calls_share_one_language_server_under_shared_sessions() {
     use local_code_intelligence::config::LspSessions;
     for (sessions, spawned) in [(LspSessions::Shared, 1), (LspSessions::PerCall, 2)] {
         let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+        let (config, workspace, state, index) = watching_sessions_fixture(&temp);
         // The same manager is offered in both arms; only `shared` uses it.
-        let manager = Arc::new(Manager::new(&config));
+        let manager = indexed_manager(&config, &workspace);
         for call in 1..=2 {
             let answer = traverse_add(&config, &workspace, &index, sessions, &manager).await;
             assert!(
@@ -5943,8 +6029,8 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     // `shared`: the walk is over, the server is not; releasing the workspace
     // of the shared manager stops it.
     let temp = tempfile::tempdir().unwrap();
-    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
-    let manager = Arc::new(Manager::new(&config));
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
     let answer = traverse_add_past_a_cold_start(
         &config,
         &workspace,
@@ -5973,7 +6059,7 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
     // manager the call was offered.
     let temp = tempfile::tempdir().unwrap();
     let (config, workspace, state, index) = shared_sessions_fixture(&temp);
-    let manager = Arc::new(Manager::new(&config));
+    let manager = indexed_manager(&config, &workspace);
     let answer = traverse_add_past_a_cold_start(
         &config,
         &workspace,
@@ -6662,19 +6748,52 @@ fn reached_through_lsp_live(answer: &Value, node: &str) -> bool {
 /// `CallSite.cs` with a second caller of `Add` on a line of its own.
 const CALL_SITE_WITH_TWICE_CS: &str = "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\npublic static class More { public static int Twice(Calculator value) => value.Add(2, 2); }\n";
 
-/// Under `sessions = "shared"` a server outlives the walk that started it, so
-/// without the sync it answers the next walk from the tree it walked at
-/// start. With `[run_profile.lsp] sync = "watch"` the edit between two walks
-/// reaches it: the second walk finds the new caller of `Add` through
-/// `lsp.live`, on the same server, which was told between the two walks.
+/// Under the default `sessions = "shared"` a server that is shared (here
+/// csharp-ls under `sync = "watch"`) outlives the walk that started it. The
+/// tree barrier of a walk compares the tree stamp (the index's files of the
+/// server's languages, their directories and ancestors, the server's
+/// manifests) with the one recorded at the server's last check: an unchanged
+/// stamp keeps the server, whatever the server's own watcher or the sync
+/// would have done.
 #[tokio::test]
-async fn a_shared_server_is_told_about_an_edit_between_two_walks() {
-    use local_code_intelligence::config::{LspSessions, LspSync};
+async fn a_shared_server_is_kept_while_the_tree_does_not_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    for call in 1..=3 {
+        let answer = traverse_add_past_a_cold_start(
+            &config,
+            &workspace,
+            &index,
+            &state,
+            local_code_intelligence::config::LspSessions::Shared,
+            &manager,
+        )
+        .await;
+        assert!(
+            reached_run_through_lsp_live(&answer),
+            "call {call}: {answer}"
+        );
+        assert!(
+            !restart_noted(&answer, "csharp-ls"),
+            "call {call}: {answer}"
+        );
+    }
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
+    manager.shutdown_all().await;
+}
+
+/// An edit between two walks restarts the kept server (`spawn_count` 2), the
+/// second walk says so in its notes and finds the new caller of `Add` through
+/// `lsp.live`. `sync = "watch"` no longer avoids the restart: the sync (which
+/// forwards the edit to a running server) is not what the barrier relies on.
+#[tokio::test]
+async fn a_shared_server_is_restarted_after_an_edit_between_two_walks() {
+    use local_code_intelligence::config::LspSessions;
     const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
     let temp = tempfile::tempdir().unwrap();
-    let (mut config, workspace, state, index) = shared_sessions_fixture(&temp);
-    config.run_profile.lsp.sync = LspSync::Watch;
-    let manager = Arc::new(Manager::new(&config));
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
     let answer = traverse_add_past_a_cold_start(
         &config,
         &workspace,
@@ -6685,22 +6804,12 @@ async fn a_shared_server_is_told_about_an_edit_between_two_walks() {
     )
     .await;
     assert!(!reached_through_lsp_live(&answer, TWICE), "{answer}");
-    assert!(
-        manager.synced(&workspace.id, &[], LOADED_BUDGET).await,
-        "the sync started with the session: {:?}",
-        manager.sync_status(&workspace.id)
-    );
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
 
-    // A second caller of `Add`, and a SCIP index written for the tree as it
-    // is now (an input of the walk, which places `Twice` by it).
+    // A second caller of `Add` (a new length for `CallSite.cs`), and a SCIP
+    // index written for the tree as it is now (an input of the walk, which
+    // places `Twice` by it).
     write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
-    assert!(
-        manager
-            .synced(&workspace.id, &["src/CallSite.cs"], LOADED_BUDGET)
-            .await,
-        "{:?}",
-        manager.sync_status(&workspace.id)
-    );
     let index = csharp_scip_index_of(
         &temp.path().join("index-twice.scip"),
         &workspace,
@@ -6711,27 +6820,277 @@ async fn a_shared_server_is_told_about_an_edit_between_two_walks() {
         ],
     );
     let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
     assert!(reached_through_lsp_live(&answer, TWICE), "{answer}");
     assert!(reached_run_through_lsp_live(&answer), "{answer}");
-    assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
-
-    // The server's record: the notification sits between the references of
-    // the first walk and those of the second.
-    let methods: Vec<String> = std::fs::read_to_string(state.join("events.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].to_string())
-        .collect();
-    let position = |method: &str| methods.iter().position(|m| m.contains(method));
-    let last_position = |method: &str| methods.iter().rposition(|m| m.contains(method));
-    let (first, told, last) = (
-        position("textDocument/references").expect("the first walk asked"),
-        position("workspace/didChangeWatchedFiles").expect("the server was told"),
-        last_position("textDocument/references").unwrap(),
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        2,
+        "the first server was stopped and a second started from the disk"
     );
-    assert!(first < told && told < last, "{methods:?}");
+
+    // Unchanged since the restart: the second server is kept.
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
     manager.shutdown_all().await;
-    assert!(manager.sync_status(&workspace.id).is_none());
+}
+
+/// A new file in a directory that holds an indexed file of the server's
+/// language is not in the snapshot, but it moves its directory's modification
+/// time: the stamp changes and the server restarts.
+#[tokio::test]
+async fn a_new_file_in_an_indexed_directory_restarts_the_shared_server() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+
+    write(
+        &workspace.path,
+        "src/Extra.cs",
+        "namespace Acceptance;\npublic static class Extra { }\n",
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 2);
+    manager.shutdown_all().await;
+}
+
+/// A change inside a directory the index does not list (an ignored one, whose
+/// files are not indexed) and that holds none of the server's indexed files
+/// does not move the stamp: the server is kept.
+#[tokio::test]
+async fn a_change_in_an_ignored_directory_keeps_the_shared_server() {
+    use local_code_intelligence::config::LspSessions;
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    write(&workspace.path, ".gitignore", "obj/\n");
+    write(
+        &workspace.path,
+        "obj/Generated.cs",
+        "namespace Acceptance;\npublic static class Generated { }\n",
+    );
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+
+    write(
+        &workspace.path,
+        "obj/Generated.cs",
+        "namespace Acceptance;\npublic static class Generated { public static int More = 1; }\n",
+    );
+    write(
+        &workspace.path,
+        "obj/Another.cs",
+        "namespace Acceptance;\npublic static class Another { }\n",
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert!(!restart_noted(&answer, "csharp-ls"), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
+    manager.shutdown_all().await;
+}
+
+/// Without an index file list there is no stamp and so no sharing: every walk
+/// restarts the shared server it is asked about.
+#[tokio::test]
+async fn without_an_index_snapshot_a_shared_server_is_not_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = Arc::new(Manager::new(&config));
+    for _ in 0..2 {
+        let answer =
+            traverse_add_by_default_until(&config, &workspace, &index, &manager, |answer| {
+                reached_run_through_lsp_live(answer)
+            })
+            .await
+            .0;
+        assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    }
+    assert!(
+        state_count(&state, "spawn_count.txt") >= 2,
+        "a server per walk"
+    );
+    manager.shutdown_all().await;
+}
+
+/// [`traverse_add`] under the default profile (no `sessions` line), for a server
+/// the walk starts on its own manager (csharp-ls is a non-watching adapter).
+/// A walk that only ran out of time on a cold fake server (a loaded machine
+/// can exceed `lsp_live::CALL_TIMEOUT`) and has not reached `done` is asked
+/// again, up to three walks in all; any other error note fails the test.
+/// Returns the last answer and the walks made.
+async fn traverse_add_by_default_until(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    manager: &Arc<Manager>,
+    done: impl Fn(&Value) -> bool,
+) -> (Value, u64) {
+    use local_code_intelligence::config::{LspProfile, LspSessions};
+    let sessions = LspProfile::default().sessions;
+    assert_eq!(sessions, LspSessions::Shared, "the default is shared");
+    let mut walks = 0;
+    loop {
+        walks += 1;
+        let answer = traverse_add(config, workspace, index, sessions, manager).await;
+        // Only a clean deadline miss may be retried: any other error note
+        // (a failed call, an error for a node, an unavailable map) fails the
+        // test.
+        let errors: Vec<&str> = answer["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|note| {
+                note.contains("calls failed")
+                    || note.contains("reported an error")
+                    || note.contains("is unavailable")
+            })
+            .collect();
+        let ran_out_of_time = answer["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|note| {
+                note.as_str()
+                    .is_some_and(|text| text.contains(lci_maps::lsp_live::DEADLINE_NOTE))
+            })
+        });
+        assert!(
+            errors
+                .iter()
+                .all(|note| note.contains(lci_maps::lsp_live::DEADLINE_NOTE)),
+            "walk {walks} failed on more than the deadline: {errors:?}"
+        );
+        if done(&answer) || walks == 3 || !ran_out_of_time {
+            return (answer, walks);
+        }
+    }
+}
+
+/// The rule behind the default `sessions = "shared"`: no answer is staler than
+/// under `per_call`. csharp-ls is a server that is told nothing about an edit
+/// (a non-watching adapter), so under the default profile with `sync = "off"`
+/// every walk starts its own server on the tree as it is, and the same edit
+/// that `a_shared_server_is_restarted_after_an_edit_between_two_walks` needs
+/// `sync = "watch"` and a restart for is seen without either. Nothing stays in
+/// the service's manager.
+#[tokio::test]
+async fn the_default_profile_sees_an_edit_on_a_server_that_does_not_watch() {
+    use local_code_intelligence::config::{LspSessions, LspSync};
+    const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shared_sessions_fixture(&temp);
+    // The default: no `sessions` line, no sync.
+    assert_eq!(config.run_profile.lsp.sessions, LspSessions::default());
+    assert_eq!(config.run_profile.lsp.sync, LspSync::Off);
+    let manager = Arc::new(Manager::new(&config));
+    let (answer, first) =
+        traverse_add_by_default_until(&config, &workspace, &index, &manager, |answer| {
+            reached_run_through_lsp_live(answer)
+        })
+        .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert!(!reached_through_lsp_live(&answer, TWICE), "{answer}");
+
+    // A second caller of `Add`, and a SCIP index written for the tree as it
+    // is now. No sync, no wait: the next walk's server reads the tree.
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    let index = csharp_scip_index_of(
+        &temp.path().join("index-twice.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/CallSite.cs", 2, "Twice"),
+        ],
+    );
+    let (answer, second) =
+        traverse_add_by_default_until(&config, &workspace, &index, &manager, |answer| {
+            reached_through_lsp_live(answer, TWICE)
+        })
+        .await;
+    assert!(reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        first + second,
+        "one server per walk: the call's own, never the offered manager's"
+    );
+    assert!(
+        manager.release(&workspace.id).await.is_empty(),
+        "nothing stayed in the service's manager"
+    );
+    manager.shutdown_all().await;
+}
+
+/// Under the default profile a service primes no csharp-ls (a walk would not
+/// share it), and a walk through the service's manager leaves no csharp-ls in
+/// it: the server is the call's own and ends with the walk.
+#[tokio::test]
+async fn the_default_profile_keeps_nothing_in_the_service_manager_for_a_non_watching_server() {
+    use local_code_intelligence::config::{LspProfile, LspSessions};
+    let service = indexed_warm_service(&[], |config| {
+        // The default profile: no `sessions` line, `sync = "off"`.
+        config.run_profile.lsp = LspProfile::default();
+    })
+    .await;
+    let (app, workspace) = (&service.app, &service.workspace);
+    assert_eq!(service.config.run_profile.lsp.sessions, LspSessions::Shared);
+    let index = csharp_scip_index(&service.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome.is_empty(), "csharp-ls was primed: {outcome:?}");
+    let status = app.status(&workspace.path).await.unwrap();
+    assert!(
+        status.analyzers["csharp-ls"].is_none(),
+        "{:?}",
+        status.analyzers
+    );
+
+    let (answer, walks) = traverse_add_by_default_until(
+        &service.config,
+        workspace,
+        &index,
+        &app.language_servers(),
+        reached_run_through_lsp_live,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    let status = app.status(&workspace.path).await.unwrap();
+    assert!(
+        status.analyzers["csharp-ls"].is_none(),
+        "{:?}",
+        status.analyzers
+    );
+    assert!(!status.analyzers_running["csharp-ls"]);
+    assert_eq!(
+        state_count(&service.state, "spawn_count.txt"),
+        walks,
+        "one server per walk, none from the warm start"
+    );
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
 }
 
 /// The real-server edit check of `[run_profile.lsp] sync` (live, skipped when

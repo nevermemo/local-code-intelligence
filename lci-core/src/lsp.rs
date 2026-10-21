@@ -37,6 +37,7 @@ pub mod java;
 mod job;
 pub mod python;
 pub mod rust;
+pub mod stamp;
 pub mod sync;
 pub mod transport;
 pub mod typescript;
@@ -772,6 +773,11 @@ pub struct Manager {
     /// The providers whose binary has answered a version probe (see
     /// [`Self::probe_once`]).
     probed: std::sync::Mutex<HashSet<&'static str>>,
+    /// The tree stamp each kept session was last checked against (see
+    /// [`Self::tree_barrier`]).
+    stamps: std::sync::Mutex<HashMap<SessionKey, stamp::TreeStamp>>,
+    /// Where the barrier gets the index's file list (`None`: no sharing).
+    indexed: std::sync::Mutex<Option<Arc<dyn stamp::IndexedFiles>>>,
     /// The kept outlines, `Some` only under `[run_profile.lsp]
     /// outline_cache = true` (see [`Self::document_symbols`]).
     outlines: Option<Arc<std::sync::Mutex<OutlineCache>>>,
@@ -890,12 +896,23 @@ impl Manager {
             syncs,
             stuck_after,
             probed: std::sync::Mutex::new(HashSet::new()),
+            stamps: std::sync::Mutex::new(HashMap::new()),
+            indexed: std::sync::Mutex::new(None),
             outlines: config
                 .run_profile
                 .lsp
                 .outline_cache
                 .then(|| Arc::new(std::sync::Mutex::new(OutlineCache::default()))),
         }
+    }
+
+    /// This manager with `source` as the index's file list for the tree
+    /// barrier ([`Self::tree_barrier`]). Without one the barrier restarts
+    /// every session it is asked about.
+    #[must_use]
+    pub fn with_indexed_files(self, source: Arc<dyn stamp::IndexedFiles>) -> Self {
+        *self.indexed.lock().unwrap() = Some(source);
+        self
     }
 
     /// This manager without `[run_profile.lsp] sync`: a per-call manager
@@ -1049,6 +1066,113 @@ impl Manager {
         Ok((session, client))
     }
 
+    /// The tree barrier of the kept sessions: for each of `adapters`, takes
+    /// the workspace's tree stamp ([`stamp::TreeStamp`], built from the
+    /// index's file list with no directory walk, before any server is started
+    /// or reused for the caller) and compares it with the one recorded when
+    /// the adapter's session was last checked. A different stamp (or a session
+    /// with no recorded stamp, whose age is unknown) stops that session, so
+    /// the caller's request starts a fresh server that reads the disk as
+    /// `per_call` would; an equal stamp keeps it. The new stamp is recorded
+    /// either way, and a first sight with no session records it for the
+    /// session that starts next. Returns the providers whose session was
+    /// restarted. With no file list (no [`stamp::IndexedFiles`] source, no
+    /// index snapshot) or a failed stat pass every session of `adapters` is
+    /// restarted and nothing is recorded: no sharing without a stamp.
+    ///
+    /// This makes a kept session never older than the tree as of the check,
+    /// up to what a stamp can see (see [`stamp`]): an edit that keeps a
+    /// file's length and modification time is not seen, nor a new file in a
+    /// directory that holds none of the server's indexed files. An edit during
+    /// the call is seen by the next barrier, as under `per_call`. It does not
+    /// depend on the server's own file watcher or on `sync`.
+    pub async fn tree_barrier(
+        &self,
+        workspace: &Workspace,
+        adapters: &[&Arc<dyn LspAdapter>],
+    ) -> Vec<&'static str> {
+        if adapters.is_empty() {
+            return Vec::new();
+        }
+        let source = self.indexed.lock().unwrap().clone();
+        let listed = match source {
+            Some(source) => source.indexed_files(workspace).await,
+            None => None,
+        };
+        let stamps: Vec<Option<stamp::TreeStamp>> = match listed {
+            Some(listed) => {
+                let servers: Vec<(Vec<&'static str>, &'static [&'static str])> = adapters
+                    .iter()
+                    .map(|adapter| (adapter.languages().to_vec(), adapter.stamp_manifests()))
+                    .collect();
+                let root = workspace.path.clone();
+                let stamped = tokio::task::spawn_blocking(move || {
+                    stamp::indexed_stamps(&root, &listed, &servers)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|stamped| stamped);
+                match stamped {
+                    Ok(stamps) => stamps.into_iter().map(Some).collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace = %workspace.path.display(),
+                            error = %format!("{error:#}"),
+                            "tree stamp failed: the kept sessions are restarted"
+                        );
+                        vec![None; adapters.len()]
+                    }
+                }
+            }
+            None => vec![None; adapters.len()],
+        };
+        let mut restarted = Vec::new();
+        for (adapter, stamp) in adapters.iter().zip(stamps) {
+            let key = Self::session_key(adapter, workspace);
+            let same = {
+                let recorded = self.stamps.lock().unwrap();
+                matches!((recorded.get(&key), stamp), (Some(before), Some(now)) if *before == now)
+            };
+            if same {
+                continue;
+            }
+            // The only await between the decision and the record is the
+            // registry lock, which comes before the session is removed: a
+            // caller dropped there has changed nothing, and one that got
+            // past it records the stamp without yielding.
+            let stopped = self.stop_session(&key).await;
+            {
+                let mut recorded = self.stamps.lock().unwrap();
+                match stamp {
+                    Some(stamp) => recorded.insert(key, stamp),
+                    None => recorded.remove(&key),
+                };
+            }
+            if stopped {
+                restarted.push(adapter.provider());
+            }
+        }
+        restarted
+    }
+
+    /// Removes the session under `key` and stops its server on a task of its
+    /// own (like [`Self::discard`]); whether there was one.
+    async fn stop_session(&self, key: &SessionKey) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let removed = sessions.remove(key);
+            prune_syncs(&sessions, &self.syncs);
+            removed
+        };
+        match removed {
+            Some(session) => {
+                tokio::spawn(session.shutdown(SHUTDOWN_GRACE));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Releases every session of this workspace: removes it from the
     /// registry, shuts its server down (the sessions side by side, each
     /// bounded by [`SHUTDOWN_GRACE`] twice over), and returns the providers
@@ -1059,6 +1183,10 @@ impl Manager {
     /// Only this manager's sessions are touched: the same workspace under
     /// another `Manager` (another process, say) is unaffected.
     pub async fn release(&self, workspace_id: &str) -> Vec<&'static str> {
+        self.stamps
+            .lock()
+            .unwrap()
+            .retain(|(_, id), _| id != workspace_id);
         let removed: Vec<Arc<Session>> = {
             let mut sessions = self.sessions.lock().await;
             let removed = sessions
@@ -1078,6 +1206,7 @@ impl Manager {
     /// shutdown: bounded by about `2 * SHUTDOWN_GRACE` however many
     /// sessions there are.
     pub async fn shutdown_all(&self) -> usize {
+        self.stamps.lock().unwrap().clear();
         let removed: Vec<Arc<Session>> = {
             let mut sessions = self.sessions.lock().await;
             let removed = sessions.drain().map(|(_, session)| session).collect();
@@ -2452,6 +2581,27 @@ mod tests {
         fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
             Box::new(|_| false)
         }
+    }
+
+    /// The table of real adapters: only rust-analyzer sees an edit on its own
+    /// (it declares no `didChangeWatchedFiles` and runs its own file watcher),
+    /// so only it keeps a session across traverse calls under `sync = "off"`
+    /// (see `LspAdapter::watches_workspace`).
+    #[test]
+    fn only_rust_analyzer_watches_its_workspace() {
+        let manager = Manager::new(&Config::default());
+        let watching: Vec<&str> = manager
+            .adapters()
+            .iter()
+            .filter(|adapter| adapter.watches_workspace())
+            .map(|adapter| adapter.provider())
+            .collect();
+        assert_eq!(watching, ["rust-analyzer"]);
+        assert_eq!(
+            manager.adapters().len(),
+            7,
+            "a new adapter must be classified"
+        );
     }
 
     #[tokio::test]

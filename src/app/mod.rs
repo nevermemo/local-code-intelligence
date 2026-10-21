@@ -100,8 +100,9 @@ pub struct App {
     index_lock: Mutex<()>,
     watchers: Mutex<HashMap<String, (crate::workspace::Workspace, CancellationToken)>>,
     /// The language servers: navigation, the search channel and, under
-    /// `[run_profile.lsp] sessions = "shared"`, the traverse calls share it
-    /// (see [`Self::language_servers`]).
+    /// `[run_profile.lsp] sessions = "shared"` (the default), the traverse
+    /// calls share it for the servers that see an edit on their own, or for
+    /// every server under `sync = "watch"` (see [`Self::language_servers`]).
     analyzer: Arc<lsp::Manager>,
     /// Whether the first touch of a workspace warms its language servers
     /// (see [`Self::warm_language_servers`]); fixed by the configuration.
@@ -120,7 +121,12 @@ impl App {
         config.data_dir = dunce::canonicalize(&config.data_dir)?;
         let store = Store::open(&config.data_dir.join("lancedb")).await?;
         let models = Models::new(&config)?;
-        let analyzer = Arc::new(lsp::Manager::new(&config));
+        let analyzer = Arc::new(lsp::Manager::new(&config).with_indexed_files(Arc::new(
+            ManifestFiles {
+                data_dir: config.data_dir.clone(),
+                kept: std::sync::Mutex::new(HashMap::new()),
+            },
+        )));
         let profile_hash = config.run_profile().hash;
         let warm_on_touch = config.run_profile.lsp.sessions == crate::config::LspSessions::Shared
             && config.traverse.enabled
@@ -165,7 +171,8 @@ impl App {
 
     /// The service's language-server manager, for a caller that shares its
     /// sessions (the traverse calls under `[run_profile.lsp] sessions =
-    /// "shared"`). A server started through a clone is stopped like any other
+    /// "shared"`, for the servers that see an edit on their own or under
+    /// `sync = "watch"`). A server started through a clone is stopped like any other
     /// of the service: by the idle sweeper, [`Self::release_language_servers`]
     /// and [`Self::shutdown_language_servers`].
     pub fn language_servers(&self) -> Arc<lsp::Manager> {
@@ -186,14 +193,30 @@ impl App {
         Ok(self.analyzer.prime(&workspace, timeout).await)
     }
 
+    /// Whether a traverse call under the profile keeps this adapter's session
+    /// in the service's manager: `sessions = "shared"` and the server sees an
+    /// edit on its own (`LspAdapter::watches_workspace`) or `sync = "watch"`
+    /// tells it. These sessions pass the tree barrier of a traverse walk
+    /// (`lsp::Manager::tree_barrier`); navigation and the search channel do
+    /// not (their kept sessions are as before).
+    fn shares_session(&self, adapter: &Arc<dyn crate::lsp::adapter::LspAdapter>) -> bool {
+        let profile = &self.config.run_profile.lsp;
+        profile.sessions == crate::config::LspSessions::Shared
+            && (profile.sync == crate::config::LspSync::Watch || adapter.watches_workspace())
+    }
+
     /// First touch of `workspace`: starts, in the background, the language
     /// servers of every enabled adapter (see [`lsp::Manager::prime`]) so the
     /// first `lsp.live` walk finds them started instead of paying the start.
     /// Returns at once; no request waits for the warm-up. Only when
-    /// `[run_profile.lsp] sessions = "shared"` and a `[traverse.policies.*]`
-    /// `extra_maps` names `lsp.live` (under the default `per_call` nothing
-    /// starts), and once per workspace and process. It changes which request
-    /// pays for a start, never an answer.
+    /// `[run_profile.lsp] sessions = "shared"` (the default) and a
+    /// `[traverse.policies.*]` `extra_maps` names `lsp.live` (under `per_call`
+    /// nothing starts), and once per workspace and process. Only the servers a
+    /// walk would share start: those that see an edit on their own
+    /// (`LspAdapter::watches_workspace`), or every server under
+    /// `sync = "watch"`; a walk starts the others per call, so a warm one
+    /// would be unused. It changes which request pays for a start, never an
+    /// answer.
     fn warm_language_servers(
         &self,
         workspace: &crate::workspace::Workspace,
@@ -202,6 +225,17 @@ impl App {
         if !self.warm_on_touch {
             return;
         }
+        let shared: std::collections::HashSet<&str> = self
+            .analyzer
+            .adapters()
+            .iter()
+            .filter(|adapter| self.shares_session(adapter))
+            .flat_map(|adapter| adapter.languages().iter().copied())
+            .collect();
+        let languages: std::collections::HashSet<String> = languages
+            .into_iter()
+            .filter(|language| shared.contains(language.as_str()))
+            .collect();
         // The entry and its task are registered together under the lock, so a
         // release that finds the entry finds the task, and one that found none
         // has left a tombstone this sees.
@@ -222,6 +256,23 @@ impl App {
             let _alive = alive;
             let workspace = task_workspace;
             let mut outcome = WarmOutcome::new();
+            // The tree stamp the sessions start under is recorded first (the
+            // barrier every shared session passes), so the first walk keeps
+            // them unless the tree has changed since.
+            let adapters: Vec<Arc<dyn crate::lsp::adapter::LspAdapter>> = analyzer
+                .adapters()
+                .iter()
+                .filter(|adapter| {
+                    adapter.enabled()
+                        && adapter
+                            .languages()
+                            .iter()
+                            .any(|language| languages.contains(*language))
+                })
+                .cloned()
+                .collect();
+            let refs: Vec<&Arc<dyn crate::lsp::adapter::LspAdapter>> = adapters.iter().collect();
+            analyzer.tree_barrier(&workspace, &refs).await;
             let primed = analyzer
                 .prime_languages(&workspace, timeout, Some(&languages))
                 .await;
@@ -396,6 +447,63 @@ async fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::f
                 return Err(error).context("acquire data-directory index lock");
             }
         }
+    }
+}
+
+/// The index's file list for the tree barrier of the service's language
+/// servers ([`lsp::stamp::IndexedFiles`]): the paths of the workspace
+/// manifest, which `index_workspace` and the incremental refresh write. The
+/// list is read once per change of the manifest file (its modification time
+/// and length) and kept, so a call with an unchanged index pays one stat. A
+/// workspace with no manifest, or an empty one, has no list.
+struct ManifestFiles {
+    data_dir: PathBuf,
+    kept: std::sync::Mutex<HashMap<String, KeptFiles>>,
+}
+
+/// One workspace's kept list and the manifest stat it was read under.
+struct KeptFiles {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    files: Arc<Vec<String>>,
+}
+
+#[lci_maps::async_trait]
+impl lsp::stamp::IndexedFiles for ManifestFiles {
+    async fn indexed_files(
+        &self,
+        workspace: &crate::workspace::Workspace,
+    ) -> Option<Arc<Vec<String>>> {
+        let path = crate::manifest::manifest_path(&self.data_dir, &workspace.id);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let (modified, len) = (metadata.modified().ok(), metadata.len());
+        if let Some(kept) = self.kept.lock().unwrap().get(&workspace.id)
+            && kept.modified == modified
+            && kept.len == len
+        {
+            return Some(Arc::clone(&kept.files));
+        }
+        let (data_dir, loaded) = (self.data_dir.clone(), workspace.clone());
+        let manifest =
+            tokio::task::spawn_blocking(move || crate::manifest::try_load(&data_dir, &loaded))
+                .await
+                .ok()?
+                .ok()?;
+        if manifest.files.is_empty() {
+            return None;
+        }
+        let mut files: Vec<String> = manifest.files.into_keys().collect();
+        files.sort();
+        let files = Arc::new(files);
+        self.kept.lock().unwrap().insert(
+            workspace.id.clone(),
+            KeptFiles {
+                modified,
+                len,
+                files: Arc::clone(&files),
+            },
+        );
+        Some(files)
     }
 }
 

@@ -1198,7 +1198,19 @@ async fn flow_from_walks_under_the_run_profile() {
 async fn flow_from_runs_the_same_under_both_session_settings() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
     let request = json!({"flow_from": {"entry": "beta", "k": 5}});
-    let per_call = Tree::new().ask(request.clone(), false).await;
+    let per_call = Tree::new()
+        .ask_under(
+            request.clone(),
+            false,
+            &RunProfileConfig {
+                lsp: lci_core::config::LspProfile {
+                    sessions: lci_core::config::LspSessions::PerCall,
+                    ..lci_core::config::LspProfile::default()
+                },
+                ..RunProfileConfig::default()
+            },
+        )
+        .await;
     let shared = Tree::new()
         .ask_under(
             request,
