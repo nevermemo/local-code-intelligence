@@ -493,6 +493,11 @@ struct TraverseArgs {
     /// started with.
     #[arg(long)]
     no_score_bound: bool,
+    /// Write a `pop` event per pop into the trace: the popped state and the
+    /// best queued candidates (evaluation runs; off by default, and the trace
+    /// is the only thing it changes). A continuation must be given it again.
+    #[arg(long)]
+    trajectory: bool,
     /// A table of fitted hop priors (the `[traverse] priors` setting); needs
     /// --question-type. A continuation must be given the same table.
     #[arg(long, requires = "question_type")]
@@ -606,6 +611,7 @@ async fn run_recipe(
         Some(out) => Dirs {
             traces: out.join("traces"),
             handles: out.join("handles"),
+            trajectory_candidates: 0,
         },
         None => Dirs::under(&config.data_dir),
     };
@@ -723,8 +729,18 @@ async fn run_traverse(
         Some(out) => Dirs {
             traces: out.join("traces"),
             handles: out.join("handles"),
+            trajectory_candidates: 0,
         },
         None => Dirs::under(&config.data_dir),
+    };
+    // The flag applies with and without `--out`.
+    let dirs = Dirs {
+        trajectory_candidates: if args.trajectory {
+            lci_maps::traverse::TRAJECTORY_CANDIDATES
+        } else {
+            0
+        },
+        ..dirs
     };
     let maps = (!args.maps.is_empty()).then_some(args.maps.as_slice());
     // The hybrid search needs the application (index store, model services);

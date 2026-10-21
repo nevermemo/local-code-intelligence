@@ -144,6 +144,11 @@ pub struct BenchArgs {
     /// note says `no-bound`.
     #[arg(long)]
     no_score_bound: bool,
+    /// Write `pop` events into the CLI traces (`lci traverse --trajectory`;
+    /// the input of `maps trajectories`). Evaluation runs only: no report file
+    /// changes with it.
+    #[arg(long)]
+    trajectory: bool,
     /// A table of fitted hop priors (`lci traverse --priors`, given
     /// `--question-type` the name of the set). The row's note says
     /// `priors=<file stem>`.
@@ -282,6 +287,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         pass_through: args.pass_through,
         rerank_frontier: args.rerank_frontier,
         no_score_bound: args.no_score_bound,
+        trajectory: args.trajectory,
         priors: args
             .priors
             .clone()
@@ -1128,6 +1134,9 @@ pub struct CliTraverser {
     pub rerank_frontier: bool,
     /// `--no-score-bound` for the CLI.
     pub no_score_bound: bool,
+    /// `--trajectory` for the CLI: `pop` events in the trace. Not part of the
+    /// run config: the report files do not change with it.
+    pub trajectory: bool,
     /// `--priors` and `--question-type` for the CLI: the table file and the
     /// question type (the name of the set being run).
     pub priors: Option<(PathBuf, String)>,
@@ -1205,6 +1214,9 @@ impl CliTraverser {
         }
         if self.no_score_bound {
             command.arg("--no-score-bound");
+        }
+        if self.trajectory {
+            command.arg("--trajectory");
         }
         if let Some((table, question_type)) = &self.priors {
             command.arg("--priors").arg(table);
@@ -4105,6 +4117,7 @@ pub fn free_two() {}
             pass_through: false,
             rerank_frontier: false,
             no_score_bound: false,
+            trajectory: false,
             priors: None,
             tie_break: None,
             first_stage: None,
@@ -4143,6 +4156,19 @@ pub fn free_two() {}
         let at = args.iter().position(|a| a == "--policy").unwrap();
         assert_eq!(PathBuf::from(&args[at + 1]), file);
         assert_eq!(args.iter().filter(|a| *a == "--policy").count(), 1);
+    }
+
+    #[test]
+    fn the_trajectory_flag_reaches_the_cli_only_when_given() {
+        let mut t = cli_traverser();
+        let plain = args_of(&t.command(&t.maps, &[], "q", None));
+        assert!(!plain.contains(&"--trajectory".to_owned()));
+        t.trajectory = true;
+        let args = args_of(&t.command(&t.maps, &[], "q", None));
+        assert_eq!(args.iter().filter(|a| *a == "--trajectory").count(), 1);
+        // Nothing else changes: the flag is not a run config key.
+        let without: Vec<&String> = args.iter().filter(|a| *a != "--trajectory").collect();
+        assert_eq!(without, plain.iter().collect::<Vec<_>>());
     }
 
     #[test]
