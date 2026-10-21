@@ -21,7 +21,9 @@
 //! result limit `k` is given ([`super::Traversal::top_k`]), the walk ends with
 //! the stop reason `bound` (status `complete`, no handle) once at least `k`
 //! results exist and neither a state still in the frontier nor a result below
-//! the top `k` can rise above the `k`-th one. The bound is
+//! the top `k` can rise above the `k`-th one. It is checked before the
+//! triggers, so a stop due at that pop is not consulted, and the answer
+//! carries no checkpoint, handle or estimate. The bound is
 //!
 //! `max(best frontier potential, best potential below the top k) * (1 + boost * (n_maps - 1)) <= ranked potential of the k-th result`
 //!
@@ -55,9 +57,14 @@
 //! estimate over the two maps that found the most nodes: with `n1` and `n2`
 //! nodes found by the two and `m` found by both (the re-finds), the number of
 //! findable nodes is estimated as `n1 * n2 / m`, and the fraction found is
-//! the union over that estimate. It assumes the two maps sample
-//! independently, which maps over one code base do not fully; read it as a
-//! hint, not a bound. No estimate exists before the two maps share a node.
+//! the union over that estimate, at most 1 by construction
+//! (`n1 + n2 - m <= n1 * n2 / m`). A map's nodes are the ones it *offered*,
+//! adopted into the walk or not. It assumes the two maps sample
+//! independently, which maps over one code base do not fully (maps built on
+//! one graph are separate finders here, so the fraction reads high); read it
+//! as a hint, not a bound. No estimate exists before the two maps share a
+//! node. It is computed at every checkpoint and shown only there, so an
+//! answer that ends without a checkpoint (`complete`, `bound`) carries none.
 
 use super::{State, rules::node_path};
 use crate::{MapId, edge::WitnessClass};
@@ -157,7 +164,8 @@ pub struct StopPolicy {
     pub on_disagreement: u32,
     /// Pops without a new node that fire a stop.
     pub on_stagnation: u32,
-    /// Estimated percent found that fires a stop.
+    /// Estimated percent found that fires a stop: it holds once the
+    /// estimate's `fraction * 100` reaches it, at most once per traversal.
     pub likely_complete: u32,
 }
 
@@ -515,5 +523,49 @@ impl Tally {
             out.push(StopReason::LikelyComplete);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(range: std::ops::Range<usize>) -> BTreeSet<NodeId> {
+        range
+            .map(|i| NodeId::file(format!("src/n{i}.rs")).unwrap())
+            .collect()
+    }
+
+    /// The written meaning of the estimate (engine.md, "Written meanings"):
+    /// the two largest finders, ties by map id, and a fraction that is
+    /// `found / estimate` and never above 1 without the clamp acting.
+    #[test]
+    fn the_estimate_picks_the_two_largest_finders_and_never_exceeds_one() {
+        // `c` is the largest; `a` and `b` tie at 3 and the smaller id wins.
+        let mut found: BTreeMap<MapId, BTreeSet<NodeId>> = BTreeMap::new();
+        found.insert("c", set(0..5));
+        found.insert("b", set(3..6));
+        found.insert("a", set(1..4));
+        let lc = likely_complete(&found).unwrap();
+        assert_eq!(lc.maps, ["c", "a"]);
+        assert_eq!((lc.n1, lc.n2, lc.refound, lc.found), (5, 3, 3, 5));
+        assert_eq!((lc.estimate, lc.fraction), (5.0, 1.0));
+
+        // Every overlap of two sets: the fraction is `found / estimate` as
+        // computed, and it is at most 1 on its own (the `min` never acts).
+        for n1 in 1..=9usize {
+            for n2 in 1..=n1 {
+                for m in 1..=n2 {
+                    let mut pair: BTreeMap<MapId, BTreeSet<NodeId>> = BTreeMap::new();
+                    pair.insert("x", set(0..n1));
+                    pair.insert("y", set(n1 - m..n1 - m + n2));
+                    let lc = likely_complete(&pair).unwrap();
+                    assert_eq!((lc.refound, lc.found), (m, n1 + n2 - m));
+                    let raw = lc.found as f64 / lc.estimate;
+                    assert_eq!(lc.fraction, raw, "n1 {n1} n2 {n2} m {m}");
+                    assert!(raw <= 1.0, "n1 {n1} n2 {n2} m {m}: {raw}");
+                }
+            }
+        }
     }
 }

@@ -1858,6 +1858,46 @@ mod steering {
         assert!(stops_of(&none).is_empty());
     }
 
+    /// The written meaning of `found` (engine.md, "Written meanings"): the
+    /// nodes a map offered at an expansion, whether or not the walk adopted
+    /// them, so the beam and the gate do not change the estimate.
+    #[tokio::test]
+    async fn likely_complete_counts_offered_nodes_adopted_or_not() {
+        let reg = || {
+            registry(vec![
+                GraphMap::new("m1", &[("a", "b"), ("a", "c"), ("a", "d"), ("a", "e")]),
+                GraphMap::new("m2", &[("a", "b"), ("a", "c")]),
+            ])
+        };
+        let estimate = |price: Option<HopPrice>| {
+            let reg = reg();
+            async move {
+                let (seen, sink) = recorder();
+                let result = walk(&reg, vec![seed("a")], budget(1), |t| {
+                    let t = t.handler(Observe(noop(), sink), every(1).max_stops(1));
+                    match price {
+                        Some(price) => t.price(price),
+                        None => t,
+                    }
+                })
+                .await;
+                let checkpoint = seen.lock().unwrap()[0].clone();
+                (result.states.len(), checkpoint)
+            }
+        };
+        let (all_states, open) = estimate(None).await;
+        let (few_states, narrow) = estimate(Some(HopPrice { gate: 1, beam: 1 })).await;
+        assert!(few_states < all_states, "the beam adopted fewer nodes");
+
+        for cp in [&open, &narrow] {
+            let lc = cp.likely_complete.as_ref().expect("the maps share nodes");
+            assert_eq!(lc.maps, ["m1", "m2"]);
+            assert_eq!((lc.n1, lc.n2, lc.refound, lc.found), (4, 2, 2, 4));
+            assert_eq!((lc.estimate, lc.fraction), (4.0, 1.0));
+            assert_eq!(cp.regions.unknown, Some(0));
+        }
+    }
+
     // ---- the checkpoint payload ------------------------------------------------
 
     #[tokio::test]
@@ -2039,6 +2079,56 @@ mod steering {
             Ladder::new(0.8, vec![agent()]).err(),
             Some(LadderError::BadRungs(vec![3]))
         );
+    }
+
+    /// The written meaning of `tau` (engine.md, "Written meanings"): the rules
+    /// rung is 1.0 confident on a clean match and 0.0 otherwise, so every
+    /// `tau` above 0 behaves alike and `tau = 0` escalates no stop. If the
+    /// rules confidence becomes graded, the written meaning is stale.
+    #[tokio::test]
+    async fn tau_zero_lets_an_unmatched_rule_list_decide_and_any_positive_tau_needs_a_clean_match()
+    {
+        let (seen, sink) = recorder();
+        walk(&fan(), vec![seed("a")], budget(10), |t| {
+            t.handler(Observe(noop(), sink), every(1).max_stops(1))
+        })
+        .await;
+        let checkpoint = seen.lock().unwrap()[0].clone();
+        assert!(!checkpoint.frontier.is_empty(), "a rule can match here");
+        let decide = |tau: f32, rules: RuleList| {
+            let rungs: Vec<Box<dyn Handler>> = vec![Box::new(rules)];
+            ladder(tau, rungs).decide(&checkpoint, &StopBudget::default())
+        };
+
+        let open = decide(0.0, no_rules());
+        assert!(!open.escalate && open.actions.is_empty());
+        assert_eq!((open.rung, open.handler.as_str()), (1, "rules"));
+        for tau in [f32::MIN_POSITIVE, 0.5, 0.8, 1.0] {
+            let unmatched = decide(tau, no_rules());
+            assert!(unmatched.escalate, "tau {tau}: no rule matched");
+            assert_eq!(unmatched.trail.len(), 1);
+            assert_eq!(unmatched.trail[0].confidence, 0.0);
+        }
+        let clean = decide(1.0, sure_rules());
+        assert!(!clean.escalate);
+        assert_eq!(clean.confidence, 1.0);
+
+        // Through the engine: tau 0 escalates no stop, any other tau does.
+        let run = |tau: f32| async move {
+            let rungs: Vec<Box<dyn Handler>> = vec![Box::new(no_rules())];
+            walk(&fan(), vec![seed("a")], budget(10), |t| {
+                t.handler(ladder(tau, rungs), every(1))
+            })
+            .await
+        };
+        let rules_only = run(0.0).await;
+        assert_eq!(rules_only.status, TraversalStatus::Complete);
+        assert!(rules_only.totals.stops > 0, "the stops were consulted");
+        assert!(rules_only.snapshot.is_none() && rules_only.checkpoint.is_none());
+        let asked = run(0.8).await;
+        assert_eq!(asked.status, TraversalStatus::Stopped);
+        assert_eq!(asked.totals.stops, 1);
+        assert!(asked.snapshot.is_some() && asked.checkpoint.is_some());
     }
 
     #[tokio::test]

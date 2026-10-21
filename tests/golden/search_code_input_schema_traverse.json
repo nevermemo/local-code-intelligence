@@ -71,7 +71,7 @@
           ]
         },
         "likely_complete": {
-          "description": "Also stop when the walk is estimated to have found this percent of\nwhat it will find (1 to 100). Counts toward `max_stops`; given alone it\nstarts the ladder like `stop_every` does.",
+          "description": "Also stop, once, when the capture-recapture estimate of nodes found\nreaches this percent (1 to 100); shown as `checkpoint.likely_complete`. Counts toward\n`max_stops`; given alone it starts the ladder like `stop_every` does.",
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -124,7 +124,7 @@
           ]
         },
         "tau": {
-          "description": "Confidence a rung needs to decide a stop, 0 to 1.",
+          "description": "Confidence a rung needs to decide a stop, 0 to 1. Only the rules\nrung exists (confidence 0 or 1): any value above 0 acts alike; 0\nmeans no stop escalates.",
           "format": "float",
           "type": [
             "number",

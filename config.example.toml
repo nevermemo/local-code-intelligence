@@ -348,6 +348,11 @@ max_est_tokens = 20000
 # bound that search). Loading the index does count against it.
 deadline_ms = 5000
 max_stops = 4
+# Confidence a rung of the steering ladder needs to decide a stop. Only the
+# rules rung exists: confidence 1 on a clean match, else 0. Any value above 0
+# behaves the same; 0 lets an unmatched rule list decide with no actions, so no
+# stop escalates to the caller (a rule's own `stop` and a list cut short still
+# end the call).
 tau = 0.8
 # How much each independent map beyond the first that reaches a node lifts its
 # rank: potential * (1 + boost * (maps - 1)). 0 ranks by potential alone; the

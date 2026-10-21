@@ -868,7 +868,11 @@ pub struct TraverseConfig {
     /// Most stops (handler consultations) of one traversal, `0..=32`.
     pub max_stops: u32,
     /// Confidence a rung of the steering ladder needs to decide a stop,
-    /// from `0` to `1`.
+    /// from `0` to `1`. Only the rules rung exists, with confidence 1 on a
+    /// clean match and 0 otherwise: any value above `0` behaves the same,
+    /// and `0` lets an unmatched rule list decide with no actions, so no
+    /// stop escalates to the caller (a rule's own `stop` and a list cut
+    /// short still end the call).
     pub tau: f32,
     /// How much each independent map beyond the first that reached a node
     /// lifts the node's rank: `potential * (1 + boost * (maps - 1))`. A
