@@ -4709,7 +4709,10 @@ async fn bm25_call(
 ) -> Value {
     let data = tempfile::tempdir().unwrap();
     let profile = lci_core::config::RunProfileConfig {
-        seeds: lci_core::config::RunProfileSeeds { bm25 },
+        seeds: lci_core::config::RunProfileSeeds {
+            bm25,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let maps: Option<Vec<String>> = maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
@@ -4946,4 +4949,404 @@ async fn the_cli_switch_reaches_the_walk_through_dirs() {
         off.response["trace"]["events"].as_u64().unwrap() as usize,
         off_events.len()
     );
+}
+
+// ---- `seeds.literal` (slice K22a-1) --------------------------------------------
+
+use lci_core::lexical::{LiteralMatch, LiteralSearch};
+
+/// A search with canned hybrid and literal answers that counts the literal
+/// calls (`literal: None` is a search that cannot run ripgrep).
+struct LiteralStub {
+    hybrid: Canned,
+    literal: Option<std::result::Result<LiteralSearch, String>>,
+    literal_calls: AtomicUsize,
+    asked: Mutex<Vec<(Vec<String>, u32)>>,
+}
+
+impl LiteralStub {
+    fn new(
+        hybrid: std::result::Result<Vec<SeedHit>, String>,
+        literal: Option<std::result::Result<LiteralSearch, String>>,
+    ) -> Self {
+        Self {
+            hybrid: Canned::new(hybrid),
+            literal,
+            literal_calls: AtomicUsize::new(0),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[lci_maps::async_trait]
+impl SeedSearch for LiteralStub {
+    async fn search(&self, question: &str, k: usize) -> Result<Vec<SeedHit>> {
+        self.hybrid.search(question, k).await
+    }
+
+    async fn literal_search(
+        &self,
+        names: &[String],
+        max_per_file: u32,
+    ) -> Option<Result<LiteralSearch>> {
+        self.literal_calls.fetch_add(1, Ordering::SeqCst);
+        self.asked
+            .lock()
+            .unwrap()
+            .push((names.to_vec(), max_per_file));
+        self.literal
+            .clone()
+            .map(|answer| answer.map_err(|error| anyhow!("{error}")))
+    }
+}
+
+/// One line ripgrep reported: `name` is the index of the needle.
+fn literal_line(path: &str, line: u32, text: &str, name: usize) -> LiteralMatch {
+    LiteralMatch {
+        relative_path: path.to_owned(),
+        line,
+        text: text.to_owned(),
+        name,
+    }
+}
+
+fn literal_found(matches: Vec<LiteralMatch>) -> LiteralSearch {
+    LiteralSearch {
+        matches,
+        warning: None,
+    }
+}
+
+/// A call with the question and search, over no tree.
+fn bare_call<'a>(
+    question: &'a str,
+    search: Option<&'a dyn SeedSearch>,
+    budget: &'a BudgetArgs,
+    steer: &'a SteerArgs,
+) -> Call<'a> {
+    Call {
+        scip_index: Path::new("unused"),
+        scip_root: None,
+        question,
+        seeds: &[],
+        seed_search: search,
+        top_k: 8,
+        maps: None,
+        budget,
+        steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    }
+}
+
+#[test]
+fn literal_needles_are_the_last_segments_of_the_code_spans() {
+    use super::seeds::literal_needles;
+    assert_eq!(
+        literal_needles("where is `Config::parse()` used, and `crate::shapes::Shape`, `x`?"),
+        ["parse", "Shape"]
+    );
+    // Once each, in question order, at most four.
+    assert_eq!(
+        literal_needles("`a::Alpha` `Beta` `b::Alpha` `Gamma` `Delta` `Epsilon`"),
+        ["Alpha", "Beta", "Gamma", "Delta"]
+    );
+    assert!(literal_needles("no code spans here, only Words").is_empty());
+}
+
+#[tokio::test]
+async fn literal_seeds_resolve_definitions_then_occurrences_then_files() {
+    use super::seeds::literal_seeds;
+    use lci_maps::lsp_live::ScipPlaces;
+    let docs = vec![
+        RawDocument {
+            path: "a.rs".into(),
+            occurrences: vec![defined("parse", 9, (9, 15))],
+        },
+        RawDocument {
+            path: "b.rs".into(),
+            occurrences: vec![
+                defined("main", 30, (30, 45)),
+                defined("other", 50, (50, 60)),
+            ],
+        },
+    ];
+    let loaded = Loaded::new(
+        (None, 0),
+        ScipMap::with_default_ids(ScipGraph::build(&docs, None)),
+    );
+    let id_of = |name: &str| {
+        let at = loaded.scip.graph().node_index(&symbol(name)).unwrap();
+        loaded.scip.node_id(at).clone()
+    };
+    let places = ScipPlaces::from_scip(&loaded.scip);
+    // ripgrep's order: by path, then line. `parse` is needle 0, `Shape` 1.
+    let matches = vec![
+        // A use inside `parse` before its definition line is reported.
+        literal_line("a.rs", 13, "    parse(x)", 0),
+        literal_line("a.rs", 10, "    pub fn parse() {}", 0),
+        literal_line("b.rs", 40, "    let c = Config::parse();", 0),
+        literal_line("b.rs", 55, "    parse(1);", 0),
+        literal_line("b.rs", 56, "    parse(2);", 0),
+        literal_line("shapes.rs", 3, "pub trait Shape {", 1),
+        literal_line("shapes.rs", 9, "fn draw(shape: &dyn Shape) {}", 1),
+        literal_line("shapes.rs", 12, "const DEFAULT: Shape = make();", 1),
+        literal_line("shapes.rs", 20, "impl Draw for Shape {", 1),
+        literal_line("notes.txt", 1, "// the trait Shape is documented", 1),
+        literal_line("README.md", 5, "The trait Shape is documented here", 1),
+    ];
+    let stub = LiteralStub::new(Ok(Vec::new()), Some(Ok(literal_found(matches))));
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let question = "where is `Config::parse` used, and what is `Shape`?";
+    let call = bare_call(question, Some(&stub), &budget, &steer);
+
+    let (seeds, details, notes) = literal_seeds(&limits(), &call, &HashSet::new(), &places)
+        .await
+        .unwrap();
+    assert_eq!(
+        stub.asked.lock().unwrap().as_slice(),
+        [(vec!["parse".to_owned(), "Shape".to_owned()], 20)]
+    );
+    let file = NodeId::file("shapes.rs").unwrap();
+    // The definition, the occurrences (most lines first), the file once.
+    let nodes: Vec<NodeId> = seeds.iter().map(|seed| seed.node.clone()).collect();
+    assert_eq!(
+        nodes,
+        [id_of("parse"), id_of("other"), id_of("main"), file.clone()]
+    );
+    assert!(seeds.iter().all(|seed| seed.map == Some(SEEDS_LITERAL)));
+    let hows: Vec<&str> = details.iter().map(|d| d["how"].as_str().unwrap()).collect();
+    assert_eq!(hows, ["definition", "occurrence", "occurrence", "file"]);
+    assert_eq!(details[0]["name"], "parse");
+    assert_eq!(
+        details[0]["line"], 10,
+        "the definition line, not the earlier use"
+    );
+    assert_eq!(details[0]["score"], 2);
+    assert_eq!(details[0]["kind"], "symbol");
+    assert_eq!(details[0]["retrievers"], json!([SEEDS_LITERAL]));
+    assert_eq!(details[0]["score_kind"], "occurrences");
+    assert_eq!(details[1]["score"], 2, "two lines of `other`");
+    assert_eq!(details[2]["score"], 1);
+    assert_eq!(details[3]["kind"], "file");
+    assert_eq!(details[3]["name"], "Shape");
+    assert_eq!(details[3]["path"], "shapes.rs");
+    assert_eq!(details[3]["line"], 3);
+    // The signature, the constant, the comment and the prose file declare nothing: 4 dropped.
+    let note = notes.join("\n");
+    assert!(note.contains("searched parse, Shape"), "{note}");
+    assert!(
+        note.contains("4 start nodes (1 definition, 2 occurrence, 1 file)"),
+        "{note}"
+    );
+    assert!(note.contains("4 lines were in no known symbol"), "{note}");
+
+    // A node an earlier source gave is left out, and the list is cut at seed_k.
+    let known: HashSet<NodeId> = [id_of("main")].into();
+    let cut = TraverseConfig {
+        seed_k: 2,
+        ..limits()
+    };
+    let (seeds, _, _) = literal_seeds(&cut, &call, &known, &places).await.unwrap();
+    let nodes: Vec<NodeId> = seeds.iter().map(|seed| seed.node.clone()).collect();
+    assert_eq!(nodes, [id_of("parse"), id_of("other")]);
+
+    // No ripgrep: a note, no seeds. A failed search: the same, with the error.
+    let none = LiteralStub::new(Ok(Vec::new()), None);
+    let failing = LiteralStub::new(Ok(Vec::new()), Some(Err("rg exploded".into())));
+    for (stub, expect) in [
+        (&none, "needs the application's ripgrep"),
+        (&failing, "rg exploded"),
+    ] {
+        let call = bare_call(question, Some(stub), &budget, &steer);
+        let (seeds, details, notes) = literal_seeds(&limits(), &call, &HashSet::new(), &places)
+            .await
+            .unwrap();
+        assert!(seeds.is_empty() && details.is_empty());
+        assert!(notes.join("\n").contains(expect), "{notes:?}");
+    }
+    // A question with no code span asks nothing.
+    let quiet = bare_call("no names here", Some(&stub), &budget, &steer);
+    let before = stub.literal_calls.load(Ordering::SeqCst);
+    let (seeds, _, notes) = literal_seeds(&limits(), &quiet, &HashSet::new(), &places)
+        .await
+        .unwrap();
+    assert!(seeds.is_empty());
+    assert!(notes[0].contains("nothing in code spans"), "{notes:?}");
+    assert_eq!(stub.literal_calls.load(Ordering::SeqCst), before);
+}
+
+/// One call over the `crowded_tree` index, under the run profile with
+/// `[run_profile.seeds] literal` as `literal` says.
+async fn literal_call(
+    tree: &(tempfile::TempDir, PathBuf),
+    literal: bool,
+    maps: Option<&[&str]>,
+    question: &str,
+    search: Option<&dyn SeedSearch>,
+) -> Value {
+    let data = tempfile::tempdir().unwrap();
+    let profile = lci_core::config::RunProfileConfig {
+        seeds: lci_core::config::RunProfileSeeds {
+            literal,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let maps: Option<Vec<String>> = maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: &tree.1,
+        scip_root: Some(tree.0.path()),
+        maps: maps.as_deref(),
+        ..bare_call(question, search, &budget, &steer)
+    };
+    run(&limits(), &profile, &Dirs::under(data.path()), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+#[tokio::test]
+async fn seeds_literal_is_inert_with_the_key_off_and_seeds_after_hybrid_with_it_on() {
+    let tree = crowded_tree(2);
+    let loaded = load(&tree.1, Some(tree.0.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
+    let id_of = |name: &str| {
+        let graph = loaded.scip.graph();
+        let at = graph
+            .node_index(&format!("rust-analyzer cargo demo 0.1.0 a/{name}()."))
+            .unwrap();
+        loaded.scip.node_id(at).to_string()
+    };
+    assert!(
+        !lci_core::config::Config::default()
+            .run_profile
+            .seeds
+            .literal,
+        "off by default"
+    );
+    let question = "who calls `target`, and what is `Gadget`?";
+    let matches = || {
+        literal_found(vec![
+            // The definition of `target` (line 1, the name is at line 0).
+            literal_line("a.rs", 1, "fn target() {}", 0),
+            // A trait the graph lacks.
+            literal_line("gadget.rs", 4, "pub trait Gadget {", 1),
+        ])
+    };
+    let hit_user1 = || Ok(vec![hit("a.rs", (2, 2), 1)]);
+
+    // Key off, the map named: the note, and the answer is the one without it;
+    // ripgrep is never asked.
+    let stub = LiteralStub::new(hit_user1(), Some(Ok(matches())));
+    let named = Some(&["seeds.literal", "graph.scip"][..]);
+    let mut off = literal_call(&tree, false, named, question, Some(&stub)).await;
+    let mut without =
+        literal_call(&tree, false, Some(&["graph.scip"]), question, Some(&stub)).await;
+    let notes = off["notes"].to_string();
+    assert!(
+        notes.contains("seeds.literal is off ([run_profile.seeds] literal = false)"),
+        "{notes}"
+    );
+    assert_eq!(off["seed_source"], without["seed_source"]);
+    off.as_object_mut().unwrap().remove("notes");
+    without.as_object_mut().unwrap().remove("notes");
+    assert_eq!(off, without);
+
+    // Key off and the default maps with a hybrid hit: as before the key.
+    let plain = literal_call(&tree, false, None, question, Some(&stub)).await;
+    assert_eq!(plain["seed_source"], "hybrid");
+    assert_eq!(plain["seeds"], json!([id_of("user1")]));
+    assert!(!plain.to_string().contains("literal"), "{plain}");
+    assert_eq!(stub.literal_calls.load(Ordering::SeqCst), 0);
+    assert!(!loaded.places_built());
+
+    // Key on, no maps named: the map is in the default set, after the hybrid
+    // nodes. The definition of `target` is a symbol, `Gadget` a file.
+    let on = literal_call(&tree, true, None, question, Some(&stub)).await;
+    assert_eq!(stub.literal_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(on["seed_source"], "hybrid+literal");
+    let file = NodeId::file("gadget.rs").unwrap().to_string();
+    assert_eq!(
+        on["seeds"],
+        json!([id_of("user1"), id_of("target"), file.clone()])
+    );
+    assert_eq!(on["seed_hits"][1]["how"], "definition");
+    assert_eq!(on["seed_hits"][1]["name"], "target");
+    assert_eq!(on["seed_hits"][2]["how"], "file");
+    assert_eq!(
+        on["seed_hits"][0]["retrievers"],
+        plain["seed_hits"][0]["retrievers"]
+    );
+    assert_eq!(
+        stub.asked.lock().unwrap().as_slice(),
+        [(vec!["target".to_owned(), "Gadget".to_owned()], 20)]
+    );
+    // The file start node has a site, at the line that declares the name.
+    assert_eq!(
+        on["seed_sites"][&file],
+        json!({"path": "gadget.rs", "line": 4, "col": 1}),
+        "{on}"
+    );
+
+    // Key on and the hybrid search down: the literal nodes are the start nodes.
+    let down = LiteralStub::new(Err("the embedder is down".into()), Some(Ok(matches())));
+    let stand_in = literal_call(&tree, true, None, question, Some(&down)).await;
+    assert_eq!(stand_in["seed_source"], "literal");
+    assert_eq!(stand_in["seeds"], json!([id_of("target"), file]));
+    assert!(
+        stand_in["seed_fallback"]
+            .as_str()
+            .unwrap()
+            .contains("embedder is down")
+    );
+
+    // Key on, a search that cannot run ripgrep: a note, the hybrid seeds stay.
+    let no_rg = LiteralStub::new(hit_user1(), None);
+    let failed_open = literal_call(&tree, true, None, question, Some(&no_rg)).await;
+    assert_eq!(failed_open["seed_source"], "hybrid");
+    assert!(
+        failed_open["notes"]
+            .to_string()
+            .contains("seeds.literal needs the application's ripgrep"),
+        "{failed_open}"
+    );
+    let no_app = NoSearch("no workspace".into());
+    let failed_open = literal_call(&tree, true, None, question, Some(&no_app)).await;
+    assert!(
+        failed_open["notes"]
+            .to_string()
+            .contains("seeds.literal needs the application's ripgrep"),
+        "{failed_open}"
+    );
+}
+
+#[test]
+fn declares_reads_the_word_before_the_name_across_languages() {
+    use super::seeds::declares;
+    for (line, name) in [
+        ("pub trait Shape {", "Shape"),
+        ("impl Draw for Shape {", "Shape"),
+        ("export function Render() {", "Render"),
+        ("object Registry {", "Registry"),
+        ("public delegate void Handler();", "Handler"),
+        ("func (s *Server) Start() error {", "Start"),
+        ("func (Server) Start() {", "Start"),
+        ("class Circle : Shape {", "Circle"),
+    ] {
+        assert!(declares(line, name), "{line}");
+    }
+    for (line, name) in [
+        ("fn draw(shape: &dyn Shape) {}", "Shape"),
+        ("const DEFAULT: Shape = make();", "Shape"),
+        ("// trait Shape", "Shape"),
+        ("class Circle : Shape {", "Shape"),
+        ("func start(s Server) Name {", "Name"),
+        ("trait ShapeKind {", "Shape"),
+    ] {
+        assert!(!declares(line, name), "{line}");
+    }
 }

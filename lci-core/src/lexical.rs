@@ -529,19 +529,66 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
     if terms.is_empty() {
         return Ok(LexicalSearch::default());
     }
+    let run = run_ripgrep(
+        rg_path,
+        root,
+        &[
+            "--json",
+            "--line-number",
+            "--ignore-case",
+            "--fixed-strings",
+        ],
+        &terms,
+    )
+    .await?;
+    let warning = run
+        .failure
+        .map(|failure| format!("Lexical retrieval incomplete: {failure}"));
+    let matcher = TermMatcher::new(&terms);
+    let matches = parse_matches(&run.stdout, root, |text| {
+        let term_mask = matcher.credit(text);
+        (term_mask != 0).then_some(term_mask)
+    })?
+    .into_iter()
+    .map(|(relative_path, line, term_mask)| LexicalMatch {
+        relative_path,
+        line,
+        term_mask,
+    })
+    .collect();
+    Ok(LexicalSearch {
+        terms,
+        matches,
+        warning,
+    })
+}
+
+/// What one ripgrep process answered.
+struct RgRun {
+    stdout: Vec<u8>,
+    /// Set when ripgrep exited with a code other than 0 (matches) and 1 (none):
+    /// the code and the tail of its stderr. Its stdout is still the answer so
+    /// far.
+    failure: Option<String>,
+}
+
+/// Runs ripgrep with `flags`, one `--glob` per language adapter and one `-e`
+/// per needle over `root`. The command every ripgrep caller of the crate
+/// starts.
+async fn run_ripgrep(
+    rg_path: &str,
+    root: &Path,
+    flags: &[&str],
+    needles: &[String],
+) -> Result<RgRun> {
     let resolved_rg = resolve_ripgrep_path(rg_path);
     let mut command = tokio::process::Command::new(&resolved_rg);
-    command.args([
-        "--json",
-        "--line-number",
-        "--ignore-case",
-        "--fixed-strings",
-    ]);
+    command.args(flags);
     for adapter in language::ADAPTERS {
         command.arg("--glob").arg(adapter.glob());
     }
-    for term in &terms {
-        command.arg("-e").arg(term);
+    for needle in needles {
+        command.arg("-e").arg(needle);
     }
     command
         .arg("--")
@@ -560,27 +607,39 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
         "ripgrep terminated without an exit code: {}",
         output.status
     );
-    let warning = output
+    let failure = output
         .status
         .code()
         .filter(|&code| !matches!(code, 0 | 1))
         .map(|code| {
             let tail = &output.stderr[output.stderr.len().saturating_sub(512)..];
             format!(
-                "Lexical retrieval incomplete: ripgrep exited with code {code}: {}",
+                "ripgrep exited with code {code}: {}",
                 String::from_utf8_lossy(tail).trim()
             )
         });
-    let matcher = TermMatcher::new(&terms);
+    Ok(RgRun {
+        stdout: output.stdout,
+        failure,
+    })
+}
+
+/// The `match` events of ripgrep's `--json` output as (path relative to
+/// `root`, 1-based line, whatever `accept` makes of the line's text). The one
+/// parser of ripgrep's JSON lines: a line `accept` turns down (`None`) is
+/// dropped before its path is resolved, a line that is not valid UTF-8 (it
+/// arrives as `bytes` only) is dropped, and a line of output that is not JSON
+/// is an error.
+pub fn parse_matches<T>(
+    stdout: &[u8],
+    root: &Path,
+    mut accept: impl FnMut(&str) -> Option<T>,
+) -> Result<Vec<(String, u32, T)>> {
     // ripgrep repeats a file's path on each of its lines; resolving a path
     // touches the file system, so each distinct path is resolved once.
     let mut relative_paths = HashMap::<String, String>::new();
     let mut matches = Vec::new();
-    for line in output
-        .stdout
-        .split(|&b| b == b'\n')
-        .filter(|l| !l.is_empty())
-    {
+    for line in stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let event: Event = serde_json::from_slice(line).context("invalid ripgrep JSON")?;
         if event.kind != "match" {
             continue;
@@ -589,17 +648,15 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
         let Some(path) = data.path.and_then(|path| path.text) else {
             continue;
         };
-        // A line that is not valid UTF-8 arrives as `bytes` only: no credit.
         let Some(text) = data.lines.and_then(|lines| lines.text) else {
             continue;
         };
         let Some(line) = data.line_number else {
             continue;
         };
-        let term_mask = matcher.credit(&text);
-        if term_mask == 0 {
+        let Some(kept) = accept(&text) else {
             continue;
-        }
+        };
         let relative = match relative_paths.get(&path) {
             Some(relative) => relative.clone(),
             None => {
@@ -608,16 +665,95 @@ pub async fn search(rg_path: &str, root: &Path, query: &str) -> Result<LexicalSe
                 relative
             }
         };
-        matches.push(LexicalMatch {
-            relative_path: relative,
-            line,
-            term_mask,
-        });
+        matches.push((relative, line, kept));
     }
-    Ok(LexicalSearch {
-        terms,
+    Ok(matches)
+}
+
+/// One line that holds a whole-identifier occurrence of a literal needle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralMatch {
+    pub relative_path: String,
+    /// 1-based.
+    pub line: u32,
+    pub text: String,
+    /// Index into the needles of [`search_literals`]: the first needle whose
+    /// whole-identifier occurrence the line holds.
+    pub name: usize,
+}
+
+/// The lines [`search_literals`] found and the failure of ripgrep, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiteralSearch {
+    pub matches: Vec<LiteralMatch>,
+    pub warning: Option<String>,
+}
+
+/// The index of the first of `needles` that `text` holds as a whole
+/// identifier: no letter, digit or `_` on either side (so `Shape` is not
+/// found in `ShapeKind` or `Shape_kind`).
+pub fn first_whole_identifier(text: &str, needles: &[String]) -> Option<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    needles.iter().position(|needle| {
+        !needle.is_empty()
+            && text.match_indices(needle.as_str()).any(|(start, _)| {
+                let before = text[..start].chars().next_back();
+                let after = text[start + needle.len()..].chars().next();
+                !before.is_some_and(word) && !after.is_some_and(word)
+            })
+    })
+}
+
+/// Exact, case-sensitive whole-word search for `needles` over the files of the
+/// language adapters: `rg --json --line-number --fixed-strings
+/// --word-regexp --sort path --max-count <max_per_file>`. `--sort path` makes
+/// ripgrep single-threaded, which the few needles a caller gives can afford,
+/// and the order deterministic. A line is kept only when it holds a needle as
+/// a whole identifier ([`first_whole_identifier`]); ripgrep's own word
+/// boundary only narrows what it reports. No needle is an ordinary empty
+/// answer: ripgrep is not started.
+pub async fn search_literals(
+    rg_path: &str,
+    root: &Path,
+    needles: &[String],
+    max_per_file: u32,
+) -> Result<LiteralSearch> {
+    if needles.is_empty() {
+        return Ok(LiteralSearch::default());
+    }
+    let max_count = max_per_file.max(1).to_string();
+    let run = run_ripgrep(
+        rg_path,
+        root,
+        &[
+            "--json",
+            "--line-number",
+            "--fixed-strings",
+            "--word-regexp",
+            "--sort",
+            "path",
+            "--max-count",
+            &max_count,
+        ],
+        needles,
+    )
+    .await?;
+    let matches = parse_matches(&run.stdout, root, |text| {
+        first_whole_identifier(text, needles).map(|name| (name, text.to_owned()))
+    })?
+    .into_iter()
+    .map(|(relative_path, line, (name, text))| LiteralMatch {
+        relative_path,
+        line,
+        text,
+        name,
+    })
+    .collect();
+    Ok(LiteralSearch {
         matches,
-        warning,
+        warning: run
+            .failure
+            .map(|failure| format!("Literal search incomplete: {failure}")),
     })
 }
 
@@ -895,6 +1031,122 @@ mod tests {
             assert!(found.matches.is_empty());
             assert!(found.warning.is_none());
         }
+    }
+
+    #[test]
+    fn whole_identifier_credit_skips_longer_names_and_underscores() {
+        let needles = vec!["Shape".to_owned(), "Circle".to_owned()];
+        assert_eq!(first_whole_identifier("struct ShapeKind;", &needles), None);
+        assert_eq!(
+            first_whole_identifier("let Shape_kind = 1;", &needles),
+            None
+        );
+        assert_eq!(first_whole_identifier("my_Shape", &needles), None);
+        // One line holding both `ShapeKind` and a standalone `Shape`.
+        assert_eq!(
+            first_whole_identifier("impl ShapeKind for Shape {}", &needles),
+            Some(0)
+        );
+        assert_eq!(first_whole_identifier("trait Shape {", &needles), Some(0));
+        assert_eq!(first_whole_identifier("Shape::new()", &needles), Some(0));
+        assert_eq!(first_whole_identifier("(Circle)", &needles), Some(1));
+        // The first needle that stands alone wins, in needle order.
+        assert_eq!(
+            first_whole_identifier("Circle and Shape", &needles),
+            Some(0)
+        );
+        assert_eq!(first_whole_identifier("shape", &needles), None);
+    }
+
+    #[test]
+    fn parse_matches_keeps_match_events_the_closure_accepts() {
+        let root = Path::new("root");
+        let stdout = concat!(
+            r#"{"type":"begin","data":{"path":{"text":"a.rs"}}}"#,
+            "\n",
+            r#"{"type":"match","data":{"path":{"text":"a.rs"},"lines":{"text":"fn one() {}\n"},"line_number":3}}"#,
+            "\n",
+            r#"{"type":"match","data":{"path":{"text":"a.rs"},"lines":{"text":"fn two() {}\n"},"line_number":9}}"#,
+            "\n",
+            r#"{"type":"match","data":{"path":{"text":"b.rs"},"lines":{"bytes":"/w=="},"line_number":1}}"#,
+            "\n",
+            r#"{"type":"end","data":{}}"#,
+            "\n",
+        );
+        let kept = parse_matches(stdout.as_bytes(), root, |text| {
+            text.contains("one").then_some(text.len())
+        })
+        .unwrap();
+        assert_eq!(kept, vec![("a.rs".to_owned(), 3, 12)]);
+        assert!(parse_matches(b"not JSON", root, |_| Some(())).is_err());
+    }
+
+    /// The runner that `search_literals` shares with `search` has to find
+    /// ripgrep; where it is not installed the real-process tests are skipped.
+    fn real_ripgrep() -> Option<String> {
+        let resolved = resolve_ripgrep_path("rg");
+        std::process::Command::new(&resolved)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|_| resolved.to_string_lossy().into_owned())
+    }
+
+    /// Pins that ripgrep's `--word-regexp` treats `_` as a word character, the
+    /// premise of the literal seeds, and that the needle of a line is the one
+    /// that stands alone. Runs the real ripgrep over real files.
+    #[tokio::test]
+    async fn search_literals_runs_rg_whole_word_and_reports_the_needle() {
+        let Some(rg) = real_ripgrep() else {
+            eprintln!("skipped: ripgrep is not installed");
+            return;
+        };
+        let temp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "trait Shape {}\nstruct ShapeKind;\nlet Shape_kind = 1;\nimpl ShapeKind for Shape {}\nfn circle() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b.rs"), "let my_Shape = 1;\nfn Circle() {}\n").unwrap();
+        let needles = vec!["Shape".to_owned(), "Circle".to_owned()];
+        let found = search_literals(&rg, &root, &needles, 20).await.unwrap();
+        assert!(found.warning.is_none(), "{:?}", found.warning);
+        let got: Vec<(&str, u32, usize)> = found
+            .matches
+            .iter()
+            .map(|m| (m.relative_path.as_str(), m.line, m.name))
+            .collect();
+        // `_` is a word character: neither `Shape_kind` nor `my_Shape` match,
+        // `ShapeKind` alone does not, and the case-sensitive `circle` does
+        // not either. Sorted by path.
+        assert_eq!(got, vec![("a.rs", 1, 0), ("a.rs", 4, 0), ("b.rs", 2, 1)]);
+        assert!(found.matches[0].text.contains("trait Shape"));
+        // No needle: ripgrep is not started.
+        let none = search_literals("missing-ripgrep-binary", &root, &[], 20)
+            .await
+            .unwrap();
+        assert!(none.matches.is_empty() && none.warning.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_literals_warns_on_a_failed_ripgrep_and_keeps_its_matches() {
+        let temp = TempDir::new().unwrap();
+        let rg = fake_ripgrep(
+            &temp,
+            r#"{"type":"match","data":{"path":{"text":"lib.rs"},"lines":{"text":"impl ShapeKind for Shape {}\n"},"line_number":4}}"#,
+            "blocked: Permission denied (os error 13)",
+            2,
+        );
+        let needles = vec!["Shape".to_owned()];
+        let found = search_literals(rg.to_str().unwrap(), temp.path(), &needles, 20)
+            .await
+            .unwrap();
+        assert_eq!(found.matches.len(), 1);
+        assert_eq!(found.matches[0].name, 0);
+        assert!(found.warning.unwrap().contains("Permission denied"));
     }
 
     #[tokio::test]

@@ -32,6 +32,15 @@
 //!   (`bm25`, which also keeps the stand-in from running). With the key off
 //!   the map is unknown to the call: naming it gives a note and no seeds,
 //!   and nothing else changes.
+//! * `hybrid+literal`, `hybrid+bm25+literal`, `bm25+literal`, `literal`: with
+//!   `[run_profile.seeds] literal = true`, the map `seeds.literal` runs
+//!   ripgrep for the names the question puts in code spans (whole word, exact
+//!   case) and places each line in the SCIP graph: the symbol defined there,
+//!   else the symbol around it, else (a declaration line) the file. Its nodes
+//!   go after the other sources' nodes, or are the start nodes when none
+//!   answered (`literal`). `[traverse] exact_seeds` is not this source. With
+//!   the key off the map is unknown to the call (a note when named) and ripgrep
+//!   is never started.
 //! * `traits`, `traits+hybrid`, `traits+name_tokens`: with `scip.implements`
 //!   on, a trait path or `Trait::method` path in a code span of the question
 //!   names trait or trait-method nodes, which the walk expands to the
@@ -141,6 +150,12 @@ pub const SEEDS_HYBRID: MapId = "seeds.hybrid";
 /// runs only when `[run_profile.seeds] bm25` is on, and then it is part of
 /// the default set of a call that names no maps.
 pub const SEEDS_BM25: MapId = "seeds.bm25";
+/// The map of the start nodes ripgrep's whole-word search finds for the names
+/// the question puts in code spans (`seed_source` `hybrid+literal`,
+/// `hybrid+bm25+literal`, `bm25+literal` or `literal`). Opt-in: it runs only
+/// when `[run_profile.seeds] literal` is on, and then it is part of the
+/// default set of a call that names no maps.
+pub const SEEDS_LITERAL: MapId = "seeds.literal";
 /// The maps a traversal can use, in registration order. All of them are on
 /// unless the caller names the ones it wants; `structure.contains` is what
 /// lets a chunk or file start node (what the hybrid search often finds) reach
@@ -165,7 +180,7 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 12] = [
+pub const OPT_IN_MAPS: [MapId; 13] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -178,6 +193,7 @@ pub const OPT_IN_MAPS: [MapId; 12] = [
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
     SEEDS_BM25,
+    SEEDS_LITERAL,
 ];
 /// The note of a call that names `probe.compile` without the trust grant.
 const PROBE_COMPILE_SKIPPED_NOTE: &str = "probe.compile skipped: cargo check would run the tree's build scripts and procedural macros; set rust_analyzer_trusted = true in the main configuration for a trusted tree";
@@ -290,7 +306,8 @@ pub struct Call<'a> {
     /// Results to return, 1 through 40.
     pub top_k: usize,
     /// The maps to use; `None` is all of [`MAPS`] (not [`OPT_IN_MAPS`]), and
-    /// [`SEEDS_BM25`] with `[run_profile.seeds] bm25`.
+    /// [`SEEDS_BM25`] with `[run_profile.seeds] bm25` and [`SEEDS_LITERAL`]
+    /// with `[run_profile.seeds] literal`.
     pub maps: Option<&'a [String]>,
     pub budget: &'a BudgetArgs,
     pub steer: &'a SteerArgs,
@@ -554,6 +571,7 @@ pub async fn run_with_trait_seeds(
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
     let mut bm25_off_note: Option<String> = None;
+    let mut literal_off_note: Option<String> = None;
     let known_map = |id: &str| {
         MAPS.iter()
             .chain(&OPT_IN_MAPS)
@@ -613,6 +631,20 @@ pub async fn run_with_trait_seeds(
             );
         }
     }
+    // `[run_profile.seeds] literal`: the same for `seeds.literal`.
+    if profile.seeds.literal {
+        if call.maps.is_none() && !wanted.contains(&SEEDS_LITERAL) {
+            wanted.push(SEEDS_LITERAL);
+        }
+    } else if wanted.contains(&SEEDS_LITERAL) {
+        wanted.retain(|id| *id != SEEDS_LITERAL);
+        if call.maps.is_some() {
+            literal_off_note = Some(
+                "seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes"
+                    .to_owned(),
+            );
+        }
+    }
     // The policy's first_k and seed_k take the place of the [traverse] keys.
     let tuned;
     let limits = if policy.first_k.is_some() || policy.seed_k.is_some() {
@@ -625,10 +657,12 @@ pub async fn run_with_trait_seeds(
     } else {
         limits
     };
-    // `seeds.bm25` reads the SCIP graph only, not the tree.
+    // `seeds.bm25` reads the SCIP graph only, not the tree; `seeds.literal`
+    // searches the tree through the application's search and says so when the
+    // call has none.
     if wanted
         .iter()
-        .any(|id| *id != SEEDS_BM25 && OPT_IN_MAPS.contains(id))
+        .any(|id| *id != SEEDS_BM25 && *id != SEEDS_LITERAL && OPT_IN_MAPS.contains(id))
         && call.scip_root.is_none()
     {
         bail!("the maps named beyond the defaults read the tree: give its root");
@@ -645,6 +679,7 @@ pub async fn run_with_trait_seeds(
     let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
     let mut notes = Vec::new();
     notes.extend(bm25_off_note);
+    notes.extend(literal_off_note);
     if !skipped_maps.is_empty() {
         notes.push(format!(
             "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
@@ -858,6 +893,15 @@ pub async fn run_with_trait_seeds(
             &mut plan_maps,
             &observer,
             Box::new(SeedMap::bm25()),
+            true,
+        )?;
+    }
+    if wants(SEEDS_LITERAL) {
+        register(
+            &mut registry,
+            &mut plan_maps,
+            &observer,
+            Box::new(SeedMap::literal()),
             true,
         )?;
     }

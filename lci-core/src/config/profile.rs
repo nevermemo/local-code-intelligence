@@ -53,6 +53,17 @@ pub struct RunProfileSeeds {
     /// search's seeds. The recipes' seeds are given, so they run the same
     /// under both values.
     pub bm25: bool,
+    /// Let the opt-in map `seeds.literal` run. `false` (the default): naming
+    /// it gives a note and no seeds, it is not in the default map set, ripgrep
+    /// is not started for it, and every answer is as without the key. `true`:
+    /// the map is in the default set when a call names no maps, and it runs
+    /// when named. It searches the tree with ripgrep for the whole-word
+    /// occurrences of the names the question puts in code spans, places each
+    /// line in the SCIP graph (a definition, else the enclosing function, else
+    /// the file of a declaration), and appends those nodes after the hybrid
+    /// search's seeds. The recipes' seeds are given, so they run the same
+    /// under both values.
+    pub literal: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -727,6 +738,7 @@ mod tests {
         config.run_profile.lsp.implementations = true;
         config.run_profile.lsp.call_hierarchy = true;
         config.run_profile.seeds.bm25 = true;
+        config.run_profile.seeds.literal = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config.run_profile.lsp.places = LspPlaces::Outline;
         config
@@ -997,6 +1009,48 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_literal_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.literal);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nliteral = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.literal);
+        assert!(!on.run_profile.seeds.bm25);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["literal"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["literal"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["literal"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.seeds.literal")
+        );
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nliteral = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nliteral = \"yes\"\n",
+            "[run_profile.seeds]\nliteral = 1\n",
+            "[run_profile]\nliteral = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn stat_gate_is_off_by_default_and_is_part_of_the_profile() {
         let off = Config::default();
         assert!(!off.run_profile.freshness.stat_gate);
@@ -1114,6 +1168,7 @@ mode = \"sometimes\"
             "run_profile.lsp.implementations",
             "run_profile.lsp.call_hierarchy",
             "run_profile.seeds.bm25",
+            "run_profile.seeds.literal",
             "run_profile.lsp.sync",
             "run_profile.lsp.places",
         ] {
