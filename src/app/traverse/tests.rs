@@ -3920,6 +3920,32 @@ impl ScipFileTree {
         handle: Option<&str>,
         pops: u32,
     ) -> Result<Value> {
+        let mut profile = RunProfileConfig::default();
+        profile.scip.mode = mode;
+        self.run_profile_at(index, &profile, maps, handle, pops)
+            .await
+    }
+
+    /// `run`, with the default profile: the mode is not set.
+    async fn run_default(&self, maps: &[&str], handle: Option<&str>, pops: u32) -> Result<Value> {
+        self.run_profile_at(
+            &self.index,
+            &RunProfileConfig::default(),
+            maps,
+            handle,
+            pops,
+        )
+        .await
+    }
+
+    async fn run_profile_at(
+        &self,
+        index: &Path,
+        profile: &RunProfileConfig,
+        maps: &[&str],
+        handle: Option<&str>,
+        pops: u32,
+    ) -> Result<Value> {
         let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
         let (budget, steer) = (
             BudgetArgs {
@@ -3943,10 +3969,8 @@ impl ScipFileTree {
             lsp: None,
             lsp_sessions: None,
         };
-        let mut profile = RunProfileConfig::default();
-        profile.scip.mode = mode;
         Ok(
-            run(&limits(), &profile, &Dirs::under(self.dir.path()), &call)
+            run(&limits(), profile, &Dirs::under(self.dir.path()), &call)
                 .await?
                 .response,
         )
@@ -4119,6 +4143,92 @@ async fn a_handle_is_bound_to_the_index_stamp_not_to_the_spelling_of_its_path() 
             .to_string();
         assert!(error.contains(wanted), "{given}: {error}");
     }
+}
+
+/// The notes of an answer as one text.
+fn notes_text(response: &Value) -> String {
+    response["notes"].to_string()
+}
+
+#[tokio::test]
+async fn an_unreadable_index_under_the_default_mode_is_parsed_once_per_stamp() {
+    let tree = ScipFileTree::new().await;
+    let good = std::fs::read(&tree.index).unwrap();
+    let root = Some(tree.dir.path());
+    let maps = ["graph.scip"];
+
+    // A handle made on the readable graph (an empty graph finishes at once and
+    // issues none).
+    let readable = tree.run_default(&maps, None, 1).await.unwrap();
+    let readable_handle = handle_of(&readable);
+
+    // Every step changes the file length, so the stamp moves.
+    std::fs::write(&tree.index, [0xff_u8; 32]).unwrap();
+    let first = tree.run_default(&maps, None, 1).await.unwrap();
+    assert!(notes_text(&first).contains("unreadable:"), "{first}");
+    assert!(!notes_text(&first).contains("remembered"), "{first}");
+    let failed_at =
+        super::index::remembered_failure(&tree.index, root).expect("the failure is remembered");
+
+    // The same stamp: no parse, the note says so.
+    let second = tree.run_default(&maps, None, 1).await.unwrap();
+    assert!(notes_text(&second).contains("unreadable:"), "{second}");
+    assert!(notes_text(&second).contains("remembered"), "{second}");
+    assert_eq!(
+        super::index::remembered_failure(&tree.index, root),
+        Some(failed_at)
+    );
+    // The remembered call is on the empty graph, so the readable graph's
+    // handle does not resume on it.
+    let error = tree
+        .run_default(&maps, Some(&readable_handle), 1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("belongs to another workspace or index"),
+        "{error}"
+    );
+
+    // Another size: the file is read again.
+    std::fs::write(&tree.index, [0xff_u8; 48]).unwrap();
+    let third = tree.run_default(&maps, None, 1).await.unwrap();
+    assert!(notes_text(&third).contains("unreadable:"), "{third}");
+    assert!(!notes_text(&third).contains("remembered"), "{third}");
+    assert_ne!(
+        super::index::remembered_failure(&tree.index, root),
+        Some(failed_at)
+    );
+
+    // The fixture back: the graph is read, the note is gone, the memory is
+    // empty.
+    std::fs::write(&tree.index, &good).unwrap();
+    let fourth = tree.run_default(&maps, None, 20).await.unwrap();
+    assert!(
+        reached_ids(&fourth).iter().any(|id| id.contains("beta")),
+        "{fourth}"
+    );
+    assert!(!notes_text(&fourth).contains("scip.mode"), "{fourth}");
+    assert_eq!(super::index::remembered_failure(&tree.index, root), None);
+}
+
+#[tokio::test]
+async fn an_unreadable_index_under_authoritative_is_never_remembered() {
+    let tree = ScipFileTree::new().await;
+    let root = Some(tree.dir.path());
+    std::fs::write(&tree.index, [0xff_u8; 32]).unwrap();
+    for _ in 0..2 {
+        let error = tree
+            .run(ScipMode::Authoritative, &["graph.scip"], None, 1)
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("remembered"), "{error:#}");
+        assert_eq!(super::index::remembered_failure(&tree.index, root), None);
+    }
+    // The default mode parses on its first call.
+    let third = tree.run_default(&["graph.scip"], None, 1).await.unwrap();
+    assert!(notes_text(&third).contains("unreadable:"), "{third}");
+    assert!(!notes_text(&third).contains("remembered"), "{third}");
 }
 
 /// A call that names `probe.compile` beside `graph.scip` on the tree fixture,

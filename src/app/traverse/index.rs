@@ -137,8 +137,13 @@ impl Loaded {
     /// The error of a map that is built from the index file.
     fn bail_if_absent(&self) -> Result<()> {
         if let Some(mode) = self.absent {
+            let hint = if mode == ScipMode::Cache {
+                "; write one with `rust-analyzer scip` in the workspace or set traverse.scip_index"
+            } else {
+                ""
+            };
             return Err(anyhow!(
-                "no SCIP index is read (scip.mode = {})",
+                "no SCIP index is read (scip.mode = {}){hint}",
                 mode.as_str()
             ));
         }
@@ -153,9 +158,40 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(Default::default)
 }
 
+type FailedKey = (PathBuf, Option<PathBuf>);
+
+/// The parse failure of an index file under `cache`, with the file stamp it was
+/// seen at: one entry per (index, root), replaced per stamp and removed when
+/// the file loads. `authoritative` and `off` never touch it.
+type Failed = Mutex<HashMap<FailedKey, (Stamp, String)>>;
+
+fn failed() -> &'static Failed {
+    static FAILED: OnceLock<Failed> = OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+/// The remembered failure text for `key` when it was seen at `stamp`.
+fn remembered(key: &FailedKey, stamp: Stamp) -> Option<String> {
+    let failed = failed().lock().unwrap_or_else(PoisonError::into_inner);
+    let (seen_at, text) = failed.get(key)?;
+    (*seen_at == stamp).then(|| text.clone())
+}
+
+/// The stamp of the remembered parse failure of `index` under `root`, if any.
+#[cfg(test)]
+pub(super) fn remembered_failure(index: &Path, root: Option<&Path>) -> Option<Stamp> {
+    let key = (index.to_path_buf(), root.map(Path::to_path_buf));
+    failed()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .map(|(stamp, _)| *stamp)
+}
+
 /// Loads the index at `index` as `mode` says: `off` never touches the path;
-/// `cache` takes a missing or unreadable file as an empty graph with a note;
-/// `authoritative` fails on both.
+/// `cache` takes a missing or unreadable file as an empty graph with a note
+/// and parses an unreadable file once per file stamp; `authoritative` fails on
+/// both.
 pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> Result<Arc<Loaded>> {
     if mode == ScipMode::Off {
         return Ok(Arc::new(Loaded::empty(
@@ -174,7 +210,11 @@ pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> R
     };
     let meta = match std::fs::metadata(index) {
         Ok(meta) => meta,
-        Err(_) if mode == ScipMode::Cache => return Ok(none_read("")),
+        Err(_) if mode == ScipMode::Cache => {
+            return Ok(none_read(
+                "; write one with `rust-analyzer scip` in the workspace or set traverse.scip_index",
+            ));
+        }
         Err(error) => {
             return Err(anyhow::Error::new(error).context(format!(
                 "no SCIP index at {}; write one with `rust-analyzer scip` in the workspace or set traverse.scip_index",
@@ -191,6 +231,13 @@ pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> R
         .filter(|loaded| loaded.stamp == stamp)
     {
         return Ok(found.clone());
+    }
+    if mode == ScipMode::Cache
+        && let Some(text) = remembered(&key, stamp)
+    {
+        return Ok(none_read(&format!(
+            "; unreadable: {text}; not re-read: the failure is remembered for this file stamp and the file is read again when its size or modified time changes"
+        )));
     }
     let (path, root_dir) = (index.to_path_buf(), root.map(Path::to_path_buf));
     let built = tokio::task::spawn_blocking(move || -> Result<Loaded> {
@@ -209,10 +256,21 @@ pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> R
     let loaded = match built {
         Ok(loaded) => loaded,
         Err(error) if mode == ScipMode::Cache => {
-            return Ok(none_read(&format!("; unreadable: {error:#}")));
+            let text = format!("{error:#}");
+            failed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, (stamp, text.clone()));
+            return Ok(none_read(&format!("; unreadable: {text}")));
         }
         Err(error) => return Err(error),
     };
+    if mode == ScipMode::Cache {
+        failed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
     let loaded = Arc::new(loaded);
     cache()
         .lock()

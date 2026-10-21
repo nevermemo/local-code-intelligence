@@ -1158,6 +1158,17 @@ async fn a_recipe_refuses_when_the_run_profile_reads_no_index() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("scip.mode = cache"), "{error}");
+    // The default profile with no file: the same refusal, with the hint that
+    // says how to make an index.
+    let bare = Tree::new();
+    std::fs::remove_file(bare.dir.path().join("index.scip")).unwrap();
+    let error = bare
+        .try_ask_under(request.clone(), false, &RunProfileConfig::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scip.mode = cache"), "{error}");
+    assert!(error.contains("rust-analyzer scip"), "{error}");
     // Cache with the file reads it, as authoritative does.
     let present = Tree::new();
     present.ask_under(request, false, &profile).await;
