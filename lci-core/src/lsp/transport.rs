@@ -100,6 +100,30 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// A request that ended because the server sent nothing for the whole
+/// inactivity timeout (`lsp_timeout_seconds`): the root cause of the
+/// `anyhow::Error` [`JsonRpcClient::request`] returns then, and of nothing
+/// else. It tells a server that is slow (a start that outlasted the bound) from
+/// one that is gone (exited, closed its pipe, broke the protocol), which
+/// carries none: `error.chain().any(|cause| cause.is::<InactivityTimeout>())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InactivityTimeout {
+    pub label: String,
+    pub seconds: u64,
+}
+
+impl fmt::Display for InactivityTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} request timed out after {} seconds of inactivity",
+            self.label, self.seconds
+        )
+    }
+}
+
+impl std::error::Error for InactivityTimeout {}
+
 /// Configuration for spawning a JSON-RPC over stdio process.
 pub struct TransportConfig {
     pub executable: String,
@@ -438,11 +462,10 @@ impl JsonRpcClient {
             let now = Instant::now();
             if now >= deadline {
                 self.pending.lock().await.remove(&id);
-                break Err(anyhow::anyhow!(
-                    "{} request timed out after {} seconds of inactivity",
-                    self.label,
-                    self.timeout.as_secs()
-                ));
+                break Err(anyhow::Error::new(InactivityTimeout {
+                    label: self.label.clone(),
+                    seconds: self.timeout.as_secs(),
+                }));
             }
             tokio::select! {
                 result = &mut receiver => {
