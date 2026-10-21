@@ -96,7 +96,7 @@ What shipped is a different, smaller surface than 3.1 to 3.5, reached through `s
 - **Handles** (`handle.rs`): a stopped or budget-limited traversal leaves a `Snapshot` of its state, a `HandleStore` keeps it as `<data_dir>/traverse/handles/<handle>.json` under the hash of its JSON (equal runs
   give equal handles; a stored file is checked on load), and `Traversal::resumed` continues from it. A handle is bound to the workspace and index it was made on (`check_identity`). Budgets (`pops`, `est_tokens`,
   `external_calls`) are absolute for the whole traversal; `deadline` and `max_depth` belong to the call; what the agent raised stays with the traversal. A resume refuses a changed corroboration boost, score-bound
-  `k`, hop priors, tie-break file or reranker identity. Handle text is at most 64 characters. There is no TTL, cap on live handles, endpoint binding or `seq`, and no drift handling beyond the
+  `k`, hop priors, tie-break file or reranker identity. A handle is `h` and 16 lowercase hex digits (the app refuses an empty one or one over 64 characters first); its file is never removed, and a changed index file (new size or modified time) or workspace root refuses it. There is no TTL, cap on live handles, endpoint binding or `seq`, and no drift handling beyond the
   identity check. S-1 to S-8 describe the design of 3.1 to 3.5 only.
 
 ## 4. Open decisions
@@ -105,7 +105,7 @@ What shipped is a different, smaller surface than 3.1 to 3.5, reached through `s
 | --- | --- | --- | --- |
 | S-1 | Three tools; ending is `continue(until=end)`. | A fourth `traverse_end` tool (clearer, one more tool on every endpoint). | S5. |
 | S-2 | Steer never runs maps; work happens at the next continue. | Execute cheap ops (prune, reweight) immediately and return the new packet (one fewer round trip). | S5, after measuring round trips. |
-| S-3 | No `pin` in v1. | Add `pin` (protect nodes from prune and the cut). Likely v2; the handle already has a `pins` set. | First scripted-agent study. |
+| S-3 | No `pin` in v1. | Add `pin` (protect nodes from prune and the cut). Likely v2; a handle has no `pins` set today. | First scripted-agent study. |
 | S-4 | No sub-query op in v1. | `add_query { text }` that runs text maps on extra text (idea N1, ephemeral maps). | W4 (ephemeral maps). |
 | S-5 | Defaults TTL 600 s, cap 3600 s, 32 per process, 8 per workspace. | Any other numbers; all are guesses until measured. | S5 load test. |
 | S-6 | On snapshot drift: keep surviving nodes, drop the rest, note it. | Fail the traversal on any drift (simpler semantics, worse for long agent pauses under `on-search`). Available as `on_drift = fail`. | S5. |

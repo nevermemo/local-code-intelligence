@@ -675,3 +675,100 @@ async fn a_handle_without_a_grouping_loads_as_tool_groups() {
         );
     }
 }
+
+// ---- K28: the shape of a handle and what it is made of ---------------------------
+
+/// The handle of `snapshot` after `change`.
+fn handle_after(snapshot: &Snapshot, change: impl FnOnce(&mut Snapshot)) -> String {
+    let mut changed = snapshot.clone();
+    change(&mut changed);
+    changed.handle()
+}
+
+#[tokio::test]
+async fn a_handle_is_h_plus_16_hex_and_every_optional_field_round_trips() {
+    let (_, plain) = cut_snapshot().await;
+    // The default walk writes none of the five optional keys, so handles made
+    // before they existed are what they were.
+    let json = plain.to_json();
+    for key in [
+        "fusion",
+        "grouping",
+        "priors",
+        "tie_break",
+        "rerank_identity",
+    ] {
+        assert!(json.get(key).is_none(), "{key} is written by default");
+    }
+    let shape = |handle: &str| {
+        handle.len() == 17
+            && handle.starts_with('h')
+            && handle[1..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    assert!(shape(&plain.handle()), "{}", plain.handle());
+
+    let mut full = plain.clone();
+    full.fusion = Fusion::Rrf;
+    full.grouping = Grouping::new(Groups::Claim, 0.5);
+    full.priors = Some(("flow".into(), "deadbeef".into()));
+    full.tie_break = Some("cafef00d".into());
+    full.rerank_floor = Some(0.25);
+    full.rerank_identity = Some("model@endpoint".into());
+    full.score_bound = false;
+    full.pass_through = true;
+    full.top_k = 5;
+    full.identity = "w1.i1".into();
+    full.boost = 0.3;
+    full.switches = vec![("g".into(), false)];
+    full.weights = vec![("g".into(), 0.5)];
+    let json = full.to_json();
+    for key in [
+        "fusion",
+        "grouping",
+        "priors",
+        "tie_break",
+        "rerank_identity",
+    ] {
+        assert!(json.get(key).is_some(), "{key} is not written");
+    }
+    let handle = full.handle();
+    assert!(shape(&handle), "{handle}");
+    assert_eq!(
+        handle,
+        format!(
+            "h{}",
+            crate::traverse::trace::hash16(json.to_string().as_bytes())
+        ),
+        "the handle is the hash of the compact JSON text"
+    );
+    assert_eq!(Snapshot::from_json(&json).unwrap(), full);
+    assert_eq!(
+        Snapshot::from_json(&json).unwrap().handle(),
+        handle,
+        "the snapshot read back has the same handle"
+    );
+
+    // Each setting changes the handle on its own, and putting it back gives
+    // the same handle again.
+    type Change = fn(&mut Snapshot);
+    let changes: [(&str, Change); 12] = [
+        ("identity", |s| s.identity = "w1.i2".into()),
+        ("boost", |s| s.boost = 0.4),
+        ("top_k", |s| s.top_k = 6),
+        ("fusion", |s| s.fusion = Fusion::Boost),
+        ("grouping", |s| s.grouping = Grouping::default()),
+        ("priors", |s| s.priors = None),
+        ("tie_break", |s| s.tie_break = None),
+        ("rerank_floor", |s| s.rerank_floor = Some(0.5)),
+        ("score_bound", |s| s.score_bound = true),
+        ("pass_through", |s| s.pass_through = false),
+        ("a switch", |s| s.switches[0].1 = true),
+        ("a weight", |s| s.weights[0].1 = 0.6),
+    ];
+    for (what, change) in changes {
+        assert_ne!(handle_after(&full, change), handle, "{what}");
+    }
+    assert_eq!(handle_after(&full, |_| {}), handle);
+}
