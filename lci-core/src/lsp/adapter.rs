@@ -161,6 +161,17 @@ pub trait LspAdapter: Send + Sync {
     fn keeps_session(&self, synced: bool) -> bool {
         !self.stamp_manifests().is_empty() && (synced || self.watches_workspace())
     }
+
+    /// Whether the search's LSP channel may start this server for a query
+    /// when a chunk of one of its languages is among the candidates. The
+    /// channel asks every applicable server for symbols named like the query;
+    /// a server whose symbols are not code names (marksman: headings) opts
+    /// out with `false`, so an indexed prose file does not start it for every
+    /// search. Navigation (`definition`, `references`, `search_symbols`) is
+    /// unaffected. Default `true`.
+    fn joins_search_channel(&self) -> bool {
+        true
+    }
 }
 
 /// The largest file a `before_position_request` hook reads and sends whole in

@@ -452,7 +452,7 @@ pub struct LspProfile {
     /// `false` (default): every outline `lsp.live` needs (a file's
     /// `textDocument/documentSymbol`) is asked of the server. `true`: for a
     /// server that is resent the file's text before every request
-    /// (`LspAdapter::opens_documents`: pyright, gopls, jdtls, clangd), a
+    /// (`LspAdapter::opens_documents`: pyright, gopls, jdtls, clangd, marksman), a
     /// manager keeps each non-empty outline under the content hash of the
     /// file it was asked for and answers the same file again from it while
     /// the bytes and the server session are unchanged (see

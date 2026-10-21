@@ -7,7 +7,7 @@
 //! - `data_dir`, as the platform default made explicit, when no higher layer
 //!   sets it;
 //! - the absolute path of `rg`, `rust-analyzer`, `csharp-ls`,
-//!   `typescript-language-server`, `pyright-langserver`, `gopls` and `clangd`
+//!   `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd` and `marksman`
 //!   found on `PATH`, when no higher layer sets that key.
 //!
 //! Everything else it learns -- a model service that answers or does not,
@@ -295,7 +295,7 @@ struct Tool {
     hint: &'static str,
 }
 
-const TOOLS: [Tool; 7] = [
+const TOOLS: [Tool; 8] = [
     Tool {
         key: "ripgrep_path",
         command: "rg",
@@ -330,6 +330,11 @@ const TOOLS: [Tool; 7] = [
         key: "clangd.path",
         command: "clangd",
         hint: "install clangd from LLVM or your system packages",
+    },
+    Tool {
+        key: "markdown.path",
+        command: "marksman",
+        hint: "download a release from github.com/artempyanykh/marksman/releases",
     },
 ];
 
@@ -1086,6 +1091,7 @@ mod tests {
             "pyright-langserver: not on PATH (npm install -g pyright)",
             "gopls: not on PATH (go install golang.org/x/tools/gopls@latest)",
             "clangd: not on PATH (install clangd from LLVM or your system packages)",
+            "marksman: not on PATH (download a release from github.com/artempyanykh/marksman/releases)",
         ] {
             assert!(texts.contains(&expected), "{expected}");
         }

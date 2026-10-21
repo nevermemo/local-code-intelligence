@@ -1773,7 +1773,8 @@ impl App {
     }
 
     /// The enabled language-server adapters that apply to the languages of
-    /// `chunks`, one per provider name, sorted by provider. The LSP channel
+    /// `chunks` that join the search channel ([`LspAdapter::joins_search_channel`]),
+    /// one per provider name, sorted by provider. The LSP channel
     /// of `search_once` and the `lsp.symbols` map both pick providers here.
     fn applicable_lsp_adapters(&self, chunks: &[Hit]) -> Vec<Arc<dyn LspAdapter>> {
         let mut applicable: HashMap<&'static str, Arc<dyn LspAdapter>> = HashMap::new();
@@ -1783,7 +1784,7 @@ impl App {
             .collect();
         for language in languages {
             for adapter in self.analyzer.adapters_for_language(language) {
-                if adapter.enabled() {
+                if adapter.enabled() && adapter.joins_search_channel() {
                     applicable
                         .entry(adapter.provider())
                         .or_insert_with(|| Arc::clone(adapter));

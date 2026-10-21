@@ -190,6 +190,19 @@ lsp_stuck_seconds = 900
 # args = []
 # disabled = false
 
+# Optional Markdown language server (marksman). Reached only for an indexed
+# prose file, so it also needs [index] prose = true. Optional and fail-open,
+# same as csharp above. The adapter forces the `server` subcommand before args
+# (marksman's stdio mode). It reads headings and links: documentSymbol is the
+# heading outline, definition at a link is its target, references at a heading
+# are the links that point at it, workspace/symbol lists headings (needs a .git
+# directory or a .marksman.toml at the workspace root, which LCI never writes). The install
+# path is a machine key: set it in the local overlay or LCI_MARKDOWN_PATH.
+# [markdown]
+# path = "marksman"
+# args = []
+# disabled = false
+
 # Query-time switches for the retrieval channels and the reranker; all default
 # to true, and a file without this section behaves exactly as before. A
 # disabled channel is skipped outright: no candidates, no work (semantic =
@@ -604,7 +617,7 @@ mode = "cache"
 # start is paid once, but only a server that lists the configuration files its
 # tree stamp covers (every adapter but jdtls) and sees an edit on its own (today
 # rust-analyzer) or is told by sync = "watch". Every other server
-# (csharp-ls, typescript-language-server, pyright, gopls, clangd; jdtls always)
+# (csharp-ls, typescript-language-server, pyright, gopls, clangd; jdtls and marksman always)
 # is started by each call and stopped when its walk ends, as under "per_call".
 # Before a walk uses a kept server it passes a tree barrier: a stamp of the
 # server's indexed files, their directories and ancestors (child names too),
@@ -631,7 +644,7 @@ mode = "cache"
 # outline_cache = false (default): every file outline lsp.live needs
 # (textDocument/documentSymbol) is asked of the server. true: for the servers that
 # are sent a file's current text before every request (pyright, gopls, jdtls,
-# clangd), the language-server manager keeps each non-empty outline under the
+# clangd, marksman), the language-server manager keeps each non-empty outline under the
 # content hash of the file and answers it again while the file's bytes and the
 # server session are unchanged; an edited file, or a restarted or released
 # server, is asked again, and an empty outline is never kept. rust-analyzer (it

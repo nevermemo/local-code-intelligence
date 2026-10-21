@@ -8,6 +8,8 @@ mod evaluation;
 mod freshness;
 #[path = "cases/indexing.rs"]
 mod indexing;
+#[path = "cases/markdown_lsp.rs"]
+mod markdown_lsp;
 #[path = "cases/mcp.rs"]
 mod mcp;
 #[path = "cases/navigation.rs"]
