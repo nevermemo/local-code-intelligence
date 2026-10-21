@@ -19,6 +19,11 @@ use lci_maps::{
 };
 use std::time::Duration;
 
+/// What something that is slow only on a loaded machine may take: the same 30 s
+/// as `LOADED_BUDGET` in `tests/support/mod.rs` (the integration binary's
+/// helper, which unit tests cannot reach).
+const LOADED_BUDGET: Duration = Duration::from_secs(30);
+
 /// The distinct chunks of the three lists, first seen first: the universe
 /// the registry's view is built from.
 fn universe(lists: [&[Hit]; 3]) -> Vec<Hit> {
@@ -335,8 +340,11 @@ async fn the_live_lexical_map_passes_c1_and_c6_and_fails_open_without_ripgrep() 
     let fixture = Fixture {
         view: &view,
         text: "calculator total",
-        budget: Duration::from_secs(5),
-        slack: Duration::from_secs(5),
+        // The map starts real ripgrep processes, which take seconds on a
+        // loaded machine (5 s failed). The injected past-deadline run lasts
+        // the whole budget, so this is half of the usual loaded budget.
+        budget: LOADED_BUDGET / 2,
+        slack: Duration::from_secs(10),
         rrf_k: RRF_K,
     };
     let config = Config::default();

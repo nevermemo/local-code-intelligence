@@ -927,6 +927,22 @@ pub(crate) mod tests {
         net::{TcpListener, TcpStream},
     };
 
+    /// What a skip window of a breaker test must outlast: the same 30 s as
+    /// `LOADED_BUDGET` in `tests/support/mod.rs` (a refused connect takes up to
+    /// about 2 s on Windows, and a loaded machine can stall a test for longer
+    /// than the 1 s and 2 s windows these tests used). A test that needs a
+    /// window to have passed ages the trip instead of sleeping through it.
+    const BREAKER_WINDOW: Duration = Duration::from_secs(30);
+
+    /// `breaker` as it is `window` after its trip: the window has passed.
+    fn age_past_the_window(breaker: &ConnectBreaker, window: Duration) {
+        breaker.trip(
+            Instant::now()
+                .checked_sub(window)
+                .expect("the machine has been up longer than the window"),
+        );
+    }
+
     /// An address on which nothing listens. Where the platform allows it the
     /// socket is bound but never listens, so connections are refused and,
     /// while it lives, no parallel test's server can take the port (releasing
@@ -1679,7 +1695,7 @@ pub(crate) mod tests {
             ..Config::default()
         };
         let mut models = Models::new(&config).unwrap();
-        models.reranker_breaker = Arc::new(ConnectBreaker::new(Duration::from_secs(1)));
+        models.reranker_breaker = Arc::new(ConnectBreaker::new(BREAKER_WINDOW));
         let documents = vec!["fn a() {}".to_owned()];
 
         let first = models.rerank("query", &documents).await.unwrap_err();
@@ -1691,17 +1707,17 @@ pub(crate) mod tests {
 
         // Within the window: no connection attempt, so it returns at once
         // and is not a connect error itself.
-        let started = Instant::now();
+        // (A skip is told from an attempt by its error: an attempt at a closed
+        // port ends in a connect error, which a skip is not.)
         let skipped = models.rerank("query", &documents).await.unwrap_err();
         assert!(
             format!("{skipped:#}").contains("recently unreachable"),
             "{skipped:#}"
         );
         assert!(!is_connect_error(&skipped), "{skipped:#}");
-        assert!(started.elapsed() < Duration::from_millis(500));
 
         // After the window the next call tries the reranker again.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        age_past_the_window(&models.reranker_breaker, BREAKER_WINDOW);
         let probed = models.rerank("query", &documents).await.unwrap_err();
         assert!(is_connect_error(&probed), "{probed:#}");
     }
@@ -1715,7 +1731,7 @@ pub(crate) mod tests {
         };
         let mut models = Models::new(&config).unwrap();
         models.initial_backoff = Duration::from_millis(10);
-        models.embedder_breaker = Arc::new(ConnectBreaker::new(Duration::from_secs(2)));
+        models.embedder_breaker = Arc::new(ConnectBreaker::new(BREAKER_WINDOW));
         let documents = vec!["fn a() {}".to_owned()];
         assert!(models.embedder_skipped().is_none());
 
@@ -1751,15 +1767,21 @@ pub(crate) mod tests {
             !format!("{probed:#}").contains("recently unreachable"),
             "{probed:#}"
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // A retrying call would have slept its first backoff (20 s) at least.
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the probe retried: it took {:?}: {probed:#}",
+            started.elapsed()
+        );
         assert!(
             models.embedder_skipped().is_some(),
-            "a failed probe re-arms"
+            "a failed probe re-arms (took {:?}): {probed:#}",
+            started.elapsed()
         );
 
         // After the window the next call tries the service again, with its
         // retries.
-        tokio::time::sleep(Duration::from_millis(2100)).await;
+        age_past_the_window(&models.embedder_breaker, BREAKER_WINDOW);
         assert!(models.embedder_skipped().is_none());
         models.initial_backoff = Duration::from_millis(10);
         let probed = models.embed(&documents).await.unwrap_err();

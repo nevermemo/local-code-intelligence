@@ -104,6 +104,18 @@ pub struct FakeLspConfig {
     /// (`--symbol-ok-at N`; 0 = none): a server that fails, answers once, then
     /// fails again.
     pub symbol_ok_at: u64,
+    /// Milliseconds to sleep before answering the `symbol_ok_at` request
+    /// (`--symbol-ok-delay-ms`): a result that arrives late, between two
+    /// failing calls, on top of `symbol_delay_ms`.
+    pub symbol_ok_delay_ms: u64,
+    /// The `slow-with-progress` scenario's pacing: how many `$/progress`
+    /// notifications come before the answer (`--progress-count`, default 4) and
+    /// how many milliseconds apart (`--progress-gap-ms`, default 400).
+    pub progress_count: u64,
+    pub progress_gap_ms: u64,
+    /// With `--progress-skip-priming` the first `workspace/symbol` request (the
+    /// priming one) is answered at once and only the later ones are paced.
+    pub progress_skip_priming: bool,
     /// Sends a `$/progress` notification before each injected `workspace/symbol`
     /// error (`--progress-before-error`): a server that is still loading and
     /// says so while it answers "ask again".
@@ -250,6 +262,15 @@ pub fn run_from_env() -> io::Result<()> {
     let symbol_ok_at = cli_arg(&cli, "--symbol-ok-at")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let symbol_ok_delay_ms = cli_arg(&cli, "--symbol-ok-delay-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let progress_count = cli_arg(&cli, "--progress-count")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(4);
+    let progress_gap_ms = cli_arg(&cli, "--progress-gap-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(400);
     let exit_on_symbol_request = cli_arg(&cli, "--exit-on-symbol-request")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
@@ -274,6 +295,10 @@ pub fn run_from_env() -> io::Result<()> {
         ignore_shutdown,
         symbol_error: InjectedError::from_cli(&cli, "--symbol-error", "--symbol-error-count"),
         symbol_ok_at,
+        symbol_ok_delay_ms,
+        progress_count,
+        progress_gap_ms,
+        progress_skip_priming: cli.iter().any(|arg| arg == "--progress-skip-priming"),
         progress_before_error: cli.iter().any(|arg| arg == "--progress-before-error"),
         definition_error: InjectedError::from_cli(
             &cli,
@@ -418,6 +443,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     }
 
     let mut symbol_requests = 0u64;
+    let mut paced_requests = 0u64;
     let mut symbol_error = config.symbol_error.clone();
     let mut definition_error = config.definition_error.clone();
     let mut pending_definition = None;
@@ -435,6 +461,22 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             }
             break;
         };
+        let body = str::from_utf8(&frame)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let request: serde_json::Value = serde_json::from_str(body)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+        let method = request.get("method").and_then(serde_json::Value::as_str);
+        let id = request.get("id").and_then(serde_json::Value::as_u64);
+
+        // The `exit` is recorded before anything else that touches the disk: a
+        // client that kills an unresponsive server a grace period after sending
+        // it must find the record, and the writes below take seconds when the
+        // disk is busy.
+        if method == Some("exit") {
+            record_event(config.state_dir.as_deref(), "exit_seen.txt");
+        }
+
         request_count += 1;
         if let Some(path) = &config.state_dir {
             fs::write(path.join("request_count.txt"), request_count.to_string())?;
@@ -446,13 +488,6 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 pid_written = true;
             }
         }
-        let body = str::from_utf8(&frame)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let request: serde_json::Value = serde_json::from_str(body)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-        let method = request.get("method").and_then(serde_json::Value::as_str);
-        let id = request.get("id").and_then(serde_json::Value::as_u64);
 
         // The client's answer to a request this server sent
         // (`--string-id-server-requests`): keep its id and result for the test
@@ -611,7 +646,6 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             // A notification: nothing to answer, only counted.
             record_event(config.state_dir.as_deref(), "did_open_seen.txt");
         } else if method == Some("exit") {
-            record_event(config.state_dir.as_deref(), "exit_seen.txt");
             if !config.ignore_shutdown {
                 process::exit(0);
             }
@@ -649,6 +683,9 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     };
                     if delay_ms > 0 {
                         thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                    if symbol_requests == config.symbol_ok_at && config.symbol_ok_delay_ms > 0 {
+                        thread::sleep(Duration::from_millis(config.symbol_ok_delay_ms));
                     }
                     if let Some(id) = id {
                         if symbol_requests > 1
@@ -707,11 +744,14 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                     }
                 }
                 (FakeScenario::SlowWithProgress, Some("workspace/symbol")) => {
-                    // Four notifications, 400ms apart (1.6s total) -- longer
-                    // than the 1s `lsp_timeout_seconds` the matching test
-                    // configures, but each individual gap is well under it.
-                    for _ in 0..4 {
-                        thread::sleep(Duration::from_millis(400));
+                    // By default four notifications, 400ms apart (1.6s total),
+                    // longer than a 1s `lsp_timeout_seconds` but each gap well
+                    // under it; `--progress-gap-ms` and `--progress-count` change
+                    // the pacing for a test whose timeout is wider.
+                    paced_requests += 1;
+                    let paced = !(config.progress_skip_priming && paced_requests == 1);
+                    for _ in 0..if paced { config.progress_count } else { 0 } {
+                        thread::sleep(Duration::from_millis(config.progress_gap_ms));
                         write_message(
                             &mut stdout,
                             &json_notification("$/progress", json!({"kind":"report"})),

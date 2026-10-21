@@ -3228,6 +3228,7 @@ async fn freshness_call(
     let profile = lci_core::config::RunProfileConfig {
         traverse: lci_core::config::RunProfileTraverse {
             map_freshness: fresh,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -3432,6 +3433,7 @@ async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() 
     let profile = lci_core::config::RunProfileConfig {
         traverse: lci_core::config::RunProfileTraverse {
             map_freshness: true,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -4029,6 +4031,391 @@ async fn probe_compile_registers_under_the_grant_and_says_what_runs() {
     // A file node is not a unit the map accepts, so no expansion ran cargo.
     let scratch = lci_maps::probe_map::ProbeConfig::for_tree(tree.dir.path()).scratch;
     assert!(!scratch.exists(), "{}", scratch.display());
+}
+
+// ---- `[run_profile.traverse] card_paths` (slice K27) --------------------------
+
+fn card_paths_profile(on: bool) -> RunProfileConfig {
+    let mut profile = RunProfileConfig::default();
+    profile.traverse.card_paths = on;
+    profile
+}
+
+/// The crowded tree walked from `user1` through `graph.scip` (the call to
+/// `target`) and `scip.impact` (the other callers of `target`): the walk has
+/// hops of two kinds and goes two hops deep. The handles are kept in the
+/// tree's own directory, so the calls of one world can continue each other.
+struct PathsWorld {
+    dir: tempfile::TempDir,
+    index: PathBuf,
+    start: String,
+}
+
+impl PathsWorld {
+    async fn new() -> Self {
+        let (dir, index) = crowded_tree(3);
+        let loaded = load(&index, Some(dir.path()), ScipMode::Authoritative)
+            .await
+            .unwrap();
+        let graph = loaded.scip.graph();
+        let user = graph
+            .node_index("rust-analyzer cargo demo 0.1.0 a/user1().")
+            .expect("user1 is a graph node");
+        let start = loaded.scip.node_id(user).to_string();
+        Self { dir, index, start }
+    }
+
+    async fn call(
+        &self,
+        profile: &RunProfileConfig,
+        limits: &TraverseConfig,
+        pops: Option<u32>,
+        handle: Option<&str>,
+    ) -> Report {
+        let maps = [
+            "graph.scip".to_owned(),
+            SCIP_IMPACT_ID.to_owned(),
+            "structure.contains".to_owned(),
+        ];
+        let budget = BudgetArgs {
+            pops,
+            max_depth: Some(3),
+            ..BudgetArgs::default()
+        };
+        let steer = SteerArgs::default();
+        let seeds = [self.start.clone()];
+        let call = Call {
+            scip_index: &self.index,
+            scip_root: Some(self.dir.path()),
+            question: "q",
+            seeds: &seeds,
+            seed_search: None,
+            top_k: 8,
+            maps: Some(&maps),
+            budget: &budget,
+            steer: &steer,
+            handle,
+            lsp: None,
+            lsp_sessions: None,
+        };
+        run(limits, profile, &Dirs::under(self.dir.path()), &call)
+            .await
+            .unwrap()
+    }
+}
+
+/// The events of a run's trace.
+fn trace_events(report: &Report) -> Vec<Value> {
+    let trace = report.trace.as_ref().expect("the trace was written");
+    std::fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// `(src, dst)` to the `(kind, witness)` of the latest `hop` or `relax` event
+/// of that edge: the route the walk ended with.
+fn route_events(report: &Report) -> HashMap<(String, String), (Value, Value)> {
+    trace_events(report)
+        .into_iter()
+        .filter(|event| matches!(event["ev"].as_str(), Some("hop" | "relax")))
+        .map(|event| {
+            (
+                (
+                    event["src"].as_str().unwrap().to_owned(),
+                    event["dst"].as_str().unwrap().to_owned(),
+                ),
+                (event["kind"].clone(), event["witness"].clone()),
+            )
+        })
+        .collect()
+}
+
+/// The cards of the lists a response can have.
+fn card_lists(response: &Value) -> Vec<(&'static str, &Vec<Value>)> {
+    [
+        "/results",
+        "/checkpoint/answer",
+        "/checkpoint/visited_cards",
+        "/checkpoint/frontier",
+    ]
+    .into_iter()
+    .filter_map(|list| Some((list, response.pointer(list)?.as_array()?)))
+    .collect()
+}
+
+/// Takes `kind` and `path` off the cards, and the clocks and the handle (a
+/// snapshot with kinds is another snapshot) out of a response.
+fn without_paths_and_clocks(response: &mut Value) {
+    for list in ["/results", "/checkpoint/answer"] {
+        if let Some(Value::Array(cards)) = response.pointer_mut(list) {
+            for card in cards {
+                if let Some(object) = card.as_object_mut() {
+                    object.remove("kind");
+                    object.remove("path");
+                }
+            }
+        }
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.remove("handle");
+    }
+    if let Some(object) = response["checkpoint"].as_object_mut() {
+        object.remove("handle");
+    }
+    if let Some(totals) = response["totals"].as_object_mut() {
+        totals.remove("elapsed_ms");
+        if let Some(per_map) = totals.get_mut("per_map").and_then(Value::as_object_mut) {
+            per_map.values_mut().for_each(|stat| {
+                stat.as_object_mut().map(|stat| stat.remove("ms"));
+            });
+        }
+    }
+    if let Some(trace) = response["trace"].as_object_mut() {
+        trace.remove("file");
+    }
+    if let Some(notes) = response["notes"].as_array_mut() {
+        notes.retain(|note| !note.as_str().is_some_and(|n| n.contains("expand p50")));
+    }
+}
+
+#[tokio::test]
+async fn cards_carry_their_path_with_the_key_on_and_nothing_with_it_off() {
+    let world = PathsWorld::new().await;
+    for pops in [None, Some(2)] {
+        let off = world
+            .call(&card_paths_profile(false), &limits(), pops, None)
+            .await;
+        let on = world
+            .call(&card_paths_profile(true), &limits(), pops, None)
+            .await;
+        assert_eq!(off.response["checkpoint"].is_object(), pops.is_some());
+
+        // Off: no card has `kind` or `path`, and the profile default is off.
+        assert!(!RunProfileConfig::default().traverse.card_paths);
+        for (list, cards) in card_lists(&off.response) {
+            assert!(
+                cards
+                    .iter()
+                    .all(|c| c.get("path").is_none() && c.get("kind").is_none()),
+                "{list}"
+            );
+        }
+        // On: the same answer, the same trace, and the paths added.
+        let (mut stripped_off, mut stripped_on) = (off.response.clone(), on.response.clone());
+        without_paths_and_clocks(&mut stripped_off);
+        without_paths_and_clocks(&mut stripped_on);
+        assert_eq!(stripped_off, stripped_on);
+        assert_eq!(
+            std::fs::read(off.trace.as_ref().unwrap()).unwrap(),
+            std::fs::read(on.trace.as_ref().unwrap()).unwrap()
+        );
+
+        let hops = route_events(&on);
+        let results = on.response["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results.iter().any(|card| card["depth"].as_u64() >= Some(2)),
+            "a walk two hops deep: {}",
+            on.response
+        );
+        let seeds = on.response["seeds"].as_array().unwrap();
+        let kinds: std::collections::BTreeSet<&str> = hops
+            .values()
+            .filter_map(|(kind, _)| kind.as_str())
+            .collect();
+        assert!(!kinds.is_empty(), "{kinds:?}");
+        for (list, cards) in card_lists(&on.response) {
+            for card in cards {
+                if !matches!(list, "/results" | "/checkpoint/answer") {
+                    // The steering views carry no route.
+                    assert!(
+                        card.get("path").is_none() && card.get("kind").is_none(),
+                        "{list}: {card}"
+                    );
+                    continue;
+                }
+                let depth = card["depth"].as_u64().unwrap() as usize;
+                let path = card["path"].as_array().expect("a path");
+                assert_eq!(path.len(), depth + 1, "{card}");
+                assert!(seeds.contains(&path[0]["node"]), "{card}");
+                assert_eq!(path[0]["kind"], Value::Null);
+                assert_eq!(path[0]["witness"], Value::Null);
+                let last = path.last().unwrap();
+                assert_eq!(last["node"], card["node"]);
+                assert_eq!(last["map"], card["via"]);
+                assert_eq!(last["witness"], card["witness"]);
+                assert_eq!(last["kind"], card["kind"]);
+                if depth == 0 {
+                    assert_eq!(card["kind"], Value::Null);
+                }
+                for pair in path.windows(2) {
+                    let edge = (
+                        pair[0]["node"].as_str().unwrap().to_owned(),
+                        pair[1]["node"].as_str().unwrap().to_owned(),
+                    );
+                    let (kind, witness) = hops
+                        .get(&edge)
+                        .unwrap_or_else(|| panic!("no hop event for {edge:?}"));
+                    assert_eq!(&pair[1]["kind"], kind, "{edge:?}");
+                    assert_eq!(&pair[1]["witness"], witness, "{edge:?}");
+                    assert!(pair[1]["kind"].is_string());
+                }
+            }
+        }
+        // The answer's size is the mechanism's: one entry per hop and card.
+        let longest = results
+            .iter()
+            .flat_map(|card| card["path"].as_array().unwrap())
+            .map(|entry| entry["node"].as_str().unwrap().len())
+            .max()
+            .unwrap();
+        let (chars_off, chars_on) = (
+            off.response.to_string().len(),
+            on.response.to_string().len(),
+        );
+        let max_depth = 3;
+        assert!(
+            chars_on - chars_off <= results.len() * 2 * (max_depth + 1) * (longest + 48),
+            "{chars_off} -> {chars_on} chars"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_first_stage_card_has_no_path_and_a_walk_card_has_one() {
+    let world = PathsWorld::new().await;
+    let report = world
+        .call(
+            &card_paths_profile(true),
+            &stage_limits(false, true),
+            None,
+            None,
+        )
+        .await;
+    let results = report.response["results"].as_array().unwrap();
+    let origins: Vec<&str> = results
+        .iter()
+        .map(|card| card["origin"].as_str().unwrap())
+        .collect();
+    assert!(
+        origins.contains(&"seed") && origins.contains(&"walk"),
+        "{origins:?}"
+    );
+    for card in results {
+        let has = card.get("path").is_some();
+        assert_eq!(has, card["origin"] == "walk", "{card}");
+        assert_eq!(card.get("kind").is_some(), has, "{card}");
+    }
+}
+
+#[tokio::test]
+async fn a_resume_shows_the_whole_path_and_notes_missing_kinds() {
+    let world = PathsWorld::new().await;
+    let on = card_paths_profile(true);
+    let off = card_paths_profile(false);
+    let note = "path kinds before this call are not kept";
+    let route = |card: &Value| -> Vec<(String, Value)> {
+        card["path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["node"].as_str().unwrap().to_owned(),
+                    entry["kind"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    // Both calls with the key on: the second call's paths go through the
+    // nodes the first found, with their kinds, and the walk is the straight
+    // run's.
+    let first = world.call(&on, &limits(), Some(1), None).await;
+    let handle = handle_of(&first.response);
+    let second = world.call(&on, &limits(), Some(20), Some(&handle)).await;
+    assert!(
+        !notes_of(&second.response).contains(note),
+        "{}",
+        second.response
+    );
+    let straight = world.call(&on, &limits(), Some(20), None).await;
+    for response in [&second.response, &straight.response] {
+        for card in response["results"].as_array().unwrap() {
+            let path = route(card);
+            assert_eq!(path.len() as u64, card["depth"].as_u64().unwrap() + 1);
+            assert!(path[1..].iter().all(|(_, kind)| kind.is_string()), "{card}");
+        }
+    }
+    let paths = |response: &Value| -> Vec<(String, Vec<(String, Value)>)> {
+        let mut paths: Vec<_> = response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| (card["node"].as_str().unwrap().to_owned(), route(card)))
+            .collect();
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        paths
+    };
+    assert_eq!(paths(&second.response), paths(&straight.response));
+    let found_first: std::collections::HashSet<String> = first.response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["node"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        second.response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|card| route(card)
+                .iter()
+                .skip(1)
+                .any(|(node, _)| found_first.contains(node))
+                && card["depth"].as_u64() >= Some(2)),
+        "a path through a node of the first call: {}",
+        second.response
+    );
+
+    // A handle made with the key off: the old hops have no kind, the note
+    // says so, and the hops of this call have theirs.
+    let first = world.call(&off, &limits(), Some(1), None).await;
+    let handle = handle_of(&first.response);
+    let second = world.call(&on, &limits(), Some(20), Some(&handle)).await;
+    assert!(
+        notes_of(&second.response).contains(note),
+        "{}",
+        second.response
+    );
+    let found_first: std::collections::HashSet<String> = first.response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["node"].as_str().unwrap().to_owned())
+        .collect();
+    let (mut old_hops, mut new_hops) = (0, 0);
+    for card in second.response["results"].as_array().unwrap() {
+        for (node, kind) in route(card).into_iter().skip(1) {
+            if found_first.contains(&node) {
+                assert_eq!(kind, Value::Null, "{card}");
+                old_hops += 1;
+            } else {
+                assert!(kind.is_string(), "{card}");
+                new_hops += 1;
+            }
+        }
+        // The card's own kind is the one of its last hop.
+        let last = route(card).pop().unwrap().1;
+        assert_eq!(card["kind"], last);
+    }
+    assert!(old_hops > 0 && new_hops > 0, "{old_hops} {new_hops}");
+    // And with the key off in both calls there is no note.
+    let second = world.call(&off, &limits(), Some(20), Some(&handle)).await;
+    assert!(!notes_of(&second.response).contains(note));
+    assert!(second.response["results"][0].get("path").is_none());
 }
 
 // ---- `seeds.bm25` (slice K21a-1) -----------------------------------------------

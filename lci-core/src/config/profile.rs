@@ -134,6 +134,21 @@ pub struct RunProfileTraverse {
     /// result to every response. See the README "Map freshness" for what
     /// `observed`, `stale` and `lag` mean.
     pub map_freshness: bool,
+    /// Put the route on the answer's cards: with `true`, every card of a
+    /// traverse answer's `results` and of the checkpoint's `answer` that the
+    /// walk reached gains `kind` (the kind of the edge that discovered the
+    /// node; `null` for a start node) and `path` (the route from its start
+    /// node, one `{node, map, kind, witness}` entry per node, `depth + 1`
+    /// entries, the last one being the card itself). `false` (the default):
+    /// the answer, the trace, the checkpoint and the handle are as without
+    /// the key. A handle made with it on also keeps each state's `kind`, so a
+    /// continuation shows the whole chain; a handle made with it off does not
+    /// have the kinds of its earlier hops (they show `null`, and the answer
+    /// says so). A continuation with the key off drops the kinds an on-handle
+    /// carried (its handle has none), so a later call with the key on shows
+    /// `null` for those hops too, with the note. The answer grows by roughly one entry of about 25 tokens per
+    /// hop of each card; the README "Paths on cards" has the measured sizes.
+    pub card_paths: bool,
 }
 
 /// How a traversal groups the evidence that reaches a node
@@ -618,6 +633,7 @@ mod tests {
         config.traverse.deadline_ms = 19;
         config.traverse.max_depth = 3;
         config.run_profile.traverse.map_freshness = true;
+        config.run_profile.traverse.card_paths = true;
         config.traverse.fusion = TraverseFusion::Rrf;
         config.traverse.max_model_calls = Some(4);
         config.traverse.priors = Some("priors.json".into());
@@ -991,6 +1007,7 @@ mode = \"sometimes\"
             "run_profile.walk.grep_corroboration",
             "run_profile.walk.pricing",
             "run_profile.traverse.map_freshness",
+            "run_profile.traverse.card_paths",
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",
             "run_profile.freshness.verify_on_read",
@@ -1051,6 +1068,33 @@ mode = \"sometimes\"
             "[run_profile.traverse]\nmap_freshness = \"yes\"\n",
             "[run_profile.traverse]\nfoo = 1\n",
             "[run_profile]\nmap_freshness = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn traverse_card_paths_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.traverse.card_paths);
+        let text = format!("{}[run_profile.traverse]\ncard_paths = true\n", base_toml());
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.traverse.card_paths);
+        // It changes what a traverse answer holds, so it changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["traverse"]["card_paths"], false);
+        assert_eq!(on.value["run_profile"]["traverse"]["card_paths"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.traverse.card_paths")
+        );
+        assert_ne!(off.hash, on.hash);
+        for bad in [
+            "[run_profile.traverse]\ncard_paths = \"yes\"\n",
+            "[run_profile]\ncard_paths = true\n",
         ] {
             let text = format!("{}{bad}", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");

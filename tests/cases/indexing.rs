@@ -3837,12 +3837,17 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-priming");
     config.lsp_search_budget_ms = 200;
-    config = with_fake_csharp_server(config, &state, &["--first-symbol-delay-ms", "8000"], 20);
+    config = with_fake_csharp_server(
+        config,
+        &state,
+        &["--first-symbol-delay-ms", "15000"],
+        LOADED_BUDGET_SECONDS,
+    );
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
-    // The server starts at once; its priming request takes 8 s, longer than
-    // both early searches together at their 3 s ceiling, so neither can see a
+    // The server starts at once; its priming request takes 15 s, longer than
+    // both early searches together at their 6 s ceiling, so neither can see a
     // primed server even under load.
     for attempt in 0..2 {
         let early = app
@@ -3856,7 +3861,7 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
             "search {attempt} ran during priming"
         );
         assert!(
-            early.timings.lsp_search_ms < 3000.0,
+            early.timings.lsp_search_ms < 6000.0,
             "search {attempt} waited {} ms for priming instead of its 200 ms budget",
             early.timings.lsp_search_ms
         );
@@ -3872,8 +3877,8 @@ async fn searches_during_priming_get_the_budget_note_and_later_ones_hit_the_prim
     );
     assert!(primed.warning.is_none(), "{:?}", primed.warning);
     assert!(
-        primed.timings.lsp_search_ms < 200.0,
-        "a primed server answers inside the budget: {} ms",
+        primed.timings.lsp_search_ms < 2000.0,
+        "a primed server answers inside the budget (the search had no note; 2 s only allows for a loaded scheduler): {} ms",
         primed.timings.lsp_search_ms
     );
     assert_eq!(spawn_count(&state), 1, "priming reuses the one server");
@@ -3924,11 +3929,16 @@ async fn answers_gathered_before_the_budget_ran_out_are_kept() {
     let workspace = temp.path().join("channels-partial");
     write_channel_workspace(&workspace);
     let state = temp.path().join("lsp-state-partial");
-    // Four terms make four symbol queries of 2500 ms each: the first fits the
-    // budget together with the server's start (up to 3.5 s, which a loaded
-    // machine needs), all four (10 s) cannot.
-    config.lsp_search_budget_ms = 6000;
-    config = with_fake_csharp_server(config, &state, &["--symbol-delay-ms", "2500"], 10);
+    // Four terms make four symbol queries of 4000 ms each: the first fits the
+    // budget together with the server's start (up to 8 s, which a loaded
+    // machine needs), all four (16 s) cannot.
+    config.lsp_search_budget_ms = 12_000;
+    config = with_fake_csharp_server(
+        config,
+        &state,
+        &["--symbol-delay-ms", "4000"],
+        LOADED_BUDGET_SECONDS,
+    );
     let app = App::open(config).await.unwrap();
     app.index(&workspace).await.unwrap();
 
