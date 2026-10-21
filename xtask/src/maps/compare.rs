@@ -6,17 +6,21 @@
 //! two means, the mean of `B - A` with a 95% paired-bootstrap percentile
 //! interval (fixed seed, 10000 resamples by default, the algorithm of
 //! `lci evaluate compare`), and how many pairs B is above, below or level on.
-//! Which side is better depends on the metric (`spurious`, `expansions` and `model_calls`
-//! are better when lower), so the counts say `B>A` and `B<A`, not wins and losses.
+//! Which side is better depends on the metric (`spurious`, `expansions`, `model_calls`,
+//! `external_calls`, `lsp_ms` and `answer_tokens` are better when lower), so the counts
+//! say `B>A` and `B<A`, not wins and losses.
 //!
 //! The per-item metrics are those `maps bench` scored and wrote to
 //! `items.json` ([`super::bench::item_record`]). A run from before that file
 //! is scored again from its `run.json` with the same function, which needs
 //! `--gold-dir`. An item is left out when either side stopped on the deadline
-//! or had reranker or map call failures (read from `raw/<id>.json`,
-//! [`super::bench::ItemFlags`]) unless `--keep-failed`; such a run is not a
-//! clean measurement. A run dir with no `raw/` (a rescored run) has unknown
-//! flags: its items are kept, and the count is printed.
+//! or another budget (the pop cap, the token budget, the `lsp.live` deadline:
+//! [`super::bench::BudgetHit`]), spent its external-call allowance (the walk goes
+//! on without those maps) or had reranker or map call failures (read from
+//! `raw/<id>.json`, [`super::bench::ItemFlags`]) unless `--keep-failed`; such a
+//! run is not a clean measurement. The counts of the left-out items are
+//! printed, in total and per kind and side. A run dir with no `raw/` (a rescored run) has unknown flags: its
+//! items are kept, and the count is printed.
 
 use super::bench::{self, ItemFlags};
 use crate::gold::{self, Set};
@@ -43,11 +47,13 @@ pub struct CompareArgs {
     /// Run dir B; deltas are `B - A`.
     run_b: PathBuf,
     /// Metrics to compare (default: the set's headline metrics, `precision`,
-    /// `f0.5`, `expansions` and `model_calls`).
+    /// `f0.5`, `expansions`, `model_calls`, `external_calls`, `lsp_ms` and
+    /// `answer_tokens`).
     #[arg(long, num_args = 1..)]
     metric: Vec<String>,
-    /// Keep items either side stopped on the deadline or had failures on
-    /// (default: leave them out).
+    /// Keep items either side stopped on a budget (deadline, pops, tokens) or
+    /// spent the external-call allowance on, or had failures on (default: leave
+    /// them out).
     #[arg(long)]
     keep_failed: bool,
     /// Gold dir, only to score a run that has no `items.json` again.
@@ -157,6 +163,9 @@ pub struct Comparison {
     pub excluded_a: usize,
     pub excluded_b: usize,
     pub excluded: usize,
+    /// How many paired items each flag kind names, as `(on A, on B)`
+    /// ([`ItemFlags::kinds`]); an item with several flags counts under each.
+    pub flag_kinds: BTreeMap<&'static str, (usize, usize)>,
     /// Kept pairs with no raw output on a side (flags unknown).
     pub unknown_flags: usize,
     pub rows: Vec<MetricRow>,
@@ -223,13 +232,8 @@ pub fn compare(
         .keys()
         .filter(|id| b.items.contains_key(*id))
         .collect();
-    let flagged = |run: &RunData, id: &str| {
-        run.flags
-            .get(id)
-            .copied()
-            .flatten()
-            .is_some_and(|flags| flags.any())
-    };
+    let flags_of = |run: &RunData, id: &str| run.flags.get(id).copied().flatten();
+    let flagged = |run: &RunData, id: &str| flags_of(run, id).is_some_and(|flags| flags.any());
     let mut out = Comparison {
         paired: both.len(),
         only_a: a.items.len() - both.len(),
@@ -237,12 +241,19 @@ pub fn compare(
         excluded_a: 0,
         excluded_b: 0,
         excluded: 0,
+        flag_kinds: BTreeMap::new(),
         unknown_flags: 0,
         rows: Vec::new(),
     };
     let mut kept: Vec<&String> = Vec::new();
     for id in both {
         let (fa, fb) = (flagged(a, id), flagged(b, id));
+        for kind in flags_of(a, id).map(|f| f.kinds()).unwrap_or_default() {
+            out.flag_kinds.entry(kind).or_default().0 += 1;
+        }
+        for kind in flags_of(b, id).map(|f| f.kinds()).unwrap_or_default() {
+            out.flag_kinds.entry(kind).or_default().1 += 1;
+        }
         out.excluded_a += usize::from(fa);
         out.excluded_b += usize::from(fb);
         if (fa || fb) && !keep_failed {
@@ -294,7 +305,15 @@ fn default_metrics(set: &str) -> Vec<String> {
     headline
         .iter()
         .copied()
-        .chain(["precision", "f0.5", "expansions", "model_calls"])
+        .chain([
+            "precision",
+            "f0.5",
+            "expansions",
+            "model_calls",
+            "external_calls",
+            "lsp_ms",
+            "answer_tokens",
+        ])
         .map(str::to_owned)
         .collect()
 }
@@ -318,18 +337,26 @@ pub fn render(
     if keep_failed {
         let _ = writeln!(
             out,
-            "kept every pair (--keep-failed); flagged by deadline or failures: {} on A, {} on B",
+            "kept every pair (--keep-failed); flagged by a deadline or budget stop or failures: {} on A, {} on B",
             c.excluded_a, c.excluded_b
         );
     } else {
         let _ = writeln!(
             out,
-            "left out {} pairs flagged by a deadline stop or failures ({} on A, {} on B); {} pairs used",
+            "left out {} pairs flagged by a deadline or budget stop or failures ({} on A, {} on B); {} pairs used",
             c.excluded,
             c.excluded_a,
             c.excluded_b,
             c.paired - c.excluded
         );
+    }
+    if !c.flag_kinds.is_empty() {
+        let kinds: Vec<String> = c
+            .flag_kinds
+            .iter()
+            .map(|(kind, (on_a, on_b))| format!("{kind} {on_a} on A, {on_b} on B"))
+            .collect();
+        let _ = writeln!(out, "flagged by kind: {}", kinds.join("; "));
     }
     if c.unknown_flags > 0 {
         let _ = writeln!(
@@ -421,6 +448,8 @@ mod tests {
         deadline: false,
         rerank_failures: 0,
         map_failures: 0,
+        budget_hit: None,
+        external_spent: false,
     };
 
     #[test]
@@ -452,11 +481,17 @@ mod tests {
             rerank_failures: 2,
             ..CLEAN
         };
+        // A walk cut by the external-call allowance is as weak as a deadline stop.
+        let budget = ItemFlags {
+            budget_hit: Some(bench::BudgetHit::ExternalCalls),
+            ..CLEAN
+        };
         let a = run_of(&[
             ("i1", 0.0, CLEAN),
             ("i2", 0.5, deadline),
             ("i3", 1.0, CLEAN),
             ("i4", 0.5, CLEAN),
+            ("i5", 0.0, budget),
             ("only-a", 1.0, CLEAN),
         ]);
         let b = run_of(&[
@@ -464,14 +499,24 @@ mod tests {
             ("i2", 1.0, CLEAN),
             ("i3", 0.5, rerank),
             ("i4", 0.5, CLEAN),
+            ("i5", 1.0, CLEAN),
             ("only-b", 1.0, CLEAN),
         ]);
         let metrics = ["path_recall".to_owned(), "missing".to_owned()];
         let strict = compare(&a, &b, &metrics, false, 1000, SEED);
-        assert_eq!((strict.paired, strict.only_a, strict.only_b), (4, 1, 1));
+        assert_eq!((strict.paired, strict.only_a, strict.only_b), (5, 1, 1));
         assert_eq!(
             (strict.excluded, strict.excluded_a, strict.excluded_b),
-            (2, 1, 1)
+            (3, 2, 1)
+        );
+        // The counts per kind and side: i2 deadline on A, i3 reranker on B, i5 budget on A.
+        assert_eq!(
+            strict.flag_kinds,
+            BTreeMap::from([
+                ("deadline", (1, 0)),
+                ("external_calls", (1, 0)),
+                ("rerank_failures", (0, 1)),
+            ])
         );
         let row = &strict.rows[0];
         // i1 (0 -> 1) and i4 (tie) remain.
@@ -484,9 +529,9 @@ mod tests {
         let kept = compare(&a, &b, &metrics, true, 1000, SEED);
         assert_eq!(kept.excluded, 0);
         let row = &kept.rows[0];
-        // i1 up, i2 up, i3 down, i4 tie.
-        assert_eq!((row.n, row.b_above, row.b_below, row.ties), (4, 2, 1, 1));
-        assert!((row.mean_delta - 0.25).abs() < 1e-12);
+        // i1 up, i2 up, i3 down, i4 tie, i5 up (the budget-hit item is back).
+        assert_eq!((row.n, row.b_above, row.b_below, row.ties), (5, 3, 1, 1));
+        assert!((row.mean_delta - 0.4).abs() < 1e-12);
     }
 
     #[test]
@@ -573,7 +618,10 @@ mod tests {
             "precision".into(),
             "f0.5".into(),
             "expansions".into(),
-            "model_calls".into()
+            "model_calls".into(),
+            "external_calls".into(),
+            "lsp_ms".into(),
+            "answer_tokens".into()
         ]));
     }
 }
