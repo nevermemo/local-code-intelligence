@@ -10,6 +10,8 @@ tests use small synthetic items.
 cargo xtask gold score       --set <impact|flow|where-to|history|instructions|traits> --gold <path> --run <path> [--out <path>] [--partial] [--strict]
 cargo xtask gold baseline    --set <set> --gold <path> [--kind shipped|oracle|constant] [--out <path>]
 cargo xtask gold to-evaluate --set <set> --gold <path> --out <path> [--workspace self] [--top-k 10]
+cargo xtask gold strata      --set <set> --gold <path> [--out <path>]
+cargo xtask mine-transcripts --input <sim.json|.jsonl>.. [--gold <path>] [--out test-results/transcripts/shapes.json]
 ```
 
 Gold file: a JSON array of items, each with a string `id`. A file with one JSON
@@ -331,3 +333,54 @@ States are as of 2026-10-16; the tests-for-code and docs-for-code rows are possi
 - An entry-point chain scorer for the error set, and the error scorer in
   `xtask gold`.
 - An independently audited error scorer and a rerun with the reranker on.
+
+## Strata and transcript shapes (K6a, 2026-10-21, d457)
+
+Two additive tools; no scorer metric, no existing stratum cell and no trend row changes.
+
+### The `guard` stratum (`xtask/src/gold/strata.rs`)
+
+Every gold item of every set gets one guard, read from the item alone (`classify(set, item)` takes no run, tree or LCI
+output, so a classification cannot depend on how any system answered):
+
+| Guard | Meaning | Rules (witness ids) |
+| --- | --- | --- |
+| `grep_easy` | the question already names the gold, so a plain grep finds it | impact: `impact_not_primary` (stem-leak or patch), `impact_named_unique` (band `unique` and a backticked name that is a gold R1 declaration); where-to: `where_to_stem_leak` (leak part of the stratum is not `clean`); history: `history_h2_path` (H2 whose question holds a path), `history_body_names_it` (`meta.body_names_it`, any family); instructions: `instructions_docs_path` (`I1/docs` and a path in the question); traits: `traits_q1_names_trait` (Q1 whose question backticks the trait) |
+| `agent_trap` | the item carries a known trap | impact: `impact_common_band`, `impact_tests_far` (`tests-far`); flow: `flow_decoy` (`accept.ignorable_nodes`); where-to: `where_to_leak_decoy` (exemplar or convention, a leaking stem, and the stem of an `accept.decoys` path is a whole word of the question); history: `history_h3b` |
+| `core` | no rule argued for another guard; witness `by_elimination` when none fired, or the note `impact_no_tests` (an absent test traps nothing for an R1-closure question) | none |
+
+Flow has no grep-easy rule (its zero grep-easy items is by construction, not a measurement). When a trap rule and a grep-easy rule both fire, the item is `agent_trap` (the report counts these as `both`); the witness lists every rule that fired. `hops` is
+flow `lenN` and the lower bound of impact `degA-B`, else null. The vocabularies are pinned to the private gold files (impact band
+`unique`/`some`/`common`, where-to leak part `clean` or a leak word, history `H1`..`H3b`); an item the rules do not reach is `core`
+by elimination and counted, so a vocabulary that drifts shows up as a growing `by_elimination`. The guard counts items; it never
+routes a question (d391).
+
+`gold::dims` appends `("guard", ...)` for every set, so every scorer's report has `strata.guard.<value>` cells (with `n`) and the
+bench's per-stratum cost (`gold::dims`, joined per item) follows. K21a-2 and K22a-2 read `strata.guard.grep_easy` against `core`
+without a join.
+
+`cargo xtask gold strata --set <set> --gold <path> [--out <path>]` prints `{set, items, counts {core, grep_easy, agent_trap},
+scored {same keys, over the items the scorers score; impact keeps `primary`}, by_witness {rule: n}, both, by_elimination, hops {p50, max}, leak {n, ids}, by_item {id: {guard, hops, witness}}}`. `leak` is the ladder rung: items whose
+question holds the stem of a gold file as a whole word (stems of fewer than 3 characters and a few generic ones are skipped) and
+that no easy rule (nor `where_to_leak_decoy`) already names; a count and a list, never a failure (the owner decides). It scores nothing, never reads LCI output
+and writes nothing into the gold file; keep the report under `test-results/`.
+
+### Transcript shapes (`xtask/src/mine_transcripts.rs`)
+
+`cargo xtask mine-transcripts --input <file>.. [--gold <path>] [--out test-results/transcripts/shapes.json]` counts question shapes
+over synthetic transcripts. The input is the simulated agent's trace shape (`sim` `Trace::to_json`: `{terms, stop, steps: [{call,
+kind, arg, tokens, cumulative_tokens, depth, ...}]}`), either a `sim.json` (`items[*].trace`) or a JSONL file of `{question, trace}`
+lines. A `sim.json` item carries no question text, so the question is joined by `id` from `--gold`; an item without one has the shape
+`other` and is counted as `no_question`. An item or line with no readable trace is named under `unreadable` (by id or line number),
+not an error. No reader of real Claude Code or Codex files lives in the repository: a converter of those, if written, writes into
+this shape locally.
+
+- `shape` (a counting key; nothing routes by it): `history-h1`, `history-h2`, `history-h3` (`exact_history::classify`, the last
+  only for a "why" question), then `where-configured`, `what-tests`, `who-calls`, `how-flows`, `where-is`, `other` by wording.
+- `trace_class`, from the steps alone: `grep_easy` (stop `gold` within 2 calls of the first `search` or `probe` step),
+  `agent_trap` (3 or more `search`/`probe` steps, or a `search` after 2 reads, without the gold), `core` (stop `gold` at depth 1 or
+  more, or after 2 or more reads), else `unresolved` (a budget stop).
+- Output: `{sources, questions, no_question, unreadable, counts {shape: {trace_class: n}}, calls {p50, p90}, tokens {p50, p90},
+  templates [{template, n}]}`; calls and tokens are those at the stop. A template is the question with backticked names replaced by
+  `<ident>`, paths by `<path>`, shas by `<sha>` and identifier-like words (`::`, `_`, a digit, an inner capital) by `<ident>`,
+  lower-cased and cut at 30 words. Shapes and counts only: no raw question and no step `arg` is written.
