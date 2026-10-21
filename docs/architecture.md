@@ -211,7 +211,7 @@ list, schemas and REST routes are exactly those of a server without them.
 
 With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
 states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
-`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` report `live` with `lag` 0 (they read current
+`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (they read current
 bytes or git, placed by the index's positions for the first two). `lag` is the number of source files (language-adapter
 files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
 first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`

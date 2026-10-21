@@ -164,6 +164,19 @@ pub const OPT_IN_MAPS: [MapId; 11] = [
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
 ];
+/// The note of a call that names `probe.compile` without the trust grant.
+const PROBE_COMPILE_SKIPPED_NOTE: &str = "probe.compile skipped: cargo check would run the tree's build scripts and procedural macros; set rust_analyzer_trusted = true in the main configuration for a trusted tree";
+
+/// Logs, once per process, that `probe.compile` is running build scripts.
+fn warn_probe_compile_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "probe.compile runs cargo check on a scratch copy of the tree: build scripts and procedural macros execute (rust_analyzer_trusted = true)"
+        );
+    });
+}
+
 /// External calls a traversal may make; no map here makes any.
 const EXTERNAL_CALLS: u32 = 100;
 /// Most results a call returns.
@@ -268,7 +281,8 @@ pub struct Call<'a> {
     /// Continue the traversal this handle names.
     pub handle: Option<&'a str>,
     /// The settings `lsp.live` starts its language servers with (server
-    /// paths, `lsp_timeout_seconds`); `None` is the defaults.
+    /// paths, `lsp_timeout_seconds`) and `rust_analyzer_trusted`, which
+    /// `probe.compile` reads; `None` is the defaults.
     pub lsp: Option<&'a lci_core::config::Config>,
     /// The language-server manager the call shares when `[run_profile.lsp]
     /// sessions = "shared"`: the MCP and REST server's own, one per process for
@@ -877,7 +891,16 @@ pub async fn run_with_trait_seeds(
     if wants(PROBE_COMPILE_ID) {
         match call.scip_root {
             None => notes.push("probe.compile needs the tree: give --root".to_owned()),
+            Some(_) if !call.lsp.is_some_and(|config| config.rust_analyzer_trusted) => {
+                notes.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
+                warnings.push(PROBE_COMPILE_SKIPPED_NOTE.to_owned());
+            }
             Some(root) => {
+                notes.push(format!(
+                    "probe.compile: cargo check runs on a scratch copy of {} with --offline, build scripts and procedural macros of the tree and its dependencies execute (rust_analyzer_trusted = true)",
+                    root.display()
+                ));
+                warn_probe_compile_once();
                 let map = ProbeMap::new(loaded.scip.clone(), ProbeConfig::for_tree(root));
                 register(
                     &mut registry,
