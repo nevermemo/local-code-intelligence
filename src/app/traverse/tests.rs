@@ -5350,3 +5350,567 @@ fn declares_reads_the_word_before_the_name_across_languages() {
         assert!(!declares(line, name), "{line}");
     }
 }
+
+// ---- `[run_profile.traverse] answer_labels` (slice K13) ----------------------------
+
+/// One call over `tree` under `profile`, a budget of `pops`, the given maps and
+/// a question that names `Foo` and asks for the commit that created it.
+async fn labelled_run(
+    tree: &ScipTree,
+    limits: &TraverseConfig,
+    profile: &RunProfileConfig,
+    pops: u32,
+    maps: &[&str],
+) -> Value {
+    labelled_run_under(tree, limits, profile, pops, maps, None).await
+}
+
+/// [`labelled_run`] with the language-server settings of the call.
+async fn labelled_run_under(
+    tree: &ScipTree,
+    limits: &TraverseConfig,
+    profile: &RunProfileConfig,
+    pops: u32,
+    maps: &[&str],
+    lsp: Option<&lci_core::config::Config>,
+) -> Value {
+    let maps: Vec<String> = maps.iter().map(|id| (*id).to_owned()).collect();
+    let (budget, steer) = (
+        BudgetArgs {
+            pops: Some(pops),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: Some(tree.dir.path()),
+        question: "Which commit first created `Foo`?",
+        seeds: &[],
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp,
+        lsp_sessions: None,
+    };
+    run(limits, profile, &Dirs::under(tree.dir.path()), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+/// A profile with the four keys that K13 reads, as given.
+fn label_profile(
+    answer_labels: bool,
+    map_freshness: bool,
+    verify_on_read: bool,
+    card_paths: bool,
+) -> RunProfileConfig {
+    let mut profile = RunProfileConfig::default();
+    profile.traverse.answer_labels = answer_labels;
+    profile.traverse.map_freshness = map_freshness;
+    profile.traverse.card_paths = card_paths;
+    profile.freshness.verify_on_read = verify_on_read;
+    profile
+}
+
+/// The lists of a response that hold cards.
+const CARD_POINTERS: [&str; 4] = [
+    "/results",
+    "/checkpoint/answer",
+    "/checkpoint/visited_cards",
+    "/checkpoint/frontier",
+];
+
+/// The cards of every list that holds cards.
+fn all_cards(response: &Value) -> Vec<&Value> {
+    CARD_POINTERS
+        .iter()
+        .filter_map(|list| response.pointer(list).and_then(Value::as_array))
+        .flatten()
+        .collect()
+}
+
+/// `response` without the K13 labels (no `completeness`, no card `freshness`,
+/// not the one `notes` line a partial answer gets) and without its wall clock.
+fn without_labels(response: &Value) -> Value {
+    let mut stripped = response.clone();
+    stripped.as_object_mut().unwrap().remove("completeness");
+    for list in CARD_POINTERS {
+        if let Some(Value::Array(cards)) = stripped.pointer_mut(list) {
+            for card in cards {
+                card.as_object_mut().unwrap().remove("freshness");
+            }
+        }
+    }
+    if let Some(notes) = stripped.get_mut("notes").and_then(Value::as_array_mut) {
+        notes.retain(|note| {
+            let note = note.as_str().unwrap();
+            !note.starts_with("partial answer (") && !note.starts_with("degraded maps: ")
+        });
+    }
+    stripped
+}
+
+fn sorted_keys(card: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = card
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The keys a walked card of `results` has with every K13 key on (`site` and
+/// `commit` come and go with what the source knows, and are left out).
+const RESULT_KEYS: [&str; 17] = [
+    "depth",
+    "fanout",
+    "file_changed",
+    "freshness",
+    "kind",
+    "maps",
+    "n_maps",
+    "node",
+    "node_kind",
+    "origin",
+    "overlap",
+    "path",
+    "potential",
+    "ranked_potential",
+    "text",
+    "via",
+    "witness",
+];
+
+/// The same for a card of the checkpoint's `answer`: no tie-break facts, no
+/// origin.
+const CHECKPOINT_KEYS: [&str; 13] = [
+    "depth",
+    "file_changed",
+    "freshness",
+    "kind",
+    "maps",
+    "n_maps",
+    "node",
+    "path",
+    "potential",
+    "ranked_potential",
+    "text",
+    "via",
+    "witness",
+];
+
+#[tokio::test]
+async fn the_card_schema_is_closed_and_the_labels_are_absent_with_the_key_off() {
+    let tree = ScipTree::new();
+    tree.commit();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID, EXACT_PICKAXE_ID];
+    let plain = limits();
+    let limits = stage_limits(true, false);
+    let on = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, true, true, true),
+        1,
+        &maps,
+    )
+    .await;
+    assert_eq!(on["status"], "budget_exhausted", "{on}");
+
+    // The keys of a card are closed.
+    let closed = |keys: &[&str], card: &Value| {
+        let mut found = sorted_keys(card);
+        found.retain(|key| !["site", "commit"].contains(key));
+        // A first-stage card (origin `exact`, `seed`) has `name` and `held`
+        // where a walked card has the tie-break facts and the path.
+        if card["origin"] != "walk" && card.get("origin").is_some() {
+            found.retain(|key| !["name", "held"].contains(key));
+            let core: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|key| !["fanout", "kind", "node_kind", "overlap", "path"].contains(key))
+                .collect();
+            assert_eq!(found, core, "{card}");
+        } else {
+            assert_eq!(found, keys, "{card}");
+        }
+    };
+    let results = on["results"].as_array().unwrap();
+    assert!(results.len() >= 2, "{on}");
+    for card in results {
+        closed(&RESULT_KEYS, card);
+    }
+    // A walk without a first stage: its cards have no `origin`, and the
+    // checkpoint's `answer` has cards.
+    let walked = PathsWorld::new()
+        .await
+        .call(
+            &label_profile(true, true, true, true),
+            &plain,
+            Some(2),
+            None,
+        )
+        .await
+        .response;
+    let no_origin: Vec<&str> = RESULT_KEYS
+        .iter()
+        .copied()
+        .filter(|key| *key != "origin")
+        .collect();
+    let walked_results = walked["results"].as_array().unwrap();
+    assert!(!walked_results.is_empty(), "{walked}");
+    for card in walked_results {
+        closed(&no_origin, card);
+    }
+    let answer = walked["checkpoint"]["answer"].as_array().unwrap();
+    assert!(!answer.is_empty(), "{walked}");
+    for card in answer {
+        closed(&CHECKPOINT_KEYS, card);
+    }
+    for response in [&on, &walked] {
+        for card in all_cards(response) {
+            let word = card["freshness"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{card}"));
+            assert!(super::response::FRESHNESS_WORDS.contains(&word), "{card}");
+        }
+    }
+    assert_eq!(
+        sorted_keys(&on["completeness"]),
+        ["complete", "estimate", "why"],
+        "{on}"
+    );
+
+    // With the key off and the other three on: neither label, and the answer is
+    // the labelled one without them.
+    let off = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(false, true, true, true),
+        1,
+        &maps,
+    )
+    .await;
+    let text = off.to_string();
+    assert!(
+        !text.contains("\"freshness\"") && !text.contains("\"completeness\""),
+        "{off}"
+    );
+    assert!(!text.contains("partial answer"), "{off}");
+    assert_eq!(off["trace"]["hash"], on["trace"]["hash"]);
+    assert_eq!(off["handle"], on["handle"]);
+    let clock = |mut response: Value| {
+        for key in ["totals", "trace"] {
+            if let Some(object) = response[key].as_object_mut() {
+                object.retain(|name, _| !name.ends_with("_ms") && name != "file");
+            }
+        }
+        if let Some(per_map) = response["totals"]["per_map"].as_object_mut() {
+            per_map.values_mut().for_each(|stat| {
+                stat.as_object_mut().map(|stat| stat.remove("ms"));
+            });
+        }
+        if let Some(notes) = response["notes"].as_array_mut() {
+            notes.retain(|note| !note.as_str().is_some_and(|n| n.contains("expand p50")));
+        }
+        response
+    };
+    let (on_plain, off_plain) = (clock(without_labels(&on)), clock(off));
+    for (key, value) in on_plain.as_object().unwrap() {
+        assert_eq!(Some(value), off_plain.get(key), "{key}");
+    }
+    assert_eq!(on_plain, off_plain);
+}
+
+#[tokio::test]
+async fn a_capped_walk_is_labelled_partial_and_keeps_its_results() {
+    let tree = ScipTree::new();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID];
+    let limits = stage_limits(true, false);
+    let on = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, false, false, false),
+        1,
+        &maps,
+    )
+    .await;
+    assert_ne!(on["status"], "complete", "{on}");
+    assert_eq!(on["completeness"]["complete"], false, "{on}");
+    assert_eq!(on["completeness"]["why"], "pops", "{on}");
+    let estimate = &on["completeness"]["estimate"];
+    assert!(
+        estimate.is_null() || (0.0..=1.0).contains(&estimate.as_f64().unwrap()),
+        "{estimate}"
+    );
+    let handle = on["handle"].as_str().expect("a capped walk has a handle");
+    let notes = on["notes"].to_string();
+    assert!(
+        notes.contains("partial answer (pops): results are what the walk found so far"),
+        "{notes}"
+    );
+    assert!(notes.contains(handle), "{notes}");
+
+    // Nothing is withheld: the results are the key-off call's, card for card.
+    let off = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(false, false, false, false),
+        1,
+        &maps,
+    )
+    .await;
+    assert!(!on["results"].as_array().unwrap().is_empty(), "{on}");
+    assert_eq!(without_labels(&on)["results"], off["results"]);
+    assert_eq!(on["status"], off["status"]);
+}
+
+#[tokio::test]
+async fn a_complete_walk_is_labelled_complete_with_no_note() {
+    let tree = ScipTree::new();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID];
+    {
+        let limits = stage_limits(true, false);
+        let on = labelled_run(
+            &tree,
+            &limits,
+            &label_profile(true, false, false, false),
+            50,
+            &maps,
+        )
+        .await;
+        assert_eq!(on["status"], "complete", "{on}");
+        assert_eq!(on["completeness"]["complete"], true, "{on}");
+        // `complete`, or `bound` when the score bound ended the walk early.
+        let why = on["completeness"]["why"].as_str().unwrap();
+        assert!(["complete", "bound"].contains(&why), "{on}");
+        assert_eq!(on["stop_reason"], why);
+        assert!(!on.to_string().contains("partial answer"), "{on}");
+        assert!(on.get("checkpoint").is_none(), "{on}");
+    }
+}
+
+#[tokio::test]
+async fn an_answer_with_no_start_node_is_labelled_partial() {
+    let tree = ScipTree::new();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID];
+    // Nothing the walk can start from: the first stage is the answer.
+    let limits = stage_limits(false, false);
+    let on = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, true, true, false),
+        3,
+        &maps,
+    )
+    .await;
+    assert_eq!(on["status"], "no_seeds", "{on}");
+    assert_eq!(
+        on["completeness"],
+        json!({"complete": false, "why": "no_seeds", "estimate": null}),
+        "{on}"
+    );
+    assert!(
+        on["notes"]
+            .to_string()
+            .contains("partial answer (no_seeds)"),
+        "{on}"
+    );
+    // Nothing is withheld, and its cards say what is known of their file.
+    assert!(!on["results"].as_array().unwrap().is_empty(), "{on}");
+    for card in all_cards(&on) {
+        assert_eq!(card["freshness"], "fresh", "{card}");
+    }
+    let off = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(false, true, true, false),
+        3,
+        &maps,
+    )
+    .await;
+    assert_eq!(off["results"], without_labels(&on)["results"]);
+    assert!(!off.to_string().contains("completeness"), "{off}");
+}
+
+#[tokio::test]
+async fn cards_say_fresh_changed_stale_or_unverified() {
+    let tree = ScipTree::new();
+    tree.commit();
+    let maps = ["graph.scip", EXACT_CLOSURE_ID, EXACT_PICKAXE_ID];
+    let limits = stage_limits(true, false);
+    // Every card of the lists whose node passes `scope` says `want`.
+    let only = |response: &Value, want: &str, scope: &dyn Fn(&str) -> bool| {
+        let seen: Vec<(&str, &str)> = all_cards(response)
+            .into_iter()
+            .map(|card| {
+                (
+                    card["node"].as_str().unwrap(),
+                    card["freshness"].as_str().unwrap(),
+                )
+            })
+            .filter(|(node, _)| scope(node))
+            .collect();
+        assert!(!seen.is_empty(), "{response}");
+        assert!(
+            seen.iter().all(|(_, word)| *word == want),
+            "{want}: {seen:?} in {response}"
+        );
+    };
+    let any = |_: &str| true;
+    let is_commit = |node: &str| node.starts_with("commit:");
+    let is_file = |node: &str| !node.starts_with("commit:");
+
+    // (a) The label alone cannot know: nothing was checked.
+    let alone = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, false, false, false),
+        3,
+        &maps,
+    )
+    .await;
+    assert!(
+        alone.get("maps").is_none() && !alone.to_string().contains("file_changed"),
+        "{alone}"
+    );
+    only(&alone, "unverified", &any);
+
+    // (b) The tree is as the index saw it: the cards of the maps built from the
+    // index are fresh, and so is the commit (its map is live).
+    let seen = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, true, false, false),
+        3,
+        &maps,
+    )
+    .await;
+    only(&seen, "fresh", &any);
+    // (d) The commit card says `fresh` under `map_freshness`, `unverified` without it.
+    only(&seen, "fresh", &is_commit);
+    only(&alone, "unverified", &is_commit);
+
+    // (c) After an edit: with `verify_on_read` the cards of `a.rs` are
+    // `changed`; with `map_freshness` alone their maps are `stale`. The commit
+    // stays fresh.
+    let source = tree.dir.path().join("a.rs");
+    let mut text = std::fs::read_to_string(&source).unwrap();
+    text.push_str("fn appended() {}\n");
+    std::fs::write(&source, text).unwrap();
+    let verified = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, true, true, false),
+        3,
+        &maps,
+    )
+    .await;
+    only(&verified, "changed", &is_file);
+    only(&verified, "fresh", &is_commit);
+    let stale = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, true, false, false),
+        3,
+        &maps,
+    )
+    .await;
+    only(&stale, "stale", &is_file);
+    only(&stale, "fresh", &is_commit);
+    // `verify_on_read` is read through `map_freshness`: alone it checks nothing,
+    // and the cards say so.
+    let files = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, false, true, false),
+        3,
+        &maps,
+    )
+    .await;
+    assert!(!files.to_string().contains("file_changed"), "{files}");
+    only(&files, "unverified", &any);
+}
+
+#[tokio::test]
+async fn a_walk_that_lost_a_map_is_not_labelled_complete() {
+    let tree = ScipTree::new();
+    // `lsp.live` is asked for, and its server is not there: the walk still runs
+    // to the end on the other maps.
+    let lsp = lci_core::config::Config {
+        rust_analyzer_path: "lci-no-such-language-server".into(),
+        ..Default::default()
+    };
+    let maps = ["graph.scip", EXACT_CLOSURE_ID, LSP_LIVE_ID];
+    let limits = stage_limits(true, false);
+    let run_with = |labels: bool, pops: u32| {
+        let (tree, limits, maps, lsp) = (&tree, &limits, &maps, &lsp);
+        async move {
+            labelled_run_under(
+                tree,
+                limits,
+                &label_profile(labels, false, false, false),
+                pops,
+                maps,
+                Some(lsp),
+            )
+            .await
+        }
+    };
+    let on = run_with(true, 50).await;
+    assert_eq!(on["status"], "complete", "{on}");
+    assert!(
+        on["notes"].to_string().contains("lsp.live is unavailable"),
+        "{on}"
+    );
+    assert_eq!(
+        on["completeness"],
+        json!({"complete": false, "why": "degraded", "degraded": ["lsp.live"], "estimate": on["completeness"]["estimate"]}),
+        "{on}"
+    );
+    let notes = on["notes"].to_string();
+    assert!(
+        notes.contains("partial answer (degraded): lsp.live"),
+        "{notes}"
+    );
+    // Nothing is withheld, and the key off says nothing of it.
+    let off = run_with(false, 50).await;
+    assert!(!on["results"].as_array().unwrap().is_empty(), "{on}");
+    assert_eq!(without_labels(&on)["results"], off["results"]);
+    assert!(!off.to_string().contains("completeness"), "{off}");
+    assert!(!off.to_string().contains("degraded"), "{off}");
+
+    // A capped walk keeps its own reason and still names the lost map.
+    let capped = run_with(true, 1).await;
+    assert_eq!(capped["completeness"]["why"], "pops", "{capped}");
+    assert_eq!(capped["completeness"]["complete"], false, "{capped}");
+    assert_eq!(
+        capped["completeness"]["degraded"],
+        json!(["lsp.live"]),
+        "{capped}"
+    );
+    assert!(
+        capped["notes"]
+            .to_string()
+            .contains("degraded maps: lsp.live"),
+        "{capped}"
+    );
+
+    // Every map of the call is there: no `degraded` key.
+    let sound = labelled_run(
+        &tree,
+        &limits,
+        &label_profile(true, false, false, false),
+        50,
+        &["graph.scip", EXACT_CLOSURE_ID],
+    )
+    .await;
+    assert_eq!(sound["completeness"]["complete"], true, "{sound}");
+    assert!(sound["completeness"].get("degraded").is_none(), "{sound}");
+}

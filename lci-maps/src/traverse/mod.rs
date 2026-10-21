@@ -206,8 +206,8 @@ use std::{
 };
 use steer::Steer;
 use stop::{
-    ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, MAX_DISAGREEMENTS, MapStat,
-    Pause, Regions, StopReason, Tally, is_structural, likely_complete,
+    ANSWER_K, CARD_K, CHECKPOINT_DISAGREEMENTS, Card, Disagreement, LikelyComplete,
+    MAX_DISAGREEMENTS, MapStat, Pause, Regions, StopReason, Tally, is_structural, likely_complete,
 };
 use tiebreak::{Facts, TieBreak};
 
@@ -496,6 +496,11 @@ pub struct TraversalResult {
     /// `Deadline` or `Budget` (a cap), `Steer`, or the trigger a handler's
     /// stop answered.
     pub stop_reason: StopReason,
+    /// The mark-recapture estimate over what the maps found by the end of the
+    /// call (the one a checkpoint's `likely_complete` shows): `None` until the
+    /// two largest finders share a node. Present on every result, also one
+    /// without a checkpoint.
+    pub estimate: Option<LikelyComplete>,
     /// What each map did over the whole traversal (a resume carries the
     /// counts of the calls before it).
     pub maps: BTreeMap<MapId, MapStat>,
@@ -1284,6 +1289,7 @@ impl<'s> Run<'s> {
             card_paths: self.t.card_paths,
             fused: fused_by_node,
             stop_reason,
+            estimate: likely_complete(&self.tally.found),
             maps: self.tally.maps,
             map_ms: self.map_ms,
             rerank_floor: self.t.rerank.as_ref().map(|(_, floor)| *floor),
