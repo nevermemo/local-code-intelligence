@@ -8,7 +8,12 @@ use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::{path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime},
+};
 
 #[async_trait]
 pub trait LspAdapter: Send + Sync {
@@ -199,26 +204,176 @@ pub async fn read_for_did_open(
     String::from_utf8(bytes).map(Some).with_context(context)
 }
 
-/// Checks a configured executable with a bounded `--version` invocation.
-pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> Result<()> {
-    let mut command = tokio::process::Command::new(crate::lsp::transport::resolve_executable(
-        &executable.to_string_lossy(),
-    ));
-    command.arg("--version");
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .with_context(|| format!("timed out running {} --version", executable.display()))?
-        .with_context(|| format!("start {}", executable.display()))?;
-    ensure!(
-        output.status.success(),
-        "subprocess {} --version failed",
-        executable.display()
-    );
+/// What identifies a binary for the process-wide probe memo. The invocation is
+/// always `--version`, so the arguments are not part of the key. The path is
+/// the resolved string as given, not canonicalised: another spelling of the
+/// same file (case or a relative form on Windows) is probed again, and on a
+/// platform without lookup a bare name that matches an entry of the working
+/// directory is memoised against that entry's metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProbeKey {
+    /// The executable after `resolve_executable`.
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+/// The binaries whose `--version` has succeeded in this process.
+static PROBED: OnceLock<Mutex<HashSet<ProbeKey>>> = OnceLock::new();
+
+/// Answers `Ok` for a binary that has already passed a probe in this process,
+/// else awaits `run` and remembers `key` only when it succeeds. A failure is
+/// never remembered. Concurrent first callers may both run.
+pub(crate) async fn probe_memoised(
+    key: ProbeKey,
+    run: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let probed = PROBED.get_or_init(Default::default);
+    let known = |probed: &Mutex<HashSet<ProbeKey>>| {
+        probed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    };
+    if known(probed) {
+        return Ok(());
+    }
+    run.await?;
+    probed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key);
     Ok(())
+}
+
+tokio::task_local! {
+    /// Set by [`fresh_probes`]: the probes of the scope bypass the memo.
+    static FRESH: bool;
+}
+
+/// Runs `work` with every [`probe_subprocess_version`] inside it answering from
+/// a real `--version` run, never from the process-wide memo, and without
+/// recording it. For a caller that reports the binary's state as it is now, as
+/// `/ready` does.
+pub async fn fresh_probes<F: std::future::Future>(work: F) -> F::Output {
+    FRESH.scope(true, work).await
+}
+
+/// Answers `run` through the process-wide memo for the binary at `resolved`,
+/// or runs it outright under [`fresh_probes`] or when the file cannot be read.
+pub(crate) async fn probe_through(
+    resolved: &std::ffi::OsStr,
+    run: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let fresh = FRESH.try_with(|fresh| *fresh).unwrap_or(false);
+    let key = if fresh {
+        None
+    } else {
+        std::fs::metadata(resolved).ok().map(|metadata| ProbeKey {
+            path: PathBuf::from(resolved),
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    };
+    match key {
+        Some(key) => probe_memoised(key, run).await,
+        None => run.await,
+    }
+}
+
+/// Checks a configured executable with a bounded `--version` invocation. A
+/// binary that has passed it once in this process (same resolved path, same
+/// modification time and size) is not run again, whichever manager asks, so a
+/// test process or a service probes one binary once, not once per manager. A
+/// binary whose file cannot be read is probed every time, and so is every
+/// binary inside [`fresh_probes`].
+pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> Result<()> {
+    let resolved = crate::lsp::transport::resolve_executable(&executable.to_string_lossy());
+    let run = async {
+        let mut command = tokio::process::Command::new(&resolved);
+        command.arg("--version");
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .with_context(|| format!("timed out running {} --version", executable.display()))?
+            .with_context(|| format!("start {}", executable.display()))?;
+        ensure!(
+            output.status.success(),
+            "subprocess {} --version failed",
+            executable.display()
+        );
+        Ok(())
+    };
+    probe_through(&resolved, run).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn a_binary_is_probed_once_per_process_until_its_identity_changes() {
+        let key = |modified: u64| ProbeKey {
+            path: PathBuf::from("a-binary-only-this-test-names"),
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(modified)),
+            len: 7,
+        };
+        let runs = AtomicUsize::new(0);
+        let run = |outcome: Result<()>| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(outcome)
+        };
+        // A failure runs and is not remembered.
+        assert!(
+            probe_memoised(key(1), async { run(Err(anyhow::anyhow!("no"))).await })
+                .await
+                .is_err()
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // The next caller runs again, succeeds, and is remembered.
+        probe_memoised(key(1), async { run(Ok(())).await })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // The same identity is answered from memory.
+        probe_memoised(key(1), async { run(Ok(())).await })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // A binary that changed on disk is probed again.
+        probe_memoised(key(2), async { run(Ok(())).await })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// `/ready` reports a binary as it is now: inside `fresh_probes` the run
+    /// happens even after a memoised success, and it records nothing. The file
+    /// is this test binary, which only this test probes through the memo.
+    #[tokio::test]
+    async fn fresh_probes_run_again_after_a_memoised_success() {
+        let exe = std::env::current_exe().unwrap().into_os_string();
+        let runs = AtomicUsize::new(0);
+        let probe = || {
+            probe_through(&exe, async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        probe().await.unwrap();
+        probe().await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the second is memoised");
+        fresh_probes(probe()).await.unwrap();
+        fresh_probes(probe()).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "each fresh probe runs");
+        // Outside the scope the memo answers again.
+        probe().await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
 }
 
 /// Checks the unit tests of the optional adapters share.

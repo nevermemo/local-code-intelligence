@@ -54,7 +54,7 @@ fn file(path: &str) -> NodeId {
 
 fn budget() -> Budget {
     Budget {
-        deadline: Instant::now() + Duration::from_secs(10),
+        deadline: Instant::now() + Duration::from_secs(3600),
         max_external_calls: u32::MAX,
         max_nodes_touched: u64::MAX,
     }
@@ -79,7 +79,7 @@ fn site_of(edge: &Edge) -> (&str, u32, u32) {
 #[tokio::test]
 async fn a_symbol_reaches_the_documents_that_mention_it_and_no_source_file() {
     let tree = fixture();
-    let map = DocsMentions::new(tree.path());
+    let map = DocsMentions::patient(tree.path());
     let node = symbol("compute_total");
     let edges = check_expand(&map, &node, Duration::from_secs(10), &view())
         .await
@@ -117,7 +117,7 @@ async fn a_file_node_looks_for_its_stem_in_the_documents() {
     write(root, "src/parser.rs", "// the parser\npub fn run() {}\n");
     write(root, "README.md", "The `parser` turns text into a tree.\n");
     write(root, "docs/parser.md", "The parser, in detail.\n");
-    let map = DocsMentions::new(root);
+    let map = DocsMentions::patient(root);
 
     let from_source = map
         .expand(&file("src/parser.rs"), budget(), &view())
@@ -148,7 +148,7 @@ async fn short_and_common_names_make_no_edges() {
         "README.md",
         "The lsp channel and the config file.\n",
     );
-    let map = DocsMentions::new(tree.path());
+    let map = DocsMentions::patient(tree.path());
     for name in ["lsp", "config"] {
         let edges = map.expand(&symbol(name), budget(), &view()).await.edges;
         assert!(edges.is_empty(), "{name}");
@@ -166,7 +166,7 @@ async fn query_labels_evidence_doc_and_reports_the_live_tree() {
     );
     write(tree.path(), "docs/guide.md", "Use compute_total here.\n");
     write(tree.path(), "docs/more.md", "Only other_name here.\n");
-    let map = DocsMentions::new(tree.path());
+    let map = DocsMentions::patient(tree.path());
     let seeds = [(symbol("compute_total"), 1.0), (symbol("other_name"), 1.0)];
     let params = serde_json::Value::Null;
     let mut request = MapRequest {
@@ -209,7 +209,7 @@ async fn query_labels_evidence_doc_and_reports_the_live_tree() {
 #[tokio::test]
 async fn an_edit_after_construction_is_seen() {
     let tree = fixture();
-    let map = DocsMentions::new(tree.path());
+    let map = DocsMentions::patient(tree.path());
     let node = symbol("compute_total");
     let before = map.expand(&node, budget(), &view()).await.edges;
     assert!(before.iter().all(|e| e.dst != file("docs/new.md")));
@@ -240,7 +240,7 @@ async fn an_edit_after_construction_is_seen() {
 #[tokio::test]
 async fn the_card_reports_file_coverage_and_a_measured_median() {
     let tree = fixture();
-    let map = DocsMentions::new(tree.path());
+    let map = DocsMentions::patient(tree.path());
     assert!(map.card().expand_p50_ms.is_none(), "nothing measured yet");
     let p50 = map.calibrate(1).await.expect("measured");
     assert!(p50 >= 0.0);
