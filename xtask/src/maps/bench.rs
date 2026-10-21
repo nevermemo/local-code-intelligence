@@ -706,9 +706,8 @@ const SEED_MAPS: [&str; 2] = ["seeds.hybrid", "seeds.scip_names"];
 fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
     use NodeKind::{Chunk, Commit, ConfigKey, File, Symbol};
     match map {
-        "seeds.scip_names" | "graph.scip" | "scip.impact" | "scip.implements" | "exact.closure" => {
-            Some(&[Symbol])
-        }
+        "seeds.scip_names" | "graph.scip" | "scip.impact" | "scip.implements"
+        | "tests.tested_by" | "exact.closure" => Some(&[Symbol]),
         "exact.pickaxe" => Some(&[Commit]),
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
         "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),
@@ -3250,6 +3249,15 @@ pub fn free_two() {}
         assert!(can_answer(Set::History, &with_git));
         // A map this runner does not know is run and judged by its results.
         assert!(can_answer(Set::History, &strings(&["git.log"])));
+    }
+
+    #[test]
+    fn tests_tested_by_can_answer_the_impact_set() {
+        let tested_by = vec!["tests.tested_by".to_string()];
+        assert!(can_answer(Set::Impact, &tested_by));
+        assert!(can_answer(Set::WhereTo, &tested_by));
+        assert!(!can_answer(Set::History, &tested_by));
+        assert!(!can_answer(Set::Instructions, &tested_by));
     }
 
     // ---- synthetic end-to-end run: tiny gold, fixture traversals, temp trend.

@@ -237,8 +237,12 @@ impl ImpactMap {
         Some((&def.path, def.name_range.0, def.name_range.1))
     }
 
-    /// Every edge leaving `node` (unsorted, uncapped) and the occurrences read.
-    fn all_edges(&self, node: &NodeId) -> (Vec<Edge>, u64) {
+    /// The units that hold a non-definition occurrence of `node`'s symbol, in
+    /// (path, line, column) order of their first occurrence: the unit's
+    /// definition index, its id and the site of that first occurrence, and
+    /// the occurrences read. The one reading of the index behind
+    /// [`ImpactMap::all_edges`] and the `tests.tested_by` map.
+    pub(crate) fn user_units(&self, node: &NodeId) -> (Vec<(usize, NodeId, Site)>, u64) {
         let Some(&def) = self.by_node.get(node) else {
             return (Vec::new(), 0);
         };
@@ -254,23 +258,37 @@ impl ImpactMap {
                 first.entry(unit).or_insert((path, line, col));
             }
         }
-        let edges = first
+        let users = first
             .into_iter()
             .filter_map(|(unit, (path, line, col))| {
-                Some(Edge {
-                    src: node.clone(),
-                    dst: self.ids[unit].clone()?,
-                    kind: EdgeKind::CallsOrRefs,
-                    map: SCIP_IMPACT_ID,
-                    witness: WitnessClass::Compiler,
-                    conf: CONF_MAX,
-                    site: Some(Site {
+                Some((
+                    unit,
+                    self.ids[unit].clone()?,
+                    Site {
                         path,
                         blob: String::new(),
                         line,
                         col,
-                    }),
-                })
+                    },
+                ))
+            })
+            .collect();
+        (users, read)
+    }
+
+    /// Every edge leaving `node` (unsorted, uncapped) and the occurrences read.
+    fn all_edges(&self, node: &NodeId) -> (Vec<Edge>, u64) {
+        let (users, read) = self.user_units(node);
+        let edges = users
+            .into_iter()
+            .map(|(_, dst, site)| Edge {
+                src: node.clone(),
+                dst,
+                kind: EdgeKind::CallsOrRefs,
+                map: SCIP_IMPACT_ID,
+                witness: WitnessClass::Compiler,
+                conf: CONF_MAX,
+                site: Some(site),
             })
             .collect();
         (edges, read)

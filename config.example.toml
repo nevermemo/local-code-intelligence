@@ -586,7 +586,8 @@ pricing = "rank"
 # unreadable file is an error. "cache": the index is read when the file is there
 # and readable; otherwise the SCIP graph is empty and a note says so. "off": the
 # index path is never touched; graph.scip, structure.contains (beyond chunk
-# lines), scip.impact, scip.implements, config.key and exact.closure are empty,
+# lines), scip.impact, scip.implements, tests.tested_by, config.key and
+# exact.closure are empty,
 # each with a note. A handle made with a graph does not resume under "off".
 # Part of the run-profile hash. Recipes read the index under "cache" when it is
 # there and refuse under "off" or without it.

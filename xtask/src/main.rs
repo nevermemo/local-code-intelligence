@@ -7,6 +7,7 @@ mod lint;
 mod live_acceptance;
 mod maps;
 mod mine;
+mod mine_transcripts;
 mod setup;
 mod sim;
 mod test;
@@ -124,6 +125,13 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         max: usize,
     },
+    /// Count question shapes over synthetic agent transcripts (the sim trace
+    /// shape: a `sim.json` or JSONL of `{question, trace}`): shape and trace
+    /// class counts, call and token quantiles and anonymised question
+    /// templates; never a raw question or a step argument. Output defaults to
+    /// test-results/transcripts/shapes.json. See
+    /// docs/spike/multimap/v2/gold-scorers.md "Strata and transcript shapes".
+    MineTranscripts(mine_transcripts::MineTranscriptsArgs),
 }
 
 #[derive(Subcommand)]
@@ -317,6 +325,7 @@ async fn main() -> Result<()> {
             out,
             max,
         } => mine::run(repo, key, out, max),
+        Command::MineTranscripts(args) => mine_transcripts::run(args),
     }
 }
 

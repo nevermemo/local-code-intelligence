@@ -12,6 +12,7 @@ mod history;
 mod impact;
 mod instructions;
 pub mod metrics;
+mod strata;
 pub(crate) mod structured;
 mod traits;
 mod where_to;
@@ -114,6 +115,22 @@ pub enum GoldCommand {
         #[arg(long, default_value_t = 10)]
         top_k: usize,
     },
+    /// Classify every item of a gold set as core, grep_easy or agent_trap
+    /// from the item alone (no run, no tree, no LCI output) and report the
+    /// counts, the hop quantiles, the items no rule reaches and the items
+    /// whose question holds a gold file's stem. Scores nothing; writes
+    /// nothing into the gold file. See the `strata` module.
+    Strata {
+        #[arg(long, value_enum)]
+        set: Set,
+        /// Gold file for the set (a JSON array of items).
+        #[arg(long)]
+        gold: PathBuf,
+        /// Write the report JSON here (by convention under `test-results/`)
+        /// instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Validate the structured-config gold files `<gold-dir>/<repo>.json`:
     /// schema, counts, spans against the checked-out trees, key leaks, the
     /// seeded dev/heldout split and portability. Exits non-zero on any
@@ -169,6 +186,10 @@ pub fn run(command: GoldCommand) -> Result<()> {
             write_file(&out, &toml_text)?;
             eprintln!("{summary}");
             Ok(())
+        }
+        GoldCommand::Strata { set, gold, out } => {
+            let items = prepare(set, load_gold(&gold)?);
+            emit(&strata::report(set, &items)?, out.as_deref())
         }
         GoldCommand::ValidateStructured {
             gold_dir,
@@ -493,19 +514,26 @@ pub struct Options {
 }
 
 fn score_item(set: Set, item: &Value, answers: &[Answer], opts: &Options) -> ItemScore {
-    match set {
+    let mut score = match set {
         Set::Impact => impact::score_item(item, answers),
         Set::Flow => flow::score_item(item, answers),
         Set::WhereTo => where_to::score_item(item, answers, opts),
         Set::History => history::score_item(item, answers),
         Set::Instructions => instructions::score_item(item, answers),
         Set::Traits => traits::score_item(item, answers),
-    }
+    };
+    // The cross-set guard (core, grep_easy, agent_trap), last: it reads the
+    // item alone and adds a dimension, never a metric.
+    score.dims.push((
+        "guard",
+        strata::classify(set, item).guard.as_str().to_string(),
+    ));
+    score
 }
 
 /// The strata (dimension -> value) of one item of `set`, the ones its scorer
-/// reports under `strata`. They come from the item alone, so they do not depend
-/// on the answers; the bench groups costs by them.
+/// reports under `strata`, then the cross-set `guard`. They come from the item
+/// alone, so they do not depend on the answers; the bench groups costs by them.
 pub fn dims(set: Set, item: &Value) -> Vec<(&'static str, String)> {
     score_item(set, item, &[], &Options { strict: false }).dims
 }
@@ -933,5 +961,41 @@ not json
         assert_eq!(parsed.queries[0].top_k, Some(7));
         assert_eq!(parsed.queries[0].expected_paths, vec!["r.rs"]);
         assert!(summary.contains("dropped 1: no gold files"));
+    }
+
+    #[test]
+    fn dims_carry_the_guard_for_every_set() {
+        let items: [(Set, Value); 6] = [
+            (
+                Set::Impact,
+                json!({"id": "a", "primary": true, "stratum": "sym-fn/deg2-4/tests-near",
+                       "ambiguity": {"band": "some"}, "gold": {"r1": {"decls": []}}}),
+            ),
+            (Set::Flow, json!({"id": "b", "stratum": "named/len3"})),
+            (
+                Set::WhereTo,
+                json!({"id": "c", "stratum": "exemplar/clean", "gold": {"form": "exemplar"}}),
+            ),
+            (Set::History, json!({"id": "d", "stratum": "H3b"})),
+            (
+                Set::Instructions,
+                json!({"id": "e", "subtype": "I1", "stratum": "I1/xtask"}),
+            ),
+            (Set::Traits, json!({"id": "f", "set": "Q2"})),
+        ];
+        let expected = ["core", "core", "core", "agent_trap", "core", "core"];
+        for ((set, item), want) in items.iter().zip(expected) {
+            let dims = dims(*set, item);
+            assert_eq!(dims.last(), Some(&("guard", want.to_string())), "{set:?}");
+        }
+        // the aggregate report carries the cell, with n, beside the scorer's own
+        let history = [
+            json!({"id": "h1", "stratum": "H3b", "gold": {"commit": "abcdef1234"}, "accept": {}}),
+            json!({"id": "h2", "stratum": "H1/x", "gold": {"commit": "abcdef1234"}, "accept": {}}),
+        ];
+        let report = score_set(Set::History, &history, &Run::new(), false, false).unwrap();
+        assert_eq!(report["strata"]["guard"]["agent_trap"]["n"], 1);
+        assert_eq!(report["strata"]["guard"]["core"]["n"], 1);
+        assert_eq!(report["strata"]["family"]["H3b"]["n"], 1);
     }
 }

@@ -102,6 +102,7 @@ use lci_maps::{
     search_maps::{
         ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
     },
+    tested_by::{TESTED_BY_ID, TestedByMap},
     traverse::{
         Grouping, Seed, Traversal, TraversalBudget,
         frontier::HopPrice,
@@ -173,14 +174,16 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// closure of the SCIP impact index), and `scip.implements` (the traits a type
 /// implements, the types that implement a trait and the members that implement
 /// a trait method, read from the `impl .. for ..` headers of the tree and the
-/// SCIP index). `lsp.live` asks a language server for
+/// SCIP index), and `tests.tested_by` (the test units that reference a symbol,
+/// read from the same impact index; a test by its path or by an inline `tests`
+/// module in its symbol chain). `lsp.live` asks a language server for
 /// definition, references and document symbols (starts the server at the first
 /// expansion; needs its binary). The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 13] = [
+pub const OPT_IN_MAPS: [MapId; 14] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -189,6 +192,7 @@ pub const OPT_IN_MAPS: [MapId; 13] = [
     SEARCH_VECTOR_ID,
     SCIP_IMPACT_ID,
     SCIP_IMPLEMENTS_ID,
+    TESTED_BY_ID,
     LSP_LIVE_ID,
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
@@ -1195,6 +1199,42 @@ pub async fn run_with_trait_seeds(
                     &mut plan_maps,
                     &observer,
                     Box::new(Shared(map)),
+                    true,
+                )?;
+            }
+        }
+    }
+    if wants(TESTED_BY_ID) {
+        match call.scip_root {
+            None => {
+                notes.push("tests.tested_by needs the tree: give --root".to_owned());
+                unavailable.push(TESTED_BY_ID);
+            }
+            Some(root) => {
+                // The index `scip.impact` reads: shared when that map was
+                // built, else built here (cached by the stamp).
+                let shared = match &impact {
+                    Some(map) => map.clone(),
+                    None => match impact_map(call.scip_index, root, &loaded).await {
+                        Ok(map) => map,
+                        Err(error) => {
+                            notes.push(format!("tests.tested_by has no edges: {error:#}"));
+                            unavailable.push(TESTED_BY_ID);
+                            Arc::new(ImpactMap::empty(ImpactOptions::default()))
+                        }
+                    },
+                };
+                let map = TestedByMap::new(shared);
+                notes.push(format!(
+                    "tests.tested_by: {} test units in the impact index, cap {} edges per node",
+                    map.test_units(),
+                    lci_maps::EXPAND_LIMIT
+                ));
+                register(
+                    &mut registry,
+                    &mut plan_maps,
+                    &observer,
+                    Box::new(map),
                     true,
                 )?;
             }
