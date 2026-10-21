@@ -166,7 +166,7 @@ Stops (`StopPolicy`; 0 switches a trigger off; all bounded by `max_stops` 4): `e
 `pops/(max_stops+1)` when rules are given), `on_disagreement`, `likely_complete` (1 to 100), `actions` (only with `handle`, the answer to a checkpoint: `[{"node"?, "action"}]`; node actions need a `node`). The
 response's `effective_policy` shows what ran. `BudgetArgs` {`pops`, `max_depth`, `est_tokens`, `deadline_ms`} can only lower the `[traverse]` caps.
 
-Handles (`handle.rs`): the hash of the snapshot JSON, file `<data_dir>/traverse/handles/<handle>.json` (`MAX_HANDLE` 64 characters), bound to the workspace and index it was made on (`check_identity`). A snapshot
+Handles (`handle.rs`, whose module doc is the spec): `h` and 16 lowercase hex digits (the first 16 of the SHA-256 of the snapshot JSON; the app refuses an empty or over-64-character handle before the store sees it), file `<data_dir>/traverse/handles/<handle>.json`, written once and never removed, bound to the workspace and index it was made on (`check_identity`: the canonical root, and the index path, size and modified time, so a re-index refuses it). A snapshot
 holds states, queue, held-back states, counters, cleared set, map weights and switches, pop count, paid costs, traced `alt_path` pairs; not the event log, edge source, scorer or handler. A resume must repeat the
 boost, `top_k`, priors, tie-break file or reranker identity, or is refused; no TTL, no cap on live handles. Stable policies: [v2/policies/README.md](v2/policies/README.md). Design of the unbuilt ops
 and tools: [specs/steering-ops.md](specs/steering-ops.md).
