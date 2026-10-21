@@ -71,7 +71,7 @@ mod tests;
 
 use crate::{
     app::App,
-    config::{LspSessions, RunProfileConfig, TraverseConfig, TraverseFirstStage},
+    config::{LspPlaces, LspSessions, RunProfileConfig, TraverseConfig, TraverseFirstStage},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use first_stage::{
@@ -85,7 +85,7 @@ use lci_maps::{
     contains::CONTAINS_MAP_ID,
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
-    lsp_live::{LSP_LIVE_ID, LspLive, ManagerBackend, ScipPlaces},
+    lsp_live::{LSP_LIVE_ID, LspLive, ManagerBackend, OutlinePlaces, ScipPlaces, SymbolPlaces},
     probe_map::{PROBE_COMPILE_ID, ProbeConfig, ProbeMap},
     scip_graph::SCIP_MAP_ID,
     scip_impact::{ImpactMap, ImpactOptions, SCIP_IMPACT_ID},
@@ -1016,7 +1016,13 @@ pub async fn run_with_trait_seeds(
         };
         match backend {
             Ok(backend) => {
-                let places = Arc::new(ScipPlaces::from_scip(&loaded.scip));
+                let scip_places = ScipPlaces::from_scip(&loaded.scip);
+                // `outline`: the index's table first, the server's own outline
+                // for what it lacks (everything under `scip.mode = "off"`).
+                let places: Arc<dyn SymbolPlaces> = match profile.lsp.places {
+                    LspPlaces::Scip => Arc::new(scip_places),
+                    LspPlaces::Outline => Arc::new(OutlinePlaces::over(scip_places)),
+                };
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)
                         .implementations(profile.lsp.implementations)

@@ -61,17 +61,29 @@ impl SymbolPlaces for Table {
             .find(|(_, p, (from, to))| p.path == path && (*from..=*to).contains(&line))
             .map(|e| e.0.clone())
     }
+
+    fn nodes_in(&self, path: &str) -> Vec<(u32, NodeId)> {
+        self.0
+            .iter()
+            .filter(|(_, p, _)| p.path == path)
+            .map(|(id, p, _)| (p.line, id.clone()))
+            .collect()
+    }
 }
 
-fn table() -> Arc<Table> {
+fn table_rows() -> Table {
     let row = |name: &str, path, line, col, span| (sym(name), place(path, line, col), span);
-    Arc::new(Table(vec![
+    Table(vec![
         row("a", "src/a.rs", 1, 3, (1, 4)),
         row("b", "src/b.rs", 10, 3, (10, 12)),
         row("c", "src/c.rs", 5, 3, (4, 9)),
         row("x", "src/x.rs", 0, 3, (0, 2)),
         row("y", "src/y.rs", 0, 3, (0, 2)),
-    ]))
+    ])
+}
+
+fn table() -> Arc<Table> {
+    Arc::new(table_rows())
 }
 
 /// What the fake server answers, by the place or path asked about. It counts
@@ -90,6 +102,8 @@ struct Fake {
     /// `Some((method, text))`: that call-hierarchy request fails with the text.
     hierarchy_error: Option<(&'static str, String)>,
     members: HashMap<String, Vec<Member>>,
+    /// `Some`: every outline request fails with this text.
+    outline_error: Option<String>,
     delay: Duration,
     requests: Arc<AtomicU32>,
     dropped: SetOnDrop,
@@ -200,15 +214,20 @@ impl LspBackend for Fake {
     }
 
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
-        self.answer(self.members.get(path)).await
+        let answer = self.answer(self.members.get(path)).await;
+        match &self.outline_error {
+            Some(error) => Err(error.clone()),
+            None => answer,
+        }
     }
 }
 
 fn fake() -> Fake {
-    let member = |name: &str, from, to| Member {
+    let member = |name: &str, from, to, kind| Member {
         name: name.into(),
         place: place("src/a.rs", from, 0),
         end_line: to,
+        kind: Some(kind),
     };
     Fake {
         // `x` is defined at `b`'s name and also, once more, at itself.
@@ -229,7 +248,7 @@ fn fake() -> Fake {
         // attributes above its name line 1); `S` (a struct) it does not.
         members: HashMap::from([(
             "src/a.rs".to_owned(),
-            vec![member("a", 0, 4), member("S", 7, 8)],
+            vec![member("a", 0, 4, 12), member("S", 7, 8, 23)],
         )]),
         ..Fake::default()
     }
@@ -761,5 +780,276 @@ async fn a_missing_server_binary_makes_the_map_unavailable_before_any_walk() {
             && error.contains("rust-analyzer")
             && error.contains("lci-no-such-language-server"),
         "{error}"
+    );
+}
+
+/// A member of `path` named `name` at `line`, column 3, of LSP kind `kind`.
+fn outline_member(path: &str, name: &str, line: u32, end_line: u32, kind: u64) -> Member {
+    Member {
+        name: name.into(),
+        place: place(path, line, 3),
+        end_line,
+        kind: Some(kind),
+    }
+}
+
+/// The id `OutlinePlaces` mints in a Rust file whose module path is `module`.
+fn minted(module: &str, name: &str, kind: SymbolKind, disambiguator: u16) -> NodeId {
+    NodeId::Symbol(SymbolKey {
+        language: "rust".into(),
+        module_path: vec![module.into()],
+        container: Vec::new(),
+        name: name.into(),
+        kind,
+        disambiguator,
+    })
+}
+
+#[test]
+fn the_outline_layer_resolves_what_the_index_lacks_and_keeps_the_indexs_ids() {
+    let places = OutlinePlaces::over(table_rows());
+    assert!(places.outline_wanted("src/a.rs"));
+    // `a` the index knows (its name is on line 1, the live outline has it on
+    // line 2: the tree moved); `S` it does not; `f` is a field.
+    places.learn(
+        "src/a.rs",
+        &[
+            outline_member("src/a.rs", "a", 2, 5, 12),
+            outline_member("src/a.rs", "S", 7, 9, 23),
+            outline_member("src/a.rs", "f", 8, 8, 8),
+        ],
+    );
+    assert!(!places.outline_wanted("src/a.rs"));
+    assert!(places.outline_wanted("src/b.rs"));
+    // One symbol, one id across the layers: the index's, at the live place.
+    assert_eq!(places.defined_at(&place("src/a.rs", 2, 3)), Some(sym("a")));
+    assert_eq!(places.place_of(&sym("a")), Some(place("src/a.rs", 2, 3)));
+    // What the index lacks gets a minted id with the file's language.
+    let s = minted("a", "S", SymbolKind::Struct, 0);
+    assert_eq!(s.to_string(), "sym:rust:a::S/struct");
+    assert_eq!(places.defined_at(&place("src/a.rs", 7, 3)), Some(s.clone()));
+    assert_eq!(places.place_of(&s), Some(place("src/a.rs", 7, 3)));
+    // A field has no node.
+    assert_eq!(places.defined_at(&place("src/a.rs", 8, 3)), None);
+    // The innermost learned span holds the line; the field's line is S's.
+    assert_eq!(places.enclosing("src/a.rs", 8), Some(s.clone()));
+    assert_eq!(places.enclosing("src/a.rs", 3), Some(sym("a")));
+    // An unlearned file is the index's.
+    assert_eq!(places.place_of(&sym("b")), Some(place("src/b.rs", 10, 3)));
+    assert_eq!(places.enclosing("src/b.rs", 11), Some(sym("b")));
+    // Contains: the name's own line, then the range.
+    assert_eq!(places.defined_in("src/a.rs", (2, 5), "a"), Some(sym("a")));
+    assert_eq!(places.defined_in("src/a.rs", (7, 9), "S"), Some(s.clone()));
+    assert_eq!(places.defined_in("src/a.rs", (8, 8), "f"), None);
+    // A later outline replaces the file's entries.
+    places.learn("src/a.rs", &[outline_member("src/a.rs", "a", 2, 5, 12)]);
+    assert_eq!(places.defined_at(&place("src/a.rs", 7, 3)), None);
+    assert_eq!(places.place_of(&s), None);
+}
+
+#[test]
+fn the_index_table_takes_the_name_line_before_a_wider_range() {
+    // An item's range now runs to its end and covers a same-named symbol
+    // inside it; the member's own name line still picks its own node.
+    let inner = |disambiguator| {
+        NodeId::Symbol(SymbolKey {
+            language: "rust".into(),
+            module_path: vec!["m".into()],
+            container: Vec::new(),
+            name: "inner".into(),
+            kind: SymbolKind::Function,
+            disambiguator,
+        })
+    };
+    let mut scip = ScipPlaces::default();
+    scip.by_file
+        .insert("src/m.rs".to_owned(), vec![(3, inner(0)), (6, inner(1))]);
+    assert_eq!(scip.defined_in("src/m.rs", (3, 9), "inner"), Some(inner(0)));
+    assert_eq!(scip.defined_in("src/m.rs", (6, 9), "inner"), Some(inner(1)));
+    // No exact line: the first inside the range, as before.
+    assert_eq!(scip.defined_in("src/m.rs", (4, 9), "inner"), Some(inner(1)));
+}
+
+#[tokio::test]
+async fn a_symbol_pays_one_outline_for_its_file_then_asks() {
+    let backend = || Fake {
+        members: HashMap::from([(
+            "src/x.rs".to_owned(),
+            vec![outline_member("src/x.rs", "x", 0, 2, 12)],
+        )]),
+        ..fake()
+    };
+    let wide = || budget(Duration::from_secs(5), 10);
+
+    // Over an empty index: a file expansion learns `src/x.rs` (one call), and
+    // the symbol it names is then asked with no second outline.
+    let server = backend();
+    let requests = server.requests.clone();
+    let map = LspLive::new(
+        Box::new(server),
+        Arc::new(OutlinePlaces::over(Table(Vec::new()))),
+    );
+    let found = map.expand(&file("src/x.rs"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 1);
+    let x = minted("x", "x", SymbolKind::Function, 0);
+    let contained: Vec<_> = found
+        .edges
+        .iter()
+        .map(|e| (e.kind, e.dst.clone()))
+        .collect();
+    assert_eq!(contained, [(EdgeKind::Contains, x.clone())]);
+    let found = map.expand(&x, wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 2, "definition and references");
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert!(map.last_error().is_none());
+
+    // A symbol of an unlearned index file: the outline, then the requests.
+    let server = backend();
+    let requests = server.requests.clone();
+    let map = LspLive::new(
+        Box::new(server),
+        Arc::new(OutlinePlaces::over(table_rows())),
+    );
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 3);
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    // `x` keeps the index's id; its definition is the index's `b`.
+    let reached: Vec<_> = found.edges.iter().map(|e| e.dst.clone()).collect();
+    assert_eq!(reached, [sym("b")]);
+    // The file is learned: asking again pays no outline.
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 2);
+    assert_eq!(requests.load(Ordering::SeqCst), 5);
+
+    // Under a budget of one call the outline is all there is.
+    let server = backend();
+    let requests = server.requests.clone();
+    let map = LspLive::new(
+        Box::new(server),
+        Arc::new(OutlinePlaces::over(table_rows())),
+    );
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 1), &view())
+        .await;
+    assert_eq!(found.cost.external_calls, 1);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(found.edges.is_empty());
+}
+
+#[tokio::test]
+async fn the_scip_table_never_asks_for_the_outline_of_a_symbol() {
+    let backend = fake();
+    let requests = backend.requests.clone();
+    let map = map_over(backend);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 10), &view())
+        .await;
+    assert_eq!(found.cost.external_calls, 2, "definition and references");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_outline_error_keeps_the_index_place() {
+    let backend = Fake {
+        outline_error: Some("no outline today".to_owned()),
+        ..fake()
+    };
+    let requests = backend.requests.clone();
+    let map = LspLive::new(
+        Box::new(backend),
+        Arc::new(OutlinePlaces::over(table_rows())),
+    );
+    let wide = || budget(Duration::from_secs(5), 10);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    // The definition is still asked at the index's place and its edge kept.
+    let reached: Vec<_> = found.edges.iter().map(|e| e.dst.clone()).collect();
+    assert_eq!(reached, [sym("b")]);
+    assert_eq!(found.cost.external_calls, 3);
+    let error = map.last_error().unwrap();
+    assert!(error.contains("documentSymbol"), "{error}");
+    assert!(error.contains("no outline today"), "{error}");
+    // The failed file is not asked again.
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 2);
+    assert_eq!(requests.load(Ordering::SeqCst), 5);
+}
+
+#[test]
+fn kinds_without_a_node_are_left_out_and_equal_names_are_disambiguated_in_document_order() {
+    let places = OutlinePlaces::over(Table(Vec::new()));
+    // Arrival order is not document order.
+    places.learn(
+        "src/n.rs",
+        &[
+            outline_member("src/n.rs", "new", 20, 22, 6),
+            outline_member("src/n.rs", "new", 2, 4, 6),
+            outline_member("src/n.rs", "count", 6, 6, 13),
+            outline_member("src/n.rs", "size", 7, 7, 8),
+            outline_member("src/n.rs", "new", 10, 12, 9),
+            outline_member("src/n.rs", "Unit", 14, 14, 22),
+        ],
+    );
+    let id_at = |line| places.defined_at(&place("src/n.rs", line, 3));
+    let method = |disambiguator| minted("n", "new", SymbolKind::Method, disambiguator);
+    assert_eq!(id_at(2), Some(method(0)));
+    assert_eq!(id_at(10), Some(method(1)));
+    assert_eq!(id_at(20), Some(method(2)));
+    assert_eq!(method(2).to_string(), "sym:rust:n::new/method~2");
+    // A variable (13), a field (8) and an enum member (22) get none.
+    for line in [6, 7, 14] {
+        assert_eq!(id_at(line), None, "line {line}");
+    }
+    // The kinds this build has a node for.
+    let kinds = [
+        (12, SymbolKind::Function),
+        (6, SymbolKind::Method),
+        (9, SymbolKind::Method),
+        (5, SymbolKind::Struct),
+        (23, SymbolKind::Struct),
+        (11, SymbolKind::Trait),
+        (10, SymbolKind::Enum),
+        (2, SymbolKind::Module),
+        (3, SymbolKind::Module),
+        (4, SymbolKind::Module),
+        (14, SymbolKind::Const),
+    ];
+    let members: Vec<Member> = (0u32..)
+        .zip(kinds)
+        .map(|(line, (kind, _))| outline_member("src/k.rs", &format!("k{line}"), line, line, kind))
+        .collect();
+    places.learn("src/k.rs", &members);
+    for (line, (kind, want)) in (0u32..).zip(kinds) {
+        assert_eq!(
+            places.defined_at(&place("src/k.rs", line, 3)),
+            Some(minted("k", &format!("k{line}"), want, 0)),
+            "LSP kind {kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_file_outline_is_not_asked_again_for_a_symbol_of_that_file() {
+    let backend = Fake {
+        outline_error: Some("no outline today".to_owned()),
+        ..fake()
+    };
+    let requests = backend.requests.clone();
+    let map = LspLive::new(
+        Box::new(backend),
+        Arc::new(OutlinePlaces::over(table_rows())),
+    );
+    let wide = || budget(Duration::from_secs(5), 10);
+    // The file branch fails: no edges, one outline request, the error kept.
+    let found = map.expand(&file("src/x.rs"), wide(), &view()).await;
+    assert!(found.edges.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(map.last_error().unwrap().contains("no outline today"));
+    // A symbol of that file asks no second outline: definition and references.
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 2);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        3,
+        "one outline request in all"
     );
 }

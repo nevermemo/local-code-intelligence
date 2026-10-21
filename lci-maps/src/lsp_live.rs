@@ -22,8 +22,9 @@
 //!   the symbol's name, kind [`EdgeKind::Implements`], direction as in
 //!   `scip.implements` (from the interface or trait member to the members that
 //!   implement it), one edge per destination, the symbol itself left out. It is
-//!   asked only at a node with a place, which until types and traits have one
-//!   means a function or method: an interface member, not the interface. An
+//!   asked only at a node with a place, which with the index alone
+//!   means a function or method: an interface member, not the interface (the
+//!   outline of `places = "outline"` gives types and traits places too). An
 //!   error reply from the implementation request costs the other edges nothing
 //!   (the error is kept in [`LspLive::last_error`]); a hang still trips the
 //!   call's deadline and clears them all.
@@ -44,14 +45,25 @@
 //!   missed 16% of the call pairs SCIP has, in macro arguments): this map
 //!   complements `graph.scip`, it does not replace it.
 //! * file (or chunk, standing for its file) -> the symbols
-//!   `textDocument/documentSymbol` lists whose name the index also defines,
-//!   kind [`EdgeKind::Contains`]. Members the index has no node for (fields,
-//!   types) are left out: a node id needs a symbol the walk can name.
+//!   `textDocument/documentSymbol` lists whose name the table also defines,
+//!   kind [`EdgeKind::Contains`]. Members the table has no node for (fields,
+//!   variables: a node id needs a symbol the walk can name) are left out.
 //!
 //! The symbol <-> place table is the SCIP index's ([`ScipPlaces`]): the node
-//! ids of `graph.scip` are the only symbol ids there are. A server column is
-//! UTF-16, the index's a byte column; they differ only after non-ASCII text on
-//! the line.
+//! ids of `graph.scip` are the ids there are. Under `[run_profile.lsp] places =
+//! "outline"` it is the index's plus the server's own outline
+//! ([`OutlinePlaces`]): the first time the walk needs a file's places (it
+//! expands a symbol the index places there, or expands the file) it asks the
+//! server for the file's `textDocument/documentSymbol`, one more external call
+//! per file and map instance, and from then on the outline's places win in that
+//! file (the index may be older than the tree). An outline member takes the
+//! index's id for the same symbol when there is one, else a minted id with the
+//! file's real language, so under `scip.mode = "off"` (an empty index) every
+//! function, method, type, enum, module and constant of an outlined file has
+//! an id. Under `places = "scip"`, the default, no outline is asked for a
+//! symbol and a symbol the index lacks has no place.
+//! A server column is UTF-16, the index's a byte column; they differ only after
+//! non-ASCII text on the line.
 //!
 //! # Cost and lifecycle
 //!
@@ -91,6 +103,10 @@
 //! are resent a file's text before every request (pyright, gopls, jdtls,
 //! clangd; [`Manager::document_symbols`]): a per-call manager reuses it within
 //! the walk, a shared one across calls too.
+
+mod places;
+
+pub use places::OutlinePlaces;
 
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,
@@ -142,7 +158,11 @@ pub struct Place {
 pub struct Member {
     pub name: String,
     pub place: Place,
+    /// The last line of the item (the line of the name for a server that
+    /// gives no wider range).
     pub end_line: u32,
+    /// The LSP `SymbolKind` number the server gave, if any.
+    pub kind: Option<u64>,
 }
 
 /// A call-hierarchy item: where the callable's name is, and the server's own
@@ -192,6 +212,20 @@ pub trait SymbolPlaces: Send + Sync {
     fn defined_in(&self, path: &str, lines: (u32, u32), name: &str) -> Option<NodeId>;
     /// The innermost node whose definition holds the line.
     fn enclosing(&self, path: &str, line: u32) -> Option<NodeId>;
+    /// The nodes of the index's table in `path`: (line of the name, node). A
+    /// table that has no index behind it gives none.
+    fn nodes_in(&self, _path: &str) -> Vec<(u32, NodeId)> {
+        Vec::new()
+    }
+    /// Takes in the server's outline of `path` (a table with no live layer
+    /// ignores it). A second call for the same file replaces what the first
+    /// one learned.
+    fn learn(&self, _path: &str, _members: &[Member]) {}
+    /// Whether the server's outline of `path` would add to the table: true
+    /// until it is learned, never for a table with no live layer.
+    fn outline_wanted(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// The places of the SCIP graph's nodes.
@@ -239,14 +273,23 @@ impl SymbolPlaces for ScipPlaces {
     }
 
     fn defined_in(&self, path: &str, lines: (u32, u32), name: &str) -> Option<NodeId> {
-        self.by_file
-            .get(path)?
+        let nodes = self.by_file.get(path)?;
+        let named = |id: &NodeId| matches!(id, NodeId::Symbol(key) if key.name == name);
+        // The name's own line first: a range that now runs to the end of the
+        // item must not re-target the edge to a same-named symbol inside it.
+        nodes
             .iter()
-            .find(|(line, id)| {
-                (lines.0..=lines.1).contains(line)
-                    && matches!(id, NodeId::Symbol(key) if key.name == name)
+            .find(|(line, id)| *line == lines.0 && named(id))
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .find(|(line, id)| (lines.0..=lines.1).contains(line) && named(id))
             })
             .map(|(_, id)| id.clone())
+    }
+
+    fn nodes_in(&self, path: &str) -> Vec<(u32, NodeId)> {
+        self.by_file.get(path).cloned().unwrap_or_default()
     }
 
     fn enclosing(&self, path: &str, line: u32) -> Option<NodeId> {
@@ -428,6 +471,7 @@ impl LspBackend for ManagerBackend {
                 Some(Member {
                     name: location.name.clone()?,
                     end_line: location.end_line.checked_sub(1)?,
+                    kind: location.kind,
                     place: places(vec![location]).pop()?,
                 })
             })
@@ -629,9 +673,26 @@ impl LspLive {
     async fn ask(&self, node: &NodeId, max_calls: u32, found: &mut Found) -> Result<(), String> {
         match node {
             NodeId::Symbol(_) => {
-                let Some(at) = self.places.place_of(node) else {
+                let Some(mut at) = self.places.place_of(node) else {
                     return Ok(());
                 };
+                // Under `places = outline` the symbol's file is outlined once,
+                // before the first request at it, and the live place replaces
+                // the index's. A failed outline keeps the index's place and
+                // counts as asked: the file is not asked again.
+                if self.places.outline_wanted(&at.path) && found.calls < max_calls {
+                    found.calls += 1;
+                    match self.backend.document_symbols(&at.path).await {
+                        Ok(members) => self.places.learn(&at.path, &members),
+                        Err(error) => {
+                            self.fail(format!("textDocument/documentSymbol: {error}"));
+                            self.places.learn(&at.path, &[]);
+                        }
+                    }
+                    if let Some(live) = self.places.place_of(node) {
+                        at = live;
+                    }
+                }
                 if found.calls < max_calls {
                     found.calls += 1;
                     for place in self.backend.definition(&at).await? {
@@ -696,7 +757,17 @@ impl LspLive {
             }
             NodeId::File { path } | NodeId::Chunk { path, .. } if found.calls < max_calls => {
                 found.calls += 1;
-                for member in self.backend.document_symbols(path).await? {
+                let members = match self.backend.document_symbols(path).await {
+                    Ok(members) => members,
+                    Err(error) => {
+                        // Asked, whatever the answer: no symbol of this file
+                        // asks for its outline again.
+                        self.places.learn(path, &[]);
+                        return Err(error);
+                    }
+                };
+                self.places.learn(path, &members);
+                for member in members {
                     let lines = (member.place.line, member.end_line);
                     if let Some(dst) =
                         self.places
