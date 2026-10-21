@@ -42,6 +42,13 @@ pub struct CompareOptions {
     pub seed: u64,
     /// Number of bootstrap resamples (at least one is always used).
     pub resamples: usize,
+    /// Keep the pairs in which either side's language server missed
+    /// `lsp_search_budget_ms` (`QueryMetrics::lsp_budget_hit`). Off by
+    /// default: such a query measured a cold start, not retrieval, so
+    /// [`compare`] leaves its pair out and counts it in `budget_hit_*`.
+    /// `--keep-failed` on `compare` and `evaluate --baseline`, the flag
+    /// name `maps compare` uses for the same choice.
+    pub keep_failed: bool,
 }
 
 impl Default for CompareOptions {
@@ -49,6 +56,7 @@ impl Default for CompareOptions {
         Self {
             seed: DEFAULT_SEED,
             resamples: DEFAULT_RESAMPLES,
+            keep_failed: false,
         }
     }
 }
@@ -162,6 +170,17 @@ pub struct ComparisonReport {
     pub skipped_baseline: usize,
     /// Of those, how many were skipped in the candidate report.
     pub skipped_candidate: usize,
+    /// Matched, executed queries left out because at least one side had a
+    /// language server past its search budget (see
+    /// [`CompareOptions::keep_failed`]). Zero when they are kept.
+    #[serde(default)]
+    pub budget_hit_pairs: usize,
+    /// Of those, how many had the hit in the baseline report.
+    #[serde(default)]
+    pub budget_hit_baseline: usize,
+    /// Of those, how many had the hit in the candidate report.
+    #[serde(default)]
+    pub budget_hit_candidate: usize,
     /// Baseline queries with no counterpart in the candidate report.
     pub unpaired_baseline: usize,
     /// Candidate queries with no counterpart in the baseline report.
@@ -225,7 +244,10 @@ pub fn compare_files(
 /// Queries are paired by `(workspace, query text)`. When a key occurs
 /// several times in one report (the same text with different filters, say),
 /// its occurrences pair in order. A matched query that was skipped on either
-/// side is excluded from the pairs and counted in `skipped_*`; a query with
+/// side is excluded from the pairs and counted in `skipped_*`; so is one in
+/// which either side had a language server past its search budget
+/// (`lsp_budget_hit`), counted in `budget_hit_*`, unless
+/// [`CompareOptions::keep_failed`]; a query with
 /// no counterpart is listed under `unpaired_*`. Failed queries are not
 /// skipped: they pair with zero metrics, like any miss.
 pub fn compare(
@@ -247,6 +269,9 @@ pub fn compare(
     let mut skipped_pairs = 0;
     let mut skipped_baseline = 0;
     let mut skipped_candidate = 0;
+    let mut budget_hit_pairs = 0;
+    let mut budget_hit_baseline = 0;
+    let mut budget_hit_candidate = 0;
     let mut unpaired_baseline_queries = Vec::new();
     for base in &baseline.queries {
         let key = (base.query.workspace.as_str(), base.query.query.as_str());
@@ -258,6 +283,12 @@ pub fn compare(
             skipped_pairs += 1;
             skipped_baseline += usize::from(base.skipped);
             skipped_candidate += usize::from(cand.skipped);
+            continue;
+        }
+        if !options.keep_failed && (base.metrics.lsp_budget_hit || cand.metrics.lsp_budget_hit) {
+            budget_hit_pairs += 1;
+            budget_hit_baseline += usize::from(base.metrics.lsp_budget_hit);
+            budget_hit_candidate += usize::from(cand.metrics.lsp_budget_hit);
             continue;
         }
         pairs.push(pair_up(base, cand));
@@ -292,6 +323,9 @@ pub fn compare(
         skipped_pairs,
         skipped_baseline,
         skipped_candidate,
+        budget_hit_pairs,
+        budget_hit_baseline,
+        budget_hit_candidate,
         unpaired_baseline: unpaired_baseline_queries.len(),
         unpaired_candidate: unpaired_candidate_queries.len(),
         unpaired_baseline_queries,
@@ -459,13 +493,16 @@ impl ComparisonReport {
         }
         let _ = writeln!(
             out,
-            "  pairs: {} | unpaired: baseline {}, candidate {} | skipped on either side: {} (baseline {}, candidate {})",
+            "  pairs: {} | unpaired: baseline {}, candidate {} | skipped on either side: {} (baseline {}, candidate {}) | LSP budget hit on either side, left out: {} (baseline {}, candidate {})",
             self.paired,
             self.unpaired_baseline,
             self.unpaired_candidate,
             self.skipped_pairs,
             self.skipped_baseline,
             self.skipped_candidate,
+            self.budget_hit_pairs,
+            self.budget_hit_baseline,
+            self.budget_hit_candidate,
         );
         let _ = writeln!(
             out,

@@ -1590,6 +1590,7 @@ fn the_interval_is_reproducible_for_a_seed_and_moves_with_it() {
             &CompareOptions {
                 seed,
                 resamples: DEFAULT_RESAMPLES,
+                ..CompareOptions::default()
             },
         )
     };

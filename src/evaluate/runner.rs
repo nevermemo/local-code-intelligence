@@ -11,8 +11,8 @@ use crate::store::Hit;
 use super::definition::validate_definition;
 use super::metrics::aggregate;
 use super::types::{
-    AggregateReport, CandidateArm, EvalTimings, EvaluationFile, IndexLifecycleAction, QueryReport,
-    ResultEvidence, bounded_snippet,
+    AggregateReport, CandidateArm, EvalTimings, EvaluationFile, IndexLifecycleAction,
+    PrimingOutcome, QueryReport, ResultEvidence, bounded_snippet,
 };
 // ---------------------------------------------------------------------------
 // Execution
@@ -102,7 +102,7 @@ fn lane_evidence(
 }
 
 /// Switches of one evaluation run that never change what it measures.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunOptions {
     /// Record, for every executed query, the whole fused candidate pool and
     /// the retrieval configuration it came from (`evaluate
@@ -110,6 +110,22 @@ pub struct RunOptions {
     /// without services. Results, metrics, and every other field of the
     /// report are the same with it on or off.
     pub dump_candidates: bool,
+    /// Start and prime the language servers before the first query of each
+    /// workspace (when `[channels] lsp` is on), so that no query's latency or
+    /// budget hit is the cost of a cold start; the outcome is recorded in
+    /// the report's `priming`. On by default. Off (`evaluate --no-prime`) the
+    /// first query pays the start, which is what a cold-start measurement
+    /// wants. It changes which query pays the start, never a ranking.
+    pub prime: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            dump_candidates: false,
+            prime: true,
+        }
+    }
 }
 
 /// Execute all queries in an evaluation definition against the supplied
@@ -152,6 +168,8 @@ pub async fn run_evaluation_with_options(
         .collect();
 
     let mut reports: Vec<QueryReport> = Vec::with_capacity(file.queries.len());
+    let mut priming: BTreeMap<String, BTreeMap<String, PrimingOutcome>> = BTreeMap::new();
+    let mut primed_workspaces: BTreeSet<&str> = BTreeSet::new();
     for query in &file.queries {
         let workspace_path = match provided.get(query.workspace.as_str()) {
             Some(path) => *path,
@@ -168,6 +186,47 @@ pub async fn run_evaluation_with_options(
                 continue;
             }
         };
+
+        // The first query of a workspace key finds its language servers
+        // started and primed. A failure is recorded, never fatal: the query
+        // then runs as it would have without priming.
+        if options.prime
+            && app.config.channels.lsp
+            && primed_workspaces.insert(query.workspace.as_str())
+        {
+            let timeout = std::time::Duration::from_secs(app.config.lsp_timeout_seconds);
+            let outcomes = match app.prime_language_servers(workspace_path, timeout).await {
+                Ok(outcomes) => outcomes
+                    .into_iter()
+                    .map(|(provider, outcome)| {
+                        let outcome = match outcome {
+                            Ok(elapsed) => PrimingOutcome {
+                                primed: true,
+                                ms: elapsed.as_secs_f64() * 1000.0,
+                                error: None,
+                            },
+                            Err(error) => PrimingOutcome {
+                                primed: false,
+                                ms: 0.0,
+                                error: Some(format!("{error:#}")),
+                            },
+                        };
+                        (provider.to_owned(), outcome)
+                    })
+                    .collect(),
+                Err(error) => BTreeMap::from([(
+                    "workspace".to_owned(),
+                    PrimingOutcome {
+                        primed: false,
+                        ms: 0.0,
+                        error: Some(format!("{error:#}")),
+                    },
+                )]),
+            };
+            if !outcomes.is_empty() {
+                priming.insert(query.workspace.clone(), outcomes);
+            }
+        }
 
         let filter_request = query.filters.clone().unwrap_or_default();
         let search_options = SearchOptions {
@@ -240,6 +299,14 @@ pub async fn run_evaluation_with_options(
         if !unscored.is_empty() {
             query_report = query_report.with_unscored_evidence(unscored);
         }
+        // Which providers missed `lsp_search_budget_ms`, from the report's
+        // structured field (the note stays text for a dump).
+        query_report.metrics.lsp_budget_hit = !report.lsp_over_budget.is_empty();
+        query_report.metrics.lsp_providers_over_budget = report
+            .lsp_over_budget
+            .iter()
+            .map(|provider| (*provider).to_owned())
+            .collect();
         // The docs list is never longer than `[docs_lane].top_k`, whatever
         // the query asks for; say so when that, not the index, bounded it.
         if let (EvalLane::Docs | EvalLane::Union, Some(docs)) = (lane, docs_list_len) {
@@ -266,7 +333,9 @@ pub async fn run_evaluation_with_options(
         reports.push(query_report);
     }
 
-    Ok(aggregate(&reports))
+    let mut aggregated = aggregate(&reports);
+    aggregated.priming = priming;
+    Ok(aggregated)
 }
 
 pub fn has_failures(report: &AggregateReport) -> bool {
