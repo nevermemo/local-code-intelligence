@@ -59,7 +59,8 @@ off) is the configuration `--lci-config` names and must be stated with any A1
 result. The calls inside `lci` (embedder, reranker) are not counted:
 `model_calls` is 0.
 
-A2 keeps the raw traversal reply. A traversal that stopped on its deadline, or
+A2 keeps the raw traversal reply. A traversal that stopped on its deadline or
+another budget (pops, tokens, external calls, the `lsp.live` deadline), or
 with map or reranker failures (the flags `maps bench` computes,
 `ItemFlags::from_raw`), is written to `raw/<item>.json`, which `maps compare`
 reads: such a pair is excluded unless `--keep-failed`. `meta.json` counts them

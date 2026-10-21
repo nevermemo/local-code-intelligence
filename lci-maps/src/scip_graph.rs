@@ -98,7 +98,17 @@ fn normalize_range(raw: &[i32]) -> Option<Range> {
     }
 }
 
-/// Reads the documents and occurrences of a SCIP index file.
+/// The documentation of the function and method symbols of an index, by
+/// symbol: the `SymbolInformation.documentation` lines joined by `\n`, cut at
+/// [`MAX_DOC_BYTES`]. A symbol with none is not in the table.
+pub type SymbolDocs = HashMap<String, String>;
+
+/// Longest documentation text kept for a symbol, in bytes (cut on a character
+/// boundary).
+pub const MAX_DOC_BYTES: usize = 1024;
+
+/// Reads the documents and occurrences of a SCIP index file. The documentation
+/// of the symbols is not read; see [`read_symbol_docs`].
 pub fn read_documents(path: &Path) -> Result<Vec<RawDocument>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let index = scip::types::Index::parse_from_bytes(&bytes)
@@ -123,6 +133,66 @@ pub fn read_documents(path: &Path) -> Result<Vec<RawDocument>, String> {
         });
     }
     Ok(documents)
+}
+
+/// The documentation of the function and method symbols (the symbols a graph
+/// node can be) of a SCIP index file, each cut at [`MAX_DOC_BYTES`] before it
+/// is copied. It parses the file again and only the entity seeds
+/// (`[run_profile.seeds] bm25`) ask for it: the graph keeps no documentation.
+pub fn read_symbol_docs(path: &Path) -> Result<SymbolDocs, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let index = scip::types::Index::parse_from_bytes(&bytes)
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let mut docs = SymbolDocs::new();
+    for info in index
+        .documents
+        .iter()
+        .flat_map(|document| &document.symbols)
+    {
+        if !info.symbol.ends_with("().")
+            || info.symbol.starts_with("local ")
+            || docs.contains_key(&info.symbol)
+        {
+            continue;
+        }
+        let mut text = String::new();
+        for line in &info.documentation {
+            if text.len() >= MAX_DOC_BYTES {
+                break;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(cut_to_boundary(line, MAX_DOC_BYTES));
+        }
+        let text = cut_to_boundary(text.trim(), MAX_DOC_BYTES);
+        if !text.is_empty() {
+            docs.insert(info.symbol.clone(), text.to_owned());
+        }
+    }
+    Ok(docs)
+}
+
+/// The names of a symbol's path, outermost first: the package, then each
+/// descriptor (modules, types, the member). The `impl` marker of a trait-impl
+/// member is left out. Empty for a symbol that does not parse.
+pub fn symbol_path_names(symbol: &str) -> Vec<String> {
+    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+        return Vec::new();
+    };
+    std::iter::once(parsed.package.name.clone())
+        .chain(parsed.descriptors.iter().map(|d| d.name.clone()))
+        .filter(|name| !name.is_empty() && name != "impl")
+        .collect()
+}
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn cut_to_boundary(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2326,6 +2396,73 @@ mod tests {
         assert_eq!(graph.report.documents, 0);
         let map = ScipMap::with_default_ids(graph);
         assert!(map.graph().nodes.is_empty());
+    }
+
+    /// An index file with one document: `alpha` carries two documentation
+    /// lines, `beta` a long one, `gamma` none, and a type symbol has some too.
+    #[test]
+    fn read_symbol_docs_keeps_function_documentation_cut_at_the_limit() {
+        use scip::types::{Document, Index, Occurrence, SymbolInformation, SymbolRole};
+
+        let (alpha, beta, gamma) = (sym("a/alpha()."), sym("a/beta()."), sym("a/gamma()."));
+        let ty = sym("a/Thing#");
+        let mut document = Document::new();
+        document.relative_path = "a.rs".into();
+        for (i, symbol) in [&alpha, &beta, &gamma].into_iter().enumerate() {
+            let mut occurrence = Occurrence::new();
+            occurrence.range = vec![i as i32, 3, 8];
+            occurrence.symbol = symbol.clone();
+            occurrence.symbol_roles = SymbolRole::Definition as i32;
+            document.occurrences.push(occurrence);
+        }
+        let long = "é".repeat(MAX_DOC_BYTES);
+        for (symbol, lines) in [
+            (
+                &alpha,
+                vec![
+                    "```rust\nfn alpha()\n```".to_owned(),
+                    "Parses the config.".to_owned(),
+                ],
+            ),
+            (&beta, vec![long.clone()]),
+            (&gamma, vec!["  ".to_owned()]),
+            (&ty, vec!["A type, not a node.".to_owned()]),
+        ] {
+            let mut info = SymbolInformation::new();
+            info.symbol = symbol.clone();
+            info.documentation = lines;
+            document.symbols.push(info);
+        }
+        let mut index = Index::new();
+        index.documents.push(document);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+
+        // The graph and `read_documents` carry no documentation: a load
+        // without the entity seeds does not read or keep any.
+        let documents = read_documents(&path).unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].occurrences.len(), 3);
+        assert_eq!(ScipGraph::load(&path, None).unwrap().nodes.len(), 3);
+
+        // Function symbols with a non-blank line only, the lines joined.
+        let docs = read_symbol_docs(&path).unwrap();
+        assert_eq!(docs.len(), 2, "{docs:?}");
+        assert!(!docs.contains_key(&ty));
+        assert_eq!(docs[&alpha], "```rust\nfn alpha()\n```\nParses the config.");
+        // Cut at MAX_DOC_BYTES on a character boundary (`é` is two bytes).
+        let beta_doc = &docs[&beta];
+        assert_eq!(beta_doc.len(), MAX_DOC_BYTES);
+        assert!(beta_doc.chars().all(|c| c == 'é'));
+        assert!(!docs.contains_key(&gamma));
+        assert!(read_symbol_docs(&dir.path().join("missing.scip")).is_err());
+        // The path names of a symbol: the package, then the descriptors.
+        assert_eq!(
+            symbol_path_names(&sym("a/Thing#run().")),
+            ["demo", "a", "Thing", "run"]
+        );
+        assert!(symbol_path_names("not a symbol").is_empty());
     }
 
     #[test]

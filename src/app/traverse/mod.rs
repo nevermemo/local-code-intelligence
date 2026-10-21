@@ -23,6 +23,15 @@
 //!   symbol names (map `seeds.scip_names`). Used only when the caller asked
 //!   for that map alone, or as the visible fallback when the hybrid search is
 //!   unavailable or finds nothing; the response says why (`seed_fallback`).
+//! * `hybrid+bm25`, `bm25`: with `[run_profile.seeds] bm25 = true`, the map
+//!   `seeds.bm25` ranks the SCIP graph's functions and methods by BM25 over
+//!   the tokens of their name, qualified path and documentation (the
+//!   scorer of the ripgrep channel, over entities). Its top `seed_k` nodes
+//!   that the hybrid search did not already give go after the hybrid nodes
+//!   (`hybrid+bm25`), or are the start nodes when the hybrid search gave none
+//!   (`bm25`, which also keeps the stand-in from running). With the key off
+//!   the map is unknown to the call: naming it gives a note and no seeds,
+//!   and nothing else changes.
 //! * `traits`, `traits+hybrid`, `traits+name_tokens`: with `scip.implements`
 //!   on, a trait path or `Trait::method` path in a code span of the question
 //!   names trait or trait-method nodes, which the walk expands to the
@@ -127,6 +136,11 @@ pub const SEEDS_MAP: MapId = "seeds.scip_names";
 /// The map of the start nodes the hybrid search found (`seed_source`
 /// `hybrid`).
 pub const SEEDS_HYBRID: MapId = "seeds.hybrid";
+/// The map of the start nodes BM25 over the graph's symbol names, paths and
+/// documentation finds (`seed_source` `hybrid+bm25` or `bm25`). Opt-in: it
+/// runs only when `[run_profile.seeds] bm25` is on, and then it is part of
+/// the default set of a call that names no maps.
+pub const SEEDS_BM25: MapId = "seeds.bm25";
 /// The maps a traversal can use, in registration order. All of them are on
 /// unless the caller names the ones it wants; `structure.contains` is what
 /// lets a chunk or file start node (what the hybrid search often finds) reach
@@ -151,7 +165,7 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 11] = [
+pub const OPT_IN_MAPS: [MapId; 12] = [
     GREP_LIVE_MAP_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
@@ -163,6 +177,7 @@ pub const OPT_IN_MAPS: [MapId; 11] = [
     LSP_LIVE_ID,
     EXACT_CLOSURE_ID,
     EXACT_PICKAXE_ID,
+    SEEDS_BM25,
 ];
 /// The note of a call that names `probe.compile` without the trust grant.
 const PROBE_COMPILE_SKIPPED_NOTE: &str = "probe.compile skipped: cargo check would run the tree's build scripts and procedural macros; set rust_analyzer_trusted = true in the main configuration for a trusted tree";
@@ -274,7 +289,8 @@ pub struct Call<'a> {
     pub seed_search: Option<&'a dyn SeedSearch>,
     /// Results to return, 1 through 40.
     pub top_k: usize,
-    /// The maps to use; `None` is all of [`MAPS`] (not [`OPT_IN_MAPS`]).
+    /// The maps to use; `None` is all of [`MAPS`] (not [`OPT_IN_MAPS`]), and
+    /// [`SEEDS_BM25`] with `[run_profile.seeds] bm25`.
     pub maps: Option<&'a [String]>,
     pub budget: &'a BudgetArgs,
     pub steer: &'a SteerArgs,
@@ -290,6 +306,16 @@ pub struct Call<'a> {
     /// manager of its own, the recipes) starts the call's own servers as under
     /// `per_call`. Under `per_call` it is never read.
     pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
+}
+
+/// The language-server manager of one `lsp.live` walk under
+/// `[run_profile.lsp] sessions = "per_call"` (or with no shared manager):
+/// built from the call's settings, and never syncing whatever
+/// `[run_profile.lsp] sync` says, since its servers start on the tree as it is
+/// and stop with the walk.
+pub fn per_call_manager(call: &Call<'_>) -> Arc<lci_core::lsp::Manager> {
+    let defaults = lci_core::config::Config::default();
+    Arc::new(lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults)).without_sync())
 }
 
 /// Where a call keeps what it writes.
@@ -522,6 +548,7 @@ pub async fn run_with_trait_seeds(
     if call.top_k == 0 || call.top_k > MAX_TOP_K {
         bail!("top_k must be 1 through {MAX_TOP_K}");
     }
+    let mut bm25_off_note: Option<String> = None;
     let known_map = |id: &str| {
         MAPS.iter()
             .chain(&OPT_IN_MAPS)
@@ -564,6 +591,23 @@ pub async fn run_with_trait_seeds(
         }
         Some(ids) => ids.iter().map(|id| known_map(id)).collect::<Result<_>>()?,
     };
+    // `[run_profile.seeds] bm25`: the map is in the default set only when the
+    // key is on; with it off a call that names the map gets a note and the
+    // map is not part of the call (nothing registers, nothing seeds).
+    let mut wanted = wanted;
+    if profile.seeds.bm25 {
+        if call.maps.is_none() && !wanted.contains(&SEEDS_BM25) {
+            wanted.push(SEEDS_BM25);
+        }
+    } else if wanted.contains(&SEEDS_BM25) {
+        wanted.retain(|id| *id != SEEDS_BM25);
+        if call.maps.is_some() {
+            bm25_off_note = Some(
+                "seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes"
+                    .to_owned(),
+            );
+        }
+    }
     // The policy's first_k and seed_k take the place of the [traverse] keys.
     let tuned;
     let limits = if policy.first_k.is_some() || policy.seed_k.is_some() {
@@ -576,7 +620,12 @@ pub async fn run_with_trait_seeds(
     } else {
         limits
     };
-    if wanted.iter().any(|id| OPT_IN_MAPS.contains(id)) && call.scip_root.is_none() {
+    // `seeds.bm25` reads the SCIP graph only, not the tree.
+    if wanted
+        .iter()
+        .any(|id| *id != SEEDS_BM25 && OPT_IN_MAPS.contains(id))
+        && call.scip_root.is_none()
+    {
         bail!("the maps named beyond the defaults read the tree: give its root");
     }
     let priors = match (&limits.priors, &limits.question_type) {
@@ -590,6 +639,7 @@ pub async fn run_with_trait_seeds(
         .transpose()?;
     let (mut budget, mut warnings) = clamp_budget(limits, call.budget);
     let mut notes = Vec::new();
+    notes.extend(bm25_off_note);
     if !skipped_maps.is_empty() {
         notes.push(format!(
             "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
@@ -786,6 +836,17 @@ pub async fn run_with_trait_seeds(
         Box::new(SeedMap::name_tokens()),
         wants(SEEDS_MAP),
     )?;
+    // Registered only when the call runs it, so a call without it (the
+    // default) lists and traces the maps it always did.
+    if wants(SEEDS_BM25) {
+        register(
+            &mut registry,
+            &mut plan_maps,
+            &observer,
+            Box::new(SeedMap::bm25()),
+            true,
+        )?;
+    }
     register(
         &mut registry,
         &mut plan_maps,
@@ -930,7 +991,7 @@ pub async fn run_with_trait_seeds(
                 let settings = call.lsp.unwrap_or(&defaults);
                 let manager = match (profile.lsp.sessions, &call.lsp_sessions) {
                     (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
-                    _ => Arc::new(lci_core::lsp::Manager::new(settings)),
+                    _ => per_call_manager(call),
                 };
                 // The version probe is bounded like the readiness probes.
                 let probe =

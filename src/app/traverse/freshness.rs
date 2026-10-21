@@ -71,10 +71,11 @@ type Files = HashMap<String, CachedFile>;
 
 /// The maps built from the SCIP index and the tree: stale when the tree
 /// differs from the baseline of the index's stamp.
-const SCIP_BUILT: [MapId; 7] = [
+const SCIP_BUILT: [MapId; 8] = [
     "graph.scip",
     "structure.contains",
     "seeds.scip_names",
+    "seeds.bm25",
     "exact.closure",
     "config.key",
     "scip.impact",

@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, LspSync},
     language,
     lsp::{
         adapter::LspAdapter,
@@ -37,6 +37,7 @@ pub mod java;
 mod job;
 pub mod python;
 pub mod rust;
+pub mod sync;
 pub mod transport;
 pub mod typescript;
 
@@ -453,6 +454,10 @@ impl Session {
     ///   same lock), so this cannot release a server between a caller
     ///   finding it and its request;
     /// - nobody has asked for it for `idle`.
+    ///
+    /// So a session whose start failed (no ready client) is never released
+    /// here: it stays in the registry, and keeps its workspace's sync, until
+    /// the next caller replaces it, a release or a shutdown.
     fn idle_and_unused(self: &Arc<Self>, idle: Duration) -> bool {
         self.ready_client().is_some()
             && *self.primed.borrow()
@@ -586,6 +591,19 @@ impl OutlineCache {
         );
         true
     }
+
+    /// Drops every outline of `workspace_id` kept for a path of `changes`
+    /// (whichever provider and session answered it): a synced change may be
+    /// one the server now sees differently.
+    fn forget(&mut self, workspace_id: &str, changes: &[sync::FileChange]) {
+        let paths: HashSet<&str> = changes
+            .iter()
+            .map(|change| change.relative.as_str())
+            .collect();
+        self.entries.retain(|(_, id, relative), _| {
+            id != workspace_id || !paths.contains(relative.as_str())
+        });
+    }
 }
 
 /// The [`content_hash`] of `file` as an outline key, or `None` when it is not
@@ -623,9 +641,31 @@ async fn outline_hash(file: &Path) -> Option<String> {
 /// session transparently. A session whose server has answered nothing but
 /// transient errors for `lsp_stuck_seconds` is replaced the same way (see
 /// [`Manager::send`]).
+///
+/// Under `[run_profile.lsp] sync = "watch"` the first session of a workspace
+/// starts a [`sync::WorkspaceSync`] for it, which sends every source-file
+/// change to the workspace's sessions as `workspace/didChangeWatchedFiles`
+/// and drops the changed files' kept outlines; every request first drains
+/// what the watcher has reported ([`Self::client`]). The sync stops when the
+/// workspace's last session goes: [`Self::release`], [`Self::shutdown_all`]
+/// or the idle sweeper. A per-call manager ([`Self::without_sync`]) never
+/// syncs.
+///
+/// Lock order: a sync's drain lock, then the session registry (the sink
+/// collects the workspace's sessions under it and sends after letting it
+/// go), then `syncs` (a `std` mutex, never held across an await). A request
+/// takes the registry and lets it go before it drains, so no path holds the
+/// registry while it waits for a drain.
 pub struct Manager {
     adapters: Vec<Arc<dyn LspAdapter>>,
     sessions: Arc<Sessions>,
+    /// `[run_profile.lsp] sync`, `Off` for a per-call manager.
+    sync: LspSync,
+    /// `watch_poll_milliseconds`: the interval of the polling watcher a sync
+    /// falls back to.
+    poll_interval: Duration,
+    /// The running syncs by workspace id, one per workspace with a session.
+    syncs: Arc<Syncs>,
     /// `lsp_stuck_seconds`: how long a session may answer nothing but transient
     /// errors before it is replaced. `None` never replaces it.
     stuck_after: Option<Duration>,
@@ -634,7 +674,86 @@ pub struct Manager {
     probed: std::sync::Mutex<HashSet<&'static str>>,
     /// The kept outlines, `Some` only under `[run_profile.lsp]
     /// outline_cache = true` (see [`Self::document_symbols`]).
-    outlines: Option<std::sync::Mutex<OutlineCache>>,
+    outlines: Option<Arc<std::sync::Mutex<OutlineCache>>>,
+}
+
+/// The running syncs of a [`Manager`], by workspace id.
+type Syncs = std::sync::Mutex<HashMap<String, Arc<sync::WorkspaceSync>>>;
+
+/// Stops the syncs of the workspaces that have no session left in
+/// `sessions` (called under the registry lock; a sync's drop only signals
+/// its watcher and task, it waits for nothing).
+fn prune_syncs(sessions: &HashMap<SessionKey, Arc<Session>>, syncs: &Syncs) {
+    syncs
+        .lock()
+        .unwrap()
+        .retain(|id, _| sessions.keys().any(|(_, workspace)| workspace == id));
+}
+
+const DID_CHANGE_WATCHED_FILES: &str = "workspace/didChangeWatchedFiles";
+
+/// The sink of a workspace's sync: drops the kept outlines of the changed
+/// files, then sends the batch to every session of the workspace. A started
+/// server gets it at once; a server still starting gets it on a task of its
+/// own once it has started (a failed start drops it: the next server walks
+/// the disk anyway).
+fn forward_to_sessions(
+    registry: Weak<Sessions>,
+    outlines: Option<Arc<std::sync::Mutex<OutlineCache>>>,
+    workspace: Workspace,
+) -> sync::Sink {
+    Arc::new(move |batch: Vec<sync::FileChange>| {
+        let (registry, outlines, workspace) =
+            (registry.clone(), outlines.clone(), workspace.clone());
+        Box::pin(async move {
+            if let Some(cache) = &outlines {
+                cache.lock().unwrap().forget(&workspace.id, &batch);
+            }
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            let sessions: Vec<Arc<Session>> = registry
+                .lock()
+                .await
+                .iter()
+                .filter(|((_, id), _)| *id == workspace.id)
+                .map(|(_, session)| Arc::clone(session))
+                .collect();
+            drop(registry);
+            let changes: Vec<Value> = batch
+                .iter()
+                .filter_map(|change| {
+                    let uri =
+                        reqwest::Url::from_file_path(workspace.path.join(&change.relative)).ok()?;
+                    Some(json!({"uri": uri.to_string(), "type": change.kind.code()}))
+                })
+                .collect();
+            let params = json!({ "changes": changes });
+            for session in sessions {
+                if let Some(client) = session.ready_client() {
+                    if let Err(error) = client
+                        .rpc
+                        .notify(DID_CHANGE_WATCHED_FILES, params.clone())
+                        .await
+                    {
+                        tracing::debug!(
+                            provider = session.provider,
+                            workspace = %workspace.path.display(),
+                            error = %format!("{error:#}"),
+                            "language server was not told about file changes"
+                        );
+                    }
+                } else if !session.failed() {
+                    let params = params.clone();
+                    tokio::spawn(async move {
+                        if let Ok(client) = session.client().await {
+                            let _ = client.rpc.notify(DID_CHANGE_WATCHED_FILES, params).await;
+                        }
+                    });
+                }
+            }
+        })
+    })
 }
 
 impl Manager {
@@ -653,9 +772,11 @@ impl Manager {
             Arc::new(ClangdServer::new(&config.clangd, timeout)),
         ];
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let syncs = Arc::new(std::sync::Mutex::new(HashMap::new()));
         if config.lsp_idle_timeout_seconds > 0 {
             spawn_idle_sweeper(
                 Arc::downgrade(&sessions),
+                Arc::downgrade(&syncs),
                 Duration::from_secs(config.lsp_idle_timeout_seconds),
             );
         }
@@ -664,14 +785,79 @@ impl Manager {
         Self {
             adapters,
             sessions,
+            sync: config.run_profile.lsp.sync,
+            poll_interval: Duration::from_millis(config.watch_poll_milliseconds.max(1)),
+            syncs,
             stuck_after,
             probed: std::sync::Mutex::new(HashSet::new()),
             outlines: config
                 .run_profile
                 .lsp
                 .outline_cache
-                .then(|| std::sync::Mutex::new(OutlineCache::default())),
+                .then(|| Arc::new(std::sync::Mutex::new(OutlineCache::default()))),
         }
+    }
+
+    /// This manager without `[run_profile.lsp] sync`: a per-call manager
+    /// starts its servers on the tree as it is and stops them when the call
+    /// ends, so it watches nothing. Call before the first request.
+    #[must_use]
+    pub fn without_sync(mut self) -> Self {
+        self.sync = LspSync::Off;
+        self
+    }
+
+    /// `[run_profile.lsp] sync` as this manager applies it.
+    pub fn sync_mode(&self) -> LspSync {
+        self.sync
+    }
+
+    /// The counters of the workspace's sync; `None` when it has none (sync
+    /// off, or no live session).
+    pub fn sync_status(&self, workspace_id: &str) -> Option<sync::SyncStatus> {
+        self.sync_of(workspace_id).map(|sync| sync.status())
+    }
+
+    /// [`sync::WorkspaceSync::synced`] for the workspace: whether each of
+    /// `relatives` reached its servers as it is on disk now, within
+    /// `timeout`. `false` at once when the workspace has no sync.
+    pub async fn synced(&self, workspace_id: &str, relatives: &[&str], timeout: Duration) -> bool {
+        match self.sync_of(workspace_id) {
+            Some(sync) => sync.synced(relatives, timeout).await,
+            None => false,
+        }
+    }
+
+    fn sync_of(&self, workspace_id: &str) -> Option<Arc<sync::WorkspaceSync>> {
+        self.syncs.lock().unwrap().get(workspace_id).cloned()
+    }
+
+    /// Starts the workspace's sync under `sync = "watch"` unless it runs.
+    /// Called under the registry lock when a session begins, so a release
+    /// cannot slip between the two. It only spawns the sync's task: the
+    /// watcher is opened (inotify walks the tree to do so) and the first walk
+    /// runs on blocking threads of that task, never under this lock.
+    fn ensure_sync(&self, workspace: &Workspace) {
+        if self.sync != LspSync::Watch {
+            return;
+        }
+        let mut syncs = self.syncs.lock().unwrap();
+        if syncs.contains_key(&workspace.id) {
+            return;
+        }
+        let sink = forward_to_sessions(
+            Arc::downgrade(&self.sessions),
+            self.outlines.clone(),
+            workspace.clone(),
+        );
+        syncs.insert(
+            workspace.id.clone(),
+            Arc::new(sync::WorkspaceSync::start(
+                workspace.path.clone(),
+                self.poll_interval,
+                sink,
+            )),
+        );
     }
 
     /// [`LspAdapter::probe_readiness`] for the adapter, answered from memory
@@ -731,6 +917,7 @@ impl Manager {
         {
             tokio::spawn(replaced.shutdown(SHUTDOWN_GRACE));
         }
+        self.ensure_sync(workspace);
         session
     }
 
@@ -749,6 +936,11 @@ impl Manager {
         let client = session.client().await?;
         if after_priming {
             session.primed().await?;
+        }
+        // `sync = "watch"`: the changes the watcher has already reported
+        // reach the server before this request does.
+        if let Some(sync) = self.sync_of(&workspace.id) {
+            sync.drain_now().await;
         }
         // The start and priming can take far longer than the idle timeout
         // (a cold rust-analyzer): count the moment the caller finally has its
@@ -769,10 +961,12 @@ impl Manager {
     pub async fn release(&self, workspace_id: &str) -> Vec<&'static str> {
         let removed: Vec<Arc<Session>> = {
             let mut sessions = self.sessions.lock().await;
-            sessions
+            let removed = sessions
                 .extract_if(|(_, id), _| id == workspace_id)
                 .map(|(_, session)| session)
-                .collect()
+                .collect();
+            prune_syncs(&sessions, &self.syncs);
+            removed
         };
         let mut released = shut_down(removed).await;
         released.sort_unstable();
@@ -786,7 +980,9 @@ impl Manager {
     pub async fn shutdown_all(&self) -> usize {
         let removed: Vec<Arc<Session>> = {
             let mut sessions = self.sessions.lock().await;
-            sessions.drain().map(|(_, session)| session).collect()
+            let removed = sessions.drain().map(|(_, session)| session).collect();
+            prune_syncs(&sessions, &self.syncs);
+            removed
         };
         shut_down(removed).await.len()
     }
@@ -818,7 +1014,10 @@ impl Manager {
                 .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(current, failed))
             {
-                sessions.remove(&key)
+                let removed = sessions.remove(&key);
+                // The workspace's last session may have gone with it.
+                prune_syncs(&sessions, &self.syncs);
+                removed
             } else {
                 None
             }
@@ -1224,6 +1423,11 @@ impl Manager {
             workspace.id.clone(),
             relative.to_owned(),
         );
+        // `sync = "watch"`: a change already reported drops its outlines
+        // before they can answer.
+        if let Some(sync) = self.sync_of(&workspace.id) {
+            sync.drain_now().await;
+        }
         if let Some(session) = self.live_session_id(adapter, workspace).await {
             let kept = cache.lock().unwrap().get(&key, &hash, session);
             if let Some(kept) = kept {
@@ -1428,7 +1632,7 @@ async fn shut_down(removed: Vec<Arc<Session>>) -> Vec<&'static str> {
 /// outside the registry lock. It holds only a [`Weak`] reference to the registry and
 /// ends at its next wake-up once the [`Manager`] is dropped. Without a Tokio
 /// runtime nothing is spawned.
-fn spawn_idle_sweeper(registry: Weak<Sessions>, idle: Duration) {
+fn spawn_idle_sweeper(registry: Weak<Sessions>, syncs: Weak<Syncs>, idle: Duration) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::debug!("no async runtime; idle language servers are released only on request");
         return;
@@ -1440,12 +1644,19 @@ fn spawn_idle_sweeper(registry: Weak<Sessions>, idle: Duration) {
             let Some(sessions) = registry.upgrade() else {
                 return;
             };
-            let expired: Vec<Arc<Session>> = sessions
-                .lock()
-                .await
-                .extract_if(|_, session| session.idle_and_unused(idle))
-                .map(|(_, session)| session)
-                .collect();
+            let expired: Vec<Arc<Session>> = {
+                let mut guard = sessions.lock().await;
+                let expired = guard
+                    .extract_if(|_, session| session.idle_and_unused(idle))
+                    .map(|(_, session)| session)
+                    .collect();
+                // A workspace whose last session went here stops being
+                // watched.
+                if let Some(syncs) = syncs.upgrade() {
+                    prune_syncs(&guard, &syncs);
+                }
+                expired
+            };
             // The shutdowns take seconds: do not keep the registry alive
             // (or locked) meanwhile.
             drop(sessions);
@@ -2292,5 +2503,107 @@ mod tests {
         cache.put(key("one-more"), old.clone(), 1, &[symbol("y")]);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.get(&key("one-more"), &old, 1).is_some());
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    /// A manager whose C# server cannot start (its binary is missing), so a
+    /// request begins a session that fails at once.
+    fn manager(sync: LspSync) -> Manager {
+        let mut config = Config::default();
+        config.csharp.path = Some("definitely-missing-csharp-ls".into());
+        config.lsp_idle_timeout_seconds = 0;
+        config.run_profile.lsp.sync = sync;
+        Manager::new(&config)
+    }
+
+    fn workspace(temp: &tempfile::TempDir, name: &str) -> Workspace {
+        let path = temp.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let path = dunce::canonicalize(path).unwrap();
+        Workspace {
+            id: crate::workspace::hash(&path.to_string_lossy()),
+            path,
+        }
+    }
+
+    async fn ask(manager: &Manager, workspace: &Workspace) {
+        let csharp = Arc::clone(manager.adapters_for_language("csharp")[0]);
+        assert!(manager.symbols(&csharp, workspace, "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_sync_stops_with_the_workspaces_last_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (one, two) = (workspace(&temp, "one"), workspace(&temp, "two"));
+        let manager = manager(LspSync::Watch);
+        assert_eq!(manager.sync_mode(), LspSync::Watch);
+        assert!(manager.sync_status(&one.id).is_none(), "no session yet");
+        ask(&manager, &one).await;
+        ask(&manager, &two).await;
+        assert!(manager.sync_status(&one.id).is_some());
+        assert!(manager.sync_status(&two.id).is_some());
+        manager.release(&one.id).await;
+        assert!(manager.sync_status(&one.id).is_none(), "released");
+        assert!(manager.sync_status(&two.id).is_some(), "another workspace");
+        ask(&manager, &one).await;
+        assert!(manager.sync_status(&one.id).is_some(), "a new session");
+        manager.shutdown_all().await;
+        assert!(manager.sync_status(&one.id).is_none());
+        assert!(manager.sync_status(&two.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn no_sync_starts_when_it_is_off_or_the_manager_is_per_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = workspace(&temp, "one");
+        let off = manager(LspSync::Off);
+        ask(&off, &one).await;
+        assert!(off.sync_status(&one.id).is_none());
+        assert!(off.syncs.lock().unwrap().is_empty());
+        let per_call = manager(LspSync::Watch).without_sync();
+        assert_eq!(per_call.sync_mode(), LspSync::Off);
+        ask(&per_call, &one).await;
+        assert!(per_call.syncs.lock().unwrap().is_empty());
+        assert!(!per_call.synced(&one.id, &[], Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn a_synced_change_drops_the_files_kept_outlines_in_its_workspace_only() {
+        let symbol = Location {
+            file_path: PathBuf::from("a"),
+            relative_file_path: Some("src/a.cs".into()),
+            start_line: 1,
+            start_character: 0,
+            end_line: 1,
+            end_character: 1,
+            name: Some("A".into()),
+            kind: None,
+            language: None,
+            provider: None,
+        };
+        let mut cache = OutlineCache::default();
+        let key = |workspace: &str, path: &str| ("pyright", workspace.to_owned(), path.to_owned());
+        for (workspace, path) in [("w", "src/a.py"), ("w", "src/b.py"), ("v", "src/a.py")] {
+            cache.put(
+                key(workspace, path),
+                "h".into(),
+                1,
+                std::slice::from_ref(&symbol),
+            );
+        }
+        cache.forget(
+            "w",
+            &[sync::FileChange {
+                relative: "src/a.py".into(),
+                kind: sync::ChangeKind::Changed,
+            }],
+        );
+        assert!(cache.get(&key("w", "src/a.py"), "h", 1).is_none());
+        assert!(cache.get(&key("w", "src/b.py"), "h", 1).is_some());
+        assert!(cache.get(&key("v", "src/a.py"), "h", 1).is_some());
     }
 }

@@ -2,16 +2,19 @@
 //! search hits to graph nodes, and the descriptor-only seed maps.
 
 use super::first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID};
-use super::{Call, SEEDS_HYBRID, SEEDS_MAP, chunks, index::Loaded};
+use super::{Call, SEEDS_BM25, SEEDS_HYBRID, SEEDS_MAP, chunks, index::Loaded};
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow};
-use lci_core::node::{NodeId, NodeKind};
+use lci_core::{
+    lexical,
+    node::{NodeId, NodeKind},
+};
 use lci_maps::{
     Contribution, FreshnessModel, Map, MapDescriptor, MapId, MapRequest, MapResponse, MapStatus,
     SnapshotView, SourceLabel,
     contains::CONTAINS_MAP_ID,
     impact::code_names,
-    scip_graph::ScipMap,
+    scip_graph::{ScipMap, SymbolDocs, symbol_path_names},
     scip_implements::{ImplementsMap, SCIP_IMPLEMENTS_ID, TargetKind},
     search_maps::ChunkSearch,
     traverse::Seed,
@@ -68,6 +71,137 @@ impl NameSeeds {
             .into_iter()
             .take(limit)
             .map(|(n, id)| (id.clone(), n))
+            .collect()
+    }
+}
+
+/// BM25 over the SCIP graph's entities (`seeds.bm25`): each function or method
+/// node is a short document of three fields, the tokens of its name, of its
+/// qualified path (the symbol's package, modules, types and member, and the
+/// file's path segments) and of its documentation. The scorer is the one the
+/// ripgrep channel uses ([`lexical::score_chunks`]): a field that holds a
+/// query term is one credited line of the node, so a term's frequency is the
+/// number of fields (1 to 3) that hold it, its document frequency the number
+/// of nodes, and a node's length its token count.
+pub(super) struct Bm25Seeds {
+    ids: Vec<NodeId>,
+    /// Per node: the graph's `Owner::name`, for the seed's details.
+    names: Vec<String>,
+    /// Per node: the name, path and documentation tokens.
+    fields: Vec<[Vec<String>; 3]>,
+    /// Per node: its token count, at least 1.
+    lengths: Vec<u32>,
+}
+
+/// A token worth indexing: one a query term could match (three characters or
+/// more, no stop word) that is not a number.
+fn indexable(token: &str) -> bool {
+    lexical::usable_term(token) && !token.chars().all(|c| c.is_ascii_digit())
+}
+
+fn index_tokens(text: &str) -> Vec<String> {
+    tokenize(text)
+        .into_iter()
+        .filter(|token| indexable(token))
+        .collect()
+}
+
+impl Bm25Seeds {
+    /// The index over the graph's nodes; `docs` is the documentation of the
+    /// SCIP index by symbol (empty when it could not be read).
+    pub(super) fn new(scip: &ScipMap, docs: &SymbolDocs) -> Self {
+        let graph = scip.graph();
+        let mut ids = Vec::with_capacity(graph.nodes.len());
+        let mut names = Vec::with_capacity(graph.nodes.len());
+        let mut fields = Vec::with_capacity(graph.nodes.len());
+        let mut lengths = Vec::with_capacity(graph.nodes.len());
+        for (i, node) in graph.nodes.iter().enumerate() {
+            let name = index_tokens(&node.name);
+            let mut path: Vec<String> = Vec::new();
+            for part in symbol_path_names(&node.symbol) {
+                path.extend(index_tokens(&part));
+            }
+            let file = node
+                .file
+                .rsplit_once('.')
+                .map_or(&*node.file, |(stem, _)| stem);
+            for part in file.split(['/', '\\']) {
+                path.extend(index_tokens(part));
+            }
+            let doc = docs
+                .get(&node.symbol)
+                .map(|text| index_tokens(text))
+                .unwrap_or_default();
+            lengths.push(
+                u32::try_from(name.len() + path.len() + doc.len()).map_or(u32::MAX, |n| n.max(1)),
+            );
+            ids.push(scip.node_id(i).clone());
+            names.push(node.name.clone());
+            fields.push([name, path, doc]);
+        }
+        Self {
+            ids,
+            names,
+            fields,
+            lengths,
+        }
+    }
+
+    /// Bit `i` is set when query term `i` is held by one of `tokens`: a term
+    /// of at most [`lexical::WORD_MATCH_MAX_CHARS`] characters must be a whole
+    /// token, a longer one may be inside a token (the rule the ripgrep
+    /// channel's matcher applies to a line).
+    fn term_mask(terms: &[String], tokens: &[String]) -> u32 {
+        terms
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| {
+                if term.chars().count() <= lexical::WORD_MATCH_MAX_CHARS {
+                    tokens.iter().any(|token| token == *term)
+                } else {
+                    tokens.iter().any(|token| token.contains(term.as_str()))
+                }
+            })
+            .fold(0, |mask, (bit, _)| mask | 1 << bit)
+    }
+
+    /// The best `limit` nodes for the question, best first, with their BM25
+    /// score; those that hold none of its scoring terms are not returned.
+    pub(super) fn matches(&self, question: &str, limit: usize) -> Vec<(NodeId, String, f64)> {
+        let terms = lexical::query_terms(question);
+        if terms.is_empty() || self.ids.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for (node, fields) in self.fields.iter().enumerate() {
+            for tokens in fields {
+                let term_mask = Self::term_mask(&terms, tokens);
+                if term_mask != 0 {
+                    lines.push(lexical::CreditedLine {
+                        file: node,
+                        chunk: node,
+                        term_mask,
+                    });
+                }
+            }
+        }
+        let mut scored = lexical::score_chunks(terms.len(), self.ids.len(), &self.lengths, &lines);
+        // Equal scores keep the order of the node ids, not of the graph.
+        scored.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| self.ids[a.chunk].cmp(&self.ids[b.chunk]))
+        });
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|scored| {
+                (
+                    self.ids[scored.chunk].clone(),
+                    self.names[scored.chunk].clone(),
+                    scored.score,
+                )
+            })
             .collect()
     }
 }
@@ -432,7 +566,7 @@ pub(super) fn map_hits(loaded: &Loaded, question: &str, hits: &[SeedHit]) -> Vec
 /// A start-node or first-stage source as a registered map: its descriptor
 /// only. The walk never queries it; registering it puts its id in the
 /// selectors, the maps list and the trace (`seeds.hybrid`, `seeds.scip_names`,
-/// `exact.closure`, `exact.pickaxe`).
+/// `seeds.bm25`, `exact.closure`, `exact.pickaxe`).
 pub(super) struct SeedMap {
     descriptor: MapDescriptor,
 }
@@ -467,6 +601,16 @@ impl SeedMap {
     pub(super) fn name_tokens() -> Self {
         Self::new(
             SEEDS_MAP,
+            vec![NodeKind::Symbol],
+            vec![SourceLabel::Lexical],
+        )
+    }
+
+    /// The symbols whose name, path and documentation hold the question's
+    /// rare words (BM25 over the SCIP graph's entities).
+    pub(super) fn bm25() -> Self {
+        Self::new(
+            SEEDS_BM25,
             vec![NodeKind::Symbol],
             vec![SourceLabel::Lexical],
         )
@@ -514,8 +658,11 @@ fn parse_seeds(seeds: &[String]) -> Result<Vec<NodeId>> {
 pub(super) struct Seeds {
     pub(super) nodes: Vec<Seed>,
     /// Where the start nodes came from: `given`, `hybrid`, `name_tokens`,
+    /// `hybrid+bm25` (the hybrid search's nodes, then those of `seeds.bm25`),
+    /// `bm25` (`seeds.bm25` answered where the hybrid search did not),
     /// `traits` (the traits and trait methods the question's paths name, with
-    /// `scip.implements` on), `traits+hybrid`, `traits+name_tokens` or
+    /// `scip.implements` on), `traits+hybrid`, `traits+hybrid+bm25`,
+    /// `traits+bm25`, `traits+name_tokens` or
     /// `traits+exact` (those, with the other source's nodes after them),
     /// `exact` (the first stage's cards, set by `run`) or `none`; empty on a
     /// continuation.
@@ -553,9 +700,10 @@ impl Seeds {
     }
 }
 
-/// Finds the start nodes: the caller's, else the hybrid search's, else (when
-/// that is unavailable or finds nothing) the name-token stand-in, and the
-/// stand-in alone when it is the only seeds map wanted.
+/// Finds the start nodes: the caller's, else the hybrid search's, then (when
+/// `seeds.bm25` is wanted) the entities it adds after them, else (when none of
+/// those answered) the name-token stand-in, and the stand-in alone when it is
+/// the only seeds map wanted.
 pub(super) async fn find_seeds(
     limits: &TraverseConfig,
     call: &Call<'_>,
@@ -575,6 +723,7 @@ pub(super) async fn find_seeds(
     }
     let mut found = Seeds::default();
     let mut reason = None;
+    let mut hybrid_answered = false;
     if wanted.contains(&SEEDS_HYBRID) {
         match call.seed_search {
             None => {
@@ -625,13 +774,59 @@ pub(super) async fn find_seeds(
                             });
                             found.details.push(seed.info);
                         }
-                        return Ok(found);
+                        hybrid_answered = true;
                     }
                 }
             }
         }
     }
-    if wanted.contains(&SEEDS_MAP) {
+    // `seeds.bm25` (only in `wanted` under `[run_profile.seeds] bm25`): the
+    // entities whose name, path and documentation hold the question's rare
+    // words, after the hybrid search's nodes.
+    if wanted.contains(&SEEDS_BM25) && !call.question.trim().is_empty() {
+        let known: HashSet<NodeId> = found.nodes.iter().map(|seed| seed.node.clone()).collect();
+        let mut added = 0;
+        let index = loaded.bm25().await;
+        for (node, name, score) in index.matches(call.question, limits.seed_k as usize) {
+            if known.contains(&node) {
+                continue;
+            }
+            found.details.push(json!({
+                "node": node.to_string(),
+                "kind": "symbol",
+                "how": "bm25",
+                "symbol": name,
+                "retrievers": ["bm25"],
+                "score": score,
+                "score_kind": "bm25",
+            }));
+            found.nodes.push(Seed {
+                node,
+                map: Some(SEEDS_BM25),
+            });
+            added += 1;
+        }
+        if added > 0 {
+            if hybrid_answered {
+                found.source = "hybrid+bm25";
+            } else {
+                found.source = "bm25";
+                if let Some(reason) = reason.take() {
+                    found.notes.push(format!(
+                        "seed_source is bm25, the entity index over symbol names, paths and documentation: {reason}"
+                    ));
+                    found.fallback = Some(reason);
+                }
+            }
+        }
+    }
+    if hybrid_answered {
+        return Ok(found);
+    }
+    if !found.nodes.is_empty() {
+        // `seeds.bm25` answered where the hybrid search did not; the
+        // stand-in is reached only when neither did.
+    } else if wanted.contains(&SEEDS_MAP) {
         found.source = "name_tokens";
         for (node, matched) in loaded.names.matches(call.question, SEED_COUNT) {
             found.details.push(json!({
@@ -801,6 +996,8 @@ pub(super) fn add_trait_seeds(
         }
         found.source = match before {
             "hybrid" => "traits+hybrid",
+            "hybrid+bm25" => "traits+hybrid+bm25",
+            "bm25" => "traits+bm25",
             "name_tokens" => "traits+name_tokens",
             "exact" => "traits+exact",
             _ => "traits",

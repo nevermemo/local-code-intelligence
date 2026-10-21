@@ -503,6 +503,13 @@ fn score_item(set: Set, item: &Value, answers: &[Answer], opts: &Options) -> Ite
     }
 }
 
+/// The strata (dimension -> value) of one item of `set`, the ones its scorer
+/// reports under `strata`. They come from the item alone, so they do not depend
+/// on the answers; the bench groups costs by them.
+pub fn dims(set: Set, item: &Value) -> Vec<(&'static str, String)> {
+    score_item(set, item, &[], &Options { strict: false }).dims
+}
+
 /// Items a set leaves out of its scored population (impact keeps `primary`).
 fn is_scored(set: Set, item: &Value) -> bool {
     match set {

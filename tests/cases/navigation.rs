@@ -4789,6 +4789,19 @@ fn outline_fixture(
     temp: &tempfile::TempDir,
     outline_cache: bool,
 ) -> (Manager, Workspace, OutlineStates) {
+    outline_fixture_with(
+        temp,
+        outline_cache,
+        local_code_intelligence::config::LspSync::Off,
+    )
+}
+
+/// [`outline_fixture`] under `[run_profile.lsp] sync`.
+fn outline_fixture_with(
+    temp: &tempfile::TempDir,
+    outline_cache: bool,
+    sync: local_code_intelligence::config::LspSync,
+) -> (Manager, Workspace, OutlineStates) {
     let workspace_path = temp.path().join("workspace");
     let data_path = temp.path().join("data");
     let states = OutlineStates {
@@ -4826,6 +4839,7 @@ fn outline_fixture(
         disabled: false,
     };
     config.run_profile.lsp.outline_cache = outline_cache;
+    config.run_profile.lsp.sync = sync;
     (Manager::new(&config), workspace, states)
 }
 
@@ -4989,6 +5003,72 @@ async fn the_outline_cache_answers_by_content_hash_and_never_stores_an_empty_out
     manager.shutdown_all().await;
 }
 
+/// Under `outline_cache` and `[run_profile.lsp] sync = "watch"` (d424), a
+/// synced change drops the file's kept outline: an edit is answered with the
+/// new outline, and even the same bytes written again (a change the server
+/// was told about) are asked again instead of answered from memory.
+#[tokio::test]
+async fn a_synced_change_drops_the_files_kept_outline() {
+    use local_code_intelligence::config::LspSync;
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, workspace, states) = outline_fixture_with(&temp, true, LspSync::Watch);
+    let python = python_adapter(&manager);
+    let calculator = "src/calculator.py";
+    let first = ["Calculator", "add"];
+    for _ in 0..2 {
+        assert_eq!(
+            outline_names(&manager, &python, &workspace, calculator).await,
+            first
+        );
+    }
+    assert_eq!(outline_requests(&states.python, calculator), 1, "kept");
+    // The sync started with the session and has walked the tree.
+    assert!(manager.synced(&workspace.id, &[], LOADED_BUDGET).await);
+
+    // An edit, synced: the new outline.
+    let edited = format!("{CALCULATOR_PY}    def twice(self, a):\n        return a + a\n");
+    write(&workspace.path, calculator, &edited);
+    assert!(
+        manager
+            .synced(&workspace.id, &[calculator], LOADED_BUDGET)
+            .await
+    );
+    let second = ["Calculator", "add", "twice"];
+    for _ in 0..2 {
+        assert_eq!(
+            outline_names(&manager, &python, &workspace, calculator).await,
+            second
+        );
+    }
+    assert_eq!(outline_requests(&states.python, calculator), 2);
+
+    // The same bytes again, with a modification time that is certainly new
+    // (a rewrite within one clock tick could keep the old one): the sync tells
+    // the server, the kept outline goes, and the server is asked.
+    write(&workspace.path, calculator, &edited);
+    std::fs::File::options()
+        .write(true)
+        .open(workspace.path.join(calculator))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    assert!(
+        manager
+            .synced(&workspace.id, &[calculator], LOADED_BUDGET)
+            .await
+    );
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        second
+    );
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        3,
+        "a synced change is asked again"
+    );
+    manager.shutdown_all().await;
+}
+
 // ---- `lsp.live` under `[run_profile.lsp] sessions` (K7b-1) -----------------
 
 /// A SCIP index over the C# fixture of [`fake_csharp_fixture`]: `Add`
@@ -4996,43 +5076,56 @@ async fn the_outline_cache_answers_by_content_hash_and_never_stores_an_empty_out
 /// text calls `Add`. It lives next to the workspace, never in it. The graph
 /// has no call edge: the only way from `Add` to `Run` is `lsp.live`'s
 /// `textDocument/references`.
-#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
 fn csharp_scip_index(temp: &tempfile::TempDir, workspace: &Workspace) -> std::path::PathBuf {
+    csharp_scip_index_of(
+        &temp.path().join("index.scip"),
+        workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+        ],
+    )
+}
+
+/// A SCIP index at `index` that defines each `(file, zero-based line, name)`
+/// as a function whose body is that whole line, as the tree is now.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn csharp_scip_index_of(
+    index: &std::path::Path,
+    workspace: &Workspace,
+    functions: &[(&str, usize, &str)],
+) -> std::path::PathBuf {
     use scip::types::{Document, Index, Occurrence, SymbolInformation, symbol_information::Kind};
     let symbol = |name: &str| format!("rust-analyzer cargo demo 0.1.0 acceptance/{name}().");
-    let line_of = |file: &str| {
+    let mut documents: Vec<Document> = Vec::new();
+    for (file, line_number, name) in functions {
         let text = std::fs::read_to_string(workspace.path.join(file)).unwrap();
-        text.lines().nth(1).unwrap().to_owned()
-    };
-    let definition = |name: &str, line: &str| {
-        let col = line.find(name).unwrap() as i32;
-        let mut o = Occurrence::default();
-        o.range = vec![1, col, col + name.len() as i32];
-        o.symbol = symbol(name);
-        o.symbol_roles = 1;
-        o.enclosing_range = vec![1, 0, 1, line.len() as i32];
-        o
-    };
-    let info = |name: &str| {
-        let mut i = SymbolInformation::default();
-        i.symbol = symbol(name);
-        i.kind = Kind::Function.into();
-        i
-    };
-    let (calculator, call_site) = (line_of("src/Calculator.cs"), line_of("src/CallSite.cs"));
-    let mut add = Document::default();
-    add.relative_path = "src/Calculator.cs".to_owned();
-    add.occurrences = vec![definition("Add", &calculator)];
-    add.symbols = vec![info("Add")];
-    let mut run = Document::default();
-    run.relative_path = "src/CallSite.cs".to_owned();
-    run.occurrences = vec![definition("Run", &call_site)];
-    run.symbols = vec![info("Run")];
+        let line = text.lines().nth(*line_number).unwrap();
+        let (row, col) = (*line_number as i32, line.find(name).unwrap() as i32);
+        let mut definition = Occurrence::default();
+        definition.range = vec![row, col, col + name.len() as i32];
+        definition.symbol = symbol(name);
+        definition.symbol_roles = 1;
+        definition.enclosing_range = vec![row, 0, row, line.len() as i32];
+        let mut info = SymbolInformation::default();
+        info.symbol = symbol(name);
+        info.kind = Kind::Function.into();
+        let document = match documents.iter_mut().find(|d| d.relative_path == *file) {
+            Some(document) => document,
+            None => {
+                let mut document = Document::default();
+                document.relative_path = (*file).to_owned();
+                documents.push(document);
+                documents.last_mut().unwrap()
+            }
+        };
+        document.occurrences.push(definition);
+        document.symbols.push(info);
+    }
     let mut message = Index::default();
-    message.documents = vec![add, run];
-    let index = temp.path().join("index.scip");
-    scip::write_message_to_file(&index, message).unwrap();
-    index
+    message.documents = documents;
+    scip::write_message_to_file(index, message).unwrap();
+    index.to_owned()
 }
 
 /// The C# fixture with the `documents`-mode fake and a request timeout that a
@@ -5923,5 +6016,268 @@ async fn lsp_live_call_hierarchy_edges_sit_at_the_call_sites() {
     assert_eq!(found.edges.len(), 1, "{:?}", found.edges);
     assert_eq!(found.cost.external_calls, 5);
     assert_eq!(requests_of(&state, "callHierarchy/incomingCalls"), 2);
+    manager.shutdown_all().await;
+}
+
+/// Whether the answer reached `node` through `lsp.live`.
+fn reached_through_lsp_live(answer: &Value, node: &str) -> bool {
+    answer["results"].as_array().is_some_and(|cards| {
+        cards.iter().any(|card| {
+            card["node"].as_str() == Some(node) && card.to_string().contains("lsp.live")
+        })
+    })
+}
+
+/// `CallSite.cs` with a second caller of `Add` on a line of its own.
+const CALL_SITE_WITH_TWICE_CS: &str = "namespace Acceptance;\npublic static class CallSite { public static int Run(Calculator value) => value.Add(1, 2); }\npublic static class More { public static int Twice(Calculator value) => value.Add(2, 2); }\n";
+
+/// Under `sessions = "shared"` a server outlives the walk that started it, so
+/// without the sync it answers the next walk from the tree it walked at
+/// start. With `[run_profile.lsp] sync = "watch"` the edit between two walks
+/// reaches it: the second walk finds the new caller of `Add` through
+/// `lsp.live`, on the same server, which was told between the two walks.
+#[tokio::test]
+async fn a_shared_server_is_told_about_an_edit_between_two_walks() {
+    use local_code_intelligence::config::{LspSessions, LspSync};
+    const TWICE: &str = "sym:rust:CallSite.cs::Twice/fn";
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state, index) = shared_sessions_fixture(&temp);
+    config.run_profile.lsp.sync = LspSync::Watch;
+    let manager = Arc::new(Manager::new(&config));
+    let answer = traverse_add_past_a_cold_start(
+        &config,
+        &workspace,
+        &index,
+        &state,
+        LspSessions::Shared,
+        &manager,
+    )
+    .await;
+    assert!(!reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert!(
+        manager.synced(&workspace.id, &[], LOADED_BUDGET).await,
+        "the sync started with the session: {:?}",
+        manager.sync_status(&workspace.id)
+    );
+
+    // A second caller of `Add`, and a SCIP index written for the tree as it
+    // is now (an input of the walk, which places `Twice` by it).
+    write(&workspace.path, "src/CallSite.cs", CALL_SITE_WITH_TWICE_CS);
+    assert!(
+        manager
+            .synced(&workspace.id, &["src/CallSite.cs"], LOADED_BUDGET)
+            .await,
+        "{:?}",
+        manager.sync_status(&workspace.id)
+    );
+    let index = csharp_scip_index_of(
+        &temp.path().join("index-twice.scip"),
+        &workspace,
+        &[
+            ("src/Calculator.cs", 1, "Add"),
+            ("src/CallSite.cs", 1, "Run"),
+            ("src/CallSite.cs", 2, "Twice"),
+        ],
+    );
+    let answer = traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await;
+    assert!(reached_through_lsp_live(&answer, TWICE), "{answer}");
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
+
+    // The server's record: the notification sits between the references of
+    // the first walk and those of the second.
+    let methods: Vec<String> = std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].to_string())
+        .collect();
+    let position = |method: &str| methods.iter().position(|m| m.contains(method));
+    let last_position = |method: &str| methods.iter().rposition(|m| m.contains(method));
+    let (first, told, last) = (
+        position("textDocument/references").expect("the first walk asked"),
+        position("workspace/didChangeWatchedFiles").expect("the server was told"),
+        last_position("textDocument/references").unwrap(),
+    );
+    assert!(first < told && told < last, "{methods:?}");
+    manager.shutdown_all().await;
+    assert!(manager.sync_status(&workspace.id).is_none());
+}
+
+/// The real-server edit check of `[run_profile.lsp] sync` (live, skipped when
+/// `gopls` or `go` is not on `PATH`): a running gopls session is told about an
+/// edit, and its next `workspace/symbol` answer lists the new function. gopls
+/// has no file watcher of its own and this client registers none, so without
+/// the sync the session keeps answering the tree it loaded.
+#[tokio::test]
+async fn a_real_gopls_session_lists_a_function_added_after_it_started() {
+    use local_code_intelligence::config::{GoLspConfig, LspSync};
+    let (Some(gopls), Some(_)) = (
+        lci_core::lexical::find_on_path("gopls"),
+        lci_core::lexical::find_on_path("go"),
+    ) else {
+        eprintln!("skipped: gopls or go is not on PATH");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    write(&root, "go.mod", "module example.com/syncprobe\n\ngo 1.21\n");
+    write(
+        &root,
+        "calc.go",
+        "package syncprobe\n\nfunc Add(a, b int) int { return a + b }\n",
+    );
+    let workspace = Workspace::resolve(&root, &data).unwrap();
+    let mut config = Config {
+        data_dir: data,
+        lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
+        go: GoLspConfig {
+            path: Some(gopls.to_string_lossy().into_owned()),
+            args: Vec::new(),
+            disabled: false,
+        },
+        ..Config::default()
+    };
+    config.run_profile.lsp.sync = LspSync::Watch;
+    let manager = Manager::new(&config);
+    let go = manager.adapters_for_language("go")[0].clone();
+    let names = |found: Vec<Location>| -> Vec<String> {
+        found
+            .into_iter()
+            .filter_map(|location| location.name)
+            .collect()
+    };
+    let added = names(manager.symbols(&go, &workspace, "Add").await.unwrap());
+    assert!(added.contains(&"Add".to_owned()), "{added:?}");
+    assert!(manager.synced(&workspace.id, &[], LOADED_BUDGET).await);
+
+    write(
+        &root,
+        "calc.go",
+        "package syncprobe\n\nfunc Add(a, b int) int { return a + b }\n\nfunc SyncProbeEight() int { return 8 }\n",
+    );
+    assert!(
+        manager
+            .synced(&workspace.id, &["calc.go"], LOADED_BUDGET)
+            .await
+    );
+    // gopls applies a change on its own schedule: ask until it lists the
+    // function, every 100 ms within the budget (a condition wait on the
+    // server's answers).
+    let deadline = tokio::time::Instant::now() + LOADED_BUDGET;
+    let listed = loop {
+        let listed = names(
+            manager
+                .symbols(&go, &workspace, "SyncProbeEight")
+                .await
+                .unwrap(),
+        );
+        if listed.contains(&"SyncProbeEight".to_owned()) || tokio::time::Instant::now() >= deadline
+        {
+            break listed;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        listed.contains(&"SyncProbeEight".to_owned()),
+        "the running session does not list the new function: {listed:?}, {:?}",
+        manager.sync_status(&workspace.id)
+    );
+    manager.shutdown_all().await;
+}
+
+/// Spins (no sleep, no await, so a current-thread runtime runs nothing
+/// else) until the workspace's watcher has queued more than `seen` events:
+/// the change is then reported but, with the forwarding task never polled,
+/// not yet drained.
+fn wait_for_a_queued_event(manager: &Manager, workspace: &Workspace, seen: u64) {
+    let deadline = std::time::Instant::now() + LOADED_BUDGET;
+    while manager.sync_status(&workspace.id).unwrap().events <= seen {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher reported nothing"
+        );
+        std::hint::spin_loop();
+    }
+}
+
+/// Under `[run_profile.lsp] sync = "watch"` a request drains what the watcher
+/// has already reported before it is sent, without anyone waiting for the
+/// sync: a change queued but not yet forwarded (the test runs on one thread
+/// and never yields between the edit and the request, so the forwarding task
+/// cannot run) is in the next answer (`Manager::client`). The second part is a
+/// behaviour check only: a reported change drops a kept outline without a
+/// wait, but `document_symbols` reads the file asynchronously before its
+/// cache lookup, which lets the forwarding task drain first, so this does not
+/// isolate the drain `document_symbols` makes itself.
+#[tokio::test]
+async fn a_request_sends_the_changes_already_reported_before_it_is_sent() {
+    use local_code_intelligence::config::LspSync;
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
+    // A request.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _) = fake_csharp_fixture(&temp, "documents");
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    config.run_profile.lsp.sync = LspSync::Watch;
+    let manager = Manager::new(&config);
+    let csharp = csharp_adapter(&manager);
+    assert!(
+        !manager
+            .symbols(&csharp, &workspace, "Calculator")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(manager.synced(&workspace.id, &[], LOADED_BUDGET).await);
+    let seen = manager.sync_status(&workspace.id).unwrap().events;
+    write(
+        &workspace.path,
+        "src/Calculator.cs",
+        "namespace Acceptance;\npublic sealed class Calculator { public int Add(int a, int b) => a + b; public int Mul(int a, int b) => a * b; }\n",
+    );
+    wait_for_a_queued_event(&manager, &workspace, seen);
+    let found = manager.symbols(&csharp, &workspace, "Mul").await.unwrap();
+    assert!(
+        found
+            .iter()
+            .any(|symbol| symbol.name.as_deref() == Some("Mul")),
+        "{found:?}"
+    );
+    manager.shutdown_all().await;
+
+    // An outline the cache holds.
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, workspace, states) = outline_fixture_with(&temp, true, LspSync::Watch);
+    let python = python_adapter(&manager);
+    let calculator = "src/calculator.py";
+    for _ in 0..2 {
+        outline_names(&manager, &python, &workspace, calculator).await;
+    }
+    assert_eq!(outline_requests(&states.python, calculator), 1, "kept");
+    assert!(manager.synced(&workspace.id, &[], LOADED_BUDGET).await);
+    let seen = manager.sync_status(&workspace.id).unwrap().events;
+    // The same bytes, with a modification time that is certainly new.
+    write(&workspace.path, calculator, CALCULATOR_PY);
+    std::fs::File::options()
+        .write(true)
+        .open(workspace.path.join(calculator))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    wait_for_a_queued_event(&manager, &workspace, seen);
+    assert_eq!(
+        outline_names(&manager, &python, &workspace, calculator).await,
+        ["Calculator", "add"]
+    );
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        2,
+        "the reported change dropped the kept outline before the lookup"
+    );
     manager.shutdown_all().await;
 }

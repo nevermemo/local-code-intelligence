@@ -1159,10 +1159,10 @@ async fn flow_from_walks_under_the_run_profile() {
     }
 }
 
-/// `[run_profile.lsp] sessions` and `outline_cache` reach the recipes' walk
-/// (the profile is the one they run under) and change nothing there: the walk
-/// has no `lsp.live`, so no language server starts and no outline is asked
-/// under any value.
+/// `[run_profile.lsp] sessions`, `outline_cache` and `sync` reach the recipes'
+/// walk (the profile is the one they run under) and change nothing there: the
+/// walk has no `lsp.live`, so no language server starts, no outline is asked
+/// and nothing is synced under any value.
 #[tokio::test]
 async fn flow_from_runs_the_same_under_both_session_settings() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
@@ -1176,6 +1176,7 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
                 lsp: lci_core::config::LspProfile {
                     sessions: lci_core::config::LspSessions::Shared,
                     outline_cache: true,
+                    sync: lci_core::config::LspSync::Watch,
                     ..lci_core::config::LspProfile::default()
                 },
                 ..RunProfileConfig::default()
@@ -1190,6 +1191,25 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
             "{count}"
         );
     }
+}
+
+/// `[run_profile.seeds] bm25` reaches the recipes' walk (the profile is the one
+/// they run under) and changes nothing there: the seeds of `flow_from` are
+/// given, so no seeds map runs under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_seeds_bm25_on() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.seeds.bm25 = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("bm25"), "{on}");
 }
 
 /// The recipes pass their run profile to the walk of `flow_from`, so the

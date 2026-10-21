@@ -27,12 +27,13 @@ heuristic, git, config, doc, agent, prior (checked by `labels::check_labels` ins
 threads). `EdgeKind` (14): query_match, prior, calls_or_refs, contains, imports, implements, tests, reads_key, mentions, touched, cochange, compile_error_at, near, defined_in. `WitnessClass` order: compiler, lsp,
 exact, text, vector, heuristic, agent. Edge confidence is 0 to `CONF_MAX` 100 (`CONF_UNKNOWN` 50); edges sort by confidence, then dst; `Site{path,blob,line,col}`.
 
-Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`OPT_IN_MAPS`), named in the maps list, and all need the tree (`--root`).
+Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`OPT_IN_MAPS`), named in the maps list, and all need the tree (`--root`) except `seeds.bm25`.
 
 | Map id | Role | Source | Freshness | Module |
 | --- | --- | --- | --- | --- |
 | `seeds.hybrid` (default) | start nodes | top `seed_k` hits of the hybrid search, mapped to SCIP symbols | PerFile | `src/app/traverse/seeds.rs` (`SeedMap`) |
 | `seeds.scip_names` (default) | start nodes | question words matched to symbol names; stand-in when the hybrid search is unavailable or empty | PerFile | `src/app/traverse/seeds.rs` |
+| `seeds.bm25` (opt-in; in the default set only with `[run_profile.seeds] bm25`; needs no `--root`) | start nodes | BM25 (`lexical::score_chunks`) over the tokens of each SCIP node's name, qualified path and documentation; its top `seed_k` nodes go after the hybrid search's, or alone when that gave none | PerFile | `src/app/traverse/seeds.rs` (`Bm25Seeds`) |
 | `graph.scip` (default) | expansion | the SCIP index (`rust-analyzer scip`, file `scip_index`), read and cached in memory by file stamp; with `--root`, also an `implements` edge (kind prior 0.9) from each trait-impl member to its trait method declaration | PerFile | `scip_graph.rs` |
 | `structure.contains` (default) | expansion | containment derived from the SCIP graph; lets a chunk or file start node reach its symbols | PerFile | `contains.rs` |
 | `grep.live` | expansion | a search of the tree's current bytes | Live | `live_grep.rs` |
@@ -102,7 +103,7 @@ order of the maps list, then, with `answer_seeds`, the start nodes. Cards say wh
 to the walk's start nodes. A continuation (call with `handle`) returns the walk alone. `exact.pickaxe` asks for `PICKAXE_UNCAPPED` 100 commits when `first_k` is 0.
 
 Start nodes (`seed_source`): `given` (caller's node ids), `hybrid` (top `seed_k` hits, each mapped to the SCIP symbols its chunk defines, at most `MAX_SYMBOLS_PER_HIT` 3, else the innermost function around it, else
-its chunk node), `name_tokens` (`SEED_COUNT` 3 from the question's words; used when the caller asked for `seeds.scip_names` alone, or as the visible fallback, reason in `seed_fallback`).
+its chunk node), `hybrid+bm25` (those, then the nodes of `seeds.bm25` that the hybrid search did not give, with `[run_profile.seeds] bm25`), `bm25` (`seeds.bm25` alone answered: the hybrid search failed, found nothing or was not asked; the name-token stand-in then does not run, and a failed search's reason is in `seed_fallback`), `name_tokens` (`SEED_COUNT` 3 from the question's words; used when the caller asked for `seeds.scip_names` alone, or as the visible fallback, reason in `seed_fallback`). With `scip.implements` the source is prefixed `traits` or `traits+<source>`, where `<source>` is `hybrid`, `hybrid+bm25`, `bm25` or `name_tokens`.
 
 ## Walk
 

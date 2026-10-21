@@ -36,6 +36,23 @@ pub struct RunProfileConfig {
     pub lsp: LspProfile,
     /// `[run_profile.freshness]`: whether an answer is checked against the tree.
     pub freshness: RunProfileFreshness,
+    /// `[run_profile.seeds]`: where a traversal's starting nodes come from.
+    pub seeds: RunProfileSeeds,
+}
+
+/// `[run_profile.seeds]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileSeeds {
+    /// Let the opt-in map `seeds.bm25` run. `false` (the default): naming it
+    /// gives a note and no seeds, it is not in the default map set, and every
+    /// answer is as without the key. `true`: the map is in the default set
+    /// when a call names no maps, and it runs when named. It ranks the SCIP
+    /// graph's function and method nodes by BM25 over their name, path and
+    /// documentation tokens, and its nodes are appended after the hybrid
+    /// search's seeds. The recipes' seeds are given, so they run the same
+    /// under both values.
+    pub bm25: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -216,6 +233,42 @@ impl std::str::FromStr for LspSessions {
     }
 }
 
+/// Whether a language-server manager tells its servers about file changes
+/// (`[run_profile.lsp] sync`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspSync {
+    /// A server walks the tree when it starts and is told nothing after.
+    /// Today's behaviour.
+    #[default]
+    Off,
+    /// While a workspace has a live session, a watcher of the workspace sends
+    /// every source-file change to each of its servers as
+    /// `workspace/didChangeWatchedFiles` (see `lsp::sync`).
+    Watch,
+}
+
+impl LspSync {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Watch => "watch",
+        }
+    }
+}
+
+impl std::str::FromStr for LspSync {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "off" => Ok(Self::Off),
+            "watch" => Ok(Self::Watch),
+            other => Err(format!("sync must be \"off\" or \"watch\" (got {other:?})")),
+        }
+    }
+}
+
 /// `[run_profile.lsp]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -252,6 +305,14 @@ pub struct LspProfile {
     /// edges. A server that refuses a request costs the other edges nothing.
     /// The recipes walk no `lsp.live` and run the same under both values.
     pub call_hierarchy: bool,
+    /// `"off"` (default): a language server is told nothing about edits after
+    /// it starts. `"watch"`: a long-lived manager (the MCP and REST server's,
+    /// the one `lci traverse` builds under `sessions = "shared"`) watches each
+    /// workspace that has a live session and sends every source-file change
+    /// to its servers (see [`LspSync`]). A per-call manager never watches:
+    /// under `sessions = "per_call"` it changes nothing for `lsp.live`. The
+    /// recipes walk no `lsp.live` and run the same under both values.
+    pub sync: LspSync,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -533,6 +594,8 @@ mod tests {
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
         config.run_profile.lsp.call_hierarchy = true;
+        config.run_profile.seeds.bm25 = true;
+        config.run_profile.lsp.sync = LspSync::Watch;
         config
     }
 
@@ -732,6 +795,44 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_bm25_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.bm25);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.bm25);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["bm25"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["bm25"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["bm25"], true);
+        assert!(off.keys.iter().any(|key| key == "run_profile.seeds.bm25"));
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nbm25 = \"yes\"\n",
+            "[run_profile.seeds]\nbm25 = 1\n",
+            "[run_profile.seeds]\nfoo = 1\n",
+            "[run_profile]\nbm25 = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -815,6 +916,8 @@ mode = \"sometimes\"
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
             "run_profile.lsp.call_hierarchy",
+            "run_profile.seeds.bm25",
+            "run_profile.lsp.sync",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -1056,6 +1159,94 @@ mode = \"sometimes\"
             for b in &hashes[i + 1..] {
                 assert_ne!(a, b);
             }
+        }
+    }
+
+    #[test]
+    fn lsp_sync_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        let watch: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsync = \"watch\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        watch.validate().unwrap();
+        assert_eq!(watch.run_profile.lsp.sync, LspSync::Watch);
+        assert_eq!(watch.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert!(!watch.run_profile.lsp.outline_cache);
+        assert_eq!(
+            serde_json::to_value(&watch).unwrap()["run_profile"]["lsp"]["sync"],
+            "watch"
+        );
+        let (off, watch) = (off.run_profile(), watch.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["sync"], "off");
+        assert_eq!(watch.value["run_profile"]["lsp"]["sync"], "watch");
+        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.sync"));
+        assert_ne!(off.hash, watch.hash);
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsync = \"off\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.lsp]\nsync = \"on\"\n",
+            "[run_profile.lsp]\nsync = \"Watch\"\n",
+            "[run_profile.lsp]\nsync = true\n",
+            "[run_profile]\nsync = \"watch\"\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        let error =
+            toml::from_str::<Config>(&format!("{}[run_profile]\nsync = \"watch\"\n", base_toml()))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("sync"), "{error}");
+        assert_eq!(LspSync::Watch.as_str(), "watch");
+        assert_eq!("off".parse::<LspSync>(), Ok(LspSync::Off));
+        assert!("on".parse::<LspSync>().is_err());
+    }
+
+    #[test]
+    fn lsp_implementations_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.lsp.implementations);
+        let text = format!("{}[run_profile.lsp]\nimplementations = true\n", base_toml());
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.lsp.implementations);
+        // The other leaf of the section keeps its default.
+        assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["lsp"]["implementations"],
+            true
+        );
+        // It changes what an lsp.live answer holds, so it changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["implementations"], false);
+        assert_eq!(on.value["run_profile"]["lsp"]["implementations"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.lsp.implementations")
+        );
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nimplementations = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.lsp]\nimplementations = \"yes\"\n",
+            "[run_profile.lsp]\nimplementations = 1\n",
+            "[run_profile]\nimplementations = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
     }
 

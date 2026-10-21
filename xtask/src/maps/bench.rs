@@ -699,6 +699,10 @@ pub struct Totals {
     /// `--pass-through` was on); total expansions = `pops + pass_through_pops`.
     pub pass_through_pops: u64,
     pub elapsed_ms: f64,
+    /// External calls the walk's allowance paid for (`totals.external_calls`) and
+    /// the ones that physically ran (`totals.physical_external_calls`).
+    pub external_calls: u32,
+    pub physical_external_calls: u32,
     /// The reranker frontier's counts (0 when it was off).
     pub rerank_calls: u64,
     pub rerank_docs: u64,
@@ -722,6 +726,9 @@ pub struct Traversed {
     /// checkpoint cards and `seed_sites`), to give the seeds theirs.
     pub sites: BTreeMap<String, Site>,
     pub totals: Option<Totals>,
+    /// Milliseconds each map took in the call (`totals.per_map.<id>.ms`); a map
+    /// that is not there did not run, and the first traces kept a bare count.
+    pub map_ms: BTreeMap<String, f64>,
     /// The whole process, when it was measured (a rescored run has none).
     pub wall_ms: Option<f64>,
 }
@@ -791,30 +798,125 @@ impl Traversed {
                 stops: t["stops"].as_u64().unwrap_or(0),
                 pass_through_pops: t["pass_through_pops"].as_u64().unwrap_or(0),
                 elapsed_ms: t["elapsed_ms"].as_f64().unwrap_or(0.0),
+                external_calls: count_u32(&t["external_calls"]),
+                physical_external_calls: count_u32(&t["physical_external_calls"]),
                 rerank_calls: t["rerank_calls"].as_u64().unwrap_or(0),
                 rerank_docs: t["rerank_docs"].as_u64().unwrap_or(0),
                 rerank_failures: t["rerank_failures"].as_u64().unwrap_or(0),
             });
+        let map_ms = value["totals"]["per_map"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, stat)| Some((id.clone(), stat["ms"].as_f64()?)))
+            .collect();
         Traversed {
             status: value["status"].as_str().unwrap_or("unknown").to_string(),
             seeds: strings(&value["seeds"]),
             results,
             sites,
             totals,
+            map_ms,
             wall_ms,
         }
     }
 }
 
+/// A count of the response, saturated at `u32::MAX`; 0 when it is absent.
+fn count_u32(value: &Value) -> u32 {
+    value
+        .as_u64()
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// The note a call carries once its external-call allowance was spent
+/// (`src/app/traverse/response.rs`; the `external_spent` events behind it are
+/// not in the response). A spent allowance never ends a walk: it goes on with
+/// the maps that need no external call, so the note says which maps went
+/// unasked, not why the call ended (`stop_reason` says that).
+const EXTERNAL_SPENT_NOTE: &str = "the external-call allowance was spent";
+
+/// Whether a reply's `notes` hold one that contains `needle`.
+fn has_note(raw: &Value, needle: &str) -> bool {
+    raw["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|note| note.contains(needle))
+}
+
+/// Which budget cut an item's walk (or its live language-server calls) short.
+/// Such an item was not measured to its natural end: `maps compare` leaves it
+/// out like a deadline stop unless `--keep-failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetHit {
+    /// The call ended on the pop cap (`stop_reason = pops`).
+    Pops,
+    /// The call ended on the token budget (`stop_reason = budget`; the engine
+    /// ends a walk on `budget` only for tokens or an unadopted result).
+    Tokens,
+    /// The external-call allowance was spent (the note in `notes`) in a walk that
+    /// ended some other way than on a budget, the deadline or the pop cap: the
+    /// maps that need an external call went unasked from then on.
+    ExternalCalls,
+    /// The call ended on its deadline (`stop_reason = deadline`).
+    Deadline,
+    /// The walk went on, but `lsp.live` ran out of the deadline on a node (its
+    /// note is in `notes`): the map's edges are partial.
+    LspDeadline,
+}
+
+impl BudgetHit {
+    /// The value written to `items.json` (`budget_hit`) and the key of the
+    /// per-stratum `budget_hits` counts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pops => "pops",
+            Self::Tokens => "tokens",
+            Self::ExternalCalls => "external_calls",
+            Self::Deadline => "deadline",
+            Self::LspDeadline => "lsp_deadline",
+        }
+    }
+
+    /// Reads the hit from a raw traversal reply. Precedence: the cause that
+    /// ended the walk (`stop_reason` `pops`, `budget` or `deadline`), then a
+    /// spent external-call allowance, then the `lsp.live` deadline note. Only one
+    /// value is kept; [`external_spent`] tells whether the allowance was spent
+    /// whatever else ended the walk.
+    pub fn from_raw(raw: &Value) -> Option<Self> {
+        match raw["stop_reason"].as_str() {
+            Some("pops") => Some(Self::Pops),
+            Some("budget") => Some(Self::Tokens),
+            Some("deadline") => Some(Self::Deadline),
+            _ if external_spent(raw) => Some(Self::ExternalCalls),
+            _ => has_note(raw, lci_maps::lsp_live::DEADLINE_NOTE).then_some(Self::LspDeadline),
+        }
+    }
+}
+
+/// Whether the call's external-call allowance was spent, whatever ended the walk.
+pub fn external_spent(raw: &Value) -> bool {
+    has_note(raw, EXTERNAL_SPENT_NOTE)
+}
+
 /// What makes one item's result weak evidence: the walk was cut by the
-/// deadline (machine load, not the algorithm), or calls it depended on failed.
+/// deadline (machine load, not the algorithm) or another budget (`budget_hit`),
+/// or calls it depended on failed.
 /// Read from the raw traversal JSON; map failures need the checkpoint, which
 /// only a run that returns one has.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ItemFlags {
+    /// `budget_hit == Some(Deadline)`, kept as its own field for the callers that
+    /// count deadline stops.
     pub deadline: bool,
     pub rerank_failures: u64,
     pub map_failures: u64,
+    pub budget_hit: Option<BudgetHit>,
+    /// The external-call allowance was spent, whatever ended the walk (it is
+    /// `budget_hit` too only when nothing else ended the walk).
+    pub external_spent: bool,
 }
 
 impl ItemFlags {
@@ -826,16 +928,44 @@ impl ItemFlags {
             .flatten()
             .filter_map(|stat| stat["failures"].as_u64())
             .sum();
+        let budget_hit = BudgetHit::from_raw(raw);
         Self {
-            deadline: raw["stop_reason"].as_str() == Some("deadline"),
+            deadline: budget_hit == Some(BudgetHit::Deadline),
             // The reranker frontier's failed calls make a row unreliable.
             rerank_failures: raw["totals"]["rerank_failures"].as_u64().unwrap_or(0),
             map_failures,
+            budget_hit,
+            external_spent: external_spent(raw),
         }
     }
 
     pub fn any(&self) -> bool {
-        self.deadline || self.rerank_failures > 0 || self.map_failures > 0
+        self.deadline
+            || self.budget_hit.is_some()
+            || self.external_spent
+            || self.rerank_failures > 0
+            || self.map_failures > 0
+    }
+
+    /// The names of what flags the item, for the counts `maps compare` prints:
+    /// the budget hit, `external_spent` (also when another cause ended the walk),
+    /// `rerank_failures` and `map_failures`.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> =
+            self.budget_hit.map(BudgetHit::as_str).into_iter().collect();
+        if self.deadline && self.budget_hit != Some(BudgetHit::Deadline) {
+            kinds.push("deadline");
+        }
+        if self.external_spent && self.budget_hit != Some(BudgetHit::ExternalCalls) {
+            kinds.push("external_calls");
+        }
+        if self.rerank_failures > 0 {
+            kinds.push("rerank_failures");
+        }
+        if self.map_failures > 0 {
+            kinds.push("map_failures");
+        }
+        kinds
     }
 }
 
@@ -1594,6 +1724,147 @@ pub(super) fn item_record(
     Ok((p, f05, record))
 }
 
+/// What one scored item cost, read from its traversal reply: the numbers the
+/// per-item record of `items.json` and the per-stratum means carry. All of it is
+/// in the raw reply already; nothing here is measured again.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ItemCosts {
+    /// Pops plus pass-through pops.
+    pub expansions: u64,
+    /// Reranker frontier calls.
+    pub model_calls: u64,
+    /// External calls the allowance paid for, and the ones that physically ran.
+    pub external_calls: u32,
+    pub physical_external_calls: u32,
+    /// Milliseconds `lsp.live` took in the call (0 when the map did not run).
+    pub lsp_ms: f64,
+    /// Characters of the answer nodes the bench scored, divided by four and
+    /// rounded up (the one computation behind the per-item number and the set total).
+    pub answer_tokens: u64,
+    /// The budget that cut the walk short, if one did.
+    pub budget_hit: Option<BudgetHit>,
+    /// The external-call allowance was spent, whatever ended the walk.
+    pub external_spent: bool,
+}
+
+impl ItemCosts {
+    pub fn of(traversed: &Traversed, flags: &ItemFlags, answer_tokens: u64) -> Self {
+        let totals = traversed.totals.clone().unwrap_or_default();
+        Self {
+            expansions: totals.pops + totals.pass_through_pops,
+            model_calls: totals.model_calls(),
+            external_calls: totals.external_calls,
+            physical_external_calls: totals.physical_external_calls,
+            lsp_ms: traversed.map_ms.get(LSP_LIVE_MAP).copied().unwrap_or(0.0),
+            answer_tokens,
+            budget_hit: flags.budget_hit,
+            external_spent: flags.external_spent,
+        }
+    }
+}
+
+/// The map whose time is the `lsp_ms` cost.
+const LSP_LIVE_MAP: &str = "lsp.live";
+
+/// [`item_record`] with the item's costs: `expansions` and `model_calls` as
+/// before, plus `external_calls`, `physical_external_calls`, `lsp_ms`,
+/// `answer_tokens` and, only when a budget cut the walk, `budget_hit` (a string,
+/// so `maps compare` does not read it as a metric), and `external_spent: true`
+/// when the external-call allowance was spent.
+pub(super) fn item_record_with_costs(
+    set: Set,
+    item: &Value,
+    answers: &[Value],
+    costs: &ItemCosts,
+) -> Result<(f64, f64, Map<String, Value>)> {
+    let (p, f05, mut record) = item_record(set, item, answers, Some(costs.expansions))?;
+    record.insert("model_calls".into(), json!(costs.model_calls));
+    record.insert("external_calls".into(), json!(costs.external_calls));
+    record.insert(
+        "physical_external_calls".into(),
+        json!(costs.physical_external_calls),
+    );
+    record.insert("lsp_ms".into(), json!(costs.lsp_ms));
+    record.insert("answer_tokens".into(), json!(costs.answer_tokens));
+    if let Some(hit) = costs.budget_hit {
+        record.insert("budget_hit".into(), json!(hit.as_str()));
+    }
+    if costs.external_spent {
+        record.insert("external_spent".into(), json!(true));
+    }
+    Ok((p, f05, record))
+}
+
+/// Means of the costs over a group of items and the budget hits among them.
+#[derive(Default)]
+struct CostCell {
+    n: usize,
+    expansions: f64,
+    external_calls: f64,
+    lsp_ms: f64,
+    answer_tokens: f64,
+    hits: BTreeMap<&'static str, usize>,
+}
+
+impl CostCell {
+    fn add(&mut self, costs: &ItemCosts) {
+        self.n += 1;
+        self.expansions += costs.expansions as f64;
+        self.external_calls += f64::from(costs.external_calls);
+        self.lsp_ms += costs.lsp_ms;
+        self.answer_tokens += costs.answer_tokens as f64;
+        if let Some(hit) = costs.budget_hit {
+            *self.hits.entry(hit.as_str()).or_default() += 1;
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mean = |sum: f64| (sum / self.n.max(1) as f64 * 10_000.0).round() / 10_000.0;
+        json!({
+            "n": self.n,
+            "mean": {
+                "expansions": mean(self.expansions),
+                "external_calls": mean(self.external_calls),
+                "lsp_ms": mean(self.lsp_ms),
+                "answer_tokens": mean(self.answer_tokens),
+            },
+            "budget_hits": self.hits,
+        })
+    }
+}
+
+/// The costs of the scored items of a set, overall and per stratum (the
+/// scorer's own dimensions, [`gold::dims`]): `{"overall": cell, "strata":
+/// {dimension: {value: cell}}}` with `cell = {n, mean: {expansions,
+/// external_calls, lsp_ms, answer_tokens}, budget_hits: {kind: n}}`. Written
+/// into `score.json` as `costs`; the scorer's own report is not touched.
+pub fn costs_by_stratum(set: Set, scored: &[(&Value, &ItemCosts)]) -> Value {
+    let mut overall = CostCell::default();
+    let mut strata: BTreeMap<&'static str, BTreeMap<String, CostCell>> = BTreeMap::new();
+    for (item, costs) in scored {
+        overall.add(costs);
+        for (dimension, value) in gold::dims(set, item) {
+            strata
+                .entry(dimension)
+                .or_default()
+                .entry(value)
+                .or_default()
+                .add(costs);
+        }
+    }
+    let strata: Map<String, Value> = strata
+        .into_iter()
+        .map(|(dimension, cells)| {
+            let cells: Map<String, Value> = cells
+                .into_iter()
+                .map(|(value, cell)| (value, cell.to_json()))
+                .collect();
+            (dimension.to_owned(), Value::Object(cells))
+        })
+        .collect();
+    json!({ "overall": overall.to_json(), "strata": strata })
+}
+
 /// The answer-set precision and recall of one item, from the scorer's own
 /// definitions (see the trend preface).
 pub fn item_precision_recall(
@@ -1985,10 +2256,9 @@ pub fn bench_set(
     let mut sums = Sums::default();
     let mut skips = Skips::default();
     let mut scored: Vec<(Vec<Value>, &Value)> = Vec::new();
-    // Work per scored item (pops, pass-through pops), for `items.json`.
-    // Per scored item: pops, pass-through pops and model calls (frontier rerank
-    // calls).
-    let mut work: Vec<[u64; 3]> = Vec::new();
+    // The costs of each scored item (expansions, model calls, external calls,
+    // LSP ms, answer tokens, budget hit), for `items.json` and `score.json`.
+    let mut costs: Vec<ItemCosts> = Vec::new();
     let started = Instant::now();
     for (index, item) in items.iter().enumerate() {
         let id = item["id"].as_str().context("gold item without an id")?;
@@ -2033,7 +2303,8 @@ pub fn bench_set(
                     sums.non_empty += 1;
                 }
                 let chars: usize = nodes.iter().map(|n| n.text.chars().count()).sum();
-                sums.answer_chars_tokens += chars.div_ceil(4) as u64;
+                let answer_tokens = chars.div_ceil(4) as u64;
+                sums.answer_chars_tokens += answer_tokens;
                 sums.wall_ms.extend(traversed.wall_ms);
                 if let Some(t) = &traversed.totals {
                     sums.pops += t.pops;
@@ -2051,9 +2322,7 @@ pub fn bench_set(
                     sums.engine_ms.push(t.elapsed_ms);
                 }
                 run.insert(id.to_string(), Value::Array(answers.clone()));
-                work.push(traversed.totals.as_ref().map_or([0, 0, 0], |t| {
-                    [t.pops, t.pass_through_pops, t.model_calls()]
-                }));
+                costs.push(ItemCosts::of(&traversed, &flags, answer_tokens));
                 scored.push((answers, item));
             }
             Err(error) => {
@@ -2077,10 +2346,9 @@ pub fn bench_set(
     }
 
     let mut item_records = Map::new();
-    for ((answers, item), work) in scored.iter().zip(&work) {
-        let (p, f05, mut record) = item_record(set, item, answers, Some(work[0] + work[1]))?;
-        // The model calls, so `maps compare` can pair on them next to `expansions`.
-        record.insert("model_calls".into(), json!(work[2]));
+    for ((answers, item), costs) in scored.iter().zip(&costs) {
+        // The costs sit beside the metrics, so `maps compare` can pair on them.
+        let (p, f05, record) = item_record_with_costs(set, item, answers, costs)?;
         sums.precision += p;
         sums.f05 += f05;
         if let Some(id) = item["id"].as_str() {
@@ -2096,6 +2364,14 @@ pub fn bench_set(
         let parsed_run = gold::parse_run(&run_value.to_string())?;
         gold::score_set(set, &scored_items, &parsed_run, false, false)?
     };
+    if let Some(object) = report.as_object_mut() {
+        let rows: Vec<(&Value, &ItemCosts)> = scored
+            .iter()
+            .map(|(_, item)| *item)
+            .zip(costs.iter())
+            .collect();
+        object.insert("costs".into(), costs_by_stratum(set, &rows));
+    }
     let grouping_warnings = grouper
         .as_ref()
         .map(ImplGrouper::warnings)
@@ -3110,6 +3386,176 @@ pub fn free_two() {}
             (3, false, true)
         );
         assert!(!ItemFlags::from_raw(&json!({"stop_reason": "bound"})).any());
+    }
+
+    /// The costs and the budget hit a raw reply gives.
+    fn costs_of(raw: &Value, answer_tokens: u64) -> (ItemCosts, ItemFlags) {
+        let traversed = Traversed::from_json(raw, None);
+        let flags = ItemFlags::from_raw(raw);
+        (ItemCosts::of(&traversed, &flags, answer_tokens), flags)
+    }
+
+    #[test]
+    fn an_item_record_carries_its_costs_and_the_budget_hit() {
+        let items = vec![impact_item(
+            "i1",
+            "q one",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let mut raw = traversal(&["x"], &[SEARCH_FN], 6);
+        raw["totals"]["external_calls"] = json!(7);
+        raw["totals"]["physical_external_calls"] = json!(9);
+        raw["totals"]["per_map"] = json!({
+            "graph.scip": {"expands": 4, "ms": 1.5},
+            "lsp.live": {"expands": 3, "ms": 120.5},
+        });
+        raw["stop_reason"] = json!("budget");
+        raw["notes"] = json!([
+            "the external-call allowance was spent: from then on only maps that need no external call were asked"
+        ]);
+        let answers = BTreeMap::from([("q one".to_owned(), raw.clone())]);
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(answers),
+            &config(&["graph.scip", "seeds.scip_names"]),
+        )
+        .unwrap();
+        let record = &outcome.items["items"]["i1"];
+        assert_eq!(record["expansions"], 6);
+        assert_eq!(record["external_calls"], 7);
+        assert_eq!(record["physical_external_calls"], 9);
+        assert_eq!(record["lsp_ms"], 120.5);
+        // The walk ended on the token budget; the spent allowance is its own flag.
+        assert_eq!(record["budget_hit"], "tokens");
+        assert_eq!(record["external_spent"], true);
+        // The per-item tokens and the set total (the `ans tok` cell) are one
+        // computation: chars/4 of the result texts, over one item.
+        let chars = format!("{SEARCH_FN} | graph.scip/compiler | p1.00 d1")
+            .chars()
+            .count();
+        let tokens = chars.div_ceil(4) as u64;
+        assert_eq!(record["answer_tokens"], tokens);
+        assert_eq!(outcome.row.cells[14], tokens.to_string());
+        // The flag is what `maps compare` excludes on; the row is not "deadline".
+        let flags = ItemFlags::from_raw(&raw);
+        assert!(flags.any() && !flags.deadline);
+
+        // The budget that ended the call, from the reply alone.
+        let hit = |reply: Value| BudgetHit::from_raw(&reply).map(BudgetHit::as_str);
+        let spent = json!(["the external-call allowance was spent: from then on only ..."]);
+        assert_eq!(
+            hit(json!({"stop_reason": "budget"})),
+            Some("tokens"),
+            "no allowance note: the token budget"
+        );
+        // A spent allowance never ends a walk: with `budget` the ending cause
+        // wins, and a walk that completed anyway is flagged by the note alone.
+        assert_eq!(
+            hit(json!({"stop_reason": "budget", "notes": spent})),
+            Some("tokens")
+        );
+        let complete = json!({"stop_reason": "complete", "notes": spent});
+        assert_eq!(hit(complete.clone()), Some("external_calls"));
+        let flags = ItemFlags::from_raw(&complete);
+        assert!(flags.external_spent && flags.any() && !flags.deadline);
+        assert_eq!(flags.kinds(), vec!["external_calls"]);
+        let cut = ItemFlags::from_raw(&json!({"stop_reason": "pops", "notes": spent}));
+        assert_eq!(cut.kinds(), vec!["pops", "external_calls"]);
+        assert!(!ItemFlags::from_raw(&json!({"stop_reason": "complete"})).any());
+        assert_eq!(hit(json!({"stop_reason": "pops"})), Some("pops"));
+        let (costs, flags) = costs_of(&json!({"stop_reason": "deadline"}), 0);
+        assert_eq!(costs.budget_hit.map(BudgetHit::as_str), Some("deadline"));
+        assert!(flags.deadline && flags.any());
+        // The walk went on but `lsp.live` ran out of the deadline on a node.
+        let lsp_note = format!(
+            "lsp.live reported an error for a node: {}",
+            lci_maps::lsp_live::DEADLINE_NOTE
+        );
+        let (costs, flags) = costs_of(&json!({"stop_reason": "complete", "notes": [lsp_note]}), 0);
+        assert_eq!(
+            costs.budget_hit.map(BudgetHit::as_str),
+            Some("lsp_deadline")
+        );
+        assert!(!flags.deadline && flags.any());
+        // No map time and no budget: `lsp_ms` is 0 and the key is absent.
+        let calm = traversal(&["x"], &[SEARCH_FN], 2);
+        let (costs, flags) = costs_of(&calm, 5);
+        assert_eq!(
+            (costs.lsp_ms, costs.budget_hit, flags.any()),
+            (0.0, None, false)
+        );
+        let (_, _, record) = item_record_with_costs(Set::Impact, &items[0], &[], &costs).unwrap();
+        assert_eq!(record["lsp_ms"], 0.0);
+        assert_eq!(record["external_calls"], 0);
+        assert_eq!(record["answer_tokens"], 5);
+        assert!(!record.contains_key("budget_hit"));
+        // An old reply with a bare per-map count has no map time.
+        let old = json!({"totals": {"pops": 1, "per_map": {"lsp.live": 3}}});
+        assert!(Traversed::from_json(&old, None).map_ms.is_empty());
+    }
+
+    #[test]
+    fn costs_by_stratum_averages_per_dimension() {
+        let mut unique = impact_item(
+            "i1",
+            "q one",
+            "src/app/search.rs",
+            "search::rerank_document",
+        );
+        unique["ambiguity"] = json!({"band": "unique"});
+        let mut common = impact_item(
+            "i2",
+            "q two",
+            "src/app/search.rs",
+            "search::rerank_document",
+        );
+        common["ambiguity"] = json!({"band": "common"});
+        let items = vec![unique, common];
+        let mut one = traversal(&["x"], &[SEARCH_FN], 4);
+        one["totals"]["external_calls"] = json!(1);
+        let mut two = traversal(&["x"], &[SEARCH_FN], 8);
+        two["totals"]["external_calls"] = json!(3);
+        two["totals"]["per_map"] = json!({"lsp.live": {"expands": 2, "ms": 30.0}});
+        two["stop_reason"] = json!("pops");
+        let answers = BTreeMap::from([("q one".to_owned(), one), ("q two".to_owned(), two)]);
+        let outcome = bench_set(
+            Set::Impact,
+            &items,
+            &Fixture::new(answers),
+            &config(&["graph.scip", "seeds.scip_names"]),
+        )
+        .unwrap();
+        let costs = &outcome.report["costs"];
+        assert_eq!(costs["overall"]["n"], 2);
+        let mean = |cell: &Value, name: &str| cell["mean"][name].as_f64().unwrap();
+        assert_eq!(mean(&costs["overall"], "expansions"), 6.0);
+        assert_eq!(mean(&costs["overall"], "external_calls"), 2.0);
+        assert_eq!(mean(&costs["overall"], "lsp_ms"), 15.0);
+        assert_eq!(costs["overall"]["budget_hits"], json!({"pops": 1}));
+        let band = &costs["strata"]["band"];
+        assert_eq!(band["unique"]["n"], 1);
+        assert_eq!(mean(&band["unique"], "expansions"), 4.0);
+        assert_eq!(mean(&band["unique"], "lsp_ms"), 0.0);
+        assert_eq!(band["unique"]["budget_hits"], json!({}));
+        assert_eq!(band["common"]["n"], 1);
+        assert_eq!(mean(&band["common"], "expansions"), 8.0);
+        assert_eq!(mean(&band["common"], "external_calls"), 3.0);
+        assert_eq!(mean(&band["common"], "lsp_ms"), 30.0);
+        assert_eq!(band["common"]["budget_hits"], json!({"pops": 1}));
+        // The other impact dimensions are there too; the scorer's own report is untouched.
+        assert_eq!(costs["strata"]["kind"]["sym-fn"]["n"], 2);
+        assert!(outcome.report["strata"]["band"]["unique"].is_object());
+        // A run with nothing scored has no report and so no costs block.
+        let none = bench_set(
+            Set::Impact,
+            &[],
+            &Fixture::new(BTreeMap::new()),
+            &config(&["graph.scip", "seeds.scip_names"]),
+        )
+        .unwrap();
+        assert!(none.report.is_null());
     }
 
     #[test]

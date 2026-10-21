@@ -262,6 +262,32 @@ already exist; anything that would need a bench rerun is listed under
   `score.json` and `items.json` and shows, per set, the secondary metrics and
   strata the one-line row leaves out, and a footer naming the ceilings below.
   A `--rescore` run with `--out-dir` writes one too, under its own wave label.
+- **Bench costs (K3a-1).** The cost of each traversal is read from its raw reply
+  and written, never re-measured. `items.json` records carry `expansions` and
+  `model_calls` as before, plus `external_calls`, `physical_external_calls`,
+  `lsp_ms` (the `lsp.live` map's milliseconds, 0 when it did not run) and
+  `answer_tokens` (chars/4 of the scored result texts, the same number the trend
+  row's `ans tok` sums), and `budget_hit` only on an item a budget cut: `pops`,
+  `tokens` (`stop_reason` `budget`: the engine ends a walk on it only for the
+  token budget or an unadopted result), `external_calls`, `deadline` (the call's
+  deadline) or `lsp_deadline` (the walk went on, `lsp.live` ran out of time on a
+  node; only the last `lsp.live` error of a call is in its notes). A spent
+  external-call allowance never ends a walk (it goes on with the maps that need
+  no external call), so `external_calls` comes from the reply's note alone and
+  only when no `pops`, `budget` or `deadline` stop ended the walk; the record
+  also carries `external_spent: true` whenever that note is there. `score.json`
+  carries a `costs`
+  block beside `strata`: `overall` and `strata.<dimension>.<value>` with `n`,
+  `mean` (expansions, external_calls, lsp_ms, answer_tokens) and `budget_hits`
+  (kind to count), over the same strata as the scorer's; `supplement.md` tables it
+  for the set's plan dimension. `maps compare` leaves out a pair when either side
+  has a `budget_hit` or `external_spent` (and the older flags) unless
+  `--keep-failed`, prints the counts per kind and side, and compares the three
+  new numbers by default. Runs from before these keys read as before:
+  a missing key is undefined for that metric and a run without a `costs` block
+  has no cost table. A walk that ended on the pop cap is a `budget_hit`, so a
+  default `maps compare` of runs whose walks mostly end that way pairs few items;
+  read the printed exclusion counts and use `--keep-failed` for those.
 - **impact.** Read the `common` band (35 items), `r2_decl_recall` and
   `tests_recall` first; `decl_recall` stays as a regression column. R1
   declaration recall on unique names is saturated by a word-boundary grep plus
