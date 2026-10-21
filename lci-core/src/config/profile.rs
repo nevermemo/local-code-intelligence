@@ -233,6 +233,42 @@ impl std::str::FromStr for LspSessions {
     }
 }
 
+/// Whether a language-server manager tells its servers about file changes
+/// (`[run_profile.lsp] sync`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspSync {
+    /// A server walks the tree when it starts and is told nothing after.
+    /// Today's behaviour.
+    #[default]
+    Off,
+    /// While a workspace has a live session, a watcher of the workspace sends
+    /// every source-file change to each of its servers as
+    /// `workspace/didChangeWatchedFiles` (see `lsp::sync`).
+    Watch,
+}
+
+impl LspSync {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Watch => "watch",
+        }
+    }
+}
+
+impl std::str::FromStr for LspSync {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "off" => Ok(Self::Off),
+            "watch" => Ok(Self::Watch),
+            other => Err(format!("sync must be \"off\" or \"watch\" (got {other:?})")),
+        }
+    }
+}
+
 /// `[run_profile.lsp]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -260,6 +296,14 @@ pub struct LspProfile {
     /// symbol node). The recipes walk no `lsp.live` and run the same under both
     /// values.
     pub implementations: bool,
+    /// `"off"` (default): a language server is told nothing about edits after
+    /// it starts. `"watch"`: a long-lived manager (the MCP and REST server's,
+    /// the one `lci traverse` builds under `sessions = "shared"`) watches each
+    /// workspace that has a live session and sends every source-file change
+    /// to its servers (see [`LspSync`]). A per-call manager never watches:
+    /// under `sessions = "per_call"` it changes nothing for `lsp.live`. The
+    /// recipes walk no `lsp.live` and run the same under both values.
+    pub sync: LspSync,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -541,6 +585,7 @@ mod tests {
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
         config.run_profile.seeds.bm25 = true;
+        config.run_profile.lsp.sync = LspSync::Watch;
         config
     }
 
@@ -861,6 +906,7 @@ mode = \"sometimes\"
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
             "run_profile.seeds.bm25",
+            "run_profile.lsp.sync",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -1041,6 +1087,53 @@ mode = \"sometimes\"
             diff = format!("golden:\n{expected_text}\ncode:\n{actual_text}");
         }
         diff
+    }
+
+    #[test]
+    fn lsp_sync_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        let watch: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsync = \"watch\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        watch.validate().unwrap();
+        assert_eq!(watch.run_profile.lsp.sync, LspSync::Watch);
+        assert_eq!(watch.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert!(!watch.run_profile.lsp.outline_cache);
+        assert_eq!(
+            serde_json::to_value(&watch).unwrap()["run_profile"]["lsp"]["sync"],
+            "watch"
+        );
+        let (off, watch) = (off.run_profile(), watch.run_profile());
+        assert_eq!(off.value["run_profile"]["lsp"]["sync"], "off");
+        assert_eq!(watch.value["run_profile"]["lsp"]["sync"], "watch");
+        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.sync"));
+        assert_ne!(off.hash, watch.hash);
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nsync = \"off\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.lsp]\nsync = \"on\"\n",
+            "[run_profile.lsp]\nsync = \"Watch\"\n",
+            "[run_profile.lsp]\nsync = true\n",
+            "[run_profile]\nsync = \"watch\"\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        let error =
+            toml::from_str::<Config>(&format!("{}[run_profile]\nsync = \"watch\"\n", base_toml()))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("sync"), "{error}");
+        assert_eq!(LspSync::Watch.as_str(), "watch");
+        assert_eq!("off".parse::<LspSync>(), Ok(LspSync::Off));
+        assert!("on".parse::<LspSync>().is_err());
     }
 
     #[test]

@@ -308,6 +308,16 @@ pub struct Call<'a> {
     pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
 }
 
+/// The language-server manager of one `lsp.live` walk under
+/// `[run_profile.lsp] sessions = "per_call"` (or with no shared manager):
+/// built from the call's settings, and never syncing whatever
+/// `[run_profile.lsp] sync` says, since its servers start on the tree as it is
+/// and stop with the walk.
+pub fn per_call_manager(call: &Call<'_>) -> Arc<lci_core::lsp::Manager> {
+    let defaults = lci_core::config::Config::default();
+    Arc::new(lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults)).without_sync())
+}
+
 /// Where a call keeps what it writes.
 pub struct Dirs {
     /// `<name>.jsonl` traces.
@@ -981,7 +991,7 @@ pub async fn run_with_trait_seeds(
                 let settings = call.lsp.unwrap_or(&defaults);
                 let manager = match (profile.lsp.sessions, &call.lsp_sessions) {
                     (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
-                    _ => Arc::new(lci_core::lsp::Manager::new(settings)),
+                    _ => per_call_manager(call),
                 };
                 // The version probe is bounded like the readiness probes.
                 let probe =

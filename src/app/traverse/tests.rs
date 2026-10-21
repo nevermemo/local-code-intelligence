@@ -2325,6 +2325,40 @@ async fn lsp_live_opens_the_call_settings_or_the_shared_manager_as_the_profile_s
     assert!(alone.contains("lci-missing-own"), "{alone}");
 }
 
+/// The manager a `per_call` walk builds from the call's settings never syncs,
+/// even when those settings (the App's whole configuration, under the MCP and
+/// REST server) say `sync = "watch"`: its servers start on the tree as it is
+/// and stop with the walk.
+#[test]
+fn a_per_call_manager_never_syncs_whatever_the_call_settings_say() {
+    use lci_core::config::LspSync;
+    let mut watching = lci_core::config::Config::default();
+    watching.run_profile.lsp.sync = LspSync::Watch;
+    assert_eq!(
+        lci_core::lsp::Manager::new(&watching).sync_mode(),
+        LspSync::Watch,
+        "the control: a manager of these settings syncs"
+    );
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    for lsp in [Some(&watching), None] {
+        let call = Call {
+            scip_index: Path::new("unused"),
+            scip_root: None,
+            question: "q",
+            seeds: &[],
+            seed_search: None,
+            top_k: 8,
+            maps: None,
+            budget: &budget,
+            steer: &steer,
+            handle: None,
+            lsp,
+            lsp_sessions: None,
+        };
+        assert_eq!(per_call_manager(&call).sync_mode(), LspSync::Off);
+    }
+}
+
 #[tokio::test]
 async fn a_tie_break_file_that_cannot_be_read_is_an_error() {
     let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
