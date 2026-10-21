@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: SHARED (`sessions = shared` default with a tree-stamp barrier, d454 to d467, cross-family review mergeable) (this), K6b transcript shapes (d464, local). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K11b, K11d-2 (K20b-1 is on its branch, d471); K22a-2 (measurement lane). Rewrite this line at every push.
+In flight: ASYNC-1 (PR, d470), K37b (stacked on ASYNC-1), K22a-2 (measurement lane). Next: K11e + N103 (d474), ASYNC-2, N104, K11b, K11d-2. Only docs PRs and the coordinator rewrite this line; a feature PR leaves it alone so parallel PRs do not conflict (d476). The live state is the coordinator's run checkpoint.
 
 ## Cycle 1
 
@@ -145,7 +145,7 @@ machine time is about 5 h (the SEED_MAPS fix and K22a-2 1 to 3 h, the SHARED sta
 weekly and 85 % five-hour rules still cut lanes); SHARED's 1 s stamp-walk kill rule on deno-sized trees (30k files); lanes on
 debug builds under load; M rows with two review rounds (about +30 %); Windows gaps for marksman, Serena and the ast-grep
 tree-sitter pin; outputs dying with worktrees (copy to `work/run` first); this file's "Now and next" going stale after every
-merge burst.
+merge burst (d476: feature PRs no longer touch it, so it lags until the next docs PR).
 
 ## Earlier items outside cycle 1
 
