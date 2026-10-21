@@ -1193,6 +1193,25 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
     }
 }
 
+/// `[run_profile.seeds] bm25` reaches the recipes' walk (the profile is the one
+/// they run under) and changes nothing there: the seeds of `flow_from` are
+/// given, so no seeds map runs under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_seeds_bm25_on() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.seeds.bm25 = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("bm25"), "{on}");
+}
+
 /// The recipes pass their run profile to the walk of `flow_from`, so the
 /// freshness keys reach it. Its answer carries no `maps` and no `file_changed`
 /// (it reads the walk's cards, not the labels), so with both keys on it is the

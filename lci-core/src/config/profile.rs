@@ -36,6 +36,23 @@ pub struct RunProfileConfig {
     pub lsp: LspProfile,
     /// `[run_profile.freshness]`: whether an answer is checked against the tree.
     pub freshness: RunProfileFreshness,
+    /// `[run_profile.seeds]`: where a traversal's starting nodes come from.
+    pub seeds: RunProfileSeeds,
+}
+
+/// `[run_profile.seeds]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileSeeds {
+    /// Let the opt-in map `seeds.bm25` run. `false` (the default): naming it
+    /// gives a note and no seeds, it is not in the default map set, and every
+    /// answer is as without the key. `true`: the map is in the default set
+    /// when a call names no maps, and it runs when named. It ranks the SCIP
+    /// graph's function and method nodes by BM25 over their name, path and
+    /// documentation tokens, and its nodes are appended after the hybrid
+    /// search's seeds. The recipes' seeds are given, so they run the same
+    /// under both values.
+    pub bm25: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -567,6 +584,7 @@ mod tests {
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
+        config.run_profile.seeds.bm25 = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config
     }
@@ -767,6 +785,44 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_bm25_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.bm25);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.bm25);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["bm25"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["bm25"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["bm25"], true);
+        assert!(off.keys.iter().any(|key| key == "run_profile.seeds.bm25"));
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nbm25 = \"yes\"\n",
+            "[run_profile.seeds]\nbm25 = 1\n",
+            "[run_profile.seeds]\nfoo = 1\n",
+            "[run_profile]\nbm25 = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -849,6 +905,7 @@ mode = \"sometimes\"
             "run_profile.freshness.verify_on_read",
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
+            "run_profile.seeds.bm25",
             "run_profile.lsp.sync",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");

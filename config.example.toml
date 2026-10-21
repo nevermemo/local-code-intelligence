@@ -614,6 +614,29 @@ sync = "off"
 [run_profile.freshness]
 verify_on_read = false
 
+# [run_profile.seeds]: where a traversal's start nodes come from.
+# bm25 = false (default): the opt-in map seeds.bm25 does not run; naming it in
+# `maps` gives a note and no seeds, it is not in the default set, and every answer
+# is as without the key. true: the map is in the default set of a call that names
+# no maps, and runs when named. It ranks the SCIP graph's functions and methods
+# (the nodes) by BM25, the scorer of the ripgrep channel, over three fields of
+# each node: the tokens of its name, of its qualified path (the symbol's package,
+# modules, types and member, and the file's path) and of its documentation (the
+# index's `documentation` for the symbol, up to 1024 bytes; empty when
+# rust-analyzer writes none). A question word counts if it is a whole token (up to
+# 4 characters) or inside one (longer); words under 3 characters and stop words
+# are not terms; a term in more than a quarter of the nodes is dropped unless no
+# term would remain. Of the top [traverse] seed_k nodes, those the hybrid search
+# did not already give (so possibly fewer) go after its nodes (seed_source
+# "hybrid+bm25"), or are the start nodes
+# when the hybrid search gave none ("bm25"; the name-token stand-in then does not
+# run). It reads the SCIP graph only (no tree needed) and builds its index on the
+# first call that wants it, reading the documentation from the index file then
+# (a second parse of the file; with the key off no documentation is ever read). The recipes' seeds are given, so they are the same
+# under both values. Part of the run-profile hash.
+[run_profile.seeds]
+bm25 = false
+
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
 # the typed service behind `rescorer = "system_one"`. Off when the section is
