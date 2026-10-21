@@ -6044,3 +6044,24 @@ async fn naming_tests_tested_by_registers_it_and_the_default_set_does_not() {
     let other = first_stage_run(&tree, &limits(), Some(&["graph.scip", SCIP_IMPACT_ID])).await;
     assert!(!listed(&other), "{other}");
 }
+
+#[tokio::test]
+async fn naming_docs_mentions_registers_it_and_the_default_set_does_not() {
+    assert!(OPT_IN_MAPS.contains(&DOCS_MENTIONS_ID) && !MAPS.contains(&DOCS_MENTIONS_ID));
+    let tree = Tree::new();
+    let listed = |response: &Value| -> bool {
+        response["effective_policy"]["maps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no maps in {response}"))
+            .iter()
+            .any(|map| map["id"] == DOCS_MENTIONS_ID && map["enabled"] == true)
+    };
+    let named = first_stage_run(&tree, &limits(), Some(&["graph.scip", DOCS_MENTIONS_ID])).await;
+    assert!(listed(&named), "{named}");
+    // A plain call (the default set) does not register it.
+    let plain = first_stage_run(&tree, &limits(), None).await;
+    assert!(!listed(&plain), "{plain}");
+    // Naming another opt-in map does not turn it on either.
+    let other = first_stage_run(&tree, &limits(), Some(&["graph.scip", SCIP_IMPACT_ID])).await;
+    assert!(!listed(&other), "{other}");
+}

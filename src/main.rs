@@ -438,8 +438,9 @@ struct TraverseArgs {
     /// `impl .. for ..` headers of the tree (--root) and the SCIP index's
     /// reference occurrences; derived and macro impls are absent),
     /// tests.tested_by (the units in a test file or a test module that
-    /// reference a symbol, from the same SCIP impact index) and lsp.live
-    /// (definition, references and document symbols from a running language
+    /// reference a symbol, from the same SCIP impact index), docs.mentions
+    /// (the documentation files that mention a node's name, edges to the
+    /// files only) and lsp.live (definition, references and document symbols from a running language
     /// server, with the server paths and lsp_timeout_seconds of the
     /// configuration; the server starts at the first expansion, so a cold
     /// start can exceed [traverse] deadline_ms and the walk then ends

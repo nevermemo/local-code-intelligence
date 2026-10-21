@@ -267,6 +267,42 @@ fn the_walk_skips_ignored_binary_large_hidden_and_target_files() {
 }
 
 #[test]
+fn a_role_list_keeps_the_walk_to_those_files() {
+    let scratch = Scratch::new("live-grep-roles").unwrap();
+    let root = scratch.path();
+    let docs = [
+        ("README.md", "the marker_name is here\n"),
+        ("docs/guide.md", "see marker_name\nmarker_name again\n"),
+        ("tests/README.md", "marker_name in a test readme\n"),
+    ];
+    for (path, text) in docs {
+        write(root, path, text);
+    }
+    write(root, "src/a.rs", "let marker_name = 1;\n");
+    write(root, "notes.txt", "marker_name\n");
+    write(root, "config.example.toml", "marker_name = 1\n");
+    let options = GrepOptions {
+        roles: Some(vec![SourceRole::Documentation]),
+        ..GrepOptions::default()
+    };
+    let found = scan_now(root, "marker_name", &options);
+    let mut paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    paths.dedup();
+    assert_eq!(paths, ["README.md", "docs/guide.md", "tests/README.md"]);
+    // The other files were never read: the cost is the documents' bytes.
+    assert_eq!(found.files_read, 3);
+    let bytes: usize = docs.iter().map(|(_, text)| text.len()).sum();
+    assert_eq!(found.bytes_read, bytes as u64);
+    assert_eq!(found.stopped, None);
+    // With no list, every file is read, as before.
+    let all = scan_now(root, "marker_name", &GrepOptions::default());
+    assert_eq!(all.files_read, 6);
+    assert!(GrepOptions::default().roles.is_none());
+    // The corpus walks the same files under a role list.
+    assert_corpus_equals_scan(root, &options, &["marker_name", "needle_z", "README"]);
+}
+
+#[test]
 fn the_match_cap_keeps_exact_matches_first_and_stops_the_walk() {
     let scratch = Scratch::new("live-grep-cap").unwrap();
     let root = scratch.path();
