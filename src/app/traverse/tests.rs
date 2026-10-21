@@ -6023,3 +6023,24 @@ async fn a_walk_that_lost_a_map_is_not_labelled_complete() {
     assert_eq!(sound["completeness"]["complete"], true, "{sound}");
     assert!(sound["completeness"].get("degraded").is_none(), "{sound}");
 }
+
+#[tokio::test]
+async fn naming_tests_tested_by_registers_it_and_the_default_set_does_not() {
+    assert!(OPT_IN_MAPS.contains(&TESTED_BY_ID) && !MAPS.contains(&TESTED_BY_ID));
+    let tree = Tree::new();
+    let listed = |response: &Value| -> bool {
+        response["effective_policy"]["maps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no maps in {response}"))
+            .iter()
+            .any(|map| map["id"] == TESTED_BY_ID && map["enabled"] == true)
+    };
+    let named = first_stage_run(&tree, &limits(), Some(&["graph.scip", TESTED_BY_ID])).await;
+    assert!(listed(&named), "{named}");
+    // A plain call (the default set) does not register it.
+    let plain = first_stage_run(&tree, &limits(), None).await;
+    assert!(!listed(&plain), "{plain}");
+    // Naming another opt-in map does not turn it on either.
+    let other = first_stage_run(&tree, &limits(), Some(&["graph.scip", SCIP_IMPACT_ID])).await;
+    assert!(!listed(&other), "{other}");
+}

@@ -160,7 +160,7 @@ pub(super) async fn load(index: &Path, root: Option<&Path>, mode: ScipMode) -> R
     if mode == ScipMode::Off {
         return Ok(Arc::new(Loaded::empty(
             mode,
-            "graph.scip: empty (scip.mode = off): the SCIP-built maps (structure.contains, seeds.bm25, scip.impact, scip.implements, config.key, exact.closure) have nothing to read; grep.live places its results by file only (no SCIP spans); lsp.live places nodes only with [run_profile.lsp] places = outline (the index has none)".to_owned(),
+            "graph.scip: empty (scip.mode = off): the SCIP-built maps (structure.contains, seeds.bm25, scip.impact, scip.implements, tests.tested_by, config.key, exact.closure) have nothing to read; grep.live places its results by file only (no SCIP spans); lsp.live places nodes only with [run_profile.lsp] places = outline (the index has none)".to_owned(),
         )));
     }
     let none_read = |why: &str| {
