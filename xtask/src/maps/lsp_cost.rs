@@ -1994,6 +1994,13 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
     }
     let arms = select_arms(&args.arms)?;
     let server = resolve_server(args.adapter, args.server.as_deref(), &args.rust_analyzer)?;
+    // For rust the resolved server is rust-analyzer: it writes the SCIP index
+    // and is the arms' `rust_analyzer_path`, so `--server` overrides both.
+    let rust_analyzer = if args.adapter == Adapter::Rust {
+        server.clone()
+    } else {
+        args.rust_analyzer.clone()
+    };
 
     let binary_source =
         args.binary
@@ -2034,13 +2041,9 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         target
     } else {
         let target = out.join("index.scip");
-        println!(
-            "writing {} with `{} scip`",
-            target.display(),
-            args.rust_analyzer
-        );
+        println!("writing {} with `{} scip`", target.display(), rust_analyzer);
         let started = Instant::now();
-        let status = std::process::Command::new(&args.rust_analyzer)
+        let status = std::process::Command::new(&rust_analyzer)
             .arg("scip")
             .arg(&tree)
             .arg("--output")
@@ -2136,7 +2139,7 @@ async fn run_async(args: LspCostArgs) -> Result<()> {
         out: out.clone(),
         work: work.clone(),
         scip,
-        rust_analyzer: args.rust_analyzer.clone(),
+        rust_analyzer,
         adapter: args.adapter,
         server: server.clone(),
         calls_file,
