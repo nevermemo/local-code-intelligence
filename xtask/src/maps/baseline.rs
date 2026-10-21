@@ -10,11 +10,14 @@
 //! * `history`: `git log -G/-S/--grep` over the frozen eval tree, from the
 //!   identifiers of the question, in the fixed order documented on
 //!   [`HistoryArgs`].
+//! * `rg` (K5a-1): `rg --fixed-strings --word-regexp` over the frozen tree for
+//!   the `traits` and `where-to` sets, from the question's names (see the
+//!   `rg` module). The LSP-over-MCP arm is K5a-2.
 //!
-//! Both write the answers as the bench's adapters do (impact `{path, line}`,
-//! history `{commit}`) and score them with [`super::bench::item_record`], so a
-//! baseline run pairs with any bench run in `maps compare`. Neither arm
-//! expands anything: `expansions` is 0.
+//! All write the answers as the bench's adapters do (impact and rg
+//! `{path, line}`, history `{commit}`) and score them with
+//! [`super::bench::item_record`], so a baseline run pairs with any bench run
+//! in `maps compare`. No arm expands anything: `expansions` is 0.
 
 use super::bench::{self, item_record, select_items, set_name, slug};
 use crate::gold::{self, Set};
@@ -29,6 +32,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod rg;
+
 #[derive(Subcommand)]
 pub enum BaselineCommand {
     /// M1.4 arm N on the impact set: anchor from the question's backticked
@@ -41,12 +46,19 @@ pub enum BaselineCommand {
     /// free text), top --top-k commits in a fixed order. Writes a run dir for
     /// `maps compare`.
     History(HistoryArgs),
+    /// `rg --fixed-strings --word-regexp` over the frozen eval tree on the
+    /// `traits` or `where-to` set, from the question's backticked names (else
+    /// its lexical terms), top --top-k `{path, line}` answers in a fixed order
+    /// (`--decl-first` moves declaration lines ahead). Not given the gold.
+    /// Writes a run dir for `maps compare`.
+    Rg(rg::RgArgs),
 }
 
 pub fn run(command: BaselineCommand) -> Result<()> {
     match command {
         BaselineCommand::Impact(args) => run_impact(args),
         BaselineCommand::History(args) => run_history(args),
+        BaselineCommand::Rg(args) => rg::run_rg_arm(args),
     }
 }
 
