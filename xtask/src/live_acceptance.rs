@@ -181,7 +181,7 @@ fn binary_step(
 /// Every descendant PID of `root` at any depth, BFS over one already-
 /// refreshed process table. Mirrors `acceptance::ManagedServer`'s private
 /// helper of the same shape.
-fn descendants_of(system: &System, root: u32) -> Vec<u32> {
+pub(crate) fn descendants_of(system: &System, root: u32) -> Vec<u32> {
     let mut frontier = vec![root];
     let mut found = Vec::new();
     let mut seen = std::collections::HashSet::new();
