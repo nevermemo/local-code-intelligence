@@ -5433,6 +5433,77 @@ async fn seeds_literal_is_inert_with_the_key_off_and_seeds_after_hybrid_with_it_
     );
 }
 
+#[tokio::test]
+async fn no_search_gives_the_ripgrep_note_even_for_a_question_without_code_spans() {
+    use super::seeds::literal_seeds;
+    use lci_maps::lsp_live::ScipPlaces;
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let loaded = Loaded::new(
+        (None, 0),
+        ScipMap::with_default_ids(ScipGraph::build(&[], None)),
+    );
+    let places = ScipPlaces::from_scip(&loaded.scip);
+    for question in ["no names here", "who calls `target`?"] {
+        let call = bare_call(question, None, &budget, &steer);
+        let (seeds, _, notes) = literal_seeds(&limits(), &call, &HashSet::new(), &places)
+            .await
+            .unwrap();
+        assert!(seeds.is_empty());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("needs the application's ripgrep"),
+            "{notes:?}"
+        );
+        assert!(!notes[0].contains("nothing in code spans"), "{notes:?}");
+    }
+
+    // The same through a whole call: the note of the call has the ripgrep
+    // line, not the no-names one; with a search the no-names note stays.
+    let tree = crowded_tree(2);
+    let named = Some(&["seeds.literal", "graph.scip"][..]);
+    let none = literal_call(&tree, true, named, "no names here", None).await;
+    let notes = none["notes"].to_string();
+    assert!(
+        notes.contains("seeds.literal needs the application's ripgrep"),
+        "{notes}"
+    );
+    assert!(!notes.contains("nothing in code spans"), "{notes}");
+    let stub = LiteralStub::new(Ok(Vec::new()), Some(Ok(literal_found(Vec::new()))));
+    let some = literal_call(&tree, true, named, "no names here", Some(&stub)).await;
+    let notes = some["notes"].to_string();
+    assert!(notes.contains("nothing in code spans"), "{notes}");
+    assert_eq!(stub.literal_calls.load(Ordering::SeqCst), 0);
+
+    // An application that failed to open (`NoSearch`) is no search either:
+    // the ripgrep note with the reason, for a question with and without a
+    // code span, in `literal_seeds` and in the whole call.
+    let down = NoSearch("the application did not open".into());
+    for question in ["no names here", "who calls `target`?"] {
+        let call = bare_call(question, Some(&down), &budget, &steer);
+        let (seeds, _, notes) = literal_seeds(&limits(), &call, &HashSet::new(), &places)
+            .await
+            .unwrap();
+        assert!(seeds.is_empty());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("needs the application's ripgrep"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[0].contains("the application did not open"),
+            "{notes:?}"
+        );
+        assert!(!notes[0].contains("nothing in code spans"), "{notes:?}");
+        let whole = literal_call(&tree, true, named, question, Some(&down)).await;
+        let notes = whole["notes"].to_string();
+        assert!(
+            notes.contains("seeds.literal needs the application's ripgrep"),
+            "{notes}"
+        );
+        assert!(!notes.contains("nothing in code spans"), "{notes}");
+    }
+}
+
 #[test]
 fn declares_reads_the_word_before_the_name_across_languages() {
     use super::seeds::declares;
