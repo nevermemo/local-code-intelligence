@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
@@ -1503,6 +1503,70 @@ impl Manager {
             .get(&(provider.to_string(), workspace_id.to_string()))
             .is_some_and(|session| session.ready_client().is_some())
     }
+
+    /// Starts the server of every enabled adapter for `workspace` and waits
+    /// until each has finished priming, so that a later `workspace/symbol`
+    /// request does not pay the start. Returns, per provider, the time the
+    /// warm-up took or why it did not happen: a binary that fails its version
+    /// probe, a server that fails to start, or one that is not primed within
+    /// `timeout` (the whole call is bounded by it; a server still starting
+    /// then keeps starting in its session). A disabled adapter is not started
+    /// and is absent from the map. Never panics.
+    ///
+    /// The sessions are the ones searches use, so this changes which request
+    /// pays for the start, never an answer.
+    pub async fn prime(
+        &self,
+        workspace: &Workspace,
+        timeout: Duration,
+    ) -> BTreeMap<&'static str, Result<Duration>> {
+        let deadline = Instant::now() + timeout;
+        let mut outcomes = BTreeMap::new();
+        let mut starting = Vec::new();
+        for adapter in self.adapters.iter().filter(|adapter| adapter.enabled()) {
+            let started = Instant::now();
+            // Every probe shares the one deadline, so hanging probes cost
+            // `timeout` in total, not each.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let probe = tokio::time::timeout(remaining, self.probe_once(adapter, remaining)).await;
+            match probe {
+                Ok(Ok(())) => {
+                    // Begin every start before waiting for any, so the servers
+                    // warm side by side.
+                    drop(self.session(adapter, workspace).await);
+                    starting.push((adapter, started));
+                }
+                Ok(Err(error)) => {
+                    outcomes.insert(adapter.provider(), Err(error));
+                }
+                Err(_) => {
+                    outcomes.insert(
+                        adapter.provider(),
+                        Err(anyhow!(
+                            "the version probe did not answer within {timeout:?}"
+                        )),
+                    );
+                }
+            }
+        }
+        for (adapter, started) in starting {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let outcome = match tokio::time::timeout(
+                remaining,
+                self.client(adapter, workspace, true),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(started.elapsed()),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow!(
+                    "not started and primed within {timeout:?}; it keeps starting in the background"
+                )),
+            };
+            outcomes.insert(adapter.provider(), outcome);
+        }
+        outcomes
+    }
 }
 
 /// Runs `attempt` (one request on one server). A server that answers with a
@@ -2221,6 +2285,123 @@ mod tests {
         let other = Manager::new(&Config::default());
         other.probe_once(&adapter, timeout).await.unwrap();
         assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
+    }
+
+    /// How a [`Primable`]'s version probe behaves.
+    #[derive(Clone, Copy)]
+    enum Probe {
+        Passes,
+        /// The binary is missing.
+        Fails,
+        /// The probe never answers.
+        Hangs,
+    }
+
+    /// An adapter with a name, a switch and a scripted version probe. It has
+    /// no transport, so a session started for it fails at once.
+    struct Primable {
+        provider: &'static str,
+        enabled: bool,
+        probe: Probe,
+    }
+
+    #[async_trait::async_trait]
+    impl LspAdapter for Primable {
+        fn provider(&self) -> &'static str {
+            self.provider
+        }
+        fn languages(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn enabled(&self) -> bool {
+            self.enabled
+        }
+        fn configured_command(&self) -> Option<String> {
+            None
+        }
+        fn readiness_component_name(&self) -> &'static str {
+            "primable_available"
+        }
+        async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
+            match self.probe {
+                Probe::Passes => Ok(()),
+                Probe::Fails => Err(anyhow!("no such binary: {}", self.provider)),
+                Probe::Hangs => std::future::pending().await,
+            }
+        }
+        fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
+            None
+        }
+        fn initialize_params(&self, _root: &std::path::Path) -> Option<Value> {
+            None
+        }
+        fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+            Box::new(|_| false)
+        }
+    }
+
+    #[tokio::test]
+    async fn prime_reports_each_provider_and_a_missing_binary_as_an_error() {
+        let mut manager = Manager::new(&Config::default());
+        let stub = |provider, enabled, probe| -> Arc<dyn LspAdapter> {
+            Arc::new(Primable {
+                provider,
+                enabled,
+                probe,
+            })
+        };
+        manager.adapters = vec![
+            stub("no-binary", true, Probe::Fails),
+            stub("no-transport", true, Probe::Passes),
+            stub("disabled", false, Probe::Fails),
+            stub("never-answers", true, Probe::Hangs),
+            stub("never-answers-either", true, Probe::Hangs),
+        ];
+        let workspace = Workspace {
+            id: "prime".into(),
+            path: PathBuf::from("workspace"),
+        };
+        let timeout = Duration::from_millis(400);
+
+        let started = Instant::now();
+        let outcomes = manager.prime(&workspace, timeout).await;
+        // Bounded by the timeout in total: two hanging probes share it
+        // (one each would take twice as long).
+        assert!(
+            started.elapsed() < timeout * 3 / 2,
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Every enabled provider is answered for, a disabled one is not asked.
+        assert_eq!(
+            outcomes.keys().copied().collect::<Vec<_>>(),
+            [
+                "never-answers",
+                "never-answers-either",
+                "no-binary",
+                "no-transport"
+            ]
+        );
+        let message = |provider: &str| format!("{:#}", outcomes[provider].as_ref().unwrap_err());
+        assert!(
+            message("no-binary").contains("no such binary"),
+            "{}",
+            message("no-binary")
+        );
+        assert!(
+            message("no-transport").contains("disabled or has no executable"),
+            "{}",
+            message("no-transport")
+        );
+        assert!(
+            message("never-answers").contains("did not answer"),
+            "{}",
+            message("never-answers")
+        );
+        // A provider whose probe failed started no session.
+        assert!(!manager.running("no-binary", "prime").await);
+        assert!(!manager.running("never-answers", "prime").await);
     }
 
     const FAST_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];

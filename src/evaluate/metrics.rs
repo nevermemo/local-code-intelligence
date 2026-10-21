@@ -166,6 +166,8 @@ pub fn query_metrics(
         file_acc_at_5: file_acc_at_k(&gold, evidence, 5),
         file_acc_at_10: file_acc_at_k(&gold, evidence, 10),
         returned_tokens: Some(snippet_tokens(&[evidence])),
+        lsp_budget_hit: false,
+        lsp_providers_over_budget: Vec::new(),
     }
 }
 
@@ -459,6 +461,11 @@ pub fn aggregate(reports: &[QueryReport]) -> AggregateReport {
         mean_file_acc_at_5: mean_metric(&executed, |metrics| metrics.file_acc_at_5),
         mean_file_acc_at_10: mean_metric(&executed, |metrics| metrics.file_acc_at_10),
         mean_returned_tokens: mean_returned_tokens(&executed),
+        lsp_budget_hit_queries: executed
+            .iter()
+            .filter(|report| report.metrics.lsp_budget_hit)
+            .count(),
+        priming: BTreeMap::new(),
         median_latency_ms,
         p95_latency_ms,
         stage_latency: stages,

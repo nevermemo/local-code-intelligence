@@ -53,7 +53,7 @@ Beyond the build prerequisites in the [README](../../README.md#build-and-run):
 | Chunking or scanning | `cargo xtask test --suite Chunk` (or `cargo test -p lci-core --lib chunk::` while iterating) |
 | Retrieval filters or source roles | `cargo xtask test --suite Filter` (or `cargo test -p lci-core --lib filter::`) |
 | Configuration layers, the local overlay, `lci config`, or `lci init` | `cargo xtask test --suite Config` (or `cargo test -p lci-core --lib config::` / `cargo test -p local-code-intelligence --lib init::` while iterating) |
-| Evaluation definitions or metrics | `cargo xtask test --suite Evaluation` |
+| Evaluation definitions or metrics, the evaluation run's language-server warm-up (`priming`, `--no-prime`), `lsp_budget_hit` or the `compare` exclusion of budget-hit pairs (`--keep-failed`) | `cargo xtask test --suite Evaluation` (the warm-up and budget-hit cases use the fake language server; `Manager::prime` itself is in `--suite Lsp`) |
 | Mined-query generator (`xtask/src/mine.rs`) | `cargo test -p xtask mine::` (xtask is a binary crate, so the `--lib` unit suites do not run it); `--suite Evaluation` also checks the checked-in mined set |
 | Development-tooling resolver (`xtask/src/env.rs`) | `cargo test -p xtask env::` (its worktree cases need `git` on `PATH`) |
 | Machine-value lint (`xtask/src/lint.rs`) | `cargo test -p xtask lint::` (its repository cases need `git` on `PATH`); `cargo xtask lint-machine-paths` runs the lint itself and is the first step of `--suite Full` |

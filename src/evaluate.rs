@@ -34,8 +34,9 @@ pub use runner::{
 };
 pub use types::{
     AggregateReport, CandidateArm, EvalQuery, EvalTimings, EvalWorkspace, EvaluationFile,
-    IndexLifecycleAction, LatencyPercentiles, QueryMetrics, QueryReport, ReplayRefusal, RerankMode,
-    RerankerState, ResultEvidence, SNIPPET_BUDGET, StageLatency, bounded_snippet,
+    IndexLifecycleAction, LatencyPercentiles, PrimingOutcome, QueryMetrics, QueryReport,
+    ReplayRefusal, RerankMode, RerankerState, ResultEvidence, SNIPPET_BUDGET, StageLatency,
+    bounded_snippet,
 };
 
 #[cfg(test)]

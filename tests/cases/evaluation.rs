@@ -112,6 +112,30 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
     assert!(json.get("hit_at_1_rate").is_some());
     assert!(json.get("mrr").is_some());
     assert!(json.get("role_distribution").is_some());
+    // A report that saw no language-server budget hit and primed nothing says
+    // so: the count is always there, the priming block only when it has content.
+    assert_eq!(json["lsp_budget_hit_queries"], 0);
+    assert_eq!(json["queries"][0]["metrics"]["lsp_budget_hit"], false);
+    assert!(
+        json["queries"][0]["metrics"]
+            .get("lsp_providers_over_budget")
+            .is_none()
+    );
+    assert!(json.get("priming").is_none());
+    // An older report, written before the fields, reads as no hit.
+    let mut older = json.clone();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("lsp_budget_hit_queries");
+    older["queries"][0]["metrics"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lsp_budget_hit");
+    let older: local_code_intelligence::evaluate::AggregateReport =
+        serde_json::from_value(older).unwrap();
+    assert_eq!(older.lsp_budget_hit_queries, 0);
+    assert!(!older.queries[0].metrics.lsp_budget_hit);
 
     let definition = EvaluationFile {
         workspaces: vec![EvalWorkspace {
@@ -184,6 +208,67 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
     assert_eq!(json["seed"], 3);
     assert_eq!(json["resamples"], 500);
     assert!(json["overall"]["mrr"]["mean_delta"].as_f64().unwrap() < 0.0);
+    assert_eq!(json["budget_hit_pairs"], 0);
+    assert!(
+        stdout.contains("LSP budget hit on either side, left out: 0"),
+        "{stdout}"
+    );
+
+    // A query whose candidate-side language server missed its search budget
+    // measured a cold start, not retrieval: its pair is left out and counted,
+    // unless `--keep-failed` keeps it.
+    let flagged: Vec<QueryReport> = [("alpha", 0.5, true), ("beta", 0.25, false)]
+        .iter()
+        .map(|(text, reciprocal_rank, over_budget)| {
+            let mut query = evaluation_query();
+            query.query = (*text).to_owned();
+            let mut report = QueryReport::failed(query, String::new());
+            report.metrics.reciprocal_rank = *reciprocal_rank;
+            report.metrics.lsp_budget_hit = *over_budget;
+            report.metrics.lsp_providers_over_budget = if *over_budget {
+                vec!["csharp-ls".to_owned()]
+            } else {
+                Vec::new()
+            };
+            report
+        })
+        .collect();
+    std::fs::write(
+        temp.path().join("flagged.json"),
+        serde_json::to_string(&aggregate(&flagged)).unwrap(),
+    )
+    .unwrap();
+    let run_compare = |extra: &[&str], output: &str| {
+        let result = std::process::Command::new(binary)
+            .current_dir(temp.path())
+            .args(["compare", "base.json", "flagged.json", "--output", output])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path().join(output)).unwrap())
+                .unwrap();
+        (String::from_utf8_lossy(&result.stdout).into_owned(), json)
+    };
+    let (summary, left_out) = run_compare(&[], "left-out.json");
+    assert_eq!(left_out["paired"], 1);
+    assert_eq!(left_out["budget_hit_pairs"], 1);
+    assert_eq!(left_out["budget_hit_baseline"], 0);
+    assert_eq!(left_out["budget_hit_candidate"], 1);
+    assert_eq!(left_out["pairs"].as_array().unwrap().len(), 1);
+    assert_eq!(left_out["pairs"][0]["query"], "beta");
+    assert!(
+        summary.contains("LSP budget hit on either side, left out: 1 (baseline 0, candidate 1)"),
+        "{summary}"
+    );
+    let (_, kept) = run_compare(&["--keep-failed"], "kept.json");
+    assert_eq!(kept["paired"], 2);
+    assert_eq!(kept["budget_hit_pairs"], 0);
 
     let unreadable = std::process::Command::new(binary)
         .current_dir(temp.path())
@@ -196,6 +281,166 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
         "{}",
         String::from_utf8_lossy(&unreadable.stderr)
     );
+}
+
+// ---------------------------------------------------------------------------
+// A language server past its search budget: a structured fact, and the
+// warm-up that keeps the first query from paying a cold start.
+// ---------------------------------------------------------------------------
+
+fn write_cold_language_server_workspace(root: &Path) {
+    write(
+        root,
+        "src/Calculator.cs",
+        "namespace Acceptance;\n\npublic sealed class Calculator\n{\n    public int Add(int a, int b) => a + b;\n}\n",
+    );
+}
+
+fn cold_language_server_definition() -> EvaluationFile {
+    EvaluationFile {
+        workspaces: vec![EvalWorkspace {
+            key: "cold".to_owned(),
+            required: true,
+        }],
+        queries: vec![EvalQuery {
+            query: "Calculator".to_owned(),
+            workspace: "cold".to_owned(),
+            top_k: Some(10),
+            filters: None,
+            expected_paths: vec!["src/Calculator.cs".to_owned()],
+            preferred_paths: Vec::new(),
+            disfavored_paths: Vec::new(),
+            expected_roles: Vec::new(),
+            required_snippet: None,
+            tags: Vec::new(),
+        }],
+    }
+}
+
+/// An application of its own (data directory, fake server state) whose fake
+/// C# server takes `start_delay_ms` to answer `initialize`, over an indexed
+/// copy of the workspace.
+async fn cold_language_server_app(
+    temp: &Path,
+    base: &Config,
+    label: &str,
+    budget_ms: u64,
+    start_delay_ms: &str,
+    workspace: &Path,
+) -> App {
+    let mut config = base.clone();
+    config.data_dir = temp.join(format!("data-{label}"));
+    config.lsp_search_budget_ms = budget_ms;
+    config = with_fake_csharp_server(
+        config,
+        &temp.join(format!("lsp-{label}")),
+        &["--initialize-delay-ms", start_delay_ms],
+        LOADED_BUDGET_SECONDS,
+    );
+    let app = App::open(config).await.unwrap();
+    app.index(workspace).await.unwrap();
+    app
+}
+
+#[tokio::test]
+async fn a_language_server_past_its_budget_is_a_structured_fact_and_priming_keeps_the_first_query_warm()
+ {
+    let (temp, config, _fake, task) = fixture().await;
+    let workspace = temp.path().join("cold-lsp");
+    write_cold_language_server_workspace(&workspace);
+    let definition = cold_language_server_definition();
+    let mappings = parse_workspace_mappings(&[format!("cold={}", workspace.display())]).unwrap();
+
+    // The search itself says which provider missed: a 100 ms budget against a
+    // server that needs 3 s to start. The note stays beside the field.
+    let app =
+        cold_language_server_app(temp.path(), &config, "search", 100, "3000", &workspace).await;
+    let search = app
+        .search(&workspace, "Calculator", Some(10))
+        .await
+        .unwrap();
+    assert_eq!(search.lsp_over_budget, ["csharp-ls"]);
+    assert!(search.warning.is_none(), "{:?}", search.warning);
+    assert_eq!(search.notes.len(), 1, "{:?}", search.notes);
+    assert!(
+        search.notes[0].contains("LSP still starting"),
+        "{:?}",
+        search.notes
+    );
+    assert_eq!(
+        serde_json::to_value(&search).unwrap()["lsp_over_budget"],
+        json!(["csharp-ls"])
+    );
+    drop(app);
+
+    // Without priming the first query pays the start and the report says so.
+    let app = cold_language_server_app(temp.path(), &config, "cold", 100, "3000", &workspace).await;
+    let cold = run_evaluation_with_options(
+        &app,
+        &definition,
+        &mappings,
+        RunOptions {
+            prime: false,
+            ..RunOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    drop(app);
+    let metrics = &cold.queries[0].metrics;
+    assert!(metrics.lsp_budget_hit);
+    assert_eq!(metrics.lsp_providers_over_budget, ["csharp-ls"]);
+    assert_eq!(cold.lsp_budget_hit_queries, 1);
+    assert!(cold.priming.is_empty(), "{:?}", cold.priming);
+    assert!(cold.queries[0].warning.is_none());
+    assert_eq!(cold.fallback_queries, 0, "a budget hit is not a fallback");
+    let cold_json = serde_json::to_value(&cold).unwrap();
+    assert_eq!(cold_json["lsp_budget_hit_queries"], 1);
+    assert_eq!(
+        cold_json["queries"][0]["metrics"]["lsp_providers_over_budget"],
+        json!(["csharp-ls"])
+    );
+    assert!(cold_json.get("priming").is_none());
+
+    // With priming (the default) the server is started and primed before the
+    // first query, which then pays neither the start nor a budget miss. The
+    // start takes 4 s, the 3 s ceiling still tells a primed query from one
+    // that waited for the start.
+    let app =
+        cold_language_server_app(temp.path(), &config, "warm", 30_000, "4000", &workspace).await;
+    let warm = run_evaluation_with_options(&app, &definition, &mappings, RunOptions::default())
+        .await
+        .unwrap();
+    drop(app);
+    let primed = &warm.priming["cold"]["csharp-ls"];
+    assert!(primed.primed, "{primed:?}");
+    assert!(primed.error.is_none(), "{primed:?}");
+    assert!(
+        primed.ms >= 3500.0,
+        "the warm-up waited for the start: {} ms",
+        primed.ms
+    );
+    // rust-analyzer is always enabled, and the fixture points it at a binary
+    // that does not exist: recorded as a failed warm-up, never fatal.
+    let missing = &warm.priming["cold"]["rust-analyzer"];
+    assert!(!missing.primed, "{missing:?}");
+    assert!(missing.error.is_some(), "{missing:?}");
+    assert_eq!(warm.priming["cold"].len(), 2, "{:?}", warm.priming);
+    let query = &warm.queries[0];
+    assert!(!query.metrics.lsp_budget_hit);
+    assert!(query.metrics.lsp_providers_over_budget.is_empty());
+    assert_eq!(warm.lsp_budget_hit_queries, 0);
+    assert!(query.warning.is_none(), "{:?}", query.warning);
+    let lsp_ms = query.timings.unwrap().lsp_search_ms;
+    assert!(
+        lsp_ms < 3000.0,
+        "the first query still paid the start: {lsp_ms} ms"
+    );
+    assert_eq!(
+        serde_json::to_value(&warm).unwrap()["priming"]["cold"]["csharp-ls"]["primed"],
+        true
+    );
+    task.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +550,9 @@ async fn a_traced_search_records_the_pool_and_returns_exactly_what_an_untraced_o
     let via_search =
         serde_json::to_value(app.search(&workspace, "translator", Some(3)).await.unwrap()).unwrap();
     for json in [&plain_json, &via_search] {
-        for key in ["candidates", "rerank_outcome", "arm"] {
+        // `lsp_over_budget` is in the list: a search that missed no
+        // language-server budget serializes exactly as it did before the field.
+        for key in ["candidates", "rerank_outcome", "arm", "lsp_over_budget"] {
             assert!(
                 json.get(key).is_none(),
                 "an untraced search has a {key} key"
@@ -566,6 +813,7 @@ async fn the_evaluation_dump_adds_candidates_and_an_arm_and_changes_nothing_else
         &mappings,
         RunOptions {
             dump_candidates: true,
+            ..RunOptions::default()
         },
     )
     .await
@@ -659,6 +907,7 @@ async fn the_evaluation_dump_adds_candidates_and_an_arm_and_changes_nothing_else
         &local_code_intelligence::evaluate::CompareOptions {
             seed: 1,
             resamples: 100,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1313,7 +1562,10 @@ async fn live_run(
         &app,
         definition,
         &dump_mappings(&workspace),
-        RunOptions { dump_candidates },
+        RunOptions {
+            dump_candidates,
+            ..RunOptions::default()
+        },
     )
     .await
     .unwrap()
