@@ -534,6 +534,10 @@ fn tag_aggregates(executed: &[&QueryReport]) -> BTreeMap<String, TagAggregate> {
                 hit_at_3_rate: share(|metrics| metrics.hit_at_3),
                 mrr: mean(|metrics| metrics.reciprocal_rank),
                 mean_ndcg_at_10: mean(|metrics| metrics.ndcg_at_10),
+                lsp_budget_hit_queries: reports
+                    .iter()
+                    .filter(|report| report.metrics.lsp_budget_hit)
+                    .count(),
             };
             (tag.to_owned(), aggregate)
         })

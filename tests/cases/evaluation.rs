@@ -122,6 +122,8 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
             .is_none()
     );
     assert!(json.get("priming").is_none());
+    // An untagged aggregate keeps its shape: no `by_tag` key at all.
+    assert!(json.get("by_tag").is_none());
     // An older report, written before the fields, reads as no hit.
     let mut older = json.clone();
     older
@@ -150,12 +152,13 @@ fn evaluation_reports_required_failures_optional_skips_and_json_metrics() {
 #[test]
 fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
     let temp = tempfile::tempdir().unwrap();
-    let write_report = |name: &str, ranks: &[(&str, f64)]| {
+    let write_report = |name: &str, ranks: &[(&str, f64, &[&str])]| {
         let reports: Vec<QueryReport> = ranks
             .iter()
-            .map(|(text, reciprocal_rank)| {
+            .map(|(text, reciprocal_rank, tags)| {
                 let mut query = evaluation_query();
                 query.query = (*text).to_owned();
+                query.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
                 let mut report = QueryReport::failed(query, String::new());
                 report.metrics.reciprocal_rank = *reciprocal_rank;
                 report.metrics.hit_at_1 = *reciprocal_rank == 1.0;
@@ -168,8 +171,20 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
         )
         .unwrap();
     };
-    write_report("base.json", &[("alpha", 1.0), ("beta", 0.5)]);
-    write_report("regressed.json", &[("alpha", 0.5), ("beta", 0.25)]);
+    write_report(
+        "base.json",
+        &[
+            ("alpha", 1.0, &["cold", "mined"]),
+            ("beta", 0.5, &["mined"]),
+        ],
+    );
+    write_report(
+        "regressed.json",
+        &[
+            ("alpha", 0.5, &["cold", "mined"]),
+            ("beta", 0.25, &["mined"]),
+        ],
+    );
     let binary = env!("CARGO_BIN_EXE_local-code-intelligence");
 
     // The configuration named here does not exist: `compare` must not load
@@ -213,26 +228,35 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
         stdout.contains("LSP budget hit on either side, left out: 0"),
         "{stdout}"
     );
+    // Nothing was left out, so the per-tag map is neither written nor shown.
+    assert!(json.get("budget_hit_by_tag").is_none());
+    assert!(!stdout.contains("by tag:"), "{stdout}");
 
     // A query whose candidate-side language server missed its search budget
     // measured a cold start, not retrieval: its pair is left out and counted,
     // unless `--keep-failed` keeps it.
-    let flagged: Vec<QueryReport> = [("alpha", 0.5, true), ("beta", 0.25, false)]
-        .iter()
-        .map(|(text, reciprocal_rank, over_budget)| {
-            let mut query = evaluation_query();
-            query.query = (*text).to_owned();
-            let mut report = QueryReport::failed(query, String::new());
-            report.metrics.reciprocal_rank = *reciprocal_rank;
-            report.metrics.lsp_budget_hit = *over_budget;
-            report.metrics.lsp_providers_over_budget = if *over_budget {
-                vec!["csharp-ls".to_owned()]
-            } else {
-                Vec::new()
-            };
-            report
-        })
-        .collect();
+    // The left-out pair takes the tag union of both sides: `alpha` is tagged
+    // `cold` and `mined` in the baseline but only `mined` here.
+    let flagged: Vec<QueryReport> = [
+        ("alpha", 0.5, true, "mined"),
+        ("beta", 0.25, false, "mined"),
+    ]
+    .iter()
+    .map(|(text, reciprocal_rank, over_budget, tag)| {
+        let mut query = evaluation_query();
+        query.query = (*text).to_owned();
+        query.tags = vec![(*tag).to_owned()];
+        let mut report = QueryReport::failed(query, String::new());
+        report.metrics.reciprocal_rank = *reciprocal_rank;
+        report.metrics.lsp_budget_hit = *over_budget;
+        report.metrics.lsp_providers_over_budget = if *over_budget {
+            vec!["csharp-ls".to_owned()]
+        } else {
+            Vec::new()
+        };
+        report
+    })
+    .collect();
     std::fs::write(
         temp.path().join("flagged.json"),
         serde_json::to_string(&aggregate(&flagged)).unwrap(),
@@ -266,9 +290,22 @@ fn compare_subcommand_runs_offline_and_a_regression_is_not_an_error() {
         summary.contains("LSP budget hit on either side, left out: 1 (baseline 0, candidate 1)"),
         "{summary}"
     );
-    let (_, kept) = run_compare(&["--keep-failed"], "kept.json");
+    assert_eq!(
+        left_out["budget_hit_by_tag"],
+        serde_json::json!({"cold": 1, "mined": 1})
+    );
+    // Only `beta` was kept, so `by_tag` has `mined` and no `cold`.
+    let by_tag = left_out["by_tag"].as_object().unwrap();
+    assert_eq!(by_tag.keys().collect::<Vec<_>>(), ["mined"]);
+    assert!(
+        summary.contains("LSP budget hit, left out, by tag: cold 1, mined 1"),
+        "{summary}"
+    );
+    let (kept_summary, kept) = run_compare(&["--keep-failed"], "kept.json");
     assert_eq!(kept["paired"], 2);
     assert_eq!(kept["budget_hit_pairs"], 0);
+    assert!(kept.get("budget_hit_by_tag").is_none());
+    assert!(!kept_summary.contains("by tag:"), "{kept_summary}");
 
     let unreadable = std::process::Command::new(binary)
         .current_dir(temp.path())
