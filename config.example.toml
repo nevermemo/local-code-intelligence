@@ -640,9 +640,22 @@ sync = "off"
 # and costs one read of the tree's source files per search a caller asks for
 # (timings.verify_ms); a traversal's seed searches and the evaluation runner do
 # not pay it.
-# Part of the run-profile hash.
+# stat_gate = false (default): every such read of the tree reads and hashes every
+# source file. true: the process keeps (modified time, length) and the content hash
+# per source file and per root, lists the tree without reading it, and reads and
+# hashes only the files whose stamp is new or changed (a file with no modified
+# time is always read). It serves map_freshness and verify_on_read alike and
+# changes no answer except for one gap: a same-length edit that keeps a modified
+# time older than 3 seconds before the previous read of the file (a deliberate
+# set_modified, or a clock that went back) is not seen until that file's next
+# edit. A file modified within 3 seconds of a read is read again on the next call
+# (a write in the same clock tick, filesystems with coarse stamps: FAT and exFAT
+# 2 s, SMB shares, 1 s filesystems). The table lives in the
+# process (per root) and is rebuilt on the first call; the index scan is not gated.
+# Both keys are part of the run-profile hash.
 [run_profile.freshness]
 verify_on_read = false
+stat_gate = false
 
 # [run_profile.seeds]: where a traversal's start nodes come from.
 # bm25 = false (default): the opt-in map seeds.bm25 does not run; naming it in

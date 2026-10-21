@@ -3681,7 +3681,12 @@ async fn an_evaluation_dump_keeps_the_note_of_a_cold_language_server() {
             &app,
             &definition,
             &mappings,
-            RunOptions { dump_candidates },
+            // Priming off: this run is about the first query meeting a
+            // server that is still starting.
+            RunOptions {
+                dump_candidates,
+                prime: false,
+            },
         )
         .await
         .unwrap();

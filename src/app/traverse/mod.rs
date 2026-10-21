@@ -714,13 +714,22 @@ pub async fn run_with_trait_seeds(
     // and before the maps built from the tree are built.
     // Reading the tree is setup, not walking: the deadline does not run.
     // With `[run_profile.freshness] verify_on_read` the same read also gives the
-    // file sets that the snapshot lag and `file_changed` compare with.
+    // file sets that the snapshot lag and `file_changed` compare with. With
+    // `[run_profile.freshness] stat_gate` it re-reads only changed files.
     let verify = profile.freshness.verify_on_read;
     let observer = if profile.traverse.map_freshness {
         let started = Instant::now();
         let view = match call.scip_root {
             Some(root) => {
-                match freshness::tree_view(call.scip_index, root, loaded.stamp, verify).await {
+                match freshness::tree_view(
+                    call.scip_index,
+                    root,
+                    loaded.stamp,
+                    verify,
+                    profile.freshness.stat_gate,
+                )
+                .await
+                {
                     Ok(view) => {
                         if view.as_ref().is_none_or(|view| view.lag.is_none()) {
                             notes.push(if let Some(mode) = loaded.absent {

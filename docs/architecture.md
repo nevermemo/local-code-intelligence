@@ -241,7 +241,11 @@ bytes or git, placed by the index's positions for the first two). `lag` is the n
 files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
 first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`
 means not compared (no tree, unreadable tree, or an index file without a modified time). The tree is read and hashed
-once per call with `chunk::scan_incremental_with`; only changed files are parsed. `Expanded` carries an optional
+once per call with `chunk::source_hashes` (the index scan's walk and its read, skip and hash function, no chunk made);
+`[run_profile.freshness] stat_gate = true` (default `false`, in the profile hash) puts a process-wide `chunk::StatGate` per
+root in front of the read, which keeps `(modified time, length, hash)` per file and reads only files whose stamp is new or
+changed. A file modified within 3 seconds of the read is not trusted (racy stamp; FAT, exFAT and SMB stamps are coarse) and is read again next call. Its gap, asserted by a test: a same-length edit that keeps a modified time older than 3 seconds before the previous read is not seen until the next edit.
+Search's `verify_on_read` reads through the same function. `Expanded` carries an optional
 `edge::Freshness` that a wrapper around each stating map records; the walk itself does not read it. Key off: no
 wrapper, no tree read, no `maps` key.
 
@@ -255,7 +259,7 @@ then labelled with it (`Observer` does not wrap them; the label is filled at rep
 `observed: live` with `places: "index"` and the SCIP lag (their places are the index's), and `response::add_file_changed` gives
 every card `file_changed` from the baseline of its maps (the SCIP baseline for the maps built from the index and the placed
 maps and the symbol cards, the manifest for the snapshot maps and the chunk cards; `null` where none applies). Key off: none of this, and no change to any answer.
-`search::App::verify_on_read` does the same for a search report the caller asked for: `SearchReport.freshness` (`snapshot`, `channels` for the channels that ran, `hits` with `file_changed` per result) from the manifest of the snapshot the search ran on and one scan of the tree (the manifest as its cache), read after the search (a refresh in between is not seen) and timed in `timings.verify_ms`. The searches inside the crate that discard the block (`AppSeeds::search`, the evaluation runner) call the `_unverified` entry points, so a traversal reads the tree once.
+`search::App::verify_on_read` does the same for a search report the caller asked for: `SearchReport.freshness` (`snapshot`, `channels` for the channels that ran, `hits` with `file_changed` per result) from the manifest of the snapshot the search ran on and one read of the tree's content hashes (`chunk::source_hashes`, gated by `stat_gate` when on), read after the search (a refresh in between is not seen) and timed in `timings.verify_ms`. The searches inside the crate that discard the block (`AppSeeds::search`, the evaluation runner) call the `_unverified` entry points, so a traversal reads the tree once.
 
 ## MCP, REST and CLI surfaces
 

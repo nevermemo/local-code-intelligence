@@ -118,6 +118,20 @@ impl App {
         Arc::clone(&self.analyzer)
     }
 
+    /// Starts the language server of every enabled adapter for the workspace
+    /// at `path` and waits (at most `timeout`) until each is primed, so the
+    /// first search does not pay the start (see [`lsp::Manager::prime`]). The
+    /// map holds, per provider, the warm-up time or why there was none. The
+    /// warm-up uses the sessions searches use; it never changes an answer.
+    pub async fn prime_language_servers(
+        &self,
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<std::collections::BTreeMap<&'static str, Result<std::time::Duration>>> {
+        let workspace = crate::workspace::Workspace::resolve(path, &self.config.data_dir)?;
+        Ok(self.analyzer.prime(&workspace, timeout).await)
+    }
+
     async fn lock(&self, id: &str) -> Arc<WorkspaceCoordination> {
         self.workspace_locks
             .lock()

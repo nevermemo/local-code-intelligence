@@ -135,6 +135,13 @@ pub struct SearchReport {
     /// empty, and never counted as a fallback.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// The language-server providers that did not answer within
+    /// `lsp_search_budget_ms`: the structured form of the budget note in
+    /// [`Self::notes`], which stays. Absent from the JSON when no provider
+    /// missed the budget, so a search without a budget hit serializes as it
+    /// did before the field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lsp_over_budget: Vec<&'static str>,
     pub timings: Timings,
     pub results: Vec<Hit>,
     /// The documentation lane. Present, and serialized, exactly when the
@@ -988,8 +995,10 @@ impl App {
 
     /// The `freshness` block of a search (`[run_profile.freshness]
     /// verify_on_read`), read after the search: the manifest of the snapshot
-    /// the search ran on against the tree's source files, one scan of the tree
-    /// with the manifest as the cache (only changed files are parsed). A
+    /// the search ran on against the tree's source files, one read of the
+    /// tree's content hashes (no chunk is made; with `[run_profile.freshness]
+    /// stat_gate` only the files whose modified time or length changed are
+    /// read). A
     /// failure to compare leaves the lags and `file_changed` null and says so
     /// in `notes`. A refresh of the snapshot between the search and this read
     /// (`[index].freshness = "watch"`) is not seen: the block then looks as
@@ -998,19 +1007,23 @@ impl App {
         VERIFY_SCANS.with(|count| count.set(count.get() + 1));
         let data_dir = self.config.data_dir.clone();
         let workspace = report.workspace.clone();
+        let stat_gate = self.config.run_profile.freshness.stat_gate;
         let compared = tokio::task::spawn_blocking(move || -> Result<Compared> {
             let manifest = crate::manifest::try_load(&data_dir, &workspace)?;
-            let scan =
-                lci_core::chunk::scan_incremental_with(&workspace.path, &manifest.files, false)?;
-            let hashes = |files: HashMap<String, crate::manifest::CachedFile>| {
-                files
+            // Only the hashes are compared: no chunk is made, and under
+            // `[run_profile.freshness] stat_gate` only changed files are read.
+            let tree = lci_core::chunk::source_hashes(&workspace.path, false, stat_gate)?;
+            Ok(Compared {
+                snapshot: manifest
+                    .files
                     .into_iter()
                     .map(|(path, file)| (path, file.content_hash))
-                    .collect()
-            };
-            Ok(Compared {
-                snapshot: hashes(manifest.files),
-                tree: hashes(scan.files),
+                    .collect(),
+                tree: tree
+                    .files
+                    .into_iter()
+                    .map(|file| (file.relative, file.content_hash))
+                    .collect(),
             })
         })
         .await
@@ -1159,6 +1172,7 @@ impl App {
             reranked: false,
             warning: resolution.warning,
             notes: Vec::new(),
+            lsp_over_budget: Vec::new(),
             timings: Timings::default(),
             results: vec![],
             docs: None,
@@ -1282,6 +1296,7 @@ impl App {
             report
                 .notes
                 .push(self.lsp_over_budget_note(&lsp_result.over_budget));
+            report.lsp_over_budget = lsp_result.over_budget.clone();
         }
         if !lsp_failures.is_empty() {
             let message = lsp_failure_warning(&lsp_failures);
@@ -3264,6 +3279,7 @@ mod tests {
             reranked: false,
             warning: None,
             notes: Vec::new(),
+            lsp_over_budget: Vec::new(),
             timings: super::Timings::default(),
             results: Vec::new(),
             docs: None,
