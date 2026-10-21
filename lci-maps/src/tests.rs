@@ -729,3 +729,36 @@ async fn a_partial_answer_that_names_nothing_missing_is_invalid() {
         "{warnings:?}"
     );
 }
+
+#[test]
+fn edge_kind_all_lists_every_variant_and_names_round_trip() {
+    // A new variant fails to compile here until it is given an index; the
+    // check below then needs `ALL` to hold it (a handle with a kind that
+    // `from_name` cannot read is corrupt).
+    fn index(kind: EdgeKind) -> usize {
+        match kind {
+            EdgeKind::QueryMatch => 0,
+            EdgeKind::Prior => 1,
+            EdgeKind::CallsOrRefs => 2,
+            EdgeKind::Contains => 3,
+            EdgeKind::Imports => 4,
+            EdgeKind::Implements => 5,
+            EdgeKind::Tests => 6,
+            EdgeKind::ReadsKey => 7,
+            EdgeKind::Mentions => 8,
+            EdgeKind::Touched => 9,
+            EdgeKind::Cochange => 10,
+            EdgeKind::CompileErrorAt => 11,
+            EdgeKind::Near => 12,
+            EdgeKind::DefinedIn => 13,
+        }
+    }
+    const VARIANTS: usize = 14;
+    assert_eq!(EdgeKind::ALL.len(), VARIANTS);
+    let mut seen = [false; VARIANTS];
+    for kind in EdgeKind::ALL {
+        seen[index(kind)] = true;
+        assert_eq!(EdgeKind::from_name(kind.as_str()), Some(kind));
+    }
+    assert!(seen.iter().all(|s| *s), "ALL misses a variant");
+}
