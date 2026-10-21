@@ -17,10 +17,10 @@ const _: () = assert!(MAX_QUERY_TERMS <= 32);
 /// Shortest term kept, in characters.
 const MIN_TERM_CHARS: usize = 3;
 /// Terms of at most this many characters must match a whole word (see
-/// [`TermMatcher`]); longer terms match as substrings. A three- or
+/// `TermMatcher`); longer terms match as substrings. A three- or
 /// four-letter fragment is otherwise inside far too many unrelated
 /// identifiers (`padding`, `address`, `added`).
-const WORD_MATCH_MAX_CHARS: usize = 4;
+pub const WORD_MATCH_MAX_CHARS: usize = 4;
 /// Terms credited in more than this fraction of the indexed files are dropped
 /// from scoring, unless every term is that common.
 pub const MAX_DOCUMENT_FREQUENCY: f64 = 0.25;
@@ -192,7 +192,9 @@ pub fn terms(query: &str) -> Vec<String> {
     terms
 }
 
-fn usable_term(term: &str) -> bool {
+/// Whether `term` can be a query term: at least three characters and not a
+/// stop word.
+pub fn usable_term(term: &str) -> bool {
     term.chars().count() >= MIN_TERM_CHARS && !STOP_WORDS.contains(&term)
 }
 

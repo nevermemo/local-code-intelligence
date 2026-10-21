@@ -36,6 +36,23 @@ pub struct RunProfileConfig {
     pub lsp: LspProfile,
     /// `[run_profile.freshness]`: whether an answer is checked against the tree.
     pub freshness: RunProfileFreshness,
+    /// `[run_profile.seeds]`: where a traversal's starting nodes come from.
+    pub seeds: RunProfileSeeds,
+}
+
+/// `[run_profile.seeds]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileSeeds {
+    /// Let the opt-in map `seeds.bm25` run. `false` (the default): naming it
+    /// gives a note and no seeds, it is not in the default map set, and every
+    /// answer is as without the key. `true`: the map is in the default set
+    /// when a call names no maps, and it runs when named. It ranks the SCIP
+    /// graph's function and method nodes by BM25 over their name, path and
+    /// documentation tokens, and its nodes are appended after the hybrid
+    /// search's seeds. The recipes' seeds are given, so they run the same
+    /// under both values.
+    pub bm25: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -171,6 +188,46 @@ impl std::str::FromStr for WalkGroups {
     }
 }
 
+/// How the edges above the walk's gate are priced by rank
+/// (`[run_profile.walk] pricing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalkPricing {
+    /// Rank `r` of the edges above the gate is worth `1 / (1 + r)` of its
+    /// kind's prior, whatever the fan-out. Today's behaviour.
+    #[default]
+    Rank,
+    /// Rank `r` of `n` candidates is worth `1 / (1 + a + r * gate / n)` of its
+    /// kind's prior (`gate` is 8; `a` is a trait seed's implementors ranked in
+    /// front, 0 for any other node), so a wide fan-out is flattened instead of
+    /// starved. Equal to `rank` at `n = gate`; at or below the gate nothing
+    /// changes.
+    Relative,
+}
+
+impl WalkPricing {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rank => "rank",
+            Self::Relative => "relative",
+        }
+    }
+}
+
+impl std::str::FromStr for WalkPricing {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "rank" => Ok(Self::Rank),
+            "relative" => Ok(Self::Relative),
+            other => Err(format!(
+                "pricing must be \"rank\" or \"relative\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[run_profile.walk]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -182,6 +239,13 @@ pub struct WalkProfile {
     /// What a group made only of `mentions` edges (text matches) adds to the
     /// evidence count, `0.0..=1.0`; 1.0 (default) counts it like any other.
     pub grep_corroboration: f64,
+    /// How the edges above the gate are priced: `"rank"` (default, `1 / (1 +
+    /// r)` of the prior) or `"relative"` (`1 / (1 + a + r * gate / n)` for `n`
+    /// candidates and `a` implementors ahead of a trait seed's). A handle does
+    /// not carry it or refuse a different one: a resumed call prices under the
+    /// profile it is given, like `gate` and `beam`, so a walk can mix pricings
+    /// across resumes.
+    pub pricing: WalkPricing,
 }
 
 impl Default for WalkProfile {
@@ -189,6 +253,7 @@ impl Default for WalkProfile {
         Self {
             groups: WalkGroups::Tool,
             grep_corroboration: 1.0,
+            pricing: WalkPricing::Rank,
         }
     }
 }
@@ -294,6 +359,15 @@ pub struct LspProfile {
     /// symbol node). The recipes walk no `lsp.live` and run the same under both
     /// values.
     pub implementations: bool,
+    /// `false` (default): `lsp.live` asks a symbol node for its definition and
+    /// its references (and, under `implementations`, its implementations).
+    /// `true`: it also asks the call hierarchy (`textDocument/
+    /// prepareCallHierarchy`, then `callHierarchy/incomingCalls` and
+    /// `callHierarchy/outgoingCalls`: up to three more external calls per
+    /// symbol node) and reports the callers and callees as `calls_or_refs`
+    /// edges. A server that refuses a request costs the other edges nothing.
+    /// The recipes walk no `lsp.live` and run the same under both values.
+    pub call_hierarchy: bool,
     /// `"off"` (default): a language server is told nothing about edits after
     /// it starts. `"watch"`: a long-lived manager (the MCP and REST server's,
     /// the one `lci traverse` builds under `sessions = "shared"`) watches each
@@ -578,11 +652,14 @@ mod tests {
         config.rescorer = crate::config::Rescorer::SystemOne;
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
+        config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config.run_profile.lsp.sessions = LspSessions::Shared;
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
+        config.run_profile.lsp.call_hierarchy = true;
+        config.run_profile.seeds.bm25 = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config
     }
@@ -656,6 +733,37 @@ mod tests {
         ] {
             assert!(base.keys.iter().any(|k| k == key), "{key}");
         }
+    }
+
+    #[test]
+    fn walk_pricing_is_rank_by_default_and_changes_the_profile_hash() {
+        let base = Config::default().run_profile();
+        assert_eq!(WalkProfile::default().pricing, WalkPricing::Rank);
+        assert!(base.canonical.contains(r#""pricing":"rank""#));
+        let mut relative = Config::default();
+        relative.run_profile.walk.pricing = WalkPricing::Relative;
+        let relative = relative.run_profile();
+        assert!(relative.canonical.contains(r#""pricing":"relative""#));
+        assert_ne!(base.hash, relative.hash);
+        assert!(base.keys.iter().any(|k| k == "run_profile.walk.pricing"));
+        assert_eq!("relative".parse::<WalkPricing>(), Ok(WalkPricing::Relative));
+        assert!("rank".parse::<WalkPricing>().is_ok());
+        assert!("linear".parse::<WalkPricing>().is_err());
+        // The key lives under `[run_profile.walk]`, not `[run_profile]`.
+        let error = toml::from_str::<Config>(&format!(
+            "{}[run_profile]\npricing = \"relative\"\n",
+            base_toml()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pricing"), "{error}");
+        let read: Config = toml::from_str(&format!(
+            "{}[run_profile.walk]\npricing = \"relative\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        read.validate().unwrap();
+        assert_eq!(read.run_profile.walk.pricing, WalkPricing::Relative);
     }
 
     #[test]
@@ -783,6 +891,44 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_bm25_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.bm25);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.bm25);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["bm25"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["bm25"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["bm25"], true);
+        assert!(off.keys.iter().any(|key| key == "run_profile.seeds.bm25"));
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nbm25 = \"yes\"\n",
+            "[run_profile.seeds]\nbm25 = 1\n",
+            "[run_profile.seeds]\nfoo = 1\n",
+            "[run_profile]\nbm25 = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -859,6 +1005,7 @@ mode = \"sometimes\"
             "rescorer",
             "run_profile.walk.groups",
             "run_profile.walk.grep_corroboration",
+            "run_profile.walk.pricing",
             "run_profile.traverse.map_freshness",
             "run_profile.traverse.card_paths",
             "run_profile.scip.mode",
@@ -866,6 +1013,8 @@ mode = \"sometimes\"
             "run_profile.freshness.verify_on_read",
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
+            "run_profile.lsp.call_hierarchy",
+            "run_profile.seeds.bm25",
             "run_profile.lsp.sync",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
@@ -1074,6 +1223,68 @@ mode = \"sometimes\"
             diff = format!("golden:\n{expected_text}\ncode:\n{actual_text}");
         }
         diff
+    }
+
+    #[test]
+    fn lsp_request_switches_are_off_by_default_and_change_the_profile_hash() {
+        for leaf in ["implementations", "call_hierarchy"] {
+            let off = Config::default();
+            assert!(!off.run_profile.lsp.implementations);
+            assert!(!off.run_profile.lsp.call_hierarchy);
+            let text = format!("{}[run_profile.lsp]\n{leaf} = true\n", base_toml());
+            let on: Config = toml::from_str(&text).unwrap();
+            on.validate().unwrap();
+            // Only the named leaf moves; the others keep their defaults.
+            let value = serde_json::to_value(&on).unwrap();
+            for other in ["implementations", "call_hierarchy"] {
+                assert_eq!(
+                    value["run_profile"]["lsp"][other],
+                    other == leaf,
+                    "{leaf} vs {other}"
+                );
+            }
+            assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+            assert!(!on.run_profile.lsp.outline_cache);
+            // It changes what an lsp.live answer holds, so it changes the hash.
+            let (off, on) = (off.run_profile(), on.run_profile());
+            assert_eq!(off.value["run_profile"]["lsp"][leaf], false);
+            assert_eq!(on.value["run_profile"]["lsp"][leaf], true);
+            let key = format!("run_profile.lsp.{leaf}");
+            assert!(off.keys.contains(&key), "{key}");
+            assert_ne!(off.hash, on.hash, "{leaf}");
+            // Spelling out the default is the default.
+            let spelled: Config = toml::from_str(&format!(
+                "{}[run_profile.lsp]\n{leaf} = false\n",
+                base_toml()
+            ))
+            .unwrap();
+            assert_eq!(spelled.run_profile().hash, off.hash, "{leaf}");
+            for bad in [
+                format!("[run_profile.lsp]\n{leaf} = \"yes\"\n"),
+                format!("[run_profile.lsp]\n{leaf} = 1\n"),
+                format!("[run_profile]\n{leaf} = true\n"),
+            ] {
+                let text = format!("{}{bad}", base_toml());
+                assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+            }
+        }
+        // The two switches are separate leaves of the hash.
+        let with = |leaves: &str| -> Config {
+            toml::from_str(&format!("{}[run_profile.lsp]\n{leaves}", base_toml())).unwrap()
+        };
+        let hashes = [
+            with("implementations = true\ncall_hierarchy = true\n")
+                .run_profile()
+                .hash,
+            with("implementations = true\n").run_profile().hash,
+            with("call_hierarchy = true\n").run_profile().hash,
+            Config::default().run_profile().hash,
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

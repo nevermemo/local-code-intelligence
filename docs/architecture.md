@@ -32,7 +32,7 @@ is implemented in the root crate (the retrieval channels wrapped as maps are in 
 | `models` | core | Embedding client (default port 8766) and fail-open reranker client (default port 8767) |
 | `lexical`, `lsp` | core | Independent, fail-open retrieval channels (ripgrep with BM25 scoring; language-server symbols) |
 | `filter` | core | Validates retrieval controls (`FilterRequest` to `EffectiveFilter`) and classifies source roles |
-| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`; `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index; `[run_profile.lsp]`: `sessions`, per call or shared, which `app::traverse::run` reads to pick the call's language-server manager, and `outline_cache` and `sync`, which `lsp::Manager::new` reads; `[run_profile.freshness]`: `verify_on_read`, which `app::traverse::run` reads from the run profile it is given) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
+| `config` | core | Loads and validates settings; `config::layers` resolves default < file < local overlay < `LCI_*` environment < flags, and `lci config` prints each value with its source; `config::profile` is the `[run_profile]` section (`[run_profile.walk]`: `groups`, tool or claim, and `grep_corroboration`, which the traversal reads through `lci_maps::traverse::Grouping`, and `pricing`, rank or relative, which `app::traverse::run` passes to the hop price (`lci_maps::traverse::frontier::HopPrice`); `[run_profile.traverse]`: `map_freshness`, which `app::traverse::run` reads from the run profile it is given; `[run_profile.scip]`: `mode`, authoritative, cache or off, which `app::traverse` reads when it loads the SCIP index; `[run_profile.lsp]`: `sessions`, per call or shared, which `app::traverse::run` reads to pick the call's language-server manager, and `outline_cache` and `sync`, which `lsp::Manager::new` reads; `[run_profile.freshness]`: `verify_on_read`, which `app::traverse::run` reads from the run profile it is given) and `Config::run_profile()`, the hash of the result-affecting settings; `App::open` caches it (`App::profile_hash`) and `app::stamp` writes it as `profile_hash` into every MCP and REST result (`server::result`, `rest::respond`; the compact `search_code` writes it as its last key) |
 | `evaluate` | root | Measures retrieval behaviour without influencing ranking (see Evaluation harness) |
 | `traverse`, `recipes`, `compact` | root `app` | Graph traversal mode of `search_code` and `lci traverse` (`src/app/traverse/`: `mod` holds the types, `run` and registration; `index` the SCIP index and map loading; `seeds` the seed search; `rescore` the `GraphRescorer`; `response` the response builders; `first_stage`, `presets`, `chunks`); named recipes and `lci_compose`; the compact `search_code` presentation. Engine and maps: `lci-maps` |
 | `server`, `rest`, `main` | root | MCP (rmcp, streamable HTTP), the REST/OpenAPI mirror on the same process and port, and the CLI |
@@ -136,6 +136,14 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   (default `false`) the map also asks `Manager::implementation` (`textDocument/implementation`) at each symbol node
   and offers `Implements` edges from an interface or trait member to its implementing members (the direction of
   `scip.implements`); it is the third request of a node, behind the same `max_external_calls` gate, and a failure of
+  it is recorded without dropping the edges of the first two. With `[run_profile.lsp] call_hierarchy = true`
+  (default `false`) it asks up to three more requests per symbol node, each behind the same gate and counted:
+  `Manager::prepare_call_hierarchy` (`textDocument/prepareCallHierarchy`), then `Manager::incoming_calls` and
+  `Manager::outgoing_calls` with the item the server gave, sent back verbatim (`HierarchyItem::raw`; the place of an
+  item is its `selectionRange`, the name). The callers and callees are `CallsOrRefs` edges (witness `Exact`, no new
+  edge kind), one per destination per expansion, seen at the call (`fromRanges`). Every error reply is recorded
+  and keeps the other edges, which is also how a server without `callHierarchyProvider` (it answers -32601) is found:
+  the capabilities are not read.
   it is recorded without dropping the edges of the first two.
   `[run_profile.lsp] sync = "watch"` (read by `Manager::new`; a per-call
   manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`
@@ -213,8 +221,9 @@ view (`compact_view`, a profile with `response = "compact"`) is applied to a fin
 
 `search_code` with `mode = "traverse"` (needs `[traverse] enabled`) and `lci traverse` run one function,
 `app::traverse::run`. It loads the SCIP index (map `graph.scip`, cached by file stamp; `[run_profile.scip] mode` `authoritative` requires it, `cache` reads it when it is there, `off` never touches it and leaves the graph and the maps built from the index file empty, each saying so in a note), finds the start nodes
-(`given`; `hybrid`: the top `seed_k` hits of the normal hybrid search mapped to SCIP symbols; or `name_tokens`, the
-visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
+(`given`; `hybrid`: the top `seed_k` hits of the normal hybrid search mapped to SCIP symbols; `hybrid+bm25` or `bm25` with `[run_profile.seeds] bm25 = true`: the opt-in map `seeds.bm25`,
+BM25 over the SCIP graph's node names, qualified paths and documentation, whose top `seed_k` nodes go after the hybrid hits or stand alone
+when the search gave none; or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
 `[traverse]` caps (a request can only lower them), writes a trace under `data_dir`, and answers with the reached nodes,
 totals and, only when work is left, a `handle` and `checkpoint`. The first stage (exact operators `exact.closure` and
 `exact.pickaxe`, then seeds), named policies per question type and the steering ladder are described in

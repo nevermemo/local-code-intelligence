@@ -3088,6 +3088,7 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
         walk: lci_core::config::WalkProfile {
             groups: lci_core::config::WalkGroups::Claim,
             grep_corroboration: 0.5,
+            ..lci_core::config::WalkProfile::default()
         },
         ..RunProfileConfig::default()
     };
@@ -3113,6 +3114,92 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
     let rank = &start_event(&resumed)["rank"];
     assert_eq!(rank["groups"], "claim", "{rank}");
     assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
+}
+
+#[tokio::test]
+async fn the_walk_reads_walk_pricing_from_the_run_profile() {
+    use lci_core::config::{WalkPricing, WalkProfile};
+    let (dir, index) = crowded_tree(30);
+    let loaded = load(&index, Some(dir.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
+    let target = loaded
+        .scip
+        .node_id(
+            loaded
+                .scip
+                .graph()
+                .node_index("rust-analyzer cargo demo 0.1.0 a/target().")
+                .expect("target is a graph node"),
+        )
+        .to_string();
+    let maps = [SCIP_IMPACT_ID.to_owned()];
+    let (budget, steer) = (
+        BudgetArgs {
+            max_depth: Some(1),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &index,
+        scip_root: Some(dir.path()),
+        question: "q",
+        seeds: std::slice::from_ref(&target),
+        seed_search: None,
+        top_k: 40,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    let dirs = Dirs::under(dir.path());
+    // The potentials of the depth-1 cards, best first: one per rank.
+    let potentials = |report: &Report| {
+        let mut values: Vec<f64> = report.response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|card| card["depth"] == 1)
+            .map(|card| card["potential"].as_f64().unwrap())
+            .collect();
+        values.sort_by(|a, b| b.total_cmp(a));
+        values
+    };
+    let close = |got: &[f64], want: Vec<f64>| {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-9, "{got:?} against {want:?}");
+        }
+    };
+    // 30 edges are offered and the default beam keeps 16: ranks 0..16.
+    let rank = run(&limits(), &RunProfileConfig::default(), &dirs, &call)
+        .await
+        .unwrap();
+    close(
+        &potentials(&rank),
+        (0..16).map(|r| 1.0 / (1.0 + r as f64)).collect(),
+    );
+    assert!((potentials(&rank)[8] - 1.0 / 9.0).abs() < 1e-9);
+    assert!(start_event(&rank).get("pricing").is_none());
+    let profile = RunProfileConfig {
+        walk: WalkProfile {
+            pricing: WalkPricing::Relative,
+            ..WalkProfile::default()
+        },
+        ..RunProfileConfig::default()
+    };
+    let relative = run(&limits(), &profile, &dirs, &call).await.unwrap();
+    close(
+        &potentials(&relative),
+        (0..16)
+            .map(|r| 1.0 / (1.0 + r as f64 * 8.0 / 30.0))
+            .collect(),
+    );
+    assert!((potentials(&relative)[8] - 1.0 / (1.0 + 8.0 * 8.0 / 30.0)).abs() < 1e-9);
+    assert_eq!(start_event(&relative)["pricing"], "relative");
 }
 
 // ---- `[run_profile.traverse] map_freshness` (slice K2a-2) ---------------------------
@@ -4329,4 +4416,389 @@ async fn a_resume_shows_the_whole_path_and_notes_missing_kinds() {
     let second = world.call(&off, &limits(), Some(20), Some(&handle)).await;
     assert!(!notes_of(&second.response).contains(note));
     assert!(second.response["results"][0].get("path").is_none());
+}
+
+// ---- `seeds.bm25` (slice K21a-1) -----------------------------------------------
+
+/// A graph of one function per entry `(symbol path, file, documentation)`,
+/// each defined on a line of its own, with the documentation by symbol.
+fn bm25_graph(
+    entries: &[(&str, &str, Option<&str>)],
+) -> (ScipMap, lci_maps::scip_graph::SymbolDocs) {
+    let mut documents: Vec<RawDocument> = Vec::new();
+    let mut docs = lci_maps::scip_graph::SymbolDocs::new();
+    for (line, (path, file, doc)) in entries.iter().enumerate() {
+        let symbol = format!("rust-analyzer cargo demo 0.1.0 {path}");
+        let line = line as u32;
+        let occurrence = RawOccurrence {
+            range: (line, 3, line, 8),
+            symbol: symbol.clone(),
+            roles: 1,
+            enclosing: Some((line, 0, line, 20)),
+        };
+        match documents.iter_mut().find(|document| document.path == *file) {
+            Some(document) => document.occurrences.push(occurrence),
+            None => documents.push(RawDocument {
+                path: (*file).to_owned(),
+                occurrences: vec![occurrence],
+            }),
+        }
+        if let Some(doc) = doc {
+            docs.insert(symbol, (*doc).to_owned());
+        }
+    }
+    (
+        ScipMap::with_default_ids(ScipGraph::build(&documents, None)),
+        docs,
+    )
+}
+
+/// Twelve functions: `Config::parse` holds both words of "parse config" in its
+/// name and its path; `parse_flags` only the first; `load_settings` holds
+/// "parses the config file" in its documentation and `config_loader` in its
+/// file; `render_page` has `config` in its file's name alone. Eleven of them
+/// are in the namespace `util`.
+const BM25_ENTRIES: [(&str, &str, Option<&str>); 12] = [
+    ("config/Config#parse().", "src/config.rs", None),
+    ("util/parse_flags().", "src/cli.rs", None),
+    (
+        "util/load_settings().",
+        "src/config_loader.rs",
+        Some("Parses the config file and returns the settings."),
+    ),
+    ("util/render_page().", "src/config.rs", None),
+    ("util/open_socket().", "src/net.rs", None),
+    ("util/alpha_one().", "src/misc.rs", None),
+    ("util/bravo_two().", "src/misc.rs", None),
+    ("util/delta_three().", "src/misc.rs", None),
+    ("util/gamma_four().", "src/misc.rs", None),
+    ("util/kilo_five().", "src/misc.rs", None),
+    ("util/lima_six().", "src/misc.rs", None),
+    ("util/mike_seven().", "src/misc.rs", None),
+];
+
+#[test]
+fn bm25_seeds_rank_a_rare_name_over_a_common_word_and_read_docs() {
+    use super::seeds::Bm25Seeds;
+    let (graph, docs) = bm25_graph(&BM25_ENTRIES);
+    let with_docs = Bm25Seeds::new(&graph, &docs);
+    let names = |found: &[(NodeId, String, f64)]| -> Vec<String> {
+        found.iter().map(|(_, name, _)| name.clone()).collect()
+    };
+
+    // The entity that holds both words in its name and its path is first; the
+    // one whose documentation says "parses the config file" beats the one with
+    // `config` in a file name alone; nothing else is returned.
+    let found = with_docs.matches("parse config", 12);
+    assert_eq!(
+        names(&found),
+        [
+            "Config::parse",
+            "util::load_settings",
+            "util::parse_flags",
+            "util::render_page"
+        ],
+        "{found:?}"
+    );
+    assert!(found.windows(2).all(|pair| pair[0].2 >= pair[1].2));
+    assert_eq!(with_docs.matches("parse config", 2).len(), 2, "capped");
+
+    // The documentation is read: without it `load_settings` scores less.
+    let without_docs = Bm25Seeds::new(&graph, &Default::default());
+    let score = |seeds: &Bm25Seeds| {
+        seeds
+            .matches("parse config", 12)
+            .into_iter()
+            .find(|(_, name, _)| name == "util::load_settings")
+            .map(|(_, _, score)| score)
+    };
+    assert!(score(&with_docs) > score(&without_docs));
+
+    // `util` is in eleven of the twelve nodes: dropped as a scoring term
+    // (more than a quarter of them) unless it is the only one.
+    assert_eq!(
+        with_docs.matches("util parse", 12),
+        with_docs.matches("parse", 12)
+    );
+    assert_eq!(with_docs.matches("util", 3).len(), 3);
+
+    // No scoring term, no seed.
+    assert!(with_docs.matches("", 3).is_empty());
+    assert!(with_docs.matches("the and for", 3).is_empty());
+    assert!(with_docs.matches("zebra", 3).is_empty());
+    assert!(
+        Bm25Seeds::new(
+            &ScipMap::with_default_ids(ScipGraph::empty()),
+            &Default::default()
+        )
+        .matches("parse", 3)
+        .is_empty()
+    );
+}
+
+/// [`seeds_for`] over a given `loaded`, with the question's maps.
+async fn seeds_in(
+    loaded: &Loaded,
+    search: Option<&dyn SeedSearch>,
+    question: &str,
+    wanted: &[MapId],
+) -> Seeds {
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: Path::new("unused"),
+        scip_root: None,
+        question,
+        seeds: &[],
+        seed_search: search,
+        top_k: 8,
+        maps: None,
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    find_seeds(&limits(), &call, loaded, wanted).await.unwrap()
+}
+
+#[tokio::test]
+async fn bm25_seeds_go_after_the_hybrid_ones_without_duplicates_and_replace_a_failed_search() {
+    let with_bm25: Vec<MapId> = MAPS.iter().copied().chain([SEEDS_BM25]).collect();
+    let question = "rank hits";
+    let loaded = loaded();
+
+    // The key's map not wanted: the entity index is never built.
+    let hybrid = Canned::new(Ok(vec![hit("src/search.rs", (13, 15), 1)]));
+    let plain = seeds_in(&loaded, Some(&hybrid), question, &MAPS).await;
+    assert_eq!(plain.source, "hybrid");
+    assert!(!loaded.bm25_built());
+
+    // Wanted, with the hybrid search answering: its nodes first, then the
+    // entities of the question's words, tagged as bm25's.
+    let found = seeds_in(&loaded, Some(&hybrid), question, &with_bm25).await;
+    assert!(loaded.bm25_built());
+    assert_eq!(found.source, "hybrid+bm25");
+    assert!(found.fallback.is_none() && found.notes.is_empty());
+    assert_eq!(found.nodes.len(), 2, "{:?}", found.details);
+    assert_eq!(found.nodes[0].node, plain.nodes[0].node);
+    assert_eq!(found.nodes[0].map, Some(SEEDS_HYBRID));
+    assert_eq!(found.nodes[1].map, Some(SEEDS_BM25));
+    assert_eq!(found.details.len(), found.nodes.len());
+    let detail = &found.details[1];
+    assert_eq!(detail["how"], "bm25");
+    assert_eq!(detail["retrievers"], json!(["bm25"]));
+    assert_eq!(detail["score_kind"], "bm25");
+    assert_eq!(detail["node"], found.nodes[1].node.to_string());
+    assert!(detail["symbol"].as_str().unwrap().ends_with("rank_hits"));
+    assert!(detail["score"].as_f64().unwrap() > 0.0);
+
+    // A node the hybrid search gave is not added again, and the source stays.
+    let inside = Canned::new(Ok(vec![hit("src/search.rs", (17, 19), 1)]));
+    let same = seeds_in(&loaded, Some(&inside), question, &with_bm25).await;
+    assert_eq!(same.source, "hybrid");
+    assert_eq!(same.nodes.len(), 1);
+    assert_eq!(same.nodes[0].map, Some(SEEDS_HYBRID));
+    assert_eq!(same.nodes[0].node, found.nodes[1].node, "rank_hits");
+
+    // The hybrid search failed or found nothing, or there is none: the
+    // entities are the start nodes, the reason stays visible, and the
+    // stand-in is not used.
+    let failing = Canned::new(Err("the embedder is down".into()));
+    let empty = Canned::new(Ok(Vec::new()));
+    for (search, why) in [
+        (Some(&failing as &dyn SeedSearch), "embedder is down"),
+        (Some(&empty as &dyn SeedSearch), "no hits"),
+        (None, "no workspace"),
+    ] {
+        let found = seeds_in(&loaded, search, question, &with_bm25).await;
+        assert_eq!(found.source, "bm25", "{why}");
+        assert_eq!(found.nodes.len(), 1, "{why}");
+        assert_eq!(found.nodes[0].map, Some(SEEDS_BM25));
+        assert!(found.fallback.as_deref().unwrap().contains(why), "{why}");
+        assert!(found.notes[0].contains("bm25"), "{:?}", found.notes);
+        assert!(found.details.iter().all(|d| d["how"] == "bm25"));
+    }
+
+    // Only the entity map wanted: no search at all.
+    let calls = hybrid.calls.load(Ordering::SeqCst);
+    let alone = seeds_in(&loaded, Some(&hybrid), question, &[SEEDS_BM25, SCIP_MAP_ID]).await;
+    assert_eq!(alone.source, "bm25");
+    assert!(alone.fallback.is_none() && alone.notes.is_empty());
+    assert_eq!(hybrid.calls.load(Ordering::SeqCst), calls);
+
+    // Nothing for the entities to match: the stand-in answers, as without.
+    let zebra = seeds_in(&loaded, None, "zebra", &with_bm25).await;
+    assert_eq!(zebra.source, "name_tokens");
+    assert!(zebra.nodes.is_empty());
+}
+
+/// One call over the `crowded_tree` index, under the run profile with
+/// `[run_profile.seeds] bm25` as `bm25` says.
+async fn bm25_call(
+    tree: &(tempfile::TempDir, PathBuf),
+    bm25: bool,
+    maps: Option<&[&str]>,
+    question: &str,
+    search: Option<&dyn SeedSearch>,
+) -> Value {
+    let data = tempfile::tempdir().unwrap();
+    let profile = lci_core::config::RunProfileConfig {
+        seeds: lci_core::config::RunProfileSeeds { bm25 },
+        ..Default::default()
+    };
+    let maps: Option<Vec<String>> = maps.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect());
+    let (budget, steer) = (BudgetArgs::default(), SteerArgs::default());
+    let call = Call {
+        scip_index: &tree.1,
+        scip_root: Some(tree.0.path()),
+        question,
+        seeds: &[],
+        seed_search: search,
+        top_k: 8,
+        maps: maps.as_deref(),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    run(&limits(), &profile, &Dirs::under(data.path()), &call)
+        .await
+        .unwrap()
+        .response
+}
+
+#[tokio::test]
+async fn seeds_bm25_is_inert_with_the_key_off_and_seeds_after_hybrid_with_it_on() {
+    let tree = crowded_tree(2);
+    let loaded = load(&tree.1, Some(tree.0.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
+    let id_of = |name: &str| {
+        let graph = loaded.scip.graph();
+        let at = graph
+            .node_index(&format!("rust-analyzer cargo demo 0.1.0 a/{name}()."))
+            .unwrap();
+        loaded.scip.node_id(at).to_string()
+    };
+    assert!(
+        !lci_core::config::Config::default().run_profile.seeds.bm25,
+        "off by default"
+    );
+
+    // Key off, the map named: the note, and the answer is the one without it
+    // (nothing registers, nothing seeds, the index is not built).
+    let named = Some(&["seeds.bm25", "graph.scip"][..]);
+    let mut off = bm25_call(&tree, false, named, "target", None).await;
+    let mut without = bm25_call(&tree, false, Some(&["graph.scip"]), "target", None).await;
+    let notes = off["notes"].to_string();
+    assert!(
+        notes.contains("seeds.bm25 is off ([run_profile.seeds] bm25 = false)"),
+        "{notes}"
+    );
+    assert_eq!(off["seed_source"], without["seed_source"]);
+    assert_eq!(off["seeds"], json!([]));
+    off.as_object_mut().unwrap().remove("notes");
+    without.as_object_mut().unwrap().remove("notes");
+    assert_eq!(off, without);
+    assert!(!loaded.bm25_built());
+
+    // Key off and the default maps with a hybrid hit: as before the key.
+    let hybrid = Canned::new(Ok(vec![hit("a.rs", (2, 2), 1)]));
+    let plain = bm25_call(&tree, false, None, "target", Some(&hybrid)).await;
+    assert_eq!(plain["seed_source"], "hybrid");
+    assert_eq!(plain["seeds"], json!([id_of("user1")]));
+    assert!(!plain.to_string().contains("bm25"), "{plain}");
+    assert!(!loaded.bm25_built());
+
+    // Key on, no maps named: the map is in the default set, after the hybrid
+    // nodes; `target` is the only entity of the question's word.
+    let on = bm25_call(&tree, true, None, "target", Some(&hybrid)).await;
+    assert!(loaded.bm25_built());
+    assert_eq!(on["seed_source"], "hybrid+bm25");
+    assert_eq!(on["seeds"], json!([id_of("user1"), id_of("target")]));
+    assert_eq!(on["seed_hits"][1]["how"], "bm25");
+    assert_eq!(
+        on["seed_hits"][0]["retrievers"],
+        plain["seed_hits"][0]["retrievers"]
+    );
+
+    // Key on and the hybrid search down: the entities are the start nodes.
+    let down = NoSearch("the embedder is down".into());
+    let stand_in = bm25_call(&tree, true, None, "target", Some(&down)).await;
+    assert_eq!(stand_in["seed_source"], "bm25");
+    assert_eq!(stand_in["seeds"], json!([id_of("target")]));
+    assert!(
+        stand_in["seed_fallback"]
+            .as_str()
+            .unwrap()
+            .contains("embedder is down")
+    );
+
+    // Key on, the map named without the others: it runs and needs no tree.
+    let named_on = bm25_call(&tree, true, named, "target", None).await;
+    assert_eq!(named_on["seed_source"], "bm25");
+    assert_eq!(named_on["seeds"], json!([id_of("target")]));
+    assert!(!named_on["notes"].to_string().contains("is off"));
+}
+
+/// A tree with `a.rs` holding `widget` and `plain`, and a SCIP index over it
+/// whose symbol information gives `widget` a documentation line.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn documented_tree() -> (tempfile::TempDir, PathBuf) {
+    use scip::types::{Document, Index, Occurrence, SymbolInformation};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn widget() {}\nfn plain() {}\n").unwrap();
+    let sym = |name: &str| format!("rust-analyzer cargo demo 0.1.0 a/{name}().");
+    let mut document = Document::default();
+    document.relative_path = "a.rs".to_owned();
+    for (line, name) in ["widget", "plain"].into_iter().enumerate() {
+        let mut o = Occurrence::default();
+        o.range = vec![line as i32, 3, 9];
+        o.symbol = sym(name);
+        o.symbol_roles = 1;
+        o.enclosing_range = vec![line as i32, 0, line as i32, 14];
+        document.occurrences.push(o);
+        let mut info = SymbolInformation::default();
+        info.symbol = sym(name);
+        if name == "widget" {
+            info.documentation = vec!["Frobnicates the gizmo.".to_owned()];
+        }
+        document.symbols.push(info);
+    }
+    let mut message = Index::default();
+    message.documents = vec![document];
+    let index = dir.path().join("index.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+    (dir, index)
+}
+
+#[tokio::test]
+async fn seeds_bm25_reads_the_indexs_documentation_only_when_the_map_runs() {
+    let tree = documented_tree();
+    let loaded = load(&tree.1, Some(tree.0.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
+    assert_eq!(loaded.index.as_deref(), Some(tree.1.as_path()));
+    let widget = loaded
+        .scip
+        .node_id(
+            loaded
+                .scip
+                .graph()
+                .node_index("rust-analyzer cargo demo 0.1.0 a/widget().")
+                .unwrap(),
+        )
+        .to_string();
+    // No name, path or hybrid hit holds "gizmo"; the key off never builds the
+    // entity index, so no documentation was read.
+    let off = bm25_call(&tree, false, None, "gizmo", None).await;
+    assert_eq!(off["seeds"], json!([]));
+    assert!(!loaded.bm25_built());
+    // The key on: the build reads the file's documentation and the node whose
+    // documentation holds the word is the seed.
+    let on = bm25_call(&tree, true, None, "gizmo", None).await;
+    assert!(loaded.bm25_built());
+    assert_eq!(on["seed_source"], "bm25");
+    assert_eq!(on["seeds"], json!([widget]));
 }

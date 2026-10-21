@@ -543,11 +543,21 @@ card_paths = false
 # off, and it cannot be combined with [traverse] fusion = "rrf" or "log_odds".
 # grep_corroboration (0 to 1, default 1): what a group made only of text-match
 # ("mentions") edges adds to the evidence count; 1 counts it like any other.
-# Both keys are part of the run-profile hash; a handle keeps the values it was
-# made with.
+# pricing = "rank" (default): above the gate (8 edges), the edge at rank r is
+# worth 1 / (1 + r) of its kind's prior whatever the fan-out. "relative": rank r
+# of n candidates (counted before the beam) is worth 1 / (1 + a + r * gate / n)
+# (a: the implementors of a trait seed, ranked in front of them; 0 for any other
+# node): equal to "rank" at n = gate, so continuous at the gate for every node,
+# and flatter above it (80 callers price the 9th edge at 1 / 1.8, not 1 / 9).
+# At or below the gate nothing changes.
+# All three keys are part of the run-profile hash. A handle keeps groups and
+# grep_corroboration; it does not carry pricing (like the gate and the beam),
+# so a resumed call prices under the profile it is given and a walk can mix
+# pricings across resumes.
 [run_profile.walk]
 groups = "tool"
 grep_corroboration = 1.0
+pricing = "rank"
 
 # [run_profile.scip]: what a traversal does with the SCIP index (index.scip).
 # mode = "authoritative" (default): the index is required; a missing or
@@ -586,6 +596,14 @@ mode = "authoritative"
 # external call per symbol) and offers the answers as `implements` edges, from
 # an interface or trait member to the members that implement it. Needs a server
 # that answers the request; a failed request leaves the other edges alone.
+# call_hierarchy = false (default): as above. true: lsp.live also asks the call
+# hierarchy of a symbol: textDocument/prepareCallHierarchy, then
+# callHierarchy/incomingCalls and callHierarchy/outgoingCalls of the item that
+# answers (up to three more external calls per symbol; none after an empty
+# prepare). The callers and callees become `calls_or_refs` edges (one per
+# destination), seen at the call. A server without call hierarchy refuses the
+# request: that is noted and the other edges stay. Servers miss some calls
+# (macro arguments, for one): this complements graph.scip.
 # sync = "off" (default): a language server is told nothing about edits after it
 # starts. "watch": this process's language-server manager watches each workspace
 # that has a running session and sends every source-file change to its servers
@@ -595,11 +613,12 @@ mode = "authoritative"
 # and stops with the workspace's last session. Independent of index watching. A
 # per-call manager (sessions = "per_call") never syncs. The recipes are the same
 # under both values.
-# All four keys are part of the run-profile hash.
+# All five keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"
 outline_cache = false
 implementations = false
+call_hierarchy = false
 sync = "off"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
@@ -624,6 +643,29 @@ sync = "off"
 # Part of the run-profile hash.
 [run_profile.freshness]
 verify_on_read = false
+
+# [run_profile.seeds]: where a traversal's start nodes come from.
+# bm25 = false (default): the opt-in map seeds.bm25 does not run; naming it in
+# `maps` gives a note and no seeds, it is not in the default set, and every answer
+# is as without the key. true: the map is in the default set of a call that names
+# no maps, and runs when named. It ranks the SCIP graph's functions and methods
+# (the nodes) by BM25, the scorer of the ripgrep channel, over three fields of
+# each node: the tokens of its name, of its qualified path (the symbol's package,
+# modules, types and member, and the file's path) and of its documentation (the
+# index's `documentation` for the symbol, up to 1024 bytes; empty when
+# rust-analyzer writes none). A question word counts if it is a whole token (up to
+# 4 characters) or inside one (longer); words under 3 characters and stop words
+# are not terms; a term in more than a quarter of the nodes is dropped unless no
+# term would remain. Of the top [traverse] seed_k nodes, those the hybrid search
+# did not already give (so possibly fewer) go after its nodes (seed_source
+# "hybrid+bm25"), or are the start nodes
+# when the hybrid search gave none ("bm25"; the name-token stand-in then does not
+# run). It reads the SCIP graph only (no tree needed) and builds its index on the
+# first call that wants it, reading the documentation from the index file then
+# (a second parse of the file; with the key off no documentation is ever read). The recipes' seeds are given, so they are the same
+# under both values. Part of the run-profile hash.
+[run_profile.seeds]
+bm25 = false
 
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and

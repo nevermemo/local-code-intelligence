@@ -450,7 +450,11 @@ async fn max_depth_records_but_does_not_expand() {
 #[tokio::test]
 async fn the_seed_of_the_random_arm_changes_the_walk() {
     let reg = registry(vec![lattice_map("g", 40)]);
-    let price = HopPrice { gate: 1, beam: 2 };
+    let price = HopPrice {
+        gate: 1,
+        beam: 2,
+        pricing: Pricing::Rank,
+    };
     let mut walks = std::collections::HashSet::new();
     for seed_value in 0..8u64 {
         let result = walk(&reg, vec![seed("n0")], budget(25), move |t| {
@@ -1014,7 +1018,11 @@ async fn a_rule_list_drives_the_engine() {
 async fn the_unscored_arm_follows_everything_in_offer_order() {
     let reg = registry(vec![lattice_map("g", 20)]);
     let result = walk(&reg, vec![seed("n0")], budget(5), |t| {
-        t.scorer(BfsScorer).price(HopPrice { gate: 0, beam: 1 })
+        t.scorer(BfsScorer).price(HopPrice {
+            gate: 0,
+            beam: 1,
+            pricing: Pricing::Rank,
+        })
     })
     .await;
     // Gate and beam are ignored: every edge of every popped node is followed.
@@ -1043,7 +1051,11 @@ fn hop_pricing_gate_and_beam() {
         &mut RulesScorer,
         &ctx,
         &cands,
-        HopPrice { gate: 5, beam: 2 },
+        HopPrice {
+            gate: 5,
+            beam: 2,
+            pricing: Pricing::Rank,
+        },
     );
     assert_eq!(steps.len(), 5);
     assert!(steps.iter().all(|(_, v)| *v == 1.0));
@@ -1052,9 +1064,165 @@ fn hop_pricing_gate_and_beam() {
         &mut RulesScorer,
         &ctx,
         &cands,
-        HopPrice { gate: 2, beam: 3 },
+        HopPrice {
+            gate: 2,
+            beam: 3,
+            pricing: Pricing::Rank,
+        },
     );
     assert_eq!(steps, [(0, 1.0), (1, 0.5), (2, 1.0 / 3.0)]);
+}
+
+/// `n` edges `a -> n00..` offered by one map with falling confidence.
+fn sibling_edges(n: usize) -> Vec<FusedEdge> {
+    fuse(
+        (0..n)
+            .map(|i| {
+                edge(
+                    "a",
+                    &format!("n{i:03}"),
+                    "g",
+                    WitnessClass::Compiler,
+                    100 - (i % 90) as u8,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The values `hop` gives, in rank order.
+fn values_of(fused: &[FusedEdge], price: HopPrice) -> Vec<f64> {
+    let cands = candidates(fused);
+    hop(&mut RulesScorer, &score_ctx(), &cands, price)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+#[test]
+fn relative_pricing_prices_by_rank_over_siblings() {
+    let rank = HopPrice {
+        beam: 100,
+        ..HopPrice::default()
+    };
+    let relative = HopPrice {
+        pricing: Pricing::Relative,
+        ..rank
+    };
+    assert_eq!(rank.pricing, Pricing::Rank);
+    let prior = values_of(&sibling_edges(9), rank)[0];
+    // One above the gate: within 12 % of today at every rank.
+    let (today, now) = (
+        values_of(&sibling_edges(9), rank),
+        values_of(&sibling_edges(9), relative),
+    );
+    assert_eq!((today.len(), now.len()), (9, 9));
+    for (r, (t, n)) in today.iter().zip(&now).enumerate() {
+        assert!(n >= t && (n - t) / t < 0.12, "rank {r}: {t} against {n}");
+    }
+    assert_eq!(today[0], now[0]);
+    // The formula, with n counted before the beam.
+    let wide = sibling_edges(80);
+    let now = values_of(&wide, relative);
+    assert_eq!(now.len(), 80);
+    for (r, value) in now.iter().enumerate() {
+        let want = prior / (1.0 + r as f64 * 8.0 / 80.0);
+        assert!(
+            (value - want).abs() < 1e-12,
+            "rank {r}: {value} against {want}"
+        );
+    }
+    // 80 callers: the 9th edge is `prior / 1.8`, not `prior / 9`.
+    assert!((now[8] - prior / 1.8).abs() < 1e-12);
+    assert!((values_of(&wide, rank)[8] - prior / 9.0).abs() < 1e-12);
+    assert_eq!(values_of(&wide, rank)[0], now[0]);
+    // Monotone in rank, and never below today's value.
+    let today = values_of(&wide, rank);
+    assert!(now.windows(2).all(|w| w[0] > w[1]));
+    assert!(now.iter().zip(&today).all(|(n, t)| n >= t));
+    // The beam only cuts: n is still the offered count.
+    let beamed = values_of(
+        &wide,
+        HopPrice {
+            beam: 10,
+            ..relative
+        },
+    );
+    assert_eq!(beamed, now[..10]);
+    // At or below the gate every edge is followed whole, whatever the pricing.
+    let few = sibling_edges(8);
+    assert_eq!(values_of(&few, relative), values_of(&few, rank));
+    assert!(values_of(&few, relative).iter().all(|&v| v == prior));
+}
+
+#[test]
+fn relative_pricing_counts_the_implementors_ahead() {
+    let fused = fuse(trait_edges(2, 10));
+    let cands = candidates(&fused);
+    let ctx = score_ctx();
+    let value_of_rank0 = |pricing: Pricing| {
+        let price = HopPrice {
+            pricing,
+            ..HopPrice::default()
+        };
+        let steps = hop_from(&mut RulesScorer, &ctx, &cands, price, true);
+        assert_eq!(steps.len(), 12);
+        steps[2].1
+    };
+    // Ten references behind two implementors: the divisor is `1 + 2 + r * 8 /
+    // 10`, the same at rank 0 and flatter below.
+    assert!((value_of_rank0(Pricing::Rank) - 1.0 / 3.0).abs() < 1e-12);
+    assert!((value_of_rank0(Pricing::Relative) - 1.0 / 3.0).abs() < 1e-12);
+    let last = |pricing: Pricing| {
+        let price = HopPrice {
+            pricing,
+            ..HopPrice::default()
+        };
+        hop_from(&mut RulesScorer, &ctx, &cands, price, true)[11].1
+    };
+    assert!((last(Pricing::Rank) - 1.0 / 12.0).abs() < 1e-12);
+    assert!((last(Pricing::Relative) - 1.0 / (3.0 + 9.0 * 8.0 / 10.0)).abs() < 1e-12);
+}
+
+/// The values `hop_from` gives a trait seed with `ahead` implementors and
+/// `refs` references, in rank order.
+fn values_behind(ahead: usize, refs: usize, price: HopPrice) -> Vec<f64> {
+    let fused = fuse(trait_edges(ahead, refs));
+    let cands = candidates(&fused);
+    hop_from(&mut RulesScorer, &score_ctx(), &cands, price, true)
+        .into_iter()
+        .skip(ahead)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+#[test]
+fn relative_pricing_is_continuous_at_the_gate_for_every_node() {
+    let rank = HopPrice::default();
+    let relative = HopPrice {
+        pricing: Pricing::Relative,
+        ..rank
+    };
+    for ahead in [0, 2] {
+        // At the gate the two pricings are the same.
+        let at = values_behind(ahead, 8, relative);
+        assert_eq!(at, values_behind(ahead, 8, rank), "ahead {ahead}");
+        // One more sibling raises no remaining candidate's price, and the
+        // top price stays what it is however many follow.
+        let past = values_behind(ahead, 9, relative);
+        assert_eq!(past.len(), 9);
+        assert!(
+            past.iter().zip(&at).all(|(p, a)| p <= a),
+            "ahead {ahead}: {at:?} then {past:?}"
+        );
+        for refs in 9..40 {
+            let values = values_behind(ahead, refs, relative);
+            assert_eq!(values[0], at[0], "ahead {ahead}, {refs} references");
+            assert!(values.windows(2).all(|w| w[0] > w[1]));
+            let today = values_behind(ahead, refs, rank);
+            assert!(values.iter().zip(&today).all(|(v, t)| v >= t));
+        }
+    }
 }
 
 /// An edge `t -> dst` of `kind`, offered by `map`.
@@ -1432,13 +1600,22 @@ mod persist {
                 .kind(EdgeKind::Mentions),
         ]);
         let result = walk(&reg, vec![seed("s")], budget(20), |t| {
-            t.price(HopPrice { gate: 0, beam: 16 }).card_paths(true)
+            t.price(HopPrice {
+                gate: 0,
+                beam: 16,
+                pricing: Pricing::Rank,
+            })
+            .card_paths(true)
         })
         .await;
         assert_eq!(events_of(&result, "relax").len(), 1);
         // Without the switch no state has a kind.
         let plain = walk(&reg, vec![seed("s")], budget(20), |t| {
-            t.price(HopPrice { gate: 0, beam: 16 })
+            t.price(HopPrice {
+                gate: 0,
+                beam: 16,
+                pricing: Pricing::Rank,
+            })
         })
         .await;
         assert!(plain.states.iter().all(|s| s.kind.is_none()));
@@ -2015,7 +2192,12 @@ mod steering {
             }
         };
         let (all_states, open) = estimate(None).await;
-        let (few_states, narrow) = estimate(Some(HopPrice { gate: 1, beam: 1 })).await;
+        let (few_states, narrow) = estimate(Some(HopPrice {
+            gate: 1,
+            beam: 1,
+            pricing: Pricing::Rank,
+        }))
+        .await;
         assert!(few_states < all_states, "the beam adopted fewer nodes");
 
         for cp in [&open, &narrow] {

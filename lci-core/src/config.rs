@@ -10,8 +10,8 @@ pub mod layers;
 pub mod profile;
 
 pub use profile::{
-    LspProfile, LspSessions, LspSync, RunProfile, RunProfileConfig, RunProfileTraverse, WalkGroups,
-    WalkProfile,
+    LspProfile, LspSessions, LspSync, RunProfile, RunProfileConfig, RunProfileSeeds,
+    RunProfileTraverse, WalkGroups, WalkPricing, WalkProfile,
 };
 
 /// Controls when a search request may trigger an automatic incremental
@@ -634,10 +634,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Rescorer::is_default")]
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
-    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`,
+    /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`,
     /// `traverse.map_freshness`, `traverse.card_paths`, `scip.mode`, `lsp.sessions`,
-    /// `lsp.outline_cache`, `lsp.implementations`, `lsp.sync` and
-    /// `freshness.verify_on_read`). Always
+    /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy`, `lsp.sync`,
+    /// `freshness.verify_on_read` and `seeds.bm25`). Always
     /// serialized; the hashed profile of the whole configuration is
     /// [`Config::run_profile`].
     pub run_profile: RunProfileConfig,
