@@ -1356,7 +1356,10 @@ fn init_refuses_to_probe_port_8765_and_still_writes_the_rest() {
         let started = std::time::Instant::now();
         let output = init.run(&args);
         assert!(output.status.success(), "{}", stderr(&output));
-        assert!(started.elapsed() < Duration::from_secs(30));
+        // A hang guard only: "refused" below is decided from the URL string
+        // (`probe_refusal`), with no outbound probe, so wall time is not the
+        // evidence (a 30 s bound failed under parallel builds).
+        assert!(started.elapsed() < 2 * LOADED_BUDGET);
         let report = parse(&output);
         for key in ["embedding_url", "reranker_url"] {
             assert_eq!(report["probes"][key]["status"], "refused", "{key}");
@@ -1409,8 +1412,9 @@ fn init_refuses_to_probe_a_host_that_is_not_loopback() {
     let started = std::time::Instant::now();
     let output = init.run(&["init", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    // Nothing waited on a network that was never asked.
-    assert!(started.elapsed() < Duration::from_secs(30));
+    // A hang guard only: the "refused" status below is decided from the URL
+    // string (`probe_refusal`), with no outbound probe.
+    assert!(started.elapsed() < 2 * LOADED_BUDGET);
     let report = parse(&output);
     for key in ["embedding_url", "reranker_url"] {
         assert_eq!(report["probes"][key]["status"], "refused", "{key}");
