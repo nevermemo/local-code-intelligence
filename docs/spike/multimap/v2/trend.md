@@ -55,6 +55,7 @@ How to read a row:
 - A row whose note says `rescored` was scored again from the raw outputs of an
   earlier run with the current adapters (`--rescore`); its traversal columns
   are the earlier run's and its wall latency is `-`.
+- A row whose note says `config=<stem>@<hash>` ran with `--config <toml>` (d447): every `lci traverse` call read that overlay, so a `[run_profile]` key differs from the default arms. The hash is the file's SHA-256 (first 12 hex); `score.json` of the run holds the path, the full hash and the `profile_hash` the traversals reported. Rows with different hashes are different arms even when every other column matches.
 - `cargo xtask maps bench` also writes `supplement.md` beside `row.md` in each run
   directory (added 2026-10-16; no row changes): the secondary metrics per stratum
   (impact: `common` band, `r2_decl_recall`, `tests_recall`; flow: answer precision
