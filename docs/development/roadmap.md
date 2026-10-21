@@ -78,7 +78,6 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | **M3** | **Walk, cards, seeds, router, cost** | | | |
 | K10b | New `SymbolKind` variants (Field, Variable, Interface, Class) from LSP outlines; adapter version bump | Unit tests | S | - |
 | K3a | Cost metrics in every report: answer tokens, external calls, LSP ms, pops, per stratum; a per-query budget-hit field (the `over_budget` note exists) and priming before the first timed query (`Session::primed` exists); `compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies, K11c (folded in, row removed) |
-| K29 | `likely_complete`, the score bound and tau get written meanings | Docs and unit tests | S | - |
 | K38 | Stat-gated freshness re-hash: with `map_freshness` on, keep `(mtime, len)` per file and re-hash only changed files; needs the public lci-core source lister K8a adds (the former M0 filler "K2a-2 follow-up", d410). After K8a | Unit tests: unchanged files are not re-read, a touched file is re-hashed, answers equal the full-hash path | S | - |
 | K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld. After K29 (the wording) and K38 (`map_freshness` and `verify_on_read` made affordable) | Card schema test | S | - |
 | K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |

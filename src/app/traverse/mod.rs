@@ -222,7 +222,9 @@ pub struct SteerArgs {
     pub ladder: Option<Vec<String>>,
     /// Most stops in the traversal (never above the `[traverse]` cap).
     pub max_stops: Option<u32>,
-    /// Confidence a rung needs to decide a stop, 0 to 1.
+    /// Confidence a rung needs to decide a stop, 0 to 1. Only the rules
+    /// rung exists (confidence 0 or 1): any value above 0 acts alike; 0
+    /// means no stop escalates.
     pub tau: Option<f32>,
     /// A stop every this many pops. Without it, stops happen every
     /// `pops / (max_stops + 1)` pops while rules are given.
@@ -233,9 +235,9 @@ pub struct SteerArgs {
     /// Counts toward `max_stops`; given alone it starts the ladder like
     /// `stop_every` does, with the periodic stops at their default spacing.
     pub on_disagreement: Option<u32>,
-    /// Also stop when the walk is estimated to have found this percent of
-    /// what it will find (1 to 100). Counts toward `max_stops`; given alone it
-    /// starts the ladder like `stop_every` does.
+    /// Also stop, once, when the capture-recapture estimate of nodes found
+    /// reaches this percent (1 to 100); shown as `checkpoint.likely_complete`. Counts toward
+    /// `max_stops`; given alone it starts the ladder like `stop_every` does.
     pub likely_complete: Option<u32>,
     /// Only with `handle`: the outer agent's answer to the checkpoint,
     /// `[{"node"?: id, "action": ..}]` with the actions of the rule list plus

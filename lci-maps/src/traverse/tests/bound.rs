@@ -359,3 +359,41 @@ async fn r10_a_handle_names_the_identity_it_was_made_for() {
     let again = second.snapshot.expect("work is left");
     assert_eq!(again.identity(), "w1+i1");
 }
+
+/// The written meaning of `stop_reason: bound` (engine.md, "Written
+/// meanings"): the call ends `complete` with no checkpoint, handle or
+/// estimate, even when a stop trigger is due at that very pop and two maps
+/// share nodes (so a checkpoint would have carried an estimate).
+#[tokio::test]
+async fn a_bound_answer_names_its_reason_and_has_no_handle_or_estimate() {
+    let edges = [("s", "a"), ("s", "b"), ("s", "c")];
+    let reg = registry(vec![
+        GraphMap::new("m1", &edges),
+        GraphMap::new("m2", &edges),
+    ]);
+
+    let result = walk(&reg, vec![seed("s")], budget(100), |t| {
+        t.top_k(2, 1)
+            .handler(noop(), every(1).likely_complete(1).max_stops(4))
+    })
+    .await;
+    assert_eq!(reason_of(&result), (StopReason::Bound, "bound"));
+    assert_eq!(result.status, TraversalStatus::Complete);
+    assert_eq!(result.totals.pops, 1);
+    assert!(result.snapshot.is_none() && result.checkpoint.is_none());
+    assert!(
+        events_of(&result, "return").is_empty(),
+        "nothing went back to the caller"
+    );
+    assert_eq!(
+        result.totals.stops, 0,
+        "the bound is checked before the triggers: the stop due at pop 1 was not consulted"
+    );
+
+    // Without the bound the same stop is due at pop 1 and is consulted.
+    let open = walk(&reg, vec![seed("s")], budget(100), |t| {
+        t.handler(noop(), every(1).likely_complete(1).max_stops(4))
+    })
+    .await;
+    assert_eq!(stops_of(&open)[0], (1, "every_pops".to_string()));
+}

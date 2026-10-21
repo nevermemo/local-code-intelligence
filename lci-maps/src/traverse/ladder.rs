@@ -15,6 +15,16 @@
 //! `Stopped`, returns the checkpoint with a handle (rung 3), and the agent
 //! sends its answer as a [`Steer`](super::steer::Steer) on the resume.
 //!
+//! Today the product builds the ladder with the rules rung alone
+//! ([`Ladder::rules`]), whose confidence is 1.0 when a rule matched, the
+//! list was not cut short and no two matched rules conflict, else 0.0. So
+//! `tau` acts as a switch: every `tau` in `(0, 1]` behaves the same (the
+//! rules decide exactly on a clean match, any other stop escalates), and
+//! `tau = 0` lets an unmatched list "decide" with no actions, so no stop
+//! escalates to the caller (a rule's own `stop` and a list cut short still
+//! end the call). A graded `tau` needs a rung whose
+//! confidence is graded (System One).
+//!
 //! Nothing of the lower rungs is applied when the ladder escalates: a rung
 //! that was not confident does not get half its way.
 
