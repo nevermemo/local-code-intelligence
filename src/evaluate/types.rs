@@ -613,6 +613,11 @@ pub struct TagAggregate {
     /// Mean [`QueryMetrics::ndcg_at_10`] over those queries (bounded by each
     /// query's result window, see there).
     pub mean_ndcg_at_10: f64,
+    /// Of those queries, how many had a language server past its search
+    /// budget ([`QueryMetrics::lsp_budget_hit`]). A report written before
+    /// the field reads 0.
+    #[serde(default)]
+    pub lsp_budget_hit_queries: usize,
 }
 
 /// Aggregate metrics across all query reports.

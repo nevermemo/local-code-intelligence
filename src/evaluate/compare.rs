@@ -181,6 +181,12 @@ pub struct ComparisonReport {
     /// Of those, how many had the hit in the candidate report.
     #[serde(default)]
     pub budget_hit_candidate: usize,
+    /// Of the `budget_hit_pairs` left out, how many carried each tag (the tag
+    /// union of both sides, as a kept pair takes it). Empty (and omitted from
+    /// JSON) when nothing was left out or no left-out pair had a tag, and
+    /// always empty with [`CompareOptions::keep_failed`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_hit_by_tag: BTreeMap<String, usize>,
     /// Baseline queries with no counterpart in the candidate report.
     pub unpaired_baseline: usize,
     /// Candidate queries with no counterpart in the baseline report.
@@ -272,6 +278,7 @@ pub fn compare(
     let mut budget_hit_pairs = 0;
     let mut budget_hit_baseline = 0;
     let mut budget_hit_candidate = 0;
+    let mut budget_hit_by_tag: BTreeMap<String, usize> = BTreeMap::new();
     let mut unpaired_baseline_queries = Vec::new();
     for base in &baseline.queries {
         let key = (base.query.workspace.as_str(), base.query.query.as_str());
@@ -289,6 +296,9 @@ pub fn compare(
             budget_hit_pairs += 1;
             budget_hit_baseline += usize::from(base.metrics.lsp_budget_hit);
             budget_hit_candidate += usize::from(cand.metrics.lsp_budget_hit);
+            for tag in tags_of(base, cand) {
+                *budget_hit_by_tag.entry(tag.clone()).or_default() += 1;
+            }
             continue;
         }
         pairs.push(pair_up(base, cand));
@@ -326,6 +336,7 @@ pub fn compare(
         budget_hit_pairs,
         budget_hit_baseline,
         budget_hit_candidate,
+        budget_hit_by_tag,
         unpaired_baseline: unpaired_baseline_queries.len(),
         unpaired_candidate: unpaired_candidate_queries.len(),
         unpaired_baseline_queries,
@@ -356,10 +367,15 @@ fn pair_metrics(report: &QueryReport) -> PairMetrics {
     }
 }
 
+/// The distinct tags of a matched pair: the union of both sides.
+fn tags_of<'a>(base: &'a QueryReport, cand: &'a QueryReport) -> BTreeSet<&'a String> {
+    base.query.tags.iter().chain(&cand.query.tags).collect()
+}
+
 fn pair_up(base: &QueryReport, cand: &QueryReport) -> PairedQuery {
     let baseline = pair_metrics(base);
     let candidate = pair_metrics(cand);
-    let tags: BTreeSet<&String> = base.query.tags.iter().chain(&cand.query.tags).collect();
+    let tags = tags_of(base, cand);
     PairedQuery {
         workspace: base.query.workspace.clone(),
         query: base.query.query.clone(),
@@ -504,6 +520,18 @@ impl ComparisonReport {
             self.budget_hit_baseline,
             self.budget_hit_candidate,
         );
+        if !self.budget_hit_by_tag.is_empty() {
+            let counts: Vec<String> = self
+                .budget_hit_by_tag
+                .iter()
+                .map(|(tag, count)| format!("{tag} {count}"))
+                .collect();
+            let _ = writeln!(
+                out,
+                "  LSP budget hit, left out, by tag: {}",
+                counts.join(", ")
+            );
+        }
         let _ = writeln!(
             out,
             "  {:.0}% paired-bootstrap CI, {} resamples, seed {}",

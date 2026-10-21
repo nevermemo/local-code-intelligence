@@ -15,13 +15,13 @@ use lci_maps::{
         lint::{LintContext, lint},
         rules::RuleList,
         steer::Steer,
-        stop::Card,
+        stop::{Card, MapStat},
         trace::{self},
     },
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     str::FromStr,
 };
@@ -80,6 +80,147 @@ pub(super) fn add_file_changed(response: &mut Value, observer: &Observer) {
             if let Some(object) = response.as_object_mut() {
                 object.insert("notes".into(), json!([note]));
             }
+        }
+    }
+}
+
+/// The words `freshness` says on a card (`[run_profile.traverse]
+/// answer_labels`).
+pub(super) const FRESHNESS_WORDS: [&str; 4] = ["fresh", "changed", "stale", "unverified"];
+
+/// What one card's `freshness` is, from the card's `file_changed` and from the
+/// answer's `maps` (`None` when the answer has no `maps` key), in this order:
+/// `file_changed` true is `changed`, false is `fresh`; otherwise, when the
+/// answer states its maps, any map of the card (`maps` plus `via`) that is
+/// `stale` makes it `stale` and all of them found with a lag make it `fresh`;
+/// anything else is `unverified`.
+fn card_freshness(card: &Value, maps: Option<&Vec<Value>>) -> &'static str {
+    match card.get("file_changed").and_then(Value::as_bool) {
+        Some(true) => return FRESHNESS_WORDS[1],
+        Some(false) => return FRESHNESS_WORDS[0],
+        None => {}
+    }
+    let Some(maps) = maps else {
+        return FRESHNESS_WORDS[3];
+    };
+    let mut named: Vec<&str> = card["maps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    named.extend(card["via"].as_str());
+    if named.is_empty() {
+        return FRESHNESS_WORDS[3];
+    }
+    let mut verified = true;
+    for id in named {
+        match maps.iter().find(|entry| entry["id"].as_str() == Some(id)) {
+            Some(entry) if entry["stale"].as_bool() == Some(true) => return FRESHNESS_WORDS[2],
+            Some(entry) if !entry["lag"].is_null() => {}
+            _ => verified = false,
+        }
+    }
+    if verified {
+        FRESHNESS_WORDS[0]
+    } else {
+        FRESHNESS_WORDS[3]
+    }
+}
+
+/// The maps an answer lacks: those the call asked for and could not set up
+/// (`unavailable`) and those with failed calls (`MapStat.failures`), sorted.
+fn degraded_maps(unavailable: &[MapId], stats: Option<&BTreeMap<MapId, MapStat>>) -> Vec<MapId> {
+    let mut degraded = unavailable.to_vec();
+    degraded.extend(
+        stats
+            .into_iter()
+            .flatten()
+            .filter(|(_, stat)| stat.failures > 0)
+            .map(|(id, _)| *id),
+    );
+    degraded.sort_unstable();
+    degraded.dedup();
+    degraded
+}
+
+/// With `[run_profile.traverse] answer_labels`, the two labels of an answer
+/// (the key off never calls this, so the response is as it was): `completeness`
+/// `{complete, why, estimate}` on the answer (`complete` is `status ==
+/// "complete"` and no map degraded, `why` the answer's `stop_reason`,
+/// `no_seeds` without a walk, `degraded` when the walk ended complete but a map
+/// the policy asked for was unavailable at setup (`unavailable`) or had failed
+/// calls (`MapStat.failures`); those maps are then listed in `degraded`, also
+/// beside another `why`; `estimate` the K29 fraction or `null`; a partial
+/// answer also gets one note) and `freshness` on every card of [`CARD_LISTS`]. Read from the response as
+/// it is, so it runs after `add_maps` and `add_file_changed`; the trace and the
+/// checkpoint hash are made before it and do not see it.
+pub(super) fn add_answer_labels(
+    response: &mut Value,
+    result: Option<&TraversalResult>,
+    unavailable: &[MapId],
+) {
+    let maps = response.get("maps").and_then(Value::as_array).cloned();
+    for list in CARD_LISTS {
+        let Some(Value::Array(items)) = response.pointer_mut(list) else {
+            continue;
+        };
+        for card in items {
+            let word = card_freshness(card, maps.as_ref());
+            if let Some(object) = card.as_object_mut() {
+                object.insert("freshness".into(), json!(word));
+            }
+        }
+    }
+    let walked_to_the_end = response["status"].as_str() == Some("complete");
+    let degraded = degraded_maps(unavailable, result.map(|r| &r.maps));
+    let complete = walked_to_the_end && degraded.is_empty();
+    let why = if walked_to_the_end && !degraded.is_empty() {
+        "degraded".to_owned()
+    } else {
+        response["stop_reason"]
+            .as_str()
+            .unwrap_or("no_seeds")
+            .to_owned()
+    };
+    let estimate = result
+        .and_then(|r| r.estimate.as_ref())
+        .map(|lc| lc.fraction);
+    let handle = response["handle"].as_str().map(str::to_owned);
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    let mut completeness = json!({"complete": complete, "why": why, "estimate": estimate});
+    if !degraded.is_empty() {
+        completeness["degraded"] = json!(degraded);
+    }
+    object.insert("completeness".into(), completeness);
+    if complete {
+        return;
+    }
+    let lost = degraded.join(", ");
+    let mut lines = Vec::new();
+    if walked_to_the_end {
+        // The frontier dried up, but not with every map: nothing more to resume.
+        lines.push(format!(
+            "partial answer (degraded): {lost} was unavailable or had failed calls, so the results lack what it would add"
+        ));
+    } else {
+        let mut note = format!("partial answer ({why}): results are what the walk found so far");
+        if let Some(handle) = handle {
+            note.push_str(&format!("; resume with handle {handle}"));
+        }
+        lines.push(note);
+        if !degraded.is_empty() {
+            lines.push(format!(
+                "degraded maps: {lost} was unavailable or had failed calls, so the results lack what it would add"
+            ));
+        }
+    }
+    match object.get_mut("notes").and_then(Value::as_array_mut) {
+        Some(notes) => notes.extend(lines.into_iter().map(Value::from)),
+        None => {
+            object.insert("notes".into(), json!(lines));
         }
     }
 }
@@ -626,4 +767,80 @@ fn checkpoint_response(checkpoint: &Checkpoint) -> Value {
         object.insert("handle".into(), json!(checkpoint.handle));
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, stale: bool, lag: Value) -> Value {
+        json!({"id": id, "observed": "snapshot", "stale": stale, "lag": lag})
+    }
+
+    #[test]
+    fn card_freshness_reads_file_changed_before_the_maps() {
+        let stale = vec![entry("graph.scip", true, json!(1))];
+        let fresh = vec![entry("graph.scip", false, json!(0))];
+        // The card's own file is as its maps read it: fresh, whatever the maps say.
+        let card = json!({"file_changed": false, "maps": ["graph.scip"], "via": "graph.scip"});
+        assert_eq!(card_freshness(&card, Some(&stale)), "fresh");
+        // A changed file is changed, though the maps say fresh.
+        let card = json!({"file_changed": true, "maps": ["graph.scip"], "via": "graph.scip"});
+        assert_eq!(card_freshness(&card, Some(&fresh)), "changed");
+    }
+
+    #[test]
+    fn card_freshness_needs_every_map_of_the_card_found_with_a_lag() {
+        let card = json!({"file_changed": null, "maps": ["graph.scip"], "via": "graph.scip"});
+        let fresh = vec![entry("graph.scip", false, json!(0))];
+        assert_eq!(card_freshness(&card, Some(&fresh)), "fresh");
+        let stale = vec![entry("graph.scip", true, json!(2))];
+        assert_eq!(card_freshness(&card, Some(&stale)), "stale");
+        // A map the answer does not list: nothing to say.
+        let other = vec![entry("grep.live", false, json!(0))];
+        assert_eq!(card_freshness(&card, Some(&other)), "unverified");
+        // A map listed with a null lag was not compared.
+        let unknown = vec![entry("graph.scip", false, Value::Null)];
+        assert_eq!(card_freshness(&card, Some(&unknown)), "unverified");
+        // One map unverified keeps the whole card unverified, a stale one wins.
+        let card = json!({"maps": ["graph.scip", "grep.live"], "via": "graph.scip"});
+        assert_eq!(card_freshness(&card, Some(&fresh)), "unverified");
+        let mixed = vec![
+            entry("graph.scip", false, json!(0)),
+            entry("grep.live", true, json!(1)),
+        ];
+        assert_eq!(card_freshness(&card, Some(&mixed)), "stale");
+        // No `maps` on the answer, or a card with no map: unverified.
+        assert_eq!(card_freshness(&card, None), "unverified");
+        assert_eq!(
+            card_freshness(&json!({"maps": []}), Some(&fresh)),
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn degraded_maps_are_the_unavailable_and_the_ones_with_failed_calls() {
+        let failed = MapStat {
+            failures: 1,
+            ..MapStat::default()
+        };
+        let stats = BTreeMap::from([
+            ("graph.scip", MapStat::default()),
+            ("grep.live", failed),
+            ("lsp.live", failed),
+        ]);
+        assert!(degraded_maps(&[], None).is_empty());
+        assert!(
+            degraded_maps(
+                &[],
+                Some(&BTreeMap::from([("graph.scip", MapStat::default())]))
+            )
+            .is_empty()
+        );
+        // Sorted, once each.
+        assert_eq!(
+            degraded_maps(&["lsp.live", "git.history"], Some(&stats)),
+            ["git.history", "grep.live", "lsp.live"]
+        );
+    }
 }

@@ -9,8 +9,11 @@
 //! the other) when the index has one, so that one symbol keeps one id across
 //! the layers, a shifted line included; else it gets a minted id (the file's
 //! real language, no container, the member's kind, equals told apart in
-//! document order). Where the file is learned the outline's places win over
-//! the index's, which may be older than the tree; the index fills what the
+//! document order). Besides functions, methods, types, enums, modules and
+//! consts, the outline names classes, interfaces (a Rust trait stays a trait),
+//! fields, properties (as fields) and variables; enum members, impl blocks and
+//! type parameters have no node. Where the file is learned the outline's
+//! places win over the index's, which may be older than the tree; the index fills what the
 //! outline does not list (a kind this build has no node for).
 //!
 //! A Rust file of a tree ([`OutlinePlaces::with_tree`]) takes the ids of its own
@@ -31,18 +34,23 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-/// The node kind of an LSP `SymbolKind` number this build has a node for.
-/// Fields, properties, variables and enum members have none until a later
-/// slice adds them (K10b), so they get no entry.
-fn node_kind(lsp_kind: u64) -> Option<SymbolKind> {
+/// The node kind of an LSP `SymbolKind` number this build has a node for, in a
+/// file of `language` (an LSP interface is a rust-analyzer trait in a Rust file,
+/// an interface elsewhere). Enum members (22), impl blocks (19), type
+/// parameters (26) and the rest have none, so they get no entry.
+fn node_kind(lsp_kind: u64, language: &str) -> Option<SymbolKind> {
     match lsp_kind {
         12 => Some(SymbolKind::Function),
         6 | 9 => Some(SymbolKind::Method),
-        5 | 23 => Some(SymbolKind::Struct),
-        11 => Some(SymbolKind::Trait),
+        5 => Some(SymbolKind::Class),
+        23 => Some(SymbolKind::Struct),
+        11 if language == "rust" => Some(SymbolKind::Trait),
+        11 => Some(SymbolKind::Interface),
         10 => Some(SymbolKind::Enum),
         2..=4 => Some(SymbolKind::Module),
         14 => Some(SymbolKind::Const),
+        7 | 8 => Some(SymbolKind::Field),
+        13 => Some(SymbolKind::Variable),
         _ => None,
     }
 }
@@ -150,7 +158,7 @@ impl OutlinePlaces {
         &self,
         path: &str,
         name: &str,
-        kind: SymbolKind,
+        (kind, language): (SymbolKind, Option<&str>),
         (line, equals_before): (u32, u16),
         taken: &HashSet<NodeId>,
         declared: &[Declared],
@@ -181,7 +189,7 @@ impl OutlinePlaces {
         if let Some(declaration) = declaration {
             return Some(declaration.id.clone());
         }
-        let language = language::for_path(Path::new(path))?.identifier();
+        let language = language?;
         let mut key = SymbolKey {
             language: language.to_owned(),
             module_path: rust_module_path(path),
@@ -261,10 +269,15 @@ impl SymbolPlaces for OutlinePlaces {
     }
 
     fn learn(&self, path: &str, members: &[Member]) {
+        // A file with no adapter gets no minted id (`id_for` declines), as before.
+        let language = language::for_path(Path::new(path)).map(|adapter| adapter.identifier());
         let mut ordered: Vec<(&Member, SymbolKind)> = members
             .iter()
             .filter(|member| !member.name.is_empty() && member.place.path == path)
-            .filter_map(|member| Some((member, node_kind(member.kind?)?)))
+            .filter_map(|member| {
+                let kind = node_kind(member.kind?, language.unwrap_or_default())?;
+                Some((member, kind))
+            })
             .collect();
         ordered.sort_by(|a, b| (&a.0.place, &a.0.name).cmp(&(&b.0.place, &b.0.name)));
         let mut entries: Vec<Entry> = Vec::new();
@@ -282,7 +295,7 @@ impl SymbolPlaces for OutlinePlaces {
             let Some(id) = self.id_for(
                 path,
                 &member.name,
-                kind,
+                (kind, language),
                 (member.place.line, equals_before),
                 &taken,
                 &declared,

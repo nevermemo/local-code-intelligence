@@ -81,7 +81,9 @@ pub enum ConfigNamespace {
     Repo,
 }
 
-/// The kind of a declaration in a [`SymbolKey`].
+/// The kind of a declaration in a [`SymbolKey`]. The first 11 come from the Rust
+/// extractor and the SCIP index; `Field`, `Variable`, `Interface` and `Class`
+/// come from language-server outlines only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -95,6 +97,10 @@ pub enum SymbolKind {
     TypeAlias,
     Module,
     Macro,
+    Field,
+    Variable,
+    Interface,
+    Class,
 }
 
 macro_rules! names {
@@ -125,6 +131,10 @@ names!(SymbolKind {
     TypeAlias => "type",
     Module => "mod",
     Macro => "macro",
+    Field => "field",
+    Variable => "variable",
+    Interface => "interface",
+    Class => "class",
 });
 
 /// The per-declaration key (lesson L1): language, module path, container

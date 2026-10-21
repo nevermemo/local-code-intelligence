@@ -6196,11 +6196,27 @@ async fn traverse_area(
     index: &std::path::Path,
     profile: &local_code_intelligence::config::RunProfileConfig,
 ) -> local_code_intelligence::app::traverse::Report {
+    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
+    traverse_area_routed(config, workspace, index, profile, Some(&maps), None, &[]).await
+}
+
+/// [`traverse_area`] with the maps and the policy left to the caller: `maps`
+/// as `--maps` (none: the call's policy picks them), `policy` as
+/// `steer.policy`, and `routes` as `[traverse.policies.<name>] extra_maps`.
+async fn traverse_area_routed(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    profile: &local_code_intelligence::config::RunProfileConfig,
+    maps: Option<&[String]>,
+    policy: Option<&str>,
+    routes: &[(&str, &[&str])],
+) -> local_code_intelligence::app::traverse::Report {
     use local_code_intelligence::{
         app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
         config::{TraverseConfig, TraverseFirstStage},
     };
-    let limits = TraverseConfig {
+    let mut limits = TraverseConfig {
         enabled: true,
         first_stage: TraverseFirstStage::Off,
         answer_seeds: false,
@@ -6214,9 +6230,20 @@ async fn traverse_area(
             max_depth: Some(1),
             ..BudgetArgs::default()
         },
-        SteerArgs::default(),
+        SteerArgs {
+            policy: policy.map(str::to_owned),
+            ..SteerArgs::default()
+        },
     );
-    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
+    for (name, extra_maps) in routes {
+        limits.policies.insert(
+            (*name).to_owned(),
+            lci_core::config::TraversePolicy {
+                extra_maps: Some(extra_maps.iter().map(|id| (*id).to_owned()).collect()),
+                ..lci_core::config::TraversePolicy::default()
+            },
+        );
+    }
     let seeds = [AREA_SEED.to_owned()];
     let call = Call {
         scip_index: index,
@@ -6225,7 +6252,7 @@ async fn traverse_area(
         seeds: &seeds,
         seed_search: None,
         top_k: 8,
-        maps: Some(&maps),
+        maps,
         budget: &budget,
         steer: &steer,
         handle: None,
@@ -7406,9 +7433,9 @@ async fn lsp_live_outline_places_walk_without_a_scip_index() {
             "sym:csharp:Shapes.cs::Area/method",
             "sym:csharp:Shapes.cs::Area/method~1",
             "sym:csharp:Shapes.cs::Area/method~2",
-            "sym:csharp:Shapes.cs::Circle/struct",
-            "sym:csharp:Shapes.cs::IShape/trait",
-            "sym:csharp:Shapes.cs::Square/struct",
+            "sym:csharp:Shapes.cs::Circle/class",
+            "sym:csharp:Shapes.cs::IShape/interface",
+            "sym:csharp:Shapes.cs::Square/class",
         ],
         "{}",
         report.response
@@ -7537,9 +7564,9 @@ async fn lsp_live_outline_places_give_contains_and_implements_edges_without_an_i
             "sym:csharp:Shapes.cs::Area/method",
             "sym:csharp:Shapes.cs::Area/method~1",
             "sym:csharp:Shapes.cs::Area/method~2",
-            "sym:csharp:Shapes.cs::Circle/struct",
-            "sym:csharp:Shapes.cs::IShape/trait",
-            "sym:csharp:Shapes.cs::Square/struct",
+            "sym:csharp:Shapes.cs::Circle/class",
+            "sym:csharp:Shapes.cs::IShape/interface",
+            "sym:csharp:Shapes.cs::Square/class",
         ]
     );
     assert_eq!(found.cost.external_calls, 1);
@@ -7589,4 +7616,59 @@ async fn lsp_live_outline_places_give_contains_and_implements_edges_without_an_i
         .collect();
     assert_eq!(got, want);
     manager.shutdown_all().await;
+}
+
+/// The router over a language server: a policy table that lists `lsp.live`
+/// brings it into a walk of the intent that names that policy, with no
+/// `--maps` on the call, and the hop is a real request to the (documents)
+/// fake. The same call under another intent, with no table entry, asks the
+/// server nothing.
+#[tokio::test]
+async fn a_policy_table_routes_an_intent_to_lsp_live_without_naming_maps() {
+    use local_code_intelligence::config::RunProfileConfig;
+    let routes: &[(&str, &[&str])] = &[("flow", &["lsp.live"])];
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let profile = RunProfileConfig::default();
+    let routed = traverse_area_routed(
+        &config,
+        &workspace,
+        &index,
+        &profile,
+        None,
+        Some("flow"),
+        routes,
+    )
+    .await;
+    assert!(!lsp_live_hops(&routed).is_empty(), "{}", routed.response);
+    let policy = &routed.response["effective_policy"];
+    assert_eq!(policy["preset"], "flow", "{}", routed.response);
+    assert!(
+        policy["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|map| map["id"] == "lsp.live"),
+        "{}",
+        routed.response
+    );
+    assert!(requests_of(&state, "textDocument/definition") >= 1);
+
+    // Another intent: the table has no entry for it, so no language server.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let unrouted = traverse_area_routed(
+        &config,
+        &workspace,
+        &index,
+        &profile,
+        None,
+        Some("explore"),
+        routes,
+    )
+    .await;
+    assert!(lsp_live_hops(&unrouted).is_empty(), "{}", unrouted.response);
+    assert_eq!(unrouted.response["effective_policy"]["preset"], "explore");
+    assert_eq!(requests_of(&state, "textDocument/definition"), 0);
 }

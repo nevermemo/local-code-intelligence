@@ -865,13 +865,13 @@ fn the_outline_layer_resolves_what_the_index_lacks_and_keeps_the_indexs_ids() {
     let places = OutlinePlaces::over(table_rows());
     assert!(places.outline_wanted("src/a.rs"));
     // `a` the index knows (its name is on line 1, the live outline has it on
-    // line 2: the tree moved); `S` it does not; `f` is a field.
+    // line 2: the tree moved); `S` it does not; `V` is an enum member (no node).
     places.learn(
         "src/a.rs",
         &[
             outline_member("src/a.rs", "a", 2, 5, 12),
             outline_member("src/a.rs", "S", 7, 9, 23),
-            outline_member("src/a.rs", "f", 8, 8, 8),
+            outline_member("src/a.rs", "V", 8, 8, 22),
         ],
     );
     assert!(!places.outline_wanted("src/a.rs"));
@@ -884,9 +884,9 @@ fn the_outline_layer_resolves_what_the_index_lacks_and_keeps_the_indexs_ids() {
     assert_eq!(s.to_string(), "sym:rust:a::S/struct");
     assert_eq!(places.defined_at(&place("src/a.rs", 7, 3)), Some(s.clone()));
     assert_eq!(places.place_of(&s), Some(place("src/a.rs", 7, 3)));
-    // A field has no node.
+    // An enum member has no node.
     assert_eq!(places.defined_at(&place("src/a.rs", 8, 3)), None);
-    // The innermost learned span holds the line; the field's line is S's.
+    // The innermost learned span holds the line; the member's line is S's.
     assert_eq!(places.enclosing("src/a.rs", 8), Some(s.clone()));
     assert_eq!(places.enclosing("src/a.rs", 3), Some(sym("a")));
     // An unlearned file is the index's.
@@ -895,7 +895,7 @@ fn the_outline_layer_resolves_what_the_index_lacks_and_keeps_the_indexs_ids() {
     // Contains: the name's own line, then the range.
     assert_eq!(places.defined_in("src/a.rs", (2, 5), "a"), Some(sym("a")));
     assert_eq!(places.defined_in("src/a.rs", (7, 9), "S"), Some(s.clone()));
-    assert_eq!(places.defined_in("src/a.rs", (8, 8), "f"), None);
+    assert_eq!(places.defined_in("src/a.rs", (8, 8), "V"), None);
     // A later outline replaces the file's entries.
     places.learn("src/a.rs", &[outline_member("src/a.rs", "a", 2, 5, 12)]);
     assert_eq!(places.defined_at(&place("src/a.rs", 7, 3)), None);
@@ -1042,6 +1042,8 @@ fn kinds_without_a_node_are_left_out_and_equal_names_are_disambiguated_in_docume
             outline_member("src/n.rs", "size", 7, 7, 8),
             outline_member("src/n.rs", "new", 10, 12, 9),
             outline_member("src/n.rs", "Unit", 14, 14, 22),
+            outline_member("src/n.rs", "Obj", 15, 15, 19),
+            outline_member("src/n.rs", "T", 16, 16, 26),
         ],
     );
     let id_at = |line| places.defined_at(&place("src/n.rs", line, 3));
@@ -1050,16 +1052,29 @@ fn kinds_without_a_node_are_left_out_and_equal_names_are_disambiguated_in_docume
     assert_eq!(id_at(10), Some(method(1)));
     assert_eq!(id_at(20), Some(method(2)));
     assert_eq!(method(2).to_string(), "sym:rust:n::new/method~2");
-    // A variable (13), a field (8) and an enum member (22) get none.
-    for line in [6, 7, 14] {
-        assert_eq!(id_at(line), None, "line {line}");
+    // A variable (13) and a field (8) are named; an enum member (22), an object (19) and a type parameter (26) are not.
+    assert_eq!(
+        id_at(6),
+        Some(minted("n", "count", SymbolKind::Variable, 0))
+    );
+    assert_eq!(id_at(7), Some(minted("n", "size", SymbolKind::Field, 0)));
+    assert_eq!(
+        minted("n", "size", SymbolKind::Field, 0).to_string(),
+        "sym:rust:n::size/field"
+    );
+    for line in [14, 15, 16] {
+        assert_eq!(
+            id_at(line),
+            None,
+            "enum member, object and type parameter (22, 19, 26)"
+        );
     }
-    // The kinds this build has a node for.
+    // The kinds this build has a node for (11 is a trait in a Rust file).
     let kinds = [
         (12, SymbolKind::Function),
         (6, SymbolKind::Method),
         (9, SymbolKind::Method),
-        (5, SymbolKind::Struct),
+        (5, SymbolKind::Class),
         (23, SymbolKind::Struct),
         (11, SymbolKind::Trait),
         (10, SymbolKind::Enum),
@@ -1067,6 +1082,9 @@ fn kinds_without_a_node_are_left_out_and_equal_names_are_disambiguated_in_docume
         (3, SymbolKind::Module),
         (4, SymbolKind::Module),
         (14, SymbolKind::Const),
+        (7, SymbolKind::Field),
+        (8, SymbolKind::Field),
+        (13, SymbolKind::Variable),
     ];
     let members: Vec<Member> = (0u32..)
         .zip(kinds)
@@ -1077,6 +1095,37 @@ fn kinds_without_a_node_are_left_out_and_equal_names_are_disambiguated_in_docume
         assert_eq!(
             places.defined_at(&place("src/k.rs", line, 3)),
             Some(minted("k", &format!("k{line}"), want, 0)),
+            "LSP kind {kind}"
+        );
+    }
+    // A language-server interface (11) is an interface outside Rust.
+    let cs = [
+        (5, SymbolKind::Class),
+        (11, SymbolKind::Interface),
+        (7, SymbolKind::Field),
+        (8, SymbolKind::Field),
+        (13, SymbolKind::Variable),
+        (22, SymbolKind::Enum),
+        (19, SymbolKind::Enum),
+        (26, SymbolKind::Enum),
+    ];
+    let members: Vec<Member> = (0u32..)
+        .zip(cs)
+        .map(|(line, (kind, _))| outline_member("K.cs", &format!("k{line}"), line, line, kind))
+        .collect();
+    places.learn("K.cs", &members);
+    for (line, (kind, want)) in (0u32..).zip(cs) {
+        let id = places.defined_at(&place("K.cs", line, 3));
+        if matches!(kind, 19 | 22 | 26) {
+            assert_eq!(id, None, "LSP kind {kind} has no node");
+            continue;
+        }
+        let Some(NodeId::Symbol(key)) = id else {
+            panic!("LSP kind {kind} has no node");
+        };
+        assert_eq!(
+            (key.language.as_str(), key.kind),
+            ("csharp", want),
             "LSP kind {kind}"
         );
     }
@@ -1107,6 +1156,43 @@ async fn a_failed_file_outline_is_not_asked_again_for_a_symbol_of_that_file() {
         3,
         "one outline request in all"
     );
+}
+
+#[tokio::test]
+async fn a_field_is_asked_like_any_symbol() {
+    let places = Arc::new(OutlinePlaces::over(Table(Vec::new())));
+    places.learn(
+        "src/a.rs",
+        &[
+            outline_member("src/a.rs", "f", 2, 2, 8),
+            outline_member("src/a.rs", "v", 3, 3, 13),
+            outline_member("src/a.rs", "C", 5, 9, 5),
+            outline_member("src/a.rs", "g", 11, 11, 12),
+        ],
+    );
+    let wide = || budget(Duration::from_secs(5), 10);
+    let mut asked = Vec::new();
+    for (name, kind) in [
+        ("f", SymbolKind::Field),
+        ("v", SymbolKind::Variable),
+        ("C", SymbolKind::Class),
+        ("g", SymbolKind::Function),
+    ] {
+        let backend = fake_with_hierarchy();
+        let requests = backend.requests.clone();
+        let map = LspLive::new(Box::new(backend), places.clone())
+            .implementations(true)
+            .call_hierarchy(true);
+        let node = minted("a", name, kind, 0);
+        let found = map.expand(&node, wide(), &view()).await;
+        assert_eq!(found.cost.external_calls, requests.load(Ordering::SeqCst));
+        asked.push(requests.load(Ordering::SeqCst));
+    }
+    // Every kind, a field and a variable included, is asked definition,
+    // references, implementation and the call hierarchy's prepare (the fake
+    // has no item at these places): a server may answer the last two for a
+    // property or a variable.
+    assert_eq!(asked, [4, 4, 4, 4]);
 }
 
 #[test]

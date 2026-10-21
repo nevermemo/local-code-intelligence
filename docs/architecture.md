@@ -149,7 +149,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   `ask` outlines a symbol's file once per map instance (`Manager::document_symbols`, one counted external call;
   `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
   outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,
-  modules, constants; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14) takes the SCIP node's id for the same file, name and
+  modules, constants, classes, interfaces, fields, variables; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14, 7 and 8, 13; 5 is `Class`, 11 is `Trait` in a Rust file and `Interface` elsewhere; enum members 22, impl blocks 19 and type parameters 26 have no node) takes the SCIP node's id for the same file, name and
   nearest line, else (a Rust file, `OutlinePlaces::with_tree`) the canonical id of the `chunk::extract_for_path` declaration around the member, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
   numbered in document order; where a file is learned its places win over the index's, which may be older than the
   tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
@@ -242,9 +242,11 @@ BM25 over the SCIP graph's node names, qualified paths and documentation, whose 
 when the search gave none; `...+literal` or `literal` with `[run_profile.seeds] literal = true`: the opt-in map `seeds.literal`, a whole-word ripgrep search (`lexical::search_literals`) for the names the question puts in code spans, each line placed in the SCIP graph (the symbol defined there, the one around it, else the file of a declaration line), appended after those sources; or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
 `[traverse]` caps (a request can only lower them), writes a trace under `data_dir`, and answers with the reached nodes,
 totals and, only when work is left, a `handle` and `checkpoint`. The first stage (exact operators `exact.closure` and
-`exact.pickaxe`, then seeds), named policies per question type and the steering ladder are described in
+`exact.pickaxe`, then seeds), named policies per question type (the router, chosen by the caller's `steer.policy`) and the steering ladder are described in
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
+
+With `[run_profile.traverse] answer_labels = true` (default `false`) the answer also has `completeness` (`{complete, why, estimate}`: `complete` is `status == "complete"` with no map lost (`degraded`: a map the call asked for that could not be set up, or had `MapStat.failures`; `why` is then `degraded` unless the walk was cut), `why` the `stop_reason`, `estimate` `TraversalResult.estimate`, the `likely_complete` fraction) and every card of `results` and the checkpoint lists has `freshness` (`fresh`, `changed`, `stale` or `unverified`, read from `file_changed` and `maps`). `app::traverse::response::add_answer_labels` adds both to the response JSON after the trace and the checkpoint hash are made, so the trace, the checkpoint, the handle and `Card`/`card_json` are unchanged, nothing is withheld, and with the key off the answer is as before.
 
 With `[run_profile.traverse] card_paths = true` (default `false`) every walked card of `results` and of `checkpoint.answer` also has `kind` and `path`, the
 route from its start node with each hop's map, edge kind and witness (`app::traverse::response::add_paths`, read from the walk's state table; the engine keeps

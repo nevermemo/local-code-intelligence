@@ -464,7 +464,10 @@ exact_seeds = true
 #                           more (first_k + top_k); below that the first stage alone
 #                           answers. 0: no minimum.
 #   extra_maps = [...]      maps added to the default maps when the call names none
-#                           (they read the tree).
+#                           (they read the tree). It may name the opt-in maps, e.g.
+#                           "grep.live" or "lsp.live" (needs the tree), which is how an
+#                           intent is routed to grep or a language server. A list given
+#                           here replaces the built-in list of the policy whole.
 #   first_k, seed_k         the policy's own first_k and seed_k.
 # Built-in values:
 #   impact   walk = false, extra_maps = ["exact.closure"], first_k = 20, seed_k = 20
@@ -527,6 +530,21 @@ enabled = false
 # source files per call. false (default): the answer has no `maps` key and is as
 # without the key.
 map_freshness = false
+# Label every traverse answer (a walk, a continuation, an answer with no start
+# node). On the answer, `completeness` {complete, why, estimate}: complete is
+# true when status is complete (the walk ended complete or bound) and no map the
+# call asked for was lost (could not be set up, or had failed calls: then
+# complete is false, why is degraded and `degraded` lists the maps), why is the
+# stop_reason (no_seeds without a walk), estimate is the fraction of the
+# likely_complete hint or null until two maps share a node; a partial answer also
+# gets one note. On every card of results and of the checkpoint's answer,
+# visited_cards and frontier, `freshness`: changed (file_changed true), fresh
+# (file_changed false, or every map of the card found in `maps` with a lag),
+# stale (a map of the card is stale) or unverified (anything else, which is what
+# every card says with map_freshness and verify_on_read off). Nothing is withheld
+# and the trace, the checkpoint and the handle do not change. false (default):
+# the answer is as without the key.
+answer_labels = false
 # Put the route on the cards: every card of `results` (and of the checkpoint's
 # `answer`) that the walk reached gains `kind` (the kind of the edge that found
 # the node; null for a start node) and `path`, the route from its start node:
@@ -644,12 +662,14 @@ mode = "authoritative"
 # and walk, none for a file already outlined) and from then on the outline's
 # places win in that file, so lines inserted since the index was written no
 # longer lose edges. A symbol of the index keeps its id; a function, method,
-# type, enum, module or constant the index lacks gets an id with the file's
-# language (sym:csharp:Shapes.cs::Area/method), so with scip.mode = "off" a
-# file's declarations have ids once it is outlined. Fields, properties and
-# variables have no node yet. A seed that is a symbol id of a file never
-# outlined still has no place. Needs a server that answers documentSymbol. The
-# recipes never run lsp.live and are the same under both values.
+# type, enum, module, constant, field (a property too) or variable the index
+# lacks gets an id with the file's language (sym:csharp:Shapes.cs::Area/method;
+# a class is /class, an interface /interface, a Rust trait /trait), so with
+# scip.mode = "off" a file's declarations have ids once it is outlined. Enum
+# members, impl blocks and type parameters have no node. A seed that is a
+# symbol id of a file never outlined still has no place. Needs a server that
+# answers documentSymbol. The recipes never run lsp.live and are the same
+# under both values.
 # All six keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "shared"
