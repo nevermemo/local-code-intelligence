@@ -499,7 +499,9 @@ pub struct LspProfile {
     /// left alone for 30 seconds: the next probe or start of that provider is
     /// refused at once, with a note that names the window (see
     /// `lsp::LspBreakers`). The windows are per provider and shared by the
-    /// process's managers (the MCP and REST server's and each call's). A
+    /// process's managers (the MCP and REST server's and each call's);
+    /// `lci traverse` under `sessions = "per_call"` builds no shared manager
+    /// and so has no window. A
     /// server that is already running is still asked, a start that timed out
     /// opens no window (it may only be slow), and `/ready` still probes the
     /// binaries. The recipes walk no `lsp.live` and run the same under both

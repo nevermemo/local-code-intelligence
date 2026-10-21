@@ -108,8 +108,8 @@ impl std::error::Error for RpcError {}
 /// carries none: `error.chain().any(|cause| cause.is::<InactivityTimeout>())`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InactivityTimeout {
-    pub label: String,
-    pub seconds: u64,
+    pub(crate) label: String,
+    pub(crate) seconds: u64,
 }
 
 impl fmt::Display for InactivityTimeout {

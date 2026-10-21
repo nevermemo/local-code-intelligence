@@ -690,7 +690,8 @@ mode = "cache"
 # seconds: the next probe or start of that provider is refused at once, with a
 # note that says so, and the window closes when a probe or a start succeeds. The
 # windows are per provider and shared by the process's managers (the service's
-# and each call's). A server that is already running is still asked, a start that
+# and each call's); `lci traverse` under sessions = "per_call" has no shared
+# manager and so no window. A server that is already running is still asked, a start that
 # timed out (lsp_timeout_seconds) opens no window because the server may only be
 # slow, and /ready still probes the binaries. The recipes never run lsp.live and
 # are the same under both values.
