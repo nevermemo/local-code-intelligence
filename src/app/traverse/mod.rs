@@ -324,15 +324,20 @@ pub struct Dirs {
     pub traces: PathBuf,
     /// `<handle>.json` snapshots.
     pub handles: PathBuf,
+    /// The candidates each `pop` event of the trace lists, for evaluation
+    /// runs (`lci traverse --trajectory`); 0 everywhere else, which writes no
+    /// `pop` event. Never set over MCP or REST.
+    pub trajectory_candidates: usize,
 }
 
 impl Dirs {
     /// The layout under the data directory: `traces/` (brief 1.6) and
-    /// `traverse/handles/`.
+    /// `traverse/handles/`; no trajectory events.
     pub fn under(data_dir: &Path) -> Self {
         Self {
             traces: data_dir.join("traces"),
             handles: data_dir.join("traverse").join("handles"),
+            trajectory_candidates: 0,
         }
     }
 }
@@ -1345,6 +1350,7 @@ pub async fn run_with_trait_seeds(
         ))
         .pass_through(limits.pass_through)
         .card_paths(profile.traverse.card_paths)
+        .trajectory(dirs.trajectory_candidates)
         .score_bound(limits.score_bound)
         .priors(priors)
         .tie_break(tie_break)
