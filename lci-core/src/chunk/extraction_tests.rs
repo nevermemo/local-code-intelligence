@@ -96,31 +96,56 @@ fn write_multilanguage_tree(root: &Path) {
 /// checked): the two are one function, so a second, equally expensive pass
 /// over a large tree would compare it with itself.
 fn assert_hook_matches_chunker(root: &Path, compare_chunker: bool) -> (usize, usize) {
-    let mut files = 0;
-    let mut chunks = 0;
-    for file in sources(root, true).unwrap().files {
-        let path = &file.relative_path;
-        let hooked = extract_with_adapter(path, &file.source, file.adapter).unwrap();
-        if compare_chunker {
-            let today = chunks_with_adapter(path, &file.source, file.adapter).unwrap();
-            // JSON text: byte identity of every field and of the order, with a
-            // readable difference on failure.
-            assert_eq!(
-                serde_json::to_string(&hooked.chunks).unwrap(),
-                serde_json::to_string(&today).unwrap(),
-                "{path}: the hook's chunks differ from chunks_with_adapter's"
-            );
-        }
-        let declarations =
-            (file.adapter.identifier() == "rust").then(|| rust_declarations(&file.source).unwrap());
-        assert_eq!(
-            hooked.declarations, declarations,
-            "{path}: the hook's declarations differ from the S1 extractor's"
-        );
-        files += 1;
-        chunks += hooked.chunks.len();
-    }
-    (files, chunks)
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Each file is checked on its own, so the files are shared out to a few
+    // threads: the chunker's test-only coverage check makes a debug build
+    // slow on a tree of this size. A failed assertion of a thread is raised
+    // again here with its own message.
+    let list = sources(root, true).unwrap().files;
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let (mut files, mut chunks) = (0, 0);
+                    while let Some(file) = list.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let path = &file.relative_path;
+                        let hooked =
+                            extract_with_adapter(path, &file.source, file.adapter).unwrap();
+                        if compare_chunker {
+                            let today =
+                                chunks_with_adapter(path, &file.source, file.adapter).unwrap();
+                            // JSON text: byte identity of every field and of the order, with a
+                            // readable difference on failure.
+                            assert_eq!(
+                                serde_json::to_string(&hooked.chunks).unwrap(),
+                                serde_json::to_string(&today).unwrap(),
+                                "{path}: the hook's chunks differ from chunks_with_adapter's"
+                            );
+                        }
+                        let declarations = (file.adapter.identifier() == "rust")
+                            .then(|| rust_declarations(&file.source).unwrap());
+                        assert_eq!(
+                            hooked.declarations, declarations,
+                            "{path}: the hook's declarations differ from the S1 extractor's"
+                        );
+                        files += 1;
+                        chunks += hooked.chunks.len();
+                    }
+                    (files, chunks)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .fold((0, 0), |(files, chunks), (f, c)| (files + f, chunks + c))
+    })
 }
 
 #[test]

@@ -276,6 +276,41 @@ async fn the_server_is_asked_only_when_expanding_and_lives_until_the_map_drops()
     );
 }
 
+/// The version probe is bounded by the timeout the caller gives. A zero bound
+/// is over before any process can have answered (tokio's timeout polls the
+/// inner future first, and the spawned process cannot finish on its first
+/// poll), so it fails with no wait; a
+/// wide one lets a real executable that answers `--version` (cargo, which runs
+/// these tests) through. The same manager and binary in both calls, so only
+/// the bound differs.
+#[tokio::test]
+async fn the_version_probe_honours_the_timeout_it_is_given() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let config = Config {
+        rust_analyzer_path: cargo,
+        ..Config::default()
+    };
+    let workspace = || Workspace {
+        id: "test".into(),
+        path: std::env::temp_dir(),
+    };
+    let manager = Arc::new(Manager::new(&config));
+    let error =
+        ManagerBackend::open_with_probe_timeout(workspace(), Arc::clone(&manager), Duration::ZERO)
+            .await
+            .err()
+            .expect("a probe with no time left fails");
+    assert!(
+        error.contains("no language server is available") && error.contains("timed out"),
+        "{error}"
+    );
+    // A failed probe is not remembered: the wide bound runs it again.
+    ManagerBackend::open_with_probe_timeout(workspace(), manager, Duration::from_secs(60))
+        .await
+        .map(drop)
+        .expect("the executable answers --version within a minute");
+}
+
 #[tokio::test]
 async fn a_missing_server_binary_makes_the_map_unavailable_before_any_walk() {
     let config = Config {

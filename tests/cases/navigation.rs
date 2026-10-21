@@ -4951,6 +4951,8 @@ fn shared_sessions_fixture(
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    // The version probe of `lsp.live` is bounded by this (5 s failed under load).
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     let index = csharp_scip_index(temp, &workspace);
     (config, workspace, state, index)

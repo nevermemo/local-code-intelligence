@@ -3378,12 +3378,14 @@ const STAMPED_TOOLS: [&str; 16] = [
 ];
 
 /// A config with every optional tool on and a fake language server per
-/// language, each in the one mode its tool needs: C# answers `find_definition`,
-/// Python `find_references`, TypeScript `search_symbols`. The `compact` profile
-/// serves `search_code` in the compact shape.
+/// language, each in the one mode its tools need: C# answers `find_definition`
+/// and `find_references` (the Python and TypeScript adapters wait a fixed 3 s
+/// after `didOpen` before a position request, which a fake does not need and
+/// which the references call used to pay), TypeScript `search_symbols`. The
+/// `compact` profile serves `search_code` in the compact shape.
 fn stamped_config(mut config: Config, state: &Path) -> Config {
     use local_code_intelligence::config::{
-        CSharpLspConfig, McpResponse, PythonLspConfig, SearchProfile, TypeScriptLspConfig,
+        CSharpLspConfig, McpResponse, SearchProfile, TypeScriptLspConfig,
     };
     config.channels.lsp = false;
     config.traverse.enabled = true;
@@ -3393,6 +3395,8 @@ fn stamped_config(mut config: Config, state: &Path) -> Config {
     // waits out the request timeout, and the timeout is wide: 5 s failed a slow
     // start under load (and the unanswered requests made it cost a wait each).
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    // Also bounds the version probe of `lsp.live` (5 s failed under load).
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     let args = |mode: &str, name: &str, primary: &str, secondary: &str| {
         vec![
             "--mode".to_owned(),
@@ -3409,20 +3413,10 @@ fn stamped_config(mut config: Config, state: &Path) -> Config {
     config.csharp = CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: args(
-            "definition",
+            "definition-references",
             "csharp",
             "src/Calculator.cs",
             "src/CallSite.cs",
-        ),
-        disabled: false,
-    };
-    config.python = PythonLspConfig {
-        path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
-        args: args(
-            "references",
-            "python",
-            "src/Calculator.py",
-            "src/CallSite.py",
         ),
         disabled: false,
     };
@@ -3488,7 +3482,7 @@ fn stamped_arguments(name: &str, workspace: &Path) -> Option<Value> {
             "line":2,"character":72,
         }),
         "find_references" => json!({
-            "workspace_path":workspace,"relative_file_path":"src/Calculator.py",
+            "workspace_path":workspace,"relative_file_path":"src/Calculator.cs",
             "line":1,"character":10,"include_declaration":true,
         }),
         "search_code" => json!({"workspace_path":workspace,"query":"Foo alpha beta"}),

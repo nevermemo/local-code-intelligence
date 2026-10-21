@@ -96,7 +96,8 @@ pub const DEADLINE_NOTE: &str = "lsp.live: the traversal deadline passed";
 /// The longest one expansion waits for the server, whatever the budget allows.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long the version probe of a server binary may take.
+/// How long the version probe of a server binary may take when the caller does
+/// not say (`readiness_timeout_seconds` default).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A place in a file: path relative to the root with `/`, 0-based line and
@@ -217,10 +218,21 @@ impl ManagerBackend {
     /// per provider and manager) and keeps the ones that answer. An error when
     /// none does, naming each failure.
     pub async fn open(workspace: Workspace, manager: Arc<Manager>) -> Result<Self, String> {
+        Self::open_with_probe_timeout(workspace, manager, PROBE_TIMEOUT).await
+    }
+
+    /// [`Self::open`] with `probe_timeout` as the bound of each version probe
+    /// (the traversal passes `readiness_timeout_seconds`; `open` uses
+    /// [`PROBE_TIMEOUT`], which is that setting's default).
+    pub async fn open_with_probe_timeout(
+        workspace: Workspace,
+        manager: Arc<Manager>,
+        probe_timeout: Duration,
+    ) -> Result<Self, String> {
         let mut adapters = Vec::new();
         let mut failures = Vec::new();
         for adapter in manager.adapters().iter().filter(|a| a.enabled()) {
-            match manager.probe_once(adapter, PROBE_TIMEOUT).await {
+            match manager.probe_once(adapter, probe_timeout).await {
                 Ok(()) => adapters.push(Arc::clone(adapter)),
                 Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
             }
