@@ -1205,6 +1205,7 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     let keyed = Tree::new();
     let mut profile = RunProfileConfig::default();
     profile.traverse.map_freshness = true;
+    profile.traverse.card_paths = true;
     profile.freshness.verify_on_read = true;
     let on = keyed.ask_under(request, false, &profile).await;
     assert_eq!(names(&on, "walk"), names(&off, "walk"), "{on}");

@@ -523,6 +523,17 @@ enabled = false
 # source files per call. false (default): the answer has no `maps` key and is as
 # without the key.
 map_freshness = false
+# Put the route on the cards: every card of `results` (and of the checkpoint's
+# `answer`) that the walk reached gains `kind` (the kind of the edge that found
+# the node; null for a start node) and `path`, the route from its start node:
+# {node, map, kind, witness} per node, depth + 1 entries, the last one the card
+# itself. The checkpoint's visited cards and frontier, the cards of the first
+# stage and the trace are unchanged. A handle made with the key on also keeps
+# each state's kind; one made with it off does not, so a continuation under the
+# key shows null for the earlier hops and the answer says so. The answer grows
+# by about 25 tokens per hop of each card. false (default): the answer, the
+# checkpoint, the trace and the handle are as without the key.
+card_paths = false
 
 # [run_profile.walk]: how a traversal counts the evidence that reaches a node.
 # groups = "tool" (default): every map is one piece of evidence (maps over one

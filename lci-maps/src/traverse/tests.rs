@@ -1418,6 +1418,135 @@ mod persist {
     }
 
     #[tokio::test]
+    async fn a_state_keeps_the_kind_of_the_edge_that_found_it_and_a_relax_updates_it() {
+        // The weak-then-strong registry of `corroboration`, with a kind per map:
+        // `x` is found first by the weakest route (`mentions`), then again by
+        // the strongest before it pops (`calls_or_refs`).
+        let reg = registry(vec![
+            GraphMap::new("m1", &[("s", "a"), ("a", "x")]).conf(90),
+            GraphMap::new("m2", &[("s", "b")])
+                .conf(80)
+                .kind(EdgeKind::Contains),
+            GraphMap::new("m3", &[("s", "x")])
+                .conf(70)
+                .kind(EdgeKind::Mentions),
+        ]);
+        let result = walk(&reg, vec![seed("s")], budget(20), |t| {
+            t.price(HopPrice { gate: 0, beam: 16 }).card_paths(true)
+        })
+        .await;
+        assert_eq!(events_of(&result, "relax").len(), 1);
+        // Without the switch no state has a kind.
+        let plain = walk(&reg, vec![seed("s")], budget(20), |t| {
+            t.price(HopPrice { gate: 0, beam: 16 })
+        })
+        .await;
+        assert!(plain.states.iter().all(|s| s.kind.is_none()));
+        assert_eq!(state(&result, "s").kind, None);
+        assert_eq!(state(&result, "a").kind, Some(EdgeKind::CallsOrRefs));
+        assert_eq!(state(&result, "b").kind, Some(EdgeKind::Contains));
+        let x = state(&result, "x");
+        assert_eq!(x.via, Some("m1"));
+        assert_eq!(x.kind, Some(EdgeKind::CallsOrRefs));
+        // Every non-start state's kind is the `hop` or `relax` event's for its parent.
+        for state in result.states.iter().filter(|s| s.parent.is_some()) {
+            let src = result.states[state.parent.unwrap()].node.to_string();
+            let dst = state.node.to_string();
+            let last = result
+                .events
+                .iter()
+                .filter(|e| matches!(e["ev"].as_str(), Some("hop" | "relax")))
+                .rfind(|e| e["src"] == src.as_str() && e["dst"] == dst.as_str())
+                .expect("an event for the edge");
+            assert_eq!(last["kind"], state.kind.unwrap().as_str(), "{dst}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handle_keeps_kinds_only_with_card_paths_on() {
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let run = |on: Option<bool>, pops: u32| {
+            let reg = &reg;
+            async move {
+                walk(reg, vec![seed("n0")], budget(pops), |t| {
+                    let t = t
+                        .question("how does n0 reach n9")
+                        .handler(scripted(prune_last), every(3));
+                    match on {
+                        Some(on) => t.card_paths(on),
+                        None => t,
+                    }
+                })
+                .await
+            }
+        };
+        let default = run(None, 6).await;
+        let off = run(Some(false), 6).await;
+        let on = run(Some(true), 6).await;
+        assert!(!default.card_paths && !off.card_paths && on.card_paths);
+        // Off: the snapshot is the default's, with no new key anywhere.
+        let (default_snapshot, off_snapshot, on_snapshot) = (
+            default.snapshot.clone().unwrap(),
+            off.snapshot.clone().unwrap(),
+            on.snapshot.clone().unwrap(),
+        );
+        assert_eq!(
+            off_snapshot.to_json().to_string(),
+            default_snapshot.to_json().to_string()
+        );
+        assert_eq!(off_snapshot.handle(), default_snapshot.handle());
+        let off_json = off_snapshot.to_json();
+        assert!(off_json.get("card_paths").is_none());
+        assert!(
+            off_json["states"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s.get("kind").is_none())
+        );
+        // On: the walk is the same walk (trace and checkpoint), the handle differs,
+        // and every state but a start node has its kind.
+        assert_eq!(on.events_jsonl(), off.events_jsonl());
+        assert_ne!(on_snapshot.handle(), off_snapshot.handle());
+        let on_json = on_snapshot.to_json();
+        assert_eq!(on_json["card_paths"], true);
+        let states = on_json["states"].as_array().unwrap();
+        assert!(states.len() > 1);
+        for s in states {
+            if s["parent"].is_null() {
+                assert!(s.get("kind").is_none(), "{s}");
+            } else {
+                assert_eq!(s["kind"], "calls_or_refs", "{s}");
+            }
+        }
+        // It reads back, to the same snapshot and the same handle.
+        let back = crate::traverse::handle::Snapshot::from_json(&on_json).unwrap();
+        assert_eq!(back, on_snapshot);
+        assert_eq!(back.handle(), on_snapshot.handle());
+        // A resume keeps the kinds of the earlier states, with the switch on or off.
+        for again in [true, false] {
+            let second = resume(&reg, back.clone(), budget(12), |t| {
+                t.handler(scripted(prune_last), every(3)).card_paths(again)
+            })
+            .await;
+            assert_eq!(second.card_paths, again);
+            for (i, first) in on.states.iter().enumerate() {
+                assert_eq!(second.states[i].kind, first.kind, "state {i}");
+            }
+            let json = second.snapshot.unwrap().to_json();
+            assert_eq!(json.get("card_paths").is_some(), again);
+        }
+        // An unknown kind is corrupt.
+        let mut bad = on_json.clone();
+        bad["states"][1]["kind"] = json!("teleport");
+        let error = crate::traverse::handle::Snapshot::from_json(&bad).unwrap_err();
+        assert!(error.contains("unknown edge kind"), "{error}");
+        let mut bad = on_json;
+        bad["states"][1]["kind"] = json!(7);
+        assert!(crate::traverse::handle::Snapshot::from_json(&bad).is_err());
+    }
+
+    #[tokio::test]
     async fn equal_runs_write_byte_identical_traces_and_handles() {
         let (a, b) = (pruning_walk(8).await, pruning_walk(8).await);
         let (dir_a, dir_b) = (scratch("bytes-a"), scratch("bytes-b"));

@@ -114,8 +114,8 @@ use index::{Loaded, Shared, config_key_map, impact_map, implements_map, load};
 pub(crate) use index::{OpenedIndex, open_config_key, open_index};
 use rescore::GraphRescorer;
 use response::{
-    add_commits, add_file_changed, add_first_stage_only, add_maps, add_policy, add_sites,
-    chunk_lines, lint_steer, no_seeds_response, response_json,
+    add_commits, add_file_changed, add_first_stage_only, add_maps, add_paths, add_policy,
+    add_sites, chunk_lines, lint_steer, no_seeds_response, response_json,
 };
 pub use seeds::TraitSeedMode;
 pub use seeds::{AppSeeds, NoSearch, SeedHit, SeedSearch};
@@ -1235,6 +1235,14 @@ pub async fn run_with_trait_seeds(
     // The most a state can be corroborated by, which the score bound needs
     // (the seed maps only start the walk; maps over one graph count once).
     let expanding = registry.independent_expanders();
+    // A handle made without `card_paths` has no edge kind for the hops of its
+    // earlier calls; their path entries say `null`.
+    if profile.traverse.card_paths && snapshot.as_ref().is_some_and(|s| !s.card_paths) {
+        notes.push(
+            "card_paths: the handle was made without it, so path kinds before this call are not kept (the earlier hops show kind null)"
+                .to_owned(),
+        );
+    }
     let traversal = match snapshot {
         Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
         None => {
@@ -1275,6 +1283,7 @@ pub async fn run_with_trait_seeds(
             profile.walk.grep_corroboration,
         ))
         .pass_through(limits.pass_through)
+        .card_paths(profile.traverse.card_paths)
         .score_bound(limits.score_bound)
         .priors(priors)
         .tie_break(tie_break)
@@ -1403,6 +1412,9 @@ pub async fn run_with_trait_seeds(
         impact.as_deref().or(site_impact.as_deref()),
         &found.details,
     );
+    if profile.traverse.card_paths {
+        add_paths(&mut response, &result);
+    }
     if let Some(history) = &git_history {
         add_commits(&mut response, history);
     }

@@ -175,7 +175,7 @@ pub mod trace;
 #[cfg(test)]
 mod tests;
 
-use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
+use crate::{Budget, EdgeKind, MapId, edge::MapCard, edge::WitnessClass};
 use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop_from};
 use handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
@@ -345,6 +345,13 @@ pub struct State {
     /// The map whose edge discovered the node.
     pub via: Option<MapId>,
     pub witness: Option<WitnessClass>,
+    /// The kind of the edge that discovered the node (`None` for a start node).
+    /// A relax takes the kind of the stronger route; an `alt_path` leaves it.
+    /// Recorded, and kept in a handle, only under [`Traversal::card_paths`]
+    /// (`None` everywhere without it, so states and handles are what they were).
+    /// A continuation with the switch off keeps the kinds in memory but its
+    /// handle has none: a later call with it on shows `None` for those hops.
+    pub kind: Option<EdgeKind>,
     /// Product of the hop values along the path.
     pub potential: f64,
     /// Edges the discovering expansion offered.
@@ -462,6 +469,9 @@ pub struct TraversalResult {
     pub grouping: Grouping,
     /// Whether the run passed through connective nodes (see the module docs).
     pub pass_through: bool,
+    /// Whether the call kept the edge kind of every state ([`Traversal::card_paths`]),
+    /// so a handle made from it carries them.
+    pub card_paths: bool,
     /// Under `rrf` or `log_odds` fusion: the fused score of every result, by node (empty
     /// otherwise).
     pub fused: HashMap<NodeId, f64>,
@@ -567,6 +577,8 @@ pub struct Traversal<'s> {
     fusion: Fusion,
     grouping: Grouping,
     pass_through: bool,
+    /// Keep the edge kind of every state in the handle ([`Traversal::card_paths`]).
+    card_paths: bool,
     /// The reranker frontier: the rescorer and the floor of the hop factor.
     rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
     score_bound: bool,
@@ -608,6 +620,7 @@ impl<'s> Traversal<'s> {
             fusion: Fusion::Boost,
             grouping: Grouping::default(),
             pass_through: false,
+            card_paths: false,
             rerank: None,
             score_bound: true,
             priors: HopPriors::default(),
@@ -708,6 +721,17 @@ impl<'s> Traversal<'s> {
     /// A resumed traversal keeps the grouping its handle was made with.
     pub fn grouping(mut self, grouping: Grouping) -> Self {
         self.grouping = grouping;
+        self
+    }
+
+    /// Records the kind of the edge that discovered each state ([`State::kind`])
+    /// and keeps it in the handle (default off: states, traces and handles are
+    /// then what they were). A snapshot writes `"kind"` per state and
+    /// `"card_paths": true` only under the switch. It is the call's own
+    /// setting: a resume from a handle made with it off has no kind for the
+    /// hops of the earlier calls.
+    pub fn card_paths(mut self, on: bool) -> Self {
+        self.card_paths = on;
         self
     }
 
@@ -947,6 +971,7 @@ impl<'s> Run<'s> {
             depth: 0,
             via: seed.map,
             witness: None,
+            kind: None,
             potential: 1.0,
             fanout,
             maps: BTreeSet::new(),
@@ -1182,6 +1207,7 @@ impl<'s> Run<'s> {
             fusion: self.t.fusion,
             grouping: self.t.grouping,
             pass_through: self.t.pass_through,
+            card_paths: self.t.card_paths,
             fused: fused_by_node,
             stop_reason,
             maps: self.tally.maps,
@@ -1551,6 +1577,7 @@ impl<'s> Run<'s> {
                 depth: depth + 1,
                 via: Some(map),
                 witness: Some(edge.best.witness),
+                kind: self.t.card_paths.then_some(edge.best.kind),
                 potential,
                 fanout,
                 maps: BTreeSet::new(),
@@ -1873,6 +1900,9 @@ impl<'s> Run<'s> {
         state.depth = depth;
         state.via = Some(edge.best.map);
         state.witness = Some(edge.best.witness);
+        if self.t.card_paths {
+            state.kind = Some(edge.best.kind);
+        }
         state.potential = potential;
         state.fanout = fanout;
         let mut event = json!({

@@ -221,6 +221,10 @@ totals and, only when work is left, a `handle` and `checkpoint`. The first stage
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
 
+With `[run_profile.traverse] card_paths = true` (default `false`) every walked card of `results` and of `checkpoint.answer` also has `kind` and `path`, the
+route from its start node with each hop's map, edge kind and witness (`app::traverse::response::add_paths`, read from the walk's state table; the engine keeps
+`State::kind`, and a handle keeps it only under the key). With the key off the answer, the trace, the checkpoint and the handle are unchanged.
+
 With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
 states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
 `grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (they read current

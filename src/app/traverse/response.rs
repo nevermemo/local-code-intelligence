@@ -10,7 +10,7 @@ use lci_maps::{
     git_history::GitHistoryMap,
     scip_impact::ImpactMap,
     traverse::{
-        TraversalBudget, TraversalResult,
+        State, TraversalBudget, TraversalResult,
         handler::{Action, Checkpoint, RAISE_MAX_POPS, RAISE_MAX_TOKENS, StopPolicy},
         lint::{LintContext, lint},
         rules::RuleList,
@@ -545,6 +545,75 @@ pub(super) fn add_sites(
             }
         }
     }
+}
+
+/// `[run_profile.traverse] card_paths`: every walked card of `/results` and of
+/// `/checkpoint/answer` gets `kind` (the kind of the edge that discovered the
+/// node, null for a start node) and `path`: the route from its start node, one
+/// `{node, map, kind, witness}` entry per node (`depth + 1` entries, the last
+/// one the card itself), read from the walk's state table (a continuation's
+/// table holds the earlier calls' states too). The cards of the first stage
+/// (`origin` `exact` or `seed`) were not walked and get neither. The visited
+/// and frontier lists stay as they are.
+pub(super) fn add_paths(response: &mut Value, result: &TraversalResult) {
+    let by_node: HashMap<String, usize> = result
+        .states
+        .iter()
+        .enumerate()
+        .map(|(at, state)| (state.node.to_string(), at))
+        .collect();
+    for list in ["/results", "/checkpoint/answer"] {
+        let Some(Value::Array(items)) = response.pointer_mut(list) else {
+            continue;
+        };
+        for card in items {
+            if matches!(card["origin"].as_str(), Some("exact" | "seed")) {
+                continue;
+            }
+            let Some(&at) = card["node"].as_str().and_then(|node| by_node.get(node)) else {
+                continue;
+            };
+            let Some(chain) = route(&result.states, at) else {
+                continue;
+            };
+            let path: Vec<Value> = chain
+                .iter()
+                .map(|&i| {
+                    let state = &result.states[i];
+                    json!({
+                        "node": state.node.to_string(),
+                        "map": state.via,
+                        "kind": state.kind.map(|kind| kind.as_str()),
+                        "witness": state.witness.map(|witness| witness.as_str()),
+                    })
+                })
+                .collect();
+            if let Some(object) = card.as_object_mut() {
+                object.insert(
+                    "kind".into(),
+                    json!(result.states[at].kind.map(|k| k.as_str())),
+                );
+                object.insert("path".into(), Value::Array(path));
+            }
+        }
+    }
+}
+
+/// The state indexes from the start node down to `at`, following parents;
+/// none when the chain does not end at a root within the table (it always does
+/// for a walk's own states).
+fn route(states: &[State], at: usize) -> Option<Vec<usize>> {
+    let mut chain = vec![at];
+    let mut here = at;
+    while let Some(parent) = states[here].parent {
+        if chain.len() > states.len() {
+            return None;
+        }
+        chain.push(parent);
+        here = parent;
+    }
+    chain.reverse();
+    Some(chain)
 }
 
 fn site_json(path: &str, line: u64, col: u64) -> Value {

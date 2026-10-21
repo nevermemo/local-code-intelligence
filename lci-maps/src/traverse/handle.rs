@@ -47,7 +47,9 @@
 //!   store and a 65-character one does not.
 //! - Content: `VERSION` 10; another version, and a `bandit` key, are `Corrupt`.
 //!   Written only when not the default: `fusion` (`rrf`, `log_odds`), `grouping`, `priors`,
-//!   `tie_break` and `rerank_identity`, and per state `groups` and `reach`; an
+//!   `tie_break` and `rerank_identity`, and per state `groups` and `reach`; under
+//!   `card_paths` (the call's switch, [`Traversal::card_paths`]) `"card_paths": true`
+//!   and per state the `kind` of the edge that found it (not for a start node); an
 //!   absent key loads as the default, so older handles keep their text. Object
 //!   keys come in the fixed order `to_json` builds them (serde_json's
 //!   `preserve_order` is on through a dependency), so equal snapshots give
@@ -93,7 +95,7 @@ use super::{
     trace::{disagreement_json, value_hash},
 };
 use crate::{
-    MapId,
+    EdgeKind, MapId,
     edge::WitnessClass,
     traverse::source::{ClaimFamily, EdgeSource},
 };
@@ -318,6 +320,10 @@ pub struct Snapshot {
     /// The content hash of the tie-break file the first call ranked with (none:
     /// discovery order). Written to the handle only when there is one.
     pub tie_break: Option<String>,
+    /// Whether the call that made this snapshot kept the edge kind of every
+    /// state ([`Traversal::card_paths`]). Written only when on; the `kind` of
+    /// a state is written only then too.
+    pub card_paths: bool,
 }
 
 impl Snapshot {
@@ -360,6 +366,9 @@ impl Snapshot {
             if let Some(identity) = &self.rerank_identity {
                 object.insert("rerank_identity".into(), json!(identity));
             }
+            if self.card_paths {
+                object.insert("card_paths".into(), json!(true));
+            }
         }
         value
     }
@@ -370,7 +379,9 @@ impl Snapshot {
             "question": self.question,
             "targets": self.targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "scorer": self.scorer,
-            "states": self.states.iter().map(state_json).collect::<Vec<_>>(),
+            "states": self.states.iter()
+                .map(|s| state_json(s, self.card_paths))
+                .collect::<Vec<_>>(),
             "frontier": self.frontier.iter()
                 .map(|&(state, priority, seq)| json!([state, priority, seq]))
                 .collect::<Vec<_>>(),
@@ -562,6 +573,11 @@ impl Snapshot {
                     witness: match get(s, "witness")? {
                         Value::Null => None,
                         v => Some(witness_of(v.as_str().ok_or("witness is not a string")?)?),
+                    },
+                    // Only a snapshot made under `card_paths` has it.
+                    kind: match s.get("kind") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(kind_of(v.as_str().ok_or("kind is not a string")?)?),
                     },
                     potential: f64_of(get(s, "potential")?)?,
                     fanout: u32_of(get(s, "fanout")?)?,
@@ -821,11 +837,15 @@ impl Snapshot {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(string_of(v)?),
             },
+            card_paths: match obj.get("card_paths") {
+                None | Some(Value::Null) => false,
+                Some(v) => v.as_bool().ok_or("card_paths is not a boolean")?,
+            },
         })
     }
 }
 
-fn state_json(s: &State) -> Value {
+fn state_json(s: &State, card_paths: bool) -> Value {
     let mut value = json!({
         "node": s.node.to_string(),
         "parent": s.parent,
@@ -838,6 +858,9 @@ fn state_json(s: &State) -> Value {
         "dependent": s.dependent,
         "witnesses": s.witnesses.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
     });
+    if let (true, Some(kind), Some(object)) = (card_paths, s.kind, value.as_object_mut()) {
+        object.insert("kind".into(), json!(kind.as_str()));
+    }
     if let (false, Some(object)) = (s.groups.is_empty(), value.as_object_mut()) {
         object.insert("groups".into(), groups_json(&s.groups));
     }
@@ -1058,6 +1081,10 @@ fn strings(value: Option<&Value>) -> Result<Vec<&str>, String> {
     }
 }
 
+fn kind_of(name: &str) -> Result<EdgeKind, String> {
+    EdgeKind::from_name(name).ok_or_else(|| format!("unknown edge kind {name:?}"))
+}
+
 fn witness_of(name: &str) -> Result<WitnessClass, String> {
     WitnessClass::parse(name).ok_or_else(|| format!("unknown witness class {name:?}"))
 }
@@ -1099,7 +1126,16 @@ impl Run<'_> {
             question: self.t.question.clone(),
             targets: self.t.targets.clone(),
             scorer: self.t.scorer.label().to_string(),
-            states: self.states.clone(),
+            // A snapshot without the switch is what one read back from its text
+            // is: no kinds.
+            states: self
+                .states
+                .iter()
+                .map(|s| State {
+                    kind: s.kind.filter(|_| self.t.card_paths),
+                    ..s.clone()
+                })
+                .collect(),
             frontier,
             next_seq,
             in_seen: in_seen.into_iter().map(|(n, c)| (n.clone(), c)).collect(),
@@ -1145,6 +1181,7 @@ impl Run<'_> {
                 .fingerprint()
                 .map(|(question_type, hash)| (question_type.to_owned(), hash.to_owned())),
             tie_break: self.t.tie_break.as_ref().map(|t| t.hash().to_owned()),
+            card_paths: self.t.card_paths,
         }
     }
 

@@ -163,6 +163,12 @@ Stops (`StopPolicy`; 0 switches a trigger off; all bounded by `max_stops` 4): `e
 (Lincoln-Petersen estimate over the two most productive maps; a hint, not a bound). A checkpoint holds cards (`CARD_K` 12, about 40 tokens each, `CARD_CHARS` 160), map stats, regions and disagreements
 (`CHECKPOINT_FRONTIER` 256).
 
+Paths on cards (`[run_profile.traverse] card_paths`, default off): a card has no ancestors, so by default a reader sees only the last hop (`via`, `witness`, `depth`).
+With the key on, every card of `results` and of `checkpoint.answer` that the walk reached also has `kind` (the edge kind of the hop that found the node, `State::kind`) and `path`, every hop
+from its start node with its map, edge kind and witness (`depth + 1` entries). `kind` is on `State` (set at discovery and on a relax, left by an `alt_path`); a snapshot writes it only under the key
+(`Traversal::card_paths`), so a continuation under the key from a handle made with it off shows `kind: null` for the earlier hops. `card_json`, the checkpoint hash, the trace and, with the key off, the handle are untouched;
+`visited_cards` and `frontier` (steering views) and first-stage cards carry no path.
+
 ### Written meanings
 
 Three names that appear in arguments, traces and responses, with what each does and does not promise.
