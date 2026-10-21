@@ -2967,20 +2967,25 @@ mod tests {
         }
     }
 
-    /// An index file list that counts how many stamps are being taken at once.
-    struct SlowFiles {
+    /// An index file list that counts how many stamps are being taken at once,
+    /// and holds each one until the test hands it a permit.
+    struct GatedFiles {
         in_flight: std::sync::atomic::AtomicUsize,
         most: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
+        /// Released once a stamp has been entered (the first one to be taken).
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
     }
 
     #[async_trait::async_trait]
-    impl stamp::IndexedFiles for SlowFiles {
+    impl stamp::IndexedFiles for GatedFiles {
         async fn indexed_files(&self, _workspace: &Workspace) -> Option<Arc<Vec<String>>> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(now, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Some(Arc::new(vec!["src/lib.rs".to_owned()]))
         }
@@ -2989,8 +2994,15 @@ mod tests {
     /// The barriers of one workspace run one at a time: a barrier that took
     /// its stamp before another finished could record an older stamp over the
     /// newer one and stop the server the other had just started.
+    ///
+    /// No timer: the stub holds every stamp it is asked for until the test
+    /// adds a permit, and the test adds them once the first stamp has been
+    /// entered. On the current-thread runtime of `#[tokio::test]` the three
+    /// spawned barriers are polled in order before the test resumes, so a
+    /// barrier without its workspace lock would already be inside the stub
+    /// (`most` 3); with the lock, the other two wait on it, and `most` is 1.
     #[tokio::test]
-    async fn concurrent_barriers_of_one_workspace_run_one_at_a_time() {
+    async fn concurrent_barriers_of_one_workspace_are_serialised_without_a_timer() {
         let temp = tempfile::tempdir().unwrap();
         let path = dunce::canonicalize(temp.path()).unwrap();
         let ws = Workspace {
@@ -2999,20 +3011,30 @@ mod tests {
         };
         std::fs::create_dir_all(ws.path.join("src")).unwrap();
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        let source = Arc::new(SlowFiles {
+        let source = Arc::new(GatedFiles {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             most: std::sync::atomic::AtomicUsize::new(0),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
         });
-        let manager = Manager::new(&Config::default())
-            .with_indexed_files(Arc::clone(&source) as Arc<dyn stamp::IndexedFiles>);
-        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
-        let only = [&rust];
-        let (a, b, c) = tokio::join!(
-            manager.tree_barrier(&ws, &only),
-            manager.tree_barrier(&ws, &only),
-            manager.tree_barrier(&ws, &only),
+        let manager = Arc::new(
+            Manager::new(&Config::default())
+                .with_indexed_files(Arc::clone(&source) as Arc<dyn stamp::IndexedFiles>),
         );
+        let rust = Arc::clone(manager.adapters_for_language("rust")[0]);
+        let barriers: Vec<_> = (0..3)
+            .map(|_| {
+                let (manager, ws, rust) = (Arc::clone(&manager), ws.clone(), Arc::clone(&rust));
+                tokio::spawn(async move { manager.tree_barrier(&ws, &[&rust]).await })
+            })
+            .collect();
+        source.entered.notified().await;
+        source.gate.add_permits(3);
+        let mut restarted = Vec::new();
+        for barrier in barriers {
+            restarted.push(barrier.await.unwrap());
+        }
         assert_eq!(source.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             source.most.load(Ordering::SeqCst),
@@ -3020,7 +3042,7 @@ mod tests {
             "two barriers of one workspace took their stamps at once"
         );
         // No session ran, so nothing was stopped or kept.
-        for restarted in [a, b, c] {
+        for restarted in restarted {
             assert!(restarted.is_empty());
         }
     }

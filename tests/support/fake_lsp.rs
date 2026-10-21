@@ -173,6 +173,13 @@ pub struct FakeLspConfig {
     /// answer the client gives is appended to `server_request_replies.txt` in
     /// the state directory as `<id> <result>`.
     pub string_id_server_requests: bool,
+    /// `--ignore-watched-files` (`--mode documents`): a `didChangeWatchedFiles`
+    /// notification is logged in `events.jsonl` but not applied, so a server
+    /// that was told about an edit still answers from the tree it read at
+    /// `initialized`, as a server that does not watch does. A test that means
+    /// the tree-stamp barrier to be the only way an edit reaches a kept server
+    /// sets it; off by default.
+    pub ignore_watched_files: bool,
 }
 
 /// An error response the fake sends instead of an answer: `code` and
@@ -326,6 +333,7 @@ pub fn run_from_env() -> io::Result<()> {
         status_cycle: cli.iter().any(|arg| arg == "--status-cycle"),
         status_shape_rust: cli_arg(&cli, "--status-shape").as_deref() == Some("rust"),
         string_id_server_requests: cli.iter().any(|arg| arg == "--string-id-server-requests"),
+        ignore_watched_files: cli.iter().any(|arg| arg == "--ignore-watched-files"),
     };
     run_server(config)
 }
@@ -462,8 +470,13 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut pid_written = false;
     let mut ready_after_next_answer = false;
     let mut root_uri: Option<String> = None;
-    let mut document_store = matches!(config.scenario, FakeScenario::Documents)
-        .then(|| documents::Store::new(config.state_dir.clone(), spawn_count));
+    let mut document_store = matches!(config.scenario, FakeScenario::Documents).then(|| {
+        documents::Store::new(
+            config.state_dir.clone(),
+            spawn_count,
+            config.ignore_watched_files,
+        )
+    });
 
     loop {
         let Some(frame) = read_frame(&mut stdin)? else {
