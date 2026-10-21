@@ -8,12 +8,13 @@
 //! an unknown revision) leaves its list empty and is counted in a [`Tally`]
 //! rather than aborting the question.
 
+use crate::process::{KillScope, wait_limited};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The history question families this arm tells apart by wording (not by the
 /// gold's `stratum`). The patterns come from the wording described in the R3
@@ -214,7 +215,6 @@ pub fn run_capture(mut command: Command, timeout: Duration) -> Result<String, St
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let started = Instant::now();
     let mut child = command.spawn().map_err(|e| format!("run git: {e}"))?;
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -237,18 +237,11 @@ pub fn run_capture(mut command: Command, timeout: Duration) -> Result<String, St
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = (stdout.join(), stderr.join());
-                return Err(format!("timeout after {}s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("wait for git: {e}")),
-        }
+    let waited = wait_limited(child, timeout, KillScope::Process)
+        .map_err(|e| format!("wait for git: {e}"))?;
+    let Some(status) = waited.status else {
+        let _ = (stdout.join(), stderr.join());
+        return Err(format!("timeout after {}s", timeout.as_secs()));
     };
     let out = stdout.join().unwrap_or_default();
     let err = stderr.join().unwrap_or_default();

@@ -64,6 +64,7 @@ use crate::{
     SourceLabel,
     edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     probe::parse_cargo_json,
+    process::{KillScope, wait_limited},
     scip_graph::ScipMap,
 };
 use lci_core::node::{NodeId, NodeKind};
@@ -73,7 +74,11 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, PoisonError, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -132,17 +137,8 @@ pub(crate) fn run_limited(mut command: Command, timeout: Duration) -> std::io::R
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        match child.try_wait()? {
-            Some(status) => break (Some(status), false),
-            None if started.elapsed() >= timeout => {
-                kill_tree(&mut child);
-                break (None, true);
-            }
-            None => std::thread::sleep(Duration::from_millis(5)),
-        }
-    };
+    let waited = wait_limited(child, timeout, KillScope::Tree)?;
+    let (status, timed_out) = (waited.status, waited.timed_out);
     // After a kill a grandchild that survived may still hold the pipes: wait
     // a moment, then take what there is.
     let grace = if timed_out {
@@ -158,24 +154,6 @@ pub(crate) fn run_limited(mut command: Command, timeout: Duration) -> std::io::R
         stderr,
         timed_out,
     })
-}
-
-fn kill_tree(child: &mut std::process::Child) {
-    let pid = child.id().to_string();
-    #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    #[cfg(not(windows))]
-    let _ = Command::new("pkill")
-        .args(["-KILL", "-P", &pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// What a cargo run returned.
@@ -428,8 +406,70 @@ pub struct ProbeConfig {
     pub timeout: Duration,
 }
 
-/// How often a probe that waits for the gate tries it again.
-const GATE_POLL: Duration = Duration::from_millis(5);
+/// The gate that lets one probe at a time use the scratch checkout: a busy
+/// flag with a condition variable, so a probe that waits is woken by the
+/// holder's release (or gives up at its deadline) instead of trying again on a
+/// timer.
+struct Gate {
+    busy: Mutex<bool>,
+    freed: Condvar,
+    /// How many times a waiter went to sleep on `freed`, and how many of those
+    /// sleeps ended at the deadline instead of on a release (the tests' proof
+    /// that a wait is a sleep until the release, not a loop or a timer).
+    sleeps: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+/// The holder's claim on the [`Gate`]; dropping it frees the gate and wakes
+/// the waiting probes.
+struct GateGuard<'a> {
+    gate: &'a Gate,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            busy: Mutex::new(false),
+            freed: Condvar::new(),
+            sleeps: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+        }
+    }
+
+    /// Takes the gate, waiting until `deadline` (the end of the query's
+    /// budget). A plain `lock` would park this blocking-pool thread for as
+    /// long as the holder's whole `cargo check`, long after the query's
+    /// deadline dropped its wait. `None` when the gate stayed busy.
+    fn acquire(&self, deadline: Instant) -> Option<GateGuard<'_>> {
+        let mut busy = lock(&self.busy);
+        loop {
+            if !*busy {
+                *busy = true;
+                return Some(GateGuard { gate: self });
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            self.sleeps.fetch_add(1, Ordering::SeqCst);
+            let (woken, result) = self
+                .freed
+                .wait_timeout(busy, left)
+                .unwrap_or_else(PoisonError::into_inner);
+            if result.timed_out() {
+                self.timeouts.fetch_add(1, Ordering::SeqCst);
+            }
+            busy = woken;
+        }
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        *lock(&self.gate.busy) = false;
+        self.gate.freed.notify_all();
+    }
+}
 
 /// `LCI_PROBE_SCRATCH_DIR` and `LCI_PROBE_TARGET_DIR` override the scratch
 /// checkout and the target directory.
@@ -480,7 +520,7 @@ struct Inner {
     config: ProbeConfig,
     cargo: Box<dyn CargoRunner>,
     /// One probe at a time: they share the scratch checkout.
-    gate: Mutex<()>,
+    gate: Gate,
     timings: Mutex<Vec<f64>>,
     last_error: Mutex<Option<String>>,
     runs: Mutex<Vec<ProbeRun>>,
@@ -533,7 +573,7 @@ impl ProbeMap {
                 node_index,
                 config,
                 cargo,
-                gate: Mutex::new(()),
+                gate: Gate::new(),
                 timings: Mutex::new(Vec::new()),
                 last_error: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
@@ -642,27 +682,6 @@ impl Inner {
         (Expanded::new(edges, cost), problem)
     }
 
-    /// Takes the gate, waiting until `deadline` (the end of the query's
-    /// budget). A plain `lock` would park this blocking-pool thread for as
-    /// long as the holder's whole `cargo check`, long after the query's
-    /// deadline dropped its wait. `None` when the gate stayed busy.
-    fn wait_for_gate(&self, deadline: Instant) -> Option<std::sync::MutexGuard<'_, ()>> {
-        loop {
-            match self.gate.try_lock() {
-                Ok(guard) => return Some(guard),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    return Some(poisoned.into_inner());
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            std::thread::sleep(left.min(GATE_POLL));
-        }
-    }
-
     fn fail(&self, message: String) -> Probed {
         *lock(&self.last_error) = Some(message.clone());
         Probed {
@@ -693,7 +712,7 @@ impl Inner {
         let unit = &graph.nodes[index];
         let rel = unit.file.replace('\\', "/");
         let deadline = Instant::now() + timeout;
-        let Some(_gate) = self.wait_for_gate(deadline) else {
+        let Some(_gate) = self.gate.acquire(deadline) else {
             return self.fail(format!(
                 "another probe held the scratch checkout for the whole budget ({} ms); this one did not run",
                 timeout.as_millis()
