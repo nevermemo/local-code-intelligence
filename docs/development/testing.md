@@ -113,6 +113,19 @@ and the probe's ms from a `debug!` line of the server (`lsp.live version probe`,
 `RUST_LOG=local_code_intelligence::app::traverse=debug`). Its mechanism (answer parsing, arm configs, the arithmetic and
 the tables) is covered by `cargo test -p xtask lsp_cost::`.
 
+## Trajectory rows (`maps bench --trajectory`, `cargo xtask maps trajectories`)
+
+An evaluation aid, not a test, and not part of `--suite Full`. `maps bench ... --trajectory` only passes `--trajectory`
+to every `lci traverse` call, so each trace gains one `pop` event per counted pop (no bench report file changes; the
+traces grow by about 1.2 KB per pop). `maps trajectories --runs <bench out dir>.. --gold-dir <dir> [--scip <index>]
+[--set <name>]` then joins those events to the gold outcome and writes, beside each run's `items.json`,
+`<wave>/<set>/trajectories.jsonl` (one row per pop, at most about 2.3 KB: state, the choice, the best candidates, each
+with a gold label, the pop's `expand` result and the item's metrics) and `trajectories.md` (items, pops, gold choices,
+pops that skipped a gold candidate, the median first gold pop). It runs no traversal and needs no service. Both files
+are derived from private gold: they stay under `test-results/`, never in git. A run made without `--trajectory` has no
+rows; the summary names its items and says so. `--scip` gives symbol nodes no card located a site (a label is `null`,
+never `false`, for a symbol nobody located). Covered by `cargo test -p xtask maps::trajectories`.
+
 ## Optional: cargo-nextest
 
 When [cargo-nextest](https://nexte.st) is installed (`cargo install cargo-nextest --locked`), the test step of

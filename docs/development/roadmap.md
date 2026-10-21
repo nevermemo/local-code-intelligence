@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K38 (stat gate), K3a-2 (PR 144), K5a-1 rg arm (PR 145), K10a-1 places, K33a-1 trajectories, K11d-1 LSP cost report, S3 (this). Next: bench `--config` overlay (XS), K21a-2, K24c M3 ceilings run, K22a-2; knob slices K7c, K11e, K9c, K20b-1 wait for K11d-1's report and K24c. Rewrite this line at every push.
+In flight: K33a-2 trajectories join (this), N101 probe bound + warm start, K10b symbol kinds, K13 answer labels, K21a-2 + K24c measurement run. Next: `sessions = shared` default (cross-family review), then K11e + N103, K20b-1, K11b; K22a-2 runs inside the seed comparison. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -80,7 +80,7 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K24c | M3 ceilings run: log_odds vs boost and relative vs rank on traits, where-to, impact, with costs (K3a-1 columns); numbers into the arm manifest | Measurement | XS-S | - |
 | K22a | Partly done: exact-literal seed source over ripgrep, `seeds.literal` under `[run_profile.seeds] literal` (off; K22a-1, d448; `exact_seeds` reuses exact cards and is not this): whole-word `rg` for the names in the question's code spans, each line placed through `SymbolPlaces` (SCIP layer today; K10a's `OutlinePlaces` is the one-argument upgrade), a `file:` seed for declaration lines (the seedless-trait cases). Remaining: K22a-2 (ceiling: `cargo xtask maps bench --set traits --set where-to --max-depth 0 --include-seeds` with the K21a-2 seed arms plus `seeds.literal` alone; the seedless-trait mechanism test with K9a's documents fake, which expands the file seed through `lsp.live` under `places = outline`; point the K5a rg arm at `lexical::parse_matches`) | Ceiling, beside an rg baseline arm | S | item 4 rest |
 | K30a | Router: caller intent through the existing `steer.policy` is the router (it picks walk, grep or LSP); document it and test it. Observable query features go to the cycle 2 screening (d391 killed text features at 20 of 59); gold labels never route | Test: each intent picks its policy | S | F3, N100 (detector stays killed) |
-| K33a | Trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs | Schema test | S | - |
+| K33a | Done (K33a-1 d444, K33a-2 d451): trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs. `lci traverse --trajectory` (CLI only, no key) writes a `pop` event per counted pop; `cargo xtask maps trajectories --runs <bench out dir> --gold-dir <dir> [--scip <index>] [--set <name>]` writes one row per pop to `<wave>/<set>/trajectories.jsonl` with `trajectories.md` beside it (a separate command; no bench file changes). Labels come from the set's own scorer; an unlocated symbol is `null`. Pops come from `end.totals`; a put-back pop the totals do not count is `counted: false`. Cycle 2's learned racer reads the rows | Schema test | S | - |
 | **M4-core** | **Maps, servers, safety, mining (unconditional)** | | | |
 | K26 | `grep.live` proposes, `lsp.live` confirms the top-k frontier (`walk.confirm`); no Codanna dependency | Cost and quality per call against the walk without confirmation | M | G1 |
 | K9c | Type-hierarchy edges | Ceiling | S | - |

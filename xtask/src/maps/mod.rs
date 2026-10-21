@@ -2,6 +2,8 @@
 //!
 //! `bench` runs `lci traverse` over a gold set, scores the answers with the
 //! gold scorers and appends a row to the trend file (see `bench.rs`).
+//! `trajectories` joins the `pop` events of a `--trajectory` run to the gold
+//! outcome, one row per pop (see `trajectories.rs`).
 
 pub mod baseline;
 pub mod bench;
@@ -11,6 +13,7 @@ pub mod fit_tiebreak;
 pub mod lsp_cost;
 pub mod oracle;
 pub mod supplement;
+pub mod trajectories;
 pub mod trend;
 
 use anyhow::Result;
@@ -43,6 +46,11 @@ pub enum MapsCommand {
     /// stopped on the deadline or had failures on are left out unless
     /// --keep-failed.
     Compare(compare::CompareArgs),
+    /// Join the `pop` events of `maps bench --trajectory` runs to the gold
+    /// outcome: one JSON row per pop (state, candidates, choice, gold labels)
+    /// in `<wave>/<set>/trajectories.jsonl` and a summary in
+    /// `trajectories.md` beside it. Changes no file of the bench run.
+    Trajectories(trajectories::TrajectoriesArgs),
     /// Simple non-walk arms, written as run dirs that `maps compare` reads:
     /// `impact` (M1.4 arm N, the exact closure of the anchor the question's
     /// names give), `history` (`git log -G/-S/--grep` on the frozen eval
@@ -71,6 +79,7 @@ pub fn run(command: MapsCommand) -> Result<()> {
         MapsCommand::FitTiebreak(args) => fit_tiebreak::run(args),
         MapsCommand::LspCost(args) => lsp_cost::run(args),
         MapsCommand::Compare(args) => compare::run(args),
+        MapsCommand::Trajectories(args) => trajectories::run(args),
         MapsCommand::Baseline { which } => baseline::run(which),
         MapsCommand::OraclePolicy(args) => oracle::run_policy(args),
         MapsCommand::OracleFilter(args) => oracle::run_filter(args),
