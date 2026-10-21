@@ -163,6 +163,29 @@ pub struct RunProfileTraverse {
     /// result to every response. See the README "Map freshness" for what
     /// `observed`, `stale` and `lag` mean.
     pub map_freshness: bool,
+    /// Label every traverse answer (a walk, a continuation, an answer with no
+    /// start node) with two facts a reader would otherwise derive: an answer
+    /// level `completeness` (`{complete, why, estimate}`: `complete` is true
+    /// exactly when `status` is `complete`, that is when the walk ended
+    /// `complete` or `bound`, and no map the call asked for was lost; a map is
+    /// lost when it could not be set up (for example `lsp.live` with no server)
+    /// or had failed calls, and then `complete` is false, `why` is `degraded`
+    /// (the walk's own `stop_reason` when it was cut or capped) and `degraded`
+    /// lists the maps; `why` is otherwise the answer's `stop_reason`, `no_seeds`
+    /// without a walk; `estimate` is the mark-recapture fraction of the K29
+    /// hint, `null` until two maps share a node; a partial answer also gets a
+    /// `notes` line) and, on every card of `results`, `checkpoint.answer`,
+    /// `visited_cards` and `frontier`, a `freshness` word: `changed` when
+    /// `file_changed` is true, `fresh` when it is false, else from `maps`: any
+    /// map of the card `stale` gives `stale`, all of them found with a lag
+    /// gives `fresh`; anything else is `unverified` (the honest answer with
+    /// `map_freshness` and `verify_on_read` off). A card whose own file is
+    /// unchanged reads `fresh` even under a stale snapshot, because its text is
+    /// current. `false` (the default): the answer, the trace, the checkpoint
+    /// and the handle are as without the key. `true` changes the response only:
+    /// nothing is withheld, `results` are the same with either value, and the
+    /// trace, the checkpoint hash and the handle do not change.
+    pub answer_labels: bool,
     /// Put the route on the answer's cards: with `true`, every card of a
     /// traverse answer's `results` and of the checkpoint's `answer` that the
     /// walk reached gains `kind` (the kind of the edge that discovered the
@@ -711,6 +734,7 @@ mod tests {
         config.traverse.max_depth = 3;
         config.run_profile.traverse.map_freshness = true;
         config.run_profile.traverse.card_paths = true;
+        config.run_profile.traverse.answer_labels = true;
         config.traverse.fusion = TraverseFusion::Rrf;
         config.traverse.max_model_calls = Some(4);
         config.traverse.priors = Some("priors.json".into());
@@ -1159,6 +1183,7 @@ mode = \"sometimes\"
             "run_profile.walk.grep_corroboration",
             "run_profile.walk.pricing",
             "run_profile.traverse.map_freshness",
+            "run_profile.traverse.answer_labels",
             "run_profile.traverse.card_paths",
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",
@@ -1250,6 +1275,36 @@ mode = \"sometimes\"
         for bad in [
             "[run_profile.traverse]\ncard_paths = \"yes\"\n",
             "[run_profile]\ncard_paths = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn traverse_answer_labels_is_off_by_default_and_changes_the_profile_hash() {
+        let off = Config::default();
+        assert!(!off.run_profile.traverse.answer_labels);
+        let text = format!(
+            "{}[run_profile.traverse]\nanswer_labels = true\n",
+            base_toml()
+        );
+        let on: Config = toml::from_str(&text).unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.traverse.answer_labels);
+        // It changes what a traverse answer holds, so it changes the hash.
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["traverse"]["answer_labels"], false);
+        assert_eq!(on.value["run_profile"]["traverse"]["answer_labels"], true);
+        assert!(
+            off.keys
+                .iter()
+                .any(|key| key == "run_profile.traverse.answer_labels")
+        );
+        assert_ne!(off.hash, on.hash);
+        for bad in [
+            "[run_profile.traverse]\nanswer_labels = \"yes\"\n",
+            "[run_profile]\nanswer_labels = true\n",
         ] {
             let text = format!("{}{bad}", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");

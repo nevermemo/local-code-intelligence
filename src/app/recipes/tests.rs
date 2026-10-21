@@ -1294,6 +1294,7 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     let mut profile = RunProfileConfig::default();
     profile.traverse.map_freshness = true;
     profile.traverse.card_paths = true;
+    profile.traverse.answer_labels = true;
     profile.freshness.verify_on_read = true;
     profile.freshness.stat_gate = true;
     let on = keyed.ask_under(request, false, &profile).await;
@@ -1305,6 +1306,9 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     }
     assert_eq!(on["stop"], off["stop"]);
     assert!(!on.to_string().contains("file_changed"), "{on}");
+    // The recipe builds its own answer: K13's labels are the traverse answer's.
+    assert!(!on.to_string().contains("freshness"), "{on}");
+    assert!(!on.to_string().contains("completeness"), "{on}");
     assert!(on.get("maps").is_none(), "{on}");
     assert_eq!(trace_ranks(&keyed), trace_ranks(&plain));
 }

@@ -246,6 +246,8 @@ totals and, only when work is left, a `handle` and `checkpoint`. The first stage
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
 
+With `[run_profile.traverse] answer_labels = true` (default `false`) the answer also has `completeness` (`{complete, why, estimate}`: `complete` is `status == "complete"` with no map lost (`degraded`: a map the call asked for that could not be set up, or had `MapStat.failures`; `why` is then `degraded` unless the walk was cut), `why` the `stop_reason`, `estimate` `TraversalResult.estimate`, the `likely_complete` fraction) and every card of `results` and the checkpoint lists has `freshness` (`fresh`, `changed`, `stale` or `unverified`, read from `file_changed` and `maps`). `app::traverse::response::add_answer_labels` adds both to the response JSON after the trace and the checkpoint hash are made, so the trace, the checkpoint, the handle and `Card`/`card_json` are unchanged, nothing is withheld, and with the key off the answer is as before.
+
 With `[run_profile.traverse] card_paths = true` (default `false`) every walked card of `results` and of `checkpoint.answer` also has `kind` and `path`, the
 route from its start node with each hop's map, edge kind and witness (`app::traverse::response::add_paths`, read from the walk's state table; the engine keeps
 `State::kind`, and a handle keeps it only under the key). With the key off the answer, the trace, the checkpoint and the handle are unchanged.

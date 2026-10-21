@@ -530,6 +530,21 @@ enabled = false
 # source files per call. false (default): the answer has no `maps` key and is as
 # without the key.
 map_freshness = false
+# Label every traverse answer (a walk, a continuation, an answer with no start
+# node). On the answer, `completeness` {complete, why, estimate}: complete is
+# true when status is complete (the walk ended complete or bound) and no map the
+# call asked for was lost (could not be set up, or had failed calls: then
+# complete is false, why is degraded and `degraded` lists the maps), why is the
+# stop_reason (no_seeds without a walk), estimate is the fraction of the
+# likely_complete hint or null until two maps share a node; a partial answer also
+# gets one note. On every card of results and of the checkpoint's answer,
+# visited_cards and frontier, `freshness`: changed (file_changed true), fresh
+# (file_changed false, or every map of the card found in `maps` with a lag),
+# stale (a map of the card is stale) or unverified (anything else, which is what
+# every card says with map_freshness and verify_on_read off). Nothing is withheld
+# and the trace, the checkpoint and the handle do not change. false (default):
+# the answer is as without the key.
+answer_labels = false
 # Put the route on the cards: every card of `results` (and of the checkpoint's
 # `answer`) that the walk reached gains `kind` (the kind of the edge that found
 # the node; null for a start node) and `path`, the route from its start node:
