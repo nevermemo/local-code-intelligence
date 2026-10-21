@@ -167,7 +167,8 @@ pub trait LspAdapter: Send + Sync {
     /// channel asks every applicable server for symbols named like the query;
     /// a server whose symbols are not code names (marksman: headings) opts
     /// out with `false`, so an indexed prose file does not start it for every
-    /// search. Navigation (`definition`, `references`, `search_symbols`) is
+    /// search (the lsp.symbols map picks its providers the same way and skips
+    /// it too). Navigation (`definition`, `references`, `search_symbols`) is
     /// unaffected. Default `true`.
     fn joins_search_channel(&self) -> bool {
         true
