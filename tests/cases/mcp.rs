@@ -2237,7 +2237,8 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(needle), "{needle}: {text}");
     }
-    // A workspace without an index says how to make one.
+    // A workspace without an index answers over an empty SCIP graph (the
+    // default mode is `cache`), and the note says how to make one.
     let empty = temp.path().join("no-scip");
     std::fs::create_dir_all(&empty).unwrap();
     let missing = mcp_search_call(
@@ -2247,13 +2248,10 @@ async fn a_traverse_call_walks_the_scip_graph_and_a_checkpoint_is_answered_with_
         json!({"workspace_path":empty,"query":"search rank","mode":"traverse"}),
     )
     .await;
-    assert_eq!(missing["isError"], true, "{missing}");
-    assert!(
-        missing["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("rust-analyzer scip")
-    );
+    assert_ne!(missing["isError"], true, "{missing}");
+    let missing_notes = missing["structuredContent"]["notes"].to_string();
+    assert!(missing_notes.contains("(scip.mode = cache)"), "{missing}");
+    assert!(missing_notes.contains("rust-analyzer scip"), "{missing}");
     // A question that names nothing in the graph is an answer with no seeds.
     let nothing = mcp_search_call(
         &client,
@@ -3810,6 +3808,15 @@ struct ScipModeServer {
 
 impl ScipModeServer {
     async fn start(mode: lci_core::config::profile::ScipMode) -> Self {
+        Self::start_with(Some(mode)).await
+    }
+
+    /// The `[run_profile.scip] mode` untouched: the default.
+    async fn start_default() -> Self {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(mode: Option<lci_core::config::profile::ScipMode>) -> Self {
         let (temp, mut config, _fake, models_task) = fixture().await;
         config.traverse.enabled = true;
         config.traverse.first_stage = lci_core::config::TraverseFirstStage::Off;
@@ -3817,7 +3824,9 @@ impl ScipModeServer {
         config.traverse.exact_seeds = false;
         // One seed (the best hit), so the walk has a callee left to reach.
         config.traverse.seed_k = 1;
-        config.run_profile.scip.mode = mode;
+        if let Some(mode) = mode {
+            config.run_profile.scip.mode = mode;
+        }
         let workspace = temp.path().join("scip-mode");
         let app = Arc::new(App::open(config).await.unwrap());
         let (base, token, server) = serve_on_loopback(app).await;
@@ -3942,6 +3951,58 @@ async fn scip_mode_cache_answers_without_the_file_and_walks_it_once_it_exists() 
                 && card["node"].as_str().unwrap().contains("translator_helper")
         }),
         "a symbol reached through graph.scip: {with}"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn a_default_server_answers_without_or_over_a_corrupt_scip_index() {
+    let server = ScipModeServer::start_default().await;
+    write_hybrid_workspace(&server.workspace);
+    let index = server.workspace.join("index.scip");
+    std::fs::remove_file(&index).unwrap();
+    let kinds = |answer: &Value| -> Vec<String> {
+        answer["seed_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["kind"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let answered = |call: Value| -> Value {
+        assert_ne!(call["isError"], true, "{call}");
+        call["structuredContent"].clone()
+    };
+
+    // No file: the call answers with the note, and the seed hits are chunks.
+    let missing = answered(server.traverse().await);
+    assert!(
+        notes_text(&missing).contains("(scip.mode = cache)"),
+        "{missing}"
+    );
+    let chunks = kinds(&missing);
+    assert!(
+        !chunks.is_empty() && chunks.iter().all(|kind| kind == "chunk"),
+        "{missing}"
+    );
+
+    // A corrupt file: unreadable once, then remembered for the same stamp.
+    std::fs::write(&index, [0xff_u8; 32]).unwrap();
+    let first = answered(server.traverse().await);
+    assert!(notes_text(&first).contains("unreadable"), "{first}");
+    assert!(!notes_text(&first).contains("remembered"), "{first}");
+    let again = answered(server.traverse().await);
+    assert!(notes_text(&again).contains("unreadable"), "{again}");
+    assert!(notes_text(&again).contains("remembered"), "{again}");
+
+    // A readable index: the hits are symbols and no mode note is left.
+    write_hybrid_workspace(&server.workspace);
+    let with = answered(server.traverse().await);
+    assert!(!notes_text(&with).contains("scip.mode"), "{with}");
+    let symbols = kinds(&with);
+    assert!(
+        !symbols.is_empty() && symbols.iter().all(|kind| kind == "symbol"),
+        "{with}"
     );
     server.stop();
 }
