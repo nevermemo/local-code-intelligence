@@ -107,8 +107,8 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K17 | `oxc_resolver` for TS and JS imports, only if K14a2 shows Codanna's TS resolution is weak | Imports against typescript-go | S | - |
 | K12b | typescript-go adapter | Live acceptance | M | - |
 | K31 | Opengrep data-flow map, opt-in; consumes Opengrep's existing flow analysis, no engine written | Ceiling on a flow set | M | - |
-| K4a | External held-out gold adapters (SWE-PolyBench Verified, LongCodeArena); dataset licences recorded; never used for tuning (stays in cycle 1; downloads approved) | Leak check | S | - |
-| K4b | External gold download and conversion | Counts | S | - |
+| K4a | Done (K4a, d484): `cargo xtask gold external convert` turns a SWE-PolyBench Verified `test.csv` into where-to exemplar items at file granularity with the leak stratum, licence, url, revision and sha256 in every item, `--known-repo` overlap marks and a counts report; the LongCodeArena column adapter (`lca_row_from_columns`) is tested on synthetic rows; held out, never used for tuning (stays in cycle 1) | Leak check | S | - |
+| K4b | External gold download and conversion: the `fetch` command, the parquet reader that feeds `lca_row_from_columns` (`parquet` crate, at most 8 new crates), the `Fetcher` test double, the real runs into the owner's gold directory and `test-results/external-gold/report.json`; downloads approved (d482) | Counts | S | K4a (done) |
 | K5a | Baseline arms rg-only and LSP-over-MCP wired into `maps baseline` (no A/B runs); not blocked. K5a-1 landed: the rg arm, `cargo xtask maps baseline rg --set traits or where-to` (d443), with three named rules: `fixed`, `fixed-decl-first` (`--decl-first`) and `regex` (`--rule regex`, traits only; the `rg_arm.py` rule behind d392). K5a-2 remains: LSP over MCP (the `workspace/symbol` arm), after K11d-1's `McpSession` harness | Smoke query | S | item 6 arm |
 | K5b | Baseline arms Codanna and Serena wired (no A/B runs); the Serena arm is not blocked, only the Codanna arm waits for the owner | Smoke query | S | - |
 
