@@ -133,7 +133,14 @@ struct GenericClient {
 }
 
 impl GenericClient {
-    async fn spawn(adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Result<Arc<Self>> {
+    /// Spawns and initializes the server. `start_timeout` bounds the
+    /// `initialize` request only (`lsp_start_timeout_seconds`); everything
+    /// after it keeps the transport's own timeout.
+    async fn spawn(
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        start_timeout: Duration,
+    ) -> Result<Arc<Self>> {
         let transport = adapter
             .transport_config(&workspace.path)
             .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
@@ -147,7 +154,7 @@ impl GenericClient {
         let params = adapter
             .initialize_params(&workspace.path)
             .with_context(|| format!("cannot build {} initialization", adapter.provider()))?;
-        rpc.request("initialize", params)
+        rpc.request_within("initialize", params, start_timeout)
             .await
             .with_context(|| format!("initialize {}", adapter.provider()))?;
         rpc.notify("initialized", json!({})).await?;
@@ -375,6 +382,7 @@ impl Session {
         workspace: Workspace,
         stuck_after: Option<Duration>,
         breakers: Option<Arc<LspBreakers>>,
+        start_timeout: Duration,
     ) -> Arc<Self> {
         let (sender, start) = watch::channel(None);
         let (primed_sender, primed) = watch::channel(false);
@@ -384,7 +392,7 @@ impl Session {
             let provider = adapter.provider();
             let started = Instant::now();
             let outcome = tokio::select! {
-                outcome = GenericClient::spawn(&adapter, &workspace) => outcome,
+                outcome = GenericClient::spawn(&adapter, &workspace, start_timeout) => outcome,
                 // Every receiver is gone: the manager was dropped.
                 () = sender.closed() => return,
             };
@@ -965,6 +973,9 @@ pub struct Manager {
     /// (see [`LspBreakers`]); a per-call manager borrows the service's
     /// ([`Self::with_breakers`]).
     breakers: Option<Arc<LspBreakers>>,
+    /// `lsp_start_timeout_seconds`, or `lsp_timeout_seconds` when it is 0: the
+    /// inactivity bound of a server's `initialize` request.
+    start_timeout: Duration,
 }
 
 /// The running syncs of a [`Manager`], by workspace id.
@@ -1094,6 +1105,11 @@ impl Manager {
                 .lsp
                 .breaker
                 .then(|| Arc::new(LspBreakers::new(LSP_DOWN_WINDOW))),
+            start_timeout: if config.lsp_start_timeout_seconds > 0 {
+                Duration::from_secs(config.lsp_start_timeout_seconds)
+            } else {
+                timeout
+            },
         }
     }
 
@@ -1279,6 +1295,7 @@ impl Manager {
                     workspace.clone(),
                     self.stuck_after,
                     self.breakers.clone(),
+                    self.start_timeout,
                 );
                 if let Some(replaced) = sessions.insert(key.clone(), Arc::clone(&session))
                     && replaced.stuck()

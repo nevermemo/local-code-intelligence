@@ -8224,6 +8224,36 @@ async fn lsp_live_skips_a_dead_server_for_the_window_and_a_live_one_closes_it() 
     manager_b.shutdown_all().await;
 }
 
+/// N103: a server that is silent for longer than `lsp_timeout_seconds` while it
+/// starts is still started when `lsp_start_timeout_seconds` is wider: the start
+/// is bounded by its own key, not by the request bound. The fake's `initialize`
+/// answer is 8 s away, past the 5 s request timeout that ends the same start in
+/// the "timeout" arm of
+/// `fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors` (that
+/// arm's mode never answers `workspace/symbol`, so this test uses the
+/// `workspace-symbols` mode of the same fixture). The fake's delay is the one
+/// wall-clock wait of this slice.
+#[tokio::test]
+async fn a_slow_initialize_is_bounded_by_the_start_timeout_not_the_request_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fake_csharp_fixture(&temp, "workspace-symbols");
+    config.lsp_timeout_seconds = 5;
+    config.lsp_start_timeout_seconds = LOADED_BUDGET_SECONDS;
+    config
+        .csharp
+        .args
+        .extend(fake_args(&["--initialize-delay-ms", "8000"]));
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    let results = manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("a start inside lsp_start_timeout_seconds must answer");
+    assert_eq!(results[0].name.as_deref(), Some("Calculator"));
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    manager.shutdown_all().await;
+}
+
 // ----- K37b: concurrent walks --------------------------------------------
 //
 // Two or more walks that share one server (the service's manager), with an

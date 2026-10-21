@@ -535,6 +535,16 @@ pub struct Config {
     /// Seconds one request to a language server may go without any sign of
     /// life from it before it fails (1..=86400).
     pub lsp_timeout_seconds: u64,
+    /// Seconds a language server's start (its `initialize` request) may go
+    /// without any sign of life from it before the start fails (default `0`:
+    /// the start is bounded by `lsp_timeout_seconds`, as every request is).
+    /// Raise it for a server that is silent while it loads a large solution
+    /// or project at start (csharp-ls, jdtls) without raising the bound of
+    /// every later request. Only `initialize` uses it; requests to a started
+    /// server, `initialized` and the adapters' own hooks keep
+    /// `lsp_timeout_seconds`. Allowed: `0..=86400`. Per machine: it is not
+    /// part of the run-profile hash.
+    pub lsp_start_timeout_seconds: u64,
     pub lsp_candidate_count: usize,
     /// Most milliseconds one search waits for the language-server channel.
     /// A server that is still starting (rust-analyzer needs ~10 s to index
@@ -1474,6 +1484,7 @@ impl Default for Config {
             rust_analyzer_path: "rust-analyzer".into(),
             rust_analyzer_trusted: false,
             lsp_timeout_seconds: 60,
+            lsp_start_timeout_seconds: 0,
             lsp_candidate_count: 40,
             lsp_search_budget_ms: 1500,
             lsp_idle_timeout_seconds: 1800,
@@ -1599,6 +1610,12 @@ impl Config {
             "lsp_timeout_seconds must be 1..={} (got {})",
             Self::MAX_LSP_TIMEOUT_SECONDS,
             self.lsp_timeout_seconds
+        );
+        ensure!(
+            self.lsp_start_timeout_seconds <= Self::MAX_LSP_TIMEOUT_SECONDS,
+            "lsp_start_timeout_seconds must be 0..={} (got {}); 0 means the start is bounded by lsp_timeout_seconds",
+            Self::MAX_LSP_TIMEOUT_SECONDS,
+            self.lsp_start_timeout_seconds
         );
         ensure!(
             self.lsp_idle_timeout_seconds <= Self::MAX_LSP_TIMEOUT_SECONDS,
@@ -2084,6 +2101,23 @@ mod tests {
         for seconds in [0, 1, Config::MAX_LSP_TIMEOUT_SECONDS] {
             let mut config: Config = toml::from_str(&base_toml()).unwrap();
             config.lsp_idle_timeout_seconds = seconds;
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn lsp_start_timeout_seconds_outside_its_range_is_rejected() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        assert_eq!(config.lsp_start_timeout_seconds, 0);
+        for seconds in [Config::MAX_LSP_TIMEOUT_SECONDS + 1, u64::MAX] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_start_timeout_seconds = seconds;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("lsp_start_timeout_seconds"), "{error}");
+        }
+        for seconds in [0, 1, Config::MAX_LSP_TIMEOUT_SECONDS] {
+            let mut config: Config = toml::from_str(&base_toml()).unwrap();
+            config.lsp_start_timeout_seconds = seconds;
             config.validate().unwrap();
         }
     }
