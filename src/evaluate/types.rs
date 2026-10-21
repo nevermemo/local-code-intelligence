@@ -238,6 +238,19 @@ pub struct EvalTimings {
     pub total_ms: f64,
 }
 
+/// What priming one language server for one workspace did before the first
+/// query of an evaluation run (see `RunOptions::prime`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrimingOutcome {
+    /// Whether the server started and finished priming within the timeout.
+    pub primed: bool,
+    /// Wall time of the attempt, in milliseconds.
+    pub ms: f64,
+    /// Why it did not, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexLifecycleAction {
@@ -340,6 +353,17 @@ pub struct QueryMetrics {
     /// a report that predates the field, where `compare` derives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returned_tokens: Option<usize>,
+    /// Whether a language-server provider missed `lsp_search_budget_ms` in
+    /// this search (it was still starting or warming, so its symbol results
+    /// are missing or incomplete). Written always; a report made before the
+    /// field reads `false`. `compare` leaves such a pair out unless told to
+    /// keep it.
+    #[serde(default)]
+    pub lsp_budget_hit: bool,
+    /// The providers behind [`Self::lsp_budget_hit`]. Empty, and absent from
+    /// the JSON, when none missed the budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lsp_providers_over_budget: Vec<String>,
 }
 
 /// The token proxy of the rows of `lists`: the characters of their snippets
@@ -517,6 +541,8 @@ impl QueryReport {
                 file_acc_at_5: 0.0,
                 file_acc_at_10: 0.0,
                 returned_tokens: None,
+                lsp_budget_hit: false,
+                lsp_providers_over_budget: Vec::new(),
             },
             candidates: Vec::new(),
             arm: None,
@@ -636,6 +662,16 @@ pub struct AggregateReport {
     /// one (a report written before the field has none); `None` when none do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_returned_tokens: Option<f64>,
+    /// Evaluated queries in which a language-server provider missed
+    /// `lsp_search_budget_ms` ([`QueryMetrics::lsp_budget_hit`]).
+    #[serde(default)]
+    pub lsp_budget_hit_queries: usize,
+    /// What the pre-run priming of the language servers did, by workspace key
+    /// and provider. Empty, and absent from the JSON, when nothing was primed
+    /// (`--no-prime`, the LSP channel off, or an offline report such as a
+    /// replay).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub priming: BTreeMap<String, BTreeMap<String, PrimingOutcome>>,
     /// Median total latency in milliseconds over evaluated queries with
     /// timings; `None` when there are no samples.
     pub median_latency_ms: Option<f64>,

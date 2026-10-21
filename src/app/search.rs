@@ -135,6 +135,13 @@ pub struct SearchReport {
     /// empty, and never counted as a fallback.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// The language-server providers that did not answer within
+    /// `lsp_search_budget_ms`: the structured form of the budget note in
+    /// [`Self::notes`], which stays. Absent from the JSON when no provider
+    /// missed the budget, so a search without a budget hit serializes as it
+    /// did before the field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lsp_over_budget: Vec<&'static str>,
     pub timings: Timings,
     pub results: Vec<Hit>,
     /// The documentation lane. Present, and serialized, exactly when the
@@ -1165,6 +1172,7 @@ impl App {
             reranked: false,
             warning: resolution.warning,
             notes: Vec::new(),
+            lsp_over_budget: Vec::new(),
             timings: Timings::default(),
             results: vec![],
             docs: None,
@@ -1288,6 +1296,7 @@ impl App {
             report
                 .notes
                 .push(self.lsp_over_budget_note(&lsp_result.over_budget));
+            report.lsp_over_budget = lsp_result.over_budget.clone();
         }
         if !lsp_failures.is_empty() {
             let message = lsp_failure_warning(&lsp_failures);
@@ -3270,6 +3279,7 @@ mod tests {
             reranked: false,
             warning: None,
             notes: Vec::new(),
+            lsp_over_budget: Vec::new(),
             timings: super::Timings::default(),
             results: Vec::new(),
             docs: None,

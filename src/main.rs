@@ -263,6 +263,18 @@ enum Command {
         /// unchanged; the pretty-printed report grows by roughly 100 KB per query.
         #[arg(long)]
         dump_candidates: bool,
+        /// Do not start and prime the language servers before the first query
+        /// of each workspace. The first query then pays the start (and may miss
+        /// `lsp_search_budget_ms`): what a cold-start measurement wants. Without
+        /// this flag, with `[channels] lsp` on, every enabled server is
+        /// primed first and the outcome is recorded under `priming`.
+        #[arg(long)]
+        no_prime: bool,
+        /// Keep, in the `--baseline` comparison, the pairs in which either run's
+        /// language server missed `lsp_search_budget_ms`. They are left out by
+        /// default and counted.
+        #[arg(long, requires = "baseline")]
+        keep_failed: bool,
     },
     /// Compare two saved evaluation reports query by query. Works offline: it
     /// needs no services, configuration, or index. A regression is not an
@@ -281,6 +293,11 @@ enum Command {
         /// Number of bootstrap resamples.
         #[arg(long, default_value_t = DEFAULT_RESAMPLES, value_parser = parse_resamples)]
         resamples: usize,
+        /// Keep the pairs in which either run's language server missed
+        /// `lsp_search_budget_ms` (`lsp_budget_hit`). They measured a cold
+        /// start, so they are left out by default and counted in the summary.
+        #[arg(long)]
+        keep_failed: bool,
     },
     /// Score other retrieval settings from the candidate dump of an earlier
     /// `evaluate --dump-candidates` report, without services. Works offline
@@ -1206,13 +1223,18 @@ async fn run() -> Result<()> {
         output,
         seed,
         resamples,
+        keep_failed,
     } = command
     {
         return run_compare(
             &baseline,
             &candidate,
             output.as_deref(),
-            &CompareOptions { seed, resamples },
+            &CompareOptions {
+                seed,
+                resamples,
+                keep_failed,
+            },
         );
     }
     if let Command::Replay {
@@ -1336,6 +1358,8 @@ async fn run() -> Result<()> {
             seed,
             resamples,
             dump_candidates,
+            no_prime,
+            keep_failed,
         } => {
             let definition = evaluate::load_definition(&definition)?;
             let workspaces = evaluate::parse_workspace_mappings(&workspaces)?;
@@ -1349,7 +1373,10 @@ async fn run() -> Result<()> {
                     &app,
                     &definition,
                     &workspaces,
-                    RunOptions { dump_candidates },
+                    RunOptions {
+                        dump_candidates,
+                        prime: !no_prime,
+                    },
                 )
                 .await?;
                 Ok(tokio::task::spawn_blocking(move || {
@@ -1357,6 +1384,7 @@ async fn run() -> Result<()> {
                         let options = CompareOptions {
                             seed: seed.unwrap_or(DEFAULT_SEED),
                             resamples: resamples.unwrap_or(DEFAULT_RESAMPLES),
+                            keep_failed,
                         };
                         let mut comparison = evaluate::compare(&baseline, &report, &options);
                         comparison.baseline_source = Some(path.display().to_string());

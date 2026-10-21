@@ -381,6 +381,7 @@ mod tests {
             reranked: true,
             warning: None,
             notes: Vec::new(),
+            lsp_over_budget: Vec::new(),
             timings: Timings::default(),
             results,
             docs: None,
