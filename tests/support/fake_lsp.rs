@@ -22,6 +22,10 @@ pub enum FakeScenario {
     NoSymbols,
     Definition,
     References,
+    /// Answers both `textDocument/definition` and `textDocument/references`
+    /// with the canned locations of `definition` and `references` (`--mode
+    /// definition-references`): one server for a test that asks both.
+    DefinitionAndReferences,
     UnsolicitedNotification,
     Stderr,
     Timeout,
@@ -211,6 +215,7 @@ pub fn run_from_env() -> io::Result<()> {
         "no-symbols" => FakeScenario::NoSymbols,
         "definition" => FakeScenario::Definition,
         "references" => FakeScenario::References,
+        "definition-references" => FakeScenario::DefinitionAndReferences,
         "unsolicited" => FakeScenario::UnsolicitedNotification,
         "stderr" => FakeScenario::Stderr,
         "timeout" => FakeScenario::Timeout,
@@ -736,7 +741,10 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                         write_message(&mut stdout, &response)?;
                     }
                 }
-                (FakeScenario::Definition, Some("textDocument/definition")) => {
+                (
+                    FakeScenario::Definition | FakeScenario::DefinitionAndReferences,
+                    Some("textDocument/definition"),
+                ) => {
                     if config.exit_on_definition_request && spawn_count == 1 {
                         process::exit(0);
                     }
@@ -765,7 +773,10 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                         }
                     }
                 }
-                (FakeScenario::References, Some("textDocument/references")) => {
+                (
+                    FakeScenario::References | FakeScenario::DefinitionAndReferences,
+                    Some("textDocument/references"),
+                ) => {
                     if let Some(id) = id {
                         write_message(
                             &mut stdout,

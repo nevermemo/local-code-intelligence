@@ -503,6 +503,9 @@ pub struct Config {
     pub embedding_document_template: String,
     pub embedding_timeout_seconds: u64,
     pub reranker_timeout_seconds: u64,
+    /// Bound in seconds (1..=30) of each dependency probe of /ready and
+    /// service_status, and of the --version probe lsp.live runs once per
+    /// language-server manager before a traversal. Default 5.
     pub readiness_timeout_seconds: u64,
     pub ripgrep_path: String,
     pub semantic_candidate_count: usize,

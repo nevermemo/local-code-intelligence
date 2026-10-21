@@ -157,90 +157,151 @@ fn manifest(
     }
 }
 
+/// What the steps of one or more seeds reached, so the test can tell that the
+/// whole run was not vacuous.
+#[derive(Default)]
+struct Reached {
+    reused: usize,
+    removed: usize,
+    ignored_by_lciignore: usize,
+    skipped: usize,
+    lossy: usize,
+    /// Scans that both reparsed and reused files: where a stale cache entry
+    /// would show.
+    mixed: usize,
+}
+
+impl Reached {
+    fn add(&mut self, other: &Reached) {
+        self.reused += other.reused;
+        self.removed += other.removed;
+        self.ignored_by_lciignore += other.ignored_by_lciignore;
+        self.skipped += other.skipped;
+        self.lossy += other.lossy;
+        self.mixed += other.mixed;
+    }
+}
+
+/// One seed: its own workspace and data directory, a random sequence of edits,
+/// and the comparison after the steps that scan.
+fn run_seed(seed: u64) -> Reached {
+    const STEPS: usize = 14;
+    let mut reached = Reached::default();
+    let mut rng = Rng(seed);
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let workspace = Workspace::resolve(&root, &data).unwrap();
+    let mut history = Vec::new();
+    for step in 0..STEPS {
+        history.push(mutate(&mut rng, &root));
+        // Several edits between scans as well as one.
+        if rng.below(3) == 0 {
+            continue;
+        }
+        let context = format!("seed {seed}, step {step}, edits {history:#?}");
+        let previous = try_load(&data, &workspace).unwrap();
+        let incremental = chunk::scan_incremental(&root, &previous.files).unwrap();
+        let cold = chunk::scan_incremental(&root, &HashMap::new()).unwrap();
+
+        // The fingerprint reads only the sources; the chunks and files
+        // below are what the previous manifest can get wrong.
+        assert_eq!(incremental.fingerprint, cold.fingerprint, "{context}");
+        assert_eq!(
+            incremental.fingerprint,
+            chunk::fingerprint(&root).unwrap(),
+            "{context}"
+        );
+        assert_eq!(json(&incremental.chunks), json(&cold.chunks), "{context}");
+        assert_eq!(json(&incremental.files), json(&cold.files), "{context}");
+        assert_eq!(incremental.lossy_files, cold.lossy_files, "{context}");
+        assert_eq!(incremental.skipped_files, cold.skipped_files, "{context}");
+        assert_eq!(
+            incremental.parsed_files + incremental.unchanged_files,
+            cold.files.len(),
+            "{context}"
+        );
+        assert_eq!(
+            incremental.removed_files,
+            previous
+                .files
+                .keys()
+                .filter(|path| !cold.files.contains_key(*path))
+                .count(),
+            "{context}"
+        );
+
+        reached.reused += incremental.unchanged_files;
+        reached.mixed +=
+            usize::from(incremental.parsed_files > 0 && incremental.unchanged_files > 0);
+        reached.removed += incremental.removed_files;
+        reached.skipped += cold.skipped_files.len();
+        reached.lossy += cold.lossy_files.len();
+        reached.ignored_by_lciignore += existing(&root)
+            .iter()
+            .filter(|path| !path.ends_with(".txt"))
+            .filter(|path| !cold.files.contains_key(**path))
+            .filter(|path| !cold.skipped_files.iter().any(|s| s.relative_path == **path))
+            .count();
+
+        let next = manifest(&workspace, incremental.fingerprint, incremental.files);
+        save(&data, &next).unwrap();
+        let loaded = try_load(&data, &workspace).unwrap();
+        assert_eq!(json(&loaded), json(&next), "{context}");
+    }
+    reached
+}
+
 #[test]
 fn incremental_scans_equal_cold_scans_and_the_manifest_round_trips() {
+    use std::sync::atomic::{AtomicU64, Ordering};
     const SEEDS: u64 = 48;
-    const STEPS: usize = 14;
+    // The seeds share nothing (each has a temporary workspace of its own), so
+    // a few threads take them in turn; a failed assertion of a seed is raised
+    // again here with its own message, which names the seed.
+    let next = AtomicU64::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
     // Totals over the whole run, so the loop cannot pass by never reaching the
     // cases it is about.
-    let (mut reused, mut removed, mut ignored_by_lciignore, mut skipped, mut lossy) =
-        (0, 0, 0, 0, 0);
-    // Scans that both reparsed and reused files: where a stale cache entry
-    // would show.
-    let mut mixed = 0;
-    for seed in 0..SEEDS {
-        let mut rng = Rng(seed);
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("workspace");
-        let data = temp.path().join("data");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&data).unwrap();
-        let workspace = Workspace::resolve(&root, &data).unwrap();
-        let mut history = Vec::new();
-        for step in 0..STEPS {
-            history.push(mutate(&mut rng, &root));
-            // Several edits between scans as well as one.
-            if rng.below(3) == 0 {
-                continue;
-            }
-            let context = format!("seed {seed}, step {step}, edits {history:#?}");
-            let previous = try_load(&data, &workspace).unwrap();
-            let incremental = chunk::scan_incremental(&root, &previous.files).unwrap();
-            let cold = chunk::scan_incremental(&root, &HashMap::new()).unwrap();
-
-            // The fingerprint reads only the sources; the chunks and files
-            // below are what the previous manifest can get wrong.
-            assert_eq!(incremental.fingerprint, cold.fingerprint, "{context}");
-            assert_eq!(
-                incremental.fingerprint,
-                chunk::fingerprint(&root).unwrap(),
-                "{context}"
-            );
-            assert_eq!(json(&incremental.chunks), json(&cold.chunks), "{context}");
-            assert_eq!(json(&incremental.files), json(&cold.files), "{context}");
-            assert_eq!(incremental.lossy_files, cold.lossy_files, "{context}");
-            assert_eq!(incremental.skipped_files, cold.skipped_files, "{context}");
-            assert_eq!(
-                incremental.parsed_files + incremental.unchanged_files,
-                cold.files.len(),
-                "{context}"
-            );
-            assert_eq!(
-                incremental.removed_files,
-                previous
-                    .files
-                    .keys()
-                    .filter(|path| !cold.files.contains_key(*path))
-                    .count(),
-                "{context}"
-            );
-
-            reused += incremental.unchanged_files;
-            mixed += usize::from(incremental.parsed_files > 0 && incremental.unchanged_files > 0);
-            removed += incremental.removed_files;
-            skipped += cold.skipped_files.len();
-            lossy += cold.lossy_files.len();
-            ignored_by_lciignore += existing(&root)
-                .iter()
-                .filter(|path| !path.ends_with(".txt"))
-                .filter(|path| !cold.files.contains_key(**path))
-                .filter(|path| !cold.skipped_files.iter().any(|s| s.relative_path == **path))
-                .count();
-
-            let next = manifest(&workspace, incremental.fingerprint, incremental.files);
-            save(&data, &next).unwrap();
-            let loaded = try_load(&data, &workspace).unwrap();
-            assert_eq!(json(&loaded), json(&next), "{context}");
+    let total = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut reached = Reached::default();
+                    loop {
+                        let seed = next.fetch_add(1, Ordering::Relaxed);
+                        if seed >= SEEDS {
+                            break reached;
+                        }
+                        reached.add(&run_seed(seed));
+                    }
+                })
+            })
+            .collect();
+        let mut total = Reached::default();
+        for handle in handles {
+            let reached = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            total.add(&reached);
         }
-    }
+        total
+    });
     assert!(
-        reused > 0
-            && mixed > 0
-            && removed > 0
-            && ignored_by_lciignore > 0
-            && skipped > 0
-            && lossy > 0,
-        "reused {reused}, mixed {mixed}, removed {removed}, ignored {ignored_by_lciignore}, \
-         skipped {skipped}, lossy {lossy}"
+        total.reused > 0
+            && total.mixed > 0
+            && total.removed > 0
+            && total.ignored_by_lciignore > 0
+            && total.skipped > 0
+            && total.lossy > 0,
+        "reused {}, mixed {}, removed {}, ignored {}, skipped {}, lossy {}",
+        total.reused,
+        total.mixed,
+        total.removed,
+        total.ignored_by_lciignore,
+        total.skipped,
+        total.lossy
     );
 }
