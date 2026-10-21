@@ -10,8 +10,8 @@ pub mod layers;
 pub mod profile;
 
 pub use profile::{
-    LspProfile, LspSessions, LspSync, RunProfile, RunProfileConfig, RunProfileSeeds, RunProfileTraverse,
-    WalkGroups, WalkProfile,
+    LspProfile, LspSessions, LspSync, RunProfile, RunProfileConfig, RunProfileSeeds,
+    RunProfileTraverse, WalkGroups, WalkProfile,
 };
 
 /// Controls when a search request may trigger an automatic incremental
