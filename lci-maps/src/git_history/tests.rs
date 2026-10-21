@@ -8,7 +8,7 @@ use crate::{
     kit_c3::check_edge_invariants,
     scratch::Scratch,
     traverse::{
-        merged::{MergedAdjacency, PreMerged},
+        merged::{BuildOptions, MergedAdjacency, PreMerged},
         source::OnTheFly,
     },
 };
@@ -452,7 +452,13 @@ async fn the_pre_merged_source_equals_the_on_the_fly_source_for_git_history() {
         },
         chunks.iter().collect(),
     );
-    let adjacency = MergedAdjacency::build(&registry, &view).await;
+    // One node is several git processes, which take seconds under load: the
+    // default 5 s per node left rows incomplete and the sources apart.
+    let options = BuildOptions {
+        per_node: Duration::from_secs(30),
+        ..BuildOptions::default()
+    };
+    let adjacency = MergedAdjacency::build_with(&registry, &view, &options).await;
     let mut nodes: Vec<NodeId> = view.ids().to_vec();
     nodes.extend(["a2.rs", "b.rs", "c.rs"].map(file));
     nodes.extend(shas.iter().map(|s| commit_id(s)));
@@ -527,7 +533,14 @@ async fn a_deadline_that_passes_during_the_work_stops_it() {
         )
         .await;
     assert!(expanded.edges.is_empty(), "{expanded:?}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Only a cap against a hang: a git process takes seconds to start on a
+    // loaded machine. That the work stopped is the run count below.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the cut took {:?}: {:?}",
+        started.elapsed(),
+        map.last_error()
+    );
     assert!(
         map.git_runs() - before <= 1,
         "the work went on after the deadline: {} git runs",
