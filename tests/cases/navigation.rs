@@ -46,6 +46,11 @@ fn python_adapter(manager: &Manager) -> Arc<dyn LspAdapter> {
         .expect("pyright adapter is always constructed")
 }
 
+/// The fake-server fixtures (C#, TypeScript, Python, clangd) allow a request
+/// timeout that a slow process start under load does not exceed
+/// ([`LOADED_BUDGET_SECONDS`]): a timed-out `initialize` is a transport
+/// failure, and its retry spawns a server the test did not count. A test about
+/// a timeout sets its own, and gives the fake something that really outlasts it.
 fn fake_csharp_fixture(
     temp: &tempfile::TempDir,
     mode: &str,
@@ -68,7 +73,7 @@ fn fake_csharp_fixture(
     let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
     let config = Config {
         data_dir: data_path,
-        lsp_timeout_seconds: 1,
+        lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
         csharp: CSharpLspConfig {
             path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
             args: vec![
@@ -106,7 +111,7 @@ fn fake_typescript_fixture(
     let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
     let config = Config {
         data_dir: data_path,
-        lsp_timeout_seconds: 1,
+        lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
         typescript: TypeScriptLspConfig {
             path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
             args: vec![
@@ -148,7 +153,7 @@ fn fake_python_fixture(
     let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
     let config = Config {
         data_dir: data_path,
-        lsp_timeout_seconds: 1,
+        lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
         python: PythonLspConfig {
             path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
             args: vec![
@@ -196,7 +201,7 @@ fn fake_clangd_fixture(
     let workspace = Workspace::resolve(&workspace_path, &data_path).unwrap();
     let config = Config {
         data_dir: data_path,
-        lsp_timeout_seconds: 1,
+        lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
         clangd: ClangdLspConfig {
             path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
             args: vec![
@@ -426,8 +431,19 @@ async fn fake_lsps_map_symbols_definitions_and_references() {
 #[tokio::test]
 async fn fake_csharp_lsp_survives_a_slow_response_paced_by_progress_notifications() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, workspace, _) = fake_csharp_fixture(&temp, "slow-with-progress");
-    assert_eq!(config.lsp_timeout_seconds, 1);
+    // An 8 s timeout, not 1 s: it also covers the process start, which takes
+    // seconds under load. Three notifications 3 s apart (9 s in all, for the
+    // request after the priming one) outlast it in total while every gap stays
+    // 5 s under it.
+    let (mut config, workspace, _) = fake_csharp_fixture(&temp, "slow-with-progress");
+    config.lsp_timeout_seconds = 8;
+    config.csharp.args.extend(fake_args(&[
+        "--progress-skip-priming",
+        "--progress-count",
+        "3",
+        "--progress-gap-ms",
+        "3000",
+    ]));
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
@@ -435,14 +451,14 @@ async fn fake_csharp_lsp_survives_a_slow_response_paced_by_progress_notification
     let results = manager
         .symbols(&adapter, &workspace, "Calculator")
         .await
-        .expect("progress notifications should keep the request alive past 1s");
+        .expect("progress notifications should keep the request alive past the 8 s timeout");
     let elapsed = started.elapsed();
 
     assert!(!results.is_empty());
     assert!(
-        elapsed >= Duration::from_millis(1500),
+        elapsed > Duration::from_secs(config.lsp_timeout_seconds),
         "expected the exchange to genuinely take longer than the nominal \
-         1s timeout (proving this isn't trivially fast); took {elapsed:?}"
+         8 s timeout (proving this isn't trivially fast); took {elapsed:?}"
     );
 }
 
@@ -467,6 +483,8 @@ async fn fake_csharp_lsp_correlates_responses_and_reuses_healthy_child() {
 #[tokio::test]
 async fn fake_csharp_lsp_discards_failed_session_and_restarts_once() {
     let temp = tempfile::tempdir().unwrap();
+    // Nothing here waits on the timeout: the first server exits, and the
+    // replacement answers.
     let (config, workspace, state) = fake_csharp_fixture(&temp, "restart-success");
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
@@ -482,7 +500,21 @@ async fn fake_csharp_lsp_discards_failed_session_and_restarts_once() {
 async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() {
     for mode in ["timeout", "malformed", "exit-during-request"] {
         let temp = tempfile::tempdir().unwrap();
-        let (config, workspace, state) = fake_csharp_fixture(&temp, mode);
+        // Only `timeout` is about the request timeout, and it keeps a short
+        // one: 5 s, with a server whose `initialize` answer is more than 30 s
+        // away, so the timeout always ends the wait. It is not 1 s because a
+        // process that starts later than the timeout is killed before it
+        // counts its start (the spawn count below). The other two end on their
+        // own (a bad frame, an exit), and a slow process start under load must
+        // not turn their `initialize` into a timeout, which is not retried.
+        let (mut config, workspace, state) = fake_csharp_fixture(&temp, mode);
+        if mode == "timeout" {
+            config.lsp_timeout_seconds = 5;
+            config
+                .csharp
+                .args
+                .extend(fake_args(&["--initialize-delay-ms", "30000"]));
+        }
         let manager = Manager::new(&config);
         let adapter = csharp_adapter(&manager);
         let error = manager
@@ -490,6 +522,12 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
             .await
             .unwrap_err();
         let message = format!("{error:#}");
+        if mode == "timeout" {
+            assert!(
+                message.contains("timed out after 5 seconds"),
+                "the 5 s bound must be what ended the wait: {message}"
+            );
+        }
         assert!(
             message.contains("timed out")
                 || message.contains("exited")
@@ -834,6 +872,12 @@ async fn answers_to_cancelled_requests_do_not_make_a_server_stuck() {
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
 
+    // The server is started and primed first (its answer is the error, whose
+    // outcome does not matter here): a 300 ms call would otherwise give up while
+    // a loaded machine is still starting the process, before any request has
+    // been sent, and the server would never be sent the requests it is to read.
+    let _ = manager.symbols(&adapter, &workspace, "Calculator").await;
+
     for _ in 0..8 {
         let outcome = tokio::time::timeout(
             Duration::from_millis(300),
@@ -847,7 +891,9 @@ async fn answers_to_cancelled_requests_do_not_make_a_server_stuck() {
     wait_until(
         "the server to read the cancelled requests",
         Duration::from_secs(30),
-        async || state_count_so_far(&state, "request_count.txt") >= 12,
+        // initialize, initialized, the priming request, the warm-up request,
+        // the eight abandoned ones, and at least one `$/cancelRequest`.
+        async || state_count_so_far(&state, "request_count.txt") >= 13,
     )
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -891,14 +937,16 @@ async fn a_request_cancelled_error_is_not_transient_and_does_not_make_a_server_s
 }
 
 /// A result ends the span: a server that fails (three answers over about 2 s),
-/// answers once, and fails again is not stuck, although the errors of the two
-/// failing calls together span about 4 s, past the 3 s limit. Without the
-/// reset on a result the third call would end that span and replace the session.
+/// answers once, and fails again is not stuck. The result takes 4 s to arrive,
+/// so the errors of the two failing calls are 6 s apart, past the 5 s limit,
+/// while each failing call alone spans about 2 s, so a loaded machine has 3 s
+/// to spare before one call could end the span by itself. Without the reset on
+/// a result the third call would end that span and replace the session.
 #[tokio::test]
 async fn a_result_between_transient_errors_ends_the_stuck_span() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
-    config.lsp_stuck_seconds = 3;
+    config.lsp_stuck_seconds = 5;
     // Requests 2 to 4 (the first call and its repeats) fail, request 5 is
     // answered, requests 6 to 8 (the third call) fail.
     config.csharp.args.extend(fake_args(&[
@@ -906,6 +954,8 @@ async fn a_result_between_transient_errors_ends_the_stuck_span() {
         "-32801:content modified",
         "--symbol-ok-at",
         "5",
+        "--symbol-ok-delay-ms",
+        "4000",
     ]));
     let manager = Manager::new(&config);
     let adapter = csharp_adapter(&manager);
@@ -1088,6 +1138,13 @@ async fn fake_client_with(
         label: "fake".to_owned(),
     };
     let client = JsonRpcClient::spawn(&transport, &[], ready).await.unwrap();
+    // The request timeout of a test about a short one (2 s) must not also have
+    // to cover the process start, which takes seconds on a loaded machine: the
+    // server claims its start ordinal as soon as it runs.
+    wait_until("the fake server to start", LOADED_BUDGET, async || {
+        state.join("spawns").join("1").exists()
+    })
+    .await;
     client
         .request(
             "initialize",
@@ -1248,9 +1305,13 @@ async fn a_server_that_stops_reading_fails_the_write_within_the_timeout() {
     let temp = tempfile::tempdir().unwrap();
     let (client, _state) =
         fake_client(&temp, &["--never-read-stdin"], Duration::from_secs(2)).await;
+    // The 2 s write bound is what is under test, so it stays; the waits around
+    // it are caps for a hang, as wide as a loaded machine needs. What shows
+    // that the bound ended the write (and that the next write was refused
+    // without waiting out a bound of its own) is the product's reason text.
     let started = std::time::Instant::now();
     let error = tokio::time::timeout(
-        Duration::from_secs(20),
+        LOADED_BUDGET,
         client.request(
             "workspace/symbol",
             json!({"query": "x".repeat(4 * 1024 * 1024)}),
@@ -1264,26 +1325,24 @@ async fn a_server_that_stops_reading_fails_the_write_within_the_timeout() {
         "{error:#}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
+        started.elapsed() < LOADED_BUDGET,
+        "the write bound ended the request after {:?}: {error:#}",
         started.elapsed()
     );
 
     let again = std::time::Instant::now();
     let later = tokio::time::timeout(
-        Duration::from_secs(10),
+        LOADED_BUDGET,
         client.request("workspace/symbol", json!({"query": "x"})),
     )
     .await
     .expect("a write after a timed-out write must fail at once")
     .unwrap_err();
+    // A write that waited out a bound of its own would say "did not take a
+    // message within 2 seconds" instead.
     assert!(
         format!("{later:#}").contains("stopped reading its input"),
-        "{later:#}"
-    );
-    assert!(
-        again.elapsed() < Duration::from_secs(1),
-        "{:?}",
+        "refused after {:?}: {later:#}",
         again.elapsed()
     );
     client.shutdown(Duration::from_secs(1)).await;
@@ -1722,9 +1781,10 @@ async fn wait_until_process_ends(what: &str, pid: u32, deadline: Duration) {
 }
 
 /// How long the operating system and `tasklist` get to show a process as ended
-/// once the call that stopped it has returned.
+/// once the call that stopped it has returned (a cap, not a duration: `tasklist`
+/// itself takes seconds on a loaded machine).
 #[cfg(windows)]
-const PROCESS_END_SLACK: Duration = Duration::from_secs(5);
+const PROCESS_END_SLACK: Duration = LOADED_BUDGET;
 
 /// A language server is often not the process that does the work: a `.cmd`
 /// shim, a `rustup` proxy or a `node.exe` behind `cmd.exe` start it, and
@@ -1738,7 +1798,10 @@ const PROCESS_END_SLACK: Duration = Duration::from_secs(5);
 async fn discarding_a_session_ends_the_processes_its_server_started() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
-    config.lsp_timeout_seconds = 2;
+    // The sleeper holds the dead server's pipes, so the first request waits
+    // out the inactivity timeout before the restart: 12 s, not the 30 s
+    // loaded budget, like the sibling test below.
+    config.lsp_timeout_seconds = 12;
     config.csharp.args.extend(fake_args(&[
         "--spawn-grandchild",
         "--exit-on-symbol-request",
@@ -1997,18 +2060,18 @@ async fn a_released_server_loses_its_processes_while_a_request_still_holds_its_c
 /// The same for a discard whose shutdown finds the server already gone (the
 /// cooperative branch of the shutdown, which also ends the tree). The first
 /// server dies on the request after the priming one, but its sleeper keeps the
-/// server's pipes open, so the request fails by the 6 s inactivity timeout
+/// server's pipes open, so the request fails by the 12 s inactivity timeout
 /// rather than at once, and the session is discarded. The replacement stalls
 /// on the repeated request for 30 s, so the call holds the discarded session's
-/// client (a local of its retry) until its own 6 s timeout runs out, about
-/// 4 s after the discard's shutdown (a 2 s wait for the answer it never gets)
+/// client (a local of its retry) until its own 12 s timeout runs out, about
+/// 10 s after the discard's shutdown (a 2 s wait for the answer it never gets)
 /// has ended the tree.
 #[cfg(windows)]
 #[tokio::test]
 async fn a_discarded_server_loses_its_processes_while_a_request_still_holds_its_client() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_release_fixture(&temp);
-    config.lsp_timeout_seconds = 6;
+    config.lsp_timeout_seconds = 12;
     config.csharp.args.extend(fake_args(&[
         "--spawn-grandchild",
         "--exit-on-symbol-request",
@@ -2035,7 +2098,7 @@ async fn a_discarded_server_loses_its_processes_while_a_request_still_holds_its_
     // one the repeated request it stalls on.
     wait_until(
         "the repeated request to reach the replacement server",
-        Duration::from_secs(30),
+        2 * LOADED_BUDGET,
         async || state_count_so_far(&state, "request_count.txt") >= 8,
     )
     .await;
@@ -2043,7 +2106,7 @@ async fn a_discarded_server_loses_its_processes_while_a_request_still_holds_its_
     wait_until_process_ends(
         "the process the discarded server started to end while a request still holds its client",
         discarded,
-        Duration::from_secs(4),
+        LOADED_BUDGET,
     )
     .await;
     assert!(
@@ -2233,18 +2296,13 @@ fn second_workspace(temp: &tempfile::TempDir, config: &Config) -> Workspace {
     Workspace::resolve(&path, &config.data_dir).unwrap()
 }
 
-/// A C# fixture for the idle and release tests. They never depend on a 1 s
-/// request timeout, and the fixture's 1 s would make a slow process start
-/// under load fail their `initialize` (so would 5 s: a timed-out start is a
-/// transport failure, and its retry spawns a server the test did not count),
-/// so this one allows [`LOADED_BUDGET_SECONDS`]. A test about the timeout sets
-/// its own.
+/// A C# fixture for the idle and release tests; since the base fixtures allow
+/// [`LOADED_BUDGET_SECONDS`], this is the one with the idle and release
+/// tests' mode. A test about the timeout sets its own.
 fn fake_csharp_release_fixture(
     temp: &tempfile::TempDir,
 ) -> (Config, Workspace, std::path::PathBuf) {
-    let (mut config, workspace, state) = fake_csharp_fixture(temp, "workspace-symbols");
-    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
-    (config, workspace, state)
+    fake_csharp_fixture(temp, "workspace-symbols")
 }
 
 #[cfg(unix)]
@@ -2701,7 +2759,6 @@ async fn a_retried_symbol_request_is_not_cut_off_by_the_idle_sweep() {
 async fn a_retried_position_request_is_not_cut_off_by_the_idle_sweep() {
     let temp = tempfile::tempdir().unwrap();
     let (mut config, workspace, state) = fake_csharp_fixture(&temp, "definition");
-    config.lsp_timeout_seconds = 5;
     config.lsp_idle_timeout_seconds = 1;
     config.csharp.args.extend(fake_args(&[
         "--exit-on-definition-request",
@@ -2965,7 +3022,7 @@ async fn cancelling_release_still_stops_a_server_with_an_in_flight_request() {
         server,
         // The grace window plus the same slack the other process-end waits
         // give a loaded machine to show the process as ended.
-        2 * local_code_intelligence::lsp::SHUTDOWN_GRACE + Duration::from_secs(5),
+        2 * local_code_intelligence::lsp::SHUTDOWN_GRACE + LOADED_BUDGET,
     )
     .await;
     assert_eq!(event_count(&state, "exit_seen.txt"), 1);
@@ -5460,6 +5517,8 @@ fn shapes_fixture(
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    // The version probe of `lsp.live` is bounded by this (5 s failed under load).
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     write(&workspace.path, "src/Shapes.cs", SHAPES_CS);
     let index = shapes_scip_index(temp);
@@ -5678,9 +5737,13 @@ async fn lsp_live_implements_edges_sit_at_the_places_the_server_answered() {
     let scip = ScipMap::with_default_ids(ScipGraph::load(&index, None).unwrap());
     let places = Arc::new(ScipPlaces::from_scip(&scip));
     let manager = Arc::new(Manager::new(&config));
-    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
-        .await
-        .unwrap();
+    let backend = ManagerBackend::open_with_probe_timeout(
+        workspace.clone(),
+        Arc::clone(&manager),
+        LOADED_BUDGET,
+    )
+    .await
+    .unwrap();
     let map = LspLive::new(Box::new(backend), places).implementations(true);
     let seed = scip.node_id(0).clone();
     assert_eq!(seed.to_string(), AREA_SEED);
@@ -5724,9 +5787,13 @@ async fn lsp_live_implements_edges_sit_at_the_places_the_server_answered() {
     assert_eq!(requests_of(&state, "textDocument/implementation"), 1);
 
     // The default: no Implements edge, no implementation request.
-    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
-        .await
-        .unwrap();
+    let backend = ManagerBackend::open_with_probe_timeout(
+        workspace.clone(),
+        Arc::clone(&manager),
+        LOADED_BUDGET,
+    )
+    .await
+    .unwrap();
     let off = LspLive::new(Box::new(backend), Arc::new(ScipPlaces::from_scip(&scip)));
     let found = off.expand(&seed, wide(), &view).await;
     assert!(
