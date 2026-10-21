@@ -81,6 +81,9 @@ fn table() -> Arc<Table> {
 struct Fake {
     definitions: HashMap<Place, Vec<Place>>,
     references: HashMap<Place, Vec<Place>>,
+    implementations: HashMap<Place, Vec<Place>>,
+    /// `Some`: every implementation request fails with this text.
+    implementation_error: Option<String>,
     members: HashMap<String, Vec<Member>>,
     delay: Duration,
     requests: Arc<AtomicU32>,
@@ -113,6 +116,14 @@ impl LspBackend for Fake {
 
     async fn references(&self, at: &Place) -> Result<Vec<Place>, String> {
         self.answer(self.references.get(at)).await
+    }
+
+    async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String> {
+        let answer = self.answer(self.implementations.get(at)).await;
+        match &self.implementation_error {
+            Some(error) => Err(error.clone()),
+            None => answer,
+        }
     }
 
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
@@ -224,6 +235,115 @@ async fn definition_references_and_document_symbols_become_exact_edges() {
         assert_eq!(found.cost.nodes_touched, want.len() as u64, "{label}");
         assert!(map.last_error().is_none(), "{label}");
     }
+}
+
+/// `x` is implemented at `b`'s name, inside `c` (not at its name), in a file
+/// the index has no symbol for, and, once more, at `x` itself.
+fn fake_with_implementations() -> Fake {
+    Fake {
+        implementations: HashMap::from([(
+            place("src/x.rs", 0, 3),
+            vec![
+                place("src/b.rs", 10, 3),
+                place("src/c.rs", 6, 1),
+                place("src/z.rs", 0, 0),
+                place("src/x.rs", 0, 3),
+            ],
+        )]),
+        ..Fake::default()
+    }
+}
+
+#[tokio::test]
+async fn the_implementation_request_is_third_and_gated_by_the_key_and_the_budget() {
+    let implements = |map: &LspLive, found: &Expanded| -> Vec<(NodeId, String, u32, u32)> {
+        check_edge_invariants(&sym("x"), map.describe(), &found.edges, EXPAND_LIMIT).unwrap();
+        found
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Implements)
+            .map(|edge| {
+                assert_eq!(edge.src, sym("x"));
+                assert_eq!(edge.witness, WitnessClass::Exact);
+                assert_eq!((edge.map, edge.conf), (LSP_LIVE_ID, CONF_MAX));
+                let site = edge.site.as_ref().unwrap();
+                (edge.dst.clone(), site.path.clone(), site.line, site.col)
+            })
+            .collect()
+    };
+    let wide = || budget(Duration::from_secs(5), 10);
+
+    // Key on: three requests, one edge per destination, the node itself left
+    // out, the destination of a place no symbol is defined at the enclosing
+    // symbol, else the file.
+    let backend = fake_with_implementations();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).implementations(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    let mut want = vec![
+        (sym("b"), "src/b.rs".to_owned(), 10, 3),
+        (sym("c"), "src/c.rs".to_owned(), 6, 1),
+        (file("src/z.rs"), "src/z.rs".to_owned(), 0, 0),
+    ];
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(implements(&map, &found), want);
+    assert_eq!(found.edges.len(), 3, "the other two requests found nothing");
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(found.cost.external_calls, 3);
+    assert!(map.last_error().is_none());
+
+    // Key off (the default): today's two requests and no Implements edge.
+    let backend = fake_with_implementations();
+    let requests = backend.requests.clone();
+    let map = map_over(backend);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert!(implements(&map, &found).is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(found.cost.external_calls, 2);
+
+    // Key on with room for two calls: the third is not made.
+    let backend = fake_with_implementations();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).implementations(true);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 2), &view())
+        .await;
+    assert!(implements(&map, &found).is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(found.cost.external_calls, 2);
+
+    // A file node asks for its symbols only.
+    let backend = fake_with_implementations();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).implementations(true);
+    map.expand(&file("src/x.rs"), wide(), &view()).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_implementation_error_keeps_the_other_edges() {
+    let mut backend = fake();
+    backend.implementation_error = Some("no implementation provider".to_owned());
+    let requests = backend.requests.clone();
+    let map = map_over(backend).implementations(true);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 10), &view())
+        .await;
+    // `fake()` defines `x` at `b`'s name: that edge stands.
+    let got: Vec<(EdgeKind, NodeId)> = found
+        .edges
+        .iter()
+        .map(|edge| (edge.kind, edge.dst.clone()))
+        .collect();
+    assert_eq!(got, [(EdgeKind::CallsOrRefs, sym("b"))]);
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(found.cost.external_calls, 3);
+    let error = map.last_error().expect("the failure is recorded");
+    assert!(
+        error.starts_with("textDocument/implementation: ")
+            && error.contains("no implementation provider"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

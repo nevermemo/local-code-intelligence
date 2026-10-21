@@ -5295,3 +5295,354 @@ async fn a_shared_traverse_server_outlives_the_walk_and_goes_with_release() {
         "the offered manager never held a session"
     );
 }
+
+// ---- `lsp.live` implementation edges (K9a) ---------------------------------
+
+/// At an interface member the documents-mode fake answers the same-named
+/// members of the implementing types, in document order; at an implementing
+/// member, nothing. (At a type name it answers its subtypes, as before.)
+#[tokio::test]
+async fn documents_fake_answers_implementation_at_an_interface_member() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write(&root, "src/Shapes.cs", SHAPES_CS);
+    let fake = DocumentsFake::start_on(&temp, root).await;
+    let lines: Vec<&str> = SHAPES_CS.lines().collect();
+    let area = |line: usize| (line as u32, lines[line].find("Area").unwrap() as u32);
+
+    let at_interface = fake
+        .at("textDocument/implementation", "src/Shapes.cs", area(0))
+        .await;
+    assert_eq!(
+        fake.places(&at_interface),
+        [
+            place("src/Shapes.cs", area(1)),
+            place("src/Shapes.cs", area(2))
+        ]
+    );
+    let at_circle = fake
+        .at("textDocument/implementation", "src/Shapes.cs", area(1))
+        .await;
+    assert!(fake.places(&at_circle).is_empty(), "{at_circle}");
+    fake.finish().await;
+}
+
+/// A SCIP index over `src/Shapes.cs` ([`SHAPES_CS`]) with the three `Area`
+/// methods (`IShape`, `Circle`, `Square`), one per line. The three share a
+/// name, kind and file, so their node ids differ by the disambiguator, in
+/// graph order: `Area/method`, `Area/method~1`, `Area/method~2`. It lives next
+/// to the workspace, never in it.
+#[allow(clippy::field_reassign_with_default)] // the generated messages have no builders
+fn shapes_scip_index(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    use scip::types::{Document, Index, Occurrence, SymbolInformation, symbol_information::Kind};
+    let mut document = Document::default();
+    document.relative_path = "src/Shapes.cs".to_owned();
+    for (line, owner) in ["IShape", "Circle", "Square"].into_iter().enumerate() {
+        let text = SHAPES_CS.lines().nth(line).unwrap();
+        let col = text.find("Area").unwrap() as i32;
+        let symbol = format!("rust-analyzer cargo demo 0.1.0 acceptance/{owner}#Area().");
+        let mut occurrence = Occurrence::default();
+        occurrence.range = vec![line as i32, col, col + 4];
+        occurrence.symbol = symbol.clone();
+        occurrence.symbol_roles = 1;
+        occurrence.enclosing_range = vec![line as i32, 0, line as i32, text.len() as i32];
+        document.occurrences.push(occurrence);
+        let mut info = SymbolInformation::default();
+        info.symbol = symbol;
+        info.kind = Kind::Method.into();
+        document.symbols.push(info);
+    }
+    let mut message = Index::default();
+    message.documents = vec![document];
+    let index = temp.path().join("shapes.scip");
+    scip::write_message_to_file(&index, message).unwrap();
+    index
+}
+
+/// The C# fixture with `src/Shapes.cs` written into the workspace and the
+/// `documents`-mode fake (a request timeout a slow start under load does not
+/// exceed; rust-analyzer is pointed at a binary that does not exist).
+fn shapes_fixture(
+    temp: &tempfile::TempDir,
+) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
+    let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
+    config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    write(&workspace.path, "src/Shapes.cs", SHAPES_CS);
+    let index = shapes_scip_index(temp);
+    (config, workspace, state, index)
+}
+
+/// What the documents fake answers for `textDocument/implementation` at the
+/// `Area` of `IShape`, asked raw (0-based line, column).
+async fn raw_implementations_of_area(workspace: &Workspace) -> Vec<(String, u64, u64)> {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = DocumentsFake::start_on(&temp, workspace.path.clone()).await;
+    let answer = fake
+        .at(
+            "textDocument/implementation",
+            "src/Shapes.cs",
+            position_of(SHAPES_CS, "Area"),
+        )
+        .await;
+    let places = fake.places(&answer);
+    fake.finish().await;
+    places
+}
+
+/// How many requests of `method` the fake server at `state` received.
+fn requests_of(state: &std::path::Path, method: &str) -> usize {
+    std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["method"] == method)
+        .count()
+}
+
+const AREA_SEED: &str = "sym:rust:Shapes.cs::Area/method";
+
+/// One `lsp.live` walk of the seed alone (`max_depth` 1: the seed is expanded
+/// once, what it reaches is not), under `profile`.
+async fn traverse_area(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    profile: &local_code_intelligence::config::RunProfileConfig,
+) -> local_code_intelligence::app::traverse::Report {
+    use local_code_intelligence::{
+        app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
+        config::{TraverseConfig, TraverseFirstStage},
+    };
+    let limits = TraverseConfig {
+        enabled: true,
+        first_stage: TraverseFirstStage::Off,
+        answer_seeds: false,
+        exact_seeds: false,
+        deadline_ms: 60_000,
+        ..TraverseConfig::default()
+    };
+    let (budget, steer) = (
+        BudgetArgs {
+            deadline_ms: Some(60_000),
+            max_depth: Some(1),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let maps = [lci_maps::lsp_live::LSP_LIVE_ID.to_owned()];
+    let seeds = [AREA_SEED.to_owned()];
+    let call = Call {
+        scip_index: index,
+        scip_root: Some(&workspace.path),
+        question: "who implements Area",
+        seeds: &seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: Some(config),
+        lsp_sessions: None,
+    };
+    run(&limits, profile, &Dirs::under(&config.data_dir), &call)
+        .await
+        .unwrap()
+}
+
+/// The destinations of the `lsp.live` hops out of the seed in a trace. A hop
+/// carries the best edge's kind only, and the documents fake answers
+/// `definition` by simple name (it names the implementing members too), so
+/// the walk cannot tell the kinds apart here; the edges are checked in
+/// `lsp_live_implements_edges_sit_at_the_places_the_server_answered`.
+fn lsp_live_hops(report: &local_code_intelligence::app::traverse::Report) -> Vec<String> {
+    let events = lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap();
+    let mut hops: Vec<String> = events
+        .iter()
+        .filter(|event| {
+            event["ev"] == "hop" && event["map"] == "lsp.live" && event["src"] == AREA_SEED
+        })
+        .map(|event| event["dst"].as_str().unwrap().to_owned())
+        .collect();
+    hops.sort();
+    hops
+}
+
+/// The ceiling of the implementation request: with the key on, a walk of the
+/// interface member asks the server `textDocument/implementation` once, pays
+/// the third external call, and reaches the places the server answers; with
+/// it off (the default) the same walk asks none and pays two.
+#[tokio::test]
+async fn lsp_live_implementations_ask_once_and_pay_the_third_call() {
+    use local_code_intelligence::config::{LspProfile, RunProfileConfig};
+    let profile = |implementations| RunProfileConfig {
+        lsp: LspProfile {
+            implementations,
+            ..LspProfile::default()
+        },
+        ..RunProfileConfig::default()
+    };
+
+    // The server's own answer: Circle.Area and Square.Area, at lines 1 and 2.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let raw = raw_implementations_of_area(&workspace).await;
+    let lines: Vec<&str> = SHAPES_CS.lines().collect();
+    let area = |line: usize| lines[line].find("Area").unwrap() as u64;
+    assert_eq!(
+        raw,
+        [
+            ("src/Shapes.cs".to_owned(), 1, area(1)),
+            ("src/Shapes.cs".to_owned(), 2, area(2))
+        ]
+    );
+
+    // Key on: the destinations are the two implementing members, no other.
+    let report = traverse_area(&config, &workspace, &index, &profile(true)).await;
+    assert_eq!(
+        lsp_live_hops(&report),
+        [
+            "sym:rust:Shapes.cs::Area/method~1",
+            "sym:rust:Shapes.cs::Area/method~2"
+        ],
+        "{}",
+        report.response
+    );
+    assert_eq!(
+        requests_of(&state, "textDocument/implementation"),
+        1,
+        "one implementation request for the one expansion"
+    );
+    assert_eq!(requests_of(&state, "textDocument/definition"), 1);
+    assert_eq!(requests_of(&state, "textDocument/references"), 1);
+    assert_eq!(report.response["totals"]["external_calls"], 3);
+    // Each reached card sits where the server said (the cards' sites count
+    // from 1).
+    let cards = report.response["results"].as_array().unwrap();
+    let sites: Vec<(String, u64, u64)> = raw
+        .iter()
+        .map(|(path, line, col)| (path.clone(), line + 1, col + 1))
+        .collect();
+    let mut reached: Vec<(String, u64, u64)> = cards
+        .iter()
+        .filter(|card| card.to_string().contains("lsp.live"))
+        .map(|card| {
+            let site = &card["site"];
+            (
+                site["path"].as_str().unwrap().to_owned(),
+                site["line"].as_u64().unwrap(),
+                site["col"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    reached.sort();
+    assert_eq!(reached, sites, "{}", report.response);
+
+    // Key off: the same walk makes no implementation request.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let report = traverse_area(&config, &workspace, &index, &profile(false)).await;
+    // The hops are the same: the fake's `definition` names the same places and
+    // `CallsOrRefs` wins the tie. The request count and `external_calls` are
+    // what tell the two runs apart.
+    assert_eq!(
+        lsp_live_hops(&report),
+        [
+            "sym:rust:Shapes.cs::Area/method~1",
+            "sym:rust:Shapes.cs::Area/method~2"
+        ],
+        "{}",
+        report.response
+    );
+    assert_eq!(report.response["totals"]["external_calls"], 2);
+    assert_eq!(requests_of(&state, "textDocument/definition"), 1);
+    assert_eq!(requests_of(&state, "textDocument/references"), 1);
+    assert_eq!(
+        requests_of(&state, "textDocument/implementation"),
+        0,
+        "no implementation request with the key off"
+    );
+}
+
+/// The edges themselves, not only where the walk goes: `lsp.live` over the
+/// real manager and the documents fake gives `Implements` edges from the
+/// interface member to the two members, each at the place the server's raw
+/// answer names, and no other `Implements` edge; with the key off it gives
+/// none and asks nothing more.
+#[tokio::test]
+async fn lsp_live_implements_edges_sit_at_the_places_the_server_answered() {
+    use lci_maps::{
+        Budget, EdgeKind, Map, SnapshotRef, SnapshotView,
+        lsp_live::{LspLive, ManagerBackend, ScipPlaces},
+        scip_graph::{ScipGraph, ScipMap},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let raw = raw_implementations_of_area(&workspace).await;
+    assert_eq!(raw.len(), 2, "{raw:?}");
+
+    let scip = ScipMap::with_default_ids(ScipGraph::load(&index, None).unwrap());
+    let places = Arc::new(ScipPlaces::from_scip(&scip));
+    let manager = Arc::new(Manager::new(&config));
+    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
+        .await
+        .unwrap();
+    let map = LspLive::new(Box::new(backend), places).implementations(true);
+    let seed = scip.node_id(0).clone();
+    assert_eq!(seed.to_string(), AREA_SEED);
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let wide = || Budget {
+        deadline: std::time::Instant::now() + Duration::from_secs(60),
+        max_external_calls: 10,
+        max_nodes_touched: u64::MAX,
+    };
+    let found = map.expand(&seed, wide(), &view).await;
+    assert!(map.last_error().is_none(), "{:?}", map.last_error());
+    let got: Vec<(EdgeKind, String, u64, u64)> = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Implements)
+        .map(|edge| {
+            let site = edge.site.as_ref().unwrap();
+            assert_eq!(site.path, "src/Shapes.cs");
+            (
+                edge.kind,
+                edge.dst.to_string(),
+                u64::from(site.line),
+                u64::from(site.col),
+            )
+        })
+        .collect();
+    let want: Vec<(EdgeKind, String, u64, u64)> = raw
+        .iter()
+        .zip(["~1", "~2"])
+        .map(|((_, line, col), suffix)| {
+            (
+                EdgeKind::Implements,
+                format!("{AREA_SEED}{suffix}"),
+                *line,
+                *col,
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(found.cost.external_calls, 3);
+    assert_eq!(requests_of(&state, "textDocument/implementation"), 1);
+
+    // The default: no Implements edge, no implementation request.
+    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
+        .await
+        .unwrap();
+    let off = LspLive::new(Box::new(backend), Arc::new(ScipPlaces::from_scip(&scip)));
+    let found = off.expand(&seed, wide(), &view).await;
+    assert!(
+        found
+            .edges
+            .iter()
+            .all(|edge| edge.kind != EdgeKind::Implements)
+    );
+    assert_eq!(found.cost.external_calls, 2);
+    assert_eq!(requests_of(&state, "textDocument/implementation"), 1);
+    manager.shutdown_all().await;
+}
