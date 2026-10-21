@@ -14,9 +14,9 @@
 //! being present.
 
 use crate::config::TypeScriptLspConfig;
-use crate::lsp::adapter::{LspAdapter, read_for_did_open};
+use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -137,40 +137,38 @@ impl LspAdapter for TypeScriptServer {
         false
     }
 
+    // A file whose text changed since this session sent it is sent again and
+    // refused by the server as today, so an edit is not synced until
+    // `didChange` is sent (roadmap K7c).
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
+        sent: &SentTexts,
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let Some(content) = read_for_did_open(file, relative, "typescript-language-server").await?
-        else {
-            return Ok(());
-        };
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        rpc.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language_id_for(relative),
-                    "version": 1,
-                    "text": content
-                }
-            }),
+        if open_if_changed(
+            rpc,
+            sent,
+            file,
+            relative,
+            "typescript-language-server",
+            language_id_for(relative),
         )
-        .await?;
-        // tsserver processes a newly opened file (parsing it and resolving
-        // its imports into the project graph) asynchronously; a definition/
-        // references request issued immediately after didOpen can race
-        // ahead of that and see an empty result, especially for a freshly
-        // spawned, one-shot-CLI-invocation process with no warm project
-        // state to reuse. Give it a bounded, best-effort head start, the
-        // same kind of fallback rust-analyzer's adapter uses.
-        let head_start = self.timeout.min(Duration::from_secs(3));
-        tokio::time::sleep(head_start).await;
+        .await?
+        .is_some()
+        {
+            // tsserver processes a newly opened file (parsing it and
+            // resolving its imports into the project graph) asynchronously;
+            // a definition/references request issued immediately after
+            // didOpen can race ahead of that and see an empty result,
+            // especially for a freshly spawned, one-shot-CLI-invocation
+            // process with no warm project state to reuse. Give it a
+            // bounded, best-effort head start, the same kind of fallback
+            // rust-analyzer's adapter uses. Only a newly sent text needs it.
+            let head_start = self.timeout.min(Duration::from_secs(3));
+            tokio::time::sleep(head_start).await;
+        }
         Ok(())
     }
 }

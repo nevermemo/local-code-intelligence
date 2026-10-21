@@ -17,9 +17,9 @@
 //! (`--compile-commands-dir=...`); this adapter does not generate one.
 
 use crate::config::ClangdLspConfig;
-use crate::lsp::adapter::{LspAdapter, read_for_did_open};
+use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -130,9 +130,9 @@ impl LspAdapter for ClangdServer {
         Box::new(|_| false)
     }
 
-    // The hook sends the current disk text on every request, and
-    // clangd's didOpen is `addDocument`, which replaces the contents of
-    // a file it already has open.
+    // The hook sends the current disk text whenever it differs from what
+    // this session sent, and clangd's didOpen is `addDocument`, which
+    // replaces the contents of a file it already has open.
     fn opens_documents(&self) -> bool {
         true
     }
@@ -140,33 +140,29 @@ impl LspAdapter for ClangdServer {
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
+        sent: &SentTexts,
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let Some(content) = read_for_did_open(file, relative, "clangd").await? else {
-            return Ok(());
-        };
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        rpc.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language_id_for(relative),
-                    "version": 1,
-                    "text": content
-                }
-            }),
+        if open_if_changed(
+            rpc,
+            sent,
+            file,
+            relative,
+            "clangd",
+            language_id_for(relative),
         )
-        .await?;
-        // Mirrors the Python/TypeScript/Go adapters' bounded head start:
-        // clangd parses and indexes a newly opened file asynchronously, so
-        // a request issued immediately after didOpen can race ahead and see
-        // no definition/references yet.
-        let head_start = self.timeout.min(Duration::from_secs(3));
-        tokio::time::sleep(head_start).await;
+        .await?
+        .is_some()
+        {
+            // Mirrors the Python/TypeScript/Go adapters' bounded head start:
+            // clangd parses and indexes a newly opened file asynchronously,
+            // so a request issued immediately after didOpen can race ahead
+            // and see no definition/references yet. Only a newly sent text
+            // needs it.
+            let head_start = self.timeout.min(Duration::from_secs(3));
+            tokio::time::sleep(head_start).await;
+        }
         Ok(())
     }
 }

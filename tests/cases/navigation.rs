@@ -3913,6 +3913,96 @@ async fn a_file_above_the_did_open_cap_is_navigated_without_sending_its_text() {
     assert_eq!(did_opens(&state), opened, "the oversized file was not sent");
 }
 
+/// One language's fake server, asked for the same definition twice, then once
+/// more after the file's text changed. The oracle is the fake's
+/// `did_open_seen.txt`, one line per `didOpen` it received.
+async fn assert_a_file_is_opened_once_per_text(
+    language: &str,
+    secondary: &str,
+    definition_at: (u32, u32),
+    fixture: impl Fn(&tempfile::TempDir, &str) -> (Config, Workspace, std::path::PathBuf),
+    adapter_of: impl Fn(&Manager) -> Arc<dyn LspAdapter>,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, state) = fixture(&temp, "definition");
+    for args in [&mut config.typescript.args, &mut config.python.args] {
+        args.push("--answer-unhandled".to_owned());
+    }
+    let manager = Manager::new(&config);
+    let adapter = adapter_of(&manager);
+    let file = workspace.path.join(secondary);
+    let definition = async || {
+        manager
+            .definition(
+                &adapter,
+                &workspace,
+                &file,
+                secondary,
+                definition_at.0,
+                definition_at.1,
+            )
+            .await
+            .unwrap()
+    };
+
+    assert!(!definition().await.is_empty(), "{language}: first answer");
+    assert_eq!(event_count(&state, "did_open_seen.txt"), 1, "{language}");
+    assert!(!definition().await.is_empty(), "{language}: second answer");
+    assert_eq!(
+        event_count(&state, "did_open_seen.txt"),
+        1,
+        "{language}: an unchanged file is not opened again"
+    );
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        1,
+        "{language}: one session served both"
+    );
+
+    let mut edited = std::fs::read_to_string(&file).unwrap();
+    edited.push('\n');
+    std::fs::write(&file, edited).unwrap();
+    assert!(!definition().await.is_empty(), "{language}: third answer");
+    assert_eq!(
+        event_count(&state, "did_open_seen.txt"),
+        2,
+        "{language}: the edited text is sent"
+    );
+    assert!(!definition().await.is_empty(), "{language}: fourth answer");
+    assert_eq!(
+        event_count(&state, "did_open_seen.txt"),
+        2,
+        "{language}: the edited text is sent once"
+    );
+}
+
+/// A repeat request on an unchanged file sends no `didOpen`, so it also pays
+/// none of the adapter's wait for the server to take the file in. Without the
+/// hash check the counts read 2 and 4.
+#[tokio::test]
+async fn a_second_request_on_an_unchanged_file_sends_no_second_did_open() {
+    tokio::time::timeout(2 * LOADED_BUDGET, async {
+        tokio::join!(
+            assert_a_file_is_opened_once_per_text(
+                "typescript",
+                "src/CallSite.ts",
+                (1, 40),
+                fake_typescript_fixture,
+                typescript_adapter,
+            ),
+            assert_a_file_is_opened_once_per_text(
+                "python",
+                "src/CallSite.py",
+                (1, 30),
+                fake_python_fixture,
+                python_adapter,
+            ),
+        );
+    })
+    .await
+    .expect("within the outer bound");
+}
+
 #[tokio::test]
 async fn csharp_lsp_timeout_fails_open_for_search_and_errors_for_navigation() {
     let (temp, mut config, _fake, task) = fixture().await;

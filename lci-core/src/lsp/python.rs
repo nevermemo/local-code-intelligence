@@ -11,9 +11,9 @@
 //! blocks further work until that reply arrives).
 
 use crate::config::PythonLspConfig;
-use crate::lsp::adapter::{LspAdapter, read_for_did_open};
+use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -127,9 +127,9 @@ impl LspAdapter for PythonServer {
             .await
     }
 
-    // The hook sends the current disk text on every request, and
-    // pyright replaces an open document's text on a repeated didOpen
-    // (it logs the redundant open and applies the new text).
+    // The hook sends the current disk text whenever it differs from what
+    // this session sent, and pyright replaces an open document's text on a
+    // repeated didOpen (it logs the redundant open and applies the new text).
     fn opens_documents(&self) -> bool {
         true
     }
@@ -137,33 +137,23 @@ impl LspAdapter for PythonServer {
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
+        sent: &SentTexts,
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let Some(content) = read_for_did_open(file, relative, "pyright").await? else {
-            return Ok(());
-        };
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        rpc.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "python",
-                    "version": 1,
-                    "text": content
-                }
-            }),
-        )
-        .await?;
-        // Mirrors the TypeScript adapter's bounded head start: pyright
-        // processes a newly opened file and its workspace scan
-        // asynchronously, so a request issued immediately after didOpen can
-        // race ahead and see no definition/references yet.
-        let head_start = self.timeout.min(Duration::from_secs(3));
-        tokio::time::sleep(head_start).await;
+        if open_if_changed(rpc, sent, file, relative, "pyright", "python")
+            .await?
+            .is_some()
+        {
+            // Mirrors the TypeScript adapter's bounded head start: pyright
+            // processes a newly opened file and its workspace scan
+            // asynchronously, so a request issued immediately after didOpen
+            // can race ahead and see no definition/references yet. Only a
+            // newly sent text needs it; a repeat request on an unchanged
+            // file pays nothing.
+            let head_start = self.timeout.min(Duration::from_secs(3));
+            tokio::time::sleep(head_start).await;
+        }
         Ok(())
     }
 }
