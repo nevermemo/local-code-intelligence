@@ -73,7 +73,7 @@ pub struct TypeStats {
 }
 
 /// A bench out dir's set runs: (out dir, set, the `raw` dir).
-fn set_runs(root: &Path) -> Result<Vec<(PathBuf, Set, PathBuf)>> {
+pub(super) fn set_runs(root: &Path) -> Result<Vec<(PathBuf, Set, PathBuf)>> {
     let subdirs = |dir: &Path| -> Result<Vec<PathBuf>> {
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
             .with_context(|| format!("read {}", dir.display()))?
@@ -311,7 +311,7 @@ pub fn fit_runs(
 
 /// The site of every symbol of a SCIP index, by node id, as the CLI's cards
 /// give it (the line of the name, counted from 1).
-fn scip_sites(index: &Path) -> Result<HashMap<String, Site>> {
+pub(super) fn scip_sites(index: &Path) -> Result<HashMap<String, Site>> {
     let graph = ScipGraph::load(index, None).map_err(|e| anyhow!(e))?;
     let map = ScipMap::with_default_ids(graph);
     Ok(map

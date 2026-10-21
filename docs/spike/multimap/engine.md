@@ -210,6 +210,19 @@ first 16 hex digits of SHA-256. Events: `start`, `expand`, `hop`, `relax`, `alt_
 `outcome` `applied`, `uncertain` or `returned`; cites `inputs_hash`), `return` (`escalated`, `handler_stop`, `budget`), `bound`, `resume` (names the handle), `end` (totals). `--out` writes `traces/`
 and `handles/` under another directory.
 
+Trajectory events (K33a, d444, d451): `lci traverse --trajectory` (CLI only; off everywhere else, no key, no profile-hash change) adds one `pop` event
+before the `expand` of each counted pop: `{ev, pop, free, node, priority, depth, via, parent, frontier, discovered, tokens_left, calls_left,
+candidates: [{node, priority, depth, via}..]}`, the candidates being the best 8 queued states still to expand; about 1.2 KB per event. A pop that
+is put back keeps its `pop` event (its `expand` is `dropped: "budget"`, or `cut`), and a budget put-back with `adopted` 0 leaves its `pop` one above `end.totals.pops`
+(the next call reuses the number); a put-back whose call timed out stays in `end.totals.pops`. The engine writes `"pop": totals.pops` for a free pop too, so under
+`pass_through` a free pop repeats the previous paid number: order and count pops by the `pop` events' position (`event`), not by `pop`. `cargo xtask maps trajectories` joins the events of a `maps bench --trajectory` out dir to the gold outcome
+(`xtask/src/maps/trajectories.rs`): one JSON row per pop in `<wave>/<set>/trajectories.jsonl`, `{set, wave, item, trace, event, pop, free,
+counted, state{depth, frontier, discovered, tokens_left, calls_left}, choice{node, priority, via, parent, gold}, candidates[{node, priority, depth,
+via, gold}], expand{offered, adopted, cut, dropped}|null, outcome{gold_candidate_skipped, gold_before, item{f0.5, headline metrics}}}`, and a
+summary in `trajectories.md`. `gold` is the set's own scorer on the node (`true`/`false`), `null` for a symbol no card or SCIP index located.
+`counted` is `false` for the last pop event when the trace has more pop events than `end.totals` counts (a put-back that stayed uncounted; the `expand` event decides only when a trace has no `end`); pops and the summary count from `end.totals`, and the summary's first-gold-pop ordinal is the row's position among the item's pop events; a row is at most about 2.3 KB (rows = pops, so at most
+about 46 MB for a 100-item set at 200 pops, typically a few MB). Nothing reads the rows yet (cycle 2's learned racer is the planned reader).
+
 ## Configuration keys
 
 `[traverse]` (`TraverseConfig`; comments and ranges in `config.example.toml`): `enabled` false, `scip_index` "index.scip", `max_pops` 200, `max_depth` 6, `max_est_tokens` 20000, `deadline_ms` 5000, `max_stops` 4,
