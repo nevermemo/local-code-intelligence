@@ -1091,18 +1091,48 @@ async fn recipes_over_calls_do_not_follow_a_trait_implementation() {
     assert!(names(&answer, "path").is_empty(), "{answer}");
 }
 
-/// The `rank` objects of the start events of every trace the walks left.
-fn trace_ranks(tree: &Tree) -> Vec<Value> {
+/// The start events of every trace the walks left.
+fn trace_starts(tree: &Tree) -> Vec<Value> {
     let traces = Dirs::under(&tree.dir.path().join("data")).traces;
-    let mut ranks = Vec::new();
+    let mut starts = Vec::new();
     for entry in std::fs::read_dir(traces).unwrap() {
         let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
         let start: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         if start["ev"] == "start" {
-            ranks.push(start["rank"].clone());
+            starts.push(start);
         }
     }
-    ranks
+    starts
+}
+
+/// The `rank` objects of the start events of every trace the walks left.
+fn trace_ranks(tree: &Tree) -> Vec<Value> {
+    trace_starts(tree)
+        .into_iter()
+        .map(|start| start["rank"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn flow_from_walks_under_the_run_profiles_pricing() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let plain = Tree::new();
+    plain.ask(request.clone(), false).await;
+    let starts = trace_starts(&plain);
+    assert!(!starts.is_empty());
+    assert!(starts.iter().all(|start| start.get("pricing").is_none()));
+    let profile = RunProfileConfig {
+        walk: lci_core::config::WalkProfile {
+            pricing: lci_core::config::WalkPricing::Relative,
+            ..lci_core::config::WalkProfile::default()
+        },
+        ..RunProfileConfig::default()
+    };
+    let relative = Tree::new();
+    relative.ask_under(request, false, &profile).await;
+    let starts = trace_starts(&relative);
+    assert!(!starts.is_empty());
+    assert!(starts.iter().all(|start| start["pricing"] == "relative"));
 }
 
 #[tokio::test]
@@ -1147,6 +1177,7 @@ async fn flow_from_walks_under_the_run_profile() {
         walk: lci_core::config::WalkProfile {
             groups: lci_core::config::WalkGroups::Claim,
             grep_corroboration: 0.5,
+            ..lci_core::config::WalkProfile::default()
         },
         ..RunProfileConfig::default()
     };

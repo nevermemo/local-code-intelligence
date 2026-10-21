@@ -9,7 +9,11 @@ use crate::traverse::{
 };
 
 /// Everything priced by rank: no edge is followed whole.
-const RANKED: HopPrice = HopPrice { gate: 0, beam: 16 };
+const RANKED: HopPrice = HopPrice {
+    gate: 0,
+    beam: 16,
+    pricing: Pricing::Rank,
+};
 
 fn names(result: &TraversalResult) -> Vec<String> {
     result

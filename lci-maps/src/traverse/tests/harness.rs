@@ -271,6 +271,7 @@ async fn run_with(
     .price(HopPrice {
         gate: case.price.0,
         beam: case.price.1,
+        pricing: Pricing::Rank,
     })
     .fusion(case.fusion)
     .pass_through(case.pass_through)
