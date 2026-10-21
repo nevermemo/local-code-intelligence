@@ -1293,9 +1293,10 @@ impl App {
         if !lsp_result.over_budget.is_empty() {
             // Not a warning: nothing failed, the server is just not ready
             // yet. A warning would also count the search as a fallback.
-            report
-                .notes
-                .push(self.lsp_over_budget_note(&lsp_result.over_budget));
+            report.notes.push(
+                self.lsp_over_budget_note(&lsp_result.over_budget, &report.workspace.id)
+                    .await,
+            );
             report.lsp_over_budget = lsp_result.over_budget.clone();
         }
         if !lsp_failures.is_empty() {
@@ -1842,14 +1843,28 @@ impl App {
     /// The note for providers past the LSP budget: not a warning, because
     /// nothing failed (the server is only not ready yet), and a warning
     /// would also count the search as a fallback.
-    fn lsp_over_budget_note(&self, over_budget: &[&str]) -> String {
-        format!(
+    ///
+    /// It ends with what each of those servers reports about itself (see
+    /// [`readiness_clause`]), so a slow start reads differently from a server
+    /// that is busy again; a provider without a session adds nothing.
+    async fn lsp_over_budget_note(&self, over_budget: &[&str], workspace_id: &str) -> String {
+        let mut note = format!(
             "LSP still starting or slow; symbol results from {} are missing or incomplete \
              for this search (lsp_search_budget_ms = {}). The server keeps starting in the \
              background.",
             over_budget.join(", "),
             self.config.lsp_search_budget_ms
-        )
+        );
+        let mut clauses = Vec::new();
+        for provider in over_budget {
+            if let Some(readiness) = self.analyzer.readiness(provider, workspace_id).await {
+                clauses.push(readiness_clause(provider, &readiness));
+            }
+        }
+        if !clauses.is_empty() {
+            note.push_str(&format!(" Server state: {}.", clauses.join("; ")));
+        }
+        note
     }
 
     /// One provider's `workspace/symbol` answers, one list per symbol query
@@ -2223,6 +2238,29 @@ impl App {
     }
 }
 
+/// One server's state for a note: `rust-analyzer: busy for 3 s, 2 ready
+/// changes`, `csharp-ls: starting for 12 s`, `pyright: stuck`.
+fn readiness_clause(provider: &str, readiness: &crate::lsp::ServerReadiness) -> String {
+    use crate::lsp::ServerStateName;
+    let seconds = |ms: u64| ms / 1000;
+    match readiness.state {
+        ServerStateName::Starting => {
+            format!("{provider}: starting for {} s", seconds(readiness.age_ms))
+        }
+        ServerStateName::Busy => format!(
+            "{provider}: busy for {} s, {} ready change{}",
+            seconds(readiness.changed_ms.unwrap_or(readiness.age_ms)),
+            readiness.ready_changes,
+            if readiness.ready_changes == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        other => format!("{provider}: {}", other.as_str()),
+    }
+}
+
 #[cfg(test)]
 mod fusion_properties;
 
@@ -2243,6 +2281,42 @@ mod tests {
         store::{Hit, source_role_prior},
     };
     use std::{collections::HashSet, ffi::OsString, path::PathBuf};
+
+    #[test]
+    fn the_readiness_clause_names_the_state_the_duration_and_the_changes() {
+        use crate::lsp::{ServerReadiness, ServerStateName};
+        let readiness = |state, changed_ms, ready_changes| ServerReadiness {
+            state,
+            primed: false,
+            progress: 0,
+            ready_changes,
+            age_ms: 12_300,
+            changed_ms,
+            idle_ms: 0,
+        };
+        assert_eq!(
+            super::readiness_clause(
+                "rust-analyzer",
+                &readiness(ServerStateName::Busy, Some(3_400), 2)
+            ),
+            "rust-analyzer: busy for 3 s, 2 ready changes"
+        );
+        assert_eq!(
+            super::readiness_clause(
+                "rust-analyzer",
+                &readiness(ServerStateName::Busy, Some(100), 1)
+            ),
+            "rust-analyzer: busy for 0 s, 1 ready change"
+        );
+        assert_eq!(
+            super::readiness_clause("csharp-ls", &readiness(ServerStateName::Starting, None, 0)),
+            "csharp-ls: starting for 12 s"
+        );
+        assert_eq!(
+            super::readiness_clause("pyright", &readiness(ServerStateName::Stuck, None, 0)),
+            "pyright: stuck"
+        );
+    }
 
     const RRF_K: f32 = 60.0;
 

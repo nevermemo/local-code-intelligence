@@ -154,6 +154,13 @@ pub struct Status {
     /// every registered server, `false` for one that is not running, disabled
     /// or unconfigured.
     pub analyzers_running: BTreeMap<String, bool>,
+    /// What each language server's session reports about itself, keyed like
+    /// `analyzers_running` (one entry for every registered server): `null`
+    /// when this workspace has no session for it, else its `state`
+    /// (`starting`, `ready`, `busy`, `failed` or `stuck`), whether it is
+    /// `primed`, and counters and ages in milliseconds. A report only: it
+    /// does not keep a session alive and changes no answer.
+    pub analyzers: BTreeMap<String, Option<crate::lsp::ServerReadiness>>,
     pub indexed_at_unix_seconds: Option<String>,
 }
 
@@ -651,11 +658,16 @@ impl App {
             };
         let watched = self.watchers.lock().await.contains_key(&workspace.id);
         let mut analyzers_running = BTreeMap::new();
+        let mut analyzers = BTreeMap::new();
         for adapter in self.analyzer.adapters() {
             let provider = adapter.provider();
             analyzers_running.insert(
                 provider.to_owned(),
                 self.analyzer.running(provider, &workspace.id).await,
+            );
+            analyzers.insert(
+                provider.to_owned(),
+                self.analyzer.readiness(provider, &workspace.id).await,
             );
         }
         // The deprecated per-server booleans read the same map, so they can
@@ -692,6 +704,7 @@ impl App {
             java_analyzer_running,
             clangd_analyzer_running,
             analyzers_running,
+            analyzers,
             indexed_at_unix_seconds: snapshot.map(|s| s.indexed_at),
         })
     }

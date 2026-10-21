@@ -55,6 +55,76 @@ pub struct Location {
     pub provider: Option<String>,
 }
 
+/// Where a language server's session stands, one word of a
+/// [`ServerReadiness`] (`snake_case` on the wire).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerStateName {
+    /// The session exists but the server has not finished starting.
+    Starting,
+    /// Started, and not reporting that it is busy.
+    Ready,
+    /// Started, and its last status notification said it is working again
+    /// (see [`LspAdapter::busy_predicate`]).
+    Busy,
+    /// The start failed.
+    Failed,
+    /// It has answered nothing but transient errors for `lsp_stuck_seconds`
+    /// (see [`Session::stuck`]).
+    Stuck,
+}
+
+impl ServerStateName {
+    /// The precedence: a failed start, then a start that has not finished,
+    /// then a stuck mark, then busy, else ready.
+    fn classify(failed: bool, started: bool, stuck: bool, busy: bool) -> Self {
+        if failed {
+            Self::Failed
+        } else if !started {
+            Self::Starting
+        } else if stuck {
+            Self::Stuck
+        } else if busy {
+            Self::Busy
+        } else {
+            Self::Ready
+        }
+    }
+
+    /// The word as the wire and the notes spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+            Self::Stuck => "stuck",
+        }
+    }
+}
+
+/// What one session of a language server reports about itself, for the status
+/// report and the notes of a search or a traversal. A report only: reading it
+/// changes no request, repeat or answer, and does not count as use of the
+/// session (the idle sweeper's clock is not touched).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ServerReadiness {
+    pub state: ServerStateName,
+    /// Priming (see [`PRIMING_QUERY`]) has settled.
+    pub primed: bool,
+    /// `$/progress` notifications the server has sent.
+    pub progress: u64,
+    /// Notifications that matched the adapter's ready or busy predicate; 0 for
+    /// an adapter that has none (a server that never reports it).
+    pub ready_changes: u64,
+    /// Milliseconds since the session began.
+    pub age_ms: u64,
+    /// Milliseconds since the last matching notification; `None` when none came.
+    pub changed_ms: Option<u64>,
+    /// Milliseconds since a caller last asked for the session.
+    pub idle_ms: u64,
+}
+
 /// A live JSON-RPC session with one spawned, initialized language server.
 struct GenericClient {
     rpc: Arc<JsonRpcClient>,
@@ -65,10 +135,11 @@ impl GenericClient {
         let transport = adapter
             .transport_config(&workspace.path)
             .with_context(|| format!("{} is disabled or has no executable", adapter.provider()))?;
-        let rpc = JsonRpcClient::spawn(
+        let rpc = JsonRpcClient::spawn_with_busy(
             &transport,
             &adapter.environment(),
             adapter.ready_predicate(),
+            adapter.busy_predicate(),
         )
         .await?;
         let params = adapter
@@ -292,6 +363,8 @@ struct Session {
     /// budget drops the call before the repeats end), and a cancelled call must
     /// still count.
     stuck: AtomicBool,
+    /// When the session began, for [`ServerReadiness::age_ms`].
+    began: Instant,
 }
 
 impl Session {
@@ -369,7 +442,34 @@ impl Session {
             streak: std::sync::Mutex::new(TransientStreak::default()),
             stuck_after,
             stuck: AtomicBool::new(false),
+            began: Instant::now(),
         })
+    }
+
+    /// The session's report. Touches nothing: not `last_used`, not the streak.
+    fn readiness(&self) -> ServerReadiness {
+        let client = self.ready_client();
+        let (busy, progress, changes, changed_ms) = match &client {
+            Some(client) => {
+                let state = client.rpc.state();
+                (
+                    state.busy,
+                    client.rpc.progress_count(),
+                    state.changes,
+                    (state.changes > 0).then(|| state.changed_at.elapsed().as_millis() as u64),
+                )
+            }
+            None => (false, 0, 0, None),
+        };
+        ServerReadiness {
+            state: ServerStateName::classify(self.failed(), client.is_some(), self.stuck(), busy),
+            primed: *self.primed.borrow(),
+            progress,
+            ready_changes: changes,
+            age_ms: self.began.elapsed().as_millis() as u64,
+            changed_ms,
+            idle_ms: self.idle_for().as_millis() as u64,
+        }
     }
 
     /// Records the outcome of one request sent to this session's `client`, as
@@ -1504,6 +1604,18 @@ impl Manager {
             .is_some_and(|session| session.ready_client().is_some())
     }
 
+    /// What the session of this provider and workspace reports about itself:
+    /// `None` when there is no session (never started, released, or replaced
+    /// after a failure). Like [`running`](Self::running) it does not count as
+    /// use of the session, so a status poll keeps no server alive.
+    pub async fn readiness(&self, provider: &str, workspace_id: &str) -> Option<ServerReadiness> {
+        self.sessions
+            .lock()
+            .await
+            .get(&(provider.to_string(), workspace_id.to_string()))
+            .map(|session| session.readiness())
+    }
+
     /// Starts the server of every enabled adapter for `workspace` and waits
     /// until each has finished priming, so that a later `workspace/symbol`
     /// request does not pay the start. Returns, per provider, the time the
@@ -2581,6 +2693,30 @@ mod tests {
                 "no repeat may start after the window has passed"
             );
         }
+    }
+
+    #[test]
+    fn the_server_state_word_follows_the_precedence() {
+        use ServerStateName::*;
+        // (failed, started, stuck, busy)
+        assert_eq!(
+            ServerStateName::classify(false, false, false, false),
+            Starting
+        );
+        assert_eq!(ServerStateName::classify(false, true, false, false), Ready);
+        assert_eq!(ServerStateName::classify(false, true, false, true), Busy);
+        assert_eq!(
+            ServerStateName::classify(false, true, true, true),
+            Stuck,
+            "at the limit the session is stuck, busy or not"
+        );
+        assert_eq!(ServerStateName::classify(true, false, false, false), Failed);
+        assert_eq!(
+            serde_json::to_value(Stuck).unwrap(),
+            json!("stuck"),
+            "the wire spelling is the word"
+        );
+        assert_eq!(Busy.as_str(), "busy");
     }
 
     const LIMIT: Duration = Duration::from_secs(900);

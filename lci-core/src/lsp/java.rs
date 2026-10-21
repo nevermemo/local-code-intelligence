@@ -359,6 +359,13 @@ impl LspAdapter for JavaServer {
         })
     }
 
+    fn busy_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        Box::new(|msg: &Value| {
+            msg.get("method").and_then(Value::as_str) == Some("language/status")
+                && msg["params"]["type"].as_str() == Some("Starting")
+        })
+    }
+
     async fn after_initialized(&self, rpc: &JsonRpcClient) -> Result<()> {
         rpc.notify("workspace/didChangeConfiguration", json!({"settings": {}}))
             .await
@@ -747,5 +754,24 @@ mod tests {
         assert!(!predicate(
             &json!({"method": "textDocument/publishDiagnostics"})
         ));
+    }
+
+    #[test]
+    fn the_busy_predicate_matches_the_starting_status_only() {
+        let config = config_with_java(JavaLspConfig::default());
+        let server = JavaServer::new(&config, Duration::from_secs(30));
+        let predicate = server.busy_predicate();
+        assert!(predicate(&json!({
+            "method": "language/status",
+            "params": {"type": "Starting", "message": "Init..."}
+        })));
+        assert!(!predicate(&json!({
+            "method": "language/status",
+            "params": {"type": "Started", "message": "Ready"}
+        })));
+        assert!(!predicate(&json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {"type": "Starting"}
+        })));
     }
 }

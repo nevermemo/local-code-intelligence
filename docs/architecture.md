@@ -150,11 +150,17 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
   outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,
   modules, constants; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14) takes the SCIP node's id for the same file, name and
-  nearest line, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
+  nearest line, else (a Rust file, `OutlinePlaces::with_tree`) the canonical id of the `chunk::extract_for_path` declaration around the member, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
   numbered in document order; where a file is learned its places win over the index's, which may be older than the
   tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
   `Member::end_line` is the last line of the item.
   it is recorded without dropping the edges of the first two.
+  Readiness is reported, not acted on: the transport keeps the `is_ready` latch (the adapter's `ready_predicate`
+  matched once, never cleared) and, beside it, a `watch` of `ServerState` (`busy`, `changes`, `changed_at`) fed by the
+  adapter's `busy_predicate` (default: never; rust-analyzer `quiescent: false`, jdtls `Starting`). `Manager::readiness`
+  turns a session into a `ServerReadiness` (`starting`, `ready`, `busy`, `failed` or `stuck`, primed, counters, ages)
+  without touching `last_used`; `Status.analyzers`, the search over-budget note and the `lsp.live` notes of a traverse
+  call read it. No request, repeat or answer depends on it.
   `[run_profile.lsp] sync = "watch"` (read by `Manager::new`; a per-call
   manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`
   watcher of the root (polling at `watch_poll_milliseconds` when the platform watcher fails) whose events a task

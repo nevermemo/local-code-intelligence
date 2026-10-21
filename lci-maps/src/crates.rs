@@ -71,12 +71,31 @@ impl CrateNames {
     /// of `files`, from `<root>/<directory>/Cargo.toml`. A directory whose
     /// manifest is missing or names no package keeps the directory form.
     pub fn read(root: &Path, files: &HashMap<String, CachedFile>) -> Self {
+        Self::read_directories(
+            root,
+            files
+                .iter()
+                .filter(|(_, file)| file.language == "rust")
+                .map(|(path, _)| path.as_str()),
+        )
+    }
+
+    /// [`CrateNames::read`] for the Rust files in `paths` only (a live walk
+    /// that knows one file, not the snapshot's file list): the same
+    /// `Cargo.toml` lookup. The one difference is that a name another,
+    /// unlisted crate also uses, or that is another crate's directory, cannot
+    /// be seen and is not dropped. Paths that are not Rust files are ignored.
+    pub fn read_paths(root: &Path, paths: &[&str]) -> Self {
+        Self::read_directories(
+            root,
+            paths.iter().copied().filter(|path| path.ends_with(".rs")),
+        )
+    }
+
+    fn read_directories<'p>(root: &Path, paths: impl Iterator<Item = &'p str>) -> Self {
         let mut named = BTreeMap::new();
         let mut directories = BTreeSet::new();
-        for (path, file) in files {
-            if file.language != "rust" {
-                continue;
-            }
+        for path in paths {
             let Some(directory) = crate_directory(path) else {
                 continue;
             };
@@ -208,6 +227,35 @@ mod tests {
         assert_eq!(
             crates.canonical(id("sym:rust:tools::f/fn")),
             id("sym:rust:tools::f/fn")
+        );
+    }
+
+    #[test]
+    fn read_paths_reads_the_manifest_of_the_files_crate_only() {
+        let tree = tempfile::tempdir().unwrap();
+        for (directory, name) in [("lci-core", "lci-core"), ("other", "other-crate")] {
+            let directory = tree.path().join(directory);
+            std::fs::create_dir_all(directory.join("src")).unwrap();
+            std::fs::write(
+                directory.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .unwrap();
+        }
+        let id = |text: &str| -> NodeId { text.parse().unwrap() };
+        let crates = CrateNames::read_paths(tree.path(), &["lci-core/src/a.rs", "README.md"]);
+        assert_eq!(
+            crates.canonical(id("sym:rust:lci-core::a::f/fn")),
+            id("sym:rust:lci_core::a::f/fn")
+        );
+        // The unlisted crate keeps its directory form; a root file has none.
+        assert_eq!(
+            crates.canonical(id("sym:rust:other::f/fn")),
+            id("sym:rust:other::f/fn")
+        );
+        assert_eq!(
+            CrateNames::read_paths(tree.path(), &["src/lib.rs"]),
+            CrateNames::default()
         );
     }
 
