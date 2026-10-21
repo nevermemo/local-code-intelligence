@@ -653,6 +653,11 @@ pub enum TraverseFusion {
     Boost,
     /// Weighted reciprocal rank fusion over the evidence sources.
     Rrf,
+    /// Capped log-odds over the evidence sources: each source adds
+    /// `weight * clamp(logit(potential), -3, 3)`, and a source that did not
+    /// deliver the node costs the cap.
+    #[serde(rename = "log_odds")]
+    LogOdds,
 }
 
 impl TraverseFusion {
@@ -660,7 +665,15 @@ impl TraverseFusion {
         match self {
             Self::Boost => "boost",
             Self::Rrf => "rrf",
+            Self::LogOdds => "log_odds",
         }
+    }
+
+    /// Whether the fusion ranks by the best potential each map delivered a
+    /// node with (every fusion but `boost`): the walk then records it, orders
+    /// ties by node id and has no score bound.
+    pub const fn uses_reach(self) -> bool {
+        !matches!(self, Self::Boost)
     }
 }
 
@@ -671,8 +684,9 @@ impl std::str::FromStr for TraverseFusion {
         match text {
             "boost" => Ok(Self::Boost),
             "rrf" => Ok(Self::Rrf),
+            "log_odds" => Ok(Self::LogOdds),
             other => Err(format!(
-                "fusion must be \"boost\" or \"rrf\" (got {other:?})"
+                "fusion must be \"boost\", \"rrf\" or \"log_odds\" (got {other:?})"
             )),
         }
     }
@@ -890,8 +904,12 @@ pub struct TraverseConfig {
     /// by the path potential lifted by `corroboration_boost`; `"rrf"` ranks by
     /// weighted reciprocal rank fusion over the evidence sources (one ranked
     /// list per independent map, the maps built on one graph counting as one
-    /// source), each node scoring `weight / (rank + 2)` per source. Under
-    /// `"rrf"` the score bound is off and `corroboration_boost` does not rank.
+    /// source), each node scoring `weight / (rank + 2)` per source;
+    /// `"log_odds"` ranks by capped log-odds over the same sources, each
+    /// source adding `weight * clamp(ln(p / (1 - p)), -3, 3)` for the best
+    /// potential `p` it delivered the node with, and `-3 * weight` when it
+    /// did not deliver the node. Under `"rrf"` and `"log_odds"` the score
+    /// bound is off and `corroboration_boost` does not rank.
     /// A resumed traversal keeps the fusion its handle was made with.
     pub fusion: TraverseFusion,
     /// Connective nodes (files, commits, config keys) are expanded without
@@ -1517,8 +1535,9 @@ impl Config {
             walk.grep_corroboration
         );
         ensure!(
-            !(walk.groups == WalkGroups::Claim && self.traverse.fusion == TraverseFusion::Rrf),
-            "run_profile.walk.groups = \"claim\" cannot be combined with traverse.fusion = \"rrf\": the reciprocal-rank sources stay per map; use traverse.fusion = \"boost\" or groups = \"tool\""
+            !(walk.groups == WalkGroups::Claim && self.traverse.fusion.uses_reach()),
+            "run_profile.walk.groups = \"claim\" cannot be combined with traverse.fusion = \"{}\": the fusion sources stay per map; use traverse.fusion = \"boost\" or groups = \"tool\"",
+            self.traverse.fusion.as_str()
         );
         Ok(())
     }
@@ -3411,6 +3430,24 @@ fusion = \"rrf\"
         );
         assert_eq!("rrf".parse::<TraverseFusion>(), Ok(TraverseFusion::Rrf));
         assert_eq!("boost".parse::<TraverseFusion>(), Ok(TraverseFusion::Boost));
+        let log_odds: Config = toml::from_str(&format!(
+            "{}[traverse]
+fusion = \"log_odds\"
+",
+            base_toml()
+        ))
+        .unwrap();
+        log_odds.validate().unwrap();
+        assert_eq!(log_odds.traverse.fusion, TraverseFusion::LogOdds);
+        assert_eq!(
+            serde_json::to_value(&log_odds).unwrap()["traverse"]["fusion"],
+            "log_odds"
+        );
+        assert_eq!(
+            "log_odds".parse::<TraverseFusion>(),
+            Ok(TraverseFusion::LogOdds)
+        );
+        assert_eq!(TraverseFusion::LogOdds.as_str(), "log_odds");
         // Pass-through is off unless set, and only a boolean sets it.
         assert_eq!(value["traverse"]["pass_through"], false);
         let free: Config =
@@ -3822,6 +3859,22 @@ grep_corroboration = 0.5
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("run_profile.walk.groups"), "{error}");
         assert!(error.contains("traverse.fusion"), "{error}");
+        config.traverse.fusion = TraverseFusion::Boost;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn claim_groups_refuse_log_odds_fusion() {
+        let mut config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.traverse.fusion = TraverseFusion::LogOdds;
+        config.validate().unwrap();
+        config.run_profile.walk.groups = WalkGroups::Claim;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("run_profile.walk.groups"), "{error}");
+        assert!(error.contains("log_odds"), "{error}");
         config.traverse.fusion = TraverseFusion::Boost;
         config.validate().unwrap();
     }

@@ -126,9 +126,9 @@ pub struct BenchArgs {
     #[arg(long)]
     max_depth: Option<u32>,
     /// How results are ranked (`lci traverse --fusion`): `boost` is the CLI's
-    /// own default and passes nothing; `rrf` is the weighted reciprocal rank
-    /// fusion. The row's note says when it is `rrf`.
-    #[arg(long, default_value = "boost", value_parser = ["boost", "rrf"])]
+    /// own default and passes nothing; `log_odds` is capped log-odds fusion; `rrf` is the weighted reciprocal rank
+    /// fusion. The row's note says when it is not `boost`.
+    #[arg(long, default_value = "boost", value_parser = ["boost", "rrf", "log_odds"])]
     fusion: String,
     /// Pass through connective nodes (`lci traverse --pass-through`): files,
     /// commits and config keys are expanded without costing a pop. The row's

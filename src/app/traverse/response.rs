@@ -325,6 +325,12 @@ pub(super) fn response_json(
         })
         .collect();
     let mut notes = notes;
+    if result.fusion == lci_maps::traverse::Fusion::LogOdds {
+        notes.push(
+            "fusion log_odds: results are ranked by capped log-odds over the evidence sources (ranked_potential is the fused score; a source that did not deliver a node costs the cap); the score bound is off"
+                .to_owned(),
+        );
+    }
     if result.fusion == lci_maps::traverse::Fusion::Rrf {
         notes.push(
             "fusion rrf: results are ranked by weighted reciprocal rank fusion over the evidence sources (ranked_potential is the fused score); the score bound is off"

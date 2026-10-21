@@ -451,7 +451,7 @@ struct TraverseArgs {
     /// Results to print.
     #[arg(long, default_value_t = 8)]
     top_k: usize,
-    /// How results are ranked: `boost` or `rrf` (default: the `[traverse]
+    /// How results are ranked: `boost`, `rrf` or `log_odds` (default: the `[traverse]
     /// fusion` setting). A continuation keeps the fusion its handle started
     /// with.
     #[arg(long)]
