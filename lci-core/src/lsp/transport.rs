@@ -16,7 +16,7 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, oneshot, watch},
 };
 
 /// Most time [`JsonRpcClient::shutdown`] gives the `exit` notification's
@@ -170,6 +170,21 @@ impl TransportConfig {
     }
 }
 
+/// What the readiness and busy predicates have reported so far, see
+/// [`JsonRpcClient::state`]. It is a report: nothing in it changes how a
+/// request is sent, repeated or answered.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerState {
+    /// The last matching status notification was a busy one (the server has
+    /// started working again after it was ready). `false` until one matches.
+    pub busy: bool,
+    /// How many notifications have matched the readiness or the busy
+    /// predicate, each one counted (a repeated "ready" counts too).
+    pub changes: u64,
+    /// When the last of those arrived; the spawn time while `changes` is 0.
+    pub changed_at: Instant,
+}
+
 /// A JSON-RPC client over a child process's stdio.
 ///
 /// Handles process lifecycle (spawn, kill on drop), Content-Length framing,
@@ -184,7 +199,9 @@ impl TransportConfig {
 /// The caller provides a readiness predicate at spawn time. The predicate is
 /// evaluated against each JSON-RPC notification (a message without an `id`
 /// field). When it returns `true`, the client is marked ready and waiters on
-/// [`wait_ready`](Self::wait_ready) are notified.
+/// [`wait_ready`](Self::wait_ready) are notified. A second predicate, the busy
+/// one, marks the server as working again; it only feeds [`state`](Self::state)
+/// and never clears the ready latch.
 pub struct JsonRpcClient {
     writer: Arc<Writer>,
     child: Mutex<Child>,
@@ -194,6 +211,8 @@ pub struct JsonRpcClient {
     label: String,
     ready: Arc<tokio::sync::Notify>,
     is_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// The readiness/busy report, written by the reader task.
+    state: watch::Receiver<ServerState>,
     /// Updated by the reader task on every parsed message of any kind
     /// (response, notification, or server-initiated request) — not just
     /// ones addressed to a particular pending request. `request` bounds its
@@ -226,6 +245,19 @@ impl JsonRpcClient {
         config: &TransportConfig,
         environment: &[(String, String)],
         ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_with_busy(config, environment, ready_predicate, Box::new(|_| false)).await
+    }
+
+    /// [`spawn`](Self::spawn) with a busy predicate, evaluated against each
+    /// notification the ready predicate did not match. A match sets
+    /// [`ServerState::busy`]; a ready match clears it. Neither touches
+    /// [`is_ready`](Self::is_ready).
+    pub async fn spawn_with_busy(
+        config: &TransportConfig,
+        environment: &[(String, String)],
+        ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+        busy_predicate: Box<dyn Fn(&Value) -> bool + Send>,
     ) -> Result<Arc<Self>> {
         let mut command = config.command(environment);
         #[cfg(windows)]
@@ -266,6 +298,11 @@ impl JsonRpcClient {
         let reader_is_ready = Arc::clone(&is_ready);
         let reader_last_activity = Arc::clone(&last_activity);
         let reader_progress = Arc::clone(&progress);
+        let (state_sender, state) = watch::channel(ServerState {
+            busy: false,
+            changes: 0,
+            changed_at: Instant::now(),
+        });
         let reader_stopped: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
         let stopped = Arc::clone(&reader_stopped);
         let label = config.label.clone();
@@ -279,6 +316,8 @@ impl JsonRpcClient {
                 reader_last_activity,
                 reader_progress,
                 ready_predicate,
+                busy_predicate,
+                state_sender,
             )
             .await
             {
@@ -311,6 +350,7 @@ impl JsonRpcClient {
             label: config.label.clone(),
             ready,
             is_ready,
+            state,
             last_activity,
             progress,
             reader_stopped,
@@ -425,8 +465,30 @@ impl JsonRpcClient {
     }
 
     /// Returns `true` if the readiness predicate has matched a notification.
+    /// A latch: it never clears, whatever the busy predicate reports.
     pub fn is_ready(&self) -> bool {
         self.is_ready.load(Ordering::Acquire)
+    }
+
+    /// What the ready and busy predicates have reported so far.
+    pub fn state(&self) -> ServerState {
+        *self.state.borrow()
+    }
+
+    /// Whether the last matching status notification was a busy one.
+    pub fn is_busy(&self) -> bool {
+        self.state.borrow().busy
+    }
+
+    /// Waits until [`ServerState::changes`] is at least `at_least`, bounded by
+    /// `timeout`; `false` when it was not reached (or the reader stopped
+    /// first). It waits on the server's own notifications, never on a timer.
+    pub async fn wait_for_changes(&self, at_least: u64, timeout: Duration) -> bool {
+        let mut state = self.state.clone();
+        matches!(
+            tokio::time::timeout(timeout, state.wait_for(|state| state.changes >= at_least)).await,
+            Ok(Ok(_))
+        )
     }
 
     /// Waits for the readiness predicate to match, bounded by `timeout`.
@@ -632,6 +694,8 @@ async fn read_messages(
     last_activity: LastActivity,
     progress: Arc<AtomicU64>,
     ready_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+    busy_predicate: Box<dyn Fn(&Value) -> bool + Send>,
+    state: watch::Sender<ServerState>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -680,8 +744,20 @@ async fn read_messages(
         // Notifications (no id): evaluate readiness predicate.
         if request_id.is_none() && ready_predicate(&message) {
             is_ready.store(true, Ordering::Release);
+            state.send_modify(|state| {
+                state.busy = false;
+                state.changes += 1;
+                state.changed_at = Instant::now();
+            });
             ready.notify_waiters();
             ready.notify_one();
+        } else if request_id.is_none() && busy_predicate(&message) {
+            // A report only: the ready latch above stays as it is.
+            state.send_modify(|state| {
+                state.busy = true;
+                state.changes += 1;
+                state.changed_at = Instant::now();
+            });
         }
         let Some(id) = id else {
             continue;

@@ -1126,6 +1126,17 @@ async fn fake_client_with(
     timeout: Duration,
     ready: Box<dyn Fn(&serde_json::Value) -> bool + Send>,
 ) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
+    fake_client_observing(temp, extra, timeout, ready, Box::new(|_| false)).await
+}
+
+/// [`fake_client_with`] with a busy predicate too.
+async fn fake_client_observing(
+    temp: &tempfile::TempDir,
+    extra: &[&str],
+    timeout: Duration,
+    ready: Box<dyn Fn(&serde_json::Value) -> bool + Send>,
+    busy: Box<dyn Fn(&serde_json::Value) -> bool + Send>,
+) -> (Arc<JsonRpcClient>, std::path::PathBuf) {
     let state = temp.path().join("state");
     let mut args = fake_args(&["--mode", "workspace-symbols", "--state"]);
     args.push(state.to_string_lossy().into_owned());
@@ -1137,7 +1148,9 @@ async fn fake_client_with(
         timeout,
         label: "fake".to_owned(),
     };
-    let client = JsonRpcClient::spawn(&transport, &[], ready).await.unwrap();
+    let client = JsonRpcClient::spawn_with_busy(&transport, &[], ready, busy)
+        .await
+        .unwrap();
     // The request timeout of a test about a short one (2 s) must not also have
     // to cover the process start, which takes seconds on a loaded machine: the
     // server claims its start ordinal as soon as it runs.
@@ -1574,9 +1587,59 @@ impl LspAdapter for LoadingAwareAdapter {
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
         Box::new(|message| message.get("method").and_then(Value::as_str) == Some("custom/ready"))
     }
+    fn busy_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        Box::new(|message| message.get("method").and_then(Value::as_str) == Some("custom/busy"))
+    }
     fn is_loading_error(&self, error: &RpcError, ready: bool) -> bool {
         !ready && error.code == RpcError::INTERNAL_ERROR && error.message.contains("file not found")
     }
+}
+
+/// `Manager::readiness` follows the transport's busy report end to end: the
+/// fake sends ready, then busy, after `initialized` (`--status-cycle`) and
+/// holds the answer to the priming request for 3 s, so the session reads
+/// `busy` with two changes until that answer arrives, and `ready` with three
+/// after the ready notification that follows it. The test waits on the
+/// session's own report, not on a fixed time.
+#[tokio::test]
+async fn a_busy_signal_makes_the_session_report_busy_and_then_ready_again() {
+    use local_code_intelligence::lsp::ServerStateName;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state) = fake_csharp_release_fixture(&temp);
+    config.csharp.args.extend(fake_args(&[
+        "--status-cycle",
+        "--first-symbol-delay-ms",
+        "3000",
+    ]));
+    let manager = Manager::new(&config);
+    let adapter: Arc<dyn LspAdapter> = Arc::new(LoadingAwareAdapter(csharp_adapter(&manager)));
+    let observe = async {
+        let mut busy = None;
+        wait_until("the session to report busy", LOADED_BUDGET, async || {
+            busy = manager
+                .readiness("csharp-ls", &workspace.id)
+                .await
+                .filter(|readiness| readiness.state == ServerStateName::Busy);
+            busy.is_some()
+        })
+        .await;
+        busy.unwrap()
+    };
+    let (symbols, busy) =
+        tokio::join!(manager.symbols(&adapter, &workspace, "Calculator"), observe);
+    symbols.unwrap();
+    assert_eq!(busy.ready_changes, 2);
+    assert!(busy.changed_ms.is_some());
+    wait_until("the session to be ready again", LOADED_BUDGET, async || {
+        manager
+            .readiness("csharp-ls", &workspace.id)
+            .await
+            .is_some_and(|readiness| {
+                readiness.state == ServerStateName::Ready && readiness.ready_changes == 3
+            })
+    })
+    .await;
 }
 
 /// An error that only means "still loading" while the server is not ready
@@ -3060,6 +3123,140 @@ async fn shutdown_all_releases_every_session() {
         .await
         .unwrap();
     assert_eq!(state_count(&state, "spawn_count.txt"), 3);
+}
+
+/// The busy predicate feeds a report and nothing else: the fake sends ready,
+/// then busy, and after the next request's answer ready again
+/// (`--status-cycle`). The ready latch stays set through the busy period, and
+/// every change is counted. Each step waits on the server's own notification,
+/// never on a timer.
+#[tokio::test]
+async fn a_busy_signal_flips_the_state_and_counts_the_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (client, _state) = fake_client_observing(
+        &temp,
+        &["--status-cycle"],
+        Duration::from_secs(30),
+        Box::new(|message| message["method"] == "custom/ready"),
+        Box::new(|message| message["method"] == "custom/busy"),
+    )
+    .await;
+    assert!(client.wait_for_changes(2, LOADED_BUDGET).await);
+    assert!(client.is_busy());
+    assert!(client.is_ready(), "the ready latch holds while busy");
+    assert_eq!(client.state().changes, 2);
+
+    client
+        .request("workspace/symbol", json!({"query": "Calculator"}))
+        .await
+        .unwrap();
+    assert!(client.wait_for_changes(3, LOADED_BUDGET).await);
+    assert!(!client.is_busy());
+    assert!(client.is_ready());
+    assert_eq!(client.state().changes, 3);
+    assert_eq!(client.progress_count(), 0);
+}
+
+/// `Manager::readiness` and `Status.analyzers`: `starting` while the fake takes
+/// 3 s to answer `initialize` (the server's own delay; the test sleeps for
+/// nothing), `ready` and primed after it, `failed` for a server that cannot be
+/// started, and `null` for the six adapters with no session.
+/// `analyzers_running` keeps its entries and values.
+#[tokio::test]
+async fn manager_readiness_reports_starting_then_ready_and_the_status_shows_it() {
+    use local_code_intelligence::lsp::ServerStateName;
+
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let app = Arc::new(
+        App::open(with_fake_csharp_server(
+            config,
+            &state,
+            &["--initialize-delay-ms", "3000"],
+            LOADED_BUDGET_SECONDS,
+        ))
+        .await
+        .unwrap(),
+    );
+    app.index(&workspace).await.unwrap();
+    assert!(
+        app.status(&workspace)
+            .await
+            .unwrap()
+            .analyzers
+            .values()
+            .all(Option::is_none),
+        "no session yet"
+    );
+
+    let call = tokio::spawn({
+        let app = Arc::clone(&app);
+        let workspace = workspace.clone();
+        async move { app.symbols(&workspace, "Calculator").await }
+    });
+    // The session is registered as soon as the call has asked for it.
+    let starting = loop {
+        let status = app.status(&workspace).await.unwrap();
+        if let Some(readiness) = status.analyzers["csharp-ls"].clone() {
+            break readiness;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(starting.state, ServerStateName::Starting);
+    assert!(!starting.primed);
+    call.await.unwrap().unwrap();
+
+    let status = app.status(&workspace).await.unwrap();
+    let ready = status.analyzers["csharp-ls"].clone().expect("a session");
+    assert_eq!(ready.state, ServerStateName::Ready);
+    assert!(ready.primed, "a symbols call waits for the priming");
+    assert!(ready.age_ms > 0);
+    assert_eq!(
+        status.analyzers.keys().collect::<Vec<_>>(),
+        status.analyzers_running.keys().collect::<Vec<_>>(),
+        "one entry per adapter, like analyzers_running"
+    );
+    for (provider, report) in &status.analyzers {
+        assert_eq!(report.is_some(), provider == "csharp-ls", "{provider}");
+    }
+    assert!(status.analyzers_running["csharp-ls"]);
+    assert_eq!(
+        status
+            .analyzers_running
+            .values()
+            .filter(|running| **running)
+            .count(),
+        1
+    );
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["analyzers"]["csharp-ls"]["state"], "ready", "{wire}");
+    assert!(wire["analyzers"]["rust-analyzer"].is_null(), "{wire}");
+    assert_eq!(wire["analyzers"].as_object().unwrap().len(), 7, "{wire}");
+    models_task.abort();
+
+    // A server that cannot be started is `failed`.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state) = fake_csharp_release_fixture(&temp);
+    config.csharp.path = Some("definitely-missing-csharp-ls".to_owned());
+    let manager = Manager::new(&config);
+    let adapter = csharp_adapter(&manager);
+    assert!(
+        manager
+            .readiness("csharp-ls", &workspace.id)
+            .await
+            .is_none()
+    );
+    call_site_definition(&manager, &adapter, &workspace)
+        .await
+        .expect_err("the server does not exist");
+    let failed = manager
+        .readiness("csharp-ls", &workspace.id)
+        .await
+        .expect("the failed session stays registered");
+    assert_eq!(failed.state, ServerStateName::Failed);
+    assert!(!manager.running("csharp-ls", &workspace.id).await);
 }
 
 /// `Status.analyzers_running` has one entry per registered language server,

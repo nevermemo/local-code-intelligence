@@ -157,6 +157,16 @@ pub struct FakeLspConfig {
     /// scenario (`--ready-notification`), the way `Initialized` always does:
     /// for an adapter whose readiness predicate matches it.
     pub ready_notification: bool,
+    /// `--status-cycle`: after `initialized` sends a ready and then a busy
+    /// status notification in place of the plain ready one; the next request
+    /// is answered as usual and a ready notification follows its answer. The
+    /// order is fixed and nothing is timed. Ready and busy are `custom/ready`
+    /// and `custom/busy`, or with `--status-shape rust`
+    /// `experimental/serverStatus` with `quiescent` true and false.
+    pub status_cycle: bool,
+    /// `--status-shape rust`: the status notifications of `status_cycle` have
+    /// rust-analyzer's shape.
+    pub status_shape_rust: bool,
     /// After `initialized`, sends two requests whose ids are strings
     /// (`--string-id-server-requests`): `custom/ready` with the id `ready-1`
     /// and `workspace/configuration` (two items) with the id `cfg-1`. Each
@@ -313,6 +323,8 @@ pub fn run_from_env() -> io::Result<()> {
         spawn_grandchild: cli.iter().any(|arg| arg == "--spawn-grandchild"),
         keep_alive_on_eof: cli.iter().any(|arg| arg == "--keep-alive-on-eof"),
         ready_notification: cli.iter().any(|arg| arg == "--ready-notification"),
+        status_cycle: cli.iter().any(|arg| arg == "--status-cycle"),
+        status_shape_rust: cli_arg(&cli, "--status-shape").as_deref() == Some("rust"),
         string_id_server_requests: cli.iter().any(|arg| arg == "--string-id-server-requests"),
     };
     run_server(config)
@@ -448,6 +460,7 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
     let mut definition_error = config.definition_error.clone();
     let mut pending_definition = None;
     let mut pid_written = false;
+    let mut ready_after_next_answer = false;
     let mut root_uri: Option<String> = None;
     let mut document_store = matches!(config.scenario, FakeScenario::Documents)
         .then(|| documents::Store::new(config.state_dir.clone(), spawn_count));
@@ -589,7 +602,13 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
             // Accept the initialized notification. The Initialized scenario
             // additionally emits a ready notification (preserving existing
             // observable behavior).
-            if config.ready_notification || matches!(config.scenario, FakeScenario::Initialized) {
+            if config.status_cycle {
+                write_message(&mut stdout, &status_notification(&config, true))?;
+                write_message(&mut stdout, &status_notification(&config, false))?;
+                ready_after_next_answer = true;
+            } else if config.ready_notification
+                || matches!(config.scenario, FakeScenario::Initialized)
+            {
                 write_message(
                     &mut stdout,
                     &json_notification("custom/ready", json!({"ready": true})),
@@ -839,10 +858,30 @@ pub fn run_server(config: FakeLspConfig) -> io::Result<()> {
                 }
             }
         }
+        // `--status-cycle`: the answer to the first request after `initialized`
+        // has been written above; the ready notification follows it.
+        if ready_after_next_answer && id.is_some() && method != Some("initialize") {
+            ready_after_next_answer = false;
+            write_message(&mut stdout, &status_notification(&config, true))?;
+        }
         stdout.flush()?;
     }
 
     Ok(())
+}
+
+/// The ready (`true`) or busy (`false`) status notification of `--status-cycle`.
+fn status_notification(config: &FakeLspConfig, ready: bool) -> serde_json::Value {
+    if config.status_shape_rust {
+        json_notification(
+            "experimental/serverStatus",
+            json!({"quiescent": ready, "health": "ok"}),
+        )
+    } else if ready {
+        json_notification("custom/ready", json!({"ready": true}))
+    } else {
+        json_notification("custom/busy", json!({"busy": true}))
+    }
 }
 
 fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
