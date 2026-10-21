@@ -79,9 +79,26 @@ fn spans() -> Arc<ScipSpans> {
     Arc::new(ScipSpans { by_file })
 }
 
+/// A bound no loaded machine reaches: the default scan timeout (3 s) stops a
+/// scan per file, so a correctness test on a starved runtime would see a short
+/// edge list. The tests of the deadline itself pass their own bounds.
+const PATIENT: Duration = Duration::from_secs(3600);
+
+/// A `grep.live` map whose own scan timeout is [`PATIENT`].
+fn live_grep(root: &Path, locator: Option<Arc<dyn SymbolLocator>>) -> LiveGrep {
+    LiveGrep::with_options(
+        root,
+        locator,
+        GrepOptions {
+            timeout: PATIENT,
+            ..GrepOptions::default()
+        },
+    )
+}
+
 fn budget() -> Budget {
     Budget {
-        deadline: Instant::now() + Duration::from_secs(10),
+        deadline: Instant::now() + PATIENT,
         max_external_calls: u32::MAX,
         max_nodes_touched: u64::MAX,
     }
@@ -110,7 +127,7 @@ fn by_dst<'a>(edges: &'a [Edge], dst: &NodeId) -> &'a Edge {
 #[tokio::test]
 async fn a_symbol_reaches_the_files_and_symbols_that_mention_it() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), Some(spans()));
+    let map = live_grep(tree.path(), Some(spans()));
     let node = symbol("compute_total", "alpha");
     let edges = check_expand(&map, &node, Duration::from_secs(10), &view())
         .await
@@ -170,7 +187,7 @@ async fn a_symbol_reaches_the_files_and_symbols_that_mention_it() {
 #[tokio::test]
 async fn without_a_locator_the_edges_go_to_files_only() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), None);
+    let map = live_grep(tree.path(), None);
     let edges = map
         .expand(&symbol("compute_total", "alpha"), budget(), &view())
         .await
@@ -185,7 +202,7 @@ async fn without_a_locator_the_edges_go_to_files_only() {
 #[tokio::test]
 async fn a_file_or_chunk_node_looks_for_its_stem_and_not_in_itself() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), Some(spans()));
+    let map = live_grep(tree.path(), Some(spans()));
     let from_file = map
         .expand(&file("src/alpha.rs"), budget(), &view())
         .await
@@ -212,7 +229,7 @@ async fn a_file_or_chunk_node_looks_for_its_stem_and_not_in_itself() {
 async fn names_that_match_everywhere_and_nodes_without_a_name_make_no_edges() {
     let tree = fixture();
     write(tree.path(), "src/zeta.rs", "fn new() {} fn default() {}\n");
-    let map = LiveGrep::new(tree.path(), Some(spans()));
+    let map = live_grep(tree.path(), Some(spans()));
     for name in ["new", "default", "ab"] {
         let edges = map
             .expand(&symbol(name, "zeta"), budget(), &view())
@@ -545,7 +562,7 @@ fn a_passed_deadline_stops_the_scan_and_says_so() {
 #[tokio::test]
 async fn an_edit_after_construction_is_seen_by_the_next_call() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), Some(spans()));
+    let map = live_grep(tree.path(), Some(spans()));
     let node = symbol("compute_total", "alpha");
     let before = map.expand(&node, budget(), &view()).await.edges;
     assert!(before.iter().all(|e| e.dst != file("src/epsilon.rs")));
@@ -589,7 +606,7 @@ async fn an_edit_after_construction_is_seen_by_the_next_call() {
 #[tokio::test]
 async fn query_names_the_same_destinations_and_reports_the_live_tree() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), Some(spans()));
+    let map = live_grep(tree.path(), Some(spans()));
     let node = symbol("compute_total", "alpha");
     let edges = map.expand(&node, budget(), &view()).await.edges;
     let seeds = [(node.clone(), 1.0)];
@@ -620,7 +637,7 @@ async fn query_names_the_same_destinations_and_reports_the_live_tree() {
 #[tokio::test]
 async fn the_card_reports_a_measured_median_and_the_live_model() {
     let tree = fixture();
-    let map = LiveGrep::new(tree.path(), None);
+    let map = live_grep(tree.path(), None);
     assert!(map.card().expand_p50_ms.is_none(), "nothing measured yet");
     let p50 = map.calibrate(3).await.expect("measured");
     assert!(p50 >= 0.0);
@@ -688,7 +705,7 @@ fn chunk(path: &str, hash: &str) -> Chunk {
 fn registry(root: &Path) -> Registry<'static> {
     let mut registry = Registry::new(60.0);
     registry
-        .register(Box::new(LiveGrep::new(root, Some(spans()))), 1.0, 40)
+        .register(Box::new(live_grep(root, Some(spans()))), 1.0, 40)
         .unwrap();
     registry
 }

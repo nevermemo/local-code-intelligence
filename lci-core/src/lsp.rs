@@ -841,6 +841,9 @@ pub struct Manager {
     /// The providers whose binary has answered a version probe (see
     /// [`Self::probe_once`]).
     probed: std::sync::Mutex<HashSet<&'static str>>,
+    /// `readiness_timeout_seconds`: the bound of one version probe in an
+    /// unbounded warm-up (see [`Self::prime_languages`]).
+    probe_timeout: Duration,
     /// The tree stamp each kept session was last checked against (see
     /// [`Self::tree_barrier`]).
     stamps: std::sync::Mutex<HashMap<SessionKey, (stamp::TreeStamp, Instant)>>,
@@ -969,6 +972,7 @@ impl Manager {
             syncs,
             stuck_after,
             probed: std::sync::Mutex::new(HashSet::new()),
+            probe_timeout: Duration::from_secs(config.readiness_timeout_seconds),
             stamps: std::sync::Mutex::new(HashMap::new()),
             barriers: std::sync::Mutex::new(HashMap::new()),
             indexed: std::sync::Mutex::new(None),
@@ -1056,6 +1060,9 @@ impl Manager {
     /// again for the life of this manager (a binary removed meanwhile is found
     /// when its session fails). A failed probe is remembered nowhere and is
     /// run again by the next caller. Concurrent first callers each probe.
+    /// The default probe also keeps a process-wide memo of its own (see
+    /// [`adapter::probe_subprocess_version`]), so a second manager in the same
+    /// process does not run a binary again that has answered.
     pub async fn probe_once(&self, adapter: &Arc<dyn LspAdapter>, timeout: Duration) -> Result<()> {
         let provider = adapter.provider();
         if self.probed.lock().unwrap().contains(provider) {
@@ -1890,20 +1897,27 @@ impl Manager {
         workspace: &Workspace,
         timeout: Duration,
     ) -> BTreeMap<&'static str, Result<Duration>> {
-        self.prime_languages(workspace, timeout, None).await
+        self.prime_languages(workspace, Some(timeout), None).await
     }
 
     /// [`Self::prime`] for the adapters that serve one of `languages` (the
     /// language identifiers of an index, for example from the store); `None`
     /// primes every enabled adapter. An adapter for a language the workspace
     /// does not hold is neither probed nor started, and is absent from the map.
+    ///
+    /// `timeout` `Some`: the whole call is bounded by it, as in [`Self::prime`].
+    /// `None`: nothing but the caller's own cancellation (dropping or aborting
+    /// the future) ends the wait for a server to start and prime, which is for
+    /// a background warm-up that has an abort. Each version probe is still
+    /// bounded by `readiness_timeout_seconds`, so a binary whose `--version`
+    /// never exits is reported and the next adapter goes on.
     pub async fn prime_languages(
         &self,
         workspace: &Workspace,
-        timeout: Duration,
+        timeout: Option<Duration>,
         languages: Option<&HashSet<String>>,
     ) -> BTreeMap<&'static str, Result<Duration>> {
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let mut outcomes = BTreeMap::new();
         let mut starting = Vec::new();
         let wanted = |adapter: &&Arc<dyn LspAdapter>| {
@@ -1917,10 +1931,15 @@ impl Manager {
         };
         for adapter in self.adapters.iter().filter(wanted) {
             let started = Instant::now();
-            // Every probe shares the one deadline, so hanging probes cost
-            // `timeout` in total, not each.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let probe = tokio::time::timeout(remaining, self.probe_once(adapter, remaining)).await;
+            // Under a timeout every probe shares the one deadline, so hanging
+            // probes cost `timeout` in total, not each.
+            let probe = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::timeout(remaining, self.probe_once(adapter, remaining)).await
+                }
+                None => Ok(self.probe_once(adapter, self.probe_timeout).await),
+            };
             match probe {
                 Ok(Ok(())) => {
                     // Begin every start before waiting for any, so the servers
@@ -1935,25 +1954,28 @@ impl Manager {
                     outcomes.insert(
                         adapter.provider(),
                         Err(anyhow!(
-                            "the version probe did not answer within {timeout:?}"
+                            "the version probe did not answer within {:?}",
+                            timeout.unwrap_or_default()
                         )),
                     );
                 }
             }
         }
         for (adapter, started) in starting {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let outcome = match tokio::time::timeout(
-                remaining,
-                self.client(adapter, workspace, true),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Ok(started.elapsed()),
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(anyhow!(
-                    "not started and primed within {timeout:?}; it keeps starting in the background"
-                )),
+            let primed = self.client(adapter, workspace, true);
+            let outcome = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(remaining, primed).await {
+                        Ok(Ok(_)) => Ok(started.elapsed()),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(anyhow!(
+                            "not started and primed within {:?}; it keeps starting in the background",
+                            timeout.unwrap_or_default()
+                        )),
+                    }
+                }
+                None => primed.await.map(|_| started.elapsed()),
             };
             outcomes.insert(adapter.provider(), outcome);
         }
@@ -2858,13 +2880,33 @@ mod tests {
     }
 
     /// How a [`Primable`]'s version probe behaves.
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum Probe {
         Passes,
         /// The binary is missing.
         Fails,
         /// The probe never answers.
         Hangs,
+        /// The probe says it has started, then waits for a permit of the gate.
+        Gated(Gate),
+    }
+
+    /// The hands a test keeps on a [`Probe::Gated`] probe.
+    #[derive(Clone)]
+    struct Gate {
+        entered: Arc<tokio::sync::Notify>,
+        permits: Arc<tokio::sync::Semaphore>,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                permits: Arc::new(tokio::sync::Semaphore::new(0)),
+                asked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
     }
 
     /// An adapter with a name, a switch and a scripted version probe. It has
@@ -2893,10 +2935,16 @@ mod tests {
             "primable_available"
         }
         async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
-            match self.probe {
+            match &self.probe {
                 Probe::Passes => Ok(()),
                 Probe::Fails => Err(anyhow!("no such binary: {}", self.provider)),
                 Probe::Hangs => std::future::pending().await,
+                Probe::Gated(gate) => {
+                    gate.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    gate.entered.notify_one();
+                    gate.permits.acquire().await.unwrap().forget();
+                    Ok(())
+                }
             }
         }
         fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
@@ -2907,6 +2955,104 @@ mod tests {
         }
         fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
             Box::new(|_| false)
+        }
+    }
+
+    fn primable(provider: &'static str, probe: Probe) -> Arc<dyn LspAdapter> {
+        Arc::new(Primable {
+            provider,
+            enabled: true,
+            probe,
+        })
+    }
+
+    fn prime_workspace() -> Workspace {
+        Workspace {
+            id: "prime".into(),
+            path: PathBuf::from("workspace"),
+        }
+    }
+
+    /// With no timeout a slow version probe is waited for: the call ends when
+    /// the probe answers, not when a clock says so.
+    #[tokio::test]
+    async fn an_unbounded_warm_up_waits_for_a_slow_probe() {
+        let gate = Gate::new();
+        let mut manager = Manager::new(&Config::default());
+        manager.adapters = vec![
+            primable("gated", Probe::Gated(gate.clone())),
+            primable("no-transport", Probe::Passes),
+        ];
+        let manager = Arc::new(manager);
+        let handle = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .prime_languages(&prime_workspace(), None, None)
+                    .await
+                    .into_iter()
+                    .map(|(provider, outcome)| (provider, format!("{:#}", outcome.unwrap_err())))
+                    .collect::<BTreeMap<_, _>>()
+            })
+        };
+        gate.entered.notified().await;
+        assert!(!handle.is_finished(), "the probe has not answered yet");
+        gate.permits.add_permits(1);
+        let outcomes = handle.await.unwrap();
+        assert_eq!(
+            outcomes.keys().copied().collect::<Vec<_>>(),
+            ["gated", "no-transport"]
+        );
+        for (provider, message) in &outcomes {
+            assert!(
+                message.contains("disabled or has no executable"),
+                "{provider}: {message}"
+            );
+            assert!(!message.contains("did not answer"), "{provider}: {message}");
+        }
+        assert_eq!(gate.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// With no timeout a probe that never answers ends only by the caller's
+    /// abort, and the abort leaves no session behind.
+    #[tokio::test]
+    async fn a_warm_up_with_a_hanging_probe_ends_only_by_abort() {
+        let gate = Gate::new();
+        let mut manager = Manager::new(&Config::default());
+        manager.adapters = vec![primable("gated", Probe::Gated(gate.clone()))];
+        let manager = Arc::new(manager);
+        let handle = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .prime_languages(&prime_workspace(), None, None)
+                    .await
+            })
+        };
+        gate.entered.notified().await;
+        assert!(!handle.is_finished());
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(!manager.running("gated", "prime").await);
+    }
+
+    /// Two probes that never answer share the one timeout: the call ends at the
+    /// deadline, not after one timeout each. The paused clock makes the end
+    /// exact; no session starts, so nothing waits on a blocking thread.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_probes_share_the_one_timeout_of_a_bounded_prime() {
+        let mut manager = Manager::new(&Config::default());
+        manager.adapters = vec![
+            primable("never-answers", Probe::Hangs),
+            primable("never-answers-either", Probe::Hangs),
+        ];
+        let timeout = Duration::from_millis(400);
+        let started = tokio::time::Instant::now();
+        let outcomes = manager.prime(&prime_workspace(), timeout).await;
+        assert_eq!(started.elapsed(), timeout);
+        for provider in ["never-answers", "never-answers-either"] {
+            let message = format!("{:#}", outcomes[provider].as_ref().unwrap_err());
+            assert!(message.contains("did not answer within 400ms"), "{message}");
         }
     }
 
@@ -2933,15 +3079,10 @@ mod tests {
         };
         let timeout = Duration::from_millis(400);
 
-        let started = Instant::now();
+        // Real time here: the session of `no-transport` fails on a blocking
+        // thread, which the paused clock would not wait for. That the probes
+        // share one deadline is the next test's, under the paused clock.
         let outcomes = manager.prime(&workspace, timeout).await;
-        // Bounded by the timeout in total: two hanging probes share it
-        // (one each would take twice as long).
-        assert!(
-            started.elapsed() < timeout * 3 / 2,
-            "{:?}",
-            started.elapsed()
-        );
 
         // Every enabled provider is answered for, a disabled one is not asked.
         assert_eq!(
@@ -2978,7 +3119,7 @@ mod tests {
         let held = HashSet::from(["rust".to_owned()]);
         assert!(
             manager
-                .prime_languages(&workspace, timeout, Some(&held))
+                .prime_languages(&workspace, Some(timeout), Some(&held))
                 .await
                 .is_empty()
         );

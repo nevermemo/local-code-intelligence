@@ -73,8 +73,9 @@
 //!
 //! Cost class External: each request to the server is one external call,
 //! charged in the [`Cost`] of the call that made it, and a call stops at the
-//! budget's `max_external_calls`. The deadline of the budget (and
-//! [`CALL_TIMEOUT`]) bounds the call: it ends with [`DEADLINE_NOTE`] as its
+//! budget's `max_external_calls`. The deadline of the budget bounds the call
+//! (the server's own inactivity bound, `lsp_timeout_seconds`, bounds each
+//! request inside it): it ends with [`DEADLINE_NOTE`] as its
 //! recorded failure ([`LspLive::last_error`]) and no edges, and the server keeps
 //! starting for the next call.
 //!
@@ -154,9 +155,6 @@ pub const LSP_LIVE_ID: MapId = "lsp.live";
 /// The note of a call that ran out of the traversal's time (the deadline of
 /// its [`Budget`]).
 pub const DEADLINE_NOTE: &str = "lsp.live: the traversal deadline passed";
-
-/// The longest one expansion waits for the server, whatever the budget allows.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long the version probe of a server binary may take when the caller does
 /// not say (`readiness_timeout_seconds` default). 15 s: a binary starting
@@ -910,7 +908,7 @@ impl LspLive {
     /// alone is recorded there too but keeps the node's other edges.
     async fn collect(&self, node: &NodeId, budget: Budget) -> Expanded {
         let started = Instant::now();
-        let deadline = budget.deadline.min(started + CALL_TIMEOUT);
+        let deadline = budget.deadline;
         let mut found = Found {
             edges: Vec::new(),
             calls: 0,

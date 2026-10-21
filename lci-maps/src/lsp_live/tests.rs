@@ -685,17 +685,37 @@ async fn a_call_hierarchy_error_keeps_the_other_edges() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn an_expansion_waits_as_long_as_its_budget_allows() {
+    // The paused clock runs through the fake's 20 s answer at once.
+    let mut cold = fake();
+    cold.delay = Duration::from_secs(20);
+    let map = map_over(cold);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(60), 10), &view())
+        .await;
+    let edges: Vec<NodeId> = found.edges.iter().map(|edge| edge.dst.clone()).collect();
+    assert_eq!(edges, vec![sym("b")]);
+    assert_eq!(map.last_error(), None);
+    assert_eq!(found.cost.external_calls, 2, "definitions and references");
+
+    // A budget shorter than the answer still ends with the note.
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(10), 10), &view())
+        .await;
+    assert!(found.edges.is_empty());
+    assert_eq!(map.last_error().as_deref(), Some(DEADLINE_NOTE));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_call_that_outlasts_its_deadline_ends_with_the_note_and_no_edges() {
     let mut slow = fake();
     slow.delay = Duration::from_secs(5);
     let requests = slow.requests.clone();
     let map = map_over(slow);
-    let started = Instant::now();
     let found = map
         .expand(&sym("x"), budget(Duration::from_millis(50), 10), &view())
         .await;
-    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(found.edges.is_empty());
     assert_eq!(found.cost.external_calls, 1, "the request was made");
     assert_eq!(map.last_error().as_deref(), Some(DEADLINE_NOTE));

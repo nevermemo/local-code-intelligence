@@ -44,6 +44,9 @@ pub struct Models {
     /// first one. Indexing compares it with the cached vectors' width, since
     /// a service can change its width under an unchanged URL and model name.
     observed_dimension: Arc<AtomicUsize>,
+    /// Shared by every clone: how many HTTP requests [`Self::send_with_retry`]
+    /// has made, retries included. Tests count with it instead of a clock.
+    attempts: Arc<AtomicUsize>,
 }
 
 #[derive(Deserialize)]
@@ -549,6 +552,7 @@ impl Models {
             embedder_breaker: Arc::new(ConnectBreaker::new(EMBEDDER_DOWN_WINDOW)),
             initial_backoff: INITIAL_BACKOFF,
             observed_dimension: Arc::default(),
+            attempts: Arc::default(),
         })
     }
 
@@ -588,6 +592,7 @@ impl Models {
     ) -> Result<reqwest::Response> {
         let mut delay = self.initial_backoff;
         for attempt in 1..=MAX_ATTEMPTS {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
             match build().send().await.map_err(reqwest::Error::without_url) {
                 Ok(response) => return Ok(response),
                 Err(error)
@@ -1731,12 +1736,21 @@ pub(crate) mod tests {
         };
         let mut models = Models::new(&config).unwrap();
         models.initial_backoff = Duration::from_millis(10);
-        models.embedder_breaker = Arc::new(ConnectBreaker::new(BREAKER_WINDOW));
+        // A window no stalled test outlasts: the trip at the end of the first
+        // call must still hold when the probe below runs, so the test counts
+        // attempts instead of reading a clock.
+        let window = Duration::from_secs(600);
+        models.embedder_breaker = Arc::new(ConnectBreaker::new(window));
         let documents = vec!["fn a() {}".to_owned()];
         assert!(models.embedder_skipped().is_none());
 
         // The first call really tries the service, with its retries.
         let first = models.embed(&documents).await.unwrap_err();
+        assert_eq!(
+            models.attempts.load(Ordering::Relaxed),
+            MAX_ATTEMPTS as usize,
+            "{first:#}"
+        );
         assert!(is_connect_error(&first), "{first:#}");
         assert!(is_service_unavailable(&first), "{first:#}");
         assert!(models.embedder_skipped().is_some());
@@ -1758,30 +1772,29 @@ pub(crate) mod tests {
         // An index-time embedding makes one probe attempt: it connects (and
         // is refused), without the retries and the backoff a closed breaker
         // allows (a retrying call would sleep 20 s and then 40 s; a refused
-        // connect itself takes up to about 2 s on Windows).
+        // connect itself takes up to about 2 s on Windows). It is counted as
+        // exactly one attempt; a retry would be a second one after the 20 s.
         models.initial_backoff = Duration::from_secs(20);
-        let started = Instant::now();
+        let before = models.attempts.load(Ordering::Relaxed);
         let probed = models.embed(&documents).await.unwrap_err();
         assert!(is_connect_error(&probed), "{probed:#}");
         assert!(
             !format!("{probed:#}").contains("recently unreachable"),
             "{probed:#}"
         );
-        // A retrying call would have slept its first backoff (20 s) at least.
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the probe retried: it took {:?}: {probed:#}",
-            started.elapsed()
+        assert_eq!(
+            models.attempts.load(Ordering::Relaxed),
+            before + 1,
+            "the probe retried: {probed:#}"
         );
         assert!(
             models.embedder_skipped().is_some(),
-            "a failed probe re-arms (took {:?}): {probed:#}",
-            started.elapsed()
+            "a failed probe re-arms: {probed:#}"
         );
 
         // After the window the next call tries the service again, with its
         // retries.
-        age_past_the_window(&models.embedder_breaker, BREAKER_WINDOW);
+        age_past_the_window(&models.embedder_breaker, window);
         assert!(models.embedder_skipped().is_none());
         models.initial_backoff = Duration::from_millis(10);
         let probed = models.embed(&documents).await.unwrap_err();
