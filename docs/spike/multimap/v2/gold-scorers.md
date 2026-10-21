@@ -11,7 +11,7 @@ cargo xtask gold score       --set <impact|flow|where-to|history|instructions|tr
 cargo xtask gold baseline    --set <set> --gold <path> [--kind shipped|oracle|constant] [--out <path>]
 cargo xtask gold to-evaluate --set <set> --gold <path> --out <path> [--workspace self] [--top-k 10]
 cargo xtask gold strata      --set <set> --gold <path> [--out <path>]
-cargo xtask mine-transcripts --input <sim.json|.jsonl>.. [--gold <path>] [--out test-results/transcripts/shapes.json]
+cargo xtask mine-transcripts --input <sim.json|.jsonl>.. [--gold <path>] [--out test-results/transcripts/shapes.json] [--counts-only]
 ```
 
 Gold file: a JSON array of items, each with a string `id`. A file with one JSON
@@ -367,7 +367,7 @@ and writes nothing into the gold file; keep the report under `test-results/`.
 
 ### Transcript shapes (`xtask/src/mine_transcripts.rs`)
 
-`cargo xtask mine-transcripts --input <file>.. [--gold <path>] [--out test-results/transcripts/shapes.json]` counts question shapes
+`cargo xtask mine-transcripts --input <file>.. [--gold <path>] [--out test-results/transcripts/shapes.json] [--counts-only]` counts question shapes
 over synthetic transcripts. The input is the simulated agent's trace shape (`sim` `Trace::to_json`: `{terms, stop, steps: [{call,
 kind, arg, tokens, cumulative_tokens, depth, ...}]}`), either a `sim.json` (`items[*].trace`) or a JSONL file of `{question, trace}`
 lines. A `sim.json` item carries no question text, so the question is joined by `id` from `--gold`; an item without one has the shape
@@ -379,8 +379,15 @@ this shape locally.
   only for a "why" question), then `where-configured`, `what-tests`, `who-calls`, `how-flows`, `where-is`, `other` by wording.
 - `trace_class`, from the steps alone: `grep_easy` (stop `gold` within 2 calls of the first `search` or `probe` step),
   `agent_trap` (3 or more `search`/`probe` steps, or a `search` after 2 reads, without the gold), `core` (stop `gold` at depth 1 or
-  more, or after 2 or more reads), else `unresolved` (a budget stop).
+  more, or after 2 or more reads), else `unresolved` (a budget stop). A trace that ends `stop = "answered"` (the agent stopped
+  searching and acted or answered; nothing verified the place it found) is classed exactly like `gold`, so a class mix over real
+  chains says how chains end, not whether they were right.
 - Output: `{sources, questions, no_question, unreadable, counts {shape: {trace_class: n}}, calls {p50, p90}, tokens {p50, p90},
   templates [{template, n}]}`; calls and tokens are those at the stop. A template is the question with backticked names replaced by
   `<ident>`, paths by `<path>`, shas by `<sha>` and identifier-like words (`::`, `_`, a digit, an inner capital) by `<ident>`,
   lower-cased and cut at 30 words. Shapes and counts only: no raw question and no step `arg` is written.
+- `--counts-only` (K6b, d464) writes the report without `templates` and without the `unreadable` list: `{sources [{kind, records,
+  unreadable}], questions, no_question, counts, calls, tokens}`. Every string left is a shape name, a class name or a source kind
+  and every other leaf is a number, so a report over real transcripts can be quoted; a test pins the vocabulary. The real
+  converters (Claude Code, Codex) are not in the repository: they write this input shape locally, and the plan's privacy rules
+  (cells under 5 hidden, a checker over each report) are applied outside it.
