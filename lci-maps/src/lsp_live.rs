@@ -59,7 +59,12 @@
 //! A missing server binary is found by [`ManagerBackend::open`], before any
 //! walk, as an error the caller reports; the map is then not registered. The
 //! version probe of a server runs once per manager ([`Manager::probe_once`]),
-//! so a shared manager probes a binary once, not on every call.
+//! so a shared manager probes a binary once, not on every call. Under
+//! `[run_profile.lsp] outline_cache = true` the manager also keeps each file's
+//! non-empty outline by content hash and server session, for the servers that
+//! are resent a file's text before every request (pyright, gopls, jdtls,
+//! clangd; [`Manager::document_symbols`]): a per-call manager reuses it within
+//! the walk, a shared one across calls too.
 
 use crate::{
     Budget, Contribution, Cost, EXPAND_LIMIT, EdgeKind, Evidence, FreshnessModel, Map,

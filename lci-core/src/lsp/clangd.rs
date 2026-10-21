@@ -120,6 +120,13 @@ impl LspAdapter for ClangdServer {
         Box::new(|_| false)
     }
 
+    // The hook sends the current disk text on every request, and
+    // clangd's didOpen is `addDocument`, which replaces the contents of
+    // a file it already has open.
+    fn opens_documents(&self) -> bool {
+        true
+    }
+
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,

@@ -120,6 +120,13 @@ impl LspAdapter for TypeScriptServer {
         Box::new(|_| false)
     }
 
+    // typescript-language-server refuses a didOpen for a document it already
+    // has open ("Can't open already open document"), so after the first
+    // request the server keeps the text it was first sent: not synced.
+    fn opens_documents(&self) -> bool {
+        false
+    }
+
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,

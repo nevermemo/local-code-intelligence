@@ -2301,7 +2301,10 @@ async fn lsp_live_opens_the_call_settings_or_the_shared_manager_as_the_profile_s
                 lsp_sessions: offered,
             };
             let profile = RunProfileConfig {
-                lsp: LspProfile { sessions },
+                lsp: LspProfile {
+                    sessions,
+                    ..LspProfile::default()
+                },
                 ..RunProfileConfig::default()
             };
             let dirs = Dirs::under(tree.path());

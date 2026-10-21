@@ -220,6 +220,17 @@ pub struct LspProfile {
     /// the MCP and REST server's own, or one per process for `lci traverse`.
     /// The recipes walk no `lsp.live` and run the same under both values.
     pub sessions: LspSessions,
+    /// `false` (default): every outline `lsp.live` needs (a file's
+    /// `textDocument/documentSymbol`) is asked of the server. `true`: for a
+    /// server that is resent the file's text before every request
+    /// (`LspAdapter::opens_documents`: pyright, gopls, jdtls, clangd), a
+    /// manager keeps each non-empty outline under the content hash of the
+    /// file it was asked for and answers the same file again from it while
+    /// the bytes and the server session are unchanged (see
+    /// `lsp::Manager::document_symbols`); the other servers are asked every
+    /// time. An empty outline or an error is never kept. The recipes walk no
+    /// `lsp.live` and run the same under both values.
+    pub outline_cache: bool,
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -498,6 +509,7 @@ mod tests {
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config.run_profile.lsp.sessions = LspSessions::Shared;
         config.run_profile.freshness.verify_on_read = true;
+        config.run_profile.lsp.outline_cache = true;
         config
     }
 
@@ -552,7 +564,7 @@ mod tests {
         assert!(
             base.canonical
                 .contains(
-                    r#""run_profile":{"freshness":{"verify_on_read":false},"lsp":{"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
+                    r#""run_profile":{"freshness":{"verify_on_read":false},"lsp":{"outline_cache":false,"sessions":"per_call"},"scip":{"mode":"authoritative"},"traverse":{"map_freshness":false},"walk":{"grep_corroboration":1.0,"groups":"tool"}}"#
                 )
         );
         let mut claim = Config::default();
@@ -745,7 +757,7 @@ mode = \"sometimes\"
         // classify it (profile or deny-list) and set it in `full_config`.
         assert_eq!(
             crate::workspace::hash(&profile.keys.join("\n")),
-            "f058a6c4e9931ec3837637f9972bd4dfa334371b3158effa756ea0cd1781030c",
+            "e62510c9f9c4fb2f00bf3d02ffcb388810b3a255eacdc07ce5d3d99ad26893aa",
             "the profile key set changed"
         );
         // Spot checks of the classification.
@@ -766,6 +778,7 @@ mode = \"sometimes\"
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",
             "run_profile.freshness.verify_on_read",
+            "run_profile.lsp.outline_cache",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -825,9 +838,10 @@ mode = \"sometimes\"
     }
 
     #[test]
-    fn lsp_sessions_are_per_call_by_default_and_change_the_profile_hash() {
+    fn lsp_sessions_and_outline_cache_are_off_by_default_and_change_the_profile_hash() {
         let off = Config::default();
         assert_eq!(off.run_profile.lsp.sessions, LspSessions::PerCall);
+        assert!(!off.run_profile.lsp.outline_cache);
         let text = format!("{}[run_profile.lsp]\nsessions = \"shared\"\n", base_toml());
         let shared: Config = toml::from_str(&text).unwrap();
         shared.validate().unwrap();
@@ -836,14 +850,32 @@ mode = \"sometimes\"
             serde_json::to_value(&shared).unwrap()["run_profile"]["lsp"]["sessions"],
             "shared"
         );
-        let (off, shared) = (off.run_profile(), shared.run_profile());
+        let cached: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\noutline_cache = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        cached.validate().unwrap();
+        assert!(cached.run_profile.lsp.outline_cache);
+        assert_eq!(cached.run_profile.lsp.sessions, LspSessions::PerCall);
+        let (off, shared, cached) = (
+            off.run_profile(),
+            shared.run_profile(),
+            cached.run_profile(),
+        );
         assert_eq!(off.value["run_profile"]["lsp"]["sessions"], "per_call");
         assert_eq!(shared.value["run_profile"]["lsp"]["sessions"], "shared");
-        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.sessions"));
+        assert_eq!(off.value["run_profile"]["lsp"]["outline_cache"], false);
+        assert_eq!(cached.value["run_profile"]["lsp"]["outline_cache"], true);
+        for key in ["run_profile.lsp.sessions", "run_profile.lsp.outline_cache"] {
+            assert!(off.keys.iter().any(|k| k == key), "{key}");
+        }
         assert_ne!(off.hash, shared.hash);
-        // Spelling out the default is the default.
+        assert_ne!(off.hash, cached.hash);
+        assert_ne!(shared.hash, cached.hash);
+        // Spelling out the defaults is the default.
         let spelled: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nsessions = \"per_call\"\n",
+            "{}[run_profile.lsp]\nsessions = \"per_call\"\noutline_cache = false\n",
             base_toml()
         ))
         .unwrap();
@@ -851,8 +883,11 @@ mode = \"sometimes\"
         for bad in [
             "[run_profile.lsp]\nsessions = \"always\"\n",
             "[run_profile.lsp]\nsessions = true\n",
+            "[run_profile.lsp]\noutline_cache = \"yes\"\n",
+            "[run_profile.lsp]\noutline_cache = 1\n",
             "[run_profile.lsp]\nfoo = 1\n",
             "[run_profile]\nsessions = \"shared\"\n",
+            "[run_profile]\noutline_cache = true\n",
         ] {
             let text = format!("{}{bad}", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
@@ -872,9 +907,10 @@ mode = \"sometimes\"
         // K20a: 854c4164... before `[run_profile.scip] mode` added its leaf.
         // K7b-1: e4cab053... before `[run_profile.lsp] sessions`.
         // K2b: 7c5a1ce8... before `[run_profile.freshness] verify_on_read`.
+        // K7b-2: 47ed48e6... before `[run_profile.lsp] outline_cache`.
         assert_eq!(
             Config::default().run_profile().hash,
-            "47ed48e63a8d6feb2329e8ce4cfb57d923f50cc1066df34540396a2dd23be471"
+            "a39b847179ca0e19bd4c64269644201540e5a9343879e392aa12d02f1417ebbd"
         );
     }
 }

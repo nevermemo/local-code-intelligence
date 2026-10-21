@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -257,6 +257,9 @@ type StartOutcome = Result<Arc<GenericClient>, String>;
 /// registry and [`Session::shutdown`] stops its server. The next caller then
 /// starts a fresh session.
 struct Session {
+    /// Unique within the process: tells this session from the one that
+    /// replaces it under the same key (see [`OutlineCache`]).
+    id: u64,
     start: watch::Receiver<Option<StartOutcome>>,
     /// Flips to `true` when priming has settled, whether it succeeded or
     /// not. Never flips if the start failed.
@@ -354,7 +357,9 @@ impl Session {
             }
             primed_sender.send_replace(true);
         });
+        static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
         Arc::new(Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             start,
             primed,
             provider,
@@ -520,6 +525,90 @@ impl Session {
     }
 }
 
+/// The content hash of a file's text: [`crate::workspace::hash`], the
+/// function the manifest and the chunk scan key a file on, so every
+/// freshness check that compares text (the outline cache here, a document's
+/// open text later) agrees with the index about what "the same bytes" are.
+pub fn content_hash(text: &str) -> String {
+    crate::workspace::hash(text)
+}
+
+/// The most outlines one [`Manager`] keeps (`[run_profile.lsp]
+/// outline_cache`); a new outline past it empties the cache first.
+pub const MAX_CACHED_OUTLINES: usize = 4096;
+
+/// `(provider, workspace id, workspace-relative path)`.
+type OutlineKey = (&'static str, String, String);
+
+/// One kept outline: what the session `session` answered for the text whose
+/// [`content_hash`] is `hash`.
+struct CachedOutline {
+    hash: String,
+    session: u64,
+    symbols: Arc<Vec<Location>>,
+}
+
+/// The `textDocument/documentSymbol` answers of a [`Manager`] under
+/// `[run_profile.lsp] outline_cache = true`. An entry answers only for the
+/// same file, the same content hash and the same server session: an edited
+/// file, or a server that was restarted, released or replaced since (and may
+/// see the file differently), is asked again. An empty outline is never kept
+/// (a loading server answers `[]`, N8), and at most
+/// [`MAX_CACHED_OUTLINES`] are: a new one past that clears the cache.
+#[derive(Default)]
+struct OutlineCache {
+    entries: HashMap<OutlineKey, CachedOutline>,
+}
+
+impl OutlineCache {
+    fn get(&self, key: &OutlineKey, hash: &str, session: u64) -> Option<Arc<Vec<Location>>> {
+        self.entries
+            .get(key)
+            .filter(|kept| kept.hash == hash && kept.session == session)
+            .map(|kept| Arc::clone(&kept.symbols))
+    }
+
+    /// Keeps `symbols` unless it is empty; returns whether it was kept.
+    fn put(&mut self, key: OutlineKey, hash: String, session: u64, symbols: &[Location]) -> bool {
+        if symbols.is_empty() {
+            return false;
+        }
+        if self.entries.len() >= MAX_CACHED_OUTLINES && !self.entries.contains_key(&key) {
+            self.entries.clear();
+        }
+        self.entries.insert(
+            key,
+            CachedOutline {
+                hash,
+                session,
+                symbols: Arc::new(symbols.to_vec()),
+            },
+        );
+        true
+    }
+}
+
+/// The [`content_hash`] of `file` as an outline key, or `None` when it is not
+/// to be cached: unreadable, not UTF-8, or larger than
+/// [`adapter::MAX_DID_OPEN_BYTES`] (the read stops one byte past the cap).
+async fn outline_hash(file: &Path) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(file)
+        .await
+        .ok()?
+        .take(adapter::MAX_DID_OPEN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    if bytes.len() as u64 > adapter::MAX_DID_OPEN_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| content_hash(&text))
+}
+
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
 /// and C# (csharp-ls) are always constructed; TypeScript/JavaScript, Python,
 /// Go, and Java join the same registry as optional, individually
@@ -543,6 +632,9 @@ pub struct Manager {
     /// The providers whose binary has answered a version probe (see
     /// [`Self::probe_once`]).
     probed: std::sync::Mutex<HashSet<&'static str>>,
+    /// The kept outlines, `Some` only under `[run_profile.lsp]
+    /// outline_cache = true` (see [`Self::document_symbols`]).
+    outlines: Option<std::sync::Mutex<OutlineCache>>,
 }
 
 impl Manager {
@@ -574,6 +666,11 @@ impl Manager {
             sessions,
             stuck_after,
             probed: std::sync::Mutex::new(HashSet::new()),
+            outlines: config
+                .run_profile
+                .lsp
+                .outline_cache
+                .then(|| std::sync::Mutex::new(OutlineCache::default())),
         }
     }
 
@@ -830,6 +927,22 @@ impl Manager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        self.position_request_on(adapter, workspace, file, relative, method, params)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::position_request`], with the id of the session whose server
+    /// gave the answer (the restarted one when the first attempt failed).
+    async fn position_request_on(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<(Value, u64)> {
         let attempt = async {
             let (session, client) = match self.client(adapter, workspace, false).await {
                 Ok(started) => started,
@@ -845,10 +958,13 @@ impl Manager {
                     .await
             }
             .await;
-            result.map_err(|error| (Some(session), error))
+            let id = session.id;
+            result
+                .map(|value| (value, id))
+                .map_err(|error| (Some(session), error))
         };
         match attempt.await {
-            Ok(value) => Ok(value),
+            Ok(answered) => Ok(answered),
             Err((_, first)) if first.downcast_ref::<RpcError>().is_some() => Err(first),
             Err((session, first)) => {
                 Self::warn_restart(adapter, workspace, method, &first);
@@ -864,6 +980,7 @@ impl Manager {
                     .await?;
                 self.send(adapter, workspace, &session, &client, method, &params)
                     .await
+                    .map(|value| (value, session.id))
             }
         }
     }
@@ -967,6 +1084,20 @@ impl Manager {
     /// `textDocument/documentSymbol` for `file`: every symbol the server lists
     /// (nested ones included, whichever of the two response shapes it uses),
     /// as the location of its name.
+    ///
+    /// Under `[run_profile.lsp] outline_cache = true`, and only for an
+    /// adapter whose server is sent the file's current text before every
+    /// position request ([`LspAdapter::opens_documents`]), the file is read
+    /// and hashed ([`content_hash`]) first, and an outline kept for the same
+    /// file, hash and live session is returned without a request (see
+    /// [`OutlineCache`]). Otherwise the server is asked, and a non-empty
+    /// answer is kept when the session that gave it is still the live one and
+    /// the file's hash is still the one read before the request (an edit
+    /// during the request keeps nothing): the answer is then about the text
+    /// with that hash. A server that is not sent the text (rust-analyzer, which
+    /// watches the disk itself and can lag an edit; csharp-ls; the
+    /// TypeScript server, which refuses a second `didOpen`) is asked every
+    /// time, as without the key.
     pub async fn document_symbols(
         &self,
         adapter: &Arc<dyn LspAdapter>,
@@ -974,11 +1105,75 @@ impl Manager {
         file: &Path,
         relative: &str,
     ) -> Result<Vec<Location>> {
+        let cache = match &self.outlines {
+            Some(cache) if adapter.opens_documents() => cache,
+            _ => {
+                return self
+                    .ask_document_symbols(adapter, workspace, file, relative)
+                    .await
+                    .map(|(found, _)| found);
+            }
+        };
+        let Some(hash) = outline_hash(file).await else {
+            return self
+                .ask_document_symbols(adapter, workspace, file, relative)
+                .await
+                .map(|(found, _)| found);
+        };
+        let key = (
+            adapter.provider(),
+            workspace.id.clone(),
+            relative.to_owned(),
+        );
+        if let Some(session) = self.live_session_id(adapter, workspace).await {
+            let kept = cache.lock().unwrap().get(&key, &hash, session);
+            if let Some(kept) = kept {
+                return Ok(kept.as_ref().clone());
+            }
+        }
+        let (found, answered_by) = self
+            .ask_document_symbols(adapter, workspace, file, relative)
+            .await?;
+        if !found.is_empty()
+            && self.live_session_id(adapter, workspace).await == Some(answered_by)
+            && outline_hash(file).await.as_deref() == Some(hash.as_str())
+        {
+            cache.lock().unwrap().put(key, hash, answered_by, &found);
+        }
+        Ok(found)
+    }
+
+    /// The id of the started session for this provider and workspace, counted
+    /// as a use of it (like [`Self::session`]); `None` when there is none, or
+    /// it is still starting, failed or stuck.
+    async fn live_session_id(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+    ) -> Option<u64> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&Self::session_key(adapter, workspace))?;
+        if session.stuck() || session.ready_client().is_none() {
+            return None;
+        }
+        session.touch();
+        Some(session.id)
+    }
+
+    /// [`Self::document_symbols`] without the cache: one request, with the id
+    /// of the session that answered it.
+    async fn ask_document_symbols(
+        &self,
+        adapter: &Arc<dyn LspAdapter>,
+        workspace: &Workspace,
+        file: &Path,
+        relative: &str,
+    ) -> Result<(Vec<Location>, u64)> {
         let uri = reqwest::Url::from_file_path(file)
             .map_err(|_| anyhow!("cannot convert file path to URI"))?
             .to_string();
-        let value = self
-            .position_request(
+        let (value, session) = self
+            .position_request_on(
                 adapter,
                 workspace,
                 file,
@@ -987,11 +1182,12 @@ impl Manager {
                 json!({"textDocument":{"uri":uri}}),
             )
             .await?;
-        locations_for(
+        let found = locations_for(
             Value::Array(flatten_document_symbols(&value, &uri)),
             workspace,
             adapter.provider(),
-        )
+        )?;
+        Ok((found, session))
     }
 
     /// Whether a started, ready session exists for this provider and
@@ -1780,5 +1976,88 @@ mod tests {
         // otherwise never get its last repeat.
         let waits: Duration = SAME_SERVER_RETRY_WAITS.iter().sum();
         assert!(waits < SAME_SERVER_RETRY_WINDOW, "{waits:?}");
+    }
+
+    #[test]
+    fn only_the_adapters_that_resend_the_text_count_as_opening_documents() {
+        let manager = Manager::new(&Config::default());
+        let mut opens: Vec<(&str, bool)> = manager
+            .adapters()
+            .iter()
+            .map(|adapter| (adapter.provider(), adapter.opens_documents()))
+            .collect();
+        opens.sort_unstable();
+        assert_eq!(
+            opens,
+            [
+                ("clangd", true),
+                ("csharp-ls", false),
+                ("gopls", true),
+                ("jdtls", true),
+                ("pyright", true),
+                ("rust-analyzer", false),
+                ("typescript-language-server", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_outline_is_kept_per_hash_and_session_never_empty_and_bounded() {
+        let symbol = |name: &str| Location {
+            file_path: PathBuf::from("/w/src/a.cs"),
+            relative_file_path: Some("src/a.cs".into()),
+            start_line: 1,
+            start_character: 0,
+            end_line: 1,
+            end_character: 1,
+            name: Some(name.into()),
+            kind: Some(6),
+            language: None,
+            provider: None,
+        };
+        let key = |path: &str| ("csharp-ls", "ws".to_owned(), path.to_owned());
+        let (old, new) = (content_hash("a"), content_hash("b"));
+        assert_eq!(old, crate::workspace::hash("a"), "the index's hash");
+        let mut cache = OutlineCache::default();
+
+        assert!(!cache.put(key("src/a.cs"), old.clone(), 1, &[]), "empty");
+        assert!(cache.get(&key("src/a.cs"), &old, 1).is_none());
+
+        assert!(cache.put(key("src/a.cs"), old.clone(), 1, &[symbol("Add")]));
+        assert_eq!(
+            cache.get(&key("src/a.cs"), &old, 1).unwrap()[0]
+                .name
+                .as_deref(),
+            Some("Add")
+        );
+        assert!(cache.get(&key("src/a.cs"), &new, 1).is_none(), "edited");
+        assert!(
+            cache.get(&key("src/a.cs"), &old, 2).is_none(),
+            "new session"
+        );
+        assert!(cache.get(&key("src/b.cs"), &old, 1).is_none(), "other file");
+        let other_workspace = ("csharp-ls", "other".to_owned(), "src/a.cs".to_owned());
+        assert!(cache.get(&other_workspace, &old, 1).is_none());
+
+        // The new text's outline replaces the old one.
+        cache.put(key("src/a.cs"), new.clone(), 1, &[symbol("Sub")]);
+        assert!(cache.get(&key("src/a.cs"), &old, 1).is_none());
+        assert_eq!(
+            cache.get(&key("src/a.cs"), &new, 1).unwrap()[0]
+                .name
+                .as_deref(),
+            Some("Sub")
+        );
+
+        // Full: replacing a kept file does not clear, a new file does.
+        for index in 1..MAX_CACHED_OUTLINES {
+            cache.put(key(&format!("f{index}")), old.clone(), 1, &[symbol("x")]);
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_OUTLINES);
+        cache.put(key("src/a.cs"), old.clone(), 1, &[symbol("Add")]);
+        assert_eq!(cache.entries.len(), MAX_CACHED_OUTLINES);
+        cache.put(key("one-more"), old.clone(), 1, &[symbol("y")]);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.get(&key("one-more"), &old, 1).is_some());
     }
 }
