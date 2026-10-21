@@ -1114,20 +1114,28 @@ impl Manager {
                 (session, false)
             }
         };
-        // The walk this request belongs to, if any, learns which it was.
+        self.note_walk(&key, session.id, session.provider, reused);
+        session
+    }
+
+    /// Tells the walk this request belongs to, if any, that it used session
+    /// `session` and whether it found it running (see [`WalkSessions`]). Every
+    /// path that answers from a session, or from something a session
+    /// produced, calls this: [`Self::session`] for a request, and
+    /// [`Self::live_session_id`] for an outline served from the cache.
+    fn note_walk(&self, key: &SessionKey, session: u64, provider: &'static str, reused: bool) {
         let _ = WALK.try_with(|walk| {
             let unchanged = reused
                 .then(|| {
                     self.stamps
                         .lock()
                         .unwrap()
-                        .get(&key)
+                        .get(key)
                         .map(|(_, since)| since.elapsed())
                 })
                 .flatten();
-            walk.note(session.id, session.provider, reused, unchanged);
+            walk.note(session, provider, reused, unchanged);
         });
-        session
     }
 
     /// Waits for the session's client, and for priming too when
@@ -1789,19 +1797,28 @@ impl Manager {
 
     /// The id of the started session for this provider and workspace, counted
     /// as a use of it (like [`Self::session`]); `None` when there is none, or
-    /// it is still starting, failed or stuck.
+    /// it is still starting, failed or stuck. The walk this call belongs to, if
+    /// any, is told it used that running session: a cached outline answers from
+    /// what this session produced, so it is a kept-session answer unless the
+    /// walk started the session itself (its earlier [`Self::session`] call
+    /// recorded that first, and the first record stands).
     async fn live_session_id(
         &self,
         adapter: &Arc<dyn LspAdapter>,
         workspace: &Workspace,
     ) -> Option<u64> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(&Self::session_key(adapter, workspace))?;
-        if session.stuck() || session.ready_client().is_none() {
-            return None;
-        }
-        session.touch();
-        Some(session.id)
+        let key = Self::session_key(adapter, workspace);
+        let (id, provider) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&key)?;
+            if session.stuck() || session.ready_client().is_none() {
+                return None;
+            }
+            session.touch();
+            (session.id, session.provider)
+        };
+        self.note_walk(&key, id, provider, true);
+        Some(id)
     }
 
     /// [`Self::document_symbols`] without the cache: one request, with the id

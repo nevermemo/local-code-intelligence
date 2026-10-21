@@ -5259,6 +5259,69 @@ async fn the_outline_cache_answers_by_content_hash_and_never_stores_an_empty_out
     manager.shutdown_all().await;
 }
 
+/// An outline served from the cache is an answer of the session that gave it:
+/// a walk that gets it without asking the server, and that did not start that
+/// session, used a kept session (`WalkSessions::reused`), so its `lsp.live`
+/// answer is labelled like any other kept-session answer. The walk that started
+/// the session and cached the outline is not marked. `outline_cache`, `sync =
+/// "watch"` (which makes pyright's session shared), two walks whose barriers
+/// both passed, the second served from the cache alone.
+#[tokio::test]
+async fn a_walk_served_a_cached_outline_by_a_kept_session_is_labelled_kept() {
+    use lci_maps::lsp_live::{LspBackend, ManagerBackend};
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, workspace, states) =
+        outline_fixture_with(&temp, true, local_code_intelligence::config::LspSync::Watch);
+    let files: Vec<String> = local_code_intelligence::chunk::source_files(&workspace.path, true)
+        .unwrap()
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    let manager = Arc::new(manager.with_indexed_files(Arc::new(SnapshotFiles(Arc::new(files)))));
+    let own = Arc::new(Manager::new(&Config::default()).without_sync());
+    let open = || {
+        ManagerBackend::open_split(
+            workspace.clone(),
+            Arc::clone(&manager),
+            Arc::clone(&own),
+            LOADED_BUDGET,
+        )
+    };
+    let calculator = "src/calculator.py";
+
+    // The first walk starts pyright, asks for the outline and caches it.
+    let first = open().await.unwrap();
+    assert_eq!(first.document_symbols(calculator).await.unwrap().len(), 2);
+    assert_eq!(outline_requests(&states.python, calculator), 1);
+    assert!(
+        first.walk().reused().is_empty(),
+        "a session the walk started: {:?}",
+        first.walk().reused()
+    );
+    let again = first.document_symbols(calculator).await.unwrap();
+    assert_eq!(again.len(), 2);
+    assert!(
+        first.walk().reused().is_empty(),
+        "its own cached outline is its own: {:?}",
+        first.walk().reused()
+    );
+
+    // The second walk, its barrier passed on the same tree, is answered by
+    // the cache alone: no request reaches the server, and it is labelled.
+    let second = open().await.unwrap();
+    assert_eq!(second.document_symbols(calculator).await.unwrap().len(), 2);
+    assert_eq!(
+        outline_requests(&states.python, calculator),
+        1,
+        "served from the cache"
+    );
+    let reused = second.walk().reused();
+    assert_eq!(reused.len(), 1, "{reused:?}");
+    assert_eq!(reused[0].0, "pyright");
+    assert!(reused[0].1.is_some(), "a stamp was recorded: {reused:?}");
+    manager.shutdown_all().await;
+}
+
 /// Under `outline_cache` and `[run_profile.lsp] sync = "watch"` (d424), a
 /// synced change drops the file's kept outline: an edit is answered with the
 /// new outline, and even the same bytes written again (a change the server
