@@ -156,6 +156,46 @@ impl std::str::FromStr for WalkGroups {
     }
 }
 
+/// How the edges above the walk's gate are priced by rank
+/// (`[run_profile.walk] pricing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalkPricing {
+    /// Rank `r` of the edges above the gate is worth `1 / (1 + r)` of its
+    /// kind's prior, whatever the fan-out. Today's behaviour.
+    #[default]
+    Rank,
+    /// Rank `r` of `n` candidates is worth `1 / (1 + a + r * gate / n)` of its
+    /// kind's prior (`gate` is 8; `a` is a trait seed's implementors ranked in
+    /// front, 0 for any other node), so a wide fan-out is flattened instead of
+    /// starved. Equal to `rank` at `n = gate`; at or below the gate nothing
+    /// changes.
+    Relative,
+}
+
+impl WalkPricing {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rank => "rank",
+            Self::Relative => "relative",
+        }
+    }
+}
+
+impl std::str::FromStr for WalkPricing {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "rank" => Ok(Self::Rank),
+            "relative" => Ok(Self::Relative),
+            other => Err(format!(
+                "pricing must be \"rank\" or \"relative\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 /// `[run_profile.walk]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -167,6 +207,13 @@ pub struct WalkProfile {
     /// What a group made only of `mentions` edges (text matches) adds to the
     /// evidence count, `0.0..=1.0`; 1.0 (default) counts it like any other.
     pub grep_corroboration: f64,
+    /// How the edges above the gate are priced: `"rank"` (default, `1 / (1 +
+    /// r)` of the prior) or `"relative"` (`1 / (1 + a + r * gate / n)` for `n`
+    /// candidates and `a` implementors ahead of a trait seed's). A handle does
+    /// not carry it or refuse a different one: a resumed call prices under the
+    /// profile it is given, like `gate` and `beam`, so a walk can mix pricings
+    /// across resumes.
+    pub pricing: WalkPricing,
 }
 
 impl Default for WalkProfile {
@@ -174,6 +221,7 @@ impl Default for WalkProfile {
         Self {
             groups: WalkGroups::Tool,
             grep_corroboration: 1.0,
+            pricing: WalkPricing::Rank,
         }
     }
 }
@@ -562,6 +610,7 @@ mod tests {
         config.rescorer = crate::config::Rescorer::SystemOne;
         config.run_profile.walk.groups = crate::config::WalkGroups::Claim;
         config.run_profile.walk.grep_corroboration = 0.5;
+        config.run_profile.walk.pricing = crate::config::WalkPricing::Relative;
         config.run_profile.scip.mode = crate::config::profile::ScipMode::Cache;
         config.run_profile.lsp.sessions = LspSessions::Shared;
         config.run_profile.freshness.verify_on_read = true;
@@ -640,6 +689,37 @@ mod tests {
         ] {
             assert!(base.keys.iter().any(|k| k == key), "{key}");
         }
+    }
+
+    #[test]
+    fn walk_pricing_is_rank_by_default_and_changes_the_profile_hash() {
+        let base = Config::default().run_profile();
+        assert_eq!(WalkProfile::default().pricing, WalkPricing::Rank);
+        assert!(base.canonical.contains(r#""pricing":"rank""#));
+        let mut relative = Config::default();
+        relative.run_profile.walk.pricing = WalkPricing::Relative;
+        let relative = relative.run_profile();
+        assert!(relative.canonical.contains(r#""pricing":"relative""#));
+        assert_ne!(base.hash, relative.hash);
+        assert!(base.keys.iter().any(|k| k == "run_profile.walk.pricing"));
+        assert_eq!("relative".parse::<WalkPricing>(), Ok(WalkPricing::Relative));
+        assert!("rank".parse::<WalkPricing>().is_ok());
+        assert!("linear".parse::<WalkPricing>().is_err());
+        // The key lives under `[run_profile.walk]`, not `[run_profile]`.
+        let error = toml::from_str::<Config>(&format!(
+            "{}[run_profile]\npricing = \"relative\"\n",
+            base_toml()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pricing"), "{error}");
+        let read: Config = toml::from_str(&format!(
+            "{}[run_profile.walk]\npricing = \"relative\"\n",
+            base_toml()
+        ))
+        .unwrap();
+        read.validate().unwrap();
+        assert_eq!(read.run_profile.walk.pricing, WalkPricing::Relative);
     }
 
     #[test]
@@ -843,6 +923,7 @@ mode = \"sometimes\"
             "rescorer",
             "run_profile.walk.groups",
             "run_profile.walk.grep_corroboration",
+            "run_profile.walk.pricing",
             "run_profile.traverse.map_freshness",
             "run_profile.scip.mode",
             "run_profile.lsp.sessions",

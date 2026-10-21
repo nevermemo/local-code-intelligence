@@ -110,7 +110,7 @@ Best-first search over path states (`lci-maps/src/traverse/mod.rs`). One pop exp
 becomes a state once and is expanded at most once. A start node is never "found by a cross-map hop".
 
 - Hop (`frontier::hop`): a node with at most 8 offered edges (the gate) is followed whole, each edge at `kind_prior` (call 1, containment 0.5); above the gate a `HopScorer` orders them, the best `beam` (16; 1 to
-  256) are kept and the edge at rank r gets `1/(1+r)` times `kind_prior`. Learned priors replace the guess (`priors.rs`, `VERSION` 1, `cargo xtask maps fit-priors`); a fitted tie-break (`tiebreak.rs`, `VERSION` 1,
+  256) are kept and the edge at rank r gets `1/(1+r)` times `kind_prior`. With `[run_profile.walk] pricing = "relative"` (default `rank`, as here) rank r of n candidates (counted before the beam; a trait seed's implementors are `a` edges ranked ahead) gets `1/(1+a+r*gate/n)` instead: equal to `rank` at n = gate, so continuous at the gate for every node, and flatter for a wide fan-out (80 edges: rank 8 is 1/1.8, not 1/9); at or below the gate nothing changes, and the handle neither carries nor checks the pricing (a walk can mix pricings across resumes). Learned priors replace the guess (`priors.rs`, `VERSION` 1, `cargo xtask maps fit-priors`); a fitted tie-break (`tiebreak.rs`, `VERSION` 1,
   `cargo xtask maps fit-tiebreak`) orders results tied at the same rank under `boost` fusion only and never lifts a result over a higher one.
 - Relax and alt paths: a node not yet expanded reached by a route with higher potential (relative 1e-9) is relaxed (trace `relax`; a node held at `max_depth` is `unblocked` by any route below it); a popped node
   keeps its state and the route is traced once as `alt_path`.

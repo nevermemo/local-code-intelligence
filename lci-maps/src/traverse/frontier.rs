@@ -12,7 +12,11 @@
 //! graph); above the gate a [`HopScorer`] orders them, the best `beam` are
 //! kept, and the edge at rank `r` gets `1 / (1 + r)` times its kind's
 //! [`kind_prior`], so a rank-0 containment edge is worth 0.5 above the gate as
-//! it is below it. An unscored arm follows every edge at 1. The rules scorer sees the edge's witness class, kind, the
+//! it is below it. Under [`Pricing::Relative`] the divisor is `1 + ahead + r *
+//! gate / n` for `n` candidates instead (`ahead` as in [`hop_from`], 0 for an
+//! ordinary node): it equals the `rank` divisor at `n = gate`, so the price is
+//! continuous at the gate for every node, and it flattens above it; `n` is
+//! counted before the beam. An unscored arm follows every edge at 1. The rules scorer sees the edge's witness class, kind, the
 //! fused confidence, the in-degree seen so far, the query overlap and the map
 //! card's cost, so a hop into another map is priced like any other. From a
 //! trait start node ([`hop_from`]) the `scip.implements` edges are followed
@@ -238,16 +242,64 @@ impl Frontier {
     }
 }
 
-/// How many edges are followed whole, and how many are kept above that.
+/// How the edges above the gate are priced by rank
+/// (`[run_profile.walk] pricing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pricing {
+    /// Rank `r` is worth `1 / (1 + r)` of its kind's prior, whatever the
+    /// fan-out. Today's behaviour.
+    #[default]
+    Rank,
+    /// Rank `r` of `n` candidates is worth `1 / (1 + ahead + r * gate / n)` of
+    /// its kind's prior (`ahead`: the implementors of a trait seed, ranked in
+    /// front of them; 0 elsewhere): a wide fan-out is flattened instead of
+    /// starved, and at `n = gate` the value is `rank`'s.
+    Relative,
+}
+
+impl Pricing {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rank => "rank",
+            Self::Relative => "relative",
+        }
+    }
+
+    /// The divisor of the prior of the candidate at `rank` among `n`
+    /// candidates, with `ahead` edges ranked in front of all of them.
+    fn divisor(self, ahead: usize, rank: usize, n: usize, gate: usize) -> f64 {
+        match self {
+            Self::Rank => 1.0 + (ahead + rank) as f64,
+            Self::Relative => 1.0 + ahead as f64 + rank as f64 * gate as f64 / n as f64,
+        }
+    }
+}
+
+impl From<lci_core::config::WalkPricing> for Pricing {
+    fn from(pricing: lci_core::config::WalkPricing) -> Self {
+        match pricing {
+            lci_core::config::WalkPricing::Rank => Self::Rank,
+            lci_core::config::WalkPricing::Relative => Self::Relative,
+        }
+    }
+}
+
+/// How many edges are followed whole, how many are kept above that, and how
+/// the ones above the gate are priced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopPrice {
     pub gate: usize,
     pub beam: usize,
+    pub pricing: Pricing,
 }
 
 impl Default for HopPrice {
     fn default() -> Self {
-        Self { gate: 8, beam: 16 }
+        Self {
+            gate: 8,
+            beam: 16,
+            pricing: Pricing::Rank,
+        }
     }
 }
 
@@ -384,8 +436,10 @@ impl HopScorer for BfsScorer {
 }
 
 /// One step: `(index into cands, hop value)` for the edges to follow. The
-/// value is the kind prior at or below the gate and `kind_prior / (1 + rank)`
-/// above it; the unscored arm gives every edge 1.
+/// value is the kind prior at or below the gate; above it, it is `kind_prior /
+/// (1 + rank)` under [`Pricing::Rank`] and `kind_prior / (1 + rank * gate / n)`
+/// for `n` candidates under [`Pricing::Relative`]; the unscored arm gives every
+/// edge 1.
 pub fn hop(
     scorer: &mut dyn HopScorer,
     ctx: &ScoreCtx,
@@ -404,7 +458,9 @@ pub fn hop(
 /// prior and in offer order, ahead of everything else. The other candidates
 /// are priced as [`hop`] prices them, but as the remainder with the `n`
 /// implementors counted before their rank (`prior / (1 + n + rank)` above the
-/// gate, `prior / (1 + n)` at or below it). When a learned table prices
+/// gate under [`Pricing::Rank`], `prior / (1 + n + rank * gate / m)` for `m`
+/// remaining candidates under [`Pricing::Relative`], `prior / (1 + n)` at or
+/// below the gate). When a learned table prices
 /// `Implements` so low that the top of that remainder would still reach the
 /// implementors' value, the remainder is scaled, keeping its order, so its top
 /// is `implements / (1 + n)`. So no other edge, whatever the priors, gets a hop
@@ -476,6 +532,8 @@ fn price_ranked(
     let scores = scorer.score(ctx, cands);
     let mut order: Vec<usize> = (0..cands.len()).collect();
     order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    // The sibling count is taken before the beam, so the beam only cuts.
+    let offered = cands.len();
     order
         .into_iter()
         .take(price.beam)
@@ -484,7 +542,8 @@ fn price_ranked(
             let edge = &cands[i].edge.best;
             (
                 i,
-                ctx.priors.prior(edge.map, edge.kind) / (1.0 + (ahead + rank) as f64),
+                ctx.priors.prior(edge.map, edge.kind)
+                    / price.pricing.divisor(ahead, rank, offered, price.gate),
             )
         })
         .collect()

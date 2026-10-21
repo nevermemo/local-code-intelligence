@@ -1281,6 +1281,7 @@ pub async fn run_with_trait_seeds(
         .top_k(call.top_k, expanding)
         .price(HopPrice {
             beam: limits.beam,
+            pricing: profile.walk.pricing.into(),
             ..HopPrice::default()
         })
         .trait_seeds(found.trait_nodes())

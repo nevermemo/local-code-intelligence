@@ -176,7 +176,9 @@ pub mod trace;
 mod tests;
 
 use crate::{Budget, MapId, edge::MapCard, edge::WitnessClass};
-use frontier::{Candidate, Frontier, HopPrice, HopScorer, RulesScorer, ScoreCtx, hop_from};
+use frontier::{
+    Candidate, Frontier, HopPrice, HopScorer, Pricing, RulesScorer, ScoreCtx, hop_from,
+};
 use handler::{
     Action, BOOST_MAX, Checkpoint, Decision, Directive, FrontierItem, Handler, RAISE_MAX_POPS,
     RAISE_MAX_TOKENS, REDIRECT_MAX, RUNG_AGENT, RUNG_RULES, RUNG_SYSTEM_ONE, StopBudget,
@@ -993,6 +995,11 @@ impl<'s> Run<'s> {
             }
             if let (false, Some(object)) = (self.t.score_bound, start.as_object_mut()) {
                 object.insert("score_bound".into(), json!(false));
+            }
+            if let (true, Some(object)) =
+                (self.t.price.pricing != Pricing::Rank, start.as_object_mut())
+            {
+                object.insert("pricing".into(), json!(self.t.price.pricing.as_str()));
             }
             if let (Some(priors), Some(object)) = (self.t.priors.json(), start.as_object_mut()) {
                 object.insert("priors".into(), priors);

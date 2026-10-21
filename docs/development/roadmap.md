@@ -81,7 +81,6 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K27 | Paths on cards: every hop with its edge kind and witness | Card schema test | S | - |
 | K21a | BM25 entity seeds over symbol names, qualified paths and doc comments, in process, built on the existing in-process BM25 lexical scorer; `seeds.bm25` off | Ceiling: gold symbol in top k on the trait and where-to gold, beside `lsp.symbols` and `rg --fixed-strings` baseline arms | M | L1, L4, I-1 |
 | K22a | Exact-literal seed source over ripgrep (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases; K10a's `OutlinePlaces` is the occurrence-to-node lookup d394 lacked. After K10a | Ceiling, beside an rg baseline arm | S | item 4 rest |
-| K24b | Rank pricing normalised by sibling count (`walk.pricing`) | Unit tests | S | - |
 | K30a | Router: caller intent through the existing `steer.policy` is the router (it picks walk, grep or LSP); document it and test it. Observable query features go to the cycle 2 screening (d391 killed text features at 20 of 59); gold labels never route | Test: each intent picks its policy | S | F3, N100 (detector stays killed) |
 | K33a | Trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs | Schema test | S | - |
 | **M4-core** | **Maps, servers, safety, mining (unconditional)** | | | |
