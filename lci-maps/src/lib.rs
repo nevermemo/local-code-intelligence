@@ -17,6 +17,7 @@ pub mod audit;
 pub mod config_key;
 pub mod contains;
 pub mod crates;
+pub mod docs_mentions;
 pub mod edge;
 pub mod exact_history;
 pub mod fresh;

@@ -35,7 +35,9 @@
 //! [`LOCKFILES`]. Names shorter than `min_name_len` and a stoplist of
 //! ubiquitous names (`new`, `default`, ...) produce no edges: they would
 //! only return the cap's worth of noise. Which `max_matches` occurrences are
-//! kept is a cap in walk (path) order, not a rank.
+//! kept is a cap in walk (path) order, not a rank. [`GrepOptions::roles`]
+//! narrows the walk to files of given [`SourceRole`]s: a file of another role
+//! is never yielded, so it is neither read nor counted.
 //!
 //! # Freshness
 //!
@@ -53,7 +55,10 @@ use crate::{
     scip_graph::ScipMap,
 };
 use ignore::WalkBuilder;
-use lci_core::node::{NodeId, NodeKind};
+use lci_core::{
+    filter::{SourceRole, classify_source_role},
+    node::{NodeId, NodeKind},
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -121,6 +126,10 @@ pub struct GrepOptions {
     /// File names (the whole name, not a pattern) the walk never reads.
     /// Empty by default; see [`LOCKFILES`].
     pub skip_files: Vec<String>,
+    /// When set, the walk yields only files whose [`classify_source_role`]
+    /// (of the path relative to the root) is in the list. `None` (the
+    /// default) yields every file.
+    pub roles: Option<Vec<SourceRole>>,
 }
 
 impl Default for GrepOptions {
@@ -134,6 +143,7 @@ impl Default for GrepOptions {
             skip_names: COMMON_NAMES.iter().map(|s| (*s).to_owned()).collect(),
             skip_dirs: vec!["target".into(), "node_modules".into()],
             skip_files: Vec::new(),
+            roles: None,
         }
     }
 }
@@ -194,6 +204,8 @@ fn live_blob(bytes: &[u8]) -> String {
 /// cannot see different files.
 fn walker(root: &Path, options: &GrepOptions) -> ignore::Walk {
     let skip_dirs: HashSet<String> = options.skip_dirs.iter().cloned().collect();
+    let roles = options.roles.clone();
+    let base = root.to_path_buf();
     WalkBuilder::new(root)
         .hidden(true)
         .parents(false)
@@ -205,9 +217,19 @@ fn walker(root: &Path, options: &GrepOptions) -> ignore::Walk {
         .follow_links(false)
         .sort_by_file_path(|a, b| a.cmp(b))
         .filter_entry(move |entry| {
-            entry.depth() == 0
-                || !(entry.file_type().is_some_and(|t| t.is_dir())
-                    && skip_dirs.contains(entry.file_name().to_string_lossy().as_ref()))
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                return !skip_dirs.contains(entry.file_name().to_string_lossy().as_ref());
+            }
+            match &roles {
+                Some(roles) if entry.file_type().is_some_and(|t| t.is_file()) => {
+                    relative_path(&base, entry.path())
+                        .is_some_and(|path| roles.contains(&classify_source_role(&path)))
+                }
+                _ => true,
+            }
         })
         .build()
 }

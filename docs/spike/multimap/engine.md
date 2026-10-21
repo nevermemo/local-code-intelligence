@@ -38,6 +38,7 @@ Traversal maps (ids as in `--maps`). Default set `MAPS`; the rest are opt-in (`O
 | `graph.scip` (default) | expansion | the SCIP index (`rust-analyzer scip`, file `scip_index`), read and cached in memory by file stamp; with `--root`, also an `implements` edge (kind prior 0.9) from each trait-impl member to its trait method declaration | PerFile | `scip_graph.rs` |
 | `structure.contains` (default) | expansion | containment derived from the SCIP graph; lets a chunk or file start node reach its symbols | PerFile | `contains.rs` |
 | `grep.live` | expansion | a search of the tree's current bytes | Live | `live_grep.rs` |
+| `docs.mentions` (opt-in; needs `--root`) | expansion | the documentation files (`.md` anywhere, or under `doc`, `docs`, `documentation`; by `classify_source_role`, so not a root `config.example.toml`) whose current bytes mention a node's name: a `Mentions` edge to the file, labelled `Doc`, witness Exact or Text; a wrapper of `grep.live` with a role filter on its walk; no symbol or section edges | Live | `docs_mentions.rs`, `live_grep.rs` (`GrepOptions.roles`) |
 | `config.key` | expansion | config keys and the declarations that read them (needs `rg`) | Global | `config_key.rs`, `reads_key.rs` (M1.2) |
 | `git.history` | expansion | commits and co-change from git history up to HEAD | PerCommit | `git_history.rs` |
 | `probe.compile` | expansion | compiler errors of a patch to a function, by `cargo check` on a scratch copy (seconds per node) | Live | `probe_map.rs`, `probe.rs` (M1.3) |

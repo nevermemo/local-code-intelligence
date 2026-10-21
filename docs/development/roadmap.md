@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: SHARED (`sessions = shared` default with a tree-stamp barrier, d454 and d460, cross-family review) (this), K22a-0 bench seed maps (d461), K32-2 docs.mentions (d462). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K20b-1, K11b, K11d-2; K22a-2 after K22a-0. Rewrite this line at every push.
+In flight: SHARED (`sessions = shared` default with a tree-stamp barrier, d454 to d466, cross-family review) (this), K22a-0 bench seed maps (d461), K6b transcript shapes (d464, local). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K20b-1, K11b, K11d-2; K22a-2 after K22a-0. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -89,7 +89,7 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K18a | Repo map: PageRank over the syntax and outline graph as a seed prior (`seeds.repo_map` off) | Ceiling | M | G2 |
 | K19 | `grep.structural` map wrapping ast-grep-core (pinned to the tree-sitter version it requires, 0.25 today; not after K15a) | Ceiling on structural queries | M | - |
 | K32-1 | `tests.tested_by` (opt-in map over the SCIP impact index, d458): built; open: the ceiling run (`maps bench --set impact` with and without the map, `tests_recall` and `tests_deep_recall` per stratum) | Ceiling | S | - |
-| K32-2 | `docs.mentions` (`Mentions` edges from documentation, a wrapper of `grep.live` over `SourceRole::Documentation` paths; plan after K32-1) | Ceiling (`docs_recall`, `i1_section_*`) | S | K32-1 |
+| K32-2 | `docs.mentions` (`Mentions` edges from documentation, a wrapper of `grep.live` over `SourceRole::Documentation` paths, d462): built; open: the ceiling run (`maps bench --set impact` with and without the map, `docs_recall`). `i1_section_*` is not a check of this row: I1 needs DocSection nodes and section lines (K32-2b, unplanned, cycle 1 optional) | Ceiling (`docs_recall`) | S | K32-1 |
 | K6a | Done (d457; K6a-1 strata, K6a-2 miner): `cargo xtask gold strata` and a `guard` stratum (`core`, `grep_easy`, `agent_trap`) on every scorer, from the gold item alone; `cargo xtask mine-transcripts` counts question shapes and trace classes over synthetic transcripts (the sim trace shape), writing shapes and counts only to `test-results/transcripts/`. Estimated S, was two S (strata plus miner) | Tests | S + S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored. Input shape: K6a-2's `{question, trace}` JSONL (the sim trace shape); the converters from the two real formats are written and kept locally and only question shapes and counts leave the machine | Counts | S | K6a |
 | **M4-conditional** | **Codanna, grammar upgrade, optional tools, external gold, baselines: each runs in cycle 1 when its condition holds** | | | |
