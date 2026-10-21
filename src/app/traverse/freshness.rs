@@ -43,9 +43,11 @@
 //!   `search.vector`) are labelled with how many source files differ between
 //!   the snapshot's manifest and the tree (read after the walk, because the
 //!   walk's first search may refresh the snapshot; prose files of the manifest
-//!   are not counted, the tree scan leaves prose out). `grep.live` and
-//!   `lsp.live` read the tree but place their answers by the SCIP index (the
-//!   line of a symbol), so they say `observed: live` with the SCIP index's lag
+//!   are not counted, the tree scan leaves prose out). `grep.live`
+//!   reads the tree and `lsp.live` queries a language server (a fresh one reads
+//!   the disk; a kept one is bounded by its tree stamp's coverage, and the
+//!   walk says so in a note), and both place their answers by the SCIP index
+//!   (the line of a symbol), so they say `observed: live` with the SCIP index's lag
 //!   and `places: "index"`: they are stale when the index's places are;
 //! * each card says `file_changed`: whether the content hash of its file now
 //!   differs from the hash the card's maps read (the SCIP baseline for the
@@ -96,7 +98,8 @@ const SCIP_BUILT: [MapId; 8] = [
     "scip.implements",
 ];
 
-/// The maps that read the working tree or git when they answer.
+/// The maps that read the working tree or git when they answer, or (`lsp.live`)
+/// query a language server that does.
 const LIVE: [MapId; 5] = [
     "grep.live",
     "lsp.live",

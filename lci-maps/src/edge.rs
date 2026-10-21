@@ -141,6 +141,8 @@ pub struct Freshness {
 
 impl Freshness {
     /// A map that reads the working tree (or git) as it is when it answers.
+    /// (`lsp.live` states it too, for a server the call started; the walk
+    /// labels a kept server's cards `unverified` and says so in a note.)
     pub const fn live() -> Self {
         Self {
             observed: Observed::LiveTree,

@@ -1497,7 +1497,7 @@ pub async fn run_with_trait_seeds(
                 );
                 add_file_changed(&mut response, &observer);
                 if profile.traverse.answer_labels {
-                    add_answer_labels(&mut response, None, &unavailable);
+                    add_answer_labels(&mut response, None, &unavailable, &[]);
                 }
                 return Ok(Report {
                     response,
@@ -1699,7 +1699,13 @@ pub async fn run_with_trait_seeds(
     );
     add_file_changed(&mut response, &observer);
     if profile.traverse.answer_labels {
-        add_answer_labels(&mut response, Some(&result), &unavailable);
+        // `lsp.live`'s evidence came from a kept server when the walk
+        // found one running (see `WalkSessions`): its cards are not `fresh`.
+        let kept: Vec<MapId> = match &lsp_live_walk {
+            Some(walk) if !walk.reused().is_empty() => vec![lci_maps::lsp_live::LSP_LIVE_ID],
+            _ => Vec::new(),
+        };
+        add_answer_labels(&mut response, Some(&result), &unavailable, &kept);
     }
     Ok(Report {
         response,

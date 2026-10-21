@@ -181,7 +181,9 @@ pub struct RunProfileTraverse {
     /// gives `fresh`; anything else is `unverified` (the honest answer with
     /// `map_freshness` and `verify_on_read` off). A card whose own file is
     /// unchanged reads `fresh` even under a stale snapshot, because its text is
-    /// current. `false` (the default): the answer, the trace, the checkpoint
+    /// current; except that a card citing `lsp.live` is `unverified` when the
+    /// walk found a language server running (a kept session: nothing checks
+    /// what it read). `false` (the default): the answer, the trace, the checkpoint
     /// and the handle are as without the key. `true` changes the response only:
     /// nothing is withheld, `results` are the same with either value, and the
     /// trace, the checkpoint hash and the handle do not change.

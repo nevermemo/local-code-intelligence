@@ -5504,6 +5504,18 @@ async fn traverse_add(
     sessions: local_code_intelligence::config::LspSessions,
     manager: &Arc<Manager>,
 ) -> Value {
+    traverse_add_with(config, workspace, index, sessions, manager, |_| {}).await
+}
+
+/// [`traverse_add`] with the run profile adjusted by `tweak`.
+async fn traverse_add_with(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    sessions: local_code_intelligence::config::LspSessions,
+    manager: &Arc<Manager>,
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Value {
     use local_code_intelligence::{
         app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
         config::{LspProfile, RunProfileConfig, TraverseConfig, TraverseFirstStage},
@@ -5516,13 +5528,14 @@ async fn traverse_add(
         deadline_ms: 60_000,
         ..TraverseConfig::default()
     };
-    let profile = RunProfileConfig {
+    let mut profile = RunProfileConfig {
         lsp: LspProfile {
             sessions,
             ..LspProfile::default()
         },
         ..RunProfileConfig::default()
     };
+    tweak(&mut profile);
     let (budget, steer) = (
         BudgetArgs {
             deadline_ms: Some(60_000),
@@ -6981,6 +6994,98 @@ async fn a_walk_that_finds_a_server_an_overlapping_walk_started_is_labelled_kept
     assert!(
         reused[0].1.is_some(),
         "the first barrier recorded the stamp: {reused:?}"
+    );
+    manager.shutdown_all().await;
+}
+
+/// The `freshness` word of every card of `answer` that cites `lsp.live`
+/// (`maps` or `via`), with `map_freshness` and `answer_labels` on.
+fn lsp_live_card_words(answer: &Value) -> Vec<String> {
+    let cites = |card: &Value| {
+        card["via"].as_str() == Some("lsp.live")
+            || card["maps"]
+                .as_array()
+                .is_some_and(|maps| maps.iter().any(|id| id.as_str() == Some("lsp.live")))
+    };
+    answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|card| cites(card))
+        .map(|card| card["freshness"].as_str().unwrap_or("none").to_owned())
+        .collect()
+}
+
+/// With `map_freshness` and `answer_labels` on, a card whose `lsp.live`
+/// evidence came from a server the walk found running is `unverified`, not
+/// `fresh`: nothing checks what a kept server read. A card from a server the
+/// walk started keeps `fresh`. The same walk, the same map, only the session's
+/// origin differs.
+#[tokio::test]
+async fn a_card_from_a_kept_session_is_unverified_and_one_from_a_fresh_session_is_fresh() {
+    use local_code_intelligence::config::LspSessions;
+    let labelled = |profile: &mut local_code_intelligence::config::RunProfileConfig| {
+        profile.traverse.map_freshness = true;
+        profile.traverse.answer_labels = true;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+
+    // A server the walk starts itself (`per_call`: its own manager, a new
+    // server per walk, so a retry after a deadline miss on a cold fake server
+    // is another fresh one): fresh.
+    let mut words = Vec::new();
+    for _ in 0..3 {
+        let answer = traverse_add_with(
+            &config,
+            &workspace,
+            &index,
+            LspSessions::PerCall,
+            &manager,
+            labelled,
+        )
+        .await;
+        assert!(!kept_noted(&answer, "csharp-ls"), "{answer}");
+        words = lsp_live_card_words(&answer);
+        if !words.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        !words.is_empty() && words.iter().all(|word| word == "fresh"),
+        "a server this walk started: {words:?}"
+    );
+
+    // A server found running by the walk (started before it, stamped by the
+    // barrier): unverified.
+    let adapter = csharp_adapter(&manager);
+    manager.tree_barrier(&workspace, &[&adapter]).await;
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts and answers");
+    let spawned = state_count(&state, "spawn_count.txt");
+    let kept = traverse_add_with(
+        &config,
+        &workspace,
+        &index,
+        LspSessions::Shared,
+        &manager,
+        labelled,
+    )
+    .await;
+    assert!(kept_noted(&kept, "csharp-ls"), "{kept}");
+    let words = lsp_live_card_words(&kept);
+    assert!(
+        !words.is_empty() && words.iter().all(|word| word == "unverified"),
+        "a kept server: {words:?} in {kept}"
+    );
+    assert_eq!(
+        state_count(&state, "spawn_count.txt"),
+        spawned,
+        "the walk started nothing"
     );
     manager.shutdown_all().await;
 }
