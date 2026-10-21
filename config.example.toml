@@ -102,6 +102,11 @@ rust_analyzer_trusted = false
 # Seconds a request to a language server may go without any sign of life from
 # it (1-86400).
 lsp_timeout_seconds = 60
+# Seconds a language server may go without any sign of life from it while it
+# starts (its initialize request; 0-86400). 0 bounds the start by
+# lsp_timeout_seconds. Raise it for a server that is silent while it loads a
+# large solution or project, without raising the bound of every later request.
+lsp_start_timeout_seconds = 0
 lsp_candidate_count = 40
 # Most milliseconds one search waits for the language-server channel
 # (100-60000). A server that is still starting (rust-analyzer takes about 10 s
