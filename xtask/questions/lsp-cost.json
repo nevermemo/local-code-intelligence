@@ -1,0 +1,14 @@
+[
+  {"id": "q01", "question": "Where does the language server version probe time out and which setting bounds it (probe_once, readiness_timeout_seconds)?"},
+  {"id": "q02", "question": "How does a traverse call build the LspLive map and its ManagerBackend, and who owns the language server manager?"},
+  {"id": "q03", "question": "Where is outline_cache applied in Manager::document_symbols and when does it hit?"},
+  {"id": "q04", "question": "How does cap_edges limit the edges of one node and where is EXPAND_LIMIT used?"},
+  {"id": "q05", "question": "Where does Store::replace_vectorless commit a snapshot without vectors when the embedder is unavailable?"},
+  {"id": "q06", "question": "How does find_seeds turn the hybrid search hits of the question into start nodes of the walk?"},
+  {"id": "q07", "question": "Where are the budget caps of a traverse request lowered by BudgetArgs and what happens above the cap?"},
+  {"id": "q08", "question": "How does the Observer add file_changed labels and map freshness to a traverse answer?"},
+  {"id": "q09", "question": "What does ScipPlaces map and how does LspLive::ask turn a symbol node into a server request?"},
+  {"id": "q10", "question": "Where does run_with_trait_seeds register the optional maps lsp.live, git.history and probe.compile?"},
+  {"id": "q11", "question": "How does the MCP search_code tool dispatch mode traverse and pass the shared language server manager?"},
+  {"id": "q12", "question": "Where is is_service_unavailable decided for a refused or timed out embedding service?"}
+]
