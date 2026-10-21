@@ -516,6 +516,8 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
                 .csharp
                 .args
                 .extend(fake_args(&["--initialize-delay-ms", "30000"]));
+            // A start that timed out may only be slow: it opens no window.
+            config.run_profile.lsp.breaker = true;
         }
         let manager = Manager::new(&config);
         let adapter = csharp_adapter(&manager);
@@ -528,6 +530,14 @@ async fn fake_csharp_lsp_timeout_and_malformed_protocol_return_bounded_errors() 
             assert!(
                 message.contains("timed out after 5 seconds"),
                 "the 5 s bound must be what ended the wait: {message}"
+            );
+            assert!(
+                manager
+                    .breakers()
+                    .expect("breaker = true")
+                    .remaining("csharp-ls")
+                    .is_none(),
+                "a start that timed out must open no window"
             );
         }
         assert!(
@@ -8138,6 +8148,80 @@ async fn a_policy_table_routes_an_intent_to_lsp_live_without_naming_maps() {
     assert!(lsp_live_hops(&unrouted).is_empty(), "{}", unrouted.response);
     assert_eq!(unrouted.response["effective_policy"]["preset"], "explore");
     assert_eq!(requests_of(&state, "textDocument/definition"), 0);
+}
+
+/// The notes of a walk answer, joined: where `lsp.live`'s unavailability and
+/// its cause are written.
+fn notes_of(answer: &Value) -> String {
+    answer["notes"].to_string()
+}
+
+#[tokio::test]
+async fn lsp_live_skips_a_dead_server_for_the_window_and_a_live_one_closes_it() {
+    use local_code_intelligence::config::LspSessions;
+    // Key off: a missing binary is probed, and fails, on every walk.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut config, workspace, _state, index) = shared_sessions_fixture(&temp);
+    config.csharp.path = Some("definitely-missing-csharp-ls".to_owned());
+    let manager = indexed_manager(&config, &workspace);
+    assert!(manager.breakers().is_none());
+    for call in 1..=2 {
+        let notes = notes_of(
+            &traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager).await,
+        );
+        assert!(notes.contains("lsp.live is unavailable"), "{call}: {notes}");
+        assert!(
+            notes.contains("definitely-missing-csharp-ls"),
+            "{call}: {notes}"
+        );
+        assert!(!notes.contains("lsp breaker"), "{call}: {notes}");
+    }
+
+    // Key on: the first walk names the probe failure and opens the window; the
+    // second is refused by it without a probe.
+    config.run_profile.lsp.breaker = true;
+    let manager_a = indexed_manager(&config, &workspace);
+    let breakers = manager_a.breakers().expect("breaker = true");
+    let first =
+        notes_of(&traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager_a).await);
+    assert!(first.contains("lsp.live is unavailable"), "{first}");
+    assert!(first.contains("definitely-missing-csharp-ls"), "{first}");
+    assert!(breakers.remaining("csharp-ls").is_some(), "{first}");
+    let second =
+        notes_of(&traverse_add(&config, &workspace, &index, LspSessions::Shared, &manager_a).await);
+    assert!(second.contains("lsp.live is unavailable"), "{second}");
+    assert!(second.contains("lsp breaker"), "{second}");
+    assert!(!second.contains("definitely-missing-csharp-ls"), "{second}");
+
+    // A manager of a working configuration that shares the windows is refused
+    // as well; closing them lets the next walk through, and its probe and
+    // start keep them closed.
+    let temp_b = tempfile::tempdir().unwrap();
+    let (mut config_b, workspace_b, _state_b, index_b) = shared_sessions_fixture(&temp_b);
+    config_b.run_profile.lsp.breaker = true;
+    let manager_b = Arc::new(Manager::new(&config_b).with_breakers(Some(Arc::clone(&breakers))));
+    let refused = traverse_add(
+        &config_b,
+        &workspace_b,
+        &index_b,
+        LspSessions::Shared,
+        &manager_b,
+    )
+    .await;
+    assert!(!reached_run_through_lsp_live(&refused), "{refused}");
+    assert!(notes_of(&refused).contains("lsp breaker"), "{refused}");
+    breakers.reset();
+    let answer = traverse_add(
+        &config_b,
+        &workspace_b,
+        &index_b,
+        LspSessions::Shared,
+        &manager_b,
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert!(breakers.remaining("csharp-ls").is_none());
+    manager_b.shutdown_all().await;
 }
 
 // ----- K37b: concurrent walks --------------------------------------------
