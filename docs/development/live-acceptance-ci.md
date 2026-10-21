@@ -27,8 +27,9 @@ Why a self-hosted runner is the only complete option: hosted runners cannot reac
 - `timeout-minutes: 150`. The first real run took a little over an hour end to end, and the original 60-minute bound
   cut off a run that had passed every acceptance step; a single job bound cannot tell a slow healthy step from a dead
   one, which is why the local orchestrator gives each step its own timeout.
-- A final `if: always()` step sweeps `%TEMP%\lci-*` fixture directories left by a crashed run (`Fixture::create` names
-  them `lci-<fixture>-<pid>`). It does not kill processes by name: the runner is a developer machine, and a blanket
+- A first step sets `LCI_ACCEPTANCE_FIXTURE_ROOT` to a run-unique directory (`lci-live-run-<run id>-<attempt>` under
+  `RUNNER_TEMP`), where `Fixture::create` puts every fixture. A final `if: always()` step removes only that directory
+  (fixtures left by a crashed run), never another run's fixtures or any other `lci-*` directory. It does not kill processes by name: the runner is a developer machine, and a blanket
   `Stop-Process -Name rust-analyzer` would also kill editor language servers and a running `serve`. An orphaned
   process after a crash needs a human look at the process list.
 

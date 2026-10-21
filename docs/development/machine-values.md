@@ -96,8 +96,8 @@ worktree is) and creates nothing unless `--ensure` or `--init` says so.
 `<local data dir>` is the platform's local data directory (`%LOCALAPPDATA%` on
 Windows, `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or
 `~/.local/share` on Linux). The scratch directory's name deliberately does not
-start with `lci-`, which `cargo xtask live-acceptance` sweeps from the system
-temp directory when a run ends. An `LCI_DEV_<KEY>` variable is the key in
+start with `lci-`; `cargo xtask live-acceptance` removes only its own run root
+(`lci-live-run-*`) from the system temp directory when a run ends. An `LCI_DEV_<KEY>` variable is the key in
 capitals (`LCI_DEV_WORK_AREA`, `LCI_DEV_PLANS_DIR`, `LCI_DEV_DEV_CONFIG`).
 Variable names are matched case-insensitively (Windows treats them so; the
 names are upper-cased on every platform, so a lower-case `lci_dev_work_area`

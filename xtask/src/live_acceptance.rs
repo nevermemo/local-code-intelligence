@@ -9,7 +9,7 @@
 //! toolkit `xtask::acceptance::ManagedServer` already uses, not a
 //! platform-specific shell script.
 
-use crate::acceptance::{lci_binary, test_results_dir, workspace_root};
+use crate::acceptance::{FIXTURE_ROOT_ENV, lci_binary, test_results_dir, workspace_root};
 use anyhow::{Result, bail};
 use std::fs::File;
 use std::process::{Command, Stdio};
@@ -37,6 +37,29 @@ impl StepSpec {
 }
 
 const CARGO: &str = "cargo";
+
+/// Name prefix of the run-unique directory that holds one run's fixtures.
+const RUN_ROOT_PREFIX: &str = "lci-live-run-";
+
+/// The fixture root of one run: `<base>/lci-live-run-<pid>-<stamp>`. The
+/// process id and the timestamp make it unique to this run.
+fn run_root_path(base: &std::path::Path, pid: u32, stamp: u64) -> std::path::PathBuf {
+    base.join(format!("{RUN_ROOT_PREFIX}{pid}-{stamp}"))
+}
+
+/// Removes the run's own fixture root, and nothing else. Refuses a path that
+/// is not a direct child of `base` named like a run root, so a wrong argument
+/// can never delete another directory; any other `lci-*` directory in `base`,
+/// including another run's root, is left alone.
+fn remove_run_root(base: &std::path::Path, root: &std::path::Path) {
+    let ours = root.parent() == Some(base)
+        && root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(RUN_ROOT_PREFIX));
+    if ours {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -214,7 +237,11 @@ fn slugify(name: &str) -> String {
 /// step early. The per-step timeout is the only actual kill trigger, kept
 /// deliberately generous per step rather than one shared budget for the
 /// whole run -- see the module doc and `docs/development/local-live-acceptance.md`.
-fn run_step(spec: &StepSpec, log_dir: &std::path::Path) -> Result<StepResult> {
+fn run_step(
+    spec: &StepSpec,
+    log_dir: &std::path::Path,
+    fixture_root: &std::path::Path,
+) -> Result<StepResult> {
     let slug = slugify(spec.name);
     let stdout_path = log_dir.join(format!("{slug}.stdout.log"));
     let stderr_path = log_dir.join(format!("{slug}.stderr.log"));
@@ -229,6 +256,7 @@ fn run_step(spec: &StepSpec, log_dir: &std::path::Path) -> Result<StepResult> {
     let mut child = spec
         .command()
         .args(&spec.args)
+        .env(FIXTURE_ROOT_ENV, fixture_root)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()?;
@@ -480,27 +508,23 @@ pub fn run(only: Vec<String>, skip_build: bool, require_all: bool) -> Result<()>
         std::process::exit(1);
     }
 
+    // Every step puts its fixtures under this run's own directory
+    // (FIXTURE_ROOT_ENV), so the cleanup below removes exactly what this run
+    // created and never another run's fixtures or an unrelated `lci-*`
+    // directory.
+    let temp_dir = std::env::temp_dir();
+    let run_root = run_root_path(&temp_dir, std::process::id(), stamp);
     let mut results = Vec::new();
     for spec in &selected {
-        results.push(run_step(spec, &log_dir)?);
+        results.push(run_step(spec, &log_dir, &run_root)?);
     }
 
-    // Mirrors live-acceptance.yml's cleanup step: only removes fixture temp
-    // directories (named lci-<fixture>-<pid> by Fixture::create, so this
-    // pattern can't match anything else). Deliberately does not kill
-    // processes by name -- this is your own machine, not a disposable
-    // sandbox, and a crashed run's orphan needs a human glance at a process
-    // list, not a script guessing by process name.
-    let temp_dir = std::env::temp_dir();
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("lci-") && entry.path().is_dir() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
+    // Mirrors live-acceptance.yml's cleanup step: removes only this run's
+    // fixture root. Deliberately does not kill processes by name -- this is
+    // your own machine, not a disposable sandbox, and a crashed run's orphan
+    // needs a human glance at a process list, not a script guessing by
+    // process name.
+    remove_run_root(&temp_dir, &run_root);
 
     println!();
     println!("=== Summary ===");
@@ -592,6 +616,42 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_only_this_runs_root() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "xtask-cleanup-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base_dir).unwrap();
+        let base = base_dir.as_path();
+        let mine = run_root_path(base, 100, 1);
+        let other_run = run_root_path(base, 200, 2);
+        let notes = base.join("lci-notes");
+        let stray_fixture = base.join("lci-csharp-300");
+        for dir in [&mine, &other_run, &notes, &stray_fixture] {
+            std::fs::create_dir_all(dir.join("lci-core-100")).unwrap();
+        }
+
+        remove_run_root(base, &mine);
+
+        assert!(!mine.exists());
+        assert!(other_run.exists());
+        assert!(notes.exists());
+        assert!(stray_fixture.exists());
+
+        // Refuses a path that is not a run root, or not a direct child.
+        remove_run_root(base, &notes);
+        remove_run_root(base, &other_run.join("lci-core-100"));
+        remove_run_root(&base.join("elsewhere"), &other_run);
+        assert!(notes.exists());
+        assert!(other_run.join("lci-core-100").exists());
+        std::fs::remove_dir_all(&base_dir).unwrap();
+    }
+
+    #[test]
     fn prerequisite_unavailable_child() {
         println!("PREREQUISITE_UNAVAILABLE: fake language server not installed");
     }
@@ -618,7 +678,7 @@ mod tests {
             ],
             1,
         );
-        let result = run_step(&spec, &log_dir).unwrap();
+        let result = run_step(&spec, &log_dir, &log_dir).unwrap();
         std::fs::remove_dir_all(&log_dir).unwrap();
 
         assert_eq!(result.status.label(), "SKIPPED");

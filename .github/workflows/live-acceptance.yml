@@ -37,6 +37,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Every acceptance fixture goes under this run's own directory
+      # (Fixture::create reads LCI_ACCEPTANCE_FIXTURE_ROOT), so the sweep at
+      # the end removes only what this run created.
+      - name: Choose the run-unique fixture root
+        shell: pwsh
+        run: |
+          "LCI_ACCEPTANCE_FIXTURE_ROOT=$env:RUNNER_TEMP/lci-live-run-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
+
       - name: Build
         run: cargo build --workspace
 
@@ -105,9 +113,11 @@ jobs:
           --workspace "self=${{ github.workspace }}"
           --output ./test-results/evaluation.json
 
-      # Only sweeps fixture temp directories (named lci-<fixture>-<pid> by
-      # Fixture::create in xtask/src/acceptance/mod.rs, so this pattern can
-      # never match anything else). Deliberately does NOT force-kill
+      # Only sweeps this run's own fixture root (lci-live-run-<run id>-<attempt>
+      # under RUNNER_TEMP, chosen above; Fixture::create in
+      # xtask/src/acceptance/mod.rs puts every fixture there), never other
+      # lci-* directories or another run's fixtures. Deliberately does NOT
+      # force-kill
       # processes by name: this runner is this machine, not a disposable CI
       # sandbox, and a blanket `Stop-Process -Name rust-analyzer` (etc.)
       # would just as happily kill your editor's language servers or the
@@ -120,5 +130,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Get-ChildItem -Path $env:TEMP -Filter 'lci-*' -Directory -ErrorAction SilentlyContinue |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          $root = $env:LCI_ACCEPTANCE_FIXTURE_ROOT
+          if ($root -and (Split-Path -Leaf $root) -like 'lci-live-run-*' -and (Test-Path -LiteralPath $root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }

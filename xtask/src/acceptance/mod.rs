@@ -189,8 +189,23 @@ pub fn resolve_acceptance_workspace(
     }
 }
 
+/// Environment variable naming the directory that holds a run's fixtures. The
+/// orchestrator (`live_acceptance`, the live-acceptance workflow) sets it to a
+/// run-unique directory and removes only that one at the end, so a cleanup
+/// never touches another run's fixtures or any other `lci-*` directory. Unset
+/// or empty, fixtures go straight under the OS temp dir.
+pub const FIXTURE_ROOT_ENV: &str = "LCI_ACCEPTANCE_FIXTURE_ROOT";
+
+/// Where [`Fixture::create`] puts its directories.
+fn fixture_root() -> PathBuf {
+    match std::env::var_os(FIXTURE_ROOT_ENV) {
+        Some(root) if !root.is_empty() => PathBuf::from(root),
+        _ => std::env::temp_dir(),
+    }
+}
+
 /// A disposable acceptance fixture: an isolated workspace directory and an
-/// isolated LanceDB data directory, both under the OS temp dir, named with
+/// isolated LanceDB data directory, both under [`fixture_root`], named with
 /// this process's PID so concurrent runs never collide.
 pub struct Fixture {
     pub dir: PathBuf,
@@ -200,8 +215,9 @@ pub struct Fixture {
 impl Fixture {
     pub fn create(name: &str) -> Result<Self> {
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("lci-{name}-{pid}"));
-        let data_dir = std::env::temp_dir().join(format!("lci-{name}-data-{pid}"));
+        let root = fixture_root();
+        let dir = root.join(format!("lci-{name}-{pid}"));
+        let data_dir = root.join(format!("lci-{name}-data-{pid}"));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create fixture dir {}", dir.display()))?;
         Ok(Self { dir, data_dir })

@@ -1619,7 +1619,45 @@ async fn process_is_running(pid: u32) -> bool {
         .output()
         .await
         .expect("tasklist runs");
-    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    tasklist_shows(
+        pid,
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Reads one `tasklist` answer. `tasklist` exits 0 and prints an information
+/// line when nothing matches, so a nonzero exit status or any text on stderr
+/// is a failed query, which must not read as "the process ended": it panics
+/// with what the program said.
+#[cfg(windows)]
+fn tasklist_shows(pid: u32, succeeded: bool, stdout: &str, stderr: &str) -> bool {
+    assert!(
+        succeeded && stderr.trim().is_empty(),
+        "tasklist failed for pid {pid} (succeeded: {succeeded}); stderr: {stderr:?}; stdout: {stdout:?}"
+    );
+    stdout.contains(&format!("\"{pid}\""))
+}
+
+#[cfg(windows)]
+#[test]
+fn tasklist_answers_are_read_strictly() {
+    let row = "\"fake.exe\",\"4242\",\"Console\",\"1\",\"3,000 K\"\n";
+    assert!(tasklist_shows(4242, true, row, ""));
+    assert!(!tasklist_shows(
+        4242,
+        true,
+        "INFO: No tasks are running which match the specified criteria.\n",
+        ""
+    ));
+    for (succeeded, stderr) in [(false, ""), (false, "ERROR: boom"), (true, "ERROR: boom")] {
+        let outcome = std::panic::catch_unwind(|| tasklist_shows(4242, succeeded, row, stderr));
+        assert!(
+            outcome.is_err(),
+            "a failed query ({succeeded}, {stderr:?}) must panic, not read as an answer"
+        );
+    }
 }
 
 /// Whether the operating system shows process `pid` as running. `ps -o stat=`
@@ -1634,9 +1672,48 @@ async fn process_is_running(pid: u32) -> bool {
         .output()
         .await
         .expect("ps runs");
-    let state = String::from_utf8_lossy(&output.stdout);
-    let state = state.trim();
+    ps_shows(
+        pid,
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Reads one `ps -o stat= -p` answer. `ps` exits 0 with the state when the
+/// process exists and exits 1 with no output when it does not; any other exit
+/// status, or text on stderr, is a failed query, which must not read as "the
+/// process ended": it panics with what the program said.
+#[cfg(not(windows))]
+fn ps_shows(pid: u32, code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+    let state = stdout.trim();
+    let gone = code == Some(1) && state.is_empty();
+    assert!(
+        (code == Some(0) || gone) && stderr.trim().is_empty(),
+        "ps failed for pid {pid} (exit code {code:?}); stderr: {stderr:?}; stdout: {stdout:?}"
+    );
     !state.is_empty() && !state.starts_with('Z')
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ps_answers_are_read_strictly() {
+    assert!(ps_shows(4242, Some(0), "S\n", ""));
+    assert!(!ps_shows(4242, Some(0), "Z\n", ""));
+    assert!(!ps_shows(4242, Some(1), "", ""));
+    for (code, stdout, stderr) in [
+        (Some(2), "", "ps: bad usage"),
+        (Some(1), "", "ps: error"),
+        (Some(1), "S\n", ""),
+        (None, "", ""),
+        (Some(0), "S\n", "ps: warning"),
+    ] {
+        let outcome = std::panic::catch_unwind(|| ps_shows(4242, code, stdout, stderr));
+        assert!(
+            outcome.is_err(),
+            "a failed query ({code:?}, {stdout:?}, {stderr:?}) must panic"
+        );
+    }
 }
 
 /// Waits until process `pid` has ended, and fails with `what` after `deadline`.
@@ -1820,17 +1897,32 @@ async fn finish_holder_test(
     state: &std::path::Path,
 ) {
     call.abort();
-    let _ = call.await;
+    // The abort ends the call as cancelled; a panic in it is a failure.
+    if let Err(error) = call.await {
+        assert!(error.is_cancelled(), "the stalled call panicked: {error}");
+    }
     drop(manager);
     for ordinal in 1..=state_count(state, "spawn_count.txt") {
-        if let Ok(text) = std::fs::read_to_string(state.join(format!("sleeper_{ordinal}.pid"))) {
-            wait_until_process_ends(
-                &format!("sleeper {ordinal} to end once the manager is dropped"),
-                text.trim().parse().expect("a process id"),
-                PROCESS_END_SLACK,
-            )
-            .await;
-        }
+        // Every spawned server starts a sleeper and writes its pid first; a
+        // missing file is a sleeper that went unchecked, so it fails the test
+        // once the bounded wait for it is over.
+        let pid_file = state.join(format!("sleeper_{ordinal}.pid"));
+        wait_until(
+            &format!("sleeper {ordinal} to have written its pid file"),
+            LOADED_BUDGET,
+            async || pid_file.exists(),
+        )
+        .await;
+        let text = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| panic!("read the pid file of sleeper {ordinal}: {error}"));
+        wait_until_process_ends(
+            &format!("sleeper {ordinal} to end once the manager is dropped"),
+            text.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("a process id in the pid file of sleeper {ordinal}")),
+            PROCESS_END_SLACK,
+        )
+        .await;
     }
 }
 

@@ -35,8 +35,9 @@ const MACHINE_FILE: &str = "machine.toml";
 /// Directory name under the platform's local data directory that holds the
 /// default work area.
 const DEV_DIR: &str = "local-code-intelligence-dev";
-/// Named so that `live_acceptance`'s end-of-run cleanup of `lci-*` temp
-/// directories (fixture leftovers) can never remove the scratch area.
+/// Named outside the `lci-` prefix. `live_acceptance` now removes only its
+/// own run root (`lci-live-run-*`, d430), so this is a second guard: the
+/// scratch area can never look like a fixture leftover.
 const SCRATCH_DIR: &str = "local-code-intelligence-scratch";
 /// Stands for the work area in the commented lines `--init` writes. A value
 /// still holding it was uncommented without being edited, so

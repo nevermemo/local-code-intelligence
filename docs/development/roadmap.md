@@ -176,9 +176,6 @@ P3 umbrella research. Rows are open items only. Item text names symbols, never l
 | N34 | `default_top_k` 5 versus 8 as a measured arm: 61 appearances, 57 at rank 5 or better, ranks 6 to 8 carry 18.7% of returned lines, 20 of 94 answered files were at rank 6 or later (U1 calls); lowest priority (roadmap@bbd3292 N34) | ready, local | S | N28 done |
 | N42 | Incremental-index peak memory: `Store::cached_vectors` plus a vector clone scale with the whole index (estimate 0.9 to 1.5 GB at 150,000 to 250,000 chunks of 768 floats, not measured); measure first; fix direction: load only vectors whose chunk hash is still present and move instead of clone; acceptance: state the bound and a test fails above it; `cloud-ok` (roadmap@bbd3292 N42) | ready, low | S | - |
 | N48 | Windows verbatim `\\?\` prefix at paths of 260 characters or more breaks prefix comparisons (roadmap@bbd3292 N48) | ready, low | XS-S | - |
-| N57 | The xtask and live-acceptance workflow cleanup deletes every `lci-*` temp directory, not only its own (roadmap@bbd3292 N57) | ready | XS | - |
-| N81 | Windows test helper `process_is_running` decides from output alone; ignores exit status and stderr (roadmap@bbd3292 N81) | ready, local, low | XS | - |
-| N82 | Windows `finish_holder_test` skips an ordinal whose pid file is missing, so a missing sleeper goes unchecked (roadmap@bbd3292 N82) | ready, local, low | XS | - |
 | N87 | The live-acceptance workflow does not use `--require-all`, so a missing tool reads green (roadmap@bbd3292 N87) | ready | S | N56 done |
 | N88 | Two load-sensitive budget tests in `tests/cases/indexing.rs`: find out whether the product or the test is at fault (roadmap@bbd3292 N88) | ready | S | - |
 | N94 | Extension comparisons are case-sensitive in 11 places (clippy pedantic census): a `.RS` or `.Py` file is skipped; decide and test (d371) | ready | S | - |
