@@ -8,7 +8,9 @@
 //! NAME` on the CLI). Fields given beside the name replace the preset's. A
 //! call that gives no policy field at all runs the first preset, `explore`,
 //! whose steer is empty and whose traverse block is empty: what the engine ran
-//! before presets existed.
+//! before presets existed. The policy is the router: the caller's intent picks
+//! the walk, the maps and the k's; nothing reads the question text to pick one
+//! (d391).
 //!
 //! [`effective`] describes what a call ran after the defaults: the stops,
 //! rules, ladder and initial map weights, with the preset name and a hash of
@@ -247,6 +249,64 @@ mod tests {
         for (name, _) in FILES {
             of(name).validate(name).unwrap();
         }
+    }
+
+    #[test]
+    fn each_intent_picks_its_walk_and_its_maps() {
+        fn names(list: &[&str]) -> Option<Vec<String>> {
+            Some(list.iter().map(|n| (*n).to_owned()).collect())
+        }
+        let limits = TraverseConfig::default();
+        let table = [
+            ("explore", None, None, None),
+            ("impact", Some(false), None, names(&["exact.closure"])),
+            ("flow", Some(true), None, None),
+            ("where-to", None, Some(20), None),
+            (
+                "history",
+                Some(false),
+                None,
+                names(&["git.history", "exact.pickaxe"]),
+            ),
+        ];
+        for (name, walk, walk_min_answers, extra_maps) in table {
+            let picked = policy_for(&limits, Some(name)).unwrap();
+            assert_eq!(picked.walk, walk, "{name} walk");
+            assert_eq!(
+                picked.walk_min_answers, walk_min_answers,
+                "{name} walk_min_answers"
+            );
+            assert_eq!(picked.extra_maps, extra_maps, "{name} extra_maps");
+        }
+        // The config table routes an intent to grep or to a language server by
+        // naming the opt-in map. It replaces the preset's list whole (`over`
+        // takes the whole Option): impact then no longer names exact.closure.
+        let mut own = TraverseConfig::default();
+        own.policies.insert(
+            "flow".into(),
+            TraversePolicy {
+                extra_maps: names(&["grep.live"]),
+                ..TraversePolicy::default()
+            },
+        );
+        own.policies.insert(
+            "impact".into(),
+            TraversePolicy {
+                extra_maps: names(&["lsp.live"]),
+                ..TraversePolicy::default()
+            },
+        );
+        let flow = policy_for(&own, Some("flow")).unwrap();
+        assert_eq!(flow.extra_maps, names(&["grep.live"]));
+        assert_eq!(flow.walk, Some(true));
+        let impact = policy_for(&own, Some("impact")).unwrap();
+        assert_eq!(impact.extra_maps, names(&["lsp.live"]));
+        assert_eq!(impact.walk, Some(false));
+        // An intent without a table entry keeps its preset's pick.
+        assert_eq!(
+            policy_for(&own, Some("history")).unwrap().extra_maps,
+            names(&["git.history", "exact.pickaxe"])
+        );
     }
 
     #[test]
