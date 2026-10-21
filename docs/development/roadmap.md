@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: K8a (PR 137), K21a-1 (PR 138), K9b, K3a-1, K24b, K27; next after K8a: K11d-1 (LSP cost report), K7b-3, K38, K3a-2, the load-flake slice; then K7c, K10a-1, K22a-1. Rewrite this line at every push.
+In flight: K38 (stat gate), K3a-2 (PR 144), K5a-1 rg arm (PR 145), K10a-1 places, K33a-1 trajectories, K11d-1 LSP cost report, S3 (this). Next: bench `--config` overlay (XS), K21a-2, K24c M3 ceilings run, K22a-1/K22a-2; knob slices K7c, K11e, K9c, K20b-1 wait for K11d-1's report and K24c. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -77,6 +77,7 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K3a | Cost metrics, search side (K3a-2; the traverse bench half, K3a-1, landed with d435): a per-query budget-hit field (the `over_budget` note exists) and priming before the first timed query (`Session::primed` exists); `lci compare` excludes budget-hit queries | Bench | S | E5, item 8 proxies, K11c (folded in, row removed); after K8a (lsp.rs) |
 | K13 | Cards say whether an answer is complete and how fresh it is; partial answers are labelled, never withheld. After K29 (the wording); K38 landed with d440 (stat gate, default off); flipping its default is a later slice | Card schema test | S | - |
 | K21a-2 | Ceiling of the BM25 entity seeds (`seeds.bm25`, `[run_profile.seeds] bm25`, off; the map landed as K21a-1, d431). Local benches only, no real-agent A/B and no API spend: `cargo xtask maps bench --set traits` and `--set where-to` with `max-depth=0 --include-seeds`, three seed arms (`seeds.bm25` alone, `seeds.scip_names` alone, `seeds.hybrid` alone, key on), top k = `seed_k`. The `symbols` (`workspace/symbol`) and `rg --fixed-strings` baseline arms fold into K5a, so the table has no gain claim over rg or LSP (d422 (11)). Not verified before this row: whether `rust-analyzer scip` fills the symbols' `documentation` (a 5-minute count through `read_symbol_docs` on this repository's index; if none, names and paths carry the ceiling); `query_terms` drops question words under 3 characters (decision D, accepted) | Gold symbol in the top k per arm (Q2 `hit@10`, Q1/Q3 `set_recall`; where-to file hits), reported under `test-results/`; cycle 2's screening reads the table | S-M | K21a-1, K5a (baseline arms), L1, L4, I-1 |
+| K24c | M3 ceilings run: log_odds vs boost and relative vs rank on traits, where-to, impact, with costs (K3a-1 columns); numbers into the arm manifest | Measurement | XS-S | - |
 | K22a | Exact-literal seed source over ripgrep (new; `exact_seeds` reuses exact cards and is not this), including the seedless-trait cases; K10a's `OutlinePlaces` is the occurrence-to-node lookup d394 lacked. After K10a | Ceiling, beside an rg baseline arm | S | item 4 rest |
 | K30a | Router: caller intent through the existing `steer.policy` is the router (it picks walk, grep or LSP); document it and test it. Observable query features go to the cycle 2 screening (d391 killed text features at 20 of 59); gold labels never route | Test: each intent picks its policy | S | F3, N100 (detector stays killed) |
 | K33a | Trajectory rows per pop (state, candidates, choice) linked to the outcome (gold hit) in evaluation runs | Schema test | S | - |

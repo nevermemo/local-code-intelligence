@@ -192,6 +192,7 @@ pub fn run(args: SimArgs) -> Result<()> {
                 pass_through: false,
                 rerank_frontier: false,
                 no_score_bound: false,
+                trajectory: false,
                 priors: None,
                 tie_break: None,
                 first_stage: None,

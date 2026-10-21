@@ -4868,3 +4868,82 @@ async fn seeds_bm25_reads_the_indexs_documentation_only_when_the_map_runs() {
     assert_eq!(on["seed_source"], "bm25");
     assert_eq!(on["seeds"], json!([widget]));
 }
+
+/// One call over the three-file tree, two pops, writing under `dirs`.
+async fn trajectory_run(tree: &Tree, dirs: &Dirs) -> Report {
+    let (budget, steer) = (
+        BudgetArgs {
+            pops: Some(2),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: Some(tree.dir.path()),
+        question: "q",
+        seeds: &tree.seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: None,
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    run(&limits(), &RunProfileConfig::default(), dirs, &call)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_cli_switch_reaches_the_walk_through_dirs() {
+    let tree = Tree::new();
+    let (off_dir, on_dir) = (tree.dir.path().join("off"), tree.dir.path().join("on"));
+    let off = trajectory_run(&tree, &Dirs::under(&off_dir)).await;
+    let on_dirs = Dirs {
+        trajectory_candidates: 2,
+        ..Dirs::under(&on_dir)
+    };
+    let on = trajectory_run(&tree, &on_dirs).await;
+    let events = |report: &Report| {
+        lci_maps::traverse::trace::read_trace(report.trace.as_ref().unwrap()).unwrap()
+    };
+    let (off_events, on_events) = (events(&off), events(&on));
+    assert!(off_events.iter().all(|e| e["ev"] != "pop"));
+    let pops: Vec<&Value> = on_events.iter().filter(|e| e["ev"] == "pop").collect();
+    assert!(!pops.is_empty(), "{on_events:?}");
+    assert!(
+        pops.iter()
+            .all(|e| e["candidates"].as_array().unwrap().len() <= 2)
+    );
+    // Only the trace differs: the other events and the answer are equal.
+    let without: Vec<&Value> = on_events.iter().filter(|e| e["ev"] != "pop").collect();
+    assert_eq!(without.len(), off_events.len());
+    let strip = |report: &Report| {
+        let mut response = report.response.clone();
+        if let Some(object) = response.as_object_mut() {
+            object.remove("trace");
+            object.remove("notes");
+        }
+        if let Some(totals) = response["totals"].as_object_mut() {
+            totals.remove("elapsed_ms");
+            if let Some(per_map) = totals.get_mut("per_map").and_then(Value::as_object_mut) {
+                per_map.values_mut().for_each(|stat| {
+                    stat.as_object_mut().map(|stat| stat.remove("ms"));
+                });
+            }
+        }
+        response
+    };
+    assert_eq!(strip(&off), strip(&on));
+    assert_eq!(
+        on.response["trace"]["events"].as_u64().unwrap() as usize,
+        on_events.len()
+    );
+    assert_eq!(
+        off.response["trace"]["events"].as_u64().unwrap() as usize,
+        off_events.len()
+    );
+}

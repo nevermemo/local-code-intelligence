@@ -155,6 +155,17 @@
 //!
 //! The run is recorded as JSON events ([`TraversalResult::events`]), written as
 //! JSONL by [`trace`]; a paused run leaves a [`handle::Snapshot`] to resume.
+//!
+//! Trajectory rows ([`Traversal::trajectory`], `lci traverse --trajectory`,
+//! off): each counted pop writes a `pop` event just before its `expand`
+//! event, `{ev, pop, free, node, priority, depth, via, parent, frontier,
+//! discovered, tokens_left, calls_left, candidates: [{node, priority, depth,
+//! via}..]}`, the candidates being the best queued states still to expand.
+//! A pop that is put back (cut, or dropped for the budget) and retried writes
+//! a second `pop` event. Size: one event is about 1.2 KB with 100-character
+//! node ids and the default 8 candidates ([`TRAJECTORY_CANDIDATES`]), so a
+//! trace at the 200-pop cap grows by at most about 240 KB. Only the trace
+//! changes (and so its hash): answers, checkpoints and handles do not.
 
 pub mod frontier;
 pub mod fusion;
@@ -210,6 +221,9 @@ pub use lci_core::config::WalkGroups as Groups;
 pub const TOKENS_PER_EDGE: u64 = 12;
 /// The most frontier items a checkpoint carries.
 pub const CHECKPOINT_FRONTIER: usize = 256;
+/// The queued states each `pop` event of a trajectory run lists
+/// ([`Traversal::trajectory`]; `lci traverse --trajectory`).
+pub const TRAJECTORY_CANDIDATES: usize = 8;
 /// The default share added to a node's rank for each map beyond the first
 /// that reached it (see [`State::ranked_potential`]).
 pub const DEFAULT_CORROBORATION_BOOST: f64 = 0.1;
@@ -581,6 +595,9 @@ pub struct Traversal<'s> {
     pass_through: bool,
     /// Keep the edge kind of every state in the handle ([`Traversal::card_paths`]).
     card_paths: bool,
+    /// The candidates each `pop` event lists; 0 writes no `pop` event
+    /// ([`Traversal::trajectory`]).
+    trajectory: usize,
     /// The reranker frontier: the rescorer and the floor of the hop factor.
     rerank: Option<(Box<dyn FrontierRescorer + 's>, f64)>,
     score_bound: bool,
@@ -623,6 +640,7 @@ impl<'s> Traversal<'s> {
             grouping: Grouping::default(),
             pass_through: false,
             card_paths: false,
+            trajectory: 0,
             rerank: None,
             score_bound: true,
             priors: HopPriors::default(),
@@ -743,6 +761,16 @@ impl<'s> Traversal<'s> {
     /// made with.
     pub fn pass_through(mut self, on: bool) -> Self {
         self.pass_through = on;
+        self
+    }
+
+    /// Trajectory rows (default 0, off): with `candidates > 0` every counted
+    /// pop writes a `pop` event before its `expand` event, naming the popped
+    /// state and the best `candidates` states still queued (see the module
+    /// doc). It only adds events: answers, checkpoints and handles are what
+    /// they are without it, and a handle does not record the setting.
+    pub fn trajectory(mut self, candidates: usize) -> Self {
+        self.trajectory = candidates;
         self
     }
 
@@ -944,6 +972,41 @@ impl<'s> Run<'s> {
         (left * 100 / total) as u32
     }
 
+    /// The `pop` event of a trajectory run (see [`Traversal::trajectory`]):
+    /// the popped state, the walk's state at the choice, and the best queued
+    /// states that were not chosen (stale entries and cleared nodes skipped).
+    /// The popped state is already in `expanded`, so it is not its own
+    /// candidate.
+    fn pop_event(&self, item: &frontier::Item, free: bool) -> Value {
+        let state = &self.states[item.state];
+        let candidates: Vec<Value> = self
+            .frontier
+            .sorted()
+            .into_iter()
+            .filter(|c| {
+                !self.expanded.contains(&c.state)
+                    && !self.cleared.contains(&self.states[c.state].node)
+            })
+            .take(self.t.trajectory)
+            .map(|c| {
+                let s = &self.states[c.state];
+                json!({
+                    "node": s.node.to_string(), "priority": c.priority,
+                    "depth": s.depth, "via": s.via,
+                })
+            })
+            .collect();
+        json!({
+            "ev": "pop", "pop": self.totals.pops, "free": free,
+            "node": state.node.to_string(), "priority": item.priority,
+            "depth": state.depth, "via": state.via,
+            "parent": state.parent.map(|p| self.states[p].node.to_string()),
+            "frontier": self.frontier.len(), "discovered": self.states.len(),
+            "tokens_left": self.tokens_left(), "calls_left": self.calls_left(),
+            "candidates": candidates,
+        })
+    }
+
     fn tokens_left(&self) -> u64 {
         self.tokens_cap().saturating_sub(self.totals.tokens)
     }
@@ -1111,6 +1174,10 @@ impl<'s> Run<'s> {
             }
             self.popped.push(item.state);
             self.expanded.insert(item.state);
+            if self.t.trajectory > 0 {
+                let event = self.pop_event(&item, free);
+                self.events.push(event);
+            }
             if let Some(adopted) = self.expand(item.state, free).await {
                 // The node is not done: back in the queue at its old place,
                 // for a resume to expand again.
