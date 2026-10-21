@@ -29,4 +29,4 @@ TypeScript and JavaScript code questions. The 450-key structured-grep spike samp
 pilot are not verified. External held-out gold (SWE-PolyBench Verified, LongCodeArena) is planned (K4a) and not built.
 
 Syntax tier plans: tree-sitter 0.26 (K15a; today the runtime is 0.25 and the grammar crates are 0.23 to 0.25), Codanna parsing and resolution behind a Cargo
-feature (K14a to K14d), structural grep over `ast-grep-core` (K19).
+feature (K14a to K14d), structural grep over `ast-grep-core` (K19: built as the opt-in map `grep.structural`, pinned to `=0.40.1` because it needs tree-sitter 0.25; ceiling in test-results).

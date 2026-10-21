@@ -836,7 +836,9 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
         "seeds.bm25" => Some(&[Symbol]),
         "seeds.literal" => Some(&[Symbol, File]),
-        "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),
+        "structure.contains" | "grep.live" | "grep.structural" | "probe.compile" => {
+            Some(&[Symbol, File])
+        }
         "git.history" => Some(&[Commit, File]),
         "docs.mentions" => Some(&[File]),
         "config.key" => Some(&[ConfigKey, Symbol]),
@@ -3425,6 +3427,20 @@ pub fn free_two() {}
         assert!(!can_answer(Set::History, &docs));
         // It emits files, never a section: the instructions set skips every item.
         assert!(!can_answer(Set::Instructions, &docs));
+    }
+
+    #[test]
+    fn grep_structural_can_answer_the_traits_and_impact_sets() {
+        let structural = vec!["grep.structural".to_string()];
+        assert_eq!(
+            map_emits("grep.structural"),
+            Some(&[NodeKind::Symbol, NodeKind::File][..])
+        );
+        assert!(can_answer(Set::Traits, &structural));
+        assert!(can_answer(Set::Impact, &structural));
+        assert!(can_answer(Set::WhereTo, &structural));
+        assert!(!can_answer(Set::History, &structural));
+        assert!(!can_answer(Set::Instructions, &structural));
     }
 
     // ---- synthetic end-to-end run: tiny gold, fixture traversals, temp trend.

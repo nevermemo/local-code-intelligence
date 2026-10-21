@@ -87,7 +87,7 @@ use first_stage::{
     BudgetedGit, EXACT_CLOSURE_ID, EXACT_PICKAXE_ID, ExactCard, FirstStage, closure_cards,
     pickaxe_cards, seed_cards,
 };
-use lci_core::node::NodeId;
+use lci_core::{lexical, node::NodeId};
 use lci_maps::{
     Map, MapId, Registry, SnapshotRef, SnapshotView,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
@@ -103,6 +103,7 @@ use lci_maps::{
     search_maps::{
         ChunkSearch, LexicalChunks, SEARCH_LEXICAL_ID, SEARCH_VECTOR_ID, ScipDecls, VectorChunks,
     },
+    structural::{Ripgrep, STRUCTURAL_ID, Structural, StructuralOptions},
     tested_by::{TESTED_BY_ID, TestedByMap},
     traverse::{
         Grouping, Seed, Traversal, TraversalBudget,
@@ -179,16 +180,21 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// read from the same impact index; a test by its path or by an inline `tests`
 /// module in its symbol chain), and `docs.mentions` (the documentation files,
 /// by source role, whose current bytes mention a node's name; a wrapper of
-/// `grep.live` that reads documentation files only). `lsp.live` asks a
+/// `grep.live` that reads documentation files only), and `grep.structural`
+/// (the `impl`, `extends` and `implements` headers and the calls of a symbol's
+/// name: ripgrep names the candidate files, an ast-grep pattern over each
+/// file's syntax tree confirms the role; needs `rg`; in the default set of a
+/// call with a tree root only with `[run_profile.grep] structural`). `lsp.live` asks a
 /// language server for definition, references and document symbols (starts the
 /// server at the first expansion; needs its binary). The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 15] = [
+pub const OPT_IN_MAPS: [MapId; 16] = [
     GREP_LIVE_MAP_ID,
     DOCS_MENTIONS_ID,
+    STRUCTURAL_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
     PROBE_COMPILE_ID,
@@ -203,6 +209,17 @@ pub const OPT_IN_MAPS: [MapId; 15] = [
     SEEDS_BM25,
     SEEDS_LITERAL,
 ];
+/// Whether `rg --version` runs for the resolved ripgrep path: `grep.structural`
+/// asks ripgrep for its candidate files and has no other source.
+async fn ripgrep_runs(resolved: &Path) -> bool {
+    tokio::process::Command::new(resolved)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
 /// The note of a call that names `probe.compile` without the trust grant.
 const PROBE_COMPILE_SKIPPED_NOTE: &str = "probe.compile skipped: cargo check would run the tree's build scripts and procedural macros; set rust_analyzer_trusted = true in the main configuration for a trusted tree";
 
@@ -584,6 +601,7 @@ pub async fn run_with_trait_seeds(
     }
     let mut bm25_off_note: Option<String> = None;
     let mut literal_off_note: Option<String> = None;
+    let mut structural_off_note: Option<String> = None;
     let known_map = |id: &str| {
         MAPS.iter()
             .chain(&OPT_IN_MAPS)
@@ -657,6 +675,21 @@ pub async fn run_with_trait_seeds(
             );
         }
     }
+    // `[run_profile.grep] structural`: the same for `grep.structural`, which
+    // reads the tree, so a call joins it to the default set only with a root.
+    if profile.grep.structural {
+        if call.maps.is_none() && call.scip_root.is_some() && !wanted.contains(&STRUCTURAL_ID) {
+            wanted.push(STRUCTURAL_ID);
+        }
+    } else if wanted.contains(&STRUCTURAL_ID) {
+        wanted.retain(|id| *id != STRUCTURAL_ID);
+        if call.maps.is_some() {
+            structural_off_note = Some(
+                "grep.structural is off ([run_profile.grep] structural = false): the map gives no edges"
+                    .to_owned(),
+            );
+        }
+    }
     // The policy's first_k and seed_k take the place of the [traverse] keys.
     let tuned;
     let limits = if policy.first_k.is_some() || policy.seed_k.is_some() {
@@ -692,6 +725,7 @@ pub async fn run_with_trait_seeds(
     let mut notes = Vec::new();
     notes.extend(bm25_off_note);
     notes.extend(literal_off_note);
+    notes.extend(structural_off_note);
     if !skipped_maps.is_empty() {
         notes.push(format!(
             "policy {}: the maps {} read the tree and were left out: give --root (or the workspace) to run them as measured",
@@ -995,6 +1029,40 @@ pub async fn run_with_trait_seeds(
             true,
         )?;
     }
+    if let (true, Some(root)) = (wants(STRUCTURAL_ID), call.scip_root) {
+        let configured = call.lsp.map_or("rg", |config| config.ripgrep_path.as_str());
+        let resolved = lexical::resolve_ripgrep_path(configured);
+        if ripgrep_runs(&resolved).await {
+            let structural = Structural::new(
+                root,
+                Box::new(Ripgrep::new(resolved.to_string_lossy().into_owned())),
+                loaded.places().await,
+                StructuralOptions::default(),
+            );
+            notes.extend(
+                structural
+                    .notes()
+                    .iter()
+                    .map(|dropped| format!("grep.structural: a pattern was dropped: {dropped}")),
+            );
+            // One expansion of a name that occurs nowhere: ripgrep over the
+            // tree, enough for the card's median.
+            structural.calibrate(1).await;
+            register(
+                &mut registry,
+                &mut plan_maps,
+                &observer,
+                Box::new(structural),
+                true,
+            )?;
+        } else {
+            notes.push(
+                "grep.structural needs ripgrep (`rg`; [index] ripgrep_path): it was not found, the map gives no edges"
+                    .to_owned(),
+            );
+            unavailable.push(STRUCTURAL_ID);
+        }
+    }
     if let (true, Some(root)) = (wants(CONFIG_KEY_MAP_ID), call.scip_root) {
         let map = match config_key_map(call.scip_index, root, &loaded).await {
             Ok(map) => {
@@ -1179,6 +1247,7 @@ pub async fn run_with_trait_seeds(
             [
                 GREP_LIVE_MAP_ID,
                 DOCS_MENTIONS_ID,
+                STRUCTURAL_ID,
                 CONFIG_KEY_MAP_ID,
                 LSP_LIVE_ID,
             ]
