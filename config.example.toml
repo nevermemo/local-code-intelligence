@@ -532,11 +532,21 @@ map_freshness = false
 # off, and it cannot be combined with [traverse] fusion = "rrf" or "log_odds".
 # grep_corroboration (0 to 1, default 1): what a group made only of text-match
 # ("mentions") edges adds to the evidence count; 1 counts it like any other.
-# Both keys are part of the run-profile hash; a handle keeps the values it was
-# made with.
+# pricing = "rank" (default): above the gate (8 edges), the edge at rank r is
+# worth 1 / (1 + r) of its kind's prior whatever the fan-out. "relative": rank r
+# of n candidates (counted before the beam) is worth 1 / (1 + a + r * gate / n)
+# (a: the implementors of a trait seed, ranked in front of them; 0 for any other
+# node): equal to "rank" at n = gate, so continuous at the gate for every node,
+# and flatter above it (80 callers price the 9th edge at 1 / 1.8, not 1 / 9).
+# At or below the gate nothing changes.
+# All three keys are part of the run-profile hash. A handle keeps groups and
+# grep_corroboration; it does not carry pricing (like the gate and the beam),
+# so a resumed call prices under the profile it is given and a walk can mix
+# pricings across resumes.
 [run_profile.walk]
 groups = "tool"
 grep_corroboration = 1.0
+pricing = "rank"
 
 # [run_profile.scip]: what a traversal does with the SCIP index (index.scip).
 # mode = "authoritative" (default): the index is required; a missing or

@@ -3088,6 +3088,7 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
         walk: lci_core::config::WalkProfile {
             groups: lci_core::config::WalkGroups::Claim,
             grep_corroboration: 0.5,
+            ..lci_core::config::WalkProfile::default()
         },
         ..RunProfileConfig::default()
     };
@@ -3113,6 +3114,92 @@ async fn the_walk_reads_walk_groups_from_the_run_profile() {
     let rank = &start_event(&resumed)["rank"];
     assert_eq!(rank["groups"], "claim", "{rank}");
     assert_eq!(rank["grep_corroboration"], 0.5, "{rank}");
+}
+
+#[tokio::test]
+async fn the_walk_reads_walk_pricing_from_the_run_profile() {
+    use lci_core::config::{WalkPricing, WalkProfile};
+    let (dir, index) = crowded_tree(30);
+    let loaded = load(&index, Some(dir.path()), ScipMode::Authoritative)
+        .await
+        .unwrap();
+    let target = loaded
+        .scip
+        .node_id(
+            loaded
+                .scip
+                .graph()
+                .node_index("rust-analyzer cargo demo 0.1.0 a/target().")
+                .expect("target is a graph node"),
+        )
+        .to_string();
+    let maps = [SCIP_IMPACT_ID.to_owned()];
+    let (budget, steer) = (
+        BudgetArgs {
+            max_depth: Some(1),
+            ..BudgetArgs::default()
+        },
+        SteerArgs::default(),
+    );
+    let call = Call {
+        scip_index: &index,
+        scip_root: Some(dir.path()),
+        question: "q",
+        seeds: std::slice::from_ref(&target),
+        seed_search: None,
+        top_k: 40,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp: None,
+        lsp_sessions: None,
+    };
+    let dirs = Dirs::under(dir.path());
+    // The potentials of the depth-1 cards, best first: one per rank.
+    let potentials = |report: &Report| {
+        let mut values: Vec<f64> = report.response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|card| card["depth"] == 1)
+            .map(|card| card["potential"].as_f64().unwrap())
+            .collect();
+        values.sort_by(|a, b| b.total_cmp(a));
+        values
+    };
+    let close = |got: &[f64], want: Vec<f64>| {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-9, "{got:?} against {want:?}");
+        }
+    };
+    // 30 edges are offered and the default beam keeps 16: ranks 0..16.
+    let rank = run(&limits(), &RunProfileConfig::default(), &dirs, &call)
+        .await
+        .unwrap();
+    close(
+        &potentials(&rank),
+        (0..16).map(|r| 1.0 / (1.0 + r as f64)).collect(),
+    );
+    assert!((potentials(&rank)[8] - 1.0 / 9.0).abs() < 1e-9);
+    assert!(start_event(&rank).get("pricing").is_none());
+    let profile = RunProfileConfig {
+        walk: WalkProfile {
+            pricing: WalkPricing::Relative,
+            ..WalkProfile::default()
+        },
+        ..RunProfileConfig::default()
+    };
+    let relative = run(&limits(), &profile, &dirs, &call).await.unwrap();
+    close(
+        &potentials(&relative),
+        (0..16)
+            .map(|r| 1.0 / (1.0 + r as f64 * 8.0 / 30.0))
+            .collect(),
+    );
+    assert!((potentials(&relative)[8] - 1.0 / (1.0 + 8.0 * 8.0 / 30.0)).abs() < 1e-9);
+    assert_eq!(start_event(&relative)["pricing"], "relative");
 }
 
 // ---- `[run_profile.traverse] map_freshness` (slice K2a-2) ---------------------------

@@ -4,7 +4,11 @@
 use super::*;
 
 /// Everything priced by rank: no edge is followed whole.
-const RANKED: HopPrice = HopPrice { gate: 0, beam: 16 };
+const RANKED: HopPrice = HopPrice {
+    gate: 0,
+    beam: 16,
+    pricing: Pricing::Rank,
+};
 
 /// `s` offers `a` (best), `b` and `x` (worst) in that rank order; `a` then
 /// leads to `x`, so `x` is found first by the weakest route and again by the
@@ -285,7 +289,11 @@ fn above_the_gate_a_hop_is_the_rank_value_times_its_kind_prior() {
     ]);
     let cands = candidates(&fused);
     let ctx = score_ctx();
-    let price = HopPrice { gate: 2, beam: 4 };
+    let price = HopPrice {
+        gate: 2,
+        beam: 4,
+        pricing: Pricing::Rank,
+    };
     let steps = hop(&mut RulesScorer, &ctx, &cands, price);
     assert_eq!(steps.len(), 4);
     // The rules scorer multiplies by the kind prior, so the order is the
@@ -316,14 +324,27 @@ fn above_the_gate_a_hop_is_the_rank_value_times_its_kind_prior() {
         &mut RulesScorer,
         &ctx,
         &cands,
-        HopPrice { gate: 1, beam: 3 },
+        HopPrice {
+            gate: 1,
+            beam: 3,
+            pricing: Pricing::Rank,
+        },
     );
     assert_eq!(
         steps.iter().map(|s| s.1).collect::<Vec<_>>(),
         [0.5, 0.25, 0.5 / 3.0]
     );
     // The unscored arm keeps 1 for every edge.
-    let steps = hop(&mut BfsScorer, &ctx, &cands, HopPrice { gate: 1, beam: 3 });
+    let steps = hop(
+        &mut BfsScorer,
+        &ctx,
+        &cands,
+        HopPrice {
+            gate: 1,
+            beam: 3,
+            pricing: Pricing::Rank,
+        },
+    );
     assert!(steps.iter().all(|s| s.1 == 1.0));
 }
 
