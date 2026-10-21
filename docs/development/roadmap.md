@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: SHARED (`sessions = shared` default with a tree-stamp barrier, d454 to d466, cross-family review) (this), K22a-0 bench seed maps (d461), K6b transcript shapes (d464, local). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K20b-1, K11b, K11d-2; K22a-2 after K22a-0. Rewrite this line at every push.
+In flight: SHARED (`sessions = shared` default with a tree-stamp barrier, d454 to d467, cross-family review mergeable) (this), K6b transcript shapes (d464, local). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K20b-1, K11b, K11d-2; K22a-2 (measurement lane). Rewrite this line at every push.
 
 ## Cycle 1
 
