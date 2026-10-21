@@ -147,7 +147,7 @@ impl LspAdapter for TypeScriptServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if open_if_changed(
+        if let Some(_opened) = open_if_changed(
             rpc,
             sent,
             file,
@@ -156,7 +156,6 @@ impl LspAdapter for TypeScriptServer {
             language_id_for(relative),
         )
         .await?
-        .is_some()
         {
             // tsserver processes a newly opened file (parsing it and
             // resolving its imports into the project graph) asynchronously;

@@ -139,10 +139,7 @@ impl LspAdapter for GoServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if open_if_changed(rpc, sent, file, relative, "gopls", "go")
-            .await?
-            .is_some()
-        {
+        if let Some(_opened) = open_if_changed(rpc, sent, file, relative, "gopls", "go").await? {
             // Mirrors the Python/TypeScript adapters' bounded head start:
             // gopls processes a newly opened file and its package graph
             // asynchronously, so a request issued immediately after didOpen

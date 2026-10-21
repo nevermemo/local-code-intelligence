@@ -141,9 +141,8 @@ impl LspAdapter for PythonServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if open_if_changed(rpc, sent, file, relative, "pyright", "python")
-            .await?
-            .is_some()
+        if let Some(_opened) =
+            open_if_changed(rpc, sent, file, relative, "pyright", "python").await?
         {
             // Mirrors the TypeScript adapter's bounded head start: pyright
             // processes a newly opened file and its workspace scan

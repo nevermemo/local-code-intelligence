@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -214,14 +214,61 @@ pub async fn read_for_did_open(
 /// The texts one session has sent in `textDocument/didOpen`, by document URI,
 /// as the content hash of each. A new session starts empty, so a restarted
 /// server is sent its files again.
+///
+/// It also holds one gate per URI. [`open_if_changed`] takes it before the
+/// comparison and an [`OpenedDocument`] keeps it until the hook that sent the
+/// text is done (its head start included), so a concurrent request for the
+/// same file waits for an open in flight instead of skipping it and reaching
+/// the server before the text or before the head start has passed. Both maps
+/// keep one entry per navigated file for the session's life.
 #[derive(Debug, Default)]
-pub struct SentTexts(Mutex<HashMap<String, String>>);
+pub struct SentTexts {
+    hashes: Mutex<HashMap<String, String>>,
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A document this hook just sent in `textDocument/didOpen`. Holding it keeps
+/// the URI's gate, so a hook that waits after the open (a head start) keeps
+/// the waiting inside the value, and drops it when the wait is over.
+#[derive(Debug)]
+pub struct OpenedDocument {
+    /// The document URI.
+    pub uri: String,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
 
 impl SentTexts {
+    /// Waits for any open of `uri` in flight, then holds the URI's gate. It
+    /// costs nothing while no hook is between its `didOpen` and its release.
+    async fn gate(&self, uri: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = Arc::clone(
+            self.gates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(uri.to_owned())
+                .or_default(),
+        );
+        gate.lock_owned().await
+    }
+
+    /// How many callers of [`open_if_changed`] wait behind an open of `uri`
+    /// in flight, that is, behind a live [`OpenedDocument`]. Counted from the
+    /// gate's owners, so a caller that is about to wait counts too. For logs
+    /// and for tests that must know a request is parked before they let the
+    /// open finish.
+    pub fn waiting(&self, uri: &str) -> usize {
+        self.gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(uri)
+            // The map's own handle and the holder's guard are not waiters.
+            .map_or(0, |gate| Arc::strong_count(gate).saturating_sub(2))
+    }
+
     /// Records `hash` as the text sent for `uri`. `true` when it differs from
     /// what was recorded (or nothing was), that is, when the text must be sent.
     pub fn changed(&self, uri: &str, hash: &str) -> bool {
-        let mut sent = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sent = self.hashes.lock().unwrap_or_else(PoisonError::into_inner);
         if sent.get(uri).is_some_and(|known| known == hash) {
             return false;
         }
@@ -232,7 +279,7 @@ impl SentTexts {
     /// Forgets `uri`, so the next [`Self::changed`] answers `true` (a send
     /// that failed).
     fn forget(&self, uri: &str) {
-        self.0
+        self.hashes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(uri);
@@ -244,6 +291,13 @@ impl SentTexts {
 /// when it sent. `None`: the text is unchanged since the last send, or the file
 /// is above [`MAX_DID_OPEN_BYTES`] and is not sent (see
 /// [`read_for_did_open`]).
+///
+/// The call first waits for any open of the same URI in flight on this
+/// session, so a request that finds the text already sent returns only after
+/// the `didOpen` has been written (the write is awaited to the end) and after
+/// the sending hook let go of its [`OpenedDocument`], head start included.
+/// Hold the returned value across a wait that must also hold other requests
+/// for the file back; drop it when the wait is over.
 pub async fn open_if_changed(
     rpc: &JsonRpcClient,
     sent: &SentTexts,
@@ -251,13 +305,14 @@ pub async fn open_if_changed(
     relative: &str,
     server: &str,
     language_id: &str,
-) -> Result<Option<String>> {
-    let Some(content) = read_for_did_open(file, relative, server).await? else {
-        return Ok(None);
-    };
+) -> Result<Option<OpenedDocument>> {
     let uri = reqwest::Url::from_file_path(file)
         .map_err(|_| anyhow!("cannot convert file path to URI"))?
         .to_string();
+    let gate = sent.gate(&uri).await;
+    let Some(content) = read_for_did_open(file, relative, server).await? else {
+        return Ok(None);
+    };
     if !sent.changed(&uri, &crate::workspace::hash(&content)) {
         return Ok(None);
     }
@@ -278,7 +333,7 @@ pub async fn open_if_changed(
         sent.forget(&uri);
         return Err(error);
     }
-    Ok(Some(uri))
+    Ok(Some(OpenedDocument { uri, _gate: gate }))
 }
 
 /// What identifies a binary for the process-wide probe memo. The invocation is

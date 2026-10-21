@@ -144,7 +144,7 @@ impl LspAdapter for ClangdServer {
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        if open_if_changed(
+        if let Some(_opened) = open_if_changed(
             rpc,
             sent,
             file,
@@ -153,7 +153,6 @@ impl LspAdapter for ClangdServer {
             language_id_for(relative),
         )
         .await?
-        .is_some()
         {
             // Mirrors the Python/TypeScript/Go adapters' bounded head start:
             // clangd parses and indexes a newly opened file asynchronously,
