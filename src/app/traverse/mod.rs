@@ -926,14 +926,16 @@ pub async fn run_with_trait_seeds(
             .map_err(|error| error.to_string());
         let backend = match workspace {
             Ok(workspace) => {
+                let defaults = lci_core::config::Config::default();
+                let settings = call.lsp.unwrap_or(&defaults);
                 let manager = match (profile.lsp.sessions, &call.lsp_sessions) {
                     (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
-                    _ => {
-                        let defaults = lci_core::config::Config::default();
-                        Arc::new(lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults)))
-                    }
+                    _ => Arc::new(lci_core::lsp::Manager::new(settings)),
                 };
-                ManagerBackend::open(workspace, manager).await
+                // The version probe is bounded like the readiness probes.
+                let probe =
+                    std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
+                ManagerBackend::open_with_probe_timeout(workspace, manager, probe).await
             }
             Err(error) => Err(error),
         };

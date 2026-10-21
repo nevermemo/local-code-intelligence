@@ -74,7 +74,8 @@ reranker_timeout_seconds = 120
 # fails (timeout, error status, malformed or partial answer) the search returns
 # the fusion order with one warning; the reranker is not the fallback.
 rescorer = "reranker"
-# Bounded timeout for /ready and service_status dependency probes (1-30 seconds).
+# Bounded timeout for /ready and service_status dependency probes, and for the
+# version probe of the lsp.live traversal map (1-30 seconds).
 readiness_timeout_seconds = 5
 ripgrep_path = "rg"
 semantic_candidate_count = 40

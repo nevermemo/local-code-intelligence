@@ -547,6 +547,8 @@ impl World {
         // The deadline only bounds a call: a language server that starts slowly
         // on a loaded machine must not turn `lsp.live` into an empty answer.
         config.traverse.deadline_ms = 60_000;
+        // The version probe of `lsp.live` is bounded by this (5 s failed under load).
+        config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
         config.index.freshness = freshness;
         config.index.stale_check_interval_seconds = 0;
         let session_state = temp.path().join("lsp-session");
@@ -1429,22 +1431,14 @@ impl World {
 
 /// The index and the snapshot follow an edit (`on-search`); every SCIP-built
 /// map and the language-server session do not. Two generations show the lag
-/// growing, and a commit shows the two git maps, which only read commits.
+/// growing. (The two git maps have a test of their own below: they read
+/// commits, not the index, so it runs beside this one.)
 #[tokio::test]
 async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
     let mut before = world.observe().await;
     assert_eq!(before.index_action, "reused");
     assert!(!before.stale_before_search);
-    let (history_before, pickaxe_before) = world.history().await;
-    assert!(
-        !history_before.is_empty(),
-        "git.history reaches the baseline commit"
-    );
-    assert!(
-        !pickaxe_before.is_empty(),
-        "exact.pickaxe finds the baseline commit of Combine"
-    );
 
     for generation in 1..=2u32 {
         world.edit();
@@ -1507,6 +1501,30 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
             &["src/Calculator.cs", "src/CallSite.cs", "src/shapes.rs"],
             true,
         );
+        // The next generation is compared with this one.
+        before = now;
+    }
+    world.finish().await;
+}
+
+/// The two git maps only read commits: an uncommitted edit is not history, in
+/// either generation, and a commit is.
+#[tokio::test]
+async fn on_search_the_git_maps_see_a_commit_and_not_an_uncommitted_edit() {
+    let mut world = World::start(IndexFreshness::OnSearch).await;
+    let (history_before, pickaxe_before) = world.history().await;
+    assert!(
+        !history_before.is_empty(),
+        "git.history reaches the baseline commit"
+    );
+    assert!(
+        !pickaxe_before.is_empty(),
+        "exact.pickaxe finds the baseline commit of Combine"
+    );
+
+    for generation in 1..=2u32 {
+        world.edit();
+        assert_eq!(world.truth().generation, generation);
         // The edit is not history yet.
         let (history, pickaxe) = world.history().await;
         assert_eq!(
@@ -1514,8 +1532,6 @@ async fn on_search_every_map_sees_an_appended_symbol_or_is_on_the_gap_list() {
             "an uncommitted edit is not history"
         );
         assert!(pickaxe.is_empty(), "{pickaxe:?}");
-        // The next generation is compared with this one.
-        before = now;
     }
 
     git(&world.workspace, &["add", "-A"]);
@@ -1719,7 +1735,10 @@ async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
 
 /// A rewritten SCIP file (a longer one: the stamp is `(mtime, length)`)
 /// refreshes every map built from it, and only those: the language-server
-/// session is still behind. The next edit makes them lag again by one.
+/// session is still behind. The next edit makes them lag again by one. The
+/// snapshot is refreshed by a search before the rewrite, so the stamp reload is
+/// tested on its own, not as a side effect of an index refresh (the stale
+/// verdicts of that search are the first generation of the `on_search` case).
 #[tokio::test]
 async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
@@ -1727,14 +1746,12 @@ async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     world.edit();
     let truth = world.truth();
     let stale = world.observe().await;
-    let verdicts = world.verdicts(&before, &stale, &truth);
-    let shown = table(Case::OnSearch, &verdicts);
-    world
-        .problems(Case::OnSearch, &verdicts)
-        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    assert_eq!(stale.index_action, "refreshed_incrementally");
 
     world.regenerate_scip();
     let rewritten = world.observe().await;
+    // The snapshot is already current: only the stamp can reload the maps.
+    assert_eq!(rewritten.index_action, "reused");
     let verdicts = world.verdicts(&before, &rewritten, &truth);
     let shown = table(Case::ScipRewritten, &verdicts);
     eprintln!("{shown}");
@@ -1880,7 +1897,7 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
 
 /// With the key off the answer has no `maps[]`, so the maps that are labelled
 /// with it on are gaps: the same data, no label. Run on the case that finds
-/// the most (`on-search`) and on the line shift.
+/// the most (`on-search`) here, and on the line shift in the test below.
 #[tokio::test]
 async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps() {
     let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
@@ -1908,7 +1925,11 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
         assert_eq!(verdicts[map], Verdict::Gap { why: *why, lag: 1 }, "{map}");
     }
     world.finish().await;
+}
 
+/// The line shift of the test above, with the key off.
+#[tokio::test]
+async fn without_the_key_the_labelled_maps_are_gaps_on_a_line_shift_too() {
     let mut world = World::start_with(IndexFreshness::OnSearch, false, false).await;
     world.edit();
     world.regenerate_scip();
