@@ -183,7 +183,8 @@ pub struct RunProfileTraverse {
     /// unchanged reads `fresh` even under a stale snapshot, because its text is
     /// current; except that a card citing `lsp.live` is `unverified` when the
     /// walk found a language server running (a kept session: nothing checks
-    /// what it read). `false` (the default): the answer, the trace, the checkpoint
+    /// what it read), and so is every such card restored from a checkpoint by
+    /// a continuation. `false` (the default): the answer, the trace, the checkpoint
     /// and the handle are as without the key. `true` changes the response only:
     /// nothing is withheld, `results` are the same with either value, and the
     /// trace, the checkpoint hash and the handle do not change.

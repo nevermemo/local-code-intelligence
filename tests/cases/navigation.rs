@@ -5516,6 +5516,29 @@ async fn traverse_add_with(
     manager: &Arc<Manager>,
     tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
 ) -> Value {
+    traverse_add_full(
+        config,
+        workspace,
+        index,
+        sessions,
+        Some(manager),
+        (None, None),
+        tweak,
+    )
+    .await
+}
+
+/// [`traverse_add_with`] with the call's `pops` and `handle` (a continuation)
+/// and an optional shared manager.
+async fn traverse_add_full(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    sessions: local_code_intelligence::config::LspSessions,
+    manager: Option<&Arc<Manager>>,
+    (pops, handle): (Option<u32>, Option<&str>),
+    tweak: impl FnOnce(&mut local_code_intelligence::config::RunProfileConfig),
+) -> Value {
     use local_code_intelligence::{
         app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
         config::{LspProfile, RunProfileConfig, TraverseConfig, TraverseFirstStage},
@@ -5538,6 +5561,7 @@ async fn traverse_add_with(
     tweak(&mut profile);
     let (budget, steer) = (
         BudgetArgs {
+            pops,
             deadline_ms: Some(60_000),
             ..BudgetArgs::default()
         },
@@ -5555,9 +5579,9 @@ async fn traverse_add_with(
         maps: Some(&maps),
         budget: &budget,
         steer: &steer,
-        handle: None,
+        handle,
         lsp: Some(config),
-        lsp_sessions: Some(Arc::clone(manager)),
+        lsp_sessions: manager.map(Arc::clone),
     };
     run(&limits, &profile, &Dirs::under(&config.data_dir), &call)
         .await
@@ -7087,6 +7111,88 @@ async fn a_card_from_a_kept_session_is_unverified_and_one_from_a_fresh_session_i
         spawned,
         "the walk started nothing"
     );
+    manager.shutdown_all().await;
+}
+
+/// A checkpoint keeps the cards of a walk that reused a server, and a
+/// continuation cannot tell whether it did: the cards it restores that cite
+/// `lsp.live` stay `unverified` (the continuation here has no shared manager,
+/// so its own walk starts its own server). The first walk's cards are
+/// `unverified` because it found the server running; so are the same nodes'
+/// cards after the continuation; only a node the continuation reached itself
+/// may read `fresh`.
+#[tokio::test]
+async fn a_continuation_keeps_the_restored_lsp_live_cards_unverified() {
+    use local_code_intelligence::config::LspSessions;
+    let labelled = |profile: &mut local_code_intelligence::config::RunProfileConfig| {
+        profile.traverse.map_freshness = true;
+        profile.traverse.answer_labels = true;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, _state, index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    age_tree(&workspace.path);
+    let adapter = csharp_adapter(&manager);
+    manager.tree_barrier(&workspace, &[&adapter]).await;
+    manager
+        .symbols(&adapter, &workspace, "Calculator")
+        .await
+        .expect("the shared server starts and answers");
+
+    // One pop over the kept server: a checkpoint with a handle.
+    let first = traverse_add_full(
+        &config,
+        &workspace,
+        &index,
+        LspSessions::Shared,
+        Some(&manager),
+        (Some(1), None),
+        labelled,
+    )
+    .await;
+    assert!(kept_noted(&first, "csharp-ls"), "{first}");
+    let before: Vec<(String, String)> = first["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|card| card["maps"].to_string().contains("lsp.live"))
+        .map(|card| {
+            (
+                card["node"].as_str().unwrap().to_owned(),
+                card["freshness"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        !before.is_empty() && before.iter().all(|(_, word)| word == "unverified"),
+        "{before:?} in {first}"
+    );
+    let handle = first["handle"].as_str().expect("a handle").to_owned();
+
+    // The continuation has no shared manager: nothing is kept for it.
+    let second = traverse_add_full(
+        &config,
+        &workspace,
+        &index,
+        LspSessions::PerCall,
+        None,
+        (Some(2), Some(&handle)),
+        labelled,
+    )
+    .await;
+    assert!(!kept_noted(&second, "csharp-ls"), "{second}");
+    for (node, _) in &before {
+        let card = second["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|card| card["node"].as_str() == Some(node))
+            .unwrap_or_else(|| panic!("{node} is still in the results: {second}"));
+        assert_eq!(
+            card["freshness"], "unverified",
+            "restored card of {node}: {card}"
+        );
+    }
     manager.shutdown_all().await;
 }
 

@@ -1482,6 +1482,19 @@ pub async fn run_with_trait_seeds(
                 .to_owned(),
         );
     }
+    // The nodes a continuation restores from its checkpoint: their cards
+    // keep evidence an earlier call gathered, possibly from a kept server
+    // (`add_answer_labels`).
+    let restored: HashSet<String> = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .states
+                .iter()
+                .map(|state| state.node.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let traversal = match snapshot {
         Some(snapshot) => Traversal::resumed(OnTheFly::new(&registry, &view), snapshot, budget),
         None => {
@@ -1497,7 +1510,7 @@ pub async fn run_with_trait_seeds(
                 );
                 add_file_changed(&mut response, &observer);
                 if profile.traverse.answer_labels {
-                    add_answer_labels(&mut response, None, &unavailable, &[]);
+                    add_answer_labels(&mut response, None, &unavailable, &[], &HashSet::new());
                 }
                 return Ok(Report {
                     response,
@@ -1705,7 +1718,7 @@ pub async fn run_with_trait_seeds(
             Some(walk) if !walk.reused().is_empty() => vec![lci_maps::lsp_live::LSP_LIVE_ID],
             _ => Vec::new(),
         };
-        add_answer_labels(&mut response, Some(&result), &unavailable, &kept);
+        add_answer_labels(&mut response, Some(&result), &unavailable, &kept, &restored);
     }
     Ok(Report {
         response,

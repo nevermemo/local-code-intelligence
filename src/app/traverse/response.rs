@@ -168,6 +168,7 @@ pub(super) fn add_answer_labels(
     result: Option<&TraversalResult>,
     unavailable: &[MapId],
     kept: &[MapId],
+    restored: &HashSet<String>,
 ) {
     let maps = response.get("maps").and_then(Value::as_array).cloned();
     for list in CARD_LISTS {
@@ -175,7 +176,20 @@ pub(super) fn add_answer_labels(
             continue;
         };
         for card in items {
-            let word = card_freshness(card, maps.as_ref(), kept);
+            // A card of a node restored from a checkpoint keeps what an
+            // earlier call gathered, and the checkpoint does not say whether
+            // that call used a kept server: such a card that cites `lsp.live`
+            // is never `fresh` (a conservative choice that leaves the
+            // checkpoint format alone). The cards the call's own walk found
+            // follow `kept`.
+            let restored_card = card["node"]
+                .as_str()
+                .is_some_and(|node| restored.contains(node));
+            let word = if restored_card {
+                card_freshness(card, maps.as_ref(), &[lci_maps::lsp_live::LSP_LIVE_ID])
+            } else {
+                card_freshness(card, maps.as_ref(), kept)
+            };
             if let Some(object) = card.as_object_mut() {
                 object.insert("freshness".into(), json!(word));
             }
@@ -810,6 +824,42 @@ mod tests {
         assert_eq!(card_freshness(&changed, Some(&fresh), &kept), "changed");
         let stale = vec![entry("lsp.live", true, json!(2))];
         assert_eq!(card_freshness(&by_lag, Some(&stale), &kept), "stale");
+    }
+
+    /// A continuation that makes no language-server request has an empty
+    /// `kept`, yet the cards it restores from its checkpoint may hold what a
+    /// kept server gave an earlier call: those that cite `lsp.live` are
+    /// `unverified` (cards of nodes its own walk found follow `kept`).
+    #[test]
+    fn restored_lsp_live_cards_stay_unverified_in_a_continuation() {
+        let mut response = json!({
+            "status": "complete",
+            "maps": [entry("graph.scip", false, json!(0)), entry("lsp.live", false, json!(0))],
+            "results": [
+                {"node": "restored-lsp", "maps": ["lsp.live"], "via": "lsp.live"},
+                {"node": "restored-index", "maps": ["graph.scip"], "via": "graph.scip"},
+                {"node": "new-lsp", "maps": ["lsp.live"], "via": "lsp.live"},
+            ],
+        });
+        let restored: HashSet<String> = ["restored-lsp", "restored-index"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        add_answer_labels(&mut response, None, &[], &[], &restored);
+        let words: Vec<&str> = response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["freshness"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            words,
+            ["unverified", "fresh", "fresh"],
+            "restored lsp.live card; restored index card; the call's own fresh-session card"
+        );
+        // With no checkpoint nothing is restored.
+        add_answer_labels(&mut response, None, &[], &[], &HashSet::new());
+        assert_eq!(response["results"][0]["freshness"], "fresh");
     }
 
     #[test]

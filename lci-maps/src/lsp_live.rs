@@ -1,7 +1,9 @@
 //! The `lsp.live` map (multimap wave W0c2a): symbol facts asked of a running
-//! language server, so that they are as fresh as the tree is. It complements
-//! `graph.scip` (an index, stale after an edit) the way `grep.live` does for
-//! text.
+//! language server. A server the call started reads the tree as it is, so its
+//! answers are as fresh as the tree; a server kept across calls
+//! (`sessions = "shared"`) is only as fresh as its tree stamp's coverage and
+//! its answers stay unverified (see below). It complements `graph.scip` (an
+//! index, stale after an edit) the way `grep.live` does for text.
 //!
 //! # Edges
 //!
