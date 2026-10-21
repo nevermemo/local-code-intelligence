@@ -93,6 +93,7 @@ watch_debounce_milliseconds = 750
 rust_analyzer_path = "rust-analyzer"
 # Restore rust-analyzer's execution/network defaults only for trusted
 # repositories and dependencies. Applies to every workspace this process uses.
+# Also gates the probe.compile traverse map (cargo check runs build scripts).
 rust_analyzer_trusted = false
 # Seconds a request to a language server may go without any sign of life from
 # it (1-86400).

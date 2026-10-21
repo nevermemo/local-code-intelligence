@@ -406,7 +406,8 @@ struct TraverseArgs {
     /// the declarations that read them; needs rg on PATH), git.history
     /// (commits and co-change from the tree's git history) and probe.compile
     /// (compiler errors of a patch to a function, found by `cargo check` on a
-    /// scratch copy; seconds per node), search.lexical (the lexical search
+    /// scratch copy; seconds per node; needs `rust_analyzer_trusted = true`:
+    /// cargo check runs the tree's build scripts), search.lexical (the lexical search
     /// from a node's own name, to the chunks it finds), search.vector (the
     /// chunks nearest to a node's stored embedding; needs the embedder only
     /// for a node with no stored vector), scip.impact (the declarations

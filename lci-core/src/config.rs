@@ -529,6 +529,8 @@ pub struct Config {
     pub rust_analyzer_path: String,
     /// Restore rust-analyzer's execution/network defaults. Only enable when
     /// every repository this process accesses and its dependencies are trusted.
+    /// Also gates the `probe.compile` traverse map (`cargo check` runs build
+    /// scripts and procedural macros).
     pub rust_analyzer_trusted: bool,
     /// Seconds one request to a language server may go without any sign of
     /// life from it before it fails (1..=86400).

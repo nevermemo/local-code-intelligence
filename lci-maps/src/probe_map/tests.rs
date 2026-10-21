@@ -758,3 +758,27 @@ fn real_cargo_finds_the_caller_of_a_renamed_function() {
     );
     assert!(!dsts.contains(&node_named(&map.inner.scip, "caller").to_string()));
 }
+
+#[test]
+fn the_cargo_command_is_offline_and_without_wrappers() {
+    let dir = Path::new("tree");
+    let target = Path::new("target");
+    let command = RealCargo::default().command(dir, target);
+    let args: Vec<_> = command.get_args().collect();
+    assert!(
+        args.contains(&std::ffi::OsStr::new("--offline")),
+        "{args:?}"
+    );
+    let envs: HashMap<_, _> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
+        .collect();
+    let value = |key: &str| envs.get(std::ffi::OsStr::new(key)).cloned().flatten();
+    let empty = Some(std::ffi::OsString::new());
+    assert_eq!(value("CARGO_NET_OFFLINE"), Some("true".into()));
+    assert_eq!(value("RUSTC_WRAPPER"), empty);
+    assert_eq!(value("RUSTC_WORKSPACE_WRAPPER"), empty);
+    assert_eq!(value("CARGO_BUILD_RUSTC_WRAPPER"), empty);
+    assert_eq!(value("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"), empty);
+    assert_eq!(value("CARGO_TARGET_DIR"), Some(target.into()));
+}

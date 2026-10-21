@@ -96,7 +96,6 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K19 | `grep.structural` map wrapping ast-grep-core (pinned to the tree-sitter version it requires, 0.25 today; not after K15a) | Ceiling on structural queries | M | - |
 | K32 | Verify which planned maps exist: `tests.tested_by` and `docs.mentions` do not (`Tests` and `Mentions` are edge kinds only); build each; check pickaxe as a walk map | Ceiling per map | S each | - |
 | K37b | Concurrent walks; also shows whether per-server request ordering needs a queue (K37a dropped, the transport already multiplexes by id, d422) | Load test | S | - |
-| K37c | `probe.compile` runs `cargo check`, which can execute build scripts: a bounded sandbox, or opt-in only with a warning | Test | S | - |
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 | **M4-conditional** | **Codanna, grammar upgrade, optional tools, external gold, baselines: each runs in cycle 1 when its condition holds** | | | |

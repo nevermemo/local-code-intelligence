@@ -20,6 +20,21 @@
 //! its new modification time on purpose: giving it back its old one would let
 //! cargo reuse the patched build.
 //!
+//! # Trust
+//!
+//! `cargo check` compiles and runs the build scripts and procedural macros of
+//! the tree and of its dependencies, so a probe runs the tree's code. The
+//! traverse app registers this map only under `rust_analyzer_trusted = true`
+//! (the operator's grant, see the README security section); [`ProbeMap::new`]
+//! itself does not check it, a library caller is its own operator. What bounds
+//! a run: the scratch copy, its own target directory, `--offline`, the
+//! offline cargo environment and emptied compiler wrappers of
+//! [`RealCargo::command`], the timeout and the process-tree kill. What does
+//! not: the environment settings do not confine what build scripts read or
+//! write or whether they open network connections, and the tree's own
+//! `.cargo/config.toml` (copied into the scratch; `build.rustc`, `[env]`
+//! with `force = true`) can still change what runs. The grant is the control.
+//!
 //! # Patches
 //!
 //! * [`PatchKind::Rename`] renames the function at its definition. Every
@@ -182,7 +197,7 @@ pub trait CargoRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RealCargo {
     /// Pass `--offline`: the probe never reaches for the network.
-    pub offline: bool,
+    offline: bool,
 }
 
 impl Default for RealCargo {
@@ -191,8 +206,19 @@ impl Default for RealCargo {
     }
 }
 
-impl CargoRunner for RealCargo {
-    fn check(&self, dir: &Path, target_dir: &Path, timeout: Duration) -> CargoOutput {
+/// Variables set for every cargo run: no network use by cargo, and no
+/// compiler wrapper from the operator's shell.
+const CARGO_ENV: [(&str, &str); 5] = [
+    ("CARGO_NET_OFFLINE", "true"),
+    ("RUSTC_WRAPPER", ""),
+    ("RUSTC_WORKSPACE_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", ""),
+];
+
+impl RealCargo {
+    /// The `cargo check` command, not yet run.
+    pub(crate) fn command(&self, dir: &Path, target_dir: &Path) -> Command {
         let mut command = Command::new("cargo");
         command.args([
             "check",
@@ -207,8 +233,15 @@ impl CargoRunner for RealCargo {
         command
             .current_dir(dir)
             .env("CARGO_TARGET_DIR", target_dir)
-            .env("CARGO_TERM_COLOR", "never");
-        match run_limited(command, timeout) {
+            .env("CARGO_TERM_COLOR", "never")
+            .envs(CARGO_ENV);
+        command
+    }
+}
+
+impl CargoRunner for RealCargo {
+    fn check(&self, dir: &Path, target_dir: &Path, timeout: Duration) -> CargoOutput {
+        match run_limited(self.command(dir, target_dir), timeout) {
             Ok(ran) => CargoOutput {
                 stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),

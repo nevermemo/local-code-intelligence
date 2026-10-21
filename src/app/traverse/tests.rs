@@ -3822,3 +3822,90 @@ async fn a_handle_is_bound_to_the_index_stamp_not_to_the_spelling_of_its_path() 
         assert!(error.contains(wanted), "{given}: {error}");
     }
 }
+
+/// A call that names `probe.compile` beside `graph.scip` on the tree fixture,
+/// under the given service settings.
+async fn run_naming_probe_compile(tree: &Tree, lsp: Option<&lci_core::config::Config>) -> Value {
+    let maps = ["graph.scip".to_owned(), "probe.compile".to_owned()];
+    let budget = BudgetArgs {
+        pops: Some(1),
+        ..BudgetArgs::default()
+    };
+    let steer = SteerArgs::default();
+    let call = Call {
+        scip_index: &tree.index,
+        scip_root: Some(tree.dir.path()),
+        question: "q",
+        seeds: &tree.seeds,
+        seed_search: None,
+        top_k: 8,
+        maps: Some(&maps),
+        budget: &budget,
+        steer: &steer,
+        handle: None,
+        lsp,
+        lsp_sessions: None,
+    };
+    run(
+        &limits(),
+        &RunProfileConfig::default(),
+        &Dirs::under(tree.dir.path()),
+        &call,
+    )
+    .await
+    .unwrap()
+    .response
+}
+
+fn policy_has_map(response: &Value, id: &str) -> bool {
+    response["effective_policy"]["maps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|map| map["id"] == id)
+}
+
+#[tokio::test]
+async fn probe_compile_is_skipped_without_the_trust_grant() {
+    let untrusted = lci_core::config::Config {
+        rust_analyzer_trusted: false,
+        ..lci_core::config::Config::default()
+    };
+    for lsp in [None, Some(&untrusted)] {
+        let tree = Tree::new();
+        let response = run_naming_probe_compile(&tree, lsp).await;
+        assert!(policy_has_map(&response, "graph.scip"), "{response}");
+        assert!(!policy_has_map(&response, "probe.compile"), "{response}");
+        let notes = notes_of(&response);
+        assert!(notes.contains("probe.compile skipped"), "{notes}");
+        assert!(notes.contains("rust_analyzer_trusted"), "{notes}");
+        assert!(
+            response["warnings"]
+                .to_string()
+                .contains("probe.compile skipped"),
+            "{response}"
+        );
+        // The scratch checkout is the first thing a probe creates: cargo was
+        // never near. (The default path: the test assumes LCI_PROBE_SCRATCH_DIR
+        // is unset.)
+        let scratch = lci_maps::probe_map::ProbeConfig::for_tree(tree.dir.path()).scratch;
+        assert!(!scratch.exists(), "{}", scratch.display());
+    }
+}
+
+#[tokio::test]
+async fn probe_compile_registers_under_the_grant_and_says_what_runs() {
+    let trusted = lci_core::config::Config {
+        rust_analyzer_trusted: true,
+        ..lci_core::config::Config::default()
+    };
+    let tree = Tree::new();
+    let response = run_naming_probe_compile(&tree, Some(&trusted)).await;
+    assert!(policy_has_map(&response, "probe.compile"), "{response}");
+    let notes = notes_of(&response);
+    assert!(notes.contains("build scripts"), "{notes}");
+    assert!(!notes.contains("probe.compile skipped"), "{notes}");
+    // A file node is not a unit the map accepts, so no expansion ran cargo.
+    let scratch = lci_maps::probe_map::ProbeConfig::for_tree(tree.dir.path()).scratch;
+    assert!(!scratch.exists(), "{}", scratch.display());
+}
