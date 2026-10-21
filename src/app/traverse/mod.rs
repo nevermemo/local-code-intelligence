@@ -92,6 +92,7 @@ use lci_maps::{
     Map, MapId, Registry, SnapshotRef, SnapshotView,
     config_key::{CONFIG_KEY_MAP_ID, ConfigKeyMap, ConfigKeyOptions},
     contains::CONTAINS_MAP_ID,
+    docs_mentions::{DOCS_MENTIONS_ID, DocsMentions},
     git_history::{GIT_HISTORY_ID, GitHistoryConfig, GitHistoryMap, symbol_files},
     live_grep::{GREP_LIVE_MAP_ID, LiveGrep, ScipSpans},
     lsp_live::{LSP_LIVE_ID, LspLive, ManagerBackend, OutlinePlaces, ScipPlaces, SymbolPlaces},
@@ -176,15 +177,18 @@ pub const MAPS: [MapId; 4] = [SEEDS_HYBRID, SEEDS_MAP, SCIP_MAP_ID, CONTAINS_MAP
 /// a trait method, read from the `impl .. for ..` headers of the tree and the
 /// SCIP index), and `tests.tested_by` (the test units that reference a symbol,
 /// read from the same impact index; a test by its path or by an inline `tests`
-/// module in its symbol chain). `lsp.live` asks a language server for
-/// definition, references and document symbols (starts the server at the first
-/// expansion; needs its binary). The two exact operators `exact.closure` (the
+/// module in its symbol chain), and `docs.mentions` (the documentation files,
+/// by source role, whose current bytes mention a node's name; a wrapper of
+/// `grep.live` that reads documentation files only). `lsp.live` asks a
+/// language server for definition, references and document symbols (starts the
+/// server at the first expansion; needs its binary). The two exact operators `exact.closure` (the
 /// declarations that reference the symbol the question names, from the same
 /// index as `scip.impact`) and `exact.pickaxe` (the commits `git log -G/-S/--grep`
 /// finds for a history question) are never walked: their cards are the first
 /// stage (see [`first_stage`] and `[traverse] first_stage`).
-pub const OPT_IN_MAPS: [MapId; 14] = [
+pub const OPT_IN_MAPS: [MapId; 15] = [
     GREP_LIVE_MAP_ID,
+    DOCS_MENTIONS_ID,
     CONFIG_KEY_MAP_ID,
     GIT_HISTORY_ID,
     PROBE_COMPILE_ID,
@@ -975,6 +979,18 @@ pub async fn run_with_trait_seeds(
             true,
         )?;
     }
+    if let (true, Some(root)) = (wants(DOCS_MENTIONS_ID), call.scip_root) {
+        let docs = DocsMentions::new(root);
+        // One walk over the documentation files only: enough for the card's median.
+        docs.calibrate(1).await;
+        register(
+            &mut registry,
+            &mut plan_maps,
+            &observer,
+            Box::new(docs),
+            true,
+        )?;
+    }
     if let (true, Some(root)) = (wants(CONFIG_KEY_MAP_ID), call.scip_root) {
         let map = match config_key_map(call.scip_index, root, &loaded).await {
             Ok(map) => {
@@ -1135,9 +1151,14 @@ pub async fn run_with_trait_seeds(
     // The maps above that read the tree and were skipped without a word for lack of one.
     if call.scip_root.is_none() {
         unavailable.extend(
-            [GREP_LIVE_MAP_ID, CONFIG_KEY_MAP_ID, LSP_LIVE_ID]
-                .into_iter()
-                .filter(|id| wants(id)),
+            [
+                GREP_LIVE_MAP_ID,
+                DOCS_MENTIONS_ID,
+                CONFIG_KEY_MAP_ID,
+                LSP_LIVE_ID,
+            ]
+            .into_iter()
+            .filter(|id| wants(id)),
         );
     }
     let mut impact = None;

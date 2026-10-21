@@ -712,6 +712,7 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
         "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),
         "git.history" => Some(&[Commit, File]),
+        "docs.mentions" => Some(&[File]),
         "config.key" => Some(&[ConfigKey, Symbol]),
         "search.lexical" | "search.vector" => Some(&[Chunk]),
         _ => None,
@@ -3258,6 +3259,16 @@ pub fn free_two() {}
         assert!(can_answer(Set::WhereTo, &tested_by));
         assert!(!can_answer(Set::History, &tested_by));
         assert!(!can_answer(Set::Instructions, &tested_by));
+    }
+
+    #[test]
+    fn docs_mentions_can_answer_the_impact_set() {
+        let docs = vec!["docs.mentions".to_string()];
+        assert!(can_answer(Set::Impact, &docs));
+        assert!(can_answer(Set::WhereTo, &docs));
+        assert!(!can_answer(Set::History, &docs));
+        // It emits files, never a section: the instructions set skips every item.
+        assert!(!can_answer(Set::Instructions, &docs));
     }
 
     // ---- synthetic end-to-end run: tiny gold, fixture traversals, temp trend.
