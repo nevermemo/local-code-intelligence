@@ -48,7 +48,7 @@ that document and is not a roadmap id.
 
 ## Now and next
 
-In flight: SHARED (`sessions = shared` default with an index-list tree-stamp barrier, d454, cross-family review), K6a gold strata (d457), K32-1 tests.tested_by (d458), sanity 10 records (this). Next: K37b, K11e + N103, K20b-1, K11b, K11d-2; the K22a-0 XS then K22a-2. Rewrite this line at every push.
+In flight: K32-1 tests.tested_by (this), SHARED (`sessions = shared` default with an index-list tree-stamp barrier, d454, cross-family review), K6a gold strata (d457). Next: K37b, the async-audit fixes (lsp.live cap vs deadline, unbounded warm start, probe memo), K11e + N103, K20b-1, K11b, K11d-2; the K22a-0 XS then K22a-2. Rewrite this line at every push.
 
 ## Cycle 1
 
@@ -88,7 +88,8 @@ an arm works: no slice claims a gain over rg or LSP before the paired screening 
 | K12c | marksman adapter for prose | Live acceptance | S | N95 |
 | K18a | Repo map: PageRank over the syntax and outline graph as a seed prior (`seeds.repo_map` off) | Ceiling | M | G2 |
 | K19 | `grep.structural` map wrapping ast-grep-core (pinned to the tree-sitter version it requires, 0.25 today; not after K15a) | Ceiling on structural queries | M | - |
-| K32 | Verify which planned maps exist: `tests.tested_by` and `docs.mentions` do not (`Tests` and `Mentions` are edge kinds only); build each; check pickaxe as a walk map. K32-1 (`tests.tested_by`) is in flight (d458); K32-3 (pickaxe) closes as a one-paragraph decision, not a slice (it is first-stage by design, d232/d233) | Ceiling per map | S each | - |
+| K32-1 | `tests.tested_by` (opt-in map over the SCIP impact index, d458): built; open: the ceiling run (`maps bench --set impact` with and without the map, `tests_recall` and `tests_deep_recall` per stratum) | Ceiling | S | - |
+| K32-2 | `docs.mentions` (`Mentions` edges from documentation, a wrapper of `grep.live` over `SourceRole::Documentation` paths; plan after K32-1) | Ceiling (`docs_recall`, `i1_section_*`) | S | K32-1 |
 | K6a | Gold strata schema (core, grep-easy guard, agent-trap guard) and a miner over synthetic transcripts | Tests | S | - |
 | K6b | Mining question shapes from real Claude Code and Codex transcripts, locally; output gitignored | Counts | S | - |
 | **M4-conditional** | **Codanna, grammar upgrade, optional tools, external gold, baselines: each runs in cycle 1 when its condition holds** | | | |

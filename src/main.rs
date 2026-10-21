@@ -436,7 +436,9 @@ struct TraverseArgs {
     /// (types to the traits they implement, traits to their implementing
     /// types and trait methods to their implementations, from the
     /// `impl .. for ..` headers of the tree (--root) and the SCIP index's
-    /// reference occurrences; derived and macro impls are absent) and lsp.live
+    /// reference occurrences; derived and macro impls are absent),
+    /// tests.tested_by (the units in a test file or a test module that
+    /// reference a symbol, from the same SCIP impact index) and lsp.live
     /// (definition, references and document symbols from a running language
     /// server, with the server paths and lsp_timeout_seconds of the
     /// configuration; the server starts at the first expansion, so a cold
