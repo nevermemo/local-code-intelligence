@@ -233,7 +233,7 @@ view (`compact_view`, a profile with `response = "compact"`) is applied to a fin
 `app::traverse::run`. It loads the SCIP index (map `graph.scip`, cached by file stamp; `[run_profile.scip] mode` `authoritative` requires it, `cache` reads it when it is there, `off` never touches it and leaves the graph and the maps built from the index file empty, each saying so in a note), finds the start nodes
 (`given`; `hybrid`: the top `seed_k` hits of the normal hybrid search mapped to SCIP symbols; `hybrid+bm25` or `bm25` with `[run_profile.seeds] bm25 = true`: the opt-in map `seeds.bm25`,
 BM25 over the SCIP graph's node names, qualified paths and documentation, whose top `seed_k` nodes go after the hybrid hits or stand alone
-when the search gave none; or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
+when the search gave none; `...+literal` or `literal` with `[run_profile.seeds] literal = true`: the opt-in map `seeds.literal`, a whole-word ripgrep search (`lexical::search_literals`) for the names the question puts in code spans, each line placed in the SCIP graph (the symbol defined there, the one around it, else the file of a declaration line), appended after those sources; or `name_tokens`, the visible fallback), builds the steering ladder from the caller's rules, runs the `lci-maps` traversal under the
 `[traverse]` caps (a request can only lower them), writes a trace under `data_dir`, and answers with the reached nodes,
 totals and, only when work is left, a `handle` and `checkpoint`. The first stage (exact operators `exact.closure` and
 `exact.pickaxe`, then seeds), named policies per question type and the steering ladder are described in

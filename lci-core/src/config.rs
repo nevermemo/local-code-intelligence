@@ -637,7 +637,7 @@ pub struct Config {
     /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`, `walk.pricing`,
     /// `traverse.map_freshness`, `traverse.card_paths`, `scip.mode`, `lsp.sessions`,
     /// `lsp.outline_cache`, `lsp.implementations`, `lsp.call_hierarchy`, `lsp.sync`,
-    /// `lsp.places`, `freshness.verify_on_read`, `freshness.stat_gate` and `seeds.bm25`). Always
+    /// `lsp.places`, `freshness.verify_on_read`, `freshness.stat_gate`, `seeds.bm25` and `seeds.literal`). Always
     /// serialized; the hashed profile of the whole configuration is
     /// [`Config::run_profile`].
     pub run_profile: RunProfileConfig,

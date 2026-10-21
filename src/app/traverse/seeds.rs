@@ -2,7 +2,7 @@
 //! search hits to graph nodes, and the descriptor-only seed maps.
 
 use super::first_stage::{EXACT_CLOSURE_ID, EXACT_PICKAXE_ID};
-use super::{Call, SEEDS_BM25, SEEDS_HYBRID, SEEDS_MAP, chunks, index::Loaded};
+use super::{Call, SEEDS_BM25, SEEDS_HYBRID, SEEDS_LITERAL, SEEDS_MAP, chunks, index::Loaded};
 use crate::{app::App, config::TraverseConfig, filter::FilterRequest, models::Models};
 use anyhow::{Context, Result, anyhow};
 use lci_core::{
@@ -14,6 +14,7 @@ use lci_maps::{
     SnapshotView, SourceLabel,
     contains::CONTAINS_MAP_ID,
     impact::code_names,
+    lsp_live::SymbolPlaces,
     scip_graph::{ScipMap, SymbolDocs, symbol_path_names},
     scip_implements::{ImplementsMap, SCIP_IMPLEMENTS_ID, TargetKind},
     search_maps::ChunkSearch,
@@ -272,6 +273,17 @@ pub trait SeedSearch: Send + Sync {
     async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
         None
     }
+
+    /// The lines of the workspace's source files that hold one of `names` as a
+    /// whole identifier (exact case), at most `max_per_file` per file, for
+    /// `seeds.literal`; `None` when this search cannot run ripgrep.
+    async fn literal_search(
+        &self,
+        _names: &[String],
+        _max_per_file: u32,
+    ) -> Option<Result<lexical::LiteralSearch>> {
+        None
+    }
 }
 
 /// The search `search_code` runs in its normal mode, over one workspace and
@@ -301,6 +313,27 @@ impl SeedSearch for AppSeeds<'_> {
             config.reranker_model,
             lci_maps::traverse::trace::hash16(config.reranker_url.as_bytes())
         ))
+    }
+
+    async fn literal_search(
+        &self,
+        names: &[String],
+        max_per_file: u32,
+    ) -> Option<Result<lexical::LiteralSearch>> {
+        let resolved =
+            crate::workspace::Workspace::resolve(self.workspace, &self.app.config.data_dir);
+        Some(match resolved {
+            Ok(workspace) => {
+                lexical::search_literals(
+                    &self.app.config.ripgrep_path,
+                    &workspace.path,
+                    names,
+                    max_per_file,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        })
     }
 
     async fn snapshot_hashes(&self) -> Option<HashMap<String, String>> {
@@ -563,6 +596,265 @@ pub(super) fn map_hits(loaded: &Loaded, question: &str, hits: &[SeedHit]) -> Vec
     seeds
 }
 
+/// Most names of the question (its code spans' last segments) `seeds.literal`
+/// searches for.
+const MAX_LITERAL_NAMES: usize = 4;
+/// Most lines of one file ripgrep reports per search (`--max-count`).
+const MAX_LITERAL_PER_FILE: u32 = 20;
+/// Most definition seeds one name gives.
+const MAX_LITERAL_PER_NAME: usize = 3;
+/// Shortest name worth a search, in characters.
+const MIN_LITERAL_CHARS: usize = 2;
+/// The note of a `seeds.literal` call whose question has no name to search for.
+const NO_LITERAL_NAMES_NOTE: &str = "seeds.literal: the question names nothing in code spans (`Name` or `a::Name`), so there is nothing to search for";
+/// Words that declare the name that follows them. `impl .. for <name>` counts
+/// by holding `impl` before the name.
+const DECL_KEYWORDS: [&str; 17] = [
+    "fn",
+    "trait",
+    "struct",
+    "enum",
+    "impl",
+    "class",
+    "interface",
+    "type",
+    "mod",
+    "def",
+    "func",
+    "union",
+    "record",
+    "protocol",
+    "function",
+    "object",
+    "delegate",
+];
+
+/// The names `seeds.literal` searches for: the last segment of each path in
+/// the question's code spans, at least [`MIN_LITERAL_CHARS`] characters, each
+/// once, in question order, at most [`MAX_LITERAL_NAMES`].
+pub(super) fn literal_needles(question: &str) -> Vec<String> {
+    let (paths, _rejected) = code_names(question);
+    let mut needles: Vec<String> = Vec::new();
+    for path in paths {
+        let Some(last) = path.last() else { continue };
+        if last.chars().count() >= MIN_LITERAL_CHARS && !needles.contains(last) {
+            needles.push(last.clone());
+        }
+        if needles.len() == MAX_LITERAL_NAMES {
+            break;
+        }
+    }
+    needles
+}
+
+/// Whether a declaration word precedes the first whole-identifier occurrence
+/// of `name` in `text` (and the line is not a comment).
+pub(super) fn declares(text: &str, name: &str) -> bool {
+    let trimmed = text.trim_start();
+    if ["//", "/*", "*", "#", "--"]
+        .iter()
+        .any(|comment| trimmed.starts_with(comment))
+    {
+        return false;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let Some(start) = text
+        .match_indices(name)
+        .map(|(start, _)| start)
+        .find(|&start| {
+            !text[..start].chars().next_back().is_some_and(word)
+                && !text[start + name.len()..].chars().next().is_some_and(word)
+        })
+    else {
+        return false;
+    };
+    // The word right before the name declares it (`trait Name`, `pub struct
+    // Name`), or the name follows the `for` of an `impl .. for Name`. A name
+    // in a signature (`fn draw(shape: Shape)`) or a constant is a use.
+    let before: Vec<&str> = text[..start]
+        .split(|c: char| !word(c))
+        .filter(|token| !token.is_empty())
+        .collect();
+    // A Go method, `func (r T) Name`: the receiver sits between the word and
+    // the name.
+    let prefix = text[..start].trim();
+    if prefix.ends_with(')') && (prefix.starts_with("func (") || prefix.starts_with("func(")) {
+        return prefix.matches('(').count() == 1;
+    }
+    match before.last() {
+        Some(&last) if DECL_KEYWORDS.contains(&last) => true,
+        Some(&"for") => before.contains(&"impl"),
+        // C#: `delegate <return type> Name(..)`.
+        Some(_) => before.contains(&"delegate") && !text[..start].contains('('),
+        _ => false,
+    }
+}
+
+/// One node `seeds.literal` found, before the cut.
+struct LiteralHit {
+    node: NodeId,
+    how: &'static str,
+    name: usize,
+    path: String,
+    line: u32,
+    count: u32,
+}
+
+/// Start nodes from the exact occurrences of the names the question puts in
+/// code spans (`seeds.literal`): ripgrep finds the lines that hold a name as a
+/// whole identifier, and each line is placed in the SCIP graph. A line that is
+/// the definition of a symbol named so gives that symbol (`definition`); else
+/// the innermost symbol around it (`occurrence`, counted per node); else, when
+/// the line declares the name ([`DECL_KEYWORDS`] before it), the file's node
+/// (`file`: a type or trait the graph lacks, which `structure.contains` or an
+/// outline expands); else the line is dropped. Order: definitions (name order,
+/// then path; at most [`MAX_LITERAL_PER_NAME`] per name), occurrences (most
+/// lines first), files (by path), with the nodes of `known` left out and the
+/// list cut at `seed_k`. Fail-open: a search that is not available or fails
+/// gives no seeds and a note.
+pub(super) async fn literal_seeds(
+    limits: &TraverseConfig,
+    call: &Call<'_>,
+    known: &HashSet<NodeId>,
+    places: &dyn SymbolPlaces,
+) -> Result<(Vec<Seed>, Vec<Value>, Vec<String>)> {
+    let mut notes = Vec::new();
+    let needles = literal_needles(call.question);
+    if needles.is_empty() {
+        notes.push(NO_LITERAL_NAMES_NOTE.to_owned());
+        return Ok((Vec::new(), Vec::new(), notes));
+    }
+    let search = match call.seed_search {
+        Some(search) => search.literal_search(&needles, MAX_LITERAL_PER_FILE).await,
+        None => None,
+    };
+    let found = match search {
+        None => {
+            notes.push(
+                "seeds.literal needs the application's ripgrep (give --root with a question)"
+                    .to_owned(),
+            );
+            return Ok((Vec::new(), Vec::new(), notes));
+        }
+        Some(Err(error)) => {
+            notes.push(format!("seeds.literal: the search failed: {error:#}"));
+            return Ok((Vec::new(), Vec::new(), notes));
+        }
+        Some(Ok(found)) => found,
+    };
+    notes.extend(found.warning.clone());
+    let mut hits: Vec<LiteralHit> = Vec::new();
+    let mut at: HashMap<NodeId, usize> = HashMap::new();
+    let mut dropped = 0usize;
+    for line in &found.matches {
+        let Some(name) = needles.get(line.name) else {
+            continue;
+        };
+        let line0 = line.line.saturating_sub(1);
+        let (node, how) =
+            if let Some(node) = places.defined_in(&line.relative_path, (line0, line0), name) {
+                (node, "definition")
+            } else if let Some(node) = places.enclosing(&line.relative_path, line0) {
+                (node, "occurrence")
+            } else if is_source_path(&line.relative_path) && declares(&line.text, name) {
+                match NodeId::file(line.relative_path.clone()) {
+                    Ok(node) => (node, "file"),
+                    Err(_) => {
+                        dropped += 1;
+                        continue;
+                    }
+                }
+            } else {
+                dropped += 1;
+                continue;
+            };
+        match at.get(&node) {
+            Some(&index) => {
+                let hit = &mut hits[index];
+                hit.count += 1;
+                if hit.how == "occurrence" && how == "definition" {
+                    // The detail shows the definition's line, not the first
+                    // use that came before it.
+                    hit.how = "definition";
+                    hit.name = line.name;
+                    hit.path.clone_from(&line.relative_path);
+                    hit.line = line.line;
+                }
+            }
+            None => {
+                at.insert(node.clone(), hits.len());
+                hits.push(LiteralHit {
+                    node,
+                    how,
+                    name: line.name,
+                    path: line.relative_path.clone(),
+                    line: line.line,
+                    count: 1,
+                });
+            }
+        }
+    }
+    let mut definitions: Vec<&LiteralHit> =
+        hits.iter().filter(|hit| hit.how == "definition").collect();
+    definitions.sort_by_key(|hit| hit.name);
+    let mut per_name = vec![0usize; needles.len()];
+    definitions.retain(|hit| {
+        per_name[hit.name] += 1;
+        per_name[hit.name] <= MAX_LITERAL_PER_NAME
+    });
+    let mut occurrences: Vec<&LiteralHit> =
+        hits.iter().filter(|hit| hit.how == "occurrence").collect();
+    occurrences.sort_by_key(|hit| std::cmp::Reverse(hit.count));
+    let files = hits.iter().filter(|hit| hit.how == "file");
+    let (mut seeds, mut details) = (Vec::new(), Vec::new());
+    let mut counts = [0usize; 3];
+    for hit in definitions
+        .into_iter()
+        .chain(occurrences)
+        .chain(files)
+        .filter(|hit| !known.contains(&hit.node))
+        .take(limits.seed_k as usize)
+    {
+        counts[match hit.how {
+            "definition" => 0,
+            "occurrence" => 1,
+            _ => 2,
+        }] += 1;
+        details.push(json!({
+            "node": hit.node.to_string(),
+            "kind": if hit.node.kind() == NodeKind::Symbol { "symbol" } else { "file" },
+            "how": hit.how,
+            "name": needles[hit.name],
+            "path": hit.path,
+            "line": hit.line,
+            "lines": [hit.line, hit.line],
+            "retrievers": [SEEDS_LITERAL],
+            "score": hit.count,
+            "score_kind": "occurrences",
+        }));
+        seeds.push(Seed {
+            node: hit.node.clone(),
+            map: Some(SEEDS_LITERAL),
+        });
+    }
+    let files_with_lines = found
+        .matches
+        .iter()
+        .map(|line| line.relative_path.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    notes.push(format!(
+        "seeds.literal: searched {}; {} lines in {files_with_lines} files held a name as a whole word; {} start nodes ({} definition, {} occurrence, {} file); {dropped} lines were in no known symbol and declared nothing",
+        needles.join(", "),
+        found.matches.len(),
+        seeds.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+    ));
+    Ok((seeds, details, notes))
+}
+
 /// A start-node or first-stage source as a registered map: its descriptor
 /// only. The walk never queries it; registering it puts its id in the
 /// selectors, the maps list and the trace (`seeds.hybrid`, `seeds.scip_names`,
@@ -612,6 +904,16 @@ impl SeedMap {
         Self::new(
             SEEDS_BM25,
             vec![NodeKind::Symbol],
+            vec![SourceLabel::Lexical],
+        )
+    }
+
+    /// The nodes of the lines that hold a name of the question's code spans
+    /// as a whole word (ripgrep, placed in the SCIP graph).
+    pub(super) fn literal() -> Self {
+        Self::new(
+            SEEDS_LITERAL,
+            vec![NodeKind::Symbol, NodeKind::File],
             vec![SourceLabel::Lexical],
         )
     }
@@ -820,12 +1122,42 @@ pub(super) async fn find_seeds(
             }
         }
     }
+    // `seeds.literal` (only in `wanted` under `[run_profile.seeds] literal`):
+    // the nodes of the lines that hold a name of the question's code spans as
+    // a whole word, after the hybrid search's and `seeds.bm25`'s nodes. Not
+    // started for a question with no such name.
+    if wanted.contains(&SEEDS_LITERAL) && !literal_needles(call.question).is_empty() {
+        let known: HashSet<NodeId> = found.nodes.iter().map(|seed| seed.node.clone()).collect();
+        let places = loaded.places().await;
+        let (seeds, details, mut notes) = literal_seeds(limits, call, &known, &*places).await?;
+        found.notes.append(&mut notes);
+        if !seeds.is_empty() {
+            found.nodes.extend(seeds);
+            found.details.extend(details);
+            found.source = match found.source {
+                "hybrid" => "hybrid+literal",
+                "hybrid+bm25" => "hybrid+bm25+literal",
+                "bm25" => "bm25+literal",
+                _ => {
+                    if let Some(reason) = reason.take() {
+                        found.notes.push(format!(
+                            "seed_source is literal, the exact occurrences of the names in code spans: {reason}"
+                        ));
+                        found.fallback = Some(reason);
+                    }
+                    "literal"
+                }
+            };
+        }
+    } else if wanted.contains(&SEEDS_LITERAL) {
+        found.notes.push(NO_LITERAL_NAMES_NOTE.to_owned());
+    }
     if hybrid_answered {
         return Ok(found);
     }
     if !found.nodes.is_empty() {
-        // `seeds.bm25` answered where the hybrid search did not; the
-        // stand-in is reached only when neither did.
+        // `seeds.bm25` or `seeds.literal` answered where the hybrid search
+        // did not; the stand-in is reached only when none did.
     } else if wanted.contains(&SEEDS_MAP) {
         found.source = "name_tokens";
         for (node, matched) in loaded.names.matches(call.question, SEED_COUNT) {
@@ -998,6 +1330,10 @@ pub(super) fn add_trait_seeds(
             "hybrid" => "traits+hybrid",
             "hybrid+bm25" => "traits+hybrid+bm25",
             "bm25" => "traits+bm25",
+            "hybrid+literal" => "traits+hybrid+literal",
+            "hybrid+bm25+literal" => "traits+hybrid+bm25+literal",
+            "bm25+literal" => "traits+bm25+literal",
+            "literal" => "traits+literal",
             "name_tokens" => "traits+name_tokens",
             "exact" => "traits+exact",
             _ => "traits",

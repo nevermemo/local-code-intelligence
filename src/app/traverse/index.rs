@@ -9,6 +9,7 @@ use lci_maps::{
     config_key::{ConfigKeyMap, ConfigKeyOptions},
     contains::ContainsMap,
     impact::{Decl, ImpactIndex},
+    lsp_live::ScipPlaces,
     scip_graph::{DirSource, ScipGraph, ScipMap, SourceText},
     scip_impact::{ImpactMap, ImpactOptions},
     scip_implements::{ImplementsMap, ImplementsOptions},
@@ -34,6 +35,10 @@ pub(super) struct Loaded {
     /// stamp. A call without the map (the default) never builds it, and the
     /// graph itself holds no documentation.
     bm25: OnceLock<Arc<Bm25Seeds>>,
+    /// The places of the graph's nodes (a definition's line, the function
+    /// around a line) that `seeds.literal` places ripgrep's lines by, built
+    /// by the first call that wants the map ([`Loaded::places`]).
+    places: OnceLock<Arc<ScipPlaces>>,
     /// The containment of the graph's files and symbols (map
     /// `structure.contains`); a call adds the lines of its chunk seeds.
     pub(super) contains: ContainsMap,
@@ -66,6 +71,7 @@ impl Loaded {
             names: Arc::new(names),
             index: None,
             bm25: OnceLock::new(),
+            places: OnceLock::new(),
             contains,
             by_file,
             absent: None,
@@ -101,6 +107,25 @@ impl Loaded {
         .await
         .expect("the entity index build does not panic");
         self.bm25.get_or_init(|| built).clone()
+    }
+
+    /// The places of the graph's nodes, built on the first call (on a blocking
+    /// thread) and kept with the graph for the index stamp.
+    pub(super) async fn places(&self) -> Arc<ScipPlaces> {
+        if let Some(built) = self.places.get() {
+            return built.clone();
+        }
+        let scip = self.scip.clone();
+        let built = tokio::task::spawn_blocking(move || Arc::new(ScipPlaces::from_scip(&scip)))
+            .await
+            .expect("the places build does not panic");
+        self.places.get_or_init(|| built).clone()
+    }
+
+    /// Whether [`Loaded::places`] has built the places.
+    #[cfg(test)]
+    pub(super) fn places_built(&self) -> bool {
+        self.places.get().is_some()
     }
 
     /// Whether [`Loaded::bm25`] has built the entity index.

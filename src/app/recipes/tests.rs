@@ -1243,6 +1243,25 @@ async fn flow_from_runs_the_same_with_seeds_bm25_on() {
     assert!(!on.to_string().contains("bm25"), "{on}");
 }
 
+/// `[run_profile.seeds] literal` reaches the recipes' walk (the profile is the
+/// one they run under) and changes nothing there: the seeds of `flow_from` are
+/// given, so no seeds map runs and ripgrep is not started under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_seeds_literal_on() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.seeds.literal = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("literal"), "{on}");
+}
+
 /// `[run_profile.lsp] places` reaches the recipes' walk (the profile is the
 /// one they run under) and changes nothing there: the walk has no `lsp.live`,
 /// so no outline is asked under either value.

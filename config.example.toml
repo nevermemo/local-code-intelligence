@@ -696,6 +696,29 @@ stat_gate = false
 # under both values. Part of the run-profile hash.
 [run_profile.seeds]
 bm25 = false
+# literal = false (default): the opt-in map seeds.literal does not run; naming it
+# in `maps` gives a note and no seeds, it is not in the default set, ripgrep is
+# not started for it, and every answer is as without the key. true: the map is in
+# the default set of a call that names no maps, and runs when named. It takes the
+# names the question puts in code spans (the last segment of `a::Name`, `Name()`;
+# at least 2 characters, at most 4 names), runs `rg --fixed-strings
+# --word-regexp` for them (case-sensitive; `_` is a word character; the source
+# files of the language adapters; 20 lines per file at most), and places each
+# line in the SCIP graph: the symbol defined on that line, else the innermost
+# symbol around it, else (the line declares the name: `trait`, `struct`, `fn`,
+# `class`... right before it, or `impl .. for` it) the file's node, which
+# structure.contains or lsp.live under places = "outline" expands; any other
+# line is dropped. Definitions (3 per name at most) come first, then the
+# occurrences (the symbols around the most lines first), then the files; nodes
+# the other sources gave are left out and the list is cut at [traverse] seed_k.
+# They go after the hybrid search's and seeds.bm25's nodes (seed_source
+# "hybrid+literal", "hybrid+bm25+literal", "bm25+literal"), or are the start
+# nodes when those gave none ("literal"; the name-token stand-in then does not
+# run). Not [traverse] exact_seeds, which turns the first stage's exact cards
+# into start nodes. Needs the application (a question with --root); without it
+# the call says so and goes on. The recipes' seeds are given, so they are the
+# same under both values. Part of the run-profile hash.
+literal = false
 
 # [system_one] is the slot for a small model planned to steer a traversal (the
 # configuration and provider client exist; no traversal rung calls it yet) and
