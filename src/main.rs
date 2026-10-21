@@ -746,12 +746,13 @@ async fn run_traverse(
         ..dirs
     };
     let maps = (!args.maps.is_empty()).then_some(args.maps.as_slice());
-    // The hybrid search needs the application (index store, model services);
-    // open it only when the start nodes come from a question over a tree.
-    let wants_search = args.seeds.is_empty()
-        && args.handle.is_none()
-        && args.question.is_some()
-        && (maps.is_none_or(|ids| ids.iter().any(|id| id == traverse::SEEDS_HYBRID)));
+    // The hybrid search and seeds.literal need the application (index store,
+    // model services, ripgrep); open it only when the start nodes come from a
+    // question over a tree.
+    let wants_search = wants_seed_search(
+        args.seeds.is_empty() && args.handle.is_none() && args.question.is_some(),
+        maps,
+    );
     // The maps search.lexical and search.vector read the index too, from
     // whatever start nodes the call has.
     let wants_chunks = maps.is_some_and(|ids| {
@@ -1516,13 +1517,47 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Whether a traverse call opens the application for its start nodes:
+/// `from_question` (no given seeds or handle, a question) and either no maps
+/// named or one of the maps that search through the application
+/// (`seeds.hybrid`, and `seeds.literal` for its ripgrep).
+fn wants_seed_search(from_question: bool, maps: Option<&[String]>) -> bool {
+    from_question
+        && maps.is_none_or(|ids| {
+            ids.iter().any(|id| {
+                id == local_code_intelligence::app::traverse::SEEDS_HYBRID
+                    || id == local_code_intelligence::app::traverse::SEEDS_LITERAL
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LOG_FILTER, ShutdownSignal, cancel_on_signal};
+    use super::{DEFAULT_LOG_FILTER, ShutdownSignal, cancel_on_signal, wants_seed_search};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 
     struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    #[test]
+    fn seeds_literal_alone_opens_the_application_for_its_ripgrep() {
+        let maps = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let on = |ids: &[&str]| wants_seed_search(true, Some(maps(ids).as_slice()));
+        assert!(on(&["seeds.literal"]));
+        assert!(on(&["seeds.hybrid"]));
+        assert!(on(&["seeds.literal", "graph.scip"]));
+        // The other seed maps and the walk maps read no search.
+        assert!(!on(&["seeds.bm25"]));
+        assert!(!on(&["seeds.scip_names", "graph.scip"]));
+        // No maps named: the defaults include the hybrid search.
+        assert!(wants_seed_search(true, None));
+        // Given seeds, a handle or no question: never.
+        assert!(!wants_seed_search(false, None));
+        assert!(!wants_seed_search(
+            false,
+            Some(maps(&["seeds.literal"]).as_slice())
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

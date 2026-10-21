@@ -254,6 +254,14 @@ pub trait SeedSearch: Send + Sync {
         None
     }
 
+    /// Why this search is known to be unavailable (the application did not
+    /// open); `None` for a search that can run. A map that needs the
+    /// application besides the hybrid search (`seeds.literal`) treats `Some`
+    /// like no search at all.
+    fn unavailable(&self) -> Option<&str> {
+        None
+    }
+
     /// The reranker client, for `[traverse] rerank_frontier`; `None` when this
     /// search has none.
     fn reranker(&self) -> Option<&Models> {
@@ -447,6 +455,10 @@ impl SeedSearch for NoSearch {
     async fn search(&self, _question: &str, _k: usize) -> Result<Vec<SeedHit>> {
         Err(anyhow!("{}", self.0))
     }
+
+    fn unavailable(&self) -> Option<&str> {
+        Some(&self.0)
+    }
 }
 
 /// A start node and what is known of where it came from.
@@ -607,6 +619,19 @@ const MAX_LITERAL_PER_NAME: usize = 3;
 const MIN_LITERAL_CHARS: usize = 2;
 /// The note of a `seeds.literal` call whose question has no name to search for.
 const NO_LITERAL_NAMES_NOTE: &str = "seeds.literal: the question names nothing in code spans (`Name` or `a::Name`), so there is nothing to search for";
+/// The note of a `seeds.literal` call with no search that can run ripgrep.
+const NO_RIPGREP_NOTE: &str =
+    "seeds.literal needs the application's ripgrep (give --root with a question)";
+/// The ripgrep note of a call whose search is missing or known to be
+/// unavailable (with the reason), else `None`.
+fn no_ripgrep_note(search: Option<&dyn SeedSearch>) -> Option<String> {
+    match search {
+        None => Some(NO_RIPGREP_NOTE.to_owned()),
+        Some(search) => search
+            .unavailable()
+            .map(|reason| format!("{NO_RIPGREP_NOTE}: the search is unavailable: {reason}")),
+    }
+}
 /// Words that declare the name that follows them. `impl .. for <name>` counts
 /// by holding `impl` before the name.
 const DECL_KEYWORDS: [&str; 17] = [
@@ -719,21 +744,26 @@ pub(super) async fn literal_seeds(
     places: &dyn SymbolPlaces,
 ) -> Result<(Vec<Seed>, Vec<Value>, Vec<String>)> {
     let mut notes = Vec::new();
+    // A call with no search, or one known to be unavailable, says so first: a
+    // question with no code span must not hide a missing ripgrep.
+    if let Some(note) = no_ripgrep_note(call.seed_search) {
+        notes.push(note);
+        return Ok((Vec::new(), Vec::new(), notes));
+    }
+    let Some(seed_search) = call.seed_search else {
+        return Ok((Vec::new(), Vec::new(), notes));
+    };
     let needles = literal_needles(call.question);
     if needles.is_empty() {
         notes.push(NO_LITERAL_NAMES_NOTE.to_owned());
         return Ok((Vec::new(), Vec::new(), notes));
     }
-    let search = match call.seed_search {
-        Some(search) => search.literal_search(&needles, MAX_LITERAL_PER_FILE).await,
-        None => None,
-    };
+    let search = seed_search
+        .literal_search(&needles, MAX_LITERAL_PER_FILE)
+        .await;
     let found = match search {
         None => {
-            notes.push(
-                "seeds.literal needs the application's ripgrep (give --root with a question)"
-                    .to_owned(),
-            );
+            notes.push(NO_RIPGREP_NOTE.to_owned());
             return Ok((Vec::new(), Vec::new(), notes));
         }
         Some(Err(error)) => {
@@ -1126,7 +1156,12 @@ pub(super) async fn find_seeds(
     // the nodes of the lines that hold a name of the question's code spans as
     // a whole word, after the hybrid search's and `seeds.bm25`'s nodes. Not
     // started for a question with no such name.
-    if wanted.contains(&SEEDS_LITERAL) && !literal_needles(call.question).is_empty() {
+    if wanted.contains(&SEEDS_LITERAL)
+        && let Some(note) = no_ripgrep_note(call.seed_search)
+    {
+        // No search to run ripgrep: said first, whatever the question names.
+        found.notes.push(note);
+    } else if wanted.contains(&SEEDS_LITERAL) && !literal_needles(call.question).is_empty() {
         let known: HashSet<NodeId> = found.nodes.iter().map(|seed| seed.node.clone()).collect();
         let places = loaded.places().await;
         let (seeds, details, mut notes) = literal_seeds(limits, call, &known, &*places).await?;

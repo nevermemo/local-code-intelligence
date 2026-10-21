@@ -101,7 +101,12 @@ pub struct BenchArgs {
     tree: Option<PathBuf>,
     /// Maps to use, comma separated (default: the maps the CLI turns on when
     /// it is not told, read from a probe call; with --rescore, name the maps
-    /// the run used).
+    /// the run used). Naming the opt-in `seeds.bm25` or `seeds.literal` turns
+    /// its `[run_profile.seeds]` key on for the run, in a derived overlay under
+    /// `<out-dir>/<wave>/overlay` (the `--config` file plus the key; its hash is in
+    /// the row's note). The hash depends on the TOML serializer (keys
+    /// re-sorted, comments dropped); `derived_from_sha256` in `score.json`
+    /// keeps the provenance. A `--rescore` run does not derive one.
     #[arg(long, value_delimiter = ',')]
     maps: Vec<String>,
     /// A steering policy file for `lci traverse --policy`, or `default` for
@@ -286,6 +291,12 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let scip = args.scip.clone().context("--scip is required")?;
     let tree = args.tree.clone().context("--tree is required")?;
     let out_dir = args.out_dir.clone().context("--out-dir is required")?;
+    // Naming an opt-in seed map turns its key on in this arm's overlay.
+    let overlay = seed_map_overlay(
+        &args.maps,
+        overlay,
+        &out_dir.join(slug(&args.wave)).join("overlay"),
+    )?;
     let lci = match &args.lci {
         Some(path) => path.clone(),
         None => default_lci()?,
@@ -296,7 +307,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         tree,
         maps: args.maps.clone(),
         policy,
-        config: args.config.clone(),
+        config: overlay.as_ref().map(|o| o.path.clone()),
         policy_dir: args.policy_dir.clone(),
         max_depth: args.max_depth,
         fusion: fusion_arg(&args.fusion),
@@ -484,6 +495,12 @@ pub struct ConfigOverlay {
     pub path: PathBuf,
     /// Lowercase hex SHA-256 of the file's bytes.
     pub sha256: String,
+    /// The opt-in seed maps the bench turned on in this file because `--maps`
+    /// names them (empty for a file the user wrote as it is).
+    pub seed_maps_on: Vec<String>,
+    /// SHA-256 of the `--config` file this one was derived from, if the user
+    /// gave one.
+    pub derived_from: Option<String>,
 }
 
 impl ConfigOverlay {
@@ -500,17 +517,25 @@ impl ConfigOverlay {
         Ok(Self {
             path: path.to_path_buf(),
             sha256,
+            seed_maps_on: Vec::new(),
+            derived_from: None,
         })
     }
 
     /// `config=<file stem>@<first 12 hex of the hash>`, for the row's note (the
-    /// path is machine-specific and stays in `score.json`).
+    /// path is machine-specific and stays in `score.json`); a file the bench
+    /// derived says which seed maps it turned on.
     fn note(&self) -> String {
         let stem = self
             .path
             .file_stem()
             .map_or_else(|| "overlay".into(), |s| s.to_string_lossy());
-        format!("config={stem}@{}", &self.sha256[..12])
+        let on = if self.seed_maps_on.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} on)", self.seed_maps_on.join(", "))
+        };
+        format!("config={stem}@{}{on}", &self.sha256[..12])
     }
 
     /// The `score.json` block: path, hash and the distinct `profile_hash`es
@@ -520,12 +545,102 @@ impl ConfigOverlay {
             .iter()
             .filter_map(|(_, value)| value["profile_hash"].as_str())
             .collect();
-        json!({
+        let mut record = json!({
             "path": self.path.to_string_lossy(),
             "sha256": self.sha256,
             "profile_hashes": profile_hashes,
-        })
+        });
+        if !self.seed_maps_on.is_empty() {
+            record["seed_maps_on"] = json!(self.seed_maps_on);
+            record["derived_from_sha256"] = json!(self.derived_from);
+        }
+        record
     }
+}
+
+/// The opt-in seed maps `--maps` names, each with its `[run_profile.seeds]`
+/// key.
+fn named_opt_in_seed_maps(maps: &[String]) -> Vec<(&'static str, &'static str)> {
+    OPT_IN_SEED_KEYS
+        .iter()
+        .filter(|(map, _)| maps.iter().any(|named| named == map))
+        .copied()
+        .collect()
+}
+
+/// `base` (the text of an overlay, or none) with `[run_profile.seeds] <key> =
+/// true` for each key; the rest of the table stays. `None` when every key is
+/// already true. Comments of `base` are not kept.
+fn with_seed_keys_on(base: Option<&str>, keys: &[&str]) -> Result<Option<String>> {
+    let mut table: toml::Table = match base {
+        Some(text) => toml::from_str(text).context("parse the --config overlay as TOML")?,
+        None => toml::Table::new(),
+    };
+    let profile = table
+        .entry("run_profile")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("[run_profile] of the --config overlay is not a table")?;
+    let seeds = profile
+        .entry("seeds")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("[run_profile.seeds] of the --config overlay is not a table")?;
+    if keys
+        .iter()
+        .all(|key| seeds.get(*key).and_then(toml::Value::as_bool) == Some(true))
+    {
+        return Ok(None);
+    }
+    for key in keys {
+        seeds.insert((*key).to_owned(), toml::Value::Boolean(true));
+    }
+    Ok(Some(
+        toml::to_string(&table).context("render the derived overlay")?,
+    ))
+}
+
+/// Naming `seeds.bm25` or `seeds.literal` in `--maps` turns its
+/// `[run_profile.seeds]` key on for the run (d461), since the map gives no
+/// start nodes while the key is off. When the `--config` overlay (if any) does
+/// not already have the key on, the effective overlay becomes a file written to
+/// `dir`: the user's overlay with the key on, or only the key when there is
+/// none. The row's `config=` note and `score.json` carry the hash of that file,
+/// so the arm cannot read as a run without it. No other key and no default
+/// changes; a run that names neither map gets the overlay it had.
+fn seed_map_overlay(
+    maps: &[String],
+    overlay: Option<ConfigOverlay>,
+    dir: &Path,
+) -> Result<Option<ConfigOverlay>> {
+    let named = named_opt_in_seed_maps(maps);
+    if named.is_empty() {
+        return Ok(overlay);
+    }
+    let base = match &overlay {
+        Some(user) => Some(
+            std::fs::read_to_string(&user.path)
+                .with_context(|| format!("read the --config overlay {}", user.path.display()))?,
+        ),
+        None => None,
+    };
+    let keys: Vec<&str> = named.iter().map(|(_, key)| *key).collect();
+    let Some(text) = with_seed_keys_on(base.as_deref(), &keys)? else {
+        return Ok(overlay);
+    };
+    let name = match overlay.as_ref().and_then(|user| user.path.file_stem()) {
+        Some(stem) => format!("{}+seeds-on.toml", stem.to_string_lossy()),
+        None => "seeds-on.toml".to_owned(),
+    };
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create the overlay directory {}", dir.display()))?;
+    let path = dir.join(name);
+    std::fs::write(&path, text)
+        .with_context(|| format!("write the derived overlay {}", path.display()))?;
+    let mut derived = ConfigOverlay::load(&path)?;
+    derived.seed_maps_on = named.iter().map(|(map, _)| (*map).to_owned()).collect();
+    derived.derived_from = overlay.map(|user| user.sha256);
+    Ok(Some(derived))
 }
 
 /// The `--fusion` value to pass the CLI: none for its default.
@@ -697,9 +812,18 @@ pub(super) fn select_items(
 
 // ------------------------------------------------------------ capabilities
 
-/// The two maps that only find start nodes; they are never expanded, so they
+/// The maps that only find start nodes; they are never expanded, so they
 /// show up in a call by the seeds they gave, not by calls counted.
-const SEED_MAPS: [&str; 2] = ["seeds.hybrid", "seeds.scip_names"];
+const SEED_MAPS: [&str; 4] = [
+    "seeds.hybrid",
+    "seeds.scip_names",
+    "seeds.bm25",
+    "seeds.literal",
+];
+
+/// The seed maps that are off until their `[run_profile.seeds]` key is on,
+/// each with that key (d461).
+const OPT_IN_SEED_KEYS: [(&str, &str); 2] = [("seeds.bm25", "bm25"), ("seeds.literal", "literal")];
 
 /// The node kinds a known map emits (the `emits` of its descriptor); `None`
 /// for a map this runner does not know (it is run and judged by its results).
@@ -710,6 +834,8 @@ fn map_emits(map: &str) -> Option<&'static [NodeKind]> {
         | "tests.tested_by" | "exact.closure" => Some(&[Symbol]),
         "exact.pickaxe" => Some(&[Commit]),
         "seeds.hybrid" => Some(&[Symbol, Chunk, File]),
+        "seeds.bm25" => Some(&[Symbol]),
+        "seeds.literal" => Some(&[Symbol, File]),
         "structure.contains" | "grep.live" | "probe.compile" => Some(&[Symbol, File]),
         "git.history" => Some(&[Commit, File]),
         "docs.mentions" => Some(&[File]),
@@ -1117,6 +1243,10 @@ pub fn parse_start_maps(trace: &str) -> Option<Vec<(String, bool)>> {
         .collect()
 }
 
+/// The part of the note `seeds.literal` writes when the question names nothing
+/// in code spans.
+const LITERAL_NO_NAMES: &str = "names nothing in code spans";
+
 /// What a probe call on `map` must show. A seeds map is judged by the start
 /// nodes it gave (it is never expanded); any other map by the start event (it
 /// was registered and switched on) and by the per-map totals (it was called at
@@ -1135,20 +1265,46 @@ pub fn check_probe(
             .unwrap_or_default()
     };
     if SEED_MAPS.contains(&map) {
-        let wanted = if map == "seeds.hybrid" {
-            "hybrid"
-        } else {
-            "name_tokens"
+        let wanted = match map {
+            "seeds.hybrid" => "hybrid",
+            "seeds.bm25" => "bm25",
+            "seeds.literal" => "literal",
+            _ => "name_tokens",
         };
         let source = response["seed_source"].as_str().unwrap_or("none");
         let n_seeds = response["seeds"].as_array().map_or(0, Vec::len);
+        // `seeds.literal` searches the names a question puts in code spans: a
+        // probe question with none gives no seeds although the map ran (a map
+        // that is off says so in another note and still fails).
+        let nothing_to_search = map == "seeds.literal"
+            && n_seeds == 0
+            && response["notes"].as_array().is_some_and(|notes| {
+                notes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|note| note.contains(LITERAL_NO_NAMES))
+            });
+        if nothing_to_search {
+            return Ok(());
+        }
         if source != wanted || n_seeds == 0 {
             let fallback = response["seed_fallback"]
                 .as_str()
                 .map(|why| format!(": {why}"))
                 .unwrap_or_default();
+            // The map's own note says why (off, no ripgrep, no names).
+            let own = response["notes"]
+                .as_array()
+                .and_then(|notes| {
+                    notes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .find(|note| note.starts_with(map))
+                })
+                .map(|note| format!(" (note: {note})"))
+                .unwrap_or_default();
             return Err(format!(
-                "{map} gave no start nodes for the probe question (seed_source {source}, {n_seeds} seeds{fallback})"
+                "{map} gave no start nodes for the probe question (seed_source {source}, {n_seeds} seeds{fallback}){own}"
             ));
         }
         if let Some(why) = response["seed_fallback"].as_str() {
@@ -4096,6 +4252,270 @@ pub fn free_two() {}
         assert!(check_probe("seeds.scip_names", &none, None).is_err());
         let names = json!({"seed_source": "name_tokens", "seeds": ["sym:rust:a::b/fn"]});
         assert!(check_probe("seeds.scip_names", &names, None).is_ok());
+    }
+
+    // ---- d461: seeds.bm25 and seeds.literal in the bench.
+
+    #[test]
+    fn the_opt_in_seed_maps_are_known_seed_maps_with_their_emitted_kinds() {
+        use NodeKind::{File, Symbol};
+        for map in ["seeds.bm25", "seeds.literal"] {
+            assert!(SEED_MAPS.contains(&map), "{map}");
+        }
+        // The descriptors in src/app/traverse/seeds.rs (`SeedMap::bm25` and
+        // `SeedMap::literal`).
+        assert_eq!(map_emits("seeds.bm25"), Some(&[Symbol][..]));
+        assert_eq!(map_emits("seeds.literal"), Some(&[Symbol, File][..]));
+        // Symbols and files answer impact, flow, where-to and traits; neither
+        // map can answer history or instructions.
+        for map in ["seeds.bm25", "seeds.literal"] {
+            let maps = vec![map.to_string()];
+            assert!(can_answer(Set::Impact, &maps), "{map}");
+            assert!(can_answer(Set::Flow, &maps), "{map}");
+            assert!(can_answer(Set::WhereTo, &maps), "{map}");
+            assert!(!can_answer(Set::History, &maps), "{map}");
+            assert!(!can_answer(Set::Instructions, &maps), "{map}");
+        }
+        // An unknown seeds.* name is no seed map: it is not judged by its
+        // seeds, so its probe needs a start event, and the CLI refuses it.
+        assert!(!SEED_MAPS.contains(&"seeds.nope"));
+        assert_eq!(map_emits("seeds.nope"), None);
+        let gave = json!({"seed_source": "bm25", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.nope", &gave, None).is_err());
+    }
+
+    #[test]
+    fn the_opt_in_seed_maps_are_checked_by_the_start_nodes_they_gave() {
+        let bm25 = json!({"seed_source": "bm25", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.bm25", &bm25, None).is_ok());
+        let literal = json!({"seed_source": "literal", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.literal", &literal, None).is_ok());
+        // A map that gave nothing, or that another source answered for, fails.
+        let off = json!({"seed_source": "none", "seeds": [],
+                         "notes": ["seeds.bm25 is off ([run_profile.seeds] bm25 = false): the map gives no start nodes"]});
+        assert!(check_probe("seeds.bm25", &off, None).is_err());
+        let off = json!({"seed_source": "none", "seeds": [],
+                         "notes": ["seeds.literal is off ([run_profile.seeds] literal = false): the map gives no start nodes"]});
+        let error = check_probe("seeds.literal", &off, None).unwrap_err();
+        assert!(error.contains("seeds.literal is off"), "{error}");
+        // The CLI opens the application for a question only with seeds.hybrid
+        // named, so a lone seeds.literal call says it has no ripgrep.
+        let no_rg = json!({"seed_source": "none", "seeds": [],
+                           "notes": ["seeds.literal needs the application's ripgrep (give --root with a question)"]});
+        let error = check_probe("seeds.literal", &no_rg, None).unwrap_err();
+        assert!(error.contains("needs the application's ripgrep"), "{error}");
+        assert!(check_probe("seeds.bm25", &literal, None).is_err());
+        assert!(check_probe("seeds.literal", &bm25, None).is_err());
+        let names = json!({"seed_source": "name_tokens", "seeds": ["sym:rust:a::b/fn"]});
+        assert!(check_probe("seeds.bm25", &names, None).is_err());
+        // The probe question may name nothing in code spans: the map ran and
+        // had nothing to search for, which is not an unavailable map.
+        let nothing = json!({"seed_source": "none", "seeds": [],
+                             "notes": ["seeds.literal: the question names nothing in code spans (`Name` or `a::Name`), so there is nothing to search for"]});
+        assert!(check_probe("seeds.literal", &nothing, None).is_ok());
+        // That exception is the literal map's alone.
+        assert!(check_probe("seeds.bm25", &nothing, None).is_err());
+    }
+
+    /// A traverser whose preflight is `check_probe` on a canned probe answer
+    /// per map, as the CLI's would be on a seed map (no probe start nodes).
+    struct ProbeFixture {
+        answers: BTreeMap<String, Value>,
+    }
+
+    impl Traverser for ProbeFixture {
+        fn traverse(
+            &self,
+            _id: &str,
+            _question: &str,
+        ) -> Result<(Traversed, Value), TraverseError> {
+            Err(TraverseError::Cli("not used".into()))
+        }
+
+        fn default_maps(&self, _question: &str) -> Result<Vec<String>, TraverseError> {
+            Ok(Vec::new())
+        }
+
+        fn preflight(&self, map: &str, _question: &str) -> Result<(), TraverseError> {
+            let none = json!({"seed_source": "none", "seeds": []});
+            let response = self.answers.get(map).unwrap_or(&none);
+            let plan = (!SEED_MAPS.contains(&map)).then_some(&[][..]);
+            check_probe(map, response, plan).map_err(TraverseError::Cli)
+        }
+    }
+
+    #[test]
+    fn named_opt_in_seed_maps_pass_the_preflight_and_the_row_has_costs_and_the_overlay_hash() {
+        let seeds = json!({"seed_source": "bm25", "seeds": ["x"]});
+        let literal = json!({"seed_source": "literal", "seeds": ["x"]});
+        let probe = ProbeFixture {
+            answers: BTreeMap::from([
+                ("seeds.bm25".to_owned(), seeds),
+                ("seeds.literal".to_owned(), literal),
+            ]),
+        };
+        let maps: Vec<String> = ["seeds.bm25", "seeds.literal", "graph.scip"]
+            .map(String::from)
+            .into();
+        let unavailable = preflight_maps(&probe, &maps[..2], "q");
+        assert!(unavailable.is_empty(), "{unavailable:?}");
+        // The same traverser refuses a seeds.* name nothing knows.
+        let nope = preflight_maps(&probe, &["seeds.nope".to_owned()], "q");
+        assert_eq!(nope.len(), 1);
+
+        // The arm's overlay: derived from the map names, hashed into the row.
+        let dir = std::env::temp_dir().join(format!("xtask-seed-maps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let overlay = seed_map_overlay(&maps, None, &dir).unwrap().unwrap();
+        assert_eq!(overlay.sha256.len(), 64);
+        let mut raw = traversal(&["x"], &[SEARCH_FN], 6);
+        raw["profile_hash"] = json!("abc123");
+        raw["totals"]["external_calls"] = json!(2);
+        let items = vec![impact_item(
+            "i1",
+            "q one",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let mut config = config(&["seeds.bm25", "seeds.literal", "graph.scip"]);
+        config.note = note_with_flags(
+            None,
+            "boost",
+            [false, false],
+            false,
+            vec![Some(overlay.note())],
+        );
+        config.overlay = Some(overlay.clone());
+        let fixture = Fixture::new(BTreeMap::from([("q one".to_owned(), raw)]));
+        let outcome = bench_set(Set::Impact, &items, &fixture, &config).unwrap();
+        let cells = &outcome.row.cells;
+        assert_eq!(cells[5], "none");
+        assert_eq!(cells[18], "none", "no map unavailable");
+        // Wall time and the cost columns are filled like any other arm.
+        assert_ne!(cells[16], "-", "wall time");
+        assert_ne!(cells[10], "-", "pops");
+        assert_eq!(cells[17], "seeds.bm25,seeds.literal,graph.scip");
+        assert!(
+            cells[20].contains(&format!("config=seeds-on@{}", &overlay.sha256[..12])),
+            "{}",
+            cells[20]
+        );
+        assert!(
+            cells[20].contains("seeds.bm25, seeds.literal on"),
+            "{}",
+            cells[20]
+        );
+        assert!(
+            outcome.report["costs"].is_object(),
+            "{}",
+            outcome.report["costs"]
+        );
+        assert!(outcome.items["items"]["i1"]["expansions"].is_number());
+        let record = &outcome.report["config_overlay"];
+        assert_eq!(record["sha256"], overlay.sha256);
+        assert_eq!(record["profile_hashes"], json!(["abc123"]));
+        assert_eq!(
+            record["seed_maps_on"],
+            json!(["seeds.bm25", "seeds.literal"])
+        );
+        assert_eq!(record["derived_from_sha256"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn naming_an_opt_in_seed_map_turns_its_key_on_in_that_arms_overlay_only() {
+        let dir = std::env::temp_dir().join(format!("xtask-seed-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let strings = |maps: &[&str]| maps.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parse = |text: &str| -> lci_core::config::Config { toml::from_str(text).unwrap() };
+
+        // The defaults stay off (the golden defaults file is not touched).
+        let defaults = lci_core::config::Config::default();
+        assert!(!defaults.run_profile.seeds.bm25 && !defaults.run_profile.seeds.literal);
+
+        // Neither map named, or only maps that are not opt-in seed maps, or an
+        // unknown seeds.* name: no file, the overlay is as it was.
+        let out = dir.join("none");
+        for maps in [
+            strings(&[]),
+            strings(&["seeds.hybrid", "seeds.scip_names", "graph.scip"]),
+            strings(&["seeds.nope"]),
+        ] {
+            assert_eq!(seed_map_overlay(&maps, None, &out).unwrap(), None);
+        }
+        assert!(!out.exists());
+
+        // bm25 named, no overlay: a file with that key only.
+        let derived = seed_map_overlay(&strings(&["seeds.bm25", "graph.scip"]), None, &out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.path, out.join("seeds-on.toml"));
+        assert_eq!(derived.seed_maps_on, ["seeds.bm25"]);
+        assert_eq!(derived.derived_from, None);
+        let config = parse(&std::fs::read_to_string(&derived.path).unwrap());
+        assert!(config.run_profile.seeds.bm25 && !config.run_profile.seeds.literal);
+        config.validate().unwrap();
+
+        // literal named next to a user overlay: its other keys stay, the
+        // user's hash is recorded, the identity differs from the user's file.
+        let user = dir.join("pricing.toml");
+        std::fs::write(
+            &user,
+            "# an arm\n[run_profile.walk]\npricing = \"relative\"\n\n[channels]\nsemantic = false\nreranker = false\n",
+        )
+        .unwrap();
+        let user = ConfigOverlay::load(&user).unwrap();
+        let both = strings(&["seeds.literal", "seeds.bm25"]);
+        let derived = seed_map_overlay(&both, Some(user.clone()), &dir.join("arm"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.path, dir.join("arm").join("pricing+seeds-on.toml"));
+        assert_eq!(derived.derived_from.as_deref(), Some(user.sha256.as_str()));
+        assert_eq!(derived.seed_maps_on, ["seeds.bm25", "seeds.literal"]);
+        assert_ne!(derived.sha256, user.sha256);
+        assert!(derived.note().starts_with("config=pricing+seeds-on@"));
+        let config = parse(&std::fs::read_to_string(&derived.path).unwrap());
+        assert!(config.run_profile.seeds.bm25 && config.run_profile.seeds.literal);
+        assert_eq!(
+            config.run_profile.walk.pricing,
+            lci_core::config::WalkPricing::Relative
+        );
+        assert!(!config.channels.semantic && !config.channels.reranker);
+        // The same inputs give the same file content (the hash is a run identity).
+        let again = seed_map_overlay(&both, Some(user.clone()), &dir.join("arm2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.sha256, derived.sha256);
+
+        // A user overlay that has the key on already is used as it is.
+        let on = dir.join("on.toml");
+        std::fs::write(&on, "[run_profile.seeds]\nbm25 = true\n").unwrap();
+        let on = ConfigOverlay::load(&on).unwrap();
+        let same =
+            seed_map_overlay(&strings(&["seeds.bm25"]), Some(on.clone()), &dir.join("on")).unwrap();
+        assert_eq!(same, Some(on.clone()));
+        assert!(!dir.join("on").exists());
+        // ... but not when it names a second map whose key is off.
+        let more = seed_map_overlay(&both, Some(on), &dir.join("on2"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            parse(&std::fs::read_to_string(&more.path).unwrap())
+                .run_profile
+                .seeds
+                .literal
+        );
+
+        // An overlay that is not a table where the key goes is an error, not a
+        // silent overwrite.
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[run_profile]\nseeds = 3\n").unwrap();
+        let bad = ConfigOverlay::load(&bad).unwrap();
+        let err =
+            seed_map_overlay(&strings(&["seeds.bm25"]), Some(bad), &dir.join("bad")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a table"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
