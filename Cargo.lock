@@ -6969,6 +6969,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "csv",
  "dirs",
  "lci-core",
  "lci-maps",

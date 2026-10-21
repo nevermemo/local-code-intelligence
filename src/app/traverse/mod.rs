@@ -350,7 +350,9 @@ pub struct Call<'a> {
     /// (`LspAdapter::keeps_session`); every other server starts on the call's own
     /// manager, as under `per_call`. `None` there (a caller with no manager of
     /// its own, the recipes) starts all the call's servers as under `per_call`.
-    /// Under `per_call` it is never read.
+    /// Under `per_call` it is never read, except for its `[run_profile.lsp]
+    /// breaker` windows, which the call's own manager reads and opens under both
+    /// values (see [`per_call_manager`]).
     pub lsp_sessions: Option<Arc<lci_core::lsp::Manager>>,
 }
 
@@ -358,10 +360,17 @@ pub struct Call<'a> {
 /// `[run_profile.lsp] sessions = "per_call"` (or with no shared manager):
 /// built from the call's settings, and never syncing whatever
 /// `[run_profile.lsp] sync` says, since its servers start on the tree as it is
-/// and stop with the walk.
+/// and stop with the walk. Under `[run_profile.lsp] breaker = true` it reads
+/// and opens the skip windows of the call's shared manager (`Call.lsp_sessions`),
+/// so a provider found dead by one call is left alone by the next; a call with no
+/// shared manager has no windows.
 pub fn per_call_manager(call: &Call<'_>) -> Arc<lci_core::lsp::Manager> {
     let defaults = lci_core::config::Config::default();
-    Arc::new(lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults)).without_sync())
+    Arc::new(
+        lci_core::lsp::Manager::new(call.lsp.unwrap_or(&defaults))
+            .without_sync()
+            .with_breakers(call.lsp_sessions.as_ref().and_then(|m| m.breakers())),
+    )
 }
 
 /// Where a call keeps what it writes.

@@ -7,6 +7,7 @@
 //! See `docs/spike/multimap/v2/gold-scorers.md` for the run schema and the
 //! metric definitions.
 
+mod external;
 mod flow;
 mod history;
 mod impact;
@@ -146,6 +147,13 @@ pub enum GoldCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// External held-out gold (SWE-PolyBench Verified, LongCodeArena): convert
+    /// a downloaded dataset file to a where-to gold file and a counts report.
+    /// Held out: the output is never a tuning input.
+    External {
+        #[command(subcommand)]
+        command: external::ExternalCommand,
+    },
 }
 
 pub fn run(command: GoldCommand) -> Result<()> {
@@ -196,6 +204,7 @@ pub fn run(command: GoldCommand) -> Result<()> {
             tree,
             out,
         } => structured::run(&gold_dir, &tree, out.as_deref()),
+        GoldCommand::External { command } => external::run(command),
     }
 }
 
