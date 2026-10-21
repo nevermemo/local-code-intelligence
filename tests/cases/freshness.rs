@@ -1736,20 +1736,22 @@ async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
 /// A rewritten SCIP file (a longer one: the stamp is `(mtime, length)`)
 /// refreshes every map built from it, and only those: the language-server
 /// session is still behind. The next edit makes them lag again by one. The
-/// rewrite and the index refresh land in the same search, so the first
-/// observation after the edit is the rewritten one (the stale one is the first
-/// generation of the `on_search` case).
+/// snapshot is refreshed by a search before the rewrite, so the stamp reload is
+/// tested on its own, not as a side effect of an index refresh (the stale
+/// verdicts of that search are the first generation of the `on_search` case).
 #[tokio::test]
 async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
     let before = world.observe().await;
     world.edit();
     let truth = world.truth();
+    let stale = world.observe().await;
+    assert_eq!(stale.index_action, "refreshed_incrementally");
 
     world.regenerate_scip();
     let rewritten = world.observe().await;
-    // The rewrite and the snapshot refresh land in this one search.
-    assert_eq!(rewritten.index_action, "refreshed_incrementally");
+    // The snapshot is already current: only the stamp can reload the maps.
+    assert_eq!(rewritten.index_action, "reused");
     let verdicts = world.verdicts(&before, &rewritten, &truth);
     let shown = table(Case::ScipRewritten, &verdicts);
     eprintln!("{shown}");
