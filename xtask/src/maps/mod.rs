@@ -37,8 +37,9 @@ pub enum MapsCommand {
     Compare(compare::CompareArgs),
     /// Simple non-walk arms, written as run dirs that `maps compare` reads:
     /// `impact` (M1.4 arm N, the exact closure of the anchor the question's
-    /// names give) and `history` (`git log -G/-S/--grep` on the frozen eval
-    /// tree). Neither is given the gold.
+    /// names give), `history` (`git log -G/-S/--grep` on the frozen eval
+    /// tree) and `rg` (`rg --fixed-strings --word-regexp` on the frozen tree,
+    /// for the `traits` and `where-to` sets). None is given the gold.
     Baseline {
         #[command(subcommand)]
         which: baseline::BaselineCommand,
