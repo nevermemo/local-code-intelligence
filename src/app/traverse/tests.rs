@@ -4231,6 +4231,88 @@ async fn an_unreadable_index_under_authoritative_is_never_remembered() {
     assert!(!notes_text(&third).contains("remembered"), "{third}");
 }
 
+#[tokio::test]
+async fn an_io_error_on_the_index_is_not_remembered() {
+    let tree = ScipFileTree::new().await;
+    let root = Some(tree.dir.path());
+    // A directory has a stamp but cannot be read: an I/O error, not a parse
+    // failure.
+    std::fs::remove_file(&tree.index).unwrap();
+    std::fs::create_dir(&tree.index).unwrap();
+    for _ in 0..2 {
+        let answer = tree.run_default(&["graph.scip"], None, 1).await.unwrap();
+        assert!(notes_text(&answer).contains("unreadable:"), "{answer}");
+        assert!(!notes_text(&answer).contains("remembered"), "{answer}");
+        assert_eq!(super::index::remembered_failure(&tree.index, root), None);
+    }
+}
+
+#[tokio::test]
+async fn an_expired_failure_is_parsed_again() {
+    use super::index::load_with;
+    let tree = ScipFileTree::new().await;
+    let root = Some(tree.dir.path());
+    std::fs::write(&tree.index, [0xff_u8; 32]).unwrap();
+    let note = |loaded: &super::index::Loaded| loaded.note.clone().unwrap_or_default();
+    let zero = std::time::Duration::ZERO;
+    // An interval of zero retries on every call.
+    for _ in 0..2 {
+        let loaded = load_with(&tree.index, root, ScipMode::Cache, zero)
+            .await
+            .unwrap();
+        assert!(note(&loaded).contains("unreadable:"), "{}", note(&loaded));
+        assert!(!note(&loaded).contains("remembered"), "{}", note(&loaded));
+        assert!(super::index::remembered_failure(&tree.index, root).is_some());
+    }
+    // A long interval holds the entry and says when the file is read again.
+    let held = load_with(
+        &tree.index,
+        root,
+        ScipMode::Cache,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+    assert!(note(&held).contains("remembered"), "{}", note(&held));
+    assert!(note(&held).contains("or after 3600 s"), "{}", note(&held));
+}
+
+#[tokio::test]
+async fn a_failure_whose_stamp_changed_before_the_insert_leaves_no_entry() {
+    let tree = ScipFileTree::new().await;
+    let root = Some(tree.dir.path());
+    std::fs::write(&tree.index, [0xff_u8; 32]).unwrap();
+    let meta = std::fs::metadata(&tree.index).unwrap();
+    let now = (meta.modified().ok(), meta.len());
+    // The stamp the parse saw is not the file's any more.
+    super::index::remember_failure_for_test(&tree.index, root, (None, 7), "parse x");
+    assert_eq!(super::index::remembered_failure(&tree.index, root), None);
+    super::index::remember_failure_for_test(&tree.index, root, now, "parse x");
+    assert_eq!(
+        super::index::remembered_failure(&tree.index, root),
+        Some(now)
+    );
+}
+
+#[tokio::test]
+async fn a_graph_cache_hit_clears_a_remembered_failure_under_cache_only() {
+    use super::index::{load, plant_failure_for_test, remembered_failure};
+    let tree = ScipFileTree::new().await;
+    let root = Some(tree.dir.path());
+    let meta = std::fs::metadata(&tree.index).unwrap();
+    let stamp = (meta.modified().ok(), meta.len());
+    // `ScipFileTree::new` loaded the graph at this stamp. A failure kept for
+    // the same stamp (a repair of the same length within one modified-time
+    // tick) is obsolete once the graph is served from the cache.
+    plant_failure_for_test(&tree.index, root, stamp, "parse x");
+    load(&tree.index, root, ScipMode::Authoritative)
+        .await
+        .unwrap();
+    assert_eq!(remembered_failure(&tree.index, root), Some(stamp));
+    load(&tree.index, root, ScipMode::Cache).await.unwrap();
+    assert_eq!(remembered_failure(&tree.index, root), None);
+}
+
 /// A call that names `probe.compile` beside `graph.scip` on the tree fixture,
 /// under the given service settings.
 async fn run_naming_probe_compile(tree: &Tree, lsp: Option<&lci_core::config::Config>) -> Value {

@@ -585,7 +585,8 @@ pricing = "rank"
 # mode = "cache" (default): the index is read when the file is there and
 # readable; otherwise the SCIP graph is empty and a note says so. A file that
 # cannot be parsed is parsed once per file stamp (size and modified time); later
-# calls say it was not read again until the stamp changes. "authoritative": the
+# calls say it was not read again until the stamp changes or 30 s pass. An I/O
+# error is never remembered. "authoritative": the
 # index is required; a missing or unreadable file is an error. "off": the
 # index path is never touched; graph.scip, structure.contains (beyond chunk
 # lines), scip.impact, scip.implements, tests.tested_by, config.key and
