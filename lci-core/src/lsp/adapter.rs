@@ -205,7 +205,11 @@ pub async fn read_for_did_open(
 }
 
 /// What identifies a binary for the process-wide probe memo. The invocation is
-/// always `--version`, so the arguments are not part of the key.
+/// always `--version`, so the arguments are not part of the key. The path is
+/// the resolved string as given, not canonicalised: another spelling of the
+/// same file (case or a relative form on Windows) is probed again, and on a
+/// platform without lookup a bare name that matches an entry of the working
+/// directory is memoised against that entry's metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ProbeKey {
     /// The executable after `resolve_executable`.

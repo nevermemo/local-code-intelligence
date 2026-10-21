@@ -1771,10 +1771,10 @@ pub(crate) mod tests {
 
         // An index-time embedding makes one probe attempt: it connects (and
         // is refused), without the retries and the backoff a closed breaker
-        // allows (a retrying call would sleep 20 s and then 40 s; a refused
+        // allows (a retrying call would sleep and retry; a refused
         // connect itself takes up to about 2 s on Windows). It is counted as
-        // exactly one attempt; a retry would be a second one after the 20 s.
-        models.initial_backoff = Duration::from_secs(20);
+        // exactly one attempt; a retry would be a second one, so the count
+        // catches it without a long backoff to wait out.
         let before = models.attempts.load(Ordering::Relaxed);
         let probed = models.embed(&documents).await.unwrap_err();
         assert!(is_connect_error(&probed), "{probed:#}");

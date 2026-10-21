@@ -271,6 +271,17 @@ fn budget(deadline: Duration, calls: u32) -> Budget {
     }
 }
 
+/// [`budget`] for a test under `start_paused`: the deadline is `deadline` after
+/// the tokio clock, which the paused runtime has advanced past the real clock
+/// that [`budget`] reads.
+fn paused_budget(deadline: Duration, calls: u32) -> Budget {
+    Budget {
+        deadline: tokio::time::Instant::now().into_std() + deadline,
+        max_external_calls: calls,
+        max_nodes_touched: u64::MAX,
+    }
+}
+
 fn view() -> SnapshotView<'static> {
     SnapshotView::new(SnapshotRef::default(), Vec::new())
 }
@@ -692,18 +703,28 @@ async fn an_expansion_waits_as_long_as_its_budget_allows() {
     cold.delay = Duration::from_secs(20);
     let map = map_over(cold);
     let found = map
-        .expand(&sym("x"), budget(Duration::from_secs(60), 10), &view())
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_secs(60), 10),
+            &view(),
+        )
         .await;
     let edges: Vec<NodeId> = found.edges.iter().map(|edge| edge.dst.clone()).collect();
     assert_eq!(edges, vec![sym("b")]);
     assert_eq!(map.last_error(), None);
     assert_eq!(found.cost.external_calls, 2, "definitions and references");
 
-    // A budget shorter than the answer still ends with the note.
+    // A budget shorter than the answer still ends with the note: the first
+    // request is made and does not come back within 10 s.
     let found = map
-        .expand(&sym("x"), budget(Duration::from_secs(10), 10), &view())
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_secs(10), 10),
+            &view(),
+        )
         .await;
     assert!(found.edges.is_empty());
+    assert_eq!(found.cost.external_calls, 1, "one request, no answer");
     assert_eq!(map.last_error().as_deref(), Some(DEADLINE_NOTE));
 }
 
@@ -714,7 +735,11 @@ async fn a_call_that_outlasts_its_deadline_ends_with_the_note_and_no_edges() {
     let requests = slow.requests.clone();
     let map = map_over(slow);
     let found = map
-        .expand(&sym("x"), budget(Duration::from_millis(50), 10), &view())
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_millis(50), 10),
+            &view(),
+        )
         .await;
     assert!(found.edges.is_empty());
     assert_eq!(found.cost.external_calls, 1, "the request was made");

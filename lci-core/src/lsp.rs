@@ -1955,7 +1955,7 @@ impl Manager {
                         adapter.provider(),
                         Err(anyhow!(
                             "the version probe did not answer within {:?}",
-                            timeout.unwrap_or_default()
+                            timeout.unwrap_or(self.probe_timeout)
                         )),
                     );
                 }
@@ -3014,7 +3014,9 @@ mod tests {
     }
 
     /// With no timeout a probe that never answers ends only by the caller's
-    /// abort, and the abort leaves no session behind.
+    /// abort. This proves the abort cancels the probe wait and leaves no
+    /// session; it does not prove the cleanup of a start already in flight
+    /// (the d450 warm-start tests cover that).
     #[tokio::test]
     async fn a_warm_up_with_a_hanging_probe_ends_only_by_abort() {
         let gate = Gate::new();
