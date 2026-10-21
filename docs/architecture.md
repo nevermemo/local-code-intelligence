@@ -150,7 +150,7 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
   outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,
   modules, constants; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14) takes the SCIP node's id for the same file, name and
-  nearest line, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
+  nearest line, else (a Rust file, `OutlinePlaces::with_tree`) the canonical id of the `chunk::extract_for_path` declaration around the member, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
   numbered in document order; where a file is learned its places win over the index's, which may be older than the
   tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
   `Member::end_line` is the last line of the item.

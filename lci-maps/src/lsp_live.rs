@@ -57,8 +57,9 @@
 //! server for the file's `textDocument/documentSymbol`, one more external call
 //! per file and map instance, and from then on the outline's places win in that
 //! file (the index may be older than the tree). An outline member takes the
-//! index's id for the same symbol when there is one, else a minted id with the
-//! file's real language, so under `scip.mode = "off"` (an empty index) every
+//! index's id for the same symbol when there is one, else (a Rust file of the
+//! tree) the id of the declaration `sym.defs` would store, else a minted id with
+//! the file's real language, so under `scip.mode = "off"` (an empty index) every
 //! function, method, type, enum, module and constant of an outlined file has
 //! an id. Under `places = "scip"`, the default, no outline is asked for a
 //! symbol and a symbol the index lacks has no place.

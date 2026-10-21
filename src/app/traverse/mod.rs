@@ -1036,7 +1036,9 @@ pub async fn run_with_trait_seeds(
                 // for what it lacks (everything under `scip.mode = "off"`).
                 let places: Arc<dyn SymbolPlaces> = match profile.lsp.places {
                     LspPlaces::Scip => Arc::new(scip_places),
-                    LspPlaces::Outline => Arc::new(OutlinePlaces::over(scip_places)),
+                    LspPlaces::Outline => {
+                        Arc::new(OutlinePlaces::over(scip_places).with_tree(root))
+                    }
                 };
                 let map = Arc::new(
                     LspLive::new(Box::new(backend), places)

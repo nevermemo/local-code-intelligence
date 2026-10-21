@@ -1053,3 +1053,88 @@ async fn a_failed_file_outline_is_not_asked_again_for_a_symbol_of_that_file() {
         "one outline request in all"
     );
 }
+
+#[test]
+fn rust_members_take_the_declarations_ids() {
+    // A crate in a subdirectory, so that the crate name replaces the
+    // directory in the module path.
+    let tree = tempfile::tempdir().unwrap();
+    let path = "mycrate-x/src/lib.rs";
+    let source = "pub trait T {\n    fn m(&self);\n}\npub struct S;\nimpl T for S {\n    fn m(&self) {}\n}\nfn free() {}\n";
+    std::fs::create_dir_all(tree.path().join("mycrate-x/src")).unwrap();
+    std::fs::write(tree.path().join(path), source).unwrap();
+    std::fs::write(
+        tree.path().join("mycrate-x/Cargo.toml"),
+        "[package]\nname = \"my-crate\"\n",
+    )
+    .unwrap();
+    // The ids `sym.defs` stores for the same file: the extractor's, with the
+    // crate name.
+    let crates = crate::crates::CrateNames::read_paths(tree.path(), &[path]);
+    let declarations = lci_core::chunk::extract_for_path(path, source)
+        .unwrap()
+        .declarations
+        .unwrap();
+    let stored = |name: &str, line: u32| {
+        let declaration = declarations
+            .iter()
+            .find(|d| d.name == name && (d.start_line..=d.end_line).contains(&line))
+            .unwrap_or_else(|| panic!("no declaration {name} at {line}"));
+        crates.canonical(declaration.node_id(path))
+    };
+
+    let places = OutlinePlaces::over(Table(Vec::new())).with_tree(tree.path());
+    places.learn(
+        path,
+        &[
+            outline_member(path, "T", 0, 2, 11),
+            outline_member(path, "m", 1, 1, 6),
+            outline_member(path, "S", 3, 3, 23),
+            outline_member(path, "m", 5, 5, 6),
+            outline_member(path, "free", 7, 7, 12),
+            // The parse has no declaration `ghost`: minted.
+            outline_member(path, "ghost", 7, 7, 12),
+        ],
+    );
+    let id_at = |line| places.defined_at(&place(path, line, 3)).unwrap();
+    // The trait's `m` and the impl's `m` are two nodes, each with its own
+    // declaration's id (a join by name alone would give both one).
+    assert_eq!(id_at(1), stored("m", 2));
+    assert_eq!(id_at(5), stored("m", 6));
+    assert_ne!(id_at(1), id_at(5));
+    assert_eq!(id_at(0), stored("T", 1));
+    assert_eq!(id_at(3), stored("S", 4));
+    // The crate name, not the directory, and the declaration's kind.
+    assert_eq!(id_at(7).to_string(), "sym:rust:my_crate::free/fn");
+    assert_eq!(id_at(3).to_string(), "sym:rust:my_crate::S/struct");
+    assert!(id_at(5).to_string().starts_with("sym:rust:my_crate::"));
+    // `ghost` shares `free`'s place, so the later one is dropped: give it its
+    // own line and it is minted from the path (no declaration to take).
+    places.learn(
+        path,
+        &[
+            outline_member(path, "free", 7, 7, 12),
+            outline_member(path, "ghost", 8, 8, 12),
+        ],
+    );
+    assert_eq!(id_at(7).to_string(), "sym:rust:my_crate::free/fn");
+    assert_eq!(
+        id_at(8),
+        minted("mycrate-x", "ghost", SymbolKind::Function, 0)
+    );
+    // The join is by line as well as name: a `free` outside `fn free`'s lines
+    // (and no other member taking the declaration) is minted.
+    let outside = OutlinePlaces::over(Table(Vec::new())).with_tree(tree.path());
+    outside.learn(path, &[outline_member(path, "free", 9, 9, 12)]);
+    assert_eq!(
+        outside.defined_at(&place(path, 9, 3)),
+        Some(minted("mycrate-x", "free", SymbolKind::Function, 0))
+    );
+    // Without a tree every member is minted, as before.
+    let bare = OutlinePlaces::over(Table(Vec::new()));
+    bare.learn(path, &[outline_member(path, "free", 7, 7, 12)]);
+    assert_eq!(
+        bare.defined_at(&place(path, 7, 3)),
+        Some(minted("mycrate-x", "free", SymbolKind::Function, 0))
+    );
+}
