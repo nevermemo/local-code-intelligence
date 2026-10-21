@@ -254,8 +254,10 @@ route from its start node with each hop's map, edge kind and witness (`app::trav
 
 With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
 states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
-`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (they read current
-bytes or git, placed by the index's positions for the first two). `lag` is the number of source files (language-adapter
+`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (`live` names the channel: `grep.live`,
+`git.history`, `exact.pickaxe` and `probe.compile` read current bytes or git, placed by the index's positions for `grep.live`;
+`lsp.live` asks a running server, which is fresh when this call started it and, when kept across calls under
+`sessions = "shared"`, bounded by its tree stamp's coverage and labelled by a `kept session` note, with the same fields). `lag` is the number of source files (language-adapter
 files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
 first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`
 means not compared (no tree, unreadable tree, or an index file without a modified time). The tree is read and hashed

@@ -1066,6 +1066,7 @@ pub async fn run_with_trait_seeds(
     let mut lsp_live_sessions: Vec<(&'static str, Arc<lci_core::lsp::Manager>, String)> =
         Vec::new();
     let mut lsp_live_workspace = String::new();
+    let mut lsp_live_walk: Option<Arc<lci_core::lsp::WalkSessions>> = None;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
@@ -1122,14 +1123,9 @@ pub async fn run_with_trait_seeds(
                         "lsp.live: {provider} restarted: the tree changed since its last call"
                     ));
                 }
-                // An answer from a reused server is not a fresh server's: it
-                // is exact for what the tree stamp covers and says so.
-                for (provider, unchanged) in backend.kept() {
-                    notes.push(format!(
-                        "lsp.live: {provider} kept session; tree stamp unchanged since {} s ago",
-                        unchanged.as_secs()
-                    ));
-                }
+                // Which servers this walk found running is read when it ends
+                // (the barrier cannot say, see `WalkSessions`).
+                lsp_live_walk = Some(backend.walk());
                 let scip_places = ScipPlaces::from_scip(&loaded.scip);
                 // `outline`: the index's table first, the server's own outline
                 // for what it lacks (everything under `scip.mode = "off"`).
@@ -1629,6 +1625,21 @@ pub async fn run_with_trait_seeds(
                 readiness.ready_changes,
                 readiness.progress
             ));
+        }
+    }
+    // An answer from a server this walk found running is not a fresh
+    // server's: it is exact for what its tree stamp covers, and says so.
+    if let Some(walk) = &lsp_live_walk {
+        for (provider, unchanged) in walk.reused() {
+            notes.push(match unchanged {
+                Some(unchanged) => format!(
+                    "lsp.live: {provider} kept session; tree stamp unchanged since {} s ago",
+                    unchanged.as_secs()
+                ),
+                None => {
+                    format!("lsp.live: {provider} kept session; no tree stamp was recorded for it")
+                }
+            });
         }
     }
     // What the new maps cost per call, measured in this run (the p50 ring the

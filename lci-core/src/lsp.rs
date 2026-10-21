@@ -728,18 +728,72 @@ async fn outline_hash(file: &Path) -> Option<String> {
         .map(|text| content_hash(&text))
 }
 
-/// What one [`Manager::tree_barrier`] did to the sessions it was asked about.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BarrierOutcome {
-    /// The providers whose running session was stopped (the tree changed since
-    /// its last check, or no stamp could be taken): the caller's request starts
-    /// a fresh server that reads the disk.
-    pub restarted: Vec<&'static str>,
-    /// The providers whose running session the barrier kept, with how long the
-    /// tree stamp has been unchanged (about how long ago the session started
-    /// from this tree): the caller says so beside the answer, since it is not a
-    /// fresh server's.
-    pub kept: Vec<(&'static str, Duration)>,
+tokio::task_local! {
+    /// The walk whose requests the running task makes (see [`WalkSessions`]).
+    static WALK: Arc<WalkSessions>;
+}
+
+/// Which sessions one walk used, and whether it started each or found it
+/// running (started by an earlier call, or by an overlapping walk that got to
+/// the server first). The barrier cannot say: two walks can both pass it
+/// before either starts a server. So the manager records it when a request
+/// acquires its session ([`Manager::session`]), for the requests made inside
+/// [`WalkSessions::scope`]; the walk reads [`Self::reused`] when it ends and
+/// labels the answers of a reused server. Requests made outside a scope (the
+/// warm start, navigation, the search channel) are not recorded.
+#[derive(Default)]
+pub struct WalkSessions {
+    seen: std::sync::Mutex<Vec<SessionUse>>,
+}
+
+/// One session a walk acquired.
+struct SessionUse {
+    session: u64,
+    provider: &'static str,
+    /// Found running, not started by this walk.
+    reused: bool,
+    /// For a reused session: how long its tree stamp had been unchanged when
+    /// the walk acquired it; `None` when no stamp was recorded for it.
+    unchanged: Option<Duration>,
+}
+
+impl WalkSessions {
+    /// Runs `future` as the requests of this walk: the sessions it acquires
+    /// are recorded here.
+    pub async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+        WALK.scope(Arc::clone(self), future).await
+    }
+
+    fn note(
+        &self,
+        session: u64,
+        provider: &'static str,
+        reused: bool,
+        unchanged: Option<Duration>,
+    ) {
+        let mut seen = self.seen.lock().unwrap();
+        if seen.iter().all(|used| used.session != session) {
+            seen.push(SessionUse {
+                session,
+                provider,
+                reused,
+                unchanged,
+            });
+        }
+    }
+
+    /// The providers whose answers (some of them) came from a session this
+    /// walk found running, each with how long that session's tree stamp had
+    /// been unchanged (`None`: no stamp was recorded), in first-use order.
+    pub fn reused(&self) -> Vec<(&'static str, Option<Duration>)> {
+        let mut found: Vec<(&'static str, Option<Duration>)> = Vec::new();
+        for used in self.seen.lock().unwrap().iter().filter(|used| used.reused) {
+            if found.iter().all(|(provider, _)| *provider != used.provider) {
+                found.push((used.provider, used.unchanged));
+            }
+        }
+        found
+    }
 }
 
 /// Per-workspace, per-provider language-server sessions. Rust (rust-analyzer)
@@ -1040,21 +1094,39 @@ impl Manager {
     /// this caller finding it and the caller's first request.
     async fn session(&self, adapter: &Arc<dyn LspAdapter>, workspace: &Workspace) -> Arc<Session> {
         let key = Self::session_key(adapter, workspace);
-        let mut sessions = self.sessions.lock().await;
-        if let Some(existing) = sessions.get(&key)
-            && !existing.failed()
-            && !existing.stuck()
-        {
-            existing.touch();
-            return Arc::clone(existing);
-        }
-        let session = Session::begin(Arc::clone(adapter), workspace.clone(), self.stuck_after);
-        if let Some(replaced) = sessions.insert(key, Arc::clone(&session))
-            && replaced.stuck()
-        {
-            tokio::spawn(replaced.shutdown(SHUTDOWN_GRACE));
-        }
-        self.ensure_sync(workspace);
+        let (session, reused) = {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(existing) = sessions.get(&key)
+                && !existing.failed()
+                && !existing.stuck()
+            {
+                existing.touch();
+                (Arc::clone(existing), true)
+            } else {
+                let session =
+                    Session::begin(Arc::clone(adapter), workspace.clone(), self.stuck_after);
+                if let Some(replaced) = sessions.insert(key.clone(), Arc::clone(&session))
+                    && replaced.stuck()
+                {
+                    tokio::spawn(replaced.shutdown(SHUTDOWN_GRACE));
+                }
+                self.ensure_sync(workspace);
+                (session, false)
+            }
+        };
+        // The walk this request belongs to, if any, learns which it was.
+        let _ = WALK.try_with(|walk| {
+            let unchanged = reused
+                .then(|| {
+                    self.stamps
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .map(|(_, since)| since.elapsed())
+                })
+                .flatten();
+            walk.note(session.id, session.provider, reused, unchanged);
+        });
         session
     }
 
@@ -1113,17 +1185,19 @@ impl Manager {
     /// edit that keeps a file's length and modification time is not seen, nor
     /// a new file two or more levels below a stamped directory; the caller
     /// labels the answer of a kept session for that reason
-    /// ([`BarrierOutcome::kept`]). An edit during the call is seen by the next
+    /// ([`WalkSessions::reused`], recorded where the walk acquires its
+    /// session, not here: two walks can both pass their barriers before either
+    /// starts a server). An edit during the call is seen by the next
     /// barrier, as under `per_call`. It does not depend on the server's own
     /// file watcher or on `sync`.
     pub async fn tree_barrier(
         &self,
         workspace: &Workspace,
         adapters: &[&Arc<dyn LspAdapter>],
-    ) -> BarrierOutcome {
-        let mut outcome = BarrierOutcome::default();
+    ) -> Vec<&'static str> {
+        let mut restarted = Vec::new();
         if adapters.is_empty() {
-            return outcome;
+            return restarted;
         }
         let lock = Arc::clone(
             self.barriers
@@ -1167,17 +1241,11 @@ impl Manager {
         };
         for (adapter, stamp) in adapters.iter().zip(stamps) {
             let key = Self::session_key(adapter, workspace);
-            let unchanged_since = {
+            let same = {
                 let recorded = self.stamps.lock().unwrap();
-                match (recorded.get(&key), stamp) {
-                    (Some((before, since)), Some(now)) if *before == now => Some(*since),
-                    _ => None,
-                }
+                matches!((recorded.get(&key), stamp), (Some((before, _)), Some(now)) if *before == now)
             };
-            if let Some(since) = unchanged_since {
-                if self.sessions.lock().await.contains_key(&key) {
-                    outcome.kept.push((adapter.provider(), since.elapsed()));
-                }
+            if same {
                 continue;
             }
             // The only await between the decision and the record is the
@@ -1193,10 +1261,10 @@ impl Manager {
                 };
             }
             if stopped {
-                outcome.restarted.push(adapter.provider());
+                restarted.push(adapter.provider());
             }
         }
-        outcome
+        restarted
     }
 
     /// Removes the session under `key` and stops its server on a task of its
@@ -2737,8 +2805,8 @@ mod tests {
             "two barriers of one workspace took their stamps at once"
         );
         // No session ran, so nothing was stopped or kept.
-        for outcome in [a, b, c] {
-            assert_eq!(outcome, BarrierOutcome::default());
+        for restarted in [a, b, c] {
+            assert!(restarted.is_empty());
         }
     }
 

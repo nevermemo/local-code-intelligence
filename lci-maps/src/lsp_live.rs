@@ -106,7 +106,10 @@
 //! list, once per walk): a changed tree stops it and the walk starts a fresh
 //! one ([`ManagerBackend::restarted`]), so a reused server is never staler
 //! than under `per_call` for a change the stamp covers; the providers it kept
-//! are listed by [`ManagerBackend::kept`], and the walk labels their answers.
+//! are listed when the walk ends by [`ManagerBackend::walk`] (the sessions its
+//! requests found running, not the barrier's view: two walks can both pass
+//! the barrier before either starts a server), and the walk labels their
+//! answers.
 //!
 //! A missing server binary is found by [`ManagerBackend::open`], before any
 //! walk, as an error the caller reports; the map is then not registered. The
@@ -133,7 +136,7 @@ use crate::{
 use lci_core::{
     config::LspSync,
     language,
-    lsp::{BarrierOutcome, HierarchyCall, HierarchyItem, Location, Manager, adapter::LspAdapter},
+    lsp::{HierarchyCall, HierarchyItem, Location, Manager, WalkSessions, adapter::LspAdapter},
     node::{NodeId, NodeKind},
     workspace::Workspace,
 };
@@ -327,9 +330,9 @@ pub struct ManagerBackend {
     /// The providers whose kept session the tree barrier stopped because the
     /// tree changed since its last check (see [`Self::open_split`]).
     restarted: Vec<&'static str>,
-    /// The providers whose running kept session the barrier kept, with how
-    /// long the tree stamp has been unchanged.
-    kept: Vec<(&'static str, std::time::Duration)>,
+    /// The sessions this walk's requests acquired, and which of them it found
+    /// running instead of starting (see [`WalkSessions`]).
+    walk: Arc<WalkSessions>,
 }
 
 impl ManagerBackend {
@@ -408,16 +411,16 @@ impl ManagerBackend {
                 failures.join("; ")
             ));
         }
-        let outcome = if split {
+        let restarted = if split {
             shared.tree_barrier(&workspace, &on_shared).await
         } else {
-            BarrierOutcome::default()
+            Vec::new()
         };
         Ok(Self {
             workspace,
             adapters,
-            restarted: outcome.restarted,
-            kept: outcome.kept,
+            restarted,
+            walk: Arc::default(),
         })
     }
 
@@ -428,12 +431,12 @@ impl ManagerBackend {
         &self.restarted
     }
 
-    /// The providers whose running kept session the barrier kept when this
-    /// backend opened, with how long the tree stamp has been unchanged: the
-    /// walk's answer comes from that session, not from a server started
-    /// fresh, so the caller labels it.
-    pub fn kept(&self) -> &[(&'static str, std::time::Duration)] {
-        &self.kept
+    /// The record of which sessions this backend's requests found running
+    /// rather than started (read it when the walk ends: [`WalkSessions::reused`]
+    /// names the providers whose answers came from a reused server, so the
+    /// caller labels them). Take it before the backend is boxed.
+    pub fn walk(&self) -> Arc<WalkSessions> {
+        Arc::clone(&self.walk)
     }
 
     /// Each probed server's provider and the manager that runs it, for the
@@ -495,8 +498,8 @@ impl LspBackend for ManagerBackend {
     async fn definition(&self, at: &Place) -> Result<Vec<Place>, String> {
         let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        manager
-            .definition(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.definition(adapter, &self.workspace, &file, &at.path, at.line, at.col))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
@@ -505,8 +508,8 @@ impl LspBackend for ManagerBackend {
     async fn references(&self, at: &Place) -> Result<Vec<Place>, String> {
         let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        manager
-            .references(
+        self.walk
+            .scope(manager.references(
                 adapter,
                 &self.workspace,
                 &file,
@@ -514,7 +517,7 @@ impl LspBackend for ManagerBackend {
                 at.line,
                 at.col,
                 false,
-            )
+            ))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
@@ -523,8 +526,15 @@ impl LspBackend for ManagerBackend {
     async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String> {
         let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        manager
-            .implementation(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.implementation(
+                adapter,
+                &self.workspace,
+                &file,
+                &at.path,
+                at.line,
+                at.col,
+            ))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
@@ -533,8 +543,15 @@ impl LspBackend for ManagerBackend {
     async fn prepare_call_hierarchy(&self, at: &Place) -> Result<Vec<CallItem>, String> {
         let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        manager
-            .prepare_call_hierarchy(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.prepare_call_hierarchy(
+                adapter,
+                &self.workspace,
+                &file,
+                &at.path,
+                at.line,
+                at.col,
+            ))
             .await
             .map(|items| items.into_iter().filter_map(call_item).collect())
             .map_err(|error| format!("{error:#}"))
@@ -542,8 +559,8 @@ impl LspBackend for ManagerBackend {
 
     async fn incoming_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
         let (adapter, manager) = self.adapter_for(&item.place.path)?;
-        manager
-            .incoming_calls(adapter, &self.workspace, &item.raw)
+        self.walk
+            .scope(manager.incoming_calls(adapter, &self.workspace, &item.raw))
             .await
             .map(call_links)
             .map_err(|error| format!("{error:#}"))
@@ -551,8 +568,8 @@ impl LspBackend for ManagerBackend {
 
     async fn outgoing_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
         let (adapter, manager) = self.adapter_for(&item.place.path)?;
-        manager
-            .outgoing_calls(adapter, &self.workspace, &item.raw)
+        self.walk
+            .scope(manager.outgoing_calls(adapter, &self.workspace, &item.raw))
             .await
             .map(call_links)
             .map_err(|error| format!("{error:#}"))
@@ -561,8 +578,9 @@ impl LspBackend for ManagerBackend {
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
         let (adapter, manager) = self.adapter_for(path)?;
         let file = self.workspace.path.join(path);
-        let found = manager
-            .document_symbols(adapter, &self.workspace, &file, path)
+        let found = self
+            .walk
+            .scope(manager.document_symbols(adapter, &self.workspace, &file, path))
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok(found

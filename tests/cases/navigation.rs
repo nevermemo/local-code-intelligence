@@ -6930,6 +6930,61 @@ async fn a_new_file_in_an_indexed_directory_restarts_the_shared_server() {
     manager.shutdown_all().await;
 }
 
+/// The kept-session label comes from the session a walk actually acquired, not
+/// from the barrier: two walks can both pass their barriers before either
+/// starts a server. The first walk starts the server with its request (and
+/// asks again: its own server is not "kept"); the second, whose barrier had
+/// already passed, finds it running and is labelled. The order is made by the
+/// calls themselves, with no wait.
+#[tokio::test]
+async fn a_walk_that_finds_a_server_an_overlapping_walk_started_is_labelled_kept() {
+    use lci_maps::lsp_live::{LspBackend, ManagerBackend, Place};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, _index) = watching_sessions_fixture(&temp);
+    let manager = indexed_manager(&config, &workspace);
+    let own = Arc::new(Manager::new(&config).without_sync());
+    let open = || {
+        ManagerBackend::open_split(
+            workspace.clone(),
+            Arc::clone(&manager),
+            Arc::clone(&own),
+            LOADED_BUDGET,
+        )
+    };
+    // Both barriers pass with no server running anywhere.
+    let first = open().await.unwrap();
+    let second = open().await.unwrap();
+    assert!(
+        !state.join("spawn_count.txt").exists(),
+        "no server has started yet"
+    );
+    let at = Place {
+        path: "src/Calculator.cs".into(),
+        line: 1,
+        col: 3,
+    };
+    // The first walk starts the server, and uses it again.
+    let _ = first.definition(&at).await;
+    let _ = first.definition(&at).await;
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1);
+    assert!(
+        first.walk().reused().is_empty(),
+        "a server the walk started is not a kept one: {:?}",
+        first.walk().reused()
+    );
+    // The second walk finds it.
+    let _ = second.definition(&at).await;
+    assert_eq!(state_count(&state, "spawn_count.txt"), 1, "one server");
+    let reused = second.walk().reused();
+    assert_eq!(reused.len(), 1, "{reused:?}");
+    assert_eq!(reused[0].0, "csharp-ls");
+    assert!(
+        reused[0].1.is_some(),
+        "the first barrier recorded the stamp: {reused:?}"
+    );
+    manager.shutdown_all().await;
+}
+
 /// A new file in an existing child directory of a stamped directory that holds
 /// no indexed file of the server's language (what a rust `#[path]` attribute
 /// can name, here `src/generated/`) moves that child's modification time: the
