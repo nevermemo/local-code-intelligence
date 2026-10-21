@@ -364,6 +364,13 @@ impl LspAdapter for JavaServer {
             .await
     }
 
+    // The hook sends the current disk text on every request, and
+    // jdtls sets the working copy's buffer to the didOpen text when it
+    // differs, also for a unit that is already open.
+    fn opens_documents(&self) -> bool {
+        true
+    }
+
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,

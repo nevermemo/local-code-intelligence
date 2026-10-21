@@ -738,10 +738,13 @@ async fn run_traverse(
     };
     // `[run_profile.lsp] sessions = "shared"`: this process's one set of
     // language servers, which a CLI call has no other user of. Stopped here
-    // (cleanly, once the walk ends) instead of at process exit.
+    // (cleanly, once the walk ends) instead of at process exit. Built only
+    // when the call can run lsp.live, so a walk without it starts no idle
+    // sweeper and waits for no shutdown.
     let lsp_sessions = (config.run_profile.lsp.sessions
-        == local_code_intelligence::config::LspSessions::Shared)
-        .then(|| std::sync::Arc::new(lsp::Manager::new(&config)));
+        == local_code_intelligence::config::LspSessions::Shared
+        && may_walk_lsp_live(&config, args.root.is_some(), maps))
+    .then(|| std::sync::Arc::new(lsp::Manager::new(&config)));
     let report = traverse::run_with_trait_seeds(
         &config.traverse,
         &config.run_profile,
@@ -774,6 +777,23 @@ async fn run_traverse(
     stamp(&mut response, &config.run_profile().hash);
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+/// Whether a `traverse` call can run `lsp.live`: it reads the tree, so the
+/// call needs `--root`, and it is opt-in, so `--maps` names it or, without
+/// `--maps`, a configured `[traverse.policies]` entry lists it in
+/// `extra_maps` (the built-in policies never do).
+fn may_walk_lsp_live(config: &Config, has_root: bool, maps: Option<&[String]>) -> bool {
+    let lsp_live = |id: &String| id == lci_maps::lsp_live::LSP_LIVE_ID;
+    has_root
+        && match maps {
+            Some(ids) => ids.iter().any(lsp_live),
+            None => config
+                .traverse
+                .policies
+                .values()
+                .any(|policy| policy.extra_maps.iter().flatten().any(lsp_live)),
+        }
 }
 
 fn parse_resamples(value: &str) -> Result<usize, String> {
@@ -1517,5 +1537,31 @@ mod tests {
                 "lci_core::lsp"
             ]
         );
+    }
+
+    #[test]
+    fn the_cli_builds_a_shared_manager_only_for_a_call_that_can_walk_lsp_live() {
+        use super::may_walk_lsp_live;
+        use local_code_intelligence::config::{Config, TraversePolicy};
+        let names = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let plain = Config::default();
+        let (with, without) = (names(&["graph.scip", "lsp.live"]), names(&["graph.scip"]));
+        assert!(may_walk_lsp_live(&plain, true, Some(&with)));
+        assert!(!may_walk_lsp_live(&plain, false, Some(&with)), "no tree");
+        assert!(!may_walk_lsp_live(&plain, true, Some(&without)));
+        assert!(!may_walk_lsp_live(&plain, true, None), "the default maps");
+        let mut policy = plain.clone();
+        policy.traverse.policies.insert(
+            "flow".into(),
+            TraversePolicy {
+                extra_maps: Some(names(&["lsp.live"])),
+                ..TraversePolicy::default()
+            },
+        );
+        assert!(
+            may_walk_lsp_live(&policy, true, None),
+            "a policy's extra map"
+        );
+        assert!(!may_walk_lsp_live(&policy, true, Some(&without)));
     }
 }

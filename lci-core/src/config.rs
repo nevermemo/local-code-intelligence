@@ -630,7 +630,8 @@ pub struct Config {
     pub rescorer: Rescorer,
     /// `[run_profile]`: the home of the switches that name a run's
     /// result-affecting configuration (`walk.groups`, `walk.grep_corroboration`,
-    /// `traverse.map_freshness`, `scip.mode` and `lsp.sessions`). Always
+    /// `traverse.map_freshness`, `scip.mode`, `lsp.sessions`,
+    /// `lsp.outline_cache` and `freshness.verify_on_read`). Always
     /// serialized; the hashed profile of the whole configuration is
     /// [`Config::run_profile`].
     pub run_profile: RunProfileConfig,
