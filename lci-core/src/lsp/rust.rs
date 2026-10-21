@@ -116,6 +116,13 @@ impl LspAdapter for RustServer {
         })
     }
 
+    fn busy_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        Box::new(|msg: &Value| {
+            msg.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
+                && msg["params"]["quiescent"].as_bool() == Some(false)
+        })
+    }
+
     fn is_loading_error(&self, error: &RpcError, ready: bool) -> bool {
         // While it loads the workspace, rust-analyzer answers a request for a
         // file it has not seen yet with an internal error, "file not found:
@@ -238,6 +245,23 @@ mod tests {
             code,
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn the_busy_predicate_matches_quiescent_false_only() {
+        let server = RustServer::new(&Config::default());
+        let busy = server.busy_predicate();
+        let ready = server.ready_predicate();
+        let status = |quiescent: Value| json!({"method": "experimental/serverStatus", "params": {"quiescent": quiescent}});
+        assert!(busy(&status(json!(false))));
+        assert!(!busy(&status(json!(true))));
+        assert!(!busy(&status(Value::Null)));
+        assert!(!busy(&json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {"quiescent": false}
+        })));
+        // The two never match the same notification.
+        assert!(ready(&status(json!(true))) && !ready(&status(json!(false))));
     }
 
     #[test]

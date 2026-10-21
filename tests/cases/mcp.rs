@@ -287,6 +287,11 @@ async fn rest_release_workspace_stops_the_language_servers_of_that_workspace() {
         .await
         .unwrap();
     assert_eq!(status["analyzers_running"]["csharp-ls"], true, "{status}");
+    assert_eq!(
+        status["analyzers"]["csharp-ls"]["state"], "ready",
+        "{status}"
+    );
+    assert!(status["analyzers"]["rust-analyzer"].is_null(), "{status}");
     assert_eq!(status["csharp_analyzer_running"], true, "{status}");
     assert_eq!(lsp_spawn_count(&state), 1);
 

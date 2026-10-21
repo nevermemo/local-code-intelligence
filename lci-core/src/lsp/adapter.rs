@@ -59,6 +59,16 @@ pub trait LspAdapter: Send + Sync {
     /// request timeouts.
     fn ready_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync>;
 
+    /// Predicate the transport evaluates against every notification the
+    /// readiness predicate did not match, to learn that the server is busy
+    /// again after it was ready (rust-analyzer reports `quiescent: false`
+    /// while it reloads the crate graph). It feeds the readiness report only:
+    /// it never clears the ready latch and changes no request or answer.
+    /// Default: never matches.
+    fn busy_predicate(&self) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+        Box::new(|_| false)
+    }
+
     /// Whether `error`, a JSON-RPC error response, is how this server says it
     /// is still loading, so that the same request is likely to succeed on the
     /// same server a moment later. `ready` is whether the readiness predicate

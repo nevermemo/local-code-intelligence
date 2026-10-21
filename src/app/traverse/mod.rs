@@ -988,6 +988,9 @@ pub async fn run_with_trait_seeds(
         }
     }
     let mut lsp_live = None;
+    // The manager and workspace id `lsp.live` runs on, to report after the walk
+    // how its servers stood.
+    let mut lsp_live_sessions: Option<(Arc<lci_core::lsp::Manager>, String)> = None;
     if let (true, Some(root)) = (wants(LSP_LIVE_ID), call.scip_root) {
         // The servers of the call's settings; a server starts at the first
         // expansion. `per_call`: the manager is the map's alone, so the server
@@ -1007,6 +1010,7 @@ pub async fn run_with_trait_seeds(
                     (LspSessions::Shared, Some(shared)) => Arc::clone(shared),
                     _ => per_call_manager(call),
                 };
+                lsp_live_sessions = Some((Arc::clone(&manager), workspace.id.clone()));
                 // The version probe is bounded like the readiness probes.
                 let probe =
                     std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
@@ -1454,6 +1458,24 @@ pub async fn run_with_trait_seeds(
     }
     if let Some(error) = lsp_live.as_ref().and_then(|map| map.last_error()) {
         notes.push(format!("lsp.live reported an error for a node: {error}"));
+    }
+    // A server that is not ready when the walk ends says why a node may have
+    // had no edges; a ready one adds nothing, so a walk whose servers are
+    // ready answers exactly as before.
+    if let Some((manager, workspace_id)) = &lsp_live_sessions {
+        for adapter in manager.adapters() {
+            let provider = adapter.provider();
+            if let Some(readiness) = manager.readiness(provider, workspace_id).await
+                && readiness.state != lci_core::lsp::ServerStateName::Ready
+            {
+                notes.push(format!(
+                    "lsp.live: {provider} {} when the walk ended (ready changes {}, progress {})",
+                    readiness.state.as_str(),
+                    readiness.ready_changes,
+                    readiness.progress
+                ));
+            }
+        }
     }
     // What the new maps cost per call, measured in this run (the p50 ring the
     // map cards report).

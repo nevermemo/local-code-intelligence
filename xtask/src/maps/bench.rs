@@ -149,6 +149,15 @@ pub struct BenchArgs {
     /// changes with it.
     #[arg(long)]
     trajectory: bool,
+    /// A configuration overlay for every `lci traverse` call of the run
+    /// (`lci --config`, the CLI's own file; no second format), so one arm can
+    /// switch a `[run_profile]` key such as `[run_profile.walk] pricing` or
+    /// `[run_profile.seeds] bm25`. The file must exist. The row's note says
+    /// `config=<file stem>@<hash>` and `score.json` records the file's
+    /// SHA-256, its path and the `profile_hash` the traversals reported, so
+    /// two runs with different overlays never read as the same run.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// A table of fitted hop priors (`lci traverse --priors`, given
     /// `--question-type` the name of the set). The row's note says
     /// `priors=<file stem>`.
@@ -229,6 +238,12 @@ pub struct BenchArgs {
 }
 
 pub fn run(args: BenchArgs) -> Result<()> {
+    // Before any work: a missing overlay stops the run here.
+    let overlay = args
+        .config
+        .as_deref()
+        .map(ConfigOverlay::load)
+        .transpose()?;
     let policy = match args.policy.as_str() {
         "default" => None,
         other => Some(other.to_string()),
@@ -265,7 +280,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         ));
     }
     if let Some(dir) = &args.rescore {
-        return rescore(&args, dir, sets[0], &gold_items[0], &trend_path);
+        return rescore(&args, dir, sets[0], &gold_items[0], &trend_path, overlay);
     }
 
     let scip = args.scip.clone().context("--scip is required")?;
@@ -281,6 +296,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         tree,
         maps: args.maps.clone(),
         policy,
+        config: args.config.clone(),
         policy_dir: args.policy_dir.clone(),
         max_depth: args.max_depth,
         fusion: fusion_arg(&args.fusion),
@@ -332,12 +348,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            extra_notes(&args),
+            extra_notes(&args, overlay.as_ref()),
         ),
         progress: true,
         rescored: false,
         score_k: args.score_k,
         tree: args.tree.clone(),
+        overlay,
     };
     traverser.maps = config.available_maps();
     for (set, items) in sets.into_iter().zip(&gold_items) {
@@ -366,6 +383,7 @@ fn rescore(
     set: Set,
     items: &[Value],
     trend_path: &Path,
+    overlay: Option<ConfigOverlay>,
 ) -> Result<()> {
     if args.set == SetArg::All {
         bail!("--rescore takes one --set: the directory holds the raw outputs of one set");
@@ -385,12 +403,13 @@ fn rescore(
             &args.fusion,
             [args.pass_through, args.rerank_frontier],
             args.no_score_bound,
-            extra_notes(args),
+            extra_notes(args, overlay.as_ref()),
         ),
         progress: false,
         rescored: true,
         score_k: args.score_k,
         tree: args.tree.clone(),
+        overlay,
     };
     let raw = RawOutputs {
         dir: dir.join("raw"),
@@ -457,6 +476,58 @@ pub fn effective_maps(
     Ok(maps)
 }
 
+/// The configuration overlay of a run (`--config`): the file the CLI reads
+/// with its own `--config`, and its content hash, which is what makes the run's
+/// identity differ from a run without it or with another file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOverlay {
+    pub path: PathBuf,
+    /// Lowercase hex SHA-256 of the file's bytes.
+    pub sha256: String,
+}
+
+impl ConfigOverlay {
+    /// Reads and hashes the file; a missing or unreadable one is an error, so
+    /// the run stops before any work.
+    pub fn load(path: &Path) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read the --config overlay {}", path.display()))?;
+        let sha256 = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self {
+            path: path.to_path_buf(),
+            sha256,
+        })
+    }
+
+    /// `config=<file stem>@<first 12 hex of the hash>`, for the row's note (the
+    /// path is machine-specific and stays in `score.json`).
+    fn note(&self) -> String {
+        let stem = self
+            .path
+            .file_stem()
+            .map_or_else(|| "overlay".into(), |s| s.to_string_lossy());
+        format!("config={stem}@{}", &self.sha256[..12])
+    }
+
+    /// The `score.json` block: path, hash and the distinct `profile_hash`es
+    /// the traversals reported (the effective run profile).
+    fn record(&self, raw: &[(String, Value)]) -> Value {
+        let profile_hashes: BTreeSet<&str> = raw
+            .iter()
+            .filter_map(|(_, value)| value["profile_hash"].as_str())
+            .collect();
+        json!({
+            "path": self.path.to_string_lossy(),
+            "sha256": self.sha256,
+            "profile_hashes": profile_hashes,
+        })
+    }
+}
+
 /// The `--fusion` value to pass the CLI: none for its default.
 fn fusion_arg(fusion: &str) -> Option<String> {
     (fusion != "boost").then(|| fusion.to_owned())
@@ -503,10 +574,11 @@ fn priors_note(args: &BenchArgs) -> Option<String> {
     Some(format!("priors={stem}{holdout}"))
 }
 
-/// The note parts that come from the model files, the depth limit and the
-/// oracle arm: priors, tie-break, `max-depth=N` and the ORACLE marker.
-fn extra_notes(args: &BenchArgs) -> Vec<Option<String>> {
+/// The note parts that come from the config overlay, the model files, the
+/// depth limit and the oracle arm: `config=`, priors, tie-break, `max-depth=N` and the ORACLE marker.
+fn extra_notes(args: &BenchArgs, overlay: Option<&ConfigOverlay>) -> Vec<Option<String>> {
     vec![
+        overlay.map(ConfigOverlay::note),
         priors_note(args),
         tie_break_note(args),
         args.max_depth.map(|depth| format!("max-depth={depth}")),
@@ -1121,6 +1193,9 @@ pub struct CliTraverser {
     pub tree: PathBuf,
     pub maps: Vec<String>,
     pub policy: Option<String>,
+    /// `--config` for the CLI: the run's configuration overlay. Nothing is
+    /// passed without it (the CLI keeps its own lookup, `LCI_CONFIG` included).
+    pub config: Option<PathBuf>,
     /// A directory of per-item policy files (`<slug of item id>.json`), the
     /// bench-only oracle arm; excludes `policy`.
     pub policy_dir: Option<PathBuf>,
@@ -1175,6 +1250,9 @@ impl CliTraverser {
         policy_file: Option<&Path>,
     ) -> Command {
         let mut command = Command::new(&self.lci);
+        if let Some(config) = &self.config {
+            command.arg("--config").arg(config);
+        }
         command
             .arg("traverse")
             .arg("--scip")
@@ -2029,6 +2107,9 @@ pub struct RunConfig {
     /// nodes in their impl blocks. None: those nodes are not grouped, and the
     /// report warns.
     pub tree: Option<PathBuf>,
+    /// The `--config` overlay: named in the row's note and recorded in
+    /// `score.json`. None: no output differs from a run without the flag.
+    pub overlay: Option<ConfigOverlay>,
 }
 
 impl RunConfig {
@@ -2383,6 +2464,9 @@ pub fn bench_set(
             .zip(costs.iter())
             .collect();
         object.insert("costs".into(), costs_by_stratum(set, &rows));
+        if let Some(overlay) = &config.overlay {
+            object.insert("config_overlay".into(), overlay.record(&raw));
+        }
     }
     let grouping_warnings = grouper
         .as_ref()
@@ -3263,6 +3347,7 @@ pub fn free_two() {}
             rescored: false,
             score_k: None,
             tree: None,
+            overlay: None,
         }
     }
 
@@ -4111,6 +4196,7 @@ pub fn free_two() {}
             tree: PathBuf::from("tree"),
             maps: vec!["graph.scip".into()],
             policy: None,
+            config: None,
             policy_dir: None,
             max_depth: None,
             fusion: None,
@@ -4172,6 +4258,158 @@ pub fn free_two() {}
     }
 
     #[test]
+    fn the_config_overlay_reaches_every_cli_call_only_when_given() {
+        let mut t = cli_traverser();
+        let plain = args_of(&t.command(&t.maps, &[], "q", None));
+        assert!(!plain.contains(&"--config".to_owned()));
+        t.config = Some(PathBuf::from("arm/pricing-relative.toml"));
+        // Every kind of call (the item call, a probe with seeds and no maps)
+        // goes through `command`, so each carries it.
+        for args in [
+            args_of(&t.command(&t.maps, &[], "q", None)),
+            args_of(&t.command(&[], &["sym:a".to_owned()], "q", None)),
+        ] {
+            assert_eq!(args.iter().filter(|a| *a == "--config").count(), 1);
+            let at = args.iter().position(|a| a == "--config").unwrap();
+            assert_eq!(args[at + 1], "arm/pricing-relative.toml");
+            // A global flag of the CLI: before the subcommand.
+            assert!(at < args.iter().position(|a| a == "traverse").unwrap());
+        }
+        // Nothing else changes.
+        let args = args_of(&t.command(&t.maps, &[], "q", None));
+        let without: Vec<&String> = args
+            .iter()
+            .filter(|a| *a != "--config" && *a != "arm/pricing-relative.toml")
+            .collect();
+        assert_eq!(without, plain.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn config_overlays_change_the_run_identity_and_no_overlay_changes_nothing() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: BenchArgs,
+        }
+        let dir = std::env::temp_dir().join(format!("xtask-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rank = dir.join("rank.toml");
+        let relative = dir.join("relative.toml");
+        std::fs::write(&rank, "[run_profile.walk]\npricing = \"rank\"\n").unwrap();
+        std::fs::write(&relative, "[run_profile.walk]\npricing = \"relative\"\n").unwrap();
+        let rank = ConfigOverlay::load(&rank).unwrap();
+        let relative = ConfigOverlay::load(&relative).unwrap();
+        assert_eq!(rank.sha256.len(), 64);
+        assert_ne!(rank.sha256, relative.sha256);
+        assert_ne!(rank.note(), relative.note());
+        assert!(rank.note().starts_with("config=rank@"));
+        // The same bytes under another name are the same overlay content.
+        let copy = dir.join("copy.toml");
+        std::fs::write(&copy, "[run_profile.walk]\npricing = \"rank\"\n").unwrap();
+        assert_eq!(ConfigOverlay::load(&copy).unwrap().sha256, rank.sha256);
+
+        // No overlay: no note part, as before.
+        let plain = Wrapper::parse_from(["x", "--set", "impact", "--gold-dir", "g"]).args;
+        assert!(plain.config.is_none());
+        assert!(extra_notes(&plain, None).iter().all(Option::is_none));
+        let given = Wrapper::parse_from([
+            "x",
+            "--set",
+            "impact",
+            "--gold-dir",
+            "g",
+            "--config",
+            "c.toml",
+        ])
+        .args;
+        assert_eq!(given.config, Some(PathBuf::from("c.toml")));
+        let notes: Vec<String> = extra_notes(&given, Some(&rank))
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(notes, vec![rank.note()]);
+
+        // The run: score.json gains the block only with an overlay, and it
+        // carries the profile hash the traversals reported.
+        let items = vec![impact_item(
+            "i1",
+            "q one",
+            "src/app/search.rs",
+            "search::rerank_document",
+        )];
+        let mut raw = traversal(&["x"], &[SEARCH_FN], 6);
+        raw["profile_hash"] = json!("abc123");
+        let answers = BTreeMap::from([("q one".to_owned(), raw)]);
+        let run_with = |overlay: Option<&ConfigOverlay>| {
+            let mut config = config(&["graph.scip", "seeds.scip_names"]);
+            config.overlay = overlay.cloned();
+            config.note = note_with_flags(
+                None,
+                "boost",
+                [false, false],
+                false,
+                extra_notes(&plain, overlay),
+            );
+            bench_set(Set::Impact, &items, &Fixture::new(answers.clone()), &config).unwrap()
+        };
+        let none = run_with(None);
+        let a = run_with(Some(&rank));
+        let b = run_with(Some(&relative));
+        assert!(none.report.get("config_overlay").is_none());
+        assert!(!none.row.cells[20].contains("config="));
+        assert_eq!(a.report["config_overlay"]["sha256"], rank.sha256);
+        assert_eq!(
+            a.report["config_overlay"]["profile_hashes"],
+            json!(["abc123"])
+        );
+        assert_ne!(
+            a.report["config_overlay"]["sha256"],
+            b.report["config_overlay"]["sha256"]
+        );
+        assert_ne!(a.row.cells[20], b.row.cells[20]);
+        assert_ne!(a.row.cells[20], none.row.cells[20]);
+        // Everything but the overlay record and the note is the same.
+        let mut stripped = a.report.clone();
+        stripped.as_object_mut().unwrap().remove("config_overlay");
+        assert_eq!(stripped, none.report);
+        assert_eq!(a.run, none.run);
+        assert_eq!(a.items, none.items);
+
+        // A missing file stops the run before any work.
+        let err = ConfigOverlay::load(&dir.join("missing.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("--config overlay"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_config_overlay_fails_run_before_any_gold_is_read() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: BenchArgs,
+        }
+        // The gold dir does not exist either: the overlay is checked first.
+        let args = Wrapper::parse_from([
+            "x",
+            "--set",
+            "impact",
+            "--gold-dir",
+            "no-such-gold-dir",
+            "--config",
+            "no-such-overlay.toml",
+        ])
+        .args;
+        let err = run(args).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no-such-overlay.toml"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn an_item_without_a_policy_file_is_skipped_not_run_without_steering() {
         let dir = std::env::temp_dir().join(format!("xtask-br3-pd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4202,7 +4440,7 @@ pub fn free_two() {}
             args: BenchArgs,
         }
         let plain = Wrapper::parse_from(["x", "--set", "impact", "--gold-dir", "g"]).args;
-        assert!(extra_notes(&plain).iter().all(Option::is_none));
+        assert!(extra_notes(&plain, None).iter().all(Option::is_none));
         assert_eq!(policy_label_of(&plain), "default");
         let oracle = Wrapper::parse_from([
             "x",
@@ -4216,12 +4454,18 @@ pub fn free_two() {}
             "work/oracle-impact",
         ])
         .args;
-        let notes: Vec<String> = extra_notes(&oracle).into_iter().flatten().collect();
+        let notes: Vec<String> = extra_notes(&oracle, None).into_iter().flatten().collect();
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0], "max-depth=1");
         assert!(notes[1].starts_with("ORACLE"));
         assert_eq!(policy_label_of(&oracle), "oracle:oracle-impact");
-        let note = note_with_flags(None, "boost", [false, false], false, extra_notes(&oracle));
+        let note = note_with_flags(
+            None,
+            "boost",
+            [false, false],
+            false,
+            extra_notes(&oracle, None),
+        );
         assert!(note.contains("max-depth=1") && note.contains("ORACLE"));
     }
 
@@ -4268,7 +4512,7 @@ pub fn free_two() {}
             "--answer-seeds",
         ])
         .args;
-        let notes: Vec<String> = extra_notes(&given).into_iter().flatten().collect();
+        let notes: Vec<String> = extra_notes(&given, None).into_iter().flatten().collect();
         assert_eq!(notes, ["first-stage=append first_k=10", "answer-seeds"]);
         let off = Wrapper::parse_from([
             "x",
