@@ -247,7 +247,6 @@ pub fn arm_config(arm: &Arm, ctx: &ConfigCtx) -> String {
     let _ = writeln!(text, "data_dir = '{}'", toml_path(&ctx.data_dir));
     let _ = writeln!(text, "rust_analyzer_path = '{}'", ctx.rust_analyzer);
     text.push_str("lsp_timeout_seconds = 120\n");
-    text.push_str("readiness_timeout_seconds = 5\n");
     text.push_str("embedding_url = \"http://127.0.0.1:18766/v1\"\n");
     text.push_str("reranker_url = \"http://127.0.0.1:18767/rerank\"\n");
     text.push_str("\n[channels]\nsemantic = false\nlsp = false\nreranker = false\n");

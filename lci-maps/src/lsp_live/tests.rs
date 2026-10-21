@@ -7,6 +7,15 @@ use lci_core::config::Config;
 use lci_core::node::{SymbolKey, SymbolKind};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+/// `ManagerBackend::open` and the traversal bound the version probe alike.
+#[test]
+fn the_probe_default_matches_the_readiness_setting() {
+    assert_eq!(
+        PROBE_TIMEOUT,
+        Duration::from_secs(Config::default().readiness_timeout_seconds)
+    );
+}
+
 fn sym(name: &str) -> NodeId {
     NodeId::Symbol(SymbolKey {
         language: "rust".into(),
