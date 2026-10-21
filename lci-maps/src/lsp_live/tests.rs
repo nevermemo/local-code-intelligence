@@ -786,9 +786,12 @@ async fn the_server_is_asked_only_when_expanding_and_lives_until_the_map_drops()
 /// poll), so it fails with no wait; a
 /// wide one lets a real executable that answers `--version` (cargo, which runs
 /// these tests) through. The same manager and binary in both calls, so only
-/// the bound differs.
+/// the bound differs. The zero-bound call runs inside `fresh_probes`: other
+/// tests in this process probe cargo too, and the process-wide memo (d470)
+/// would otherwise answer it without a probe.
 #[tokio::test]
 async fn the_version_probe_honours_the_timeout_it_is_given() {
+    use lci_core::lsp::adapter::fresh_probes;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let config = Config {
         rust_analyzer_path: cargo,
@@ -799,11 +802,14 @@ async fn the_version_probe_honours_the_timeout_it_is_given() {
         path: std::env::temp_dir(),
     };
     let manager = Arc::new(Manager::new(&config));
-    let error =
-        ManagerBackend::open_with_probe_timeout(workspace(), Arc::clone(&manager), Duration::ZERO)
-            .await
-            .err()
-            .expect("a probe with no time left fails");
+    let error = fresh_probes(ManagerBackend::open_with_probe_timeout(
+        workspace(),
+        Arc::clone(&manager),
+        Duration::ZERO,
+    ))
+    .await
+    .err()
+    .expect("a probe with no time left fails");
     assert!(
         error.contains("no language server is available") && error.contains("timed out"),
         "{error}"
