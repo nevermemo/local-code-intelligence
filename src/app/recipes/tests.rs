@@ -1257,6 +1257,7 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     profile.traverse.map_freshness = true;
     profile.traverse.card_paths = true;
     profile.freshness.verify_on_read = true;
+    profile.freshness.stat_gate = true;
     let on = keyed.ask_under(request, false, &profile).await;
     assert_eq!(names(&on, "walk"), names(&off, "walk"), "{on}");
     assert!(!names(&on, "walk").is_empty(), "{on}");

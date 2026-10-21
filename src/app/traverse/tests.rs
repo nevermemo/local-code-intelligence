@@ -3225,9 +3225,25 @@ async fn freshness_call(
     fresh: bool,
     maps: &[&str],
 ) -> Value {
+    freshness_call_gated(dir, index, data, fresh, false, maps).await
+}
+
+/// [`freshness_call`] with `[run_profile.freshness] stat_gate` as given.
+async fn freshness_call_gated(
+    dir: &Path,
+    index: &Path,
+    data: &Path,
+    fresh: bool,
+    stat_gate: bool,
+    maps: &[&str],
+) -> Value {
     let profile = lci_core::config::RunProfileConfig {
         traverse: lci_core::config::RunProfileTraverse {
             map_freshness: fresh,
+            ..Default::default()
+        },
+        freshness: lci_core::config::profile::RunProfileFreshness {
+            stat_gate,
             ..Default::default()
         },
         ..Default::default()
@@ -3472,10 +3488,60 @@ async fn without_a_tree_or_a_modified_time_the_lag_is_null_and_a_note_says_so() 
 
     // An index file with no modified time is not compared.
     let tree = tempfile::tempdir().unwrap();
-    let lag = freshness::tree_lag(&tree.path().join("index.scip"), tree.path(), (None, 7))
+    for stat_gate in [false, true] {
+        let lag = freshness::tree_lag(
+            &tree.path().join("index.scip"),
+            tree.path(),
+            (None, 7),
+            stat_gate,
+        )
         .await
         .unwrap();
-    assert_eq!(lag, None);
+        assert_eq!(lag, None);
+    }
+}
+
+/// `[run_profile.freshness] stat_gate` changes the cost of the read of the
+/// tree, not the lag: the same edits give the same lags with the gate on and
+/// off (every edit here moves the length or adds or removes a file).
+#[tokio::test]
+async fn the_lag_is_the_same_with_the_stat_gate_on_and_off() {
+    let mut lags = Vec::new();
+    for stat_gate in [false, true] {
+        let (dir, index) = crowded_tree(2);
+        let data = tempfile::tempdir().unwrap();
+        let named = ["graph.scip", "structure.contains", "grep.live"];
+        // The index is ten seconds older than its tree (no sleep): `a.rs` is
+        // newer, as in the lag test above.
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+        let call =
+            || freshness_call_gated(dir.path(), &index, data.path(), true, stat_gate, &named);
+        let lag = |response: &Value| freshness_of(response)["graph.scip"].clone();
+        let source = dir.path().join("a.rs");
+        let mut seen = vec![lag(&call().await)];
+        for text in ["fn edited() {}\n", "fn edited_again() {}\n"] {
+            let mut now = std::fs::read_to_string(&source).unwrap();
+            now.push_str(text);
+            std::fs::write(&source, now).unwrap();
+            seen.push(lag(&call().await));
+        }
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        seen.push(lag(&call().await));
+        std::fs::remove_file(dir.path().join("b.rs")).unwrap();
+        seen.push(lag(&call().await));
+        // The gate holds one table per root, and it follows the tree.
+        let gate = lci_core::chunk::stat_gate(dir.path());
+        let gated = gate.lock().unwrap().len();
+        assert_eq!(gated, if stat_gate { 1 } else { 0 }, "a.rs only");
+        lags.push(seen);
+    }
+    assert_eq!(lags[0], lags[1]);
+    assert!(lags[0].last().unwrap().1, "a.rs is newer than the index");
 }
 
 // ---- `[run_profile.freshness] verify_on_read` (slice K2b) ---------------------------

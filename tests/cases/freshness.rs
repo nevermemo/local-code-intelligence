@@ -559,8 +559,20 @@ impl World {
         verify: bool,
         sync: bool,
     ) -> World {
+        World::start_gated(freshness, labels, verify, sync, false).await
+    }
+
+    /// [`World::start_with`] with `[run_profile.freshness] stat_gate` as given.
+    async fn start_gated(
+        freshness: IndexFreshness,
+        labels: bool,
+        verify: bool,
+        sync: bool,
+        stat_gate: bool,
+    ) -> World {
         let (temp, mut config, fake, models_task) = fixture().await;
         config.run_profile.freshness.verify_on_read = verify;
+        config.run_profile.freshness.stat_gate = stat_gate;
         config.run_profile.lsp.sync = if sync {
             local_code_intelligence::config::LspSync::Watch
         } else {
@@ -2212,6 +2224,89 @@ async fn with_verify_on_read_off_the_snapshot_maps_and_the_shifted_live_maps_are
     }
     live_as_before(&after.walk);
     world.finish().await;
+}
+
+/// What an observation says about freshness, for a comparison between two
+/// worlds: the traverse answer's `maps[]`, which file each card cites says
+/// changed, and the search report's `freshness` block. Timings are left out.
+fn freshness_signature(now: &Observed) -> Value {
+    let mut cards: Vec<String> = now.walk["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|card| {
+            let mut maps: Vec<&str> = card["maps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            maps.sort_unstable();
+            Some(format!(
+                "{} {:?} {}",
+                card["site"]["path"].as_str()?,
+                maps,
+                card["file_changed"]
+            ))
+        })
+        .collect();
+    cards.sort();
+    json!({
+        "maps": now.walk["maps"],
+        "cards": cards,
+        "snapshot": now.search["freshness"]["snapshot"],
+        "channels": now.search["freshness"]["channels"],
+        "hits": now.search["freshness"]["hits"],
+    })
+}
+
+/// `[run_profile.freshness] stat_gate` changes what a read of the tree costs,
+/// not what the labels say: the same edits give the same `maps[]` lags and
+/// `file_changed` sets, and the same search `freshness` block, as the world
+/// without the gate, at every step (the edit, then the line shift). The edits
+/// change file lengths, so the documented same-stamp gap is not in play (it has
+/// its own test in `lci-core`). `timings.verify_ms` is logged for both worlds
+/// (a number, not an assertion).
+#[tokio::test]
+async fn with_the_stat_gate_on_the_labels_equal_the_full_hash_path() {
+    let mut signatures: Vec<Vec<Value>> = Vec::new();
+    for stat_gate in [false, true] {
+        let mut world =
+            World::start_gated(IndexFreshness::OnSearch, true, true, false, stat_gate).await;
+        let mut seen = vec![freshness_signature(&world.observe().await)];
+        world.edit().await;
+        seen.push(freshness_signature(&world.observe().await));
+        world.shift().await;
+        let after = world.observe().await;
+        eprintln!(
+            "stat_gate = {stat_gate}: verify_ms of the last search = {}",
+            after.search["timings"]["verify_ms"]
+        );
+        assert!(after.search["timings"]["verify_ms"].is_number());
+        seen.push(freshness_signature(&after));
+        // The table is the gate's: filled with it on, never touched with it off.
+        let kept = lci_core::chunk::stat_gate(&world.workspace)
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(
+            kept > 0,
+            stat_gate,
+            "{kept} entries with stat_gate = {stat_gate}"
+        );
+        signatures.push(seen);
+        world.finish().await;
+    }
+    for (step, (off, on)) in signatures[0].iter().zip(&signatures[1]).enumerate() {
+        assert_eq!(off, on, "step {step}: the gate changed a label");
+    }
+    // The edits are seen through the gate, not hidden by it.
+    let edited = &signatures[1][1];
+    assert!(
+        edited["maps"].to_string().contains(r#""stale":true"#)
+            && edited["cards"].to_string().contains("true"),
+        "{edited}"
+    );
 }
 
 /// The lists are compared with what a case finds in both directions: a gap or

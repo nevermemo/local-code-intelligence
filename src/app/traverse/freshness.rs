@@ -15,7 +15,21 @@
 //! file, and an edit made after the first call that saw the stamp to a file
 //! that was newer than the index (it counted from the start). An index file
 //! without a modified time is not compared (`lag` is null). K20b owns the full
-//! label. Every call reads and hashes the tree's source files.
+//! label. Every call reads and hashes the tree's source files, unless
+//! `[run_profile.freshness] stat_gate` is on (below). No chunk is made.
+//!
+//! `[run_profile.freshness] stat_gate` (slice K38), default off, makes that one
+//! read cheap: the process keeps, per root, each source file's modified time,
+//! length and content hash ([`chunk::StatGate`]), lists the tree without reading
+//! it, and reads and hashes only the files whose modified time or length is new
+//! or changed (a file without a modified time is always read). The answers are
+//! the full read's, through the same hash function, except for one gap: a
+//! same-length edit that keeps a modified time older than 3 seconds before the
+//! previous read of the file (a deliberate `set_modified`, or a clock that went
+//! back) is not seen until the file's next edit. A file modified within 3
+//! seconds of a read is read again (coarse-stamp filesystems: FAT, exFAT, SMB).
+//! The table is per process, rebuilt on the first call, and also
+//! serves a search's `verify_on_read`. Key off: every file is read, as before.
 //!
 //! The maps themselves do not see the tree, so [`Observer`] wraps each map
 //! that states a freshness: it sets [`Expanded::freshness`] unless the map did,
@@ -107,24 +121,31 @@ fn baselines() -> &'static Baselines {
     BASELINES.get_or_init(Default::default)
 }
 
-/// The files the language adapters index, prose left out, with the chunks
-/// dropped: only the content hashes are kept, and a scan against these files
-/// parses just the files that changed.
-fn source_files(root: &Path, previous: &Files) -> Result<Files> {
-    let scan = chunk::scan_incremental_with(root, previous, false)?;
-    Ok(scan
-        .files
-        .into_iter()
-        .map(|(path, file)| {
-            (
-                path,
-                CachedFile {
-                    chunks: Vec::new(),
-                    ..file
-                },
-            )
-        })
-        .collect())
+/// The modified time of each file of a [`Files`] (`None`: the platform gave
+/// none), taken by the same listing that hashed it.
+type Modified = HashMap<String, Option<SystemTime>>;
+
+/// The files the language adapters index, prose left out, hashed without
+/// parsing or keeping any chunk (one [`chunk::source_hashes`] call; with
+/// `stat_gate` only the files whose modified time or length changed are read),
+/// and their modified times.
+fn source_hashes(root: &Path, stat_gate: bool) -> Result<(Files, Modified)> {
+    let hashed = chunk::source_hashes(root, false, stat_gate)?;
+    let mut files = Files::with_capacity(hashed.files.len());
+    let mut modified = Modified::with_capacity(hashed.files.len());
+    for file in hashed.files {
+        modified.insert(file.relative.clone(), file.modified);
+        files.insert(
+            file.relative,
+            CachedFile {
+                language: file.language.into(),
+                adapter_version: file.adapter_version.into(),
+                content_hash: file.content_hash,
+                chunks: Vec::new(),
+            },
+        );
+    }
+    Ok((files, modified))
 }
 
 /// How many files differ between two sets: changed, added or removed.
@@ -142,13 +163,11 @@ fn files_differing(then: &Files, now: &Files) -> u32 {
 
 /// The files of `now` that are not newer than `index_modified` (a file whose
 /// modified time cannot be read counts as not newer): the baseline.
-fn not_newer(root: &Path, now: &Files, index_modified: SystemTime) -> Files {
+fn not_newer(now: &Files, modified: &Modified, index_modified: SystemTime) -> Files {
     now.iter()
-        .filter(|(path, _)| {
-            match std::fs::metadata(root.join(path)).and_then(|meta| meta.modified()) {
-                Ok(modified) => modified <= index_modified,
-                Err(_) => true,
-            }
+        .filter(|(path, _)| match modified.get(*path) {
+            Some(Some(modified)) => *modified <= index_modified,
+            _ => true,
         })
         .map(|(path, file)| (path.clone(), file.clone()))
         .collect()
@@ -158,10 +177,16 @@ fn not_newer(root: &Path, now: &Files, index_modified: SystemTime) -> Files {
 /// and those changed since this process first saw its stamp (see the module
 /// comment). The first call that sees a stamp takes the baseline. `None` when
 /// the stamp has no modified time (not compared). Every call reads and hashes
-/// the tree's source files; only changed ones are parsed.
+/// the tree's source files; with `stat_gate` only those whose modified time or
+/// length changed.
 #[cfg(test)]
-pub(super) async fn tree_lag(index: &Path, root: &Path, stamp: Stamp) -> Result<Option<u32>> {
-    Ok(tree_view(index, root, stamp, false)
+pub(super) async fn tree_lag(
+    index: &Path,
+    root: &Path,
+    stamp: Stamp,
+    stat_gate: bool,
+) -> Result<Option<u32>> {
+    Ok(tree_view(index, root, stamp, false, stat_gate)
         .await?
         .and_then(|view| view.lag))
 }
@@ -182,18 +207,22 @@ pub(super) struct TreeView {
 /// [`tree_lag`] with the sets behind it. `want_now`: read the tree even when
 /// the stamp has no modified time (the snapshot check needs `now`, the lag is
 /// then `None`); without it such a call reads nothing and gives `None`.
+/// `stat_gate`: `[run_profile.freshness] stat_gate`, whether the read keeps
+/// each file's `(modified time, length)` and hash in the process and reads only
+/// the files that changed (see the module comment for its gap).
 pub(super) async fn tree_view(
     index: &Path,
     root: &Path,
     stamp: Stamp,
     want_now: bool,
+    stat_gate: bool,
 ) -> Result<Option<TreeView>> {
     let Some(index_modified) = stamp.0 else {
         if !want_now {
             return Ok(None);
         }
         let root = root.to_path_buf();
-        let now = tokio::task::spawn_blocking(move || source_files(&root, &Files::new()))
+        let (now, _) = tokio::task::spawn_blocking(move || source_hashes(&root, stat_gate))
             .await
             .context("read the tree")??;
         return Ok(Some(TreeView {
@@ -212,15 +241,14 @@ pub(super) async fn tree_view(
     let root = root.to_path_buf();
     let (then, now, lag) =
         tokio::task::spawn_blocking(move || -> Result<(Arc<Files>, Files, u32)> {
+            let (now, modified) = source_hashes(&root, stat_gate)?;
             match known {
                 Some(then) => {
-                    let now = source_files(&root, &then)?;
                     let lag = files_differing(&then, &now);
                     Ok((then, now, lag))
                 }
                 None => {
-                    let now = source_files(&root, &Files::new())?;
-                    let then = Arc::new(not_newer(&root, &now, index_modified));
+                    let then = Arc::new(not_newer(&now, &modified, index_modified));
                     let lag = files_differing(&then, &now);
                     Ok((then, now, lag))
                 }
