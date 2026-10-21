@@ -1055,7 +1055,10 @@ pub async fn run_with_trait_seeds(
                     _ => per_call_manager(call),
                 };
                 lsp_live_sessions = Some((Arc::clone(&manager), workspace.id.clone()));
-                // The version probe is bounded like the readiness probes.
+                // The version probe is bounded like the readiness probes. It
+                // runs inside the setup window that `budget.deadline +=
+                // setup.elapsed()` below credits back to the walk deadline, so
+                // a slow probe costs the walk no budget.
                 let probe =
                     std::time::Duration::from_secs(settings.readiness_timeout_seconds.clamp(1, 30));
                 let probe_started = Instant::now();

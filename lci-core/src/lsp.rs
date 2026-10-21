@@ -1632,10 +1632,32 @@ impl Manager {
         workspace: &Workspace,
         timeout: Duration,
     ) -> BTreeMap<&'static str, Result<Duration>> {
+        self.prime_languages(workspace, timeout, None).await
+    }
+
+    /// [`Self::prime`] for the adapters that serve one of `languages` (the
+    /// language identifiers of an index, for example from the store); `None`
+    /// primes every enabled adapter. An adapter for a language the workspace
+    /// does not hold is neither probed nor started, and is absent from the map.
+    pub async fn prime_languages(
+        &self,
+        workspace: &Workspace,
+        timeout: Duration,
+        languages: Option<&HashSet<String>>,
+    ) -> BTreeMap<&'static str, Result<Duration>> {
         let deadline = Instant::now() + timeout;
         let mut outcomes = BTreeMap::new();
         let mut starting = Vec::new();
-        for adapter in self.adapters.iter().filter(|adapter| adapter.enabled()) {
+        let wanted = |adapter: &&Arc<dyn LspAdapter>| {
+            adapter.enabled()
+                && languages.is_none_or(|held| {
+                    adapter
+                        .languages()
+                        .iter()
+                        .any(|language| held.contains(*language))
+                })
+        };
+        for adapter in self.adapters.iter().filter(wanted) {
             let started = Instant::now();
             // Every probe shares the one deadline, so hanging probes cost
             // `timeout` in total, not each.
@@ -2577,6 +2599,16 @@ mod tests {
         // A provider whose probe failed started no session.
         assert!(!manager.running("no-binary", "prime").await);
         assert!(!manager.running("never-answers", "prime").await);
+
+        // Only the adapters of the languages asked for are primed: these
+        // stubs serve none, so none is asked, and `None` still asks them all.
+        let held = HashSet::from(["rust".to_owned()]);
+        assert!(
+            manager
+                .prime_languages(&workspace, timeout, Some(&held))
+                .await
+                .is_empty()
+        );
     }
 
     const FAST_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];

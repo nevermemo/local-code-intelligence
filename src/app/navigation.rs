@@ -49,6 +49,8 @@ impl App {
     /// that does not exist is an error.
     pub async fn release_language_servers(&self, path: &Path) -> Result<ReleaseReport> {
         let workspace = Workspace::resolve(path, &self.config.data_dir)?;
+        // A pending warm start would create a session after the release.
+        self.stop_warm_starts(Some(&workspace.id)).await;
         let released = self
             .analyzer
             .release(&workspace.id)
@@ -66,6 +68,7 @@ impl App {
     /// Returns how many servers were stopped. Bounded by about four seconds
     /// however many servers there are, because they shut down side by side.
     pub async fn shutdown_language_servers(&self) -> usize {
+        self.stop_warm_starts(None).await;
         self.analyzer.shutdown_all().await
     }
 

@@ -143,7 +143,7 @@ Defaults work with the services described under Ports and URLs. Copy `config.exa
 | `reranker_timeout_seconds` | 120 |
 | `rescorer` | `"reranker"` (allowed: `"reranker"`, `"system_one"`; which service orders the fused shortlist while `[channels].reranker` is on. `"system_one"` needs `[system_one]` with `provider = "system_one_wire"`: one `POST <url>/v1/systemone` per search with a yes/no question per candidate, the answers used as probabilities; any failure returns fusion order with one warning that names an HTTP status by code only (the response body is never shown), and the reranker is not the fallback; a candidate dump records the System One model and batch size, and `replay` refuses a scored replay of such a dump when the window changes the candidates sent or their order) |
 | `[system_one].provider`, `.url`, `.model`, `.api_key_env`, `.allow_remote`, `.timeout_ms`, `.batch_size` | `openai_compat`, `http://127.0.0.1:8080/v1`, `qwen3-4b`, unset, `false`, 30000 (allowed: 100-600000), 24 (allowed: 1-200; with `system_one_wire`, the most candidates per request) |
-| `readiness_timeout_seconds` | 5 (allowed: 1-30) |
+| `readiness_timeout_seconds` | 15 (allowed: 1-30; was 5. It bounds `/ready`, `init` and `service_status` probes and the `lsp.live` version probe, so they wait up to 15 s for a hanging dependency and report ready one that answers in 5 to 15 s; a refused port or a missing binary still fails at once) |
 | `ripgrep_path` | `rg` (on Windows, also discovers common VS Code-bundled copies) |
 | `semantic_candidate_count` | 40 |
 | `lexical_candidate_count` | 40 |

@@ -1164,6 +1164,14 @@ impl App {
         let snapshot = resolution
             .snapshot
             .context("workspace is not indexed; call index_workspace first")?;
+        // Not while a build runs: it must not compete with the start. The
+        // read guard is held until the task is spawned.
+        if self.warm_start_due(&workspace.id) {
+            let languages = Store::languages(&snapshot).await.unwrap_or_default();
+            if let Ok(_building_excluded) = coordination.lock.try_read() {
+                self.warm_language_servers(&workspace, languages);
+            }
+        }
         let mut report = SearchReport {
             workspace,
             query: query.into(),

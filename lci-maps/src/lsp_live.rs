@@ -140,8 +140,9 @@ pub const DEADLINE_NOTE: &str = "lsp.live: the traversal deadline passed";
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long the version probe of a server binary may take when the caller does
-/// not say (`readiness_timeout_seconds` default).
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// not say (`readiness_timeout_seconds` default). 15 s: a binary starting
+/// under load took up to 4.3 s and one probe timed out at 5 s (d438, d450).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A place in a file: path relative to the root with `/`, 0-based line and
 /// column.
@@ -311,13 +312,14 @@ pub struct ManagerBackend {
 
 impl ManagerBackend {
     /// Probes the enabled servers of `manager` (`--version`, no session; once
-    /// per provider and manager) and keeps the ones that answer. An error when
-    /// none does, naming each failure.
+    /// per provider and manager), all at once, and keeps the ones that answer.
+    /// An error when none does, naming each failure.
     pub async fn open(workspace: Workspace, manager: Arc<Manager>) -> Result<Self, String> {
         Self::open_with_probe_timeout(workspace, manager, PROBE_TIMEOUT).await
     }
 
     /// [`Self::open`] with `probe_timeout` as the bound of each version probe
+    /// and so of the whole call, the probes running side by side
     /// (the traversal passes `readiness_timeout_seconds`; `open` uses
     /// [`PROBE_TIMEOUT`], which is that setting's default).
     pub async fn open_with_probe_timeout(
@@ -327,8 +329,15 @@ impl ManagerBackend {
     ) -> Result<Self, String> {
         let mut adapters = Vec::new();
         let mut failures = Vec::new();
-        for adapter in manager.adapters().iter().filter(|a| a.enabled()) {
-            match manager.probe_once(adapter, probe_timeout).await {
+        // Side by side, each bounded by `probe_timeout`: a hanging binary costs
+        // the caller one bound in all, not one per server.
+        let enabled: Vec<&Arc<dyn LspAdapter>> =
+            manager.adapters().iter().filter(|a| a.enabled()).collect();
+        let probes = enabled
+            .iter()
+            .map(|adapter| manager.probe_once(adapter, probe_timeout));
+        for (adapter, probed) in enabled.iter().zip(futures::future::join_all(probes).await) {
+            match probed {
                 Ok(()) => adapters.push(Arc::clone(adapter)),
                 Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
             }

@@ -472,6 +472,8 @@ fn with_fake_csharp_server(
     timeout_seconds: u64,
 ) -> Config {
     config.lsp_timeout_seconds = timeout_seconds;
+    // Also bounds the version probe of `lsp.live` (5 s failed under load).
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.csharp = local_code_intelligence::config::CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: ["--mode", "workspace-symbols", "--state"]
@@ -496,6 +498,8 @@ fn with_fake_documents_server(
     timeout_seconds: u64,
 ) -> Config {
     config.lsp_timeout_seconds = timeout_seconds;
+    // Also bounds the version probe of `lsp.live` (5 s failed under load).
+    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.csharp = local_code_intelligence::config::CSharpLspConfig {
         path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
         args: ["--mode", "documents", "--state"]

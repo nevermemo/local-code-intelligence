@@ -505,7 +505,7 @@ pub struct Config {
     pub reranker_timeout_seconds: u64,
     /// Bound in seconds (1..=30) of each dependency probe of /ready and
     /// service_status, and of the --version probe lsp.live runs once per
-    /// language-server manager before a traversal. Default 5.
+    /// language-server manager before a traversal. Default 15 (d450).
     pub readiness_timeout_seconds: u64,
     pub ripgrep_path: String,
     pub semantic_candidate_count: usize,
@@ -1462,7 +1462,7 @@ impl Default for Config {
             embedding_document_template: DEFAULT_EMBEDDING_DOCUMENT_TEMPLATE.into(),
             embedding_timeout_seconds: 120,
             reranker_timeout_seconds: 120,
-            readiness_timeout_seconds: 5,
+            readiness_timeout_seconds: 15,
             ripgrep_path: "rg".into(),
             semantic_candidate_count: 40,
             lexical_candidate_count: 40,
@@ -2014,6 +2014,21 @@ mod tests {
         let mut config: Config = toml::from_str(&base_toml()).unwrap();
         config.lsp_timeout_seconds = Config::MAX_LSP_TIMEOUT_SECONDS;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn readiness_timeout_defaults_to_fifteen_seconds_and_keeps_its_range() {
+        assert_eq!(Config::default().readiness_timeout_seconds, 15);
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.readiness_timeout_seconds, 15);
+        for seconds in [0, 31] {
+            let invalid = Config {
+                readiness_timeout_seconds: seconds,
+                ..Config::default()
+            };
+            assert!(invalid.validate().is_err(), "{seconds} s is out of range");
+        }
     }
 
     #[test]

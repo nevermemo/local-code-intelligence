@@ -75,8 +75,12 @@ reranker_timeout_seconds = 120
 # the fusion order with one warning; the reranker is not the fallback.
 rescorer = "reranker"
 # Bounded timeout for /ready and service_status dependency probes, and for the
-# version probe of the lsp.live traversal map (1-30 seconds).
-readiness_timeout_seconds = 5
+# version probe of the lsp.live traversal map (1-30 seconds). 15 by default (it
+# was 5): a language-server binary can take several seconds to answer `--version`
+# while the machine is busy. A hanging dependency is now waited for up to 15 s,
+# and one that answers in 5 to 15 s is reported ready; a refused port or a
+# missing binary still fails at once.
+readiness_timeout_seconds = 15
 ripgrep_path = "rg"
 semantic_candidate_count = 40
 lexical_candidate_count = 40

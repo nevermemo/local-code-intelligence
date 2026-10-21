@@ -74,6 +74,8 @@ fn fake_csharp_fixture(
     let config = Config {
         data_dir: data_path,
         lsp_timeout_seconds: LOADED_BUDGET_SECONDS,
+        // Also bounds the version probe of `lsp.live` (5 s failed under load).
+        readiness_timeout_seconds: LOADED_BUDGET_SECONDS,
         csharp: CSharpLspConfig {
             path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
             args: vec![
@@ -5390,8 +5392,6 @@ fn shared_sessions_fixture(
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
-    // The version probe of `lsp.live` is bounded by this (5 s failed under load).
-    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     let index = csharp_scip_index(temp, &workspace);
     (config, workspace, state, index)
@@ -5550,6 +5550,359 @@ fn reached_run_through_lsp_live(answer: &Value) -> bool {
                 && card.to_string().contains("lsp.live")
         })
     })
+}
+
+/// `config` as a service that warms the language servers at the first touch of
+/// a workspace: shared sessions and a traverse policy that adds `lsp.live`.
+fn with_lsp_live_warm_start(mut config: Config) -> Config {
+    config.run_profile.lsp.sessions = local_code_intelligence::config::LspSessions::Shared;
+    config.traverse.enabled = true;
+    config.traverse.policies.insert(
+        "explore".to_owned(),
+        local_code_intelligence::config::TraversePolicy {
+            extra_maps: Some(vec![lci_maps::lsp_live::LSP_LIVE_ID.to_owned()]),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+/// The finished outcome of the warm start `app` began for `workspace_id`,
+/// waiting at most [`LOADED_BUDGET`] on the signal itself.
+async fn finished_warm_start(
+    app: &App,
+    workspace_id: &str,
+) -> Arc<local_code_intelligence::app::WarmOutcome> {
+    let mut warm = app
+        .warm_start(workspace_id)
+        .expect("the first touch began a warm start");
+    let finished = tokio::time::timeout(LOADED_BUDGET, warm.wait_for(Option::is_some))
+        .await
+        .expect("the warm start finishes within the loaded budget")
+        .expect("the warm start was not dropped");
+    finished.clone().expect("a finished warm start")
+}
+
+/// A service that warms its language servers (see [`with_lsp_live_warm_start`])
+/// over the `documents`-mode fake, with the C# workspace indexed (a warm start
+/// waits for an index). `extra_args` are more fake-server flags; `tweak`
+/// changes the configuration before the service opens.
+struct WarmService {
+    temp: tempfile::TempDir,
+    config: Config,
+    app: App,
+    workspace: Workspace,
+    state: std::path::PathBuf,
+    _fake: Arc<FakeModels>,
+    models_task: tokio::task::JoinHandle<()>,
+}
+
+async fn indexed_warm_service(extra_args: &[&str], tweak: impl FnOnce(&mut Config)) -> WarmService {
+    let (temp, config, fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let path = temp.path().join("workspace");
+    write_csharp_workspace(&path);
+    let mut config = with_lsp_live_warm_start(with_fake_documents_server(
+        config,
+        &state,
+        extra_args,
+        LOADED_BUDGET_SECONDS,
+    ));
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    tweak(&mut config);
+    let app = App::open(config.clone()).await.unwrap();
+    let workspace = app.index(&path).await.unwrap().workspace;
+    WarmService {
+        temp,
+        config,
+        app,
+        workspace,
+        state,
+        _fake: fake,
+        models_task,
+    }
+}
+
+#[tokio::test]
+async fn a_shared_service_warms_the_servers_at_the_first_status_call() {
+    use local_code_intelligence::lsp::ServerStateName;
+
+    // A server that takes 30 s to answer `initialize`: `status` returns at
+    // once (it does not wait for the warm start) and shows it `starting`.
+    let held = indexed_warm_service(&["--initialize-delay-ms", "30000"], |_| {}).await;
+    let (app, workspace) = (&held.app, &held.workspace);
+    let began = std::time::Instant::now();
+    let status = app.status(&workspace.path).await.unwrap();
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(15),
+        "the first status call waited for the warm start: {:?}",
+        began.elapsed()
+    );
+    let starting = tokio::time::timeout(LOADED_BUDGET, async {
+        loop {
+            let status = app.status(&workspace.path).await.unwrap();
+            if let Some(readiness) = status.analyzers["csharp-ls"].clone() {
+                break readiness;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the warm start begins to start the server");
+    assert_eq!(starting.state, ServerStateName::Starting);
+    assert!(!starting.primed);
+    assert!(
+        app.warm_start(&status.workspace.id)
+            .unwrap()
+            .borrow()
+            .is_none(),
+        "the warm start is still running"
+    );
+    app.shutdown_language_servers().await;
+    held.models_task.abort();
+
+    // A server that starts: the warm start finishes with an `Ok` for it, the
+    // session is primed, and the first walk reuses it.
+    let warm = indexed_warm_service(&[], |_| {}).await;
+    let (app, workspace) = (&warm.app, &warm.workspace);
+    let index = csharp_scip_index(&warm.temp, workspace);
+    let id = app.status(&workspace.path).await.unwrap().workspace.id;
+    let outcome = finished_warm_start(app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    let ready = app.status(&workspace.path).await.unwrap().analyzers["csharp-ls"]
+        .clone()
+        .expect("a session");
+    assert!(ready.primed, "{ready:?}");
+    assert_eq!(state_count(&warm.state, "spawn_count.txt"), 1);
+    let answer = traverse_add(
+        &warm.config,
+        workspace,
+        &index,
+        local_code_intelligence::config::LspSessions::Shared,
+        &app.language_servers(),
+    )
+    .await;
+    assert!(reached_run_through_lsp_live(&answer), "{answer}");
+    assert_eq!(
+        state_count(&warm.state, "spawn_count.txt"),
+        1,
+        "the walk reused the warmed server, and a second status call began no second warm start"
+    );
+    app.shutdown_language_servers().await;
+    warm.models_task.abort();
+}
+
+#[tokio::test]
+async fn releasing_a_workspace_stops_its_pending_warm_start() {
+    // The server is still starting (30 s `initialize`) when the workspace is
+    // released: the release removes the session and the warm task creates
+    // none afterwards, whether the workspace is touched again or not.
+    let held = indexed_warm_service(&["--initialize-delay-ms", "30000"], |_| {}).await;
+    let (app, workspace) = (&held.app, &held.workspace);
+    app.status(&workspace.path).await.unwrap();
+    tokio::time::timeout(LOADED_BUDGET, async {
+        loop {
+            let status = app.status(&workspace.path).await.unwrap();
+            if status.analyzers["csharp-ls"].is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the warm start begins to start the server");
+    let released = app.release_language_servers(&workspace.path).await.unwrap();
+    assert_eq!(released.released, ["csharp-ls"]);
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let status = app.status(&workspace.path).await.unwrap();
+    assert!(
+        status.analyzers.values().all(Option::is_none),
+        "a released workspace has no session, and its next touch warms nothing: {:?}",
+        status.analyzers
+    );
+    held.models_task.abort();
+}
+
+#[tokio::test]
+async fn overlapping_stops_all_wait_for_the_pending_warm_start() {
+    // Two releases, then a release with a shutdown, race over one warm task
+    // held by a 30 s `initialize`: whichever returns, the task is gone and
+    // left no session, and exactly one server was ever started.
+    for shutdown_too in [false, true] {
+        let held = indexed_warm_service(&["--initialize-delay-ms", "30000"], |_| {}).await;
+        let (app, workspace) = (&held.app, &held.workspace);
+        app.status(&workspace.path).await.unwrap();
+        tokio::time::timeout(LOADED_BUDGET, async {
+            loop {
+                let status = app.status(&workspace.path).await.unwrap();
+                if status.analyzers["csharp-ls"].is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the warm start begins to start the server");
+        if shutdown_too {
+            let (release, _) = tokio::join!(
+                app.release_language_servers(&workspace.path),
+                app.shutdown_language_servers()
+            );
+            release.unwrap();
+        } else {
+            let (first, second) = tokio::join!(
+                app.release_language_servers(&workspace.path),
+                app.release_language_servers(&workspace.path)
+            );
+            first.unwrap();
+            second.unwrap();
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let status = app.status(&workspace.path).await.unwrap();
+        assert!(
+            status.analyzers.values().all(Option::is_none),
+            "shutdown_too {shutdown_too}: a session survived: {:?}",
+            status.analyzers
+        );
+        assert!(
+            state_count_so_far(&held.state, "spawn_count.txt") <= 1,
+            "shutdown_too {shutdown_too}: more than one server started"
+        );
+        held.models_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_release_before_the_first_status_leaves_no_warm_start() {
+    // The release finds no warm start and reserves the workspace: the status
+    // call racing it (here: right after it) begins none, so no server starts
+    // after the release returned.
+    let held = indexed_warm_service(&[], |_| {}).await;
+    let (app, workspace) = (&held.app, &held.workspace);
+    assert!(
+        app.release_language_servers(&workspace.path)
+            .await
+            .unwrap()
+            .released
+            .is_empty()
+    );
+    let status = app.status(&workspace.path).await.unwrap();
+    assert!(app.warm_start(&status.workspace.id).is_none());
+    app.search(&workspace.path, "Calculator", Some(3))
+        .await
+        .unwrap();
+    assert!(app.warm_start(&status.workspace.id).is_none());
+    assert!(
+        status.analyzers.values().all(Option::is_none),
+        "{:?}",
+        status.analyzers
+    );
+    held.models_task.abort();
+}
+
+#[tokio::test]
+async fn the_warm_start_skips_adapters_for_languages_the_index_lacks() {
+    // A workspace of C# files only, with a second fake server configured for
+    // TypeScript: the warm start primes csharp-ls and never starts the other.
+    let typescript_state = tempfile::tempdir().unwrap();
+    let state = typescript_state.path().to_owned();
+    let service = indexed_warm_service(&[], move |config| {
+        config.typescript = TypeScriptLspConfig {
+            path: Some(env!("CARGO_BIN_EXE_fake-lsp-server").to_owned()),
+            args: vec![
+                "--mode".to_owned(),
+                "workspace-symbols".to_owned(),
+                "--state".to_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            disabled: false,
+        };
+    })
+    .await;
+    let id = service
+        .app
+        .status(&service.workspace.path)
+        .await
+        .unwrap()
+        .workspace
+        .id;
+    let outcome = finished_warm_start(&service.app, &id).await;
+    assert_eq!(
+        outcome.keys().copied().collect::<Vec<_>>(),
+        ["csharp-ls"],
+        "{outcome:?}"
+    );
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    assert!(
+        !typescript_state.path().join("spawn_count.txt").exists(),
+        "the TypeScript server was started for a workspace with no TypeScript"
+    );
+    service.app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
+#[tokio::test]
+async fn no_warm_start_under_per_call_or_without_an_lsp_live_policy() {
+    use local_code_intelligence::config::LspSessions;
+
+    for (label, tweak) in [
+        (
+            "per_call sessions",
+            Box::new(|config: &mut Config| config.run_profile.lsp.sessions = LspSessions::PerCall)
+                as Box<dyn FnOnce(&mut Config)>,
+        ),
+        (
+            "no policy naming lsp.live",
+            Box::new(|config: &mut Config| config.traverse.policies.clear()),
+        ),
+    ] {
+        let service = indexed_warm_service(&[], tweak).await;
+        let status = service.app.status(&service.workspace.path).await.unwrap();
+        service
+            .app
+            .search(&service.workspace.path, "Calculator", Some(3))
+            .await
+            .unwrap();
+        assert!(
+            service.app.warm_start(&status.workspace.id).is_none(),
+            "{label}: no warm start began"
+        );
+        assert!(
+            status.analyzers["csharp-ls"].is_none(),
+            "{label}: no server was started: {:?}",
+            status.analyzers
+        );
+        service.app.shutdown_language_servers().await;
+        service.models_task.abort();
+    }
+
+    // The warm configuration: neither `status` before an index nor `index`
+    // is a touch; `status` and `search` over an index are.
+    let (temp, config, _fake, models_task) = fixture().await;
+    let state = temp.path().join("state");
+    let workspace = temp.path().join("workspace");
+    write_csharp_workspace(&workspace);
+    let mut config = with_lsp_live_warm_start(with_fake_csharp_server(
+        config,
+        &state,
+        &[],
+        LOADED_BUDGET_SECONDS,
+    ));
+    config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
+    let app = App::open(config).await.unwrap();
+    let id = app.status(&workspace).await.unwrap().workspace.id;
+    assert!(app.warm_start(&id).is_none(), "no index yet: no touch");
+    app.index(&workspace).await.unwrap();
+    assert!(app.warm_start(&id).is_none(), "an index build is no touch");
+    app.search(&workspace, "Calculator", Some(3)).await.unwrap();
+    let outcome = finished_warm_start(&app, &id).await;
+    assert!(outcome["csharp-ls"].is_ok(), "{outcome:?}");
+    app.shutdown_language_servers().await;
+    models_task.abort();
 }
 
 #[tokio::test]
@@ -5714,8 +6067,6 @@ fn shapes_fixture(
 ) -> (Config, Workspace, std::path::PathBuf, std::path::PathBuf) {
     let (mut config, workspace, state) = fake_csharp_fixture(temp, "documents");
     config.lsp_timeout_seconds = LOADED_BUDGET_SECONDS;
-    // The version probe of `lsp.live` is bounded by this (5 s failed under load).
-    config.readiness_timeout_seconds = LOADED_BUDGET_SECONDS;
     config.rust_analyzer_path = "definitely-missing-rust-analyzer".into();
     write(&workspace.path, "src/Shapes.cs", SHAPES_CS);
     let index = shapes_scip_index(temp);
@@ -6234,9 +6585,13 @@ async fn lsp_live_call_hierarchy_edges_sit_at_the_call_sites() {
     let scip = ScipMap::with_default_ids(ScipGraph::load(&index, None).unwrap());
     let places = Arc::new(ScipPlaces::from_scip(&scip));
     let manager = Arc::new(Manager::new(&config));
-    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
-        .await
-        .unwrap();
+    let backend = ManagerBackend::open_with_probe_timeout(
+        workspace.clone(),
+        Arc::clone(&manager),
+        LOADED_BUDGET,
+    )
+    .await
+    .unwrap();
     let map = LspLive::new(Box::new(backend), places).call_hierarchy(true);
     let seed_of = |id: &str| {
         (0..scip.graph().nodes.len())
@@ -6792,9 +7147,13 @@ async fn lsp_live_outline_places_give_contains_and_implements_edges_without_an_i
     let empty = ScipMap::with_default_ids(ScipGraph::empty());
     let places = Arc::new(OutlinePlaces::over(ScipPlaces::from_scip(&empty)));
     let manager = Arc::new(Manager::new(&config));
-    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
-        .await
-        .unwrap();
+    let backend = ManagerBackend::open_with_probe_timeout(
+        workspace.clone(),
+        Arc::clone(&manager),
+        LOADED_BUDGET,
+    )
+    .await
+    .unwrap();
     let map = LspLive::new(Box::new(backend), places).implementations(true);
     let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
     let wide = || Budget {

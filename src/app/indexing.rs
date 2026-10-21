@@ -621,6 +621,18 @@ impl App {
         let coordination = self.lock(&workspace.id).await;
         let indexing = coordination.lock.try_read().is_err();
         let snapshot = self.store.snapshot(&workspace).await?;
+        // Warm the servers once there is an index and no build competes: the
+        // decision is made under a read guard of the workspace, held until the
+        // task is spawned (spawning awaits nothing), so a build cannot start
+        // between the check and the warm start.
+        if let Some(snapshot) = &snapshot
+            && self.warm_start_due(&workspace.id)
+        {
+            let languages = Store::languages(snapshot).await.unwrap_or_default();
+            if let Ok(_building_excluded) = coordination.lock.try_read() {
+                self.warm_language_servers(&workspace, languages);
+            }
+        }
         let chunks = match &snapshot {
             Some(s) => s.table.count_rows(None).await?,
             None => 0,
