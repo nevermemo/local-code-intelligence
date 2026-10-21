@@ -1761,6 +1761,105 @@ mod persist {
     }
 
     #[tokio::test]
+    async fn a_trajectory_walk_writes_one_pop_event_per_counted_pop_with_bounded_candidates() {
+        let plain = pruning_walk(9).await;
+        let reg = registry(vec![lattice_map("g", 60)]);
+        let on = walk(&reg, vec![seed("n0")], budget(9), |t| {
+            t.question("how does n0 reach n9")
+                .handler(scripted(prune_last), every(3))
+                .trajectory(2)
+        })
+        .await;
+        // Off writes no pop event at all.
+        assert!(plain.events.iter().all(|e| e["ev"] != "pop"));
+        let pops: Vec<(usize, &Value)> = on
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["ev"] == "pop")
+            .collect();
+        let counted = u64::from(on.totals.pops + on.totals.pass_through_pops);
+        assert_eq!(pops.len() as u64, counted);
+        let mut expanded: Vec<String> = Vec::new();
+        let mut widest = 0;
+        for (index, event) in &pops {
+            let node = event["node"].as_str().unwrap().to_string();
+            // It comes right before its expand event.
+            let next = &on.events[index + 1];
+            assert_eq!(next["ev"], "expand");
+            assert_eq!(next["pop"], event["pop"]);
+            assert_eq!(next["node"], event["node"]);
+            expanded.push(node.clone());
+            let candidates = event["candidates"].as_array().unwrap();
+            assert!(candidates.len() <= 2, "{event}");
+            widest = widest.max(candidates.len());
+            let priorities: Vec<f64> = candidates
+                .iter()
+                .map(|c| c["priority"].as_f64().unwrap())
+                .collect();
+            assert!(
+                priorities.windows(2).all(|w| w[0] >= w[1]),
+                "{priorities:?}"
+            );
+            for candidate in candidates {
+                let name = candidate["node"].as_str().unwrap();
+                assert!(!expanded.iter().any(|done| done == name), "{event}");
+                assert!(candidate["depth"].is_u64());
+            }
+            // The state fields are present.
+            for key in ["priority", "depth", "free", "frontier", "discovered"] {
+                assert!(!event[key].is_null(), "{key}: {event}");
+            }
+            assert!(event["tokens_left"].is_u64() && event["calls_left"].is_u64());
+        }
+        assert!(widest >= 1, "the lattice offers a candidate");
+        // A wide fan: the second pop sees six queued states and lists two.
+        let mut fan = GraphMap::new("g", &[]);
+        fan.edges = (0..6)
+            .map(|i| ("n0".to_owned(), format!("n{}", i + 1)))
+            .collect();
+        let fan_reg = registry(vec![fan]);
+        let wide = walk(&fan_reg, vec![seed("n0")], budget(3), |t| t.trajectory(2)).await;
+        let counts: Vec<usize> = wide
+            .events
+            .iter()
+            .filter(|e| e["ev"] == "pop")
+            .map(|e| e["candidates"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(counts[0], 0, "the seed is alone in the queue: {counts:?}");
+        assert_eq!(counts[1], 2, "{counts:?}");
+        // The first pop is the seed: no parent.
+        assert!(pops[0].1["parent"].is_null());
+        // Only the trace moves: the other events, the answers, the checkpoints
+        // and the handle are what the plain walk's are.
+        let without: Vec<Value> = on
+            .events
+            .iter()
+            .filter(|e| e["ev"] != "pop")
+            .cloned()
+            .collect();
+        assert_eq!(without, plain.events);
+        assert_ne!(
+            trace::trace_hash(&on.events),
+            trace::trace_hash(&plain.events)
+        );
+        assert_eq!(stop_hashes(&on), stop_hashes(&plain));
+        // Everything but the clock.
+        let timeless = |totals: &Totals| Totals {
+            elapsed_ms: 0.0,
+            ..totals.clone()
+        };
+        assert_eq!(timeless(&on.totals), timeless(&plain.totals));
+        assert_eq!(on.popped, plain.popped);
+        let (son, splain) = (
+            on.snapshot.clone().unwrap(),
+            plain.snapshot.clone().unwrap(),
+        );
+        assert_eq!(son.handle(), splain.handle());
+        assert_eq!(son.to_json().to_string(), splain.to_json().to_string());
+    }
+
+    #[tokio::test]
     async fn a_resume_continues_at_the_pop_count_and_shares_the_straight_runs_later_stop_hashes() {
         let straight = pruning_walk(12).await;
         // That the walks agree is checked for random walks in `harness`; here
