@@ -50,6 +50,11 @@ impl LspAdapter for PythonServer {
         &[LANGUAGE_IDENTIFIER]
     }
 
+    /// The project configuration the server reads (see the trait).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &["pyrightconfig.json", "pyproject.toml", "setup.cfg"]
+    }
+
     fn enabled(&self) -> bool {
         self.config.enabled()
     }

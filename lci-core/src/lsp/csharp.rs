@@ -158,6 +158,21 @@ impl LspAdapter for CSharpServer {
         &[LANGUAGE_IDENTIFIER]
     }
 
+    /// The solution and project files csharp-ls loads, and the files that
+    /// feed their properties (see the trait).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &[
+            "*.sln",
+            "*.slnx",
+            "*.csproj",
+            "Directory.Build.props",
+            "Directory.Build.targets",
+            "Directory.Packages.props",
+            "global.json",
+            "nuget.config",
+        ]
+    }
+
     // Calls are qualified with the type name (rather than `self.enabled()`
     // etc.) even though inherent methods would win method resolution anyway
     // — this makes it unambiguous to a reader that these delegate to the

@@ -57,6 +57,16 @@ impl LspAdapter for ClangdServer {
         LANGUAGES
     }
 
+    /// The project configuration the server reads (see the trait).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &[
+            "compile_commands.json",
+            "compile_flags.txt",
+            ".clangd",
+            "CMakeLists.txt",
+        ]
+    }
+
     fn enabled(&self) -> bool {
         self.config.enabled()
     }

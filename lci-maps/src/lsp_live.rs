@@ -1,7 +1,9 @@
 //! The `lsp.live` map (multimap wave W0c2a): symbol facts asked of a running
-//! language server, so that they are as fresh as the tree is. It complements
-//! `graph.scip` (an index, stale after an edit) the way `grep.live` does for
-//! text.
+//! language server. A server the call started reads the tree as it is, so its
+//! answers are as fresh as the tree; a server kept across calls
+//! (`sessions = "shared"`) is only as fresh as its tree stamp's coverage and
+//! its answers stay unverified (see below). It complements `graph.scip` (an
+//! index, stale after an edit) the way `grep.live` does for text.
 //!
 //! # Edges
 //!
@@ -79,22 +81,37 @@
 //! A cold server start can exceed the default `[traverse] deadline_ms` (5000):
 //! a cold rust-analyzer took about 8 s to answer its first request, so the
 //! walk that starts a cold server may return [`DEADLINE_NOTE`] and no edges
-//! from this map (under `per_call` the server stops with the map, when the walk
-//! ends; a shared server keeps starting for the next call).
+//! from this map (under `per_call`, and for a server that does not watch its
+//! workspace, the server stops with the map, when the walk ends; a shared
+//! server keeps starting for the next call).
 //!
 //! The server starts at the first request (not when the map is built) and is
 //! reused for the walk. Who stops it is the manager [`ManagerBackend::open`]
-//! is given:
+//! (one manager for every server) or [`ManagerBackend::open_split`] (a
+//! manager per server) routes it to:
 //!
 //! * a manager that only the map holds (`[run_profile.lsp] sessions =
-//!   "per_call"`, the default: the caller builds one per call): the server
-//!   stops when the map is dropped, because the manager's clients end the
-//!   server's whole process tree when they drop;
-//! * the process's own manager (`sessions = "shared"`: the MCP and REST
-//!   server's, the one navigation and the search channel use): dropping the
-//!   map stops nothing. The server stays for the next call and ends with that
-//!   manager's idle sweeper (`lsp_idle_timeout_seconds`), `release_workspace`,
-//!   a stuck-session replacement or service shutdown.
+//!   "per_call"`, or a server that does not see an edit on its own under
+//!   `sessions = "shared"` with `sync = "off"`: the caller builds one per
+//!   call): the server stops when the map is dropped, because the manager's
+//!   clients end the server's whole process tree when they drop;
+//! * the process's own manager (`sessions = "shared"`, the default: the MCP
+//!   and REST server's, the one navigation and the search channel use; only
+//!   for a server that watches its workspace, today rust-analyzer, or under
+//!   `sync = "watch"`): dropping the map stops nothing. The server stays for
+//!   the next call and ends with that manager's idle sweeper
+//!   (`lsp_idle_timeout_seconds`), `release_workspace`, a stuck-session
+//!   replacement or service shutdown.
+//!
+//! A server kept in the process's manager passes the tree barrier when the
+//! backend opens ([`Manager::tree_barrier`]: a stamp from the index's file
+//! list, once per walk): a changed tree stops it and the walk starts a fresh
+//! one ([`ManagerBackend::restarted`]), so a reused server is never staler
+//! than under `per_call` for a change the stamp covers; the providers it kept
+//! are listed when the walk ends by [`ManagerBackend::walk`] (the sessions its
+//! requests found running, not the barrier's view: two walks can both pass
+//! the barrier before either starts a server), and the walk labels their
+//! answers.
 //!
 //! A missing server binary is found by [`ManagerBackend::open`], before any
 //! walk, as an error the caller reports; the map is then not registered. The
@@ -119,8 +136,9 @@ use crate::{
     scip_graph::ScipMap,
 };
 use lci_core::{
+    config::LspSync,
     language,
-    lsp::{HierarchyCall, HierarchyItem, Location, Manager, adapter::LspAdapter},
+    lsp::{HierarchyCall, HierarchyItem, Location, Manager, WalkSessions, adapter::LspAdapter},
     node::{NodeId, NodeKind},
     workspace::Workspace,
 };
@@ -301,14 +319,22 @@ impl SymbolPlaces for ScipPlaces {
 }
 
 /// The language servers of `lci-core`, through a [`Manager`]: one session per
-/// server and workspace, started by its first request. The manager is shared
+/// server and workspace, started by its first request. A manager is shared
 /// (an `Arc`): a caller that keeps another reference keeps the sessions alive
-/// past this backend (see the module notes).
+/// past this backend (see the module notes). Each server is routed to one
+/// manager when the backend opens ([`Self::open_split`]); the one-manager
+/// constructors route every server to it.
 pub struct ManagerBackend {
-    manager: Arc<Manager>,
     workspace: Workspace,
-    /// The enabled servers whose binary answered the version probe.
-    adapters: Vec<Arc<dyn LspAdapter>>,
+    /// The enabled servers whose binary answered the version probe, each with
+    /// the manager whose session answers its requests.
+    adapters: Vec<(Arc<dyn LspAdapter>, Arc<Manager>)>,
+    /// The providers whose kept session the tree barrier stopped because the
+    /// tree changed since its last check (see [`Self::open_split`]).
+    restarted: Vec<&'static str>,
+    /// The sessions this walk's requests acquired, and which of them it found
+    /// running instead of starting (see [`WalkSessions`]).
+    walk: Arc<WalkSessions>,
 }
 
 impl ManagerBackend {
@@ -322,10 +348,37 @@ impl ManagerBackend {
     /// [`Self::open`] with `probe_timeout` as the bound of each version probe
     /// and so of the whole call, the probes running side by side
     /// (the traversal passes `readiness_timeout_seconds`; `open` uses
-    /// [`PROBE_TIMEOUT`], which is that setting's default).
+    /// [`PROBE_TIMEOUT`], which is that setting's default). Every server uses
+    /// `manager`.
     pub async fn open_with_probe_timeout(
         workspace: Workspace,
         manager: Arc<Manager>,
+        probe_timeout: Duration,
+    ) -> Result<Self, String> {
+        Self::open_split(workspace, Arc::clone(&manager), manager, probe_timeout).await
+    }
+
+    /// [`Self::open_with_probe_timeout`] for a process that has a long-lived
+    /// `shared` manager and a throwaway `own` one (`sessions = "shared"`):
+    /// the version probes run through `shared`, so its per-provider cache
+    /// holds, and each probed server is then routed to `shared` when it sees
+    /// an edit on its own ([`LspAdapter::watches_workspace`]) or `shared`
+    /// syncs edits to its servers (`sync = "watch"`) and it lists the
+    /// configuration files of its tree stamp ([`LspAdapter::keeps_session`]),
+    /// and to `own` otherwise.
+    /// A server on `own` starts after the last edit, as under `per_call`, and
+    /// stops when `own` drops. A server on `shared` first passes the tree
+    /// barrier ([`Manager::tree_barrier`], one stamp, once here and not per
+    /// expansion, before the server is started or reused): its session is
+    /// stopped, and so started again from the disk, when the stamp of its
+    /// languages changed since the session was last checked or cannot be
+    /// taken. So a reused server is never staler than under `per_call` for a
+    /// change the stamp covers, whatever the server's own watcher or the sync
+    /// did. No barrier when `shared` and `own` are one manager.
+    pub async fn open_split(
+        workspace: Workspace,
+        shared: Arc<Manager>,
+        own: Arc<Manager>,
         probe_timeout: Duration,
     ) -> Result<Self, String> {
         let mut adapters = Vec::new();
@@ -333,13 +386,24 @@ impl ManagerBackend {
         // Side by side, each bounded by `probe_timeout`: a hanging binary costs
         // the caller one bound in all, not one per server.
         let enabled: Vec<&Arc<dyn LspAdapter>> =
-            manager.adapters().iter().filter(|a| a.enabled()).collect();
+            shared.adapters().iter().filter(|a| a.enabled()).collect();
         let probes = enabled
             .iter()
-            .map(|adapter| manager.probe_once(adapter, probe_timeout));
+            .map(|adapter| shared.probe_once(adapter, probe_timeout));
+        let synced = shared.sync_mode() == LspSync::Watch;
+        let split = !Arc::ptr_eq(&shared, &own);
+        let mut on_shared: Vec<&Arc<dyn LspAdapter>> = Vec::new();
         for (adapter, probed) in enabled.iter().zip(futures::future::join_all(probes).await) {
             match probed {
-                Ok(()) => adapters.push(Arc::clone(adapter)),
+                Ok(()) => {
+                    let manager = if adapter.keeps_session(synced) {
+                        on_shared.push(*adapter);
+                        &shared
+                    } else {
+                        &own
+                    };
+                    adapters.push((Arc::clone(adapter), Arc::clone(manager)));
+                }
                 Err(error) => failures.push(format!("{}: {error:#}", adapter.provider())),
             }
         }
@@ -349,21 +413,52 @@ impl ManagerBackend {
                 failures.join("; ")
             ));
         }
+        let restarted = if split {
+            shared.tree_barrier(&workspace, &on_shared).await
+        } else {
+            Vec::new()
+        };
         Ok(Self {
-            manager,
             workspace,
             adapters,
+            restarted,
+            walk: Arc::default(),
         })
     }
 
-    /// The server for the file's language.
-    fn adapter_for(&self, path: &str) -> Result<&Arc<dyn LspAdapter>, String> {
+    /// The providers whose kept session the barrier stopped when this backend
+    /// opened: the tree changed since its last check, so the walk's server
+    /// starts from the disk.
+    pub fn restarted(&self) -> &[&'static str] {
+        &self.restarted
+    }
+
+    /// The record of which sessions this backend's requests found running
+    /// rather than started (read it when the walk ends: [`WalkSessions::reused`]
+    /// names the providers whose answers came from a reused server, so the
+    /// caller labels them). Take it before the backend is boxed.
+    pub fn walk(&self) -> Arc<WalkSessions> {
+        Arc::clone(&self.walk)
+    }
+
+    /// Each probed server's provider and the manager that runs it, for the
+    /// walk-end readiness notes.
+    pub fn routes(&self) -> Vec<(&'static str, Arc<Manager>)> {
+        self.adapters
+            .iter()
+            .map(|(adapter, manager)| (adapter.provider(), Arc::clone(manager)))
+            .collect()
+    }
+
+    /// The server for the file's language and the manager that runs it.
+    fn adapter_for(&self, path: &str) -> Result<(&Arc<dyn LspAdapter>, &Arc<Manager>), String> {
         let language = language::for_path(Path::new(path))
             .map(|adapter| adapter.identifier())
             .ok_or_else(|| format!("no language is known for {path}"))?;
         self.adapters
             .iter()
-            .find(|adapter| adapter.languages().contains(&language))
+            .find(|(adapter, _)| adapter.languages().contains(&language))
+            .map(|(adapter, manager)| (adapter, manager))
             .ok_or_else(|| format!("no language server is available for {language} ({path})"))
     }
 }
@@ -403,20 +498,20 @@ fn call_links(calls: Vec<HierarchyCall>) -> Vec<CallLink> {
 #[crate::async_trait]
 impl LspBackend for ManagerBackend {
     async fn definition(&self, at: &Place) -> Result<Vec<Place>, String> {
-        let adapter = self.adapter_for(&at.path)?;
+        let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        self.manager
-            .definition(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.definition(adapter, &self.workspace, &file, &at.path, at.line, at.col))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn references(&self, at: &Place) -> Result<Vec<Place>, String> {
-        let adapter = self.adapter_for(&at.path)?;
+        let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        self.manager
-            .references(
+        self.walk
+            .scope(manager.references(
                 adapter,
                 &self.workspace,
                 &file,
@@ -424,56 +519,70 @@ impl LspBackend for ManagerBackend {
                 at.line,
                 at.col,
                 false,
-            )
+            ))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String> {
-        let adapter = self.adapter_for(&at.path)?;
+        let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        self.manager
-            .implementation(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.implementation(
+                adapter,
+                &self.workspace,
+                &file,
+                &at.path,
+                at.line,
+                at.col,
+            ))
             .await
             .map(places)
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn prepare_call_hierarchy(&self, at: &Place) -> Result<Vec<CallItem>, String> {
-        let adapter = self.adapter_for(&at.path)?;
+        let (adapter, manager) = self.adapter_for(&at.path)?;
         let file = self.workspace.path.join(&at.path);
-        self.manager
-            .prepare_call_hierarchy(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+        self.walk
+            .scope(manager.prepare_call_hierarchy(
+                adapter,
+                &self.workspace,
+                &file,
+                &at.path,
+                at.line,
+                at.col,
+            ))
             .await
             .map(|items| items.into_iter().filter_map(call_item).collect())
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn incoming_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
-        let adapter = self.adapter_for(&item.place.path)?;
-        self.manager
-            .incoming_calls(adapter, &self.workspace, &item.raw)
+        let (adapter, manager) = self.adapter_for(&item.place.path)?;
+        self.walk
+            .scope(manager.incoming_calls(adapter, &self.workspace, &item.raw))
             .await
             .map(call_links)
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn outgoing_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
-        let adapter = self.adapter_for(&item.place.path)?;
-        self.manager
-            .outgoing_calls(adapter, &self.workspace, &item.raw)
+        let (adapter, manager) = self.adapter_for(&item.place.path)?;
+        self.walk
+            .scope(manager.outgoing_calls(adapter, &self.workspace, &item.raw))
             .await
             .map(call_links)
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
-        let adapter = self.adapter_for(path)?;
+        let (adapter, manager) = self.adapter_for(path)?;
         let file = self.workspace.path.join(path);
         let found = self
-            .manager
-            .document_symbols(adapter, &self.workspace, &file, path)
+            .walk
+            .scope(manager.document_symbols(adapter, &self.workspace, &file, path))
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok(found

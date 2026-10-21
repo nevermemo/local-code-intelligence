@@ -102,7 +102,7 @@ xtask maps lsp-cost --binary <target>/debug/local-code-intelligence --arms base 
 xtask maps lsp-cost --binary <target>/debug/local-code-intelligence                                                         # all 7 arms, 12 questions x 5 rounds, quiet then loaded
 ```
 
-Options: `--arms` (`base`, `shared`, `shared+cache`, `shared+impl`, `shared+sync`, `per_call+sync`, `lifecycle`),
+Options: `--arms` (`base`, `shared`, `shared+cache`, `shared+impl`, `shared+sync`, `per_call+sync`, `lifecycle`; `base` and `per_call+sync` write `sessions = "per_call"` because the default is `shared`),
 `--repeat`, `--max-questions`, `--load none|cpu|both`, `--load-threads` (default: half the logical cores), `--deadline-ms`
 (20000), `--scip` (an `index.scip` of the tree; missing, `rust-analyzer scip` writes one into the output directory and
 the report says so), `--questions`, `--out`, `--work-dir`. The `loaded` condition is CPU-only synthetic load (busy

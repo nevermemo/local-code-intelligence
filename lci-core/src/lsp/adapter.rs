@@ -115,6 +115,47 @@ pub trait LspAdapter: Send + Sync {
     fn opens_documents(&self) -> bool {
         false
     }
+
+    /// Whether the server learns of an edit to any file of its workspace on
+    /// its own, without the client resending text or sending
+    /// `workspace/didChangeWatchedFiles`: it runs its own file watcher. Only
+    /// such a server may keep one session across traverse calls under the
+    /// default `[run_profile.lsp] sessions = "shared"` without `sync =
+    /// "watch"`, and then only with a [`Self::stamp_manifests`] list
+    /// ([`Self::keeps_session`]); every other server is started per call. (A
+    /// kept session also passes the tree barrier of each walk,
+    /// `Manager::tree_barrier`, so a reused server is never staler than under
+    /// `per_call` for a change the stamp covers, whatever the watcher does.) A
+    /// server that is resent only the requested file
+    /// ([`Self::opens_documents`]) does not qualify: an edit
+    /// to another file stays unseen. Default `false`; an override names its
+    /// capability evidence.
+    fn watches_workspace(&self) -> bool {
+        false
+    }
+
+    /// The project configuration file names that change what the server sees
+    /// without changing a source file (rust-analyzer: its crate graph and its
+    /// settings; the TypeScript server: `tsconfig.json`). A name, or a name
+    /// with one `*` (`tsconfig.*.json`). The tree stamp (`lsp::stamp`) covers
+    /// each match among the children of every directory that holds one of the
+    /// server's indexed files, and of that directory's ancestors. Default
+    /// none, and a server with none is never shared (see
+    /// [`Self::keeps_session`]): an edit to its configuration would go
+    /// unseen by the barrier.
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether a traverse call keeps this server's session on the service's
+    /// manager under `sessions = "shared"`: the server declares the
+    /// configuration files its tree stamp covers
+    /// ([`Self::stamp_manifests`], non-empty) and it sees an edit on its own
+    /// ([`Self::watches_workspace`]) or `synced` (`sync = "watch"` tells it).
+    /// Any other server starts per call.
+    fn keeps_session(&self, synced: bool) -> bool {
+        !self.stamp_manifests().is_empty() && (synced || self.watches_workspace())
+    }
 }
 
 /// The largest file a `before_position_request` hook reads and sends whole in

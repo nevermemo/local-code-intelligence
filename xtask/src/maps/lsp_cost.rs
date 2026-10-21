@@ -69,7 +69,8 @@ pub struct LspCostArgs {
     #[arg(long)]
     pub questions: Option<PathBuf>,
     /// Arms, comma separated (default: all):
-    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle.
+    /// base, shared, shared+cache, shared+impl, shared+sync, per_call+sync, lifecycle
+    /// (`base` and `per_call+sync` write `sessions = "per_call"`: the default is `shared`).
     #[arg(long, value_delimiter = ',')]
     pub arms: Vec<String>,
     /// Calls per question per arm, round-robin over the questions.
@@ -205,12 +206,14 @@ pub fn select_arms(names: &[String]) -> Result<Vec<Arm>> {
         .collect()
 }
 
-/// The `[run_profile.lsp]` leaf lines of an arm: exactly the keys it turns on.
+/// The `[run_profile.lsp]` leaf lines of an arm: `sessions` always (the
+/// default is `shared`, so `base` and `per_call+sync` must say `per_call` to
+/// measure it), then exactly the other keys it turns on.
 pub fn arm_overlay_lines(arm: &Arm) -> Vec<String> {
-    let mut lines = Vec::new();
-    if arm.shared {
-        lines.push("sessions = \"shared\"".to_owned());
-    }
+    let mut lines = vec![format!(
+        "sessions = \"{}\"",
+        if arm.shared { "shared" } else { "per_call" }
+    )];
     if arm.outline_cache {
         lines.push("outline_cache = true".to_owned());
     }
@@ -1569,7 +1572,7 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
     for note in &meta.notes {
         let _ = writeln!(out, "- {note}");
     }
-    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts. `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. RA RSS = peak sum of RSS of the server's descendants named rust-analyzer, max over calls. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet.\n");
+    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts (`base` and `per_call+sync` write `sessions = \"per_call\"`, since the default is `shared`). `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. RA RSS = peak sum of RSS of the server's descendants named rust-analyzer, max over calls. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet.\n");
     for result in results {
         let _ = writeln!(
             out,
@@ -2068,7 +2071,7 @@ mod tests {
     #[test]
     fn arm_overlay_lines_are_exactly_the_keys_an_arm_turns_on() {
         let lines = |name: &str| arm_overlay_lines(ARMS.iter().find(|a| a.name == name).unwrap());
-        assert!(lines("base").is_empty());
+        assert_eq!(lines("base"), ["sessions = \"per_call\""]);
         assert_eq!(lines("shared"), ["sessions = \"shared\""]);
         assert_eq!(
             lines("shared+cache"),
@@ -2082,7 +2085,10 @@ mod tests {
             lines("shared+sync"),
             ["sessions = \"shared\"", "sync = \"watch\""]
         );
-        assert_eq!(lines("per_call+sync"), ["sync = \"watch\""]);
+        assert_eq!(
+            lines("per_call+sync"),
+            ["sessions = \"per_call\"", "sync = \"watch\""]
+        );
         assert_eq!(
             lines("lifecycle"),
             [

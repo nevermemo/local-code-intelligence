@@ -52,6 +52,11 @@ impl LspAdapter for GoServer {
         &[LANGUAGE_IDENTIFIER]
     }
 
+    /// The project configuration the server reads (see the trait).
+    fn stamp_manifests(&self) -> &'static [&'static str] {
+        &["go.mod", "go.sum", "go.work"]
+    }
+
     fn enabled(&self) -> bool {
         self.config.enabled()
     }

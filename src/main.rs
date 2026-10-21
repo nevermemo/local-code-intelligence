@@ -778,11 +778,13 @@ async fn run_traverse(
         )))),
         _ => None,
     };
-    // `[run_profile.lsp] sessions = "shared"`: this process's one set of
-    // language servers, which a CLI call has no other user of. Stopped here
-    // (cleanly, once the walk ends) instead of at process exit. Built only
-    // when the call can run lsp.live, so a walk without it starts no idle
-    // sweeper and waits for no shutdown.
+    // `[run_profile.lsp] sessions = "shared"` (the default): this process's one
+    // manager, which a CLI call has no other user of, holds the sessions of the
+    // servers that see an edit on their own (and every server under `sync =
+    // "watch"`); the other servers start per call. Stopped here (cleanly, once
+    // the walk ends) instead of at process exit, so a one-shot call leaves no
+    // server running. Built only when the call can run lsp.live, so a walk
+    // without it starts no idle sweeper and waits for no shutdown.
     let lsp_sessions = (config.run_profile.lsp.sessions
         == local_code_intelligence::config::LspSessions::Shared
         && may_walk_lsp_live(&config, args.root.is_some(), maps))

@@ -354,7 +354,10 @@ pub struct Cost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observed {
     Snapshot,
-    /// A live map read the working tree and mapped it onto the snapshot.
+    /// A live map read the working tree and mapped it onto the snapshot
+    /// (`lsp.live` asks a running language server instead: it reads the disk
+    /// when the call started the server, and a kept one is bounded by its tree
+    /// stamp).
     LiveTree,
     AsOf(String),
 }

@@ -120,11 +120,11 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   over budget adds a note, a provider that fails adds a warning; locations map onto chunks of the same language that
   contain `start_line`; capped at `lsp_candidate_count` (40). Navigation tools (`symbols`, `definition`, `references`)
   are not fused, return raw `Location`s and need an index containing the file's language. The `lsp.live` map of a
-  traversal (`lci-maps` `lsp_live`) asks a `Manager` it is given (`ManagerBackend::open(workspace, Arc<Manager>)`). Under
-  `[run_profile.lsp] sessions = "per_call"` (default) `app::traverse::run` builds one per call, so the map owns it and its
-  server dies with the map; under `"shared"` it uses `Call.lsp_sessions`, the `Arc<Manager>` that `App::language_servers()`
-  hands out (the service's own, so a server started by navigation, search or a traverse call serves the others; the CLI
-  `traverse` builds one per process and shuts it down after the walk), and the server's lifetime is the manager's (idle
+  traversal (`lci-maps` `lsp_live`) asks the `Manager`s it is given: `ManagerBackend::open(workspace, Arc<Manager>)` (one for every server) or `ManagerBackend::open_split(workspace, shared, own, probe)`, which probes through `shared` and routes each server to `shared` when `LspAdapter::watches_workspace()` (rust-analyzer alone: it runs its own file watcher) or `shared` syncs (`sync = "watch"`), else to `own`; a server routed to `shared` first passes `Manager::tree_barrier` once per walk, which stats the server's indexed files, their directories and ancestors and its manifests (`lsp::stamp`, from the index's file list that `App` supplies through `stamp::IndexedFiles` over the workspace manifest) and stops the session when the stamp changed, so the walk starts one that reads the disk. Under
+  `[run_profile.lsp] sessions = "per_call"` `app::traverse::run` builds one per call, so the map owns it and its
+  server dies with the map; under `"shared"` (default) it uses `Call.lsp_sessions` as `shared` and a per-call manager as `own`, so a server that does not see an edit on its own (or lists no configuration files for the tree stamp) starts per call, and a reused server is never staler than `per_call` for any change inside the tree stamp's coverage (its residuals are in the README; the walk labels a reused server's answer with a `kept session` note); `Call.lsp_sessions` is the `Arc<Manager>` that `App::language_servers()`
+  hands out (the service's own, so a server started by navigation, search or a kept traverse server serves the others; the CLI
+  `traverse` builds one per process and shuts it down after the walk), and a kept server's lifetime is the manager's (idle
   sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful version probe per provider for
   the manager's life. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
@@ -246,7 +246,7 @@ totals and, only when work is left, a `handle` and `checkpoint`. The first stage
 [engine.md](spike/multimap/engine.md). Default off: with `[traverse]`, `[recipes]` and `[compose]` disabled the tool
 list, schemas and REST routes are exactly those of a server without them.
 
-With `[run_profile.traverse] answer_labels = true` (default `false`) the answer also has `completeness` (`{complete, why, estimate}`: `complete` is `status == "complete"` with no map lost (`degraded`: a map the call asked for that could not be set up, or had `MapStat.failures`; `why` is then `degraded` unless the walk was cut), `why` the `stop_reason`, `estimate` `TraversalResult.estimate`, the `likely_complete` fraction) and every card of `results` and the checkpoint lists has `freshness` (`fresh`, `changed`, `stale` or `unverified`, read from `file_changed` and `maps`). `app::traverse::response::add_answer_labels` adds both to the response JSON after the trace and the checkpoint hash are made, so the trace, the checkpoint, the handle and `Card`/`card_json` are unchanged, nothing is withheld, and with the key off the answer is as before.
+With `[run_profile.traverse] answer_labels = true` (default `false`) the answer also has `completeness` (`{complete, why, estimate}`: `complete` is `status == "complete"` with no map lost (`degraded`: a map the call asked for that could not be set up, or had `MapStat.failures`; `why` is then `degraded` unless the walk was cut), `why` the `stop_reason`, `estimate` `TraversalResult.estimate`, the `likely_complete` fraction) and every card of `results` and the checkpoint lists has `freshness` (`fresh`, `changed`, `stale` or `unverified`, read from `file_changed` and `maps`; a card that cites `lsp.live` is `unverified`, not `fresh`, when the walk found a language server running, `add_answer_labels`' `kept` argument from the walk's `WalkSessions`; a continuation also demotes the `lsp.live` cards of the nodes it restores from the checkpoint, its `restored` argument). `app::traverse::response::add_answer_labels` adds both to the response JSON after the trace and the checkpoint hash are made, so the trace, the checkpoint, the handle and `Card`/`card_json` are unchanged, nothing is withheld, and with the key off the answer is as before.
 
 With `[run_profile.traverse] card_paths = true` (default `false`) every walked card of `results` and of `checkpoint.answer` also has `kind` and `path`, the
 route from its start node with each hop's map, edge kind and witness (`app::traverse::response::add_paths`, read from the walk's state table; the engine keeps
@@ -254,8 +254,10 @@ route from its start node with each hop's map, edge kind and witness (`app::trav
 
 With `[run_profile.traverse] map_freshness = true` (default `false`) the answer also has `maps`: for each map of the call that
 states a freshness, `{id, observed, stale, lag}` (`app::traverse::freshness`). The SCIP-built maps report `snapshot`;
-`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (they read current
-bytes or git, placed by the index's positions for the first two). `lag` is the number of source files (language-adapter
+`grep.live`, `lsp.live`, `git.history`, `exact.pickaxe` and `probe.compile` (which runs only under `rust_analyzer_trusted = true`) report `live` with `lag` 0 (`live` names the channel: `grep.live`,
+`git.history`, `exact.pickaxe` and `probe.compile` read current bytes or git, placed by the index's positions for `grep.live`;
+`lsp.live` asks a running server, which is fresh when this call started it and, when kept across calls under
+`sessions = "shared"`, bounded by its tree stamp's coverage and labelled by a `kept session` note, with the same fields). `lag` is the number of source files (language-adapter
 files, prose left out) newer than the index file plus those changed (content hash), added or removed since the process
 first saw the index's current stamp (modified time and length), each counted once; `stale` means `lag` above 0 and `null`
 means not compared (no tree, unreadable tree, or an index file without a modified time). The tree is read and hashed

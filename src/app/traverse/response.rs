@@ -94,15 +94,13 @@ pub(super) const FRESHNESS_WORDS: [&str; 4] = ["fresh", "changed", "stale", "unv
 /// answer states its maps, any map of the card (`maps` plus `via`) that is
 /// `stale` makes it `stale` and all of them found with a lag make it `fresh`;
 /// anything else is `unverified`.
-fn card_freshness(card: &Value, maps: Option<&Vec<Value>>) -> &'static str {
-    match card.get("file_changed").and_then(Value::as_bool) {
-        Some(true) => return FRESHNESS_WORDS[1],
-        Some(false) => return FRESHNESS_WORDS[0],
-        None => {}
-    }
-    let Some(maps) = maps else {
-        return FRESHNESS_WORDS[3];
-    };
+///
+/// `kept` names the maps whose evidence this walk took from a server it found
+/// running (a session kept across calls: `lsp.live`, see
+/// `lci_core::lsp::WalkSessions`). Nothing checks what such a server read, so
+/// a card that cites one is never `fresh`: it is `unverified` (a `changed` or
+/// `stale` verdict stands, being a positive finding).
+fn card_freshness(card: &Value, maps: Option<&Vec<Value>>, kept: &[MapId]) -> &'static str {
     let mut named: Vec<&str> = card["maps"]
         .as_array()
         .into_iter()
@@ -110,10 +108,20 @@ fn card_freshness(card: &Value, maps: Option<&Vec<Value>>) -> &'static str {
         .filter_map(Value::as_str)
         .collect();
     named.extend(card["via"].as_str());
+    let from_kept = named.iter().any(|id| kept.contains(id));
+    match card.get("file_changed").and_then(Value::as_bool) {
+        Some(true) => return FRESHNESS_WORDS[1],
+        Some(false) if from_kept => return FRESHNESS_WORDS[3],
+        Some(false) => return FRESHNESS_WORDS[0],
+        None => {}
+    }
+    let Some(maps) = maps else {
+        return FRESHNESS_WORDS[3];
+    };
     if named.is_empty() {
         return FRESHNESS_WORDS[3];
     }
-    let mut verified = true;
+    let mut verified = !from_kept;
     for id in named {
         match maps.iter().find(|entry| entry["id"].as_str() == Some(id)) {
             Some(entry) if entry["stale"].as_bool() == Some(true) => return FRESHNESS_WORDS[2],
@@ -159,6 +167,8 @@ pub(super) fn add_answer_labels(
     response: &mut Value,
     result: Option<&TraversalResult>,
     unavailable: &[MapId],
+    kept: &[MapId],
+    restored: &HashSet<String>,
 ) {
     let maps = response.get("maps").and_then(Value::as_array).cloned();
     for list in CARD_LISTS {
@@ -166,7 +176,20 @@ pub(super) fn add_answer_labels(
             continue;
         };
         for card in items {
-            let word = card_freshness(card, maps.as_ref());
+            // A card of a node restored from a checkpoint keeps what an
+            // earlier call gathered, and the checkpoint does not say whether
+            // that call used a kept server: such a card that cites `lsp.live`
+            // is never `fresh` (a conservative choice that leaves the
+            // checkpoint format alone). The cards the call's own walk found
+            // follow `kept`.
+            let restored_card = card["node"]
+                .as_str()
+                .is_some_and(|node| restored.contains(node));
+            let word = if restored_card {
+                card_freshness(card, maps.as_ref(), &[lci_maps::lsp_live::LSP_LIVE_ID])
+            } else {
+                card_freshness(card, maps.as_ref(), kept)
+            };
             if let Some(object) = card.as_object_mut() {
                 object.insert("freshness".into(), json!(word));
             }
@@ -777,43 +800,105 @@ mod tests {
         json!({"id": id, "observed": "snapshot", "stale": stale, "lag": lag})
     }
 
+    /// A card that cites a map whose evidence came from a kept server is never
+    /// `fresh`, with `file_changed` false or a lag of 0 alike; a card of other
+    /// maps is as before, and a `changed` or `stale` finding stands.
+    #[test]
+    fn a_card_citing_a_kept_session_map_is_unverified_not_fresh() {
+        let kept = ["lsp.live"];
+        let fresh = vec![
+            entry("graph.scip", false, json!(0)),
+            entry("lsp.live", false, json!(0)),
+        ];
+        let by_lag = json!({"maps": ["graph.scip", "lsp.live"], "via": "lsp.live"});
+        assert_eq!(card_freshness(&by_lag, Some(&fresh), &[]), "fresh");
+        assert_eq!(card_freshness(&by_lag, Some(&fresh), &kept), "unverified");
+        let by_file = json!({"file_changed": false, "maps": ["lsp.live"]});
+        assert_eq!(card_freshness(&by_file, Some(&fresh), &[]), "fresh");
+        assert_eq!(card_freshness(&by_file, Some(&fresh), &kept), "unverified");
+        // A card of an index map only is unaffected.
+        let index_only = json!({"maps": ["graph.scip"], "via": "graph.scip"});
+        assert_eq!(card_freshness(&index_only, Some(&fresh), &kept), "fresh");
+        // Findings stand.
+        let changed = json!({"file_changed": true, "maps": ["lsp.live"]});
+        assert_eq!(card_freshness(&changed, Some(&fresh), &kept), "changed");
+        let stale = vec![entry("lsp.live", true, json!(2))];
+        assert_eq!(card_freshness(&by_lag, Some(&stale), &kept), "stale");
+    }
+
+    /// A continuation that makes no language-server request has an empty
+    /// `kept`, yet the cards it restores from its checkpoint may hold what a
+    /// kept server gave an earlier call: those that cite `lsp.live` are
+    /// `unverified` (cards of nodes its own walk found follow `kept`).
+    #[test]
+    fn restored_lsp_live_cards_stay_unverified_in_a_continuation() {
+        let mut response = json!({
+            "status": "complete",
+            "maps": [entry("graph.scip", false, json!(0)), entry("lsp.live", false, json!(0))],
+            "results": [
+                {"node": "restored-lsp", "maps": ["lsp.live"], "via": "lsp.live"},
+                {"node": "restored-index", "maps": ["graph.scip"], "via": "graph.scip"},
+                {"node": "new-lsp", "maps": ["lsp.live"], "via": "lsp.live"},
+            ],
+        });
+        let restored: HashSet<String> = ["restored-lsp", "restored-index"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        add_answer_labels(&mut response, None, &[], &[], &restored);
+        let words: Vec<&str> = response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["freshness"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            words,
+            ["unverified", "fresh", "fresh"],
+            "restored lsp.live card; restored index card; the call's own fresh-session card"
+        );
+        // With no checkpoint nothing is restored.
+        add_answer_labels(&mut response, None, &[], &[], &HashSet::new());
+        assert_eq!(response["results"][0]["freshness"], "fresh");
+    }
+
     #[test]
     fn card_freshness_reads_file_changed_before_the_maps() {
         let stale = vec![entry("graph.scip", true, json!(1))];
         let fresh = vec![entry("graph.scip", false, json!(0))];
         // The card's own file is as its maps read it: fresh, whatever the maps say.
         let card = json!({"file_changed": false, "maps": ["graph.scip"], "via": "graph.scip"});
-        assert_eq!(card_freshness(&card, Some(&stale)), "fresh");
+        assert_eq!(card_freshness(&card, Some(&stale), &[]), "fresh");
         // A changed file is changed, though the maps say fresh.
         let card = json!({"file_changed": true, "maps": ["graph.scip"], "via": "graph.scip"});
-        assert_eq!(card_freshness(&card, Some(&fresh)), "changed");
+        assert_eq!(card_freshness(&card, Some(&fresh), &[]), "changed");
     }
 
     #[test]
     fn card_freshness_needs_every_map_of_the_card_found_with_a_lag() {
         let card = json!({"file_changed": null, "maps": ["graph.scip"], "via": "graph.scip"});
         let fresh = vec![entry("graph.scip", false, json!(0))];
-        assert_eq!(card_freshness(&card, Some(&fresh)), "fresh");
+        assert_eq!(card_freshness(&card, Some(&fresh), &[]), "fresh");
         let stale = vec![entry("graph.scip", true, json!(2))];
-        assert_eq!(card_freshness(&card, Some(&stale)), "stale");
+        assert_eq!(card_freshness(&card, Some(&stale), &[]), "stale");
         // A map the answer does not list: nothing to say.
         let other = vec![entry("grep.live", false, json!(0))];
-        assert_eq!(card_freshness(&card, Some(&other)), "unverified");
+        assert_eq!(card_freshness(&card, Some(&other), &[]), "unverified");
         // A map listed with a null lag was not compared.
         let unknown = vec![entry("graph.scip", false, Value::Null)];
-        assert_eq!(card_freshness(&card, Some(&unknown)), "unverified");
+        assert_eq!(card_freshness(&card, Some(&unknown), &[]), "unverified");
         // One map unverified keeps the whole card unverified, a stale one wins.
         let card = json!({"maps": ["graph.scip", "grep.live"], "via": "graph.scip"});
-        assert_eq!(card_freshness(&card, Some(&fresh)), "unverified");
+        assert_eq!(card_freshness(&card, Some(&fresh), &[]), "unverified");
         let mixed = vec![
             entry("graph.scip", false, json!(0)),
             entry("grep.live", true, json!(1)),
         ];
-        assert_eq!(card_freshness(&card, Some(&mixed)), "stale");
+        assert_eq!(card_freshness(&card, Some(&mixed), &[]), "stale");
         // No `maps` on the answer, or a card with no map: unverified.
-        assert_eq!(card_freshness(&card, None), "unverified");
+        assert_eq!(card_freshness(&card, None, &[]), "unverified");
         assert_eq!(
-            card_freshness(&json!({"maps": []}), Some(&fresh)),
+            card_freshness(&json!({"maps": []}), Some(&fresh), &[]),
             "unverified"
         );
     }

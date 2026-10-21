@@ -128,19 +128,26 @@ pub struct Edge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Freshness {
     /// What the answer was read from: the map's stored snapshot, the working
-    /// tree as it is now, or a named point in time.
+    /// tree as it is now, or a named point in time. (`lsp.live` is a live
+    /// map that queries a language server: the server reads the tree itself
+    /// when the call started it; a server kept across calls is bounded by its
+    /// tree stamp's coverage, and its answer stays unverified.)
     pub observed: Observed,
     /// The source the answer was read from is known to differ from the tree
     /// now. `false` also when nothing was compared (`lag` is then `None`).
     pub stale: bool,
     /// How many files differ between what the answer was read from and the
     /// tree now (changed, added or removed), a count and never wall time;
-    /// `None` when it was not measured. A live map reads the tree itself: `0`.
+    /// `None` when it was not measured. A live map reads the tree itself: `0`
+    /// (for `lsp.live` that holds for a server the call started, not for a
+    /// kept one).
     pub lag: Option<u32>,
 }
 
 impl Freshness {
     /// A map that reads the working tree (or git) as it is when it answers.
+    /// (`lsp.live` states it too, for a server the call started; the walk
+    /// labels a kept server's cards `unverified` and says so in a note.)
     pub const fn live() -> Self {
         Self {
             observed: Observed::LiveTree,
