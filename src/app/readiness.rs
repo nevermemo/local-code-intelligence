@@ -2,7 +2,10 @@
 //! dependency, shared by `/ready` and the `service_status` MCP tool.
 
 use super::App;
-use crate::{lexical, lsp::adapter::probe_subprocess_version};
+use crate::{
+    lexical,
+    lsp::adapter::{fresh_probes, probe_subprocess_version},
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::{path::Path, sync::Arc};
@@ -113,7 +116,7 @@ impl App {
                     let probe: Result<()> = if !adapter.enabled() {
                         Ok(())
                     } else {
-                        adapter.probe_readiness(timeout).await
+                        fresh_probes(adapter.probe_readiness(timeout)).await
                     };
                     (adapter, probe)
                 }
@@ -147,7 +150,7 @@ impl App {
                 "reranker model listing",
                 timeout
             ),
-            probe_subprocess_version(&ripgrep_resolved, timeout),
+            fresh_probes(probe_subprocess_version(&ripgrep_resolved, timeout)),
             lsp_probes_future,
         );
 

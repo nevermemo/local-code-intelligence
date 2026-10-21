@@ -9,8 +9,10 @@
 //! extra_maps` because an MCP call has no `maps` argument. Per call the harness
 //! reads the answer (`totals`, the per-map ms, notes) and samples the RSS of
 //! the server's process tree; the version probe's ms comes from one `debug!`
-//! line of the server's log. Two load conditions exist: `quiet`, and `loaded`
-//! (busy CPU threads, no disk traffic, for the whole condition).
+//! line of the server's log (the probe is memoised for the process since d470:
+//! only the first probe of a binary costs real ms, later calls log about 0).
+//! Two load conditions exist: `quiet`, and `loaded` (busy CPU threads, no disk
+//! traffic, for the whole condition).
 //!
 //! Everything that needs no process (answer parsing, arm configs, the
 //! arithmetic and the report tables) is a pure function with a unit test.
@@ -1572,7 +1574,7 @@ fn render_report(meta: &ReportMeta, results: &[ConditionResult]) -> String {
     for note in &meta.notes {
         let _ = writeln!(out, "- {note}");
     }
-    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts (`base` and `per_call+sync` write `sessions = \"per_call\"`, since the default is `shared`). `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. RA RSS = peak sum of RSS of the server's descendants named rust-analyzer, max over calls. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet.\n");
+    out.push_str("\nMethod: `serve` on 127.0.0.1:8769 per arm (copied binary, own data dir, vectorless index, semantic/LSP-search/reranker channels off, freshness manual). `lsp.live` joins the walk through `[traverse.policies.explore] extra_maps`. Cold = first call of the arm; warm = every later call; `repeat` = warm calls of round 2 and later (a question asked again). Under `per_call` every call starts its own server, so its cold and warm figures are both cold starts (`base` and `per_call+sync` write `sessions = \"per_call\"`, since the default is `shared`). `ms/exp` = `totals.per_map[\"lsp.live\"].ms / expands`. `pops per 5 s` = total pops / total walk `elapsed_ms` x 5000. RA RSS = peak sum of RSS of the server's descendants named rust-analyzer, max over calls. `fail-open` = calls with a result but no result card naming `lsp.live`. `deadline` = stop_reason deadline; `lsp deadline` = the `lsp.live` deadline note; `unavailable` = the `lsp.live is unavailable` note. `machine CPU %` = mean CPU use of the whole machine while the calls ran (the server and its language server included); `idle CPU` below = the machine's CPU use over 10 s just before the arm's server started, a reading of whatever else runs: above 20% the quiet condition is not quiet. The version probe is memoised for the server's process (d470), so only the first probe of a binary logs a real ms and every arm's later calls log about 0: the older comparison of one probe per call under `base` and one under `shared` no longer applies.\n");
     for result in results {
         let _ = writeln!(
             out,

@@ -216,8 +216,10 @@ impl App {
     /// walk would share start: those that see an edit on their own
     /// (`LspAdapter::watches_workspace`), or every server under
     /// `sync = "watch"`; a walk starts the others per call, so a warm one
-    /// would be unused. It changes which request pays for a start, never an
-    /// answer.
+    /// would be unused. It is bounded by nothing but its abort
+    /// (`stop_warm_starts`): a server that is slow to start keeps starting in
+    /// its session and the first walk shares that start. It changes which
+    /// request pays for a start, never an answer.
     fn warm_language_servers(
         &self,
         workspace: &crate::workspace::Workspace,
@@ -251,7 +253,6 @@ impl App {
         let (sender, receiver) = watch::channel(None);
         let analyzer = Arc::clone(&self.analyzer);
         let task_workspace = workspace.clone();
-        let timeout = Duration::from_secs(self.config.lsp_timeout_seconds);
         let (alive, ended) = watch::channel(());
         let task = tokio::spawn(async move {
             let _alive = alive;
@@ -275,7 +276,7 @@ impl App {
             let refs: Vec<&Arc<dyn crate::lsp::adapter::LspAdapter>> = adapters.iter().collect();
             analyzer.tree_barrier(&workspace, &refs).await;
             let primed = analyzer
-                .prime_languages(&workspace, timeout, Some(&languages))
+                .prime_languages(&workspace, None, Some(&languages))
                 .await;
             for (provider, result) in primed {
                 match &result {

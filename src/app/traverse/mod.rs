@@ -1117,8 +1117,10 @@ pub async fn run_with_trait_seeds(
                     Some(shared) => ManagerBackend::open_split(workspace, shared, own, probe).await,
                     None => ManagerBackend::open_with_probe_timeout(workspace, own, probe).await,
                 };
-                // `cargo xtask maps lsp-cost` reads this line: a shared manager
-                // probes a binary once, so later calls log about 0 ms.
+                // `cargo xtask maps lsp-cost` reads this line: the version probe is
+                // memoised for the process (d470), per-call managers included, so
+                // only the first probe of a binary logs real ms and later calls
+                // log about 0.
                 tracing::debug!(
                     probe_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
                     probe_limit_ms = probe.as_millis() as u64,

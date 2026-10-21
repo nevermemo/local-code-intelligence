@@ -271,6 +271,17 @@ fn budget(deadline: Duration, calls: u32) -> Budget {
     }
 }
 
+/// [`budget`] for a test under `start_paused`: the deadline is `deadline` after
+/// the tokio clock, which the paused runtime has advanced past the real clock
+/// that [`budget`] reads.
+fn paused_budget(deadline: Duration, calls: u32) -> Budget {
+    Budget {
+        deadline: tokio::time::Instant::now().into_std() + deadline,
+        max_external_calls: calls,
+        max_nodes_touched: u64::MAX,
+    }
+}
+
 fn view() -> SnapshotView<'static> {
     SnapshotView::new(SnapshotRef::default(), Vec::new())
 }
@@ -685,17 +696,51 @@ async fn a_call_hierarchy_error_keeps_the_other_edges() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn an_expansion_waits_as_long_as_its_budget_allows() {
+    // The paused clock runs through the fake's 20 s answer at once.
+    let mut cold = fake();
+    cold.delay = Duration::from_secs(20);
+    let map = map_over(cold);
+    let found = map
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_secs(60), 10),
+            &view(),
+        )
+        .await;
+    let edges: Vec<NodeId> = found.edges.iter().map(|edge| edge.dst.clone()).collect();
+    assert_eq!(edges, vec![sym("b")]);
+    assert_eq!(map.last_error(), None);
+    assert_eq!(found.cost.external_calls, 2, "definitions and references");
+
+    // A budget shorter than the answer still ends with the note: the first
+    // request is made and does not come back within 10 s.
+    let found = map
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_secs(10), 10),
+            &view(),
+        )
+        .await;
+    assert!(found.edges.is_empty());
+    assert_eq!(found.cost.external_calls, 1, "one request, no answer");
+    assert_eq!(map.last_error().as_deref(), Some(DEADLINE_NOTE));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_call_that_outlasts_its_deadline_ends_with_the_note_and_no_edges() {
     let mut slow = fake();
     slow.delay = Duration::from_secs(5);
     let requests = slow.requests.clone();
     let map = map_over(slow);
-    let started = Instant::now();
     let found = map
-        .expand(&sym("x"), budget(Duration::from_millis(50), 10), &view())
+        .expand(
+            &sym("x"),
+            paused_budget(Duration::from_millis(50), 10),
+            &view(),
+        )
         .await;
-    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(found.edges.is_empty());
     assert_eq!(found.cost.external_calls, 1, "the request was made");
     assert_eq!(map.last_error().as_deref(), Some(DEADLINE_NOTE));
@@ -741,9 +786,12 @@ async fn the_server_is_asked_only_when_expanding_and_lives_until_the_map_drops()
 /// poll), so it fails with no wait; a
 /// wide one lets a real executable that answers `--version` (cargo, which runs
 /// these tests) through. The same manager and binary in both calls, so only
-/// the bound differs.
+/// the bound differs. The zero-bound call runs inside `fresh_probes`: other
+/// tests in this process probe cargo too, and the process-wide memo (d470)
+/// would otherwise answer it without a probe.
 #[tokio::test]
 async fn the_version_probe_honours_the_timeout_it_is_given() {
+    use lci_core::lsp::adapter::fresh_probes;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let config = Config {
         rust_analyzer_path: cargo,
@@ -754,11 +802,14 @@ async fn the_version_probe_honours_the_timeout_it_is_given() {
         path: std::env::temp_dir(),
     };
     let manager = Arc::new(Manager::new(&config));
-    let error =
-        ManagerBackend::open_with_probe_timeout(workspace(), Arc::clone(&manager), Duration::ZERO)
-            .await
-            .err()
-            .expect("a probe with no time left fails");
+    let error = fresh_probes(ManagerBackend::open_with_probe_timeout(
+        workspace(),
+        Arc::clone(&manager),
+        Duration::ZERO,
+    ))
+    .await
+    .err()
+    .expect("a probe with no time left fails");
     assert!(
         error.contains("no language server is available") && error.contains("timed out"),
         "{error}"

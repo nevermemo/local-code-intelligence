@@ -78,6 +78,23 @@ pub struct DocsMentions {
 
 impl DocsMentions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_options(root, docs_options())
+    }
+
+    /// [`Self::new`] with a scan timeout no loaded machine reaches, for the
+    /// tests of what the map answers (the default stops a scan after 3 s).
+    #[cfg(test)]
+    fn patient(root: impl Into<PathBuf>) -> Self {
+        Self::with_options(
+            root,
+            GrepOptions {
+                timeout: Duration::from_secs(3600),
+                ..docs_options()
+            },
+        )
+    }
+
+    fn with_options(root: impl Into<PathBuf>, options: GrepOptions) -> Self {
         Self {
             descriptor: MapDescriptor {
                 id: DOCS_MENTIONS_ID,
@@ -90,7 +107,7 @@ impl DocsMentions {
                 source_labels: vec![SourceLabel::Doc],
                 needs: Vec::new(),
             },
-            grep: LiveGrep::with_options(root, None, docs_options()),
+            grep: LiveGrep::with_options(root, None, options),
         }
     }
 

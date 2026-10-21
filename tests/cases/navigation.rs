@@ -5652,11 +5652,10 @@ async fn traverse_add_full(
         .response
 }
 
-/// [`traverse_add`] past a cold language server. However wide the budget, one
-/// expansion waits at most `lsp_live::CALL_TIMEOUT` (15 s, a product
-/// constant), and a cold fake server on a loaded machine took 21 s to answer:
-/// a walk that starts a cold server may then end with the deadline note and no
-/// edges from the map, as the map documents.
+/// [`traverse_add`] past a cold language server. A cold fake server on a loaded
+/// machine took 21 s to answer; the walk's 60 s deadline covers it. A walk that
+/// starts a cold server may still end with the deadline note and no edges from
+/// the map, as the map documents, so the retry below stays.
 ///
 /// Under `shared` the server is started first by one `symbols` call, which
 /// returns once it answers, so the single walk that follows must reach `Run`
@@ -7432,9 +7431,10 @@ async fn without_an_index_snapshot_a_shared_server_is_not_kept() {
 
 /// [`traverse_add`] under the default profile (no `sessions` line), for a server
 /// the walk starts on its own manager (csharp-ls is a non-watching adapter).
-/// A walk that only ran out of time on a cold fake server (a loaded machine
-/// can exceed `lsp_live::CALL_TIMEOUT`) and has not reached `done` is asked
-/// again, up to three walks in all; any other error note fails the test.
+/// A walk that only ran out of time on a cold fake server (a cold fake server
+/// on a loaded machine took 21 s; the walk's 60 s deadline covers it) and has
+/// not reached `done` is asked again, up to three walks in all; any other error
+/// note fails the test.
 /// Returns the last answer and the walks made.
 async fn traverse_add_by_default_until(
     config: &Config,
