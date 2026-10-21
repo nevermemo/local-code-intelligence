@@ -1243,6 +1243,25 @@ async fn flow_from_runs_the_same_with_seeds_bm25_on() {
     assert!(!on.to_string().contains("bm25"), "{on}");
 }
 
+/// `[run_profile.lsp] places` reaches the recipes' walk (the profile is the
+/// one they run under) and changes nothing there: the walk has no `lsp.live`,
+/// so no outline is asked under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_places_outline() {
+    assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let scip = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.lsp.places = lci_core::config::LspPlaces::Outline;
+    let outline = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&scip, "walk").is_empty(), "{scip}");
+    assert_eq!(outline["walk"], scip["walk"], "{outline}");
+    assert_eq!(outline["stop"], scip["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(outline["counts"][count], scip["counts"][count], "{count}");
+    }
+}
+
 /// The recipes pass their run profile to the walk of `flow_from`, so the
 /// freshness keys reach it. Its answer carries no `maps` and no `file_changed`
 /// (it reads the walk's cards, not the labels), so with both keys on it is the

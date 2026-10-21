@@ -12,6 +12,13 @@
 //! not scanned. Frozen records (the pre-registrations and results under
 //! `docs/spike/multimap/v2`) are scanned and reported but never fail the
 //! check, because they are never edited.
+//!
+//! The same check also rejects merge-conflict markers in any scanned Markdown
+//! file (a line starting `<<<<<<< ` or `>>>>>>> `, or exactly `=======`) and
+//! guards the decision log, `docs/decisions.md`, which is merged with
+//! `merge=union`: every table row's first cell must be a decision id
+//! (`dNNN`) and no id may repeat. Ids need not be in order, because rows land
+//! out of order by design.
 
 use crate::acceptance::workspace_root;
 use crate::lint::tracked_files;
@@ -22,6 +29,8 @@ use std::path::Path;
 
 /// Vendored third-party skill material: not ours to rewrite.
 const VENDORED_PREFIX: &str = ".agents/skills/rust-skills/";
+/// The decision log, an append-only table merged with `merge=union`.
+const DECISIONS_LOG: &str = "docs/decisions.md";
 /// Where frozen records live.
 const FROZEN_DIR: &str = "docs/spike/multimap/v2/";
 
@@ -343,18 +352,92 @@ pub struct Broken {
     pub frozen: bool,
 }
 
+/// One merge-conflict marker or decision-log fault.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogIssue {
+    pub path: String,
+    pub line: usize,
+    pub reason: String,
+    pub frozen: bool,
+}
+
 /// What a scan of the tracked Markdown files found.
 #[derive(Debug, Default)]
 pub struct Report {
     pub files: usize,
     pub links: usize,
     pub broken: Vec<Broken>,
+    /// Conflict markers in any scanned file and decision-log faults.
+    pub issues: Vec<LogIssue>,
 }
 
 impl Report {
     pub fn failures(&self) -> usize {
         self.broken.iter().filter(|b| !b.frozen).count()
+            + self.issues.iter().filter(|i| !i.frozen).count()
     }
+}
+
+/// `(line, reason)` of every line that is a merge-conflict marker: it starts
+/// with `<<<<<<< ` or `>>>>>>> `, or is exactly `=======` in a file that also
+/// has one of the other two (alone, `=======` is a Setext heading underline).
+pub fn conflict_markers(text: &str) -> Vec<(usize, String)> {
+    let found: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(at, line)| {
+            let marker = if line.starts_with("<<<<<<< ") {
+                "<<<<<<<"
+            } else if line.starts_with(">>>>>>> ") {
+                ">>>>>>>"
+            } else if line == "=======" {
+                "======="
+            } else {
+                return None;
+            };
+            Some((at + 1, marker))
+        })
+        .collect();
+    let bracketed = found.iter().any(|&(_, marker)| marker != "=======");
+    found
+        .into_iter()
+        .filter(|&(_, marker)| bracketed || marker != "=======")
+        .map(|(line, marker)| (line, format!("merge-conflict marker `{marker}`")))
+        .collect()
+}
+
+/// `(line, reason)` of every decision-log fault: a table row whose first cell
+/// is not `dNNN`, or an id that already appeared on an earlier row. The header
+/// row (`id`) and the separator row are not decisions.
+pub fn decision_log_faults(text: &str) -> Vec<(usize, String)> {
+    let mut faults = Vec::new();
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    for (at, line) in text.lines().enumerate() {
+        let Some(row) = line.strip_prefix('|') else {
+            continue;
+        };
+        let cell = row.split('|').next().unwrap_or("").trim();
+        if cell == "id" || (!cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':'))) {
+            continue;
+        }
+        let is_id = cell
+            .strip_prefix('d')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !is_id {
+            faults.push((
+                at + 1,
+                format!("row's first cell `{cell}` is not a decision id (dNNN)"),
+            ));
+        } else if let Some(first) = first_seen.get(cell) {
+            faults.push((
+                at + 1,
+                format!("duplicate decision id {cell} (first on line {first})"),
+            ));
+        } else {
+            first_seen.insert(cell, at + 1);
+        }
+    }
+    faults
 }
 
 /// Checks every tracked `*.md` file under `root` (a git working tree).
@@ -378,7 +461,20 @@ pub fn check_repo(root: &Path) -> Result<Report> {
         let bytes = std::fs::read(&path).with_context(|| format!("read {rel}"))?;
         report.files += 1;
         let frozen = is_frozen(rel);
-        let found = scan(&String::from_utf8_lossy(&bytes));
+        let text = String::from_utf8_lossy(&bytes);
+        let mut faults = conflict_markers(&text);
+        if rel == DECISIONS_LOG {
+            faults.extend(decision_log_faults(&text));
+        }
+        report
+            .issues
+            .extend(faults.into_iter().map(|(line, reason)| LogIssue {
+                path: rel.clone(),
+                line,
+                reason,
+                frozen,
+            }));
+        let found = scan(&text);
         let mut broken = |line: usize, target: String, reason: String| {
             report.broken.push(Broken {
                 path: rel.clone(),
@@ -404,6 +500,9 @@ pub fn check_repo(root: &Path) -> Result<Report> {
         }
         report.links += checked;
     }
+    report
+        .issues
+        .sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
     report.broken.sort_by(|a, b| {
         (a.path.as_str(), a.line, a.target.as_str()).cmp(&(
             b.path.as_str(),
@@ -427,14 +526,24 @@ pub fn run() -> Result<()> {
             broken.path, broken.line, broken.target, broken.reason
         );
     }
+    for issue in &report.issues {
+        let note = if issue.frozen {
+            "; frozen record, reported only"
+        } else {
+            ""
+        };
+        println!("{}:{}: {}{note}", issue.path, issue.line, issue.reason);
+    }
     let failures = report.failures();
-    let frozen = report.broken.len() - failures;
+    let frozen = report.broken.len() + report.issues.len() - failures;
     println!(
-        "docs check: {} Markdown files, {} relative links, {failures} broken, {frozen} broken in frozen records (reported, never fail)",
+        "docs check: {} Markdown files, {} relative links, {failures} problems (broken links, conflict markers, decision log), {frozen} in frozen records (reported, never fail)",
         report.files, report.links
     );
     if failures > 0 {
-        bail!("docs check: {failures} broken link(s); fix them or the heading they point at");
+        bail!(
+            "docs check: {failures} problem(s); fix the links, remove the conflict markers, or repair the decision log (unique `dNNN` ids)"
+        );
     }
     Ok(())
 }
@@ -845,5 +954,98 @@ mod tests {
         assert!(is_frozen("docs/spike/multimap/v2/engine-results.md"));
         assert!(!is_frozen("docs/spike/multimap/v2/trend.md"));
         assert!(!is_frozen("docs/spike/multimap/m0-results.md"));
+    }
+
+    #[test]
+    fn conflict_markers_are_found_with_line_numbers() {
+        let text = "ok\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n\
+                    <<<<<<<nospace\n======== longer\n  =======\n";
+        let found: Vec<usize> = conflict_markers(text)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(found, [2, 4, 6]);
+        assert_eq!(
+            conflict_markers("<<<<<<< HEAD\r\na\r\n=======\r\n").len(),
+            2
+        );
+        // A lone `=======` is a Setext heading underline, not a marker.
+        assert!(conflict_markers("Title\n=======\ntext\n").is_empty());
+        assert!(conflict_markers("no markers\n| d001 | x |\n").is_empty());
+    }
+
+    const LOG_HEAD: &str = "Intro\n\n| id | date | kind | area | text | ref |\n| --- | --- | --- | --- | --- | --- |\n";
+
+    #[test]
+    fn an_out_of_order_decision_table_is_valid() {
+        let text = format!("{LOG_HEAD}| d010 | a |\n| d002 | b |\n| d1000 | c |\n| d003 | d |\n");
+        assert!(decision_log_faults(&text).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_decision_id_is_reported_on_the_later_row() {
+        let text = format!("{LOG_HEAD}| d010 | a |\n| d011 | b |\n| d010 | c |\n");
+        assert_eq!(
+            decision_log_faults(&text),
+            [(7, "duplicate decision id d010 (first on line 5)".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_decision_id_is_reported() {
+        let text =
+            format!("{LOG_HEAD}| d010 | a |\n| 11 | b |\n| d | c |\n| dx1 | d |\n|  | e |\n");
+        let lines: Vec<usize> = decision_log_faults(&text)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(lines, [6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn a_repository_check_fails_on_conflict_markers_and_a_bad_decision_log() {
+        let repo = TempRepo::new();
+        repo.write(
+            "README.md",
+            "# Top\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n",
+        );
+        repo.write(
+            DECISIONS_LOG,
+            &format!("{LOG_HEAD}| d002 | a |\n| d001 | b |\n| d002 | c |\n"),
+        );
+        repo.write("docs/other.md", "| not-a-decision | x |\n");
+        repo.write(".agents/skills/rust-skills/x.md", "<<<<<<< vendored\n");
+        repo.write("docs/spike/multimap/v2/m1-prereg.md", "<<<<<<< frozen\n");
+        repo.track();
+        let report = check_repo(&repo.0).unwrap();
+        let found: Vec<(&str, usize, bool)> = report
+            .issues
+            .iter()
+            .map(|issue| (issue.path.as_str(), issue.line, issue.frozen))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("README.md", 2, false),
+                ("README.md", 4, false),
+                ("README.md", 6, false),
+                ("docs/decisions.md", 7, false),
+                ("docs/spike/multimap/v2/m1-prereg.md", 1, true),
+            ]
+        );
+        assert_eq!(report.failures(), 4);
+    }
+
+    #[test]
+    fn a_clean_out_of_order_log_passes_the_repository_check() {
+        let repo = TempRepo::new();
+        repo.write(
+            DECISIONS_LOG,
+            &format!("{LOG_HEAD}| d005 | a |\n| d003 | b |\n| d004 | c |\n"),
+        );
+        repo.track();
+        let report = check_repo(&repo.0).unwrap();
+        assert!(report.issues.is_empty());
+        assert_eq!(report.failures(), 0);
     }
 }

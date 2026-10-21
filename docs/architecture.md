@@ -144,6 +144,16 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   edge kind), one per destination per expansion, seen at the call (`fromRanges`). Every error reply is recorded
   and keeps the other edges, which is also how a server without `callHierarchyProvider` (it answers -32601) is found:
   the capabilities are not read.
+  The symbol-to-place table behind the map (`lsp_live::SymbolPlaces`) is `ScipPlaces`, built from the SCIP graph's
+  nodes, under `[run_profile.lsp] places = "scip"` (default). With `places = "outline"` it is `OutlinePlaces` over it:
+  `ask` outlines a symbol's file once per map instance (`Manager::document_symbols`, one counted external call;
+  `SymbolPlaces::outline_wanted`), as it already does for a file or chunk node, and `SymbolPlaces::learn` takes the
+  outline in. A member whose kind this build has a node for (`SymbolKind`: functions, methods, types, enums,
+  modules, constants; LSP kinds 12, 6, 9, 5, 23, 11, 10, 2-4, 14) takes the SCIP node's id for the same file, name and
+  nearest line, else a minted `SymbolKey` with the file's `language::for_path` identifier and the equal names
+  numbered in document order; where a file is learned its places win over the index's, which may be older than the
+  tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
+  `Member::end_line` is the last line of the item.
   it is recorded without dropping the edges of the first two.
   `[run_profile.lsp] sync = "watch"` (read by `Manager::new`; a per-call
   manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`

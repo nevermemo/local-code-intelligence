@@ -5856,14 +5856,15 @@ fn names_of<'a>(calls: &'a Value, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// One `lsp.live` walk of `seed` alone (`max_depth` 1), under `profile`, with
+/// One `lsp.live` walk of `seed` alone to `max_depth`, under `profile`, with
 /// the loaded-machine budget.
-async fn traverse_symbol(
+async fn traverse_symbol_to(
     config: &Config,
     workspace: &Workspace,
     index: &std::path::Path,
     profile: &local_code_intelligence::config::RunProfileConfig,
     seed: &str,
+    max_depth: u32,
 ) -> local_code_intelligence::app::traverse::Report {
     use local_code_intelligence::{
         app::traverse::{BudgetArgs, Call, Dirs, SteerArgs, run},
@@ -5880,7 +5881,7 @@ async fn traverse_symbol(
     let (budget, steer) = (
         BudgetArgs {
             deadline_ms: Some(LOADED_BUDGET_SECONDS * 1000),
-            max_depth: Some(1),
+            max_depth: Some(max_depth),
             ..BudgetArgs::default()
         },
         SteerArgs::default(),
@@ -5904,6 +5905,17 @@ async fn traverse_symbol(
     run(&limits, profile, &Dirs::under(&config.data_dir), &call)
         .await
         .unwrap()
+}
+
+/// [`traverse_symbol_to`] to `max_depth` 1.
+async fn traverse_symbol(
+    config: &Config,
+    workspace: &Workspace,
+    index: &std::path::Path,
+    profile: &local_code_intelligence::config::RunProfileConfig,
+    seed: &str,
+) -> local_code_intelligence::app::traverse::Report {
+    traverse_symbol_to(config, workspace, index, profile, seed, 1).await
 }
 
 /// The destinations of the `lsp.live` hops out of `seed` in a trace, sorted.
@@ -6346,5 +6358,320 @@ async fn a_request_sends_the_changes_already_reported_before_it_is_sent() {
         2,
         "the reported change dropped the kept outline before the lookup"
     );
+    manager.shutdown_all().await;
+}
+
+// ---- `lsp.live` places from the outline (K10a) ------------------------------
+
+const BOX_CS: &str = "public class Box {\n    public int Size() {\n        return 1;\n    }\n    public int Count() => 2;\n}\n";
+
+/// The documents fake's outline answers each declaration with a range from its
+/// name to the end of the declaration (a flat `SymbolInformation` has no
+/// `selectionRange`, so the range's start is the name), while `definition`
+/// still answers the name token. A two-line method ends on its closing line, a
+/// `=>` member on its own line, the type on its closing brace.
+#[tokio::test]
+async fn documents_fake_outline_ranges_run_to_the_declarations_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write(&root, "src/Box.cs", BOX_CS);
+    let fake = DocumentsFake::start_on(&temp, root).await;
+    let outline = fake
+        .ask(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": fake.uri("src/Box.cs")}}),
+        )
+        .await;
+    let ranges: Vec<(String, u64, u64, u64)> = outline
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let range = &item["location"]["range"];
+            (
+                item["name"].as_str().unwrap().to_owned(),
+                range["start"]["line"].as_u64().unwrap(),
+                range["start"]["character"].as_u64().unwrap(),
+                range["end"]["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let lines: Vec<&str> = BOX_CS.lines().collect();
+    let column = |line: usize, name: &str| lines[line].find(name).unwrap() as u64;
+    assert_eq!(
+        ranges,
+        [
+            ("Box".to_owned(), 0, column(0, "Box"), 5),
+            ("Size".to_owned(), 1, column(1, "Size"), 3),
+            ("Count".to_owned(), 4, column(4, "Count"), 4),
+        ]
+    );
+    // `definition` still answers the name token.
+    let size = position_of(BOX_CS, "Size");
+    let answer = fake.at("textDocument/definition", "src/Box.cs", size).await;
+    let range = &answer[0]["range"];
+    assert_eq!(range["start"]["line"], 1);
+    assert_eq!(range["end"]["line"], 1);
+    assert_eq!(
+        range["end"]["character"].as_u64().unwrap() - range["start"]["character"].as_u64().unwrap(),
+        "Size".len() as u64
+    );
+    fake.finish().await;
+}
+
+/// The profile of the K10a walks: no SCIP index read (`off`), the live outline
+/// as the place table, implementations on.
+fn outline_profile(
+    mode: local_code_intelligence::config::profile::ScipMode,
+    places: local_code_intelligence::config::LspPlaces,
+) -> local_code_intelligence::config::RunProfileConfig {
+    use local_code_intelligence::config::{LspProfile, RunProfileConfig, profile::ScipProfile};
+    RunProfileConfig {
+        scip: ScipProfile { mode },
+        lsp: LspProfile {
+            places,
+            implementations: true,
+            ..LspProfile::default()
+        },
+        ..RunProfileConfig::default()
+    }
+}
+
+/// Ceiling check 1: with no SCIP index at all (`scip.mode = off`) `lsp.live`
+/// walks out of a file once its places come from the server's outline. The
+/// walk of `src/Shapes.cs` outlines the file once, names its six declarations
+/// with ids of the file's real language, and reaches the implementing members
+/// from the interface member. Under `places = scip` the same walk asks the
+/// file's outline (as before) but names nothing and asks nothing else (d411).
+/// Without the slice there is no place, so no request at any symbol and no edge.
+#[tokio::test]
+async fn lsp_live_outline_places_walk_without_a_scip_index() {
+    use local_code_intelligence::config::{LspPlaces, profile::ScipMode};
+    const FILE: &str = "file:src/Shapes.cs";
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+
+    // The server's own outline: IShape, Circle, Square and the three `Area`
+    // methods (kind 6), by document order.
+    let raw = {
+        let fake_temp = tempfile::tempdir().unwrap();
+        let fake = DocumentsFake::start_on(&fake_temp, workspace.path.clone()).await;
+        let answer = fake
+            .ask(
+                "textDocument/documentSymbol",
+                json!({"textDocument": {"uri": fake.uri("src/Shapes.cs")}}),
+            )
+            .await;
+        fake.finish().await;
+        answer
+    };
+    let listed: Vec<(String, u64)> = raw
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["name"].as_str().unwrap().to_owned(),
+                item["location"]["range"]["start"]["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let area_kinds: Vec<u64> = raw
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["name"] == "Area")
+        .map(|item| item["kind"].as_u64().unwrap())
+        .collect();
+    assert_eq!(area_kinds, [6, 6, 6], "{listed:?}");
+    assert_eq!(listed.len(), 6, "{listed:?}");
+
+    let profile = outline_profile(ScipMode::Off, LspPlaces::Outline);
+    let report = traverse_symbol_to(&config, &workspace, &index, &profile, FILE, 2).await;
+    let from_file = lsp_live_hops_from(&report, FILE);
+    assert_eq!(
+        from_file,
+        [
+            "sym:csharp:Shapes.cs::Area/method",
+            "sym:csharp:Shapes.cs::Area/method~1",
+            "sym:csharp:Shapes.cs::Area/method~2",
+            "sym:csharp:Shapes.cs::Circle/struct",
+            "sym:csharp:Shapes.cs::IShape/trait",
+            "sym:csharp:Shapes.cs::Square/struct",
+        ],
+        "{}",
+        report.response
+    );
+    assert_eq!(
+        requests_of(&state, "textDocument/documentSymbol"),
+        1,
+        "the file is outlined once"
+    );
+    // Each of the six symbols is asked at the place the outline gave it, for
+    // its definition, references and implementations: the interface member's
+    // implementation request is what names the two members that implement it
+    // (their hops are the file's, so a trace shows no second hop to them).
+    for method in [
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/implementation",
+    ] {
+        assert_eq!(requests_of(&state, method), 6, "{method}");
+    }
+    // One outline, then definition, references and implementation for each of
+    // the six symbols the walk expands.
+    assert_eq!(report.response["totals"]["external_calls"], 1 + 6 * 3);
+
+    // `places = scip` under `off`: the file's own outline is asked as it
+    // always was (one call), but it names nothing the empty index defines, so
+    // there is no hop, no symbol is placed and no other request is made.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let profile = outline_profile(ScipMode::Off, LspPlaces::Scip);
+    let report = traverse_symbol_to(&config, &workspace, &index, &profile, FILE, 2).await;
+    assert!(
+        lsp_live_hops_from(&report, FILE).is_empty(),
+        "{}",
+        report.response
+    );
+    assert_eq!(report.response["totals"]["external_calls"], 1);
+    assert_eq!(requests_of(&state, "textDocument/documentSymbol"), 1);
+    assert_eq!(requests_of(&state, "textDocument/definition"), 0);
+}
+
+/// Ceiling check 2: with the index present the layers agree. A walk of the
+/// index's `Area` under `places = outline` asks the file's outline once (one
+/// more external call), and every id it names is the index's own, not a minted
+/// one: the outline does not shadow the index.
+#[tokio::test]
+async fn lsp_live_outline_places_keep_the_indexs_ids() {
+    use local_code_intelligence::config::{LspPlaces, profile::ScipMode};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let profile = outline_profile(ScipMode::Authoritative, LspPlaces::Outline);
+    let report = traverse_symbol_to(&config, &workspace, &index, &profile, AREA_SEED, 1).await;
+    assert_eq!(
+        lsp_live_hops_from(&report, AREA_SEED),
+        [
+            "sym:rust:Shapes.cs::Area/method~1",
+            "sym:rust:Shapes.cs::Area/method~2"
+        ],
+        "{}",
+        report.response
+    );
+    assert_eq!(report.response["totals"]["external_calls"], 4);
+    assert_eq!(requests_of(&state, "textDocument/documentSymbol"), 1);
+    assert_eq!(requests_of(&state, "textDocument/definition"), 1);
+    assert_eq!(requests_of(&state, "textDocument/references"), 1);
+    assert_eq!(requests_of(&state, "textDocument/implementation"), 1);
+
+    // The default asks no outline: the K9a walk, three calls.
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, index) = shapes_fixture(&temp);
+    let profile = outline_profile(ScipMode::Authoritative, LspPlaces::Scip);
+    let report = traverse_symbol_to(&config, &workspace, &index, &profile, AREA_SEED, 1).await;
+    assert_eq!(report.response["totals"]["external_calls"], 3);
+    assert_eq!(requests_of(&state, "textDocument/documentSymbol"), 0);
+}
+
+/// The edges themselves, over the real manager and the documents fake, with an
+/// empty index and `places = outline`: expanding the file gives `Contains`
+/// edges to its six declarations (the sites are the outline's name places),
+/// and expanding the interface's `Area` by the id the outline gave it gives
+/// `Implements` edges to the two implementing members, both symbols (no file
+/// destination), at the places the server's own answer names.
+#[tokio::test]
+async fn lsp_live_outline_places_give_contains_and_implements_edges_without_an_index() {
+    use lci_maps::{
+        Budget, EdgeKind, Map, SnapshotRef, SnapshotView,
+        lsp_live::{LspLive, ManagerBackend, OutlinePlaces, ScipPlaces},
+        scip_graph::{ScipGraph, ScipMap},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (config, workspace, state, _index) = shapes_fixture(&temp);
+    let raw = raw_implementations_of_area(&workspace).await;
+    assert_eq!(raw.len(), 2, "{raw:?}");
+
+    let empty = ScipMap::with_default_ids(ScipGraph::empty());
+    let places = Arc::new(OutlinePlaces::over(ScipPlaces::from_scip(&empty)));
+    let manager = Arc::new(Manager::new(&config));
+    let backend = ManagerBackend::open(workspace.clone(), Arc::clone(&manager))
+        .await
+        .unwrap();
+    let map = LspLive::new(Box::new(backend), places).implementations(true);
+    let view = SnapshotView::new(SnapshotRef::default(), Vec::new());
+    let wide = || Budget {
+        deadline: std::time::Instant::now() + Duration::from_secs(60),
+        max_external_calls: 10,
+        max_nodes_touched: u64::MAX,
+    };
+
+    let file = lci_core::node::NodeId::file("src/Shapes.cs").unwrap();
+    let found = map.expand(&file, wide(), &view).await;
+    assert!(map.last_error().is_none(), "{:?}", map.last_error());
+    let mut contained: Vec<String> = found
+        .edges
+        .iter()
+        .inspect(|edge| assert_eq!(edge.kind, EdgeKind::Contains))
+        .map(|edge| edge.dst.to_string())
+        .collect();
+    contained.sort();
+    assert_eq!(
+        contained,
+        [
+            "sym:csharp:Shapes.cs::Area/method",
+            "sym:csharp:Shapes.cs::Area/method~1",
+            "sym:csharp:Shapes.cs::Area/method~2",
+            "sym:csharp:Shapes.cs::Circle/struct",
+            "sym:csharp:Shapes.cs::IShape/trait",
+            "sym:csharp:Shapes.cs::Square/struct",
+        ]
+    );
+    assert_eq!(found.cost.external_calls, 1);
+
+    let interface_area = lci_core::node::NodeId::Symbol(lci_core::node::SymbolKey {
+        language: "csharp".into(),
+        module_path: vec!["Shapes.cs".into()],
+        container: Vec::new(),
+        name: "Area".into(),
+        kind: lci_core::node::SymbolKind::Method,
+        disambiguator: 0,
+    });
+    let found = map.expand(&interface_area, wide(), &view).await;
+    assert!(map.last_error().is_none(), "{:?}", map.last_error());
+    // No second outline: the file is learned; definition, references and
+    // implementation are the three calls.
+    assert_eq!(found.cost.external_calls, 3);
+    assert_eq!(requests_of(&state, "textDocument/documentSymbol"), 1);
+    let got: Vec<(String, u64, u64)> = found
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Implements)
+        .map(|edge| {
+            assert!(
+                matches!(edge.dst, lci_core::node::NodeId::Symbol(_)),
+                "{}",
+                edge.dst
+            );
+            let site = edge.site.as_ref().unwrap();
+            (
+                edge.dst.to_string(),
+                u64::from(site.line),
+                u64::from(site.col),
+            )
+        })
+        .collect();
+    let want: Vec<(String, u64, u64)> = raw
+        .iter()
+        .zip(["~1", "~2"])
+        .map(|((_, line, col), suffix)| {
+            (
+                format!("sym:csharp:Shapes.cs::Area/method{suffix}"),
+                *line,
+                *col,
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
     manager.shutdown_all().await;
 }

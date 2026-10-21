@@ -613,13 +613,30 @@ mode = "authoritative"
 # and stops with the workspace's last session. Independent of index watching. A
 # per-call manager (sessions = "per_call") never syncs. The recipes are the same
 # under both values.
-# All five keys are part of the run-profile hash.
+# places = "scip" (default): lsp.live places a symbol only where the SCIP index
+# has a node for it, so it asks nothing about a symbol the index lacks and,
+# under [run_profile.scip] mode = "off", nothing at all. "outline": the index's
+# table first, then the language server's own outline of a file
+# (textDocument/documentSymbol) for what the index lacks or misplaces: the first
+# time a walk expands a symbol the index places in a file, or expands the file,
+# it asks the server for that file's outline (one more external call per file
+# and walk, none for a file already outlined) and from then on the outline's
+# places win in that file, so lines inserted since the index was written no
+# longer lose edges. A symbol of the index keeps its id; a function, method,
+# type, enum, module or constant the index lacks gets an id with the file's
+# language (sym:csharp:Shapes.cs::Area/method), so with scip.mode = "off" a
+# file's declarations have ids once it is outlined. Fields, properties and
+# variables have no node yet. A seed that is a symbol id of a file never
+# outlined still has no place. Needs a server that answers documentSymbol. The
+# recipes never run lsp.live and are the same under both values.
+# All six keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "per_call"
 outline_cache = false
 implementations = false
 call_hierarchy = false
 sync = "off"
+places = "scip"
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against
