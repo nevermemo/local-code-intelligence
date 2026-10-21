@@ -1752,8 +1752,10 @@ fn spawn_idle_sweeper(registry: Weak<Sessions>, syncs: Weak<Syncs>, idle: Durati
 
 /// The items of a `textDocument/documentSymbol` response as the flat
 /// `SymbolInformation` shape `locations_for` reads: a `DocumentSymbol` has no
-/// uri (it is the requested file's) and its name is its `selectionRange`;
-/// children follow their parent.
+/// uri (it is the requested file's): its range starts at the name
+/// (`selectionRange`) and ends where the item does (`range`), so the last line
+/// of a `Location` is the item's, not the name's. A flat item is unchanged
+/// (its range is the item). Children follow their parent.
 fn flatten_document_symbols(value: &Value, uri: &str) -> Vec<Value> {
     let mut out = Vec::new();
     for item in value.as_array().into_iter().flatten() {
@@ -1761,7 +1763,21 @@ fn flatten_document_symbols(value: &Value, uri: &str) -> Vec<Value> {
             out.push(item.clone());
             continue;
         }
-        let range = item.get("selectionRange").or_else(|| item.get("range"));
+        let range = match (item.get("selectionRange"), item.get("range")) {
+            (Some(name), Some(whole)) => {
+                // An item that ends before its name (a malformed answer) ends
+                // with the name.
+                let end_line = |range: &Value| range["end"]["line"].as_u64();
+                let end = if end_line(whole) >= end_line(name) {
+                    &whole["end"]
+                } else {
+                    &name["end"]
+                };
+                Some(json!({"start": name["start"], "end": end}))
+            }
+            (Some(range), None) | (None, Some(range)) => Some(range.clone()),
+            (None, None) => None,
+        };
         if let Some(range) = range {
             out.push(json!({
                 "name": item.get("name"), "kind": item.get("kind"),
@@ -2055,6 +2071,53 @@ mod tests {
         );
         assert_eq!(names(&flat), [("item".into(), 4)]);
         assert!(names(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_nested_document_symbol_starts_at_its_name_and_ends_with_the_item() {
+        let at = |line: u32, character: u32| json!({"line": line, "character": character});
+        let nested = json!([{
+            "name":"outer","kind":23,
+            "range":{"start": at(3, 0), "end": at(9, 1)},
+            "selectionRange":{"start": at(4, 8), "end": at(4, 13)}
+        }]);
+        let flat = json!([{
+            "name":"item","kind":12,
+            "location":{"uri":"file:///x.rs","range":{"start": at(4, 8), "end": at(4, 12)}}
+        }]);
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            id: "test".into(),
+            path: dunce::canonicalize(temp.path()).unwrap(),
+        };
+        let uri = reqwest::Url::from_file_path(workspace.path.join("x.rs"))
+            .unwrap()
+            .to_string();
+        let located = |value: &Value| {
+            let flattened = flatten_document_symbols(value, &uri);
+            // A flat item keeps its own uri; point it at the workspace file.
+            let flattened: Vec<Value> = flattened
+                .into_iter()
+                .map(|mut item| {
+                    item["location"]["uri"] = json!(uri);
+                    item
+                })
+                .collect();
+            locations_for(Value::Array(flattened), &workspace, "test").unwrap()
+        };
+        // The name's start (1-based line 5, column 8), the item's end (line 10).
+        let nested = located(&nested);
+        assert_eq!(
+            (
+                nested[0].start_line,
+                nested[0].start_character,
+                nested[0].end_line
+            ),
+            (5, 8, 10)
+        );
+        // A flat item is unchanged: its range is the item.
+        let flat = located(&flat);
+        assert_eq!((flat[0].start_line, flat[0].end_line), (5, 5));
     }
 
     #[cfg(unix)]

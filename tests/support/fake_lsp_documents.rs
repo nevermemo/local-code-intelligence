@@ -383,6 +383,7 @@ impl Store {
                 .map(|decl| Decl {
                     uri,
                     tok: &decl.tok,
+                    end: decl.end,
                     kind: decl.kind,
                     container: None,
                     is_type: true,
@@ -390,6 +391,7 @@ impl Store {
                 .chain(doc.parsed.fns.iter().map(|decl| Decl {
                     uri,
                     tok: &decl.tok,
+                    end: decl.end,
                     kind: decl.kind,
                     container: decl.container.as_deref(),
                     is_type: false,
@@ -442,7 +444,7 @@ impl Store {
             .decls()
             .iter()
             .filter(|decl| decl.tok.name.to_lowercase().contains(&query))
-            .map(Decl::symbol)
+            .map(|decl| decl.symbol(false))
             .collect();
         json!(symbols)
     }
@@ -493,7 +495,7 @@ impl Store {
             .decls()
             .iter()
             .filter(|decl| decl.uri == uri)
-            .map(Decl::symbol)
+            .map(|decl| decl.symbol(true))
             .collect();
         json!(symbols)
     }
@@ -710,6 +712,8 @@ impl Store {
 struct Decl<'a> {
     uri: &'a str,
     tok: &'a Tok,
+    /// Where the declaration ends: (line, byte column after its last token).
+    end: (u32, u32),
     kind: u32,
     container: Option<&'a str>,
     is_type: bool,
@@ -720,12 +724,22 @@ impl Decl<'_> {
         location(self.uri, self.tok)
     }
 
-    /// A flat `SymbolInformation`.
-    fn symbol(&self) -> Value {
+    /// A flat `SymbolInformation`. `whole`: its range runs from the name to the
+    /// end of the declaration (as `documentSymbol` answers it); else it is the
+    /// name token (`workspace/symbol`).
+    fn symbol(&self, whole: bool) -> Value {
+        let location = if whole {
+            json!({"uri": self.uri, "range": {
+                "start": {"line": self.tok.line, "character": self.tok.start},
+                "end": {"line": self.end.0, "character": self.end.1},
+            }})
+        } else {
+            self.location()
+        };
         let mut symbol = json!({
             "name": self.tok.name,
             "kind": self.kind,
-            "location": self.location(),
+            "location": location,
         });
         if let Some(container) = self.container {
             symbol["containerName"] = json!(container);
@@ -830,12 +844,14 @@ struct Tok {
 
 struct TypeDecl {
     tok: Tok,
+    end: (u32, u32),
     kind: u32,
     supers: Vec<String>,
 }
 
 struct FnDecl {
     tok: Tok,
+    end: (u32, u32),
     /// 6 (method) after a type declaration of the document, else 12.
     kind: u32,
     container: Option<String>,
@@ -1002,8 +1018,46 @@ fn declares_function(line: &str, toks: &[Tok], at: usize) -> bool {
             || ends_without_body(after))
 }
 
+/// Where the declaration whose name is `tok` ends: after the `}` that closes
+/// its first `{` (counting braces from the name on), or, when a `;` comes
+/// before any `{` (a bodiless or `=>` member), after that `;`. The end of the
+/// text when neither comes.
+fn declaration_end(lines: &[&str], tok: &Tok) -> (u32, u32) {
+    let mut depth = 0u32;
+    let mut opened = false;
+    for (number, line) in lines.iter().enumerate().skip(tok.line as usize) {
+        let from = if number == tok.line as usize {
+            tok.end as usize
+        } else {
+            0
+        };
+        for (offset, character) in line.bytes().enumerate().skip(from) {
+            match character {
+                b'{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                b'}' if opened => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (number as u32, offset as u32 + 1);
+                    }
+                }
+                b';' if !opened => return (number as u32, offset as u32 + 1),
+                _ => {}
+            }
+        }
+    }
+    let last = lines.len().saturating_sub(1);
+    (
+        last as u32,
+        lines.get(last).map_or(0, |line| line.len() as u32),
+    )
+}
+
 fn parse(text: &str) -> Parsed {
     let mut parsed = Parsed::default();
+    let lines: Vec<&str> = text.lines().collect();
     for (number, line) in text.lines().enumerate() {
         let toks = identifiers(line, number as u32);
         for (at, tok) in toks.iter().enumerate() {
@@ -1017,6 +1071,7 @@ fn parse(text: &str) -> Parsed {
             {
                 parsed.types.push(TypeDecl {
                     tok: name.clone(),
+                    end: declaration_end(&lines, name),
                     kind,
                     supers: supertypes(line, name.end as usize),
                 });
@@ -1031,6 +1086,7 @@ fn parse(text: &str) -> Parsed {
                 if declares_function(line, &toks, at) {
                     parsed.fns.push(FnDecl {
                         tok: tok.clone(),
+                        end: declaration_end(&lines, tok),
                         kind: 12,
                         container: None,
                     });
