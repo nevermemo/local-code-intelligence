@@ -126,7 +126,14 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   hands out (the service's own, so a server started by navigation, search or a kept traverse server serves the others; the CLI
   `traverse` builds one per process and shuts it down after the walk), and a kept server's lifetime is the manager's (idle
   sweeper, `release_workspace`, shutdown). `Manager::probe_once` caches a successful version probe per provider for
-  the manager's life. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
+  the manager's life. Under `[run_profile.lsp] breaker = true` a manager also holds `lsp::LspBreakers`, one 30 s
+  window per provider (`LSP_DOWN_WINDOW`, the `ConnectBreaker` of the model clients): a failed probe in `probe_once`,
+  or a start in `Session::begin` that failed for a reason other than the transport's inactivity timeout
+  (`transport::InactivityTimeout`: a slow `initialize` is not a dead server), opens it, and `probe_once` and
+  `Manager::session` (a new start only; a usable session is returned whatever the window says) then refuse the
+  provider with a `lsp breaker` error until it has passed or a probe or start succeeds. `per_call_manager` gives
+  a call's own manager the windows of `Call.lsp_sessions` (under both `sessions` values), so a dead server found by
+  one call is skipped by the next; `/ready` probes the adapters directly and never reads them. The recipes walk no `lsp.live` and pass no manager. `[run_profile.lsp] outline_cache` (read by
   `Manager::new` from the config it is built with: the App's, the CLI's, or `Call.lsp` for a per-call manager) gives the
   manager an outline cache, used only for adapters whose `LspAdapter::opens_documents()` is true (pyright, gopls,
   jdtls, clangd: the hook resends the disk text and the server takes it): `Manager::document_symbols` keys each
@@ -175,7 +182,9 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   with an error `is_service_unavailable` accepts, and index-time `embed` makes one probe attempt without retries or
   backoff (a failed probe re-arms the window, an answer closes the breaker). An HTTP 5xx does not trip it.
   `rerank` makes one attempt and returns `(index, score)` best first; after a
-  refused connection a breaker skips the reranker for 30 s (`RERANKER_DOWN_WINDOW`). Batches the service rejects as
+  refused connection a breaker skips the reranker for 30 s (`RERANKER_DOWN_WINDOW`). The language servers have the same
+  window under `[run_profile.lsp] breaker = true` (`lsp::LspBreakers`, off by default; see the language-server item
+  above). Batches the service rejects as
   oversized are retried one input at a time with prefixes halved down to 512 bytes.
 
 ## Indexing flow and freshness

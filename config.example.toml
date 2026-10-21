@@ -683,7 +683,19 @@ mode = "cache"
 # symbol id of a file never outlined still has no place. Needs a server that
 # answers documentSymbol. The recipes never run lsp.live and are the same
 # under both values.
-# All six keys are part of the run-profile hash.
+# breaker = false (default): every call probes and starts a language server as it
+# is asked, so a server that is not there is probed again on every call. true: a
+# provider whose version probe failed, or whose server could not be started (it
+# could not be spawned, exited, or broke the protocol), is left alone for 30
+# seconds: the next probe or start of that provider is refused at once, with a
+# note that says so, and the window closes when a probe or a start succeeds. The
+# windows are per provider and shared by the process's managers (the service's
+# and each call's); `lci traverse` under sessions = "per_call" has no shared
+# manager and so no window. A server that is already running is still asked, a start that
+# timed out (lsp_timeout_seconds) opens no window because the server may only be
+# slow, and /ready still probes the binaries. The recipes never run lsp.live and
+# are the same under both values.
+# All seven keys are part of the run-profile hash.
 [run_profile.lsp]
 sessions = "shared"
 outline_cache = false
@@ -691,6 +703,7 @@ implementations = false
 call_hierarchy = false
 sync = "off"
 places = "scip"
+breaker = false
 
 # [run_profile.freshness]: verify on read. verify_on_read = false (default): every
 # answer is as without the key. true checks what a traverse answer cites against
