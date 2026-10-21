@@ -53,7 +53,7 @@ use local_code_intelligence::{
         traverse::{self, AppSeeds, BudgetArgs, Call, Dirs, SteerArgs},
         verify_scans_on_this_thread,
     },
-    config::IndexFreshness,
+    config::{IndexFreshness, LspPlaces},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -538,6 +538,9 @@ struct World {
     /// `[run_profile.lsp] sync = "watch"` for the application's language
     /// servers (`lsp.symbols`).
     sync: bool,
+    /// `[run_profile.lsp] places` for the calls of this world (K10a): `scip`,
+    /// or `outline`, which places `lsp.live` by the server's own outline.
+    places: LspPlaces,
     /// Observations made so far (names the SCIP file of each probe call).
     probe_runs: std::cell::Cell<u32>,
     /// The source files of the tree (path and content hash) as they were when
@@ -622,6 +625,7 @@ impl World {
             labels,
             verify,
             sync,
+            places: LspPlaces::Scip,
             probe_runs: std::cell::Cell::new(0),
             scip_tree,
         }
@@ -739,6 +743,7 @@ impl World {
         let mut profile = self.app.config.run_profile.clone();
         profile.traverse.map_freshness = self.labels;
         profile.freshness.verify_on_read = self.verify;
+        profile.lsp.places = self.places;
         let report = traverse::run(
             &self.app.config.traverse,
             &profile,
@@ -1277,6 +1282,16 @@ const VERIFIED_ON_READ: &[(Case, &str, Why)] = &[
     (Case::LineShift, "lsp.live", Why::LostEdge),
 ];
 
+/// The entries of [`VERIFIED_ON_READ`] that `[run_profile.lsp] places =
+/// "outline"` (K10a) changes, with what they become: `lsp.live` asks the server
+/// at the places of the server's own outline of the file, not at the index's, so
+/// one blank line on top of a file loses no edge (no `LostEdge`). Measured: the
+/// nodes it reaches are also reached through the index, whose card sites keep
+/// the index's lines, so the map is still stale and labelled, now as
+/// `SiteDrift` (with the other keys as the entry was: a gap while
+/// `verify_on_read` is off).
+const PLACED_BY_OUTLINE: &[(Case, &str, Why)] = &[(Case::LineShift, "lsp.live", Why::SiteDrift)];
+
 /// The maps that miss the edit but say so in `maps[]` with a lag that covers
 /// the files they are behind by (with the key off they are gaps: the same
 /// data, no label).
@@ -1309,12 +1324,21 @@ type Listed = Vec<(Case, &'static str, Why)>;
 /// The gaps and the labelled maps a case must find. Every key on: as the lists
 /// say. `verify_on_read` off: the verified maps are gaps. `map_freshness` off:
 /// every labelled map is a gap (`verify_on_read` does nothing without it in a
-/// traverse answer). `sync` off: the session's maps are gaps.
-fn expected(labels: bool, verify: bool, sync: bool) -> (Listed, Listed) {
+/// traverse answer). `sync` off: the session's maps are gaps. `places = outline`:
+/// the entries of [`PLACED_BY_OUTLINE`] have the reason it names.
+fn expected(labels: bool, verify: bool, sync: bool, places: LspPlaces) -> (Listed, Listed) {
     let unsynced = SYNCED.iter().copied().filter(|_| !sync);
     let gaps = EXPECTED_GAPS.iter().copied().chain(unsynced);
     let labelled = EXPECTED_LABELLED.iter().copied();
-    let verified = VERIFIED_ON_READ.iter().copied();
+    let verified = VERIFIED_ON_READ.iter().copied().map(move |entry| {
+        let placed = PLACED_BY_OUTLINE
+            .iter()
+            .find(|(case, map, _)| (*case, *map) == (entry.0, entry.1));
+        match placed {
+            Some((case, map, why)) if places == LspPlaces::Outline => (*case, *map, *why),
+            _ => entry,
+        }
+    });
     match (labels, verify) {
         (true, true) => (gaps.collect(), labelled.chain(verified).collect()),
         (true, false) => (gaps.chain(verified).collect(), labelled.collect()),
@@ -1491,18 +1515,22 @@ fn shift_table(verdicts: &BTreeMap<&str, Verdict>) -> String {
 }
 
 fn problems_of(
-    (labels, verify, sync): (bool, bool, bool),
+    (labels, verify, sync, places): (bool, bool, bool, LspPlaces),
     case: Case,
     found: &BTreeMap<&str, Verdict>,
 ) -> Result<(), String> {
-    let (gaps, labelled) = expected(labels, verify, sync);
+    let (gaps, labelled) = expected(labels, verify, sync, places);
     compare_gaps(&gaps, &labelled, case, found)
 }
 
 impl World {
     /// The lists of this world's keys against what a case found.
     fn problems(&self, case: Case, found: &BTreeMap<&str, Verdict>) -> Result<(), String> {
-        problems_of((self.labels, self.verify, self.sync), case, found)
+        problems_of(
+            (self.labels, self.verify, self.sync, self.places),
+            case,
+            found,
+        )
     }
 
     /// With the sync on, the session's own record shows it was told: a
@@ -1847,6 +1875,63 @@ async fn a_line_shift_moves_live_sites_and_the_gap_list_names_them() {
     world.finish().await;
 }
 
+/// The same shift with `[run_profile.lsp] places = "outline"` (K10a): the walk
+/// outlines `Calculator.cs` with the server before it asks, so `lsp.live` asks
+/// at the places of the tree as it is, not at the index's, and loses no edge:
+/// it is no longer the `LostEdge` gap of the default. It is still labelled
+/// stale, as `SiteDrift`: the nodes it reaches are also reached through the
+/// index, whose card sites are the index's lines (`PLACED_BY_OUTLINE`).
+/// Without the slice the walk asks at the index's line and the edge is lost.
+#[tokio::test]
+async fn a_line_shift_loses_no_lsp_live_edge_under_places_outline() {
+    let mut world = World::start(IndexFreshness::OnSearch).await;
+    world.places = LspPlaces::Outline;
+    world.edit().await;
+    world.regenerate_scip();
+    let before = world.observe().await;
+    world.shift().await;
+    let truth = world.truth();
+    let after = world.observe().await;
+    assert_eq!(truth.lines["Combine"], 5);
+    let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
+    let shown = shift_table(&verdicts);
+    eprintln!("{shown}");
+    world
+        .problems(Case::LineShift, &verdicts)
+        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    assert_eq!(
+        verdicts["lsp.live"],
+        Verdict::StaleLabelled { lag: 1 },
+        "{shown}"
+    );
+    // Every symbol-to-symbol edge `lsp.live` offered before the shift is still
+    // there, and the walk paid for the outline it asked at.
+    let symbols = |observed: &Observed| -> BTreeSet<(String, String)> {
+        observed
+            .edges
+            .get("lsp.live")
+            .into_iter()
+            .flatten()
+            .filter(|(src, dst)| src.starts_with("sym:") && dst.starts_with("sym:"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        !symbols(&before).is_empty(),
+        "{:?}",
+        before.edges.get("lsp.live")
+    );
+    assert!(symbols(&before).is_subset(&symbols(&after)));
+    let walk_state = world._temp.path().join("lsp-walk");
+    assert!(
+        events_of(&walk_state)
+            .iter()
+            .any(|event| event["method"] == "textDocument/documentSymbol"),
+        "the walk asked the server for an outline"
+    );
+    world.finish().await;
+}
+
 /// A rewritten SCIP file (a longer one: the stamp is `(mtime, length)`)
 /// refreshes every map built from it, and only those (the language-server
 /// session is fresh by the sync, which this world has on). The next edit
@@ -2100,8 +2185,12 @@ async fn without_the_key_the_labelled_maps_are_gaps_and_the_answer_has_no_maps()
     let verdicts = world.verdicts(&before, &now, &truth);
     let shown = table(Case::OnSearch, &verdicts);
     eprintln!("key off\n{shown}");
-    problems_of((false, false, false), Case::OnSearch, &verdicts)
-        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    problems_of(
+        (false, false, false, LspPlaces::Scip),
+        Case::OnSearch,
+        &verdicts,
+    )
+    .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     // Every map the key labels is a silent gap here (the lag is the number of
     // generations).
     for (_, map, why) in EXPECTED_LABELLED
@@ -2130,8 +2219,12 @@ async fn without_the_key_the_labelled_maps_are_gaps_on_a_line_shift_too() {
     let verdicts = shift_verdicts(&before, &after, &truth, world.files_behind());
     let shown = shift_table(&verdicts);
     eprintln!("key off\n{shown}");
-    problems_of((false, false, false), Case::LineShift, &verdicts)
-        .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
+    problems_of(
+        (false, false, false, LspPlaces::Scip),
+        Case::LineShift,
+        &verdicts,
+    )
+    .unwrap_or_else(|problem| panic!("{problem}\n{shown}"));
     world.finish().await;
 }
 
@@ -2329,7 +2422,7 @@ fn the_gap_list_is_exact_in_both_directions() {
     // `verify_on_read` moves exactly the verified maps between the lists:
     // labelled with both keys on, gaps with it off, and every labelled map is
     // a gap with `map_freshness` off.
-    let (gaps, labelled) = expected(true, true, true);
+    let (gaps, labelled) = expected(true, true, true, LspPlaces::Scip);
     for entry in VERIFIED_ON_READ {
         assert!(
             labelled.contains(entry) && !gaps.contains(entry),
@@ -2351,8 +2444,8 @@ fn the_gap_list_is_exact_in_both_directions() {
         ]
     );
     for (labels, verify) in [(true, true), (true, false), (false, false)] {
-        let (on, on_labelled) = expected(labels, verify, true);
-        let (off, off_labelled) = expected(labels, verify, false);
+        let (on, on_labelled) = expected(labels, verify, true, LspPlaces::Scip);
+        let (off, off_labelled) = expected(labels, verify, false, LspPlaces::Scip);
         assert_eq!(on_labelled, off_labelled);
         let added: Listed = off
             .iter()
@@ -2362,7 +2455,7 @@ fn the_gap_list_is_exact_in_both_directions() {
         assert_eq!(added, SYNCED);
         assert!(on.iter().all(|entry| off.contains(entry)));
     }
-    let (gaps, labelled) = expected(true, false, true);
+    let (gaps, labelled) = expected(true, false, true, LspPlaces::Scip);
     for entry in VERIFIED_ON_READ {
         assert!(
             gaps.contains(entry) && !labelled.contains(entry),
@@ -2370,7 +2463,7 @@ fn the_gap_list_is_exact_in_both_directions() {
         );
     }
     assert_eq!(labelled, EXPECTED_LABELLED);
-    let (gaps, labelled) = expected(false, true, false);
+    let (gaps, labelled) = expected(false, true, false, LspPlaces::Scip);
     assert!(labelled.is_empty());
     assert_eq!(
         gaps.len(),
@@ -2378,12 +2471,43 @@ fn the_gap_list_is_exact_in_both_directions() {
     );
     for (labels, verify) in [(true, true), (true, false), (false, false)] {
         for sync in [true, false] {
-            let (gaps, labelled) = expected(labels, verify, sync);
+            let (gaps, labelled) = expected(labels, verify, sync, LspPlaces::Scip);
+            lists_are_exact(&gaps, &labelled);
+        }
+    }
+    // `places = outline` changes exactly the reason of the entries of
+    // `PLACED_BY_OUTLINE` (on whichever list the other keys put them), and
+    // nothing else moves.
+    for (case, map, why) in PLACED_BY_OUTLINE {
+        assert!(
+            VERIFIED_ON_READ
+                .iter()
+                .any(|entry| (entry.0, entry.1) == (*case, *map) && entry.2 != *why),
+            "{case:?} {map} is on the verified list with another reason"
+        );
+    }
+    let placed = |list: &Listed| -> Listed {
+        list.iter()
+            .map(|&entry| {
+                PLACED_BY_OUTLINE
+                    .iter()
+                    .find(|(case, map, _)| (*case, *map) == (entry.0, entry.1))
+                    .map_or(entry, |&(case, map, why)| (case, map, why))
+            })
+            .collect()
+    };
+    for (labels, verify) in [(true, true), (true, false), (false, false)] {
+        for sync in [true, false] {
+            let (scip_gaps, scip_labelled) = expected(labels, verify, sync, LspPlaces::Scip);
+            let (gaps, labelled) = expected(labels, verify, sync, LspPlaces::Outline);
+            assert_eq!(gaps, placed(&scip_gaps), "{labels} {verify} {sync}");
+            assert_eq!(labelled, placed(&scip_labelled), "{labels} {verify} {sync}");
+            assert!(gaps != scip_gaps || labelled != scip_labelled);
             lists_are_exact(&gaps, &labelled);
         }
     }
     // A map that gave nothing before the edit cannot be called fresh or a gap.
-    let (gaps, labelled) = expected(true, true, true);
+    let (gaps, labelled) = expected(true, true, true, LspPlaces::Scip);
     let mut unexercised = verdicts_of(Case::OnSearch, &gaps, &labelled);
     unexercised.insert("grep.live", Verdict::Unexercised);
     assert!(compare_gaps(&gaps, &labelled, Case::OnSearch, &unexercised).is_err());
