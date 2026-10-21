@@ -367,6 +367,13 @@ async fn a_language_server_past_its_budget_is_a_structured_fact_and_priming_keep
         "{:?}",
         search.notes
     );
+    // The note also says what the server reports (its state word depends on the
+    // load: a start that finishes inside the budget reads `ready`).
+    assert!(
+        search.notes[0].contains("Server state: csharp-ls:"),
+        "{:?}",
+        search.notes
+    );
     assert_eq!(
         serde_json::to_value(&search).unwrap()["lsp_over_budget"],
         json!(["csharp-ls"])

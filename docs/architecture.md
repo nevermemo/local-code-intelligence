@@ -155,6 +155,12 @@ reranker are each a URL, a model name and optionally the NAME of an environment 
   tree. `flatten_document_symbols` gives a nested `DocumentSymbol` the range from its name to its item's end, so
   `Member::end_line` is the last line of the item.
   it is recorded without dropping the edges of the first two.
+  Readiness is reported, not acted on: the transport keeps the `is_ready` latch (the adapter's `ready_predicate`
+  matched once, never cleared) and, beside it, a `watch` of `ServerState` (`busy`, `changes`, `changed_at`) fed by the
+  adapter's `busy_predicate` (default: never; rust-analyzer `quiescent: false`, jdtls `Starting`). `Manager::readiness`
+  turns a session into a `ServerReadiness` (`starting`, `ready`, `busy`, `failed` or `stuck`, primed, counters, ages)
+  without touching `last_used`; `Status.analyzers`, the search over-budget note and the `lsp.live` notes of a traverse
+  call read it. No request, repeat or answer depends on it.
   `[run_profile.lsp] sync = "watch"` (read by `Manager::new`; a per-call
   manager is built `without_sync`) gives each workspace with a session an `lsp::sync::WorkspaceSync`: a `notify`
   watcher of the root (polling at `watch_poll_milliseconds` when the platform watcher fails) whose events a task
