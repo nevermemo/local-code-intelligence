@@ -1224,6 +1224,25 @@ async fn flow_from_runs_the_same_under_both_session_settings() {
     }
 }
 
+/// `[run_profile.seeds] bm25` reaches the recipes' walk (the profile is the one
+/// they run under) and changes nothing there: the seeds of `flow_from` are
+/// given, so no seeds map runs under either value.
+#[tokio::test]
+async fn flow_from_runs_the_same_with_seeds_bm25_on() {
+    let request = json!({"flow_from": {"entry": "beta", "k": 5}});
+    let off = Tree::new().ask(request.clone(), false).await;
+    let mut profile = RunProfileConfig::default();
+    profile.seeds.bm25 = true;
+    let on = Tree::new().ask_under(request, false, &profile).await;
+    assert!(!names(&off, "walk").is_empty(), "{off}");
+    assert_eq!(on["walk"], off["walk"], "{on}");
+    assert_eq!(on["stop"], off["stop"]);
+    for count in ["cards_seen", "judge_calls", "operator_calls"] {
+        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+    }
+    assert!(!on.to_string().contains("bm25"), "{on}");
+}
+
 /// The recipes pass their run profile to the walk of `flow_from`, so the
 /// freshness keys reach it. Its answer carries no `maps` and no `file_changed`
 /// (it reads the walk's cards, not the labels), so with both keys on it is the
@@ -1250,31 +1269,41 @@ async fn flow_from_answers_the_same_with_the_freshness_keys_on() {
     assert_eq!(trace_ranks(&keyed), trace_ranks(&plain));
 }
 
-/// `[run_profile.lsp] implementations` reaches the recipes' walk (the profile
-/// is the one they run under) and changes nothing there: the walk has no
-/// `lsp.live`, the only map that asks for implementations, so the stamped
-/// profile hash stays true for a recipe whichever way the key is set.
+/// The `[run_profile.lsp]` request switches (`implementations`,
+/// `call_hierarchy`) reach the recipes' walk (the profile is the one they run
+/// under) and change nothing there: the walk has no `lsp.live`, the only map
+/// that asks for implementations or the call hierarchy, so the stamped profile
+/// hash stays true for a recipe whichever way a key is set.
 #[tokio::test]
-async fn flow_from_runs_the_same_with_implementations_on() {
+async fn flow_from_runs_the_same_with_the_lsp_request_switches_on() {
     assert!(!FLOW_WALK_MAPS.contains(&lci_maps::lsp_live::LSP_LIVE_ID));
     let request = json!({"flow_from": {"entry": "beta", "k": 5}});
     let off = Tree::new().ask(request.clone(), false).await;
-    let on = Tree::new()
-        .ask_under(
-            request,
-            false,
-            &RunProfileConfig {
-                lsp: lci_core::config::LspProfile {
-                    implementations: true,
-                    ..lci_core::config::LspProfile::default()
+    let profiles = [
+        lci_core::config::LspProfile {
+            implementations: true,
+            ..lci_core::config::LspProfile::default()
+        },
+        lci_core::config::LspProfile {
+            call_hierarchy: true,
+            ..lci_core::config::LspProfile::default()
+        },
+    ];
+    for lsp in profiles {
+        let on = Tree::new()
+            .ask_under(
+                request.clone(),
+                false,
+                &RunProfileConfig {
+                    lsp,
+                    ..RunProfileConfig::default()
                 },
-                ..RunProfileConfig::default()
-            },
-        )
-        .await;
-    assert_eq!(on["walk"], off["walk"], "{on}");
-    assert_eq!(on["stop"], off["stop"], "{on}");
-    for count in ["cards_seen", "judge_calls", "operator_calls"] {
-        assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+            )
+            .await;
+        assert_eq!(on["walk"], off["walk"], "{on}");
+        assert_eq!(on["stop"], off["stop"], "{on}");
+        for count in ["cards_seen", "judge_calls", "operator_calls"] {
+            assert_eq!(on["counts"][count], off["counts"][count], "{count}");
+        }
     }
 }

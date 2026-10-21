@@ -84,6 +84,11 @@ struct Fake {
     implementations: HashMap<Place, Vec<Place>>,
     /// `Some`: every implementation request fails with this text.
     implementation_error: Option<String>,
+    /// Per place of a callable: its callers and its callees. A prepare request
+    /// answers one item at the asked place when the key exists, else nothing.
+    hierarchy: HashMap<Place, (Vec<CallLink>, Vec<CallLink>)>,
+    /// `Some((method, text))`: that call-hierarchy request fails with the text.
+    hierarchy_error: Option<(&'static str, String)>,
     members: HashMap<String, Vec<Member>>,
     delay: Duration,
     requests: Arc<AtomicU32>,
@@ -95,6 +100,48 @@ impl Fake {
         self.requests.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
         Ok(found.cloned().unwrap_or_default())
+    }
+}
+
+/// The server's own item of the callable named at `at`: the map must send it
+/// back as it got it.
+fn raw_item(at: &Place) -> serde_json::Value {
+    serde_json::json!({"name": at.path, "data": {"line": at.line, "col": at.col}})
+}
+
+fn call_item(path: &str, line: u32, col: u32) -> CallItem {
+    let place = place(path, line, col);
+    CallItem {
+        raw: raw_item(&place),
+        place,
+    }
+}
+
+fn link(item: CallItem, sites: &[Place]) -> CallLink {
+    CallLink {
+        item,
+        sites: sites.to_vec(),
+    }
+}
+
+impl Fake {
+    /// One call-hierarchy request: counted, delayed, and refused when
+    /// `hierarchy_error` names it.
+    async fn hierarchy_request(&self, method: &str) -> Result<(), String> {
+        self.answer::<()>(None).await?;
+        match &self.hierarchy_error {
+            Some((failing, error)) if *failing == method => Err(error.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    fn calls_of(&self, item: &CallItem) -> Result<&(Vec<CallLink>, Vec<CallLink>), String> {
+        if item.raw != raw_item(&item.place) {
+            return Err("the item was not sent back as it was given".to_owned());
+        }
+        self.hierarchy
+            .get(&item.place)
+            .ok_or_else(|| "no such item".to_owned())
     }
 }
 
@@ -124,6 +171,32 @@ impl LspBackend for Fake {
             Some(error) => Err(error.clone()),
             None => answer,
         }
+    }
+
+    async fn prepare_call_hierarchy(&self, at: &Place) -> Result<Vec<CallItem>, String> {
+        self.hierarchy_request("textDocument/prepareCallHierarchy")
+            .await?;
+        Ok(self
+            .hierarchy
+            .contains_key(at)
+            .then(|| CallItem {
+                place: at.clone(),
+                raw: raw_item(at),
+            })
+            .into_iter()
+            .collect())
+    }
+
+    async fn incoming_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
+        self.hierarchy_request("callHierarchy/incomingCalls")
+            .await?;
+        Ok(self.calls_of(item)?.0.clone())
+    }
+
+    async fn outgoing_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
+        self.hierarchy_request("callHierarchy/outgoingCalls")
+            .await?;
+        Ok(self.calls_of(item)?.1.clone())
     }
 
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
@@ -343,6 +416,244 @@ async fn an_implementation_error_keeps_the_other_edges() {
         error.starts_with("textDocument/implementation: ")
             && error.contains("no implementation provider"),
         "{error}"
+    );
+}
+
+/// `x`: called by `b` (at src/b.rs:11:2) and by something in a file the index
+/// has no symbol for; it calls `c` (at src/x.rs:1:4) and, once, itself.
+fn fake_with_hierarchy() -> Fake {
+    Fake {
+        hierarchy: HashMap::from([(
+            place("src/x.rs", 0, 3),
+            (
+                vec![
+                    link(
+                        call_item("src/b.rs", 10, 3),
+                        &[place("src/b.rs", 11, 9), place("src/b.rs", 11, 2)],
+                    ),
+                    link(call_item("src/z.rs", 0, 0), &[]),
+                ],
+                vec![
+                    link(call_item("src/c.rs", 5, 3), &[place("src/x.rs", 1, 4)]),
+                    link(call_item("src/x.rs", 0, 3), &[place("src/x.rs", 1, 1)]),
+                ],
+            ),
+        )]),
+        ..Fake::default()
+    }
+}
+
+fn rows(map: &LspLive, seed: &NodeId, found: &Expanded) -> Vec<Row> {
+    check_edge_invariants(seed, map.describe(), &found.edges, EXPAND_LIMIT).unwrap();
+    found
+        .edges
+        .iter()
+        .map(|edge| {
+            assert_eq!(edge.src, *seed);
+            assert_eq!(edge.witness, WitnessClass::Exact);
+            assert_eq!((edge.map, edge.conf), (LSP_LIVE_ID, CONF_MAX));
+            let site = edge.site.as_ref().unwrap();
+            (edge.kind, edge.dst.clone(), site.path.clone(), site.line)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn call_hierarchy_edges_follow_the_fakes_items_and_sites() {
+    let wide = || budget(Duration::from_secs(5), 10);
+
+    // Key on: five requests (definition, references, prepare, incoming,
+    // outgoing), `CallsOrRefs` edges only, a caller's and a callee's site the
+    // call (the smallest place of its calls), a destination with no symbol its
+    // file at the item's place, the node itself left out.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    let mut want: Vec<Row> = vec![
+        (EdgeKind::CallsOrRefs, sym("b"), "src/b.rs".into(), 11),
+        (
+            EdgeKind::CallsOrRefs,
+            file("src/z.rs"),
+            "src/z.rs".into(),
+            0,
+        ),
+        (EdgeKind::CallsOrRefs, sym("c"), "src/x.rs".into(), 1),
+    ];
+    want.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(rows(&map, &sym("x"), &found), want);
+    assert_eq!(requests.load(Ordering::SeqCst), 5);
+    assert_eq!(found.cost.external_calls, 5);
+    assert_eq!(found.cost.nodes_touched, 3);
+    assert!(map.last_error().is_none());
+
+    // Key off (the default): today's two requests and no hierarchy edge.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert!(found.edges.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(found.cost.external_calls, 2);
+
+    // Both optional keys on: the implementation request comes first, then the
+    // hierarchy's three.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).implementations(true).call_hierarchy(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 6);
+    assert_eq!(found.cost.external_calls, 6);
+    assert_eq!(found.edges.len(), 3);
+}
+
+#[tokio::test]
+async fn a_destination_the_references_named_gets_no_second_edge() {
+    // `fake()`'s `y` is used inside `c` (first at src/c.rs:6) and in a file
+    // with no symbol; the hierarchy names `c` once more, and `a` besides.
+    let mut backend = fake();
+    backend.hierarchy = HashMap::from([(
+        place("src/y.rs", 0, 3),
+        (
+            vec![
+                link(call_item("src/c.rs", 5, 3), &[place("src/c.rs", 8, 0)]),
+                link(call_item("src/a.rs", 1, 3), &[place("src/a.rs", 2, 0)]),
+            ],
+            vec![link(
+                call_item("src/c.rs", 5, 3),
+                &[place("src/y.rs", 1, 0)],
+            )],
+        ),
+    )]);
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map
+        .expand(&sym("y"), budget(Duration::from_secs(5), 10), &view())
+        .await;
+    let mut want: Vec<Row> = vec![
+        (EdgeKind::CallsOrRefs, sym("c"), "src/c.rs".into(), 6),
+        (
+            EdgeKind::CallsOrRefs,
+            file("src/z.rs"),
+            "src/z.rs".into(),
+            2,
+        ),
+        (EdgeKind::CallsOrRefs, sym("a"), "src/a.rs".into(), 2),
+    ];
+    want.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(rows(&map, &sym("y"), &found), want);
+    assert_eq!(found.cost.nodes_touched, found.edges.len() as u64);
+    assert_eq!(found.cost.external_calls, 5);
+}
+
+#[tokio::test]
+async fn call_hierarchy_is_gated_by_the_budget_and_stops_after_an_empty_prepare() {
+    // Room for three calls: definition, references, prepare. Neither the
+    // callers nor the callees are asked.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 3), &view())
+        .await;
+    assert!(found.edges.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(found.cost.external_calls, 3);
+    assert!(map.last_error().is_none());
+
+    // Room for four: the callers are asked, the callees are not.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map
+        .expand(&sym("x"), budget(Duration::from_secs(5), 4), &view())
+        .await;
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    assert_eq!(found.edges.len(), 2, "the callers only");
+
+    // A node the server has no item for: prepare is empty, nothing more is
+    // asked, nothing fails.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map
+        .expand(&sym("y"), budget(Duration::from_secs(5), 10), &view())
+        .await;
+    assert!(found.edges.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(found.cost.external_calls, 3);
+    assert!(map.last_error().is_none());
+
+    // A file node asks for its symbols only.
+    let backend = fake_with_hierarchy();
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    map.expand(
+        &file("src/x.rs"),
+        budget(Duration::from_secs(5), 10),
+        &view(),
+    )
+    .await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_call_hierarchy_error_keeps_the_other_edges() {
+    let with = |method: &'static str| {
+        // `fake()` defines `x` at `b`'s name (a definition edge to `b`).
+        let mut backend = fake();
+        backend.hierarchy = fake_with_hierarchy().hierarchy;
+        backend.hierarchy_error = Some((method, "no provider".to_owned()));
+        backend
+    };
+    let wide = || budget(Duration::from_secs(5), 10);
+    let destinations = |found: &Expanded| -> Vec<NodeId> {
+        found.edges.iter().map(|edge| edge.dst.clone()).collect()
+    };
+
+    // The callers fail: the definition edge stands, the callees are still asked.
+    let backend = with("callHierarchy/incomingCalls");
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    let mut want = vec![sym("b"), sym("c")];
+    want.sort();
+    assert_eq!(destinations(&found), want);
+    assert_eq!(requests.load(Ordering::SeqCst), 5);
+    assert_eq!(found.cost.external_calls, 5);
+    let error = map.last_error().expect("the failure is recorded");
+    assert!(
+        error.starts_with("callHierarchy/incomingCalls: ") && error.contains("no provider"),
+        "{error}"
+    );
+
+    // The callees fail: the definition edge and the callers' edges stand (the
+    // definition's `b` is also a caller: still one edge to it).
+    let backend = with("callHierarchy/outgoingCalls");
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(found.cost.external_calls, 5);
+    let mut want = vec![sym("b"), file("src/z.rs")];
+    want.sort();
+    assert_eq!(destinations(&found), want);
+    assert!(
+        map.last_error()
+            .unwrap()
+            .starts_with("callHierarchy/outgoingCalls: ")
+    );
+
+    // Prepare fails (a server without call hierarchy answers -32601 here):
+    // the definition edge stands and nothing more is asked.
+    let backend = with("textDocument/prepareCallHierarchy");
+    let requests = backend.requests.clone();
+    let map = map_over(backend).call_hierarchy(true);
+    let found = map.expand(&sym("x"), wide(), &view()).await;
+    assert_eq!(destinations(&found), [sym("b")]);
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(found.cost.external_calls, 3);
+    assert!(
+        map.last_error()
+            .unwrap()
+            .starts_with("textDocument/prepareCallHierarchy: ")
     );
 }
 

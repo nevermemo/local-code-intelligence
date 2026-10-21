@@ -2,11 +2,12 @@
 //!
 //! Everything here is computed from the scorer report and the per-item metrics
 //! the run already wrote (`score.json`, `items.json`). Nothing is re-run and no
-//! other output changes: `run.json`, `score.json`, `items.json`, `row.md` and
-//! the trend row are byte-for-byte what they were. The file adds, per set, the
-//! secondary metrics and strata that the one-line row leaves out, and a footer
-//! that names which metrics sit near a ceiling, so a delta on a saturated
-//! metric is not read as evidence.
+//! other output changes. The file adds, per set, the secondary metrics and
+//! strata that the one-line row leaves out, a second table of the costs per
+//! stratum (the `costs` block `maps bench` adds to `score.json`: mean
+//! expansions, external calls, `lsp.live` ms and answer tokens, and the budget
+//! hits), and a footer that names which metrics sit near a ceiling, so a delta
+//! on a saturated metric is not read as evidence.
 
 use crate::gold::Set;
 use serde_json::Value;
@@ -89,6 +90,57 @@ fn mean_precision(items: &Value) -> Option<(f64, usize)> {
     ))
 }
 
+/// The cost table of a set: the means per value of the plan's dimension next
+/// to the budget hits, or `None` for a report with no `costs` block (a run from
+/// before it).
+fn costs_table(plan: &Plan, report: &Value) -> Option<String> {
+    let costs = report.get("costs").filter(|c| c.is_object())?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} | n | expansions | external_calls | lsp_ms | answer_tokens | budget hits",
+        plan.dimension
+    );
+    let _ = writeln!(out, "{}", ["---"; 7].join(" | "));
+    let mut row = |label: &str, cell: &Value| {
+        let mean = |name: &str| {
+            cell["mean"][name]
+                .as_f64()
+                .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"))
+        };
+        let hits = cell["budget_hits"]
+            .as_object()
+            .filter(|h| !h.is_empty())
+            .map_or_else(
+                || "none".to_owned(),
+                |h| {
+                    h.iter()
+                        .map(|(kind, n)| format!("{kind}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            );
+        let _ = writeln!(
+            out,
+            "{label} | {} | {} | {} | {} | {} | {hits}",
+            cell["n"],
+            mean("expansions"),
+            mean("external_calls"),
+            mean("lsp_ms"),
+            mean("answer_tokens"),
+        );
+    };
+    row("all", &costs["overall"]);
+    for (value, cell) in costs["strata"][plan.dimension]
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        row(value, cell);
+    }
+    Some(out)
+}
+
 /// The supplement of one set, or `None` when the set has none or nothing was
 /// scored.
 pub fn render(set: Set, report: &Value, items: &Value) -> Option<String> {
@@ -134,6 +186,13 @@ pub fn render(set: Set, report: &Value, items: &Value) -> Option<String> {
             out,
             "\nAnswer precision (share of returned answers that are not spurious, mean per item): {p:.3} over {n}"
         );
+    }
+    if let Some(table) = costs_table(&plan, report) {
+        let _ = writeln!(
+            out,
+            "\nCosts per stratum (mean per item; a budget hit is a walk cut by the pop cap, the token budget or a deadline, or a spent external-call allowance, and `maps compare` leaves such items out by default):\n"
+        );
+        let _ = write!(out, "{table}");
     }
     let _ = writeln!(out);
     for line in plan.footer {
@@ -199,6 +258,45 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\nH2 | 1 | 1.000"), "{text}");
+    }
+
+    #[test]
+    fn a_costs_block_adds_one_table_per_plan_dimension() {
+        let mut report = impact_report();
+        report["costs"] = json!({
+            "overall": {"n": 3, "mean": {"expansions": 10.0, "external_calls": 1.0, "lsp_ms": 12.5, "answer_tokens": 40.0},
+                        "budget_hits": {"pops": 1}},
+            "strata": {
+                "band": {"common": {"n": 2, "mean": {"expansions": 12.0, "external_calls": 1.5, "lsp_ms": 18.75, "answer_tokens": 50.0},
+                                    "budget_hits": {"pops": 1, "tokens": 1}},
+                         "unique": {"n": 1, "mean": {"expansions": 6.0, "external_calls": 0.0, "lsp_ms": 0.0, "answer_tokens": 20.0},
+                                    "budget_hits": {}}},
+                "kind": {"fn": {"n": 3, "mean": {}, "budget_hits": {}}}
+            }
+        });
+        let text = render(Set::Impact, &report, &Value::Null).unwrap();
+        assert!(
+            text.contains(
+                "band | n | expansions | external_calls | lsp_ms | answer_tokens | budget hits"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("all | 3 | 10.00 | 1.00 | 12.50 | 40.00 | pops=1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("common | 2 | 12.00 | 1.50 | 18.75 | 50.00 | pops=1 tokens=1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("unique | 1 | 6.00 | 0.00 | 0.00 | 20.00 | none"),
+            "{text}"
+        );
+        // Only the plan's dimension is tabled, and a report without costs has no table.
+        assert!(!text.contains("fn | 3"), "{text}");
+        let plain = render(Set::Impact, &impact_report(), &Value::Null).unwrap();
+        assert!(!plain.contains("Costs per stratum"), "{plain}");
     }
 
     #[test]

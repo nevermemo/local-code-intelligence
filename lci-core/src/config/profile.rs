@@ -36,6 +36,23 @@ pub struct RunProfileConfig {
     pub lsp: LspProfile,
     /// `[run_profile.freshness]`: whether an answer is checked against the tree.
     pub freshness: RunProfileFreshness,
+    /// `[run_profile.seeds]`: where a traversal's starting nodes come from.
+    pub seeds: RunProfileSeeds,
+}
+
+/// `[run_profile.seeds]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfileSeeds {
+    /// Let the opt-in map `seeds.bm25` run. `false` (the default): naming it
+    /// gives a note and no seeds, it is not in the default map set, and every
+    /// answer is as without the key. `true`: the map is in the default set
+    /// when a call names no maps, and it runs when named. It ranks the SCIP
+    /// graph's function and method nodes by BM25 over their name, path and
+    /// documentation tokens, and its nodes are appended after the hybrid
+    /// search's seeds. The recipes' seeds are given, so they run the same
+    /// under both values.
+    pub bm25: bool,
 }
 
 /// `[run_profile.freshness]`.
@@ -327,6 +344,15 @@ pub struct LspProfile {
     /// symbol node). The recipes walk no `lsp.live` and run the same under both
     /// values.
     pub implementations: bool,
+    /// `false` (default): `lsp.live` asks a symbol node for its definition and
+    /// its references (and, under `implementations`, its implementations).
+    /// `true`: it also asks the call hierarchy (`textDocument/
+    /// prepareCallHierarchy`, then `callHierarchy/incomingCalls` and
+    /// `callHierarchy/outgoingCalls`: up to three more external calls per
+    /// symbol node) and reports the callers and callees as `calls_or_refs`
+    /// edges. A server that refuses a request costs the other edges nothing.
+    /// The recipes walk no `lsp.live` and run the same under both values.
+    pub call_hierarchy: bool,
     /// `"off"` (default): a language server is told nothing about edits after
     /// it starts. `"watch"`: a long-lived manager (the MCP and REST server's,
     /// the one `lci traverse` builds under `sessions = "shared"`) watches each
@@ -616,6 +642,8 @@ mod tests {
         config.run_profile.freshness.verify_on_read = true;
         config.run_profile.lsp.outline_cache = true;
         config.run_profile.lsp.implementations = true;
+        config.run_profile.lsp.call_hierarchy = true;
+        config.run_profile.seeds.bm25 = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config
     }
@@ -847,6 +875,44 @@ mode = \"sometimes\"
     }
 
     #[test]
+    fn seeds_bm25_is_off_by_default_and_is_part_of_the_profile() {
+        let off = Config::default();
+        assert!(!off.run_profile.seeds.bm25);
+        let on: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        on.validate().unwrap();
+        assert!(on.run_profile.seeds.bm25);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["run_profile"]["seeds"]["bm25"],
+            true
+        );
+        let (off, on) = (off.run_profile(), on.run_profile());
+        assert_eq!(off.value["run_profile"]["seeds"]["bm25"], false);
+        assert_eq!(on.value["run_profile"]["seeds"]["bm25"], true);
+        assert!(off.keys.iter().any(|key| key == "run_profile.seeds.bm25"));
+        assert_ne!(off.hash, on.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.seeds]\nbm25 = false\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, off.hash);
+        for bad in [
+            "[run_profile.seeds]\nbm25 = \"yes\"\n",
+            "[run_profile.seeds]\nbm25 = 1\n",
+            "[run_profile.seeds]\nfoo = 1\n",
+            "[run_profile]\nbm25 = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn canonical_json_has_sorted_keys_and_no_whitespace() {
         let mixed = json!({"b": 1, "a": [{"d": 1, "c": "x y"}, 2.5], "e": {}});
         assert_eq!(
@@ -930,6 +996,8 @@ mode = \"sometimes\"
             "run_profile.freshness.verify_on_read",
             "run_profile.lsp.outline_cache",
             "run_profile.lsp.implementations",
+            "run_profile.lsp.call_hierarchy",
+            "run_profile.seeds.bm25",
             "run_profile.lsp.sync",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
@@ -1111,6 +1179,68 @@ mode = \"sometimes\"
             diff = format!("golden:\n{expected_text}\ncode:\n{actual_text}");
         }
         diff
+    }
+
+    #[test]
+    fn lsp_request_switches_are_off_by_default_and_change_the_profile_hash() {
+        for leaf in ["implementations", "call_hierarchy"] {
+            let off = Config::default();
+            assert!(!off.run_profile.lsp.implementations);
+            assert!(!off.run_profile.lsp.call_hierarchy);
+            let text = format!("{}[run_profile.lsp]\n{leaf} = true\n", base_toml());
+            let on: Config = toml::from_str(&text).unwrap();
+            on.validate().unwrap();
+            // Only the named leaf moves; the others keep their defaults.
+            let value = serde_json::to_value(&on).unwrap();
+            for other in ["implementations", "call_hierarchy"] {
+                assert_eq!(
+                    value["run_profile"]["lsp"][other],
+                    other == leaf,
+                    "{leaf} vs {other}"
+                );
+            }
+            assert_eq!(on.run_profile.lsp.sessions, LspSessions::PerCall);
+            assert!(!on.run_profile.lsp.outline_cache);
+            // It changes what an lsp.live answer holds, so it changes the hash.
+            let (off, on) = (off.run_profile(), on.run_profile());
+            assert_eq!(off.value["run_profile"]["lsp"][leaf], false);
+            assert_eq!(on.value["run_profile"]["lsp"][leaf], true);
+            let key = format!("run_profile.lsp.{leaf}");
+            assert!(off.keys.contains(&key), "{key}");
+            assert_ne!(off.hash, on.hash, "{leaf}");
+            // Spelling out the default is the default.
+            let spelled: Config = toml::from_str(&format!(
+                "{}[run_profile.lsp]\n{leaf} = false\n",
+                base_toml()
+            ))
+            .unwrap();
+            assert_eq!(spelled.run_profile().hash, off.hash, "{leaf}");
+            for bad in [
+                format!("[run_profile.lsp]\n{leaf} = \"yes\"\n"),
+                format!("[run_profile.lsp]\n{leaf} = 1\n"),
+                format!("[run_profile]\n{leaf} = true\n"),
+            ] {
+                let text = format!("{}{bad}", base_toml());
+                assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+            }
+        }
+        // The two switches are separate leaves of the hash.
+        let with = |leaves: &str| -> Config {
+            toml::from_str(&format!("{}[run_profile.lsp]\n{leaves}", base_toml())).unwrap()
+        };
+        let hashes = [
+            with("implementations = true\ncall_hierarchy = true\n")
+                .run_profile()
+                .hash,
+            with("implementations = true\n").run_profile().hash,
+            with("call_hierarchy = true\n").run_profile().hash,
+            Config::default().run_profile().hash,
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

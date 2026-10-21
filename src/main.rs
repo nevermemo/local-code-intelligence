@@ -400,6 +400,10 @@ struct TraverseArgs {
     /// Maps to use, comma separated: graph.scip, structure.contains,
     /// seeds.hybrid, seeds.scip_names (default: all four). Without
     /// seeds.hybrid the stand-in seeds.scip_names finds the start nodes;
+    /// seeds.bm25 (BM25 over the SCIP graph's symbol names, paths and
+    /// documentation, its nodes after the hybrid search's) joins the default
+    /// set and runs only with `[run_profile.seeds] bm25 = true`, and needs no
+    /// --root;
     /// structure.contains lets a chunk or file start node reach the symbols it
     /// holds. Also available, only when named, and all need --root: grep.live
     /// (a search of the tree's current bytes), config.key (config keys and

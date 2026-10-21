@@ -27,6 +27,22 @@
 //!   error reply from the implementation request costs the other edges nothing
 //!   (the error is kept in [`LspLive::last_error`]); a hang still trips the
 //!   call's deadline and clears them all.
+//! * with `[run_profile.lsp] call_hierarchy = true` (default off), up to three
+//!   more requests for a symbol: `textDocument/prepareCallHierarchy` at its
+//!   name, then `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`
+//!   of the item that answers (none: no further request). Both directions are
+//!   [`EdgeKind::CallsOrRefs`] (the kind has no direction, d397), one edge per
+//!   destination: a caller is a destination that refers to the symbol
+//!   (direction reversed, as `references`), a callee one the symbol refers to
+//!   (as `graph.scip`). The site is the smallest place of the call itself
+//!   (`fromRanges`), else the item's. A destination that `definition` or
+//!   `references` already named keeps that edge. Each request fails open as
+//!   the implementation request does: an error reply (a server without `callHierarchyProvider`
+//!   answers -32601) is recorded in [`LspLive::last_error`] and keeps the
+//!   other edges, a failed prepare ends the block, a failed incoming request
+//!   still asks outgoing. Servers miss calls (rust-analyzer's `callHierarchy`
+//!   missed 16% of the call pairs SCIP has, in macro arguments): this map
+//!   complements `graph.scip`, it does not replace it.
 //! * file (or chunk, standing for its file) -> the symbols
 //!   `textDocument/documentSymbol` lists whose name the index also defines,
 //!   kind [`EdgeKind::Contains`]. Members the index has no node for (fields,
@@ -86,12 +102,12 @@ use crate::{
 };
 use lci_core::{
     language,
-    lsp::{Location, Manager, adapter::LspAdapter},
+    lsp::{HierarchyCall, HierarchyItem, Location, Manager, adapter::LspAdapter},
     node::{NodeId, NodeKind},
     workspace::Workspace,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
@@ -129,6 +145,22 @@ pub struct Member {
     pub end_line: u32,
 }
 
+/// A call-hierarchy item: where the callable's name is, and the server's own
+/// item, which a follow-up request sends back verbatim (its `data` is opaque).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallItem {
+    pub place: Place,
+    pub raw: serde_json::Value,
+}
+
+/// A caller or callee of an item, with the places of the calls (in the
+/// caller's file for a caller, in the asked item's file for a callee).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallLink {
+    pub item: CallItem,
+    pub sites: Vec<Place>,
+}
+
 /// The questions the map asks of a language server.
 #[crate::async_trait]
 pub trait LspBackend: Send + Sync {
@@ -139,6 +171,13 @@ pub trait LspBackend: Send + Sync {
     /// Where the member named at `at` is implemented (`textDocument/
     /// implementation`).
     async fn implementation(&self, at: &Place) -> Result<Vec<Place>, String>;
+    /// The call-hierarchy items of the callable named at `at`
+    /// (`textDocument/prepareCallHierarchy`).
+    async fn prepare_call_hierarchy(&self, at: &Place) -> Result<Vec<CallItem>, String>;
+    /// The callers of `item` (`callHierarchy/incomingCalls`).
+    async fn incoming_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String>;
+    /// The callees of `item` (`callHierarchy/outgoingCalls`).
+    async fn outgoing_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String>;
     /// The symbols the server lists for `path`.
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String>;
 }
@@ -288,6 +327,25 @@ fn places(locations: Vec<Location>) -> Vec<Place> {
         .collect()
 }
 
+fn call_item(item: HierarchyItem) -> Option<CallItem> {
+    Some(CallItem {
+        place: places(vec![item.location]).pop()?,
+        raw: item.raw,
+    })
+}
+
+fn call_links(calls: Vec<HierarchyCall>) -> Vec<CallLink> {
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            Some(CallLink {
+                item: call_item(call.item)?,
+                sites: places(call.from_ranges),
+            })
+        })
+        .collect()
+}
+
 #[crate::async_trait]
 impl LspBackend for ManagerBackend {
     async fn definition(&self, at: &Place) -> Result<Vec<Place>, String> {
@@ -328,6 +386,34 @@ impl LspBackend for ManagerBackend {
             .map_err(|error| format!("{error:#}"))
     }
 
+    async fn prepare_call_hierarchy(&self, at: &Place) -> Result<Vec<CallItem>, String> {
+        let adapter = self.adapter_for(&at.path)?;
+        let file = self.workspace.path.join(&at.path);
+        self.manager
+            .prepare_call_hierarchy(adapter, &self.workspace, &file, &at.path, at.line, at.col)
+            .await
+            .map(|items| items.into_iter().filter_map(call_item).collect())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn incoming_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
+        let adapter = self.adapter_for(&item.place.path)?;
+        self.manager
+            .incoming_calls(adapter, &self.workspace, &item.raw)
+            .await
+            .map(call_links)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn outgoing_calls(&self, item: &CallItem) -> Result<Vec<CallLink>, String> {
+        let adapter = self.adapter_for(&item.place.path)?;
+        self.manager
+            .outgoing_calls(adapter, &self.workspace, &item.raw)
+            .await
+            .map(call_links)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     async fn document_symbols(&self, path: &str) -> Result<Vec<Member>, String> {
         let adapter = self.adapter_for(path)?;
         let file = self.workspace.path.join(path);
@@ -359,12 +445,21 @@ pub struct LspLive {
     /// Whether a symbol node also asks `textDocument/implementation`
     /// (`[run_profile.lsp] implementations`).
     implementations: bool,
+    /// Whether a symbol node also asks the call hierarchy
+    /// (`[run_profile.lsp] call_hierarchy`).
+    call_hierarchy: bool,
 }
 
 /// What a call found, or why it stopped.
 struct Found {
     edges: Vec<Edge>,
     calls: u32,
+    /// The destinations that already have a [`EdgeKind::CallsOrRefs`] edge from
+    /// the `definition` or `references` request or the call hierarchy: the
+    /// kind has no direction and the engine fuses an expansion's edges by
+    /// destination, so a call-hierarchy edge to one of them would only inflate
+    /// the count. (The two older requests keep every edge they made.)
+    refers: BTreeSet<NodeId>,
 }
 
 impl LspLive {
@@ -386,6 +481,7 @@ impl LspLive {
             log: CostLog::default(),
             last_error: Mutex::new(None),
             implementations: false,
+            call_hierarchy: false,
         }
     }
 
@@ -395,6 +491,16 @@ impl LspLive {
     #[must_use]
     pub fn implementations(mut self, on: bool) -> Self {
         self.implementations = on;
+        self
+    }
+
+    /// Whether a symbol node also asks the server for its call hierarchy
+    /// (default off): up to three more external calls per symbol node (prepare,
+    /// incoming, outgoing) and [`EdgeKind::CallsOrRefs`] edges to the callers
+    /// and callees.
+    #[must_use]
+    pub fn call_hierarchy(mut self, on: bool) -> Self {
+        self.call_hierarchy = on;
         self
     }
 
@@ -446,6 +552,79 @@ impl LspLive {
             .or_else(|| NodeId::file(&place.path).ok())
     }
 
+    /// The call-hierarchy requests for the symbol `node` named at `at`: prepare,
+    /// then the callers, then the callees of the item that answers, each behind
+    /// the budget's gate. Every error reply is recorded and keeps the edges
+    /// already found; a failed or empty prepare ends the block, a failed
+    /// incoming request still asks outgoing.
+    async fn ask_call_hierarchy(
+        &self,
+        node: &NodeId,
+        at: &Place,
+        max_calls: u32,
+        found: &mut Found,
+    ) {
+        found.calls += 1;
+        let items = match self.backend.prepare_call_hierarchy(at).await {
+            Ok(items) => items,
+            Err(error) => {
+                self.fail(format!("textDocument/prepareCallHierarchy: {error}"));
+                return;
+            }
+        };
+        let Some(item) = items
+            .iter()
+            .find(|item| item.place == *at)
+            .or_else(|| items.first())
+        else {
+            return;
+        };
+        if found.calls < max_calls {
+            found.calls += 1;
+            match self.backend.incoming_calls(item).await {
+                Ok(links) => self.call_edges(node, links, found),
+                Err(error) => self.fail(format!("callHierarchy/incomingCalls: {error}")),
+            }
+        }
+        if found.calls < max_calls {
+            found.calls += 1;
+            match self.backend.outgoing_calls(item).await {
+                Ok(links) => self.call_edges(node, links, found),
+                Err(error) => self.fail(format!("callHierarchy/outgoingCalls: {error}")),
+            }
+        }
+    }
+
+    /// The edges of one call-hierarchy answer: one per destination (the symbol
+    /// holding the caller's or callee's name, else its file; `node` itself
+    /// left out) that no earlier request named, seen at the smallest place of
+    /// the calls, else at the item's place. Which way the calls run is not in
+    /// the edge (the kind has no direction); the request that made it is in the
+    /// trace.
+    fn call_edges(&self, node: &NodeId, links: Vec<CallLink>, found: &mut Found) {
+        let mut linked: BTreeMap<NodeId, Place> = BTreeMap::new();
+        for link in links {
+            let Some(dst) = self
+                .holder(&link.item.place, true)
+                .filter(|dst| dst != node)
+            else {
+                continue;
+            };
+            let site = link.sites.into_iter().min().unwrap_or(link.item.place);
+            let seen = linked.entry(dst).or_insert_with(|| site.clone());
+            if site < *seen {
+                *seen = site;
+            }
+        }
+        for (dst, place) in linked {
+            if found.refers.insert(dst.clone()) {
+                found
+                    .edges
+                    .push(Self::edge(node, EdgeKind::CallsOrRefs, dst, &place));
+            }
+        }
+    }
+
     /// The requests for `node`, in order, until `calls` reaches `max_calls`.
     async fn ask(&self, node: &NodeId, max_calls: u32, found: &mut Found) -> Result<(), String> {
         match node {
@@ -457,6 +636,7 @@ impl LspLive {
                     found.calls += 1;
                     for place in self.backend.definition(&at).await? {
                         if let Some(dst) = self.holder(&place, true).filter(|dst| dst != node) {
+                            found.refers.insert(dst.clone());
                             found
                                 .edges
                                 .push(Self::edge(node, EdgeKind::CallsOrRefs, dst, &place));
@@ -475,6 +655,7 @@ impl LspLive {
                         }
                     }
                     for (dst, place) in users {
+                        found.refers.insert(dst.clone());
                         found
                             .edges
                             .push(Self::edge(node, EdgeKind::CallsOrRefs, dst, &place));
@@ -509,6 +690,9 @@ impl LspLive {
                         Err(error) => self.fail(format!("textDocument/implementation: {error}")),
                     }
                 }
+                if self.call_hierarchy && found.calls < max_calls {
+                    self.ask_call_hierarchy(node, &at, max_calls, found).await;
+                }
             }
             NodeId::File { path } | NodeId::Chunk { path, .. } if found.calls < max_calls => {
                 found.calls += 1;
@@ -539,6 +723,7 @@ impl LspLive {
         let mut found = Found {
             edges: Vec::new(),
             calls: 0,
+            refers: BTreeSet::new(),
         };
         if started >= deadline {
             self.fail(DEADLINE_NOTE.to_owned());
