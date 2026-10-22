@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -106,7 +107,10 @@ impl std::error::Error for SourceRoleError {}
 pub fn classify_source_role(relative_path: &str) -> SourceRole {
     let normalized = normalize_path(relative_path);
     let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
-    let file_name = components.last().copied().unwrap_or("");
+    // The extension is compared as lowercase (N94): `lib_test.RS` is a Rust test file.
+    // The stem and every directory component stay case-sensitive.
+    let file_name = lowercase_extension(components.last().copied().unwrap_or(""));
+    let file_name = file_name.as_ref();
     let dir_components: Vec<&str> = components
         .iter()
         .copied()
@@ -323,12 +327,12 @@ fn is_example(dirs: &[&str], _file_name: &str) -> bool {
         .any(|c| matches!(*c, "example" | "examples" | "samples"))
 }
 
-/// Whether `file_name` is a Markdown file: the lowercase extension `md` after
-/// a non-empty stem, the same exact match the language registry makes.
+/// Whether `file_name` is a Markdown file: the extension `md` in any case after
+/// a non-empty stem, the same match the language registry makes.
 fn is_documentation_file_name(file_name: &str) -> bool {
     file_name
         .rsplit_once('.')
-        .is_some_and(|(stem, extension)| !stem.is_empty() && extension == "md")
+        .is_some_and(|(stem, extension)| !stem.is_empty() && extension.eq_ignore_ascii_case("md"))
 }
 
 fn is_documentation(dirs: &[&str]) -> bool {
@@ -356,6 +360,19 @@ fn is_configuration(dirs: &[&str], file_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Path normalization
 // ---------------------------------------------------------------------------
+
+/// `file_name` with its extension (the text after the last dot, when a
+/// non-empty stem precedes the dot) in ASCII lowercase, the stem untouched.
+fn lowercase_extension(file_name: &str) -> Cow<'_, str> {
+    match file_name.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty() && extension.bytes().any(|byte| byte.is_ascii_uppercase()) =>
+        {
+            Cow::Owned(format!("{stem}.{}", extension.to_ascii_lowercase()))
+        }
+        _ => Cow::Borrowed(file_name),
+    }
+}
 
 /// Normalize a repository-relative path to use `/` separators.
 ///

@@ -786,7 +786,11 @@ fn hierarchy_item(uri: &str, tok: &Tok, kind: u32) -> Value {
 fn is_source(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| EXTENSIONS.contains(&extension))
+        .is_some_and(|extension| {
+            EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+        })
 }
 
 fn path_for_uri(uri: &str) -> Option<PathBuf> {

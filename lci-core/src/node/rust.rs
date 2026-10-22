@@ -62,8 +62,11 @@ impl Declaration {
 /// `tests/cases/mcp.rs` -> `tests::cases::mcp`.
 pub fn rust_module_path(path: &str) -> Vec<String> {
     let mut components: Vec<&str> = path.split('/').collect();
-    if let Some(last) = components.last_mut() {
-        *last = last.strip_suffix(".rs").unwrap_or(last);
+    if let Some(last) = components.last_mut()
+        && let Some((stem, extension)) = last.rsplit_once('.')
+        && extension.eq_ignore_ascii_case("rs")
+    {
+        *last = stem;
     }
     let mut module_path = Vec::new();
     let modules = match components.iter().rposition(|c| *c == "src") {
