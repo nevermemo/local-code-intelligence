@@ -54,8 +54,9 @@ pub enum MapsCommand {
     /// Simple non-walk arms, written as run dirs that `maps compare` reads:
     /// `impact` (M1.4 arm N, the exact closure of the anchor the question's
     /// names give), `history` (`git log -G/-S/--grep` on the frozen eval
-    /// tree) and `rg` (`rg --fixed-strings --word-regexp` on the frozen tree,
-    /// for the `traits` and `where-to` sets). None is given the gold.
+    /// tree), `rg` (`rg --fixed-strings --word-regexp` on the frozen tree,
+    /// for the `traits` and `where-to` sets) and `serena` (Serena's symbol
+    /// tools over MCP on a copy of the frozen tree). None is given the gold.
     Baseline {
         #[command(subcommand)]
         which: baseline::BaselineCommand,
