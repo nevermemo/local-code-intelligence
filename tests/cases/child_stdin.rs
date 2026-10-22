@@ -17,7 +17,7 @@ const FINISHED: &str = "PROBE_FINISHED";
 #[tokio::test]
 async fn a_version_probe_does_not_inherit_a_stdin_that_stays_open() {
     let fake = env!("CARGO_BIN_EXE_fake-lsp-server");
-    if std::env::var_os(CHILD).is_some() {
+    if std::env::var_os(CHILD).is_some_and(|v| v == "1") {
         // The probe's own bound is wider than the parent's wait, so a hang is
         // seen by the parent and not hidden by the probe's timeout.
         let probed = probe_subprocess_version(Path::new(fake), 2 * LOADED_BUDGET).await;
