@@ -3269,6 +3269,7 @@ mod corroboration;
 mod accounting;
 
 mod bound;
+mod confirm;
 mod continuation;
 
 mod harness;

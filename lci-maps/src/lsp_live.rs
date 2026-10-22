@@ -141,6 +141,7 @@ use crate::{
     edge::{CONF_MAX, Edge, Expanded, MapCard, QuestionType, Site, WitnessClass, cap_edges},
     live_grep::{CostLog, ScipSpans, SymbolLocator},
     scip_graph::ScipMap,
+    traverse::confirm::{Confirmation, FrontierConfirmer, Proposal, Verdict},
 };
 use lci_core::{
     config::LspSync,
@@ -1009,6 +1010,72 @@ impl Map for LspLive {
             dependent: false,
             good_for: vec![QuestionType::WhereTo, QuestionType::Impact],
         }
+    }
+}
+
+impl LspLive {
+    /// The confirmer of the confirm frontier (`[run_profile.walk] confirm`;
+    /// see [`crate::traverse::confirm`]): it asks the server where the name
+    /// at each text proposal's site is defined, one `textDocument/definition`
+    /// request per proposal, through this map's backend and places.
+    pub fn confirmer(self: &Arc<Self>) -> Arc<dyn FrontierConfirmer> {
+        Arc::new(LspConfirmer {
+            map: Arc::clone(self),
+        })
+    }
+}
+
+/// [`LspLive::confirmer`]: an answered place that holds the proposal's `src`
+/// (the symbol defined there, else the one whose definition holds its line,
+/// else the file) confirms it; answers that all name something else refute
+/// it; no answer or an error is unknown.
+struct LspConfirmer {
+    map: Arc<LspLive>,
+}
+
+#[crate::async_trait]
+impl FrontierConfirmer for LspConfirmer {
+    async fn confirm(
+        &self,
+        proposals: &[Proposal],
+        max_calls: u32,
+    ) -> Result<Confirmation, String> {
+        let mut verdicts = Vec::with_capacity(proposals.len());
+        let mut calls = 0u32;
+        for proposal in proposals {
+            // The call stops at the allowance: the rest are not asked.
+            if calls >= max_calls {
+                verdicts.push(Verdict::Unknown);
+                continue;
+            }
+            calls += 1;
+            let at = Place {
+                path: proposal.site.path.clone(),
+                line: proposal.site.line,
+                col: proposal.site.col,
+            };
+            verdicts.push(match self.map.backend.definition(&at).await {
+                Ok(places) if places.is_empty() => Verdict::Unknown,
+                Ok(places) => {
+                    let holds_src = places
+                        .iter()
+                        .any(|place| self.map.holder(place, true).as_ref() == Some(&proposal.src));
+                    if holds_src {
+                        Verdict::Confirmed
+                    } else {
+                        Verdict::Refuted
+                    }
+                }
+                // The map's own `last_error` is left alone: it reports the
+                // expansions, and a hop that stays as it was needs no note.
+                Err(_) => Verdict::Unknown,
+            });
+        }
+        Ok(Confirmation { verdicts, calls })
+    }
+
+    fn identity(&self) -> String {
+        format!("{LSP_LIVE_ID} definition")
     }
 }
 
