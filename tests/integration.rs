@@ -34,5 +34,7 @@ mod recipes;
 mod run_records;
 #[path = "cases/traverse_matrix.rs"]
 mod traverse_matrix;
+#[path = "cases/tsgo_lsp.rs"]
+mod tsgo_lsp;
 #[path = "cases/watching.rs"]
 mod watching;

@@ -319,7 +319,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
+        description = "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
     )]
     async fn search_symbols(&self, Parameters(args): Parameters<SymbolArgs>) -> CallToolResult {
         self.answer(
@@ -329,7 +329,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
+        description = "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
     )]
     async fn find_definition(&self, Parameters(args): Parameters<PositionArgs>) -> CallToolResult {
         self.answer(
@@ -344,7 +344,7 @@ impl McpServer {
         )
     }
     #[tool(
-        description = "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
+        description = "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman."
     )]
     async fn find_references(
         &self,
@@ -414,7 +414,7 @@ impl McpServer {
         }
     }
     #[tool(
-        description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail."
+        description = "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, typescript-go, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail."
     )]
     async fn service_status(&self, Parameters(_args): Parameters<NoArgs>) -> CallToolResult {
         result(self.app.profile_hash(), Ok(self.app.service_status().await))

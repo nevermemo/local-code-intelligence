@@ -1329,7 +1329,7 @@
   },
   "tools": [
     {
-      "description": "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
+      "description": "Resolve a definition at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -1365,7 +1365,7 @@
       "name": "find_definition"
     },
     {
-      "description": "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
+      "description": "Find references at a one-based source line and zero-based UTF-16 character. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -1528,7 +1528,7 @@
       "name": "search_code"
     },
     {
-      "description": "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
+      "description": "Find symbols by name using each applicable enabled language server for the indexed workspace. Rust uses rust-analyzer; C# uses optional csharp-ls; TypeScript/TSX/JavaScript/JSX use optional typescript-language-server or typescript-go; Python uses optional pyright; Go uses optional gopls; Java uses optional jdtls; C and C++ use optional clangd; Markdown (indexed prose) uses optional marksman.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -1549,7 +1549,7 @@
       "name": "search_symbols"
     },
     {
-      "description": "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail.",
+      "description": "Report service readiness and independent optional tooling diagnostics for ripgrep, rust-analyzer, csharp-ls, typescript-language-server, typescript-go, pyright, gopls, jdtls, clangd, and marksman. Missing language servers do not make readiness fail.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,

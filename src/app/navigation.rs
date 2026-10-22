@@ -234,11 +234,15 @@ impl App {
         let identifier = language::for_path(file)
             .map(|adapter| adapter.identifier())
             .context("language-server navigation requires a recognized source path")?;
-        let adapter = self
-            .analyzer
-            .adapters_for_language(identifier)
-            .into_iter()
-            .next()
+        // A language may have two servers (TypeScript: typescript-language-
+        // server or typescript-go; at most one is enabled): the first enabled
+        // one answers, else the first, so a disabled language names it.
+        let adapters = self.analyzer.adapters_for_language(identifier);
+        let adapter = adapters
+            .iter()
+            .find(|adapter| adapter.enabled())
+            .or_else(|| adapters.first())
+            .copied()
             .cloned()
             .with_context(|| {
                 format!("language-server navigation does not support {identifier} source files")

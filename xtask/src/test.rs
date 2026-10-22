@@ -221,6 +221,7 @@ fn focused_invocations(suite: Suite) -> Option<Vec<Vec<&'static str>>> {
             integration("navigation::"),
             integration("child_stdin::"),
             integration("markdown_lsp::"),
+            integration("tsgo_lsp::"),
             integration("lsp_concurrent_open::"),
             integration("lsp_diagnostics_wait::"),
             integration("navigation_barrier::"),

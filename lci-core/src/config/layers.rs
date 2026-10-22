@@ -75,9 +75,10 @@ const SCALAR_KEYS: [(&str, &str); 8] = [
 
 /// The language-server sections of the machine set, each with the upper-case
 /// name its environment variables use (`LCI_<NAME>_PATH`, `LCI_<NAME>_DISABLED`).
-const LSP_SECTIONS: [(&str, &str); 7] = [
+const LSP_SECTIONS: [(&str, &str); 8] = [
     ("csharp", "CSHARP"),
     ("typescript", "TYPESCRIPT"),
+    ("tsgo", "TSGO"),
     ("python", "PYTHON"),
     ("go", "GO"),
     ("java", "JAVA"),
@@ -275,6 +276,7 @@ pub struct LocalOverrides {
     pub rust_analyzer_path: Option<String>,
     pub csharp: Option<LspOverride>,
     pub typescript: Option<LspOverride>,
+    pub tsgo: Option<LspOverride>,
     pub python: Option<LspOverride>,
     pub go: Option<LspOverride>,
     pub java: Option<LspOverride>,
@@ -330,6 +332,7 @@ impl LocalOverrides {
         match section {
             "csharp" => self.csharp.as_ref(),
             "typescript" => self.typescript.as_ref(),
+            "tsgo" => self.tsgo.as_ref(),
             "python" => self.python.as_ref(),
             "go" => self.go.as_ref(),
             "java" => self.java.as_ref(),
@@ -340,7 +343,7 @@ impl LocalOverrides {
     }
 
     /// The slot of language-server section `section` (`csharp`, `typescript`,
-    /// `python`, `go`, `java`, `clangd` or `markdown`).
+    /// `tsgo`, `python`, `go`, `java`, `clangd` or `markdown`).
     ///
     /// # Panics
     ///
@@ -349,6 +352,7 @@ impl LocalOverrides {
         match section {
             "csharp" => &mut self.csharp,
             "typescript" => &mut self.typescript,
+            "tsgo" => &mut self.tsgo,
             "python" => &mut self.python,
             "go" => &mut self.go,
             "java" => &mut self.java,
@@ -413,6 +417,11 @@ impl LocalOverrides {
                     &mut config.typescript.path,
                     &mut config.typescript.args,
                     &mut config.typescript.disabled,
+                ),
+                "tsgo" => (
+                    &mut config.tsgo.path,
+                    &mut config.tsgo.args,
+                    &mut config.tsgo.disabled,
                 ),
                 "python" => (
                     &mut config.python.path,
@@ -1344,7 +1353,7 @@ mod tests {
                  embedding_model = 'e'\nreranker_url = 'http://127.0.0.1:9202/rerank'\n\
                  reranker_model = 'r'\nripgrep_path = '/x/rg'\nrust_analyzer_path = '/x/ra'\n\
                  [csharp]\npath = '/x/cs'\nargs = ['a']\ndisabled = false\n\
-                 [typescript]\npath = '/x/ts'\n[python]\npath = '/x/py'\n[go]\npath = '/x/go'\n\
+                 [typescript]\npath = '/x/ts'\n[tsgo]\npath = '/x/tsgo'\ndisabled = true\n[python]\npath = '/x/py'\n[go]\npath = '/x/go'\n\
                  [java]\npath = '/x/java'\n[clangd]\npath = '/x/clangd'\ndisabled = true\n\
                  [markdown]\npath = '/x/marksman'\n",
                 data = literal(&dir.join("d2"))
@@ -1361,6 +1370,7 @@ mod tests {
         assert_eq!(config.csharp.args, vec!["a".to_owned()]);
         assert!(config.clangd.path.is_some() && !config.clangd.enabled());
         assert!(config.markdown.enabled());
+        assert!(config.tsgo.path.is_some() && !config.tsgo.enabled());
         for key in machine_keys() {
             if key.ends_with(".args") || key.ends_with(".disabled") {
                 continue;
@@ -1377,11 +1387,16 @@ mod tests {
             ("LCI_GO_PATH", "/x/gopls"),
             ("LCI_GO_DISABLED", "TRUE"),
             ("LCI_PYTHON_DISABLED", "0"),
+            ("LCI_TSGO_PATH", "/x/tsgo"),
             ("LCI_RIPGREP_PATH", ""),
             ("LCI_UNRELATED_VARIABLE", "ignored"),
         ]))
         .unwrap();
         assert_eq!(parsed.port, Some(9001));
+        assert_eq!(
+            parsed.tsgo.as_ref().and_then(|tsgo| tsgo.path.as_deref()),
+            Some("/x/tsgo")
+        );
         assert!(parsed.csharp.is_none());
         assert!(parsed.ripgrep_path.is_none());
         let go = parsed.go.unwrap();
@@ -1822,6 +1837,7 @@ mod tests {
                 Some(false),
             )),
             typescript: Some(lsp("/x/ts", &[], None)),
+            tsgo: Some(lsp("/x/tsgo", &["--x"], Some(true))),
             python: Some(LspOverride {
                 path: Some("/x/py".to_owned()),
                 ..LspOverride::default()

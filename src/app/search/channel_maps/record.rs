@@ -181,6 +181,7 @@ impl App {
             Some(&config.rust_analyzer_path),
             config.csharp.path.as_ref(),
             config.typescript.path.as_ref(),
+            config.tsgo.path.as_ref(),
             config.python.path.as_ref(),
             config.go.path.as_ref(),
             config.java.path.as_ref(),

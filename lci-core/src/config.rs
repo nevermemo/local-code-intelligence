@@ -583,6 +583,10 @@ pub struct Config {
     /// (typescript-language-server) settings. Absent or empty configuration
     /// keeps TS/JS navigation disabled; syntax retrieval is unaffected.
     pub typescript: TypeScriptLspConfig,
+    /// Optional typescript-go (`tsgo`) language-server settings: the other
+    /// TS/JS server. Absent or empty configuration keeps it off; at most one
+    /// of `typescript` and `tsgo` may be enabled (validation refuses both).
+    pub tsgo: TsgoLspConfig,
     /// Optional Python language-server (pyright) settings. Absent or empty
     /// configuration keeps Python navigation disabled; syntax retrieval is
     /// unaffected.
@@ -1271,6 +1275,42 @@ impl TypeScriptLspConfig {
     }
 }
 
+/// Optional typescript-go (`tsgo`) language-server configuration: the native
+/// TypeScript compiler's server, an alternative to typescript-language-server
+/// for the same four languages.
+///
+/// Optional and fail-open like every other section: an absent or empty
+/// `[tsgo]` section keeps it off. At most one of `[typescript]` and `[tsgo]`
+/// may be enabled (`Config::validate` refuses both). The adapter forces
+/// `--lsp --stdio` before the configured `args`; the shared
+/// `lsp_timeout_seconds` applies here too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TsgoLspConfig {
+    /// Path to the tsgo executable. `None` (the default) keeps it off. An
+    /// empty or whitespace-only value is rejected by validation rather than
+    /// silently counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to tsgo, appended after `--lsp --stdio`.
+    pub args: Vec<String>,
+    /// Explicitly disable tsgo even when a path is configured.
+    pub disabled: bool,
+}
+
+impl TsgoLspConfig {
+    /// Whether the typescript-go language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
 /// Optional Python language-server (pyright) configuration.
 ///
 /// Python navigation is optional and fail-open: an absent or empty
@@ -1530,6 +1570,7 @@ impl Default for Config {
             lsp_stuck_seconds: 900,
             csharp: CSharpLspConfig::default(),
             typescript: TypeScriptLspConfig::default(),
+            tsgo: TsgoLspConfig::default(),
             python: PythonLspConfig::default(),
             go: GoLspConfig::default(),
             java: JavaLspConfig::default(),
@@ -1692,6 +1733,14 @@ impl Config {
                 "typescript.path must be nonempty when set; omit it or set typescript.disabled = true to keep TypeScript/JavaScript navigation disabled"
             );
         }
+        if !self.tsgo.disabled
+            && let Some(path) = &self.tsgo.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "tsgo.path must be nonempty when set; omit it or set tsgo.disabled = true to keep typescript-go off"
+            );
+        }
         if !self.python.disabled
             && let Some(path) = &self.python.path
         {
@@ -1732,6 +1781,12 @@ impl Config {
                 "markdown.path must be nonempty when set; omit it or set markdown.disabled = true to keep prose navigation disabled"
             );
         }
+        // Two servers for the same four languages would both be "applicable";
+        // an explicit refusal beats a silent first-wins order.
+        ensure!(
+            !(self.typescript.enabled() && self.tsgo.enabled()),
+            "typescript.path and tsgo.path are both set and enabled; they navigate the same languages, so set typescript.disabled = true or tsgo.disabled = true"
+        );
         ensure!(
             self.channels.semantic || self.channels.lexical || self.channels.lsp,
             "channels: at least one of semantic, lexical, and lsp must be enabled; a search with no retrieval channel can return nothing"
@@ -2400,6 +2455,46 @@ mod tests {
             toml::from_str(&format!("{}[markdown]\npath = \"   \"\n", base_toml())).unwrap();
         let error = blank.validate().unwrap_err();
         assert!(error.to_string().contains("markdown.path"));
+    }
+
+    #[test]
+    fn one_typescript_server_at_a_time() {
+        let load = |sections: &str| -> Config {
+            toml::from_str(&format!("{}{sections}", base_toml())).unwrap()
+        };
+        // Off by default; either alone is fine.
+        let default = Config::default();
+        assert!(!default.tsgo.enabled() && default.tsgo.path.is_none());
+        default.validate().unwrap();
+        let ts = load("[typescript]\npath = \"typescript-language-server\"\n");
+        ts.validate().unwrap();
+        let go = load("[tsgo]\npath = \"tsgo\"\n");
+        assert!(go.tsgo.enabled());
+        go.validate().unwrap();
+        // Both enabled: refused, naming both keys.
+        let both = load("[typescript]\npath = \"tls\"\n[tsgo]\npath = \"tsgo\"\n");
+        let error = both.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("typescript.path") && error.contains("tsgo.path"),
+            "{error}"
+        );
+        assert!(error.contains("disabled = true"), "{error}");
+        // Either one disabled: fine again.
+        load("[typescript]\npath = \"tls\"\ndisabled = true\n[tsgo]\npath = \"tsgo\"\n")
+            .validate()
+            .unwrap();
+        load("[typescript]\npath = \"tls\"\n[tsgo]\npath = \"tsgo\"\ndisabled = true\n")
+            .validate()
+            .unwrap();
+        // A blank path is its own error.
+        let blank = load("[tsgo]\npath = \"  \"\n");
+        assert!(
+            blank
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("tsgo.path")
+        );
     }
 
     #[test]

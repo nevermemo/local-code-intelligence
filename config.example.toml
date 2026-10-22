@@ -155,6 +155,19 @@ lsp_stuck_seconds = 900
 # args = []
 # disabled = false
 
+# Optional alternative TypeScript/JavaScript language server: typescript-go
+# (tsgo, the native TypeScript compiler's server, npm install -g
+# @typescript/native-preview). It navigates the same four languages, so it is
+# either this or [typescript], not both: a configuration with both enabled is
+# refused at load (set disabled = true on one). Navigation uses the first
+# enabled one. Off until a path is set; `lci init` does not write it. LCI always
+# passes --lsp --stdio; args here are appended after them. The path is a machine
+# key: set it in the local overlay or LCI_TSGO_PATH.
+# [tsgo]
+# path = "tsgo"
+# args = []
+# disabled = false
+
 # Optional Python language server (pyright, npm install -g pyright, which
 # provides pyright-langserver). Optional and fail-open, same as csharp above.
 # LCI always passes --stdio; args here are appended after it.

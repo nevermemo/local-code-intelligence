@@ -93,6 +93,7 @@ fn overrides(rng: &mut Rng) -> LocalOverrides {
         rust_analyzer_path: rng.chance().then(|| string(rng)),
         csharp: lsp(rng),
         typescript: lsp(rng),
+        tsgo: lsp(rng),
         python: lsp(rng),
         go: lsp(rng),
         java: lsp(rng),

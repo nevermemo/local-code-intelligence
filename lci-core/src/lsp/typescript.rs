@@ -26,6 +26,15 @@ use std::{path::Path, time::Duration};
 /// instance navigates.
 pub const LANGUAGES: &[&str] = &["typescript", "tsx", "javascript", "jsx"];
 
+/// The project configuration files the TypeScript servers read (their tree
+/// stamp covers them); the typescript-go adapter shares the list.
+pub(crate) const MANIFESTS: &[&str] = &[
+    "tsconfig.json",
+    "jsconfig.json",
+    "package.json",
+    "tsconfig.*.json",
+];
+
 /// A narrow, client-neutral representation of the optional TypeScript/
 /// JavaScript language server. It carries configuration and can produce the
 /// transport and initialization payloads without spawning a process.
@@ -58,12 +67,7 @@ impl LspAdapter for TypeScriptServer {
 
     /// The project configuration the server reads (see the trait).
     fn stamp_manifests(&self) -> &'static [&'static str] {
-        &[
-            "tsconfig.json",
-            "jsconfig.json",
-            "package.json",
-            "tsconfig.*.json",
-        ]
+        MANIFESTS
     }
 
     fn enabled(&self) -> bool {
@@ -182,7 +186,7 @@ impl LspAdapter for TypeScriptServer {
 /// The LSP `languageId` tsserver expects for a file, derived from its
 /// extension (matching the Tree-sitter language identifiers this adapter
 /// covers, translated to the LSP-standard `*react` ids for JSX/TSX).
-fn language_id_for(relative: &str) -> &'static str {
+pub(crate) fn language_id_for(relative: &str) -> &'static str {
     if has_extension_ignore_case(relative, "ts") {
         "typescript"
     } else if has_extension_ignore_case(relative, "tsx") {

@@ -12,6 +12,7 @@ use crate::{
         rust::RustServer,
         transport::{InactivityTimeout, JsonRpcClient, RpcError},
         typescript::TypeScriptServer,
+        typescript_go::TsgoServer,
     },
     models::ConnectBreaker,
     workspace::Workspace,
@@ -44,6 +45,7 @@ pub mod stamp;
 pub mod sync;
 pub mod transport;
 pub mod typescript;
+pub mod typescript_go;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct Location {
@@ -1211,6 +1213,9 @@ impl Manager {
             Arc::new(RustServer::new(config)),
             Arc::new(CSharpServer::new(&config.csharp, timeout)),
             Arc::new(TypeScriptServer::new(&config.typescript, timeout)),
+            // After typescript-language-server: `adapters_for_language`
+            // lists it first, and navigation prefers the first enabled one.
+            Arc::new(TsgoServer::new(&config.tsgo, timeout)),
             Arc::new(PythonServer::new(&config.python, timeout)),
             Arc::new(GoServer::new(&config.go, timeout)),
             Arc::new(JavaServer::new(config, timeout)),
@@ -3252,7 +3257,7 @@ mod tests {
         assert_eq!(watching, ["rust-analyzer"]);
         assert_eq!(
             manager.adapters().len(),
-            8,
+            9,
             "a new adapter must be classified"
         );
     }
@@ -3282,6 +3287,7 @@ mod tests {
                 "gopls",
                 "pyright",
                 "rust-analyzer",
+                "typescript-go",
                 "typescript-language-server"
             ],
             "sync = watch: jdtls lists no configuration files"
@@ -4287,6 +4293,7 @@ mod tests {
                 ("marksman", true),
                 ("pyright", true),
                 ("rust-analyzer", false),
+                ("typescript-go", true),
                 ("typescript-language-server", true),
             ]
         );
