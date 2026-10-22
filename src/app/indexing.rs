@@ -253,6 +253,62 @@ pub enum IndexAction {
     RefreshedIncrementally,
 }
 
+/// The `last_stale_check` stamp of one search that found the check due. If it
+/// is dropped without [`Self::keep`] (the search future was dropped mid-check)
+/// the previous value comes back, unless a later stamp replaced ours.
+struct StaleCheckStamp<'a> {
+    coordination: &'a WorkspaceCoordination,
+    previous: Option<Instant>,
+    stamped: Instant,
+    kept: bool,
+}
+
+impl<'a> StaleCheckStamp<'a> {
+    /// Stamps now and returns the guard when the check is due (never run, or
+    /// last run at least `interval` ago); `None` when it is throttled.
+    fn take(
+        coordination: &'a WorkspaceCoordination,
+        interval: std::time::Duration,
+    ) -> Option<Self> {
+        let mut last = coordination
+            .last_stale_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = *last;
+        if !previous.is_none_or(|checked_at| checked_at.elapsed() >= interval) {
+            return None;
+        }
+        let stamped = Instant::now();
+        *last = Some(stamped);
+        Some(Self {
+            coordination,
+            previous,
+            stamped,
+            kept: false,
+        })
+    }
+
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for StaleCheckStamp<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let mut last = self
+            .coordination
+            .last_stale_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last == Some(self.stamped) {
+            *last = self.previous;
+        }
+    }
+}
+
 impl App {
     /// Embeds every chunk whose vector key `cache` lacks (each key once) and
     /// adds the vectors to `cache`; returns how many it embedded. Chunks the
@@ -543,16 +599,38 @@ impl App {
         identity_changed: bool,
         vectors_missing: bool,
     ) -> Result<(IndexAction, Option<String>)> {
-        let due = {
-            let mut last = coordination.last_stale_check.lock().await;
-            let interval =
-                std::time::Duration::from_secs(self.config.index.stale_check_interval_seconds);
-            let due = last.is_none_or(|checked_at| checked_at.elapsed() >= interval);
-            if due {
-                *last = Some(Instant::now());
-            }
-            due
-        };
+        // The stamp is taken before the walk so that concurrent searches skip
+        // the check while one runs; it only stays if the check completes. A
+        // search dropped mid-check (an MCP cancel) gives it back, so the next
+        // search is not throttled into reusing a snapshot nobody checked.
+        let stamp = StaleCheckStamp::take(
+            coordination,
+            std::time::Duration::from_secs(self.config.index.stale_check_interval_seconds),
+        );
+        let due = stamp.is_some();
+        let result = self
+            .refresh_stale_snapshot_checked(
+                workspace,
+                coordination,
+                identity_changed,
+                vectors_missing,
+                due,
+            )
+            .await;
+        if let Some(stamp) = stamp {
+            stamp.keep();
+        }
+        result
+    }
+
+    async fn refresh_stale_snapshot_checked(
+        &self,
+        workspace: &Workspace,
+        coordination: &WorkspaceCoordination,
+        identity_changed: bool,
+        vectors_missing: bool,
+        due: bool,
+    ) -> Result<(IndexAction, Option<String>)> {
         let current_fingerprint = if due {
             let root = workspace.path.clone();
             let prose = self.config.index.prose;
