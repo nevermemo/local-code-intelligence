@@ -3401,6 +3401,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_probe_is_run_once_per_provider_until_it_fails() {
+        // The contract is the key off: a failed probe is asked again.
+        let mut no_breaker = Config::default();
+        no_breaker.run_profile.lsp.breaker = false;
         let timeout = Duration::from_secs(1);
         let probing = |answers: &[bool]| {
             let adapter = Arc::new(Probing {
@@ -3409,7 +3412,7 @@ mod tests {
             });
             (Arc::clone(&adapter) as Arc<dyn LspAdapter>, adapter)
         };
-        let manager = Manager::new(&Config::default());
+        let manager = Manager::new(&no_breaker);
         // Ok, Ok: the second call is answered from memory.
         let (adapter, counts) = probing(&[true]);
         manager.probe_once(&adapter, timeout).await.unwrap();
@@ -3417,14 +3420,14 @@ mod tests {
         assert_eq!(counts.asked.load(Ordering::SeqCst), 1);
         // Err, Ok: a failure is not remembered, the next call asks again, and
         // after the Ok no more probes are made.
-        let manager = Manager::new(&Config::default());
+        let manager = Manager::new(&no_breaker);
         let (adapter, counts) = probing(&[false, true]);
         assert!(manager.probe_once(&adapter, timeout).await.is_err());
         manager.probe_once(&adapter, timeout).await.unwrap();
         manager.probe_once(&adapter, timeout).await.unwrap();
         assert_eq!(counts.asked.load(Ordering::SeqCst), 2);
         // Another manager keeps its own memory.
-        let other = Manager::new(&Config::default());
+        let other = Manager::new(&no_breaker);
         other.probe_once(&adapter, timeout).await.unwrap();
         assert_eq!(counts.asked.load(Ordering::SeqCst), 3);
     }
@@ -3621,7 +3624,9 @@ mod tests {
         });
         let adapter: Arc<dyn LspAdapter> = Arc::clone(&stub) as Arc<dyn LspAdapter>;
         let workspace = prime_workspace();
-        let manager = Manager::new(&Config::default());
+        let mut config = Config::default();
+        config.run_profile.lsp.breaker = false;
+        let manager = Manager::new(&config);
         assert!(manager.breakers().is_none());
         for _ in 0..2 {
             let error = manager
@@ -3759,7 +3764,11 @@ mod tests {
     #[tokio::test]
     async fn an_unbounded_warm_up_waits_for_a_slow_probe() {
         let gate = Gate::new();
-        let mut manager = Manager::new(&Config::default());
+        // The stub's session cannot start, and a second ask must start it again: its
+        // contract is the breaker off (it is on by default).
+        let mut config = Config::default();
+        config.run_profile.lsp.breaker = false;
+        let mut manager = Manager::new(&config);
         manager.adapters = vec![
             primable("gated", Probe::Gated(gate.clone())),
             primable("no-transport", Probe::Passes),
@@ -3841,7 +3850,11 @@ mod tests {
 
     #[tokio::test]
     async fn prime_reports_each_provider_and_a_missing_binary_as_an_error() {
-        let mut manager = Manager::new(&Config::default());
+        // The stub's session cannot start, and a second ask must start it again: its
+        // contract is the breaker off (it is on by default).
+        let mut config = Config::default();
+        config.run_profile.lsp.breaker = false;
+        let mut manager = Manager::new(&config);
         let stub = |provider, enabled, probe| -> Arc<dyn LspAdapter> {
             Arc::new(Primable {
                 provider,
@@ -4227,6 +4240,8 @@ mod sync_tests {
         config.csharp.path = Some("definitely-missing-csharp-ls".into());
         config.lsp_idle_timeout_seconds = 0;
         config.run_profile.lsp.sync = sync;
+        // The test asks a server that cannot start again and again.
+        config.run_profile.lsp.breaker = false;
         Manager::new(&config)
     }
 

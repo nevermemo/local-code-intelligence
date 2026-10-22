@@ -12,8 +12,9 @@
 //! cannot share a clock tick with the tree the stamp recorded.
 
 use super::navigation::{
-    CALL_SITE_WITH_TWICE_CS, WarmService, age_tree, csharp_scip_index, indexed_warm_service,
-    kept_noted, reached_run_through_lsp_live, restart_noted, spawns_started, traverse_add,
+    CALL_SITE_WITH_TWICE_CS, WarmService, age_tree, csharp_scip_index, finished_warm_start,
+    indexed_warm_service, kept_noted, reached_run_through_lsp_live, restart_noted, spawns_started,
+    traverse_add,
 };
 use super::*;
 use local_code_intelligence::{config::LspSessions, workspace::Workspace};
@@ -276,6 +277,14 @@ struct RustService {
 }
 
 async fn rust_service() -> RustService {
+    rust_service_with(false).await
+}
+
+/// [`rust_service`] with `[traverse] enabled` when `traverse`: the service then
+/// warms the Rust server at the first touch (`lsp.live` is in the default set),
+/// so the tree is aged before the index is built and the stamp the warm start
+/// records is the one the edit later changes.
+async fn rust_service_with(traverse: bool) -> RustService {
     let (temp, config, fake, models_task) = fixture().await;
     let state = temp.path().join("state");
     let path = temp.path().join("workspace");
@@ -295,13 +304,23 @@ async fn rust_service() -> RustService {
         "pub fn run() -> i32 { crate::calculate_total(1, 2) }\n",
     );
     let mut config = with_fake_rust_analyzer(config, temp.path(), &state, &[]);
-    config.traverse.enabled = false;
+    config.traverse.enabled = traverse;
+    if traverse {
+        // The seeds are the hybrid search's: the walk's first stage is not
+        // under test.
+        config.traverse.first_stage = local_code_intelligence::config::TraverseFirstStage::Off;
+        config.traverse.answer_seeds = false;
+        config.traverse.exact_seeds = false;
+        age_tree(&path);
+    }
     // A start lands inside the search channel's budget: keep the budget out of
     // the way of a slow start under load.
     config.lsp_search_budget_ms = LOADED_BUDGET.as_millis() as u64;
     let app = App::open(config).await.unwrap();
     let workspace = app.index(&path).await.unwrap().workspace;
-    age_tree(&workspace.path);
+    if !traverse {
+        age_tree(&workspace.path);
+    }
     RustService {
         app,
         workspace,
@@ -388,4 +407,144 @@ async fn the_search_channel_keeps_a_watching_server_after_an_edit_and_navigation
     .expect("the test finishes within the loaded budget");
     app.shutdown_language_servers().await;
     service.models_task.abort();
+}
+
+/// The note of a walk whose `lsp.live` found its kept server restarted by the
+/// tree barrier.
+const RUST_WALK_RESTARTED: &str =
+    "lsp.live: rust-analyzer restarted: the tree changed since its last call";
+
+/// One default traverse walk (`mode = "traverse"` of the service) of `query`:
+/// no maps are named, so `lsp.live` runs through `[run_profile.lsp] live`.
+async fn default_walk(app: &App, workspace: &Workspace, query: &str) -> Value {
+    local_code_intelligence::app::traverse::search(
+        app,
+        &workspace.path.to_string_lossy(),
+        query,
+        Some(8),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// How many notes of a walk answer `wanted` accepts.
+fn count_notes(answer: &Value, wanted: impl Fn(&str) -> bool) -> usize {
+    answer["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|note| wanted(note))
+        .count()
+}
+
+/// K11b-3 (review finding F1): a traverse walk with `lsp.live` passes one tree
+/// barrier, before its seed search. Without it the seed search (the search
+/// channel, which keeps a watching server through an edit) used the stale
+/// session and `lsp.live` then restarted it inside the walk's deadline; now
+/// the server is restarted once, up front, and the seed search and `lsp.live`
+/// share the fresh session.
+///
+/// The fake records which start (spawn) received each request: after the edit
+/// the seed search's `workspace/symbol` must reach the second start, never the
+/// first. A plain search after the same kind of edit still keeps the session
+/// (N108).
+#[tokio::test]
+async fn a_walk_restarts_a_watching_server_once_before_its_seed_search() {
+    let service = rust_service_with(true).await;
+    let (app, workspace, state) = (&service.app, &service.workspace, &service.state);
+    tokio::time::timeout(LOADED_BUDGET, async {
+        // The first touch warmed the server under the aged tree's stamp.
+        app.status(&workspace.path).await.unwrap();
+        finished_warm_start(app, &workspace.id).await;
+        assert_eq!(spawns_started(state), 1);
+
+        // No edit: the walk restarts nothing and asks the running session.
+        let quiet = default_walk(app, workspace, "calculate_total").await;
+        assert_eq!(
+            count_notes(&quiet, |note| note.contains("restarted")),
+            0,
+            "{quiet}"
+        );
+        assert_eq!(spawns_started(state), 1, "{quiet}");
+
+        write(
+            &workspace.path,
+            "src/call_site.rs",
+            "pub fn run_renamed() -> i32 { crate::calculate_total(1, 2) }\n",
+        );
+        let stale_asks = symbol_requests_of(state, 1);
+        let walked = default_walk(app, workspace, "run_renamed").await;
+        assert_eq!(
+            count_notes(&walked, |note| note == RUST_WALK_RESTARTED),
+            1,
+            "one restart, noted by the walk: {walked}"
+        );
+        // The seed search did not keep the stale session: nothing is labelled
+        // as kept through a changed tree, and the seed search saw the server
+        // that started after the edit.
+        assert_eq!(
+            count_notes(&walked, |note| note.contains("(kept: it watches")),
+            0,
+            "{walked}"
+        );
+        assert_eq!(
+            symbol_requests_of(state, 1),
+            stale_asks,
+            "the seed search asked the stale session: {walked}"
+        );
+        assert!(
+            symbol_requests_of(state, 2) >= 1,
+            "the seed search asked the restarted server: {walked}"
+        );
+        assert_eq!(spawns_started(state), 2, "one restart, one new start");
+
+        // The walk recorded the stamp: the next walk keeps what it started.
+        let after = default_walk(app, workspace, "run_renamed").await;
+        assert_eq!(
+            count_notes(&after, |note| note.contains("restarted")),
+            0,
+            "{after}"
+        );
+        assert_eq!(spawns_started(state), 2, "{after}");
+
+        // A plain search after another edit keeps the session, as before.
+        write(
+            &workspace.path,
+            "src/call_site.rs",
+            "pub fn run_third() -> i32 { crate::calculate_total(5, 6) }
+",
+        );
+        let plain = app
+            .search(&workspace.path, "calculate_total", Some(3))
+            .await
+            .unwrap();
+        let lsp_notes: Vec<&String> = plain
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("lsp:"))
+            .collect();
+        assert_eq!(lsp_notes, [RUST_KEPT_AFTER_EDIT], "{:?}", plain.notes);
+        assert_eq!(spawns_started(state), 2, "the search kept the session");
+    })
+    .await
+    .expect("the test finishes within the loaded budget");
+    app.shutdown_language_servers().await;
+    service.models_task.abort();
+}
+
+/// How many `workspace/symbol` requests (the search channel's and so the seed
+/// search's; `lsp.live` asks `documentSymbol` and the like) the fake's
+/// start number `spawn` received.
+fn symbol_requests_of(state: &std::path::Path, spawn: u64) -> usize {
+    std::fs::read_to_string(state.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["method"] == "workspace/symbol" && event["spawn"] == spawn)
+        .count()
 }

@@ -467,7 +467,7 @@ impl std::str::FromStr for LspPlaces {
 }
 
 /// `[run_profile.lsp]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LspProfile {
     /// `"shared"` (default): the calls of a process reuse the sessions of the
@@ -521,21 +521,48 @@ pub struct LspProfile {
     /// (see [`LspPlaces`]). The recipes walk no `lsp.live` and run the same
     /// under both values.
     pub places: LspPlaces,
-    /// `false` (default): every call probes and starts a language server as it
-    /// is asked, so a server that is not there is probed again on every call.
-    /// `true`: a provider whose version probe failed, or whose server could not
-    /// be started (it could not be spawned, exited, or broke the protocol), is
-    /// left alone for 30 seconds: the next probe or start of that provider is
-    /// refused at once, with a note that names the window (see
-    /// `lsp::LspBreakers`). The windows are per provider and shared by the
-    /// process's managers (the MCP and REST server's and each call's);
-    /// `lci traverse` under `sessions = "per_call"` builds no shared manager
-    /// and so has no window. A
-    /// server that is already running is still asked, a start that timed out
-    /// opens no window (it may only be slow), and `/ready` still probes the
-    /// binaries. The recipes walk no `lsp.live` and run the same under both
-    /// values.
+    /// `true` (default): a provider whose version probe failed, or whose server
+    /// could not be started (it could not be spawned, exited, or broke the
+    /// protocol), is left alone for 30 seconds: the next probe or start of that
+    /// provider is refused at once, with a note that names the window (see
+    /// `lsp::LspBreakers`). A missing binary and a timed-out probe or start
+    /// open no window (the first costs under a millisecond per probe and its
+    /// note is the same on every call; the second may only be a slow machine).
+    /// The windows are per provider and shared by the process's managers (the
+    /// MCP and REST server's and each call's); `lci traverse` under
+    /// `sessions = "per_call"` builds no shared manager and so has no window. A
+    /// server that is already running is still asked, and `/ready` still probes
+    /// the binaries. `false`: every call probes and starts a language server as
+    /// it is asked, so a server that is dead is probed or started again on every
+    /// call. The recipes walk no `lsp.live` and run the same under both values.
     pub breaker: bool,
+    /// `true` (default): a call that names no maps, has a tree, runs under
+    /// `sessions = "shared"` and has a shared manager (the MCP and REST
+    /// server's own) also walks `lsp.live`, after the policy's `extra_maps`
+    /// (naming it there is then a no-op). A server that is not installed, will
+    /// not start or is refused costs the walk a note and an unavailable map,
+    /// never an error. The CLI one-shot (`lci traverse`) and
+    /// `sessions = "per_call"` are not changed by it: a server that dies with
+    /// the call cannot amortise its start (d438), so there the map runs only
+    /// when named. `false`: the map runs only when a call or a policy names it.
+    /// A call that names its maps is never changed. The recipes walk no
+    /// `lsp.live` and run the same under both values.
+    pub live: bool,
+}
+
+impl Default for LspProfile {
+    fn default() -> Self {
+        Self {
+            sessions: LspSessions::default(),
+            outline_cache: false,
+            implementations: false,
+            call_hierarchy: false,
+            sync: LspSync::default(),
+            places: LspPlaces::default(),
+            breaker: true,
+            live: true,
+        }
+    }
 }
 
 /// Dotted keys left out of the profile besides [`machine_keys`]. A key naming
@@ -829,6 +856,8 @@ mod tests {
         config.run_profile.grep.structural = true;
         config.run_profile.lsp.sync = LspSync::Watch;
         config.run_profile.lsp.places = LspPlaces::Outline;
+        config.run_profile.lsp.breaker = false;
+        config.run_profile.lsp.live = false;
         config
     }
 
@@ -1345,6 +1374,7 @@ mode = \"sometimes\"
             "run_profile.lsp.sync",
             "run_profile.lsp.places",
             "run_profile.lsp.breaker",
+            "run_profile.lsp.live",
         ] {
             assert!(profile.keys.iter().any(|k| k == key), "{key} must be in");
         }
@@ -1742,42 +1772,81 @@ mode = \"sometimes\"
     }
 
     #[test]
-    fn lsp_breaker_is_off_by_default_and_changes_the_profile_hash() {
-        let off = Config::default();
-        assert!(!off.run_profile.lsp.breaker);
-        let on: Config = toml::from_str(&format!(
-            "{}[run_profile.lsp]\nbreaker = true\n",
-            base_toml()
-        ))
-        .unwrap();
-        on.validate().unwrap();
+    fn lsp_breaker_is_on_by_default_and_off_changes_the_profile_hash() {
+        let on = Config::default();
         assert!(on.run_profile.lsp.breaker);
-        // Only the named leaf moves.
-        assert_eq!(on.run_profile.lsp.sessions, LspSessions::Shared);
-        assert_eq!(on.run_profile.lsp.sync, LspSync::Off);
-        assert_eq!(on.run_profile.lsp.places, LspPlaces::Scip);
-        assert!(!on.run_profile.lsp.implementations);
-        assert!(!on.run_profile.lsp.call_hierarchy);
-        assert_eq!(
-            serde_json::to_value(&on).unwrap()["run_profile"]["lsp"]["breaker"],
-            true
-        );
-        let (off, on) = (off.run_profile(), on.run_profile());
-        assert_eq!(off.value["run_profile"]["lsp"]["breaker"], false);
-        assert_eq!(on.value["run_profile"]["lsp"]["breaker"], true);
-        assert!(off.keys.iter().any(|key| key == "run_profile.lsp.breaker"));
-        assert_ne!(off.hash, on.hash);
-        // Spelling out the default is the default.
-        let spelled: Config = toml::from_str(&format!(
+        let off: Config = toml::from_str(&format!(
             "{}[run_profile.lsp]\nbreaker = false\n",
             base_toml()
         ))
         .unwrap();
-        assert_eq!(spelled.run_profile().hash, off.hash);
+        off.validate().unwrap();
+        assert!(!off.run_profile.lsp.breaker);
+        // Only the named leaf moves.
+        assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(off.run_profile.lsp.places, LspPlaces::Scip);
+        assert!(off.run_profile.lsp.live);
+        assert!(!off.run_profile.lsp.implementations);
+        assert!(!off.run_profile.lsp.call_hierarchy);
+        assert_eq!(
+            serde_json::to_value(&off).unwrap()["run_profile"]["lsp"]["breaker"],
+            false
+        );
+        let (on, off) = (on.run_profile(), off.run_profile());
+        assert_eq!(on.value["run_profile"]["lsp"]["breaker"], true);
+        assert_eq!(off.value["run_profile"]["lsp"]["breaker"], false);
+        assert!(on.keys.iter().any(|key| key == "run_profile.lsp.breaker"));
+        assert_ne!(on.hash, off.hash);
+        // Spelling out the default is the default.
+        let spelled: Config = toml::from_str(&format!(
+            "{}[run_profile.lsp]\nbreaker = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert_eq!(spelled.run_profile().hash, on.hash);
         for bad in [
             "[run_profile.lsp]\nbreaker = \"yes\"\n",
             "[run_profile.lsp]\nbreaker = 1\n",
             "[run_profile]\nbreaker = true\n",
+        ] {
+            let text = format!("{}{bad}", base_toml());
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lsp_live_is_on_by_default_and_off_changes_the_profile_hash() {
+        let on = Config::default();
+        assert!(on.run_profile.lsp.live);
+        let off: Config =
+            toml::from_str(&format!("{}[run_profile.lsp]\nlive = false\n", base_toml())).unwrap();
+        off.validate().unwrap();
+        assert!(!off.run_profile.lsp.live);
+        // Only the named leaf moves.
+        assert_eq!(off.run_profile.lsp.sessions, LspSessions::Shared);
+        assert_eq!(off.run_profile.lsp.sync, LspSync::Off);
+        assert_eq!(off.run_profile.lsp.places, LspPlaces::Scip);
+        assert!(off.run_profile.lsp.breaker);
+        assert!(!off.run_profile.lsp.implementations);
+        assert_eq!(
+            serde_json::to_value(&off).unwrap()["run_profile"]["lsp"]["live"],
+            false
+        );
+        // It changes which maps a default walk runs, so it changes the hash.
+        let (on, off) = (on.run_profile(), off.run_profile());
+        assert_eq!(on.value["run_profile"]["lsp"]["live"], true);
+        assert_eq!(off.value["run_profile"]["lsp"]["live"], false);
+        assert!(on.keys.iter().any(|key| key == "run_profile.lsp.live"));
+        assert_ne!(on.hash, off.hash);
+        // Spelling out the default is the default.
+        let spelled: Config =
+            toml::from_str(&format!("{}[run_profile.lsp]\nlive = true\n", base_toml())).unwrap();
+        assert_eq!(spelled.run_profile().hash, on.hash);
+        for bad in [
+            "[run_profile.lsp]\nlive = \"yes\"\n",
+            "[run_profile.lsp]\nlive = 1\n",
+            "[run_profile]\nlive = true\n",
         ] {
             let text = format!("{}{bad}", base_toml());
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
