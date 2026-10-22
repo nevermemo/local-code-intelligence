@@ -572,7 +572,8 @@ struct RgRun {
     failure: Option<String>,
 }
 
-/// Runs ripgrep with `flags`, one `--glob` per language adapter and one `-e`
+/// Runs ripgrep with `flags`, one case-insensitive `--glob` per language adapter
+/// and one `-e`
 /// per needle over `root`. The command every ripgrep caller of the crate
 /// starts.
 async fn run_ripgrep(
@@ -584,6 +585,8 @@ async fn run_ripgrep(
     let resolved_rg = resolve_ripgrep_path(rg_path);
     let mut command = tokio::process::Command::new(&resolved_rg);
     command.args(flags);
+    // The adapter globs match an extension in any case, like the registry (N94).
+    command.arg("--glob-case-insensitive");
     for adapter in language::ADAPTERS {
         command.arg("--glob").arg(adapter.glob());
     }
@@ -1130,6 +1133,31 @@ mod tests {
             .await
             .unwrap();
         assert!(none.matches.is_empty() && none.warning.is_none());
+    }
+
+    /// The lexical channel reads a file of a registered language whatever the
+    /// case of its extension (N94): the adapter globs are case-insensitive.
+    /// Runs the real ripgrep over real files.
+    #[tokio::test]
+    async fn search_literals_reads_files_with_a_mixed_case_extension() {
+        let Some(rg) = real_ripgrep() else {
+            eprintln!("skipped: ripgrep is not installed");
+            return;
+        };
+        let temp = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        for name in ["Lib.RS", "Tool.Py", "plain.rs", "notes.txt"] {
+            std::fs::write(root.join(name), "fn Marker() {}\n").unwrap();
+        }
+        let needles = vec!["Marker".to_owned()];
+        let found = search_literals(&rg, &root, &needles, 20).await.unwrap();
+        assert!(found.warning.is_none(), "{:?}", found.warning);
+        let paths: Vec<&str> = found
+            .matches
+            .iter()
+            .map(|m| m.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["Lib.RS", "Tool.Py", "plain.rs"]);
     }
 
     #[cfg(unix)]

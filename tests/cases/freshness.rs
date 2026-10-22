@@ -1176,7 +1176,7 @@ fn assert_file_changed(answer: &Value, changed: &[&str], index_maps_only: bool) 
         if !applies {
             continue;
         }
-        let want = if path.ends_with(".toml") {
+        let want = if lci_core::path::has_extension_ignore_case(path, "toml") {
             Value::Null
         } else {
             json!(changed.contains(&path))

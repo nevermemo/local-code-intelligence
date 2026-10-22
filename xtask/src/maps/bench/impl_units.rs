@@ -179,7 +179,7 @@ impl ImplResolver {
     }
 
     pub(super) fn place(&mut self, path: &str, line: u64) -> Placement {
-        if !path.ends_with(".rs") {
+        if !lci_core::path::has_extension_ignore_case(path, "rs") {
             return Placement::Elsewhere;
         }
         let root = &self.root;

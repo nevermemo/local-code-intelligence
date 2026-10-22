@@ -90,7 +90,9 @@ async fn a_symbol_reaches_the_documents_that_mention_it_and_no_source_file() {
         e.kind == EdgeKind::Mentions
             && e.map == DOCS_MENTIONS_ID
             && e.dst.kind() == NodeKind::File
-            && e.dst.path().is_some_and(|p| p.ends_with(".md"))
+            && e.dst
+                .path()
+                .is_some_and(|p| lci_core::path::has_extension_ignore_case(p, "md"))
     }));
     let readme = by_dst(&edges, &file("README.md"));
     assert_eq!(
