@@ -621,33 +621,41 @@ fn cargo_gets_only_the_budget_the_gate_wait_left() {
     ));
     let helper = node_named(&map.inner.scip, "helper");
 
-    // Another probe holds the gate for the first 2 s of this one's budget. The
-    // hold starts only once the probe thread runs, and the 1 s margin covers a
-    // loaded machine delaying the probe between that signal and its deadline.
-    let budget = Duration::from_millis(5000);
+    // Another probe holds the gate while this one waits. The budget is well
+    // under the cargo cap (30 s), so the cap cannot be what limits cargo, and
+    // well above the hold, so a loaded machine delaying the probe cannot spend
+    // it all (no wall-clock margin is assumed).
+    let budget = Duration::from_secs(20);
     let held = map
         .inner
         .gate
         .acquire(Instant::now() + WAIT)
         .expect("the gate is free");
-    let (started, running) = std::sync::mpsc::channel();
     let probe = {
         let (map, helper) = (map.clone(), helper.clone());
-        std::thread::spawn(move || {
-            started.send(()).unwrap();
-            map.edges_blocking(&helper, budget)
-        })
+        std::thread::spawn(move || map.edges_blocking(&helper, budget))
     };
-    running.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(2000));
+    // The sleep counter moves after the probe took its deadline, so the
+    // instant seen here is never before the start of the probe's budget.
+    let give_up = Instant::now() + WAIT;
+    while map.inner.gate.sleeps.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < give_up, "the probe never waited");
+        std::thread::yield_now();
+    }
+    let waiting_since = Instant::now();
+    std::thread::sleep(Duration::from_millis(1000));
+    let released = Instant::now();
     drop(held);
     probe.join().unwrap();
 
+    // The probe waited at least from `waiting_since` to `released`, however
+    // late it ran after that: cargo has at most the rest of the budget.
+    let held_for = released - waiting_since;
     let timeouts = lock(&timed.timeouts).clone();
     assert_eq!(timeouts.len(), 1, "the probe should have run cargo once");
     assert!(
-        timeouts[0] < Duration::from_millis(4000),
-        "cargo was given {:?} of a {budget:?} budget after it waited about 2 s for the gate",
+        timeouts[0] <= budget - held_for,
+        "cargo was given {:?} of a {budget:?} budget after the probe waited at least {held_for:?} for the gate",
         timeouts[0]
     );
 }

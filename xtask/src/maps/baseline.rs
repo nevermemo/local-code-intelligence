@@ -13,8 +13,11 @@
 //! * `rg` (K5a-1): `rg --fixed-strings --word-regexp` over the frozen tree for
 //!   the `traits` and `where-to` sets, from the question's names (see the
 //!   `rg` module). The LSP-over-MCP arm is K5a-2.
+//! * `serena` (K5b): Serena's symbol tools over MCP (loopback, a separate
+//!   process) for `traits`, `where-to` and `impact`, on a copy of the frozen
+//!   tree (see the `serena` module).
 //!
-//! All write the answers as the bench's adapters do (impact and rg
+//! All write the answers as the bench's adapters do (impact, rg and serena
 //! `{path, line}`, history `{commit}`) and score them with
 //! [`super::bench::item_record`], so a baseline run pairs with any bench run
 //! in `maps compare`. No arm expands anything: `expansions` is 0.
@@ -33,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod rg;
+mod serena;
 
 #[derive(Subcommand)]
 pub enum BaselineCommand {
@@ -52,6 +56,13 @@ pub enum BaselineCommand {
     /// (`--decl-first` moves declaration lines ahead). Not given the gold.
     /// Writes a run dir for `maps compare`.
     Rg(rg::RgArgs),
+    /// Serena (symbol tools over language servers, run as a separate process
+    /// over MCP on loopback) on the `traits`, `where-to` or `impact` set, from
+    /// the question's names, top --top-k `{path, line}` answers. Runs against a
+    /// COPY of the frozen tree (Serena writes `.serena/` into its project) and
+    /// records the tree's hash before and after. Not given the gold. Writes a
+    /// run dir for `maps compare`.
+    Serena(serena::SerenaArgs),
 }
 
 pub fn run(command: BaselineCommand) -> Result<()> {
@@ -59,6 +70,7 @@ pub fn run(command: BaselineCommand) -> Result<()> {
         BaselineCommand::Impact(args) => run_impact(args),
         BaselineCommand::History(args) => run_history(args),
         BaselineCommand::Rg(args) => rg::run_rg_arm(args),
+        BaselineCommand::Serena(args) => serena::run_serena_arm(args),
     }
 }
 

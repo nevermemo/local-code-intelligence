@@ -1343,7 +1343,9 @@ impl Manager {
                 Err(error)
                     if error.chain().any(|cause| {
                         matches!(
-                            cause.downcast_ref::<adapter::ProbeFailure>(),
+                            cause
+                                .downcast_ref::<adapter::ProbeError>()
+                                .map(|e| e.failure),
                             Some(adapter::ProbeFailure::Missing | adapter::ProbeFailure::TimedOut)
                         )
                     }) => {}
@@ -3498,7 +3500,10 @@ mod tests {
         async fn probe_readiness(&self, _timeout: Duration) -> Result<()> {
             let n = self.asked.fetch_add(1, Ordering::SeqCst);
             let cause = self.causes[n.min(self.causes.len() - 1)];
-            Err(anyhow::Error::new(cause).context("start failing-probe-server"))
+            Err(adapter::ProbeError::error(
+                cause,
+                "start failing-probe-server",
+            ))
         }
         fn transport_config(&self, _root: &std::path::Path) -> Option<TransportConfig> {
             None
