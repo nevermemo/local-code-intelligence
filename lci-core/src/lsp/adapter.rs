@@ -5,13 +5,13 @@
 //! by omitting the adapter.
 
 use crate::lsp::transport::{JsonRpcClient, RpcError, TransportConfig};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -99,9 +99,15 @@ pub trait LspAdapter: Send + Sync {
     /// request on a specific file. Default no-op; the TypeScript/JavaScript
     /// adapter uses this to send `textDocument/didOpen`, since tsserver only
     /// knows about files it has been told are open.
+    ///
+    /// `sent` is the session's table of the texts already sent (see
+    /// [`SentTexts`]); a hook that opens documents goes through
+    /// [`open_if_changed`], so a file whose text did not change since this
+    /// session sent it is not opened again.
     async fn before_position_request(
         &self,
         _rpc: &JsonRpcClient,
+        _sent: &SentTexts,
         _file: &Path,
         _relative: &str,
     ) -> Result<()> {
@@ -110,9 +116,10 @@ pub trait LspAdapter: Send + Sync {
 
     /// Whether the server holds the file's current disk text at every
     /// position request: [`Self::before_position_request`] sends it in a
-    /// `textDocument/didOpen` (read just before the request, up to
-    /// [`MAX_DID_OPEN_BYTES`]) and the server takes that text even when the
-    /// document is already open. Only then may the manager's outline cache
+    /// `textDocument/didOpen` when it differs from the text this session sent
+    /// last (read just before the request, up to [`MAX_DID_OPEN_BYTES`]), so an
+    /// unchanged file is not sent again, and the server takes that text even
+    /// when the document is already open. Only then may the manager's outline cache
     /// (`[run_profile.lsp] outline_cache`) keep an answer under the hash of
     /// the bytes on disk. Default `false`: a server that is told nothing
     /// (csharp-ls), or that watches the disk itself and can lag an edit
@@ -202,6 +209,131 @@ pub async fn read_for_did_open(
         return Ok(None);
     }
     String::from_utf8(bytes).map(Some).with_context(context)
+}
+
+/// The texts one session has sent in `textDocument/didOpen`, by document URI,
+/// as the content hash of each. A new session starts empty, so a restarted
+/// server is sent its files again.
+///
+/// It also holds one gate per URI. [`open_if_changed`] takes it before the
+/// comparison and an [`OpenedDocument`] keeps it until the hook that sent the
+/// text is done (its head start included), so a concurrent request for the
+/// same file waits for an open in flight instead of skipping it and reaching
+/// the server before the text or before the head start has passed. Both maps
+/// keep one entry per navigated file for the session's life.
+#[derive(Debug, Default)]
+pub struct SentTexts {
+    hashes: Mutex<HashMap<String, String>>,
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A document this hook just sent in `textDocument/didOpen`. Holding it keeps
+/// the URI's gate, so a hook that waits after the open (a head start) keeps
+/// the waiting inside the value, and drops it when the wait is over.
+#[derive(Debug)]
+pub struct OpenedDocument {
+    /// The document URI.
+    pub uri: String,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SentTexts {
+    /// Waits for any open of `uri` in flight, then holds the URI's gate. It
+    /// costs nothing while no hook is between its `didOpen` and its release.
+    async fn gate(&self, uri: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = Arc::clone(
+            self.gates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(uri.to_owned())
+                .or_default(),
+        );
+        gate.lock_owned().await
+    }
+
+    /// How many callers of [`open_if_changed`] wait behind an open of `uri`
+    /// in flight, that is, behind a live [`OpenedDocument`]. Counted from the
+    /// gate's owners, so a caller that is about to wait counts too. For logs
+    /// and for tests that must know a request is parked before they let the
+    /// open finish.
+    pub fn waiting(&self, uri: &str) -> usize {
+        self.gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(uri)
+            // The map's own handle and the holder's guard are not waiters.
+            .map_or(0, |gate| Arc::strong_count(gate).saturating_sub(2))
+    }
+
+    /// Records `hash` as the text sent for `uri`. `true` when it differs from
+    /// what was recorded (or nothing was), that is, when the text must be sent.
+    pub fn changed(&self, uri: &str, hash: &str) -> bool {
+        let mut sent = self.hashes.lock().unwrap_or_else(PoisonError::into_inner);
+        if sent.get(uri).is_some_and(|known| known == hash) {
+            return false;
+        }
+        sent.insert(uri.to_owned(), hash.to_owned());
+        true
+    }
+
+    /// Forgets `uri`, so the next [`Self::changed`] answers `true` (a send
+    /// that failed).
+    fn forget(&self, uri: &str) {
+        self.hashes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(uri);
+    }
+}
+
+/// Sends `file`'s current disk text in `textDocument/didOpen` (version 1) unless
+/// this session already sent that exact text, and answers the document URI
+/// when it sent. `None`: the text is unchanged since the last send, or the file
+/// is above [`MAX_DID_OPEN_BYTES`] and is not sent (see
+/// [`read_for_did_open`]).
+///
+/// The call first waits for any open of the same URI in flight on this
+/// session, so a request that finds the text already sent returns only after
+/// the `didOpen` has been written (the write is awaited to the end) and after
+/// the sending hook let go of its [`OpenedDocument`], head start included.
+/// Hold the returned value across a wait that must also hold other requests
+/// for the file back; drop it when the wait is over.
+pub async fn open_if_changed(
+    rpc: &JsonRpcClient,
+    sent: &SentTexts,
+    file: &Path,
+    relative: &str,
+    server: &str,
+    language_id: &str,
+) -> Result<Option<OpenedDocument>> {
+    let uri = reqwest::Url::from_file_path(file)
+        .map_err(|_| anyhow!("cannot convert file path to URI"))?
+        .to_string();
+    let gate = sent.gate(&uri).await;
+    let Some(content) = read_for_did_open(file, relative, server).await? else {
+        return Ok(None);
+    };
+    if !sent.changed(&uri, &crate::workspace::hash(&content)) {
+        return Ok(None);
+    }
+    let notified = rpc
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": content
+                }
+            }),
+        )
+        .await;
+    if let Err(error) = notified {
+        sent.forget(&uri);
+        return Err(error);
+    }
+    Ok(Some(OpenedDocument { uri, _gate: gate }))
 }
 
 /// What identifies a binary for the process-wide probe memo. The invocation is
@@ -314,6 +446,28 @@ pub async fn probe_subprocess_version(executable: &Path, timeout: Duration) -> R
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sent_texts_report_a_change_once_per_new_hash() {
+        let sent = SentTexts::default();
+        assert!(sent.changed("file:///a", "h1"), "first text");
+        assert!(!sent.changed("file:///a", "h1"), "same text again");
+        assert!(
+            sent.changed("file:///b", "h1"),
+            "another uri is its own entry"
+        );
+        assert!(sent.changed("file:///a", "h2"), "a new text");
+        assert!(!sent.changed("file:///a", "h2"));
+        assert!(
+            sent.changed("file:///a", "h1"),
+            "back to the old text is a change"
+        );
+        sent.forget("file:///a");
+        assert!(
+            sent.changed("file:///a", "h1"),
+            "a forgotten uri is sent again"
+        );
+    }
 
     #[tokio::test]
     async fn a_binary_is_probed_once_per_process_until_its_identity_changes() {

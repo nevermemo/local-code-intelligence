@@ -26,7 +26,7 @@ Gold column: gold files are private and outside the repository except the seed q
 bug-localisation set (`gold-bugloc.json`), both under `docs/spike/multimap`; the sets are listed in
 [evaluation.md](spike/multimap/evaluation.md#sets). No set exists for C#, Go, Java, C, C++, Python or
 TypeScript and JavaScript code questions. The 450-key structured-grep spike sample (LCI, Vite, Home Assistant) measured live grep on config keys and is not retrieval gold. The languages of the 15 public repositories planned for the agent A/B
-pilot are not verified. External held-out gold (SWE-PolyBench Verified, LongCodeArena): the converter and the leak check are built (K4a, d484); the download, the real conversion and the counts are K4b.
+pilot are not verified. External held-out gold (SWE-PolyBench Verified, LongCodeArena): built (K4a d484, K4b d499), data in the owner's gold directory and never in the repository; the LongCodeArena parquet files go through a one-off conversion to JSONL outside the repository (no parquet reader in xtask); counts in [evaluation.md](spike/multimap/evaluation.md#sets).
 
 Syntax tier plans: tree-sitter 0.26 (K15a; today the runtime is 0.25 and the grammar crates are 0.23 to 0.25), Codanna parsing and resolution behind a Cargo
 feature (K14a to K14d), structural grep over `ast-grep-core` (K19: built as the opt-in map `grep.structural`, pinned to `=0.40.1` because it needs tree-sitter 0.25; ceiling in test-results).

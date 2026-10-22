@@ -22,6 +22,7 @@ scip = "0.10.0"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["time", "macros", "rt"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
