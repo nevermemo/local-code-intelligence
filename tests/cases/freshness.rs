@@ -39,7 +39,7 @@
 //!   second world, that the same maps are plain gaps with it off, so the label
 //!   and not the data is what changed.
 //! * `Gap`: it did not and the answer is silent or says "not stale" (the live
-//!   maps, the search channels, `lsp.symbols`). `EXPECTED_GAPS`,
+//!   maps and the search channels). `EXPECTED_GAPS`,
 //!   `EXPECTED_LABELLED` and `VERIFIED_ON_READ` list today's outcomes and are
 //!   asserted in both directions. `VERIFIED_ON_READ` holds the maps that are
 //!   labelled only with `[run_profile.freshness] verify_on_read` (K2b) on, on
@@ -1254,16 +1254,15 @@ impl World {
 /// that finds it.
 const EXPECTED_GAPS: &[(Case, &str, Why)] = &[];
 
-/// The maps that miss the edit only with `[run_profile.lsp] sync` off (K8a):
-/// the language-server session walked the tree before the edit and is told
-/// nothing after it, and its answer is not compared with the tree. With the
-/// sync on the session is told and answers the edit.
-const SYNCED: &[(Case, &str, Why)] = &[
-    (Case::OnSearch, "lsp.symbols", Why::OldSession),
-    (Case::Manual, "lsp.symbols", Why::OldSession),
-    // After the SCIP file was rewritten only the session is behind.
-    (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
-];
+/// The maps that miss the edit only with `[run_profile.lsp] sync` off (K8a).
+/// None any more (N104): the language-server session of `lsp.symbols` walked
+/// the tree before the edit and, with the sync off, is told nothing after it,
+/// but navigation and the search channel pass the tree barrier, which stops a
+/// session whose tree changed so the request starts one that reads the disk.
+/// The sync no longer decides whether `lsp.symbols` sees the edit. The list
+/// and its use stay: a map that is behind only without the sync is listed here
+/// again.
+const SYNCED: &[(Case, &str, Why)] = &[];
 
 /// The maps that miss the edit and say so only with `verify_on_read` on (K2b):
 /// with it off they are gaps (the same data, no label).
@@ -1535,13 +1534,16 @@ impl World {
 
     /// With the sync on, the session's own record shows it was told: a
     /// `workspace/didChangeWatchedFiles` that names `src/Calculator.cs` as
-    /// changed (type 2) and that the fake applied (no note), from the one
-    /// server that started. Read after an observation, whose requests follow
-    /// the notification.
+    /// changed (type 2) and that the fake applied (no note). Read after an
+    /// observation, whose requests follow the notification. The tree barrier
+    /// (N104) restarts the session at the first request after each edit and
+    /// keeps it while the tree is unchanged, so the servers started are one
+    /// per generation plus the first: the edit told the session, then the
+    /// barrier replaced it.
     fn assert_session_told(&self) {
         assert!(self.sync);
         let events = events_of(&self.session_state);
-        assert!(events.iter().all(|event| event["spawn"] == 1), "one server");
+        self.assert_restarted_once_per_edit(&events);
         let told: Vec<&Value> = events
             .iter()
             .filter(|event| event["method"] == "workspace/didChangeWatchedFiles")
@@ -1563,6 +1565,21 @@ impl World {
             }),
             "{told:?}"
         );
+    }
+}
+
+impl World {
+    /// The language-server sessions of the application's manager are numbered
+    /// 1 to `generation + 1`: a restart by the tree barrier after each edit
+    /// and no other start (the unchanged tree after a rewritten SCIP file,
+    /// which lives outside the tree, keeps the session).
+    fn assert_restarted_once_per_edit(&self, events: &[Value]) {
+        let spawns: BTreeSet<u64> = events
+            .iter()
+            .map(|event| event["spawn"].as_u64().unwrap())
+            .collect();
+        let wanted: BTreeSet<u64> = (1..=u64::from(self.generation) + 1).collect();
+        assert_eq!(spawns, wanted, "a restart after each edit, no other start");
     }
 }
 
@@ -1964,7 +1981,7 @@ async fn a_rewritten_scip_index_refreshes_the_scip_built_maps_by_its_stamp() {
     assert_eq!(
         verdicts["lsp.symbols"],
         Verdict::Fresh,
-        "the sync told the session"
+        "the barrier restarted the session after the edit"
     );
     world.assert_session_told();
 
@@ -2014,11 +2031,14 @@ fn events_of(state: &Path) -> Vec<Value> {
 
 /// With `[run_profile.lsp] sync` off (the default), the application's
 /// language-server session walks the tree when it starts and is told nothing
-/// after that: an edit on disk is not in its answers, and a new session has it.
-/// The fake answers from its store (K7a), so this is the store's staleness and
-/// not the disk's.
+/// after that, so an edit on disk is not pushed to it. Navigation passes the
+/// tree barrier (N104): the first call after the edit stops that session, the
+/// new one walks the disk and lists the edit (with a `restarted` note), and a
+/// call on the unchanged tree keeps it. The fake answers from its store (K7a):
+/// the store of the first server stays as it walked, the second one's holds
+/// the edit.
 #[tokio::test]
-async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
+async fn with_sync_off_the_barrier_restarts_the_session_and_the_new_one_walks_the_disk() {
     let mut world = World::start_with(IndexFreshness::OnSearch, true, true, false).await;
     // The names the session lists in `Calculator.cs` (the fake walks the
     // sidecar's Rust file too, and answers from it).
@@ -2035,6 +2055,7 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
         .await
         .unwrap();
     assert_eq!(names(&first.results), ["Combine"]);
+    assert!(first.notes.is_empty(), "{first:?}");
 
     world.edit().await;
     assert!(
@@ -2043,14 +2064,20 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
             .contains("ProbeG1"),
         "the disk has the probe"
     );
-    let stale = world
+    let found = world
         .app
         .symbols(&world.workspace, "ProbeG1")
         .await
         .unwrap();
+    assert_eq!(names(&found.results), ["ProbeG1"], "{found:?}");
+    // (rust-analyzer's path is missing in this fixture, so it has no server;
+    // its failed-start session entry is also stopped and noted by the
+    // barrier, which is why the notes are searched, not compared whole.)
     assert!(
-        stale.results.is_empty(),
-        "the session answers its store: {stale:?}"
+        found
+            .notes
+            .contains(&"lsp: csharp-ls restarted: the tree changed since its last call".to_owned()),
+        "{found:?}"
     );
     let events = events_of(&world.session_state);
     let methods: Vec<&str> = events
@@ -2068,14 +2095,11 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
             "{notification} in {methods:?}"
         );
     }
-    assert!(
-        events.iter().all(|event| event["spawn"] == 1),
-        "one server so far"
-    );
+    world.assert_restarted_once_per_edit(&events);
     assert_eq!(
         store_lines(&world.session_state),
-        calculator(0, false).lines().count() as u64,
-        "the store still holds the text it walked"
+        calculator(1, false).lines().count() as u64,
+        "the second server's store holds the text it walked"
     );
 
     // No sync ran.
@@ -2086,7 +2110,25 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
             .sync_status(&world.workspace_id())
             .is_none()
     );
-    // A new session walks the disk again and has it.
+    // The tree is unchanged: the second server is kept.
+    let again = world
+        .app
+        .symbols(&world.workspace, "ProbeG1")
+        .await
+        .unwrap();
+    assert_eq!(names(&again.results), ["ProbeG1"]);
+    assert!(
+        again.notes.iter().any(
+            |note| note.starts_with("lsp: csharp-ls kept session; tree stamp unchanged since ")
+        ),
+        "{again:?}"
+    );
+    assert!(
+        !again.notes.iter().any(|note| note.contains("restarted")),
+        "{again:?}"
+    );
+    world.assert_restarted_once_per_edit(&events_of(&world.session_state));
+    // A new session (after a release) walks the disk again and has it.
     world
         .app
         .release_language_servers(&world.workspace)
@@ -2101,7 +2143,7 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
     assert!(
         events_of(&world.session_state)
             .iter()
-            .any(|event| event["spawn"] == 2)
+            .any(|event| event["spawn"] == 3)
     );
     assert_eq!(
         store_lines(&world.session_state),
@@ -2110,11 +2152,13 @@ async fn lsp_symbols_answers_the_documents_fake_store_not_the_disk() {
     world.finish().await;
 }
 
-/// With `[run_profile.lsp] sync = "watch"` the same session is told about the
-/// edit and lists the probe: no new server answered, the fake's store holds
-/// the new text, and the sync walked the tree once (at start), not per event.
+/// With `[run_profile.lsp] sync = "watch"` the session is told about the
+/// edit (the first server received the `workspace/didChangeWatchedFiles`),
+/// and the tree barrier (N104) then replaces it: the second server lists the
+/// probe, the fake's store holds the new text, and the sync walked the tree
+/// once per session (at start), not per event.
 #[tokio::test]
-async fn with_sync_on_the_session_is_told_about_the_edit_and_lists_the_probe() {
+async fn with_sync_on_the_session_is_told_about_the_edit_and_the_barrier_replaces_it() {
     let mut world = World::start(IndexFreshness::OnSearch).await;
     let names = |results: &[local_code_intelligence::lsp::Location]| -> Vec<String> {
         results
@@ -2137,6 +2181,15 @@ async fn with_sync_on_the_session_is_told_about_the_edit_and_lists_the_probe() {
         .await
         .unwrap();
     assert_eq!(names(&found.results), ["ProbeG1"], "{found:?}");
+    // (rust-analyzer's path is missing in this fixture, so it has no server;
+    // its failed-start session entry is also stopped and noted by the
+    // barrier, which is why the notes are searched, not compared whole.)
+    assert!(
+        found
+            .notes
+            .contains(&"lsp: csharp-ls restarted: the tree changed since its last call".to_owned()),
+        "{found:?}"
+    );
     world.assert_session_told();
     assert_eq!(
         store_lines(&world.session_state),
@@ -2149,7 +2202,10 @@ async fn with_sync_on_the_session_is_told_about_the_edit_and_lists_the_probe() {
         .sync_status(&world.workspace_id())
         .expect("the session's workspace is synced");
     assert_eq!((status.walks, status.rescans), (1, 0), "{status:?}");
-    assert!(status.batches >= 1 && status.forwarded >= 1, "{status:?}");
+    // The replacement session started after the edit and walked the disk, so
+    // its sync forwarded nothing; the forwarding to the first server is the
+    // `workspace/didChangeWatchedFiles` event `assert_session_told` read.
+    assert_eq!((status.batches, status.forwarded), (0, 0), "{status:?}");
     // Released with its last session.
     world
         .app
@@ -2431,18 +2487,13 @@ fn the_gap_list_is_exact_in_both_directions() {
     }
     assert_eq!(gaps, EXPECTED_GAPS);
     // With every key on no gap is left: the language-server session, the last
-    // one, is told about edits by the sync.
+    // one, is replaced by the tree barrier after an edit (N104; the sync tells
+    // it too, which no longer decides).
     assert!(EXPECTED_GAPS.is_empty(), "{EXPECTED_GAPS:?}");
-    // `sync` moves exactly the session's maps: gaps with it off, absent
-    // (fresh) with it on, whatever the other keys are.
-    assert_eq!(
-        SYNCED,
-        [
-            (Case::OnSearch, "lsp.symbols", Why::OldSession),
-            (Case::Manual, "lsp.symbols", Why::OldSession),
-            (Case::ScipRewritten, "lsp.symbols", Why::OldSession),
-        ]
-    );
+    // `sync` moves exactly the maps of `SYNCED`: gaps with it off, absent
+    // (fresh) with it on, whatever the other keys are. The session's maps are
+    // no longer among them (N104): the barrier makes them fresh either way.
+    assert!(SYNCED.is_empty(), "{SYNCED:?}");
     for (labels, verify) in [(true, true), (true, false), (false, false)] {
         let (on, on_labelled) = expected(labels, verify, true, LspPlaces::Scip);
         let (off, off_labelled) = expected(labels, verify, false, LspPlaces::Scip);

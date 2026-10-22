@@ -599,6 +599,10 @@ pub struct Config {
     /// configuration keeps C/C++ navigation disabled; syntax retrieval is
     /// unaffected.
     pub clangd: ClangdLspConfig,
+    /// Optional Markdown language-server (marksman) settings. Absent or empty
+    /// configuration keeps prose navigation disabled; the server is reached
+    /// only for an indexed prose file (`[index] prose = true`).
+    pub markdown: MarkdownLspConfig,
     pub index: IndexConfig,
     /// Query-time channel and reranker switches; all enabled by default.
     pub channels: ChannelsConfig,
@@ -1449,6 +1453,41 @@ impl ClangdLspConfig {
     }
 }
 
+/// Optional Markdown language-server (marksman) configuration.
+///
+/// Prose navigation is optional and fail-open: an absent or empty
+/// `[markdown]` section keeps the server disabled without affecting
+/// retrieval. marksman is reached only for an indexed prose file, so it
+/// needs `[index] prose = true` as well. Its stdio mode is the `server`
+/// subcommand (`marksman server`), which the adapter forces before the
+/// configured `args`. The shared `lsp_timeout_seconds` applies here too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MarkdownLspConfig {
+    /// Path to the standalone marksman executable. `None` (the default)
+    /// keeps prose navigation disabled. An empty or whitespace-only value is
+    /// rejected by validation rather than silently counting as enabled.
+    pub path: Option<String>,
+    /// Additional arguments passed to marksman after `server`.
+    pub args: Vec<String>,
+    /// Explicitly disable the marksman server even when a path is configured.
+    pub disabled: bool,
+}
+
+impl MarkdownLspConfig {
+    /// Whether the Markdown language server is enabled.
+    ///
+    /// Enabled only when not explicitly disabled and a nonempty executable
+    /// path is configured.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+            && self
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Per-OS local data directory: %LOCALAPPDATA% on Windows,
@@ -1495,6 +1534,7 @@ impl Default for Config {
             go: GoLspConfig::default(),
             java: JavaLspConfig::default(),
             clangd: ClangdLspConfig::default(),
+            markdown: MarkdownLspConfig::default(),
             index: IndexConfig::default(),
             channels: ChannelsConfig::default(),
             fusion: FusionConfig::default(),
@@ -1682,6 +1722,14 @@ impl Config {
             ensure!(
                 !path.trim().is_empty(),
                 "clangd.path must be nonempty when set; omit it or set clangd.disabled = true to keep C/C++ navigation disabled"
+            );
+        }
+        if !self.markdown.disabled
+            && let Some(path) = &self.markdown.path
+        {
+            ensure!(
+                !path.trim().is_empty(),
+                "markdown.path must be nonempty when set; omit it or set markdown.disabled = true to keep prose navigation disabled"
             );
         }
         ensure!(
@@ -2332,6 +2380,26 @@ mod tests {
         let config: Config = toml::from_str(&toml_text).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("clangd.path"));
+    }
+
+    #[test]
+    fn markdown_section_enables_server_and_validates_the_path() {
+        let default: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(!default.markdown.enabled() && default.markdown.path.is_none());
+        let on: Config =
+            toml::from_str(&format!("{}[markdown]\npath = \"marksman\"\n", base_toml())).unwrap();
+        on.validate().unwrap();
+        assert!(on.markdown.enabled());
+        let off: Config = toml::from_str(&format!(
+            "{}[markdown]\npath = \"marksman\"\ndisabled = true\n",
+            base_toml()
+        ))
+        .unwrap();
+        assert!(!off.markdown.enabled());
+        let blank: Config =
+            toml::from_str(&format!("{}[markdown]\npath = \"   \"\n", base_toml())).unwrap();
+        let error = blank.validate().unwrap_err();
+        assert!(error.to_string().contains("markdown.path"));
     }
 
     #[test]

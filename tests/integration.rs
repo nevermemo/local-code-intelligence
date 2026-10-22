@@ -8,12 +8,18 @@ mod evaluation;
 mod freshness;
 #[path = "cases/indexing.rs"]
 mod indexing;
+#[path = "cases/lsp_breaker.rs"]
+mod lsp_breaker;
 #[path = "cases/lsp_concurrent_open.rs"]
 mod lsp_concurrent_open;
+#[path = "cases/markdown_lsp.rs"]
+mod markdown_lsp;
 #[path = "cases/mcp.rs"]
 mod mcp;
 #[path = "cases/navigation.rs"]
 mod navigation;
+#[path = "cases/navigation_barrier.rs"]
+mod navigation_barrier;
 #[path = "cases/readiness.rs"]
 mod readiness;
 #[path = "cases/recipes.rs"]
