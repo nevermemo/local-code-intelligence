@@ -21,10 +21,10 @@
 //! processes.
 
 use crate::config::JavaLspConfig;
-use crate::lsp::adapter::{LspAdapter, read_for_did_open};
+use crate::lsp::adapter::{LspAdapter, SentTexts, open_if_changed};
 use crate::lsp::transport::{JsonRpcClient, TransportConfig};
 use crate::workspace;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::{
@@ -371,8 +371,8 @@ impl LspAdapter for JavaServer {
             .await
     }
 
-    // The hook sends the current disk text on every request, and
-    // jdtls sets the working copy's buffer to the didOpen text when it
+    // The hook sends the current disk text whenever it differs from what
+    // this session sent, and jdtls sets the working copy's buffer to the didOpen text when it
     // differs, also for a unit that is already open.
     fn opens_documents(&self) -> bool {
         true
@@ -381,27 +381,13 @@ impl LspAdapter for JavaServer {
     async fn before_position_request(
         &self,
         rpc: &JsonRpcClient,
+        sent: &SentTexts,
         file: &Path,
         relative: &str,
     ) -> Result<()> {
-        let Some(content) = read_for_did_open(file, relative, "jdtls").await? else {
-            return Ok(());
-        };
-        let uri = reqwest::Url::from_file_path(file)
-            .map_err(|_| anyhow!("cannot convert file path to URI"))?
-            .to_string();
-        rpc.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "java",
-                    "version": 1,
-                    "text": content
-                }
-            }),
-        )
-        .await
+        open_if_changed(rpc, sent, file, relative, "jdtls", "java")
+            .await
+            .map(|_| ())
     }
 }
 

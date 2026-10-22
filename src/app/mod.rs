@@ -405,10 +405,6 @@ fn ms(start: Instant) -> f64 {
 /// across processes.
 const INDEX_LOCK_FILE: &str = "index.lock";
 
-/// How often a wait for another process's data-directory index lock tries
-/// the lock again.
-const INDEX_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Cross-process counterpart of `App::index_lock`: takes an exclusive OS
 /// file lock on `<data_dir>/index.lock` (waiting until any other holder
 /// releases it) and returns the handle that holds it; dropping the handle
@@ -417,12 +413,15 @@ const INDEX_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1
 /// `evaluate` -- serialize their snapshot commits instead of interleaving
 /// LanceDB table overwrites and manifest writes. Reads never take it.
 ///
-/// The wait tries the lock every [`INDEX_LOCK_RETRY`] on this task instead of
-/// blocking in `lock()` on a blocking thread: dropping the future ends the
-/// wait. A blocking wait could not be cancelled, and the runtime's shutdown
-/// waits for blocking threads, so a `serve` stopped by a signal while a
-/// watcher's reindex waited here stayed alive until the other process let
-/// go of the lock.
+/// The wait is the OS's blocking `lock()` on a plain `std::thread` (not the
+/// runtime's blocking pool), and the caller awaits a `oneshot`: the lock's
+/// release is the event that ends the wait, with no retry timer. Dropping the
+/// future ends the caller's wait at once, and the thread, which cannot be
+/// interrupted inside `lock()`, unlocks and ends as soon as it gets the lock
+/// (its send finds no receiver). A plain thread is not joined by the
+/// runtime's shutdown, as a blocking-pool thread is, so a `serve` stopped by a
+/// signal while a watcher's reindex waited here exits at once; the OS drops
+/// the thread's lock request with the process.
 async fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::fs::File> {
     use anyhow::Context;
     let file = std::fs::OpenOptions::new()
@@ -431,25 +430,45 @@ async fn lock_data_dir_for_indexing(data_dir: &std::path::Path) -> Result<std::f
         .write(true)
         .open(data_dir.join(INDEX_LOCK_FILE))
         .context("open data-directory index lock")?;
-    let mut announced = false;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if !announced {
-                    tracing::info!(
-                        data_dir = %data_dir.display(),
-                        "another process is committing an index in this data directory; waiting for it"
-                    );
-                    announced = true;
+    let data_dir = data_dir.display().to_string();
+    lock_file_exclusive(file, move || {
+        tracing::info!(
+            data_dir = %data_dir,
+            "another process is committing an index in this data directory; waiting for it"
+        );
+    })
+    .await
+}
+
+/// Takes an exclusive OS lock on `file` on a plain thread and returns the
+/// file holding it. `on_wait` runs once, on that thread, when the lock is
+/// held by another handle and the thread is about to block.
+async fn lock_file_exclusive(
+    file: std::fs::File,
+    on_wait: impl FnOnce() + Send + 'static,
+) -> Result<std::fs::File> {
+    use anyhow::Context;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("lci-index-lock".into())
+        .spawn(move || {
+            let locked = match file.try_lock() {
+                Ok(()) => Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    on_wait();
+                    file.lock().map(|()| file)
                 }
-                tokio::time::sleep(INDEX_LOCK_RETRY).await;
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("acquire data-directory index lock");
-            }
-        }
-    }
+                Err(std::fs::TryLockError::Error(error)) => Err(error),
+            };
+            // A caller that stopped waiting leaves the file here: dropping it
+            // releases a lock that nobody wants.
+            let _ = sender.send(locked);
+        })
+        .context("start the index-lock thread")?;
+    receiver
+        .await
+        .context("the index-lock thread ended without an answer")?
+        .context("acquire data-directory index lock")
 }
 
 /// The index's file list for the tree barrier of the service's language
@@ -511,43 +530,101 @@ impl lsp::stamp::IndexedFiles for ManifestFiles {
 
 #[cfg(test)]
 mod tests {
-    use super::{INDEX_LOCK_FILE, lock_data_dir_for_indexing};
+    use super::{INDEX_LOCK_FILE, lock_data_dir_for_indexing, lock_file_exclusive};
     use std::{fs::OpenOptions, time::Duration};
 
-    #[tokio::test]
-    async fn data_dir_index_lock_waits_for_another_holder() {
-        let temp = tempfile::tempdir().unwrap();
-        let holder = OpenOptions::new()
+    /// Outer bound of a test's awaits: a hung wait fails the test, it is never
+    /// what a passing test depends on.
+    const OUTER: Duration = Duration::from_secs(20);
+
+    fn open_lock_file(dir: &std::path::Path) -> std::fs::File {
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(temp.path().join(INDEX_LOCK_FILE))
-            .unwrap();
+            .open(dir.join(INDEX_LOCK_FILE))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_lock_wait_ends_when_the_holder_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = open_lock_file(temp.path());
         holder.lock().unwrap();
 
-        let data_dir = temp.path().to_path_buf();
-        let mut waiter = tokio::spawn(async move { lock_data_dir_for_indexing(&data_dir).await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), &mut waiter)
-                .await
-                .is_err(),
-            "lock_data_dir_for_indexing returned while another holder held the lock"
-        );
+        // The waiter tells the test when its thread is about to enter
+        // `lock()` (the callback fires just before the call, so the release
+        // below may come before or after the thread blocks); either way the
+        // wait can only end through the release, since the holder keeps the lock.
+        let (blocking, about_to_block) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(lock_file_exclusive(
+            open_lock_file(temp.path()),
+            move || blocking.send(()).unwrap(),
+        ));
+        tokio::task::spawn_blocking(move || about_to_block.recv().unwrap())
+            .await
+            .unwrap();
 
         drop(holder);
-        let acquired = tokio::time::timeout(Duration::from_secs(5), waiter)
+        let acquired = tokio::time::timeout(OUTER, waiter)
             .await
-            .expect("lock_data_dir_for_indexing must return promptly after the lock is released")
+            .expect("the wait did not end after the holder released the lock")
             .unwrap()
             .unwrap();
-        let contender = OpenOptions::new()
-            .write(true)
-            .open(temp.path().join(INDEX_LOCK_FILE))
-            .unwrap();
+        let contender = open_lock_file(temp.path());
         assert!(
             matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
             "the returned handle must keep holding the lock"
         );
         drop(acquired);
+    }
+
+    #[tokio::test]
+    async fn a_free_lock_is_taken_without_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let acquired = tokio::time::timeout(OUTER, lock_data_dir_for_indexing(temp.path()))
+            .await
+            .expect("a free lock must not wait")
+            .unwrap();
+        let contender = open_lock_file(temp.path());
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(acquired);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_wait_gives_the_lock_back_when_the_thread_gets_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = open_lock_file(temp.path());
+        holder.lock().unwrap();
+
+        let (blocking, about_to_block) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(lock_file_exclusive(
+            open_lock_file(temp.path()),
+            move || blocking.send(()).unwrap(),
+        ));
+        tokio::task::spawn_blocking(move || about_to_block.recv().unwrap())
+            .await
+            .unwrap();
+
+        // The caller gives up: the future is dropped while the thread blocks.
+        waiter.abort();
+        let _ = waiter.await;
+        drop(holder);
+
+        // The thread now gets the lock, finds no receiver and releases it, so
+        // a blocking lock on a fresh handle ends instead of waiting forever.
+        let contender = open_lock_file(temp.path());
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            contender.lock().unwrap();
+            done.send(()).unwrap();
+        });
+        tokio::task::spawn_blocking(move || finished.recv_timeout(OUTER))
+            .await
+            .unwrap()
+            .expect("the lock stayed held after its caller stopped waiting");
     }
 }

@@ -8,6 +8,8 @@ mod evaluation;
 mod freshness;
 #[path = "cases/indexing.rs"]
 mod indexing;
+#[path = "cases/lsp_concurrent_open.rs"]
+mod lsp_concurrent_open;
 #[path = "cases/mcp.rs"]
 mod mcp;
 #[path = "cases/navigation.rs"]
